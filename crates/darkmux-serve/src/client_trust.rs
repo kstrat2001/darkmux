@@ -48,8 +48,8 @@
 //! running as this user, could run `client approve` anyway.
 
 use crate::client_pairing::{
-    approve_as, deny, peer_holders_of, Approval, ClientServerState, ClientStore, RememberedApp, SigningIdentity,
-    PAIR_REQUESTS_PER_PROCESS,
+    approve_as, deny, peer_holders_of, Approval, ClientServerState, ClientStore, RememberedApp,
+    SigningIdentity, PAIR_REQUESTS_PER_PROCESS,
 };
 use darkmux_platform::{AllowAnswer, SignedApp};
 use std::collections::HashMap;
@@ -58,7 +58,10 @@ use std::sync::{Arc, Mutex};
 
 /// Mux Bot's bundle ids: the app and its check build. A Mux Bot signed by a
 /// verified team is one of these.
-pub const MUX_BOT_BUNDLES: &[&str] = &["com.darklyenergized.darkmuxapp", "com.darklyenergized.darkmuxapp.check"];
+pub const MUX_BOT_BUNDLES: &[&str] = &[
+    "com.darklyenergized.darkmuxapp",
+    "com.darklyenergized.darkmuxapp.check",
+];
 
 /// How long a dialog waits for an answer before it gives up (the request
 /// stays pending, and `client approve` can still approve it).
@@ -80,7 +83,10 @@ impl PairingPolicy {
     /// What an unreadable config leaves: nothing approved on its own, and
     /// the dialog (which only asks the operator).
     pub fn fail_closed() -> Self {
-        Self { verified_teams: Vec::new(), dialog: true }
+        Self {
+            verified_teams: Vec::new(),
+            dialog: true,
+        }
     }
 }
 
@@ -117,7 +123,11 @@ pub enum Sender {
 
 /// What `signed` (the sender's signature, or why it has none) means under
 /// `policy` and the `remembered` apps.
-pub fn judge(signed: Result<SignedApp, String>, policy: &PairingPolicy, remembered: &[RememberedApp]) -> Sender {
+pub fn judge(
+    signed: Result<SignedApp, String>,
+    policy: &PairingPolicy,
+    remembered: &[RememberedApp],
+) -> Sender {
     let app = match signed {
         Ok(app) => app,
         Err(why) => return Sender::Unverified(why),
@@ -125,7 +135,10 @@ pub fn judge(signed: Result<SignedApp, String>, policy: &PairingPolicy, remember
     if policy.verified_teams.contains(&app.team) && MUX_BOT_BUNDLES.contains(&app.bundle.as_str()) {
         return Sender::Trusted(app, TrustedBy::VerifiedTeam);
     }
-    if remembered.iter().any(|r| r.team == app.team && r.bundle == app.bundle) {
+    if remembered
+        .iter()
+        .any(|r| r.team == app.team && r.bundle == app.bundle)
+    {
         return Sender::Trusted(app, TrustedBy::Remembered);
     }
     Sender::Signed(app)
@@ -147,7 +160,10 @@ pub fn dialog_message(code: &str, signed: Option<&SignedApp>) -> String {
         ),
         None => "Not signed by a known developer.".to_string(),
     };
-    format!("An app wants to use darkmux on this computer. Code {}.\n\n{who}", safe(code))
+    format!(
+        "An app wants to use darkmux on this computer. Code {}.\n\n{who}",
+        safe(code)
+    )
 }
 
 /// The notice once a trusted app is paired.
@@ -202,12 +218,31 @@ pub async fn sender_of(state: &ClientServerState, holders: &[u32]) -> (Sender, P
     let policy = (state.pairing_policy)().unwrap_or_else(|_| PairingPolicy::fail_closed());
     let pid = match holders {
         [pid] => *pid,
-        [] => return (Sender::Unverified("darkmux could not tell which process sent it".to_string()), policy),
-        many => return (Sender::Unverified(format!("its connection is held by {} processes ({many:?})", many.len())), policy),
+        [] => {
+            return (
+                Sender::Unverified("darkmux could not tell which process sent it".to_string()),
+                policy,
+            )
+        }
+        many => {
+            return (
+                Sender::Unverified(format!(
+                    "its connection is held by {} processes ({many:?})",
+                    many.len()
+                )),
+                policy,
+            )
+        }
     };
-    let remembered = state.store.read().map(|f| f.remembered_apps).unwrap_or_default();
+    let remembered = state
+        .store
+        .read()
+        .map(|f| f.remembered_apps)
+        .unwrap_or_default();
     let check = state.signed_app.clone();
-    let signed = tokio::task::spawn_blocking(move || check(pid)).await.unwrap_or_else(|e| Err(e.to_string()));
+    let signed = tokio::task::spawn_blocking(move || check(pid))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
     (judge(signed, &policy, &remembered), policy)
 }
 
@@ -225,12 +260,16 @@ pub async fn decide(
     let sender = match sender {
         Sender::Trusted(app, by) => match still_the_same_app(state, peer, from, &app).await {
             Ok(()) => return vec![approve_trusted(state, request_id, &app, by)],
-            Err(why) => Sender::Unverified(format!("{app} did not check out again before approval: {why}")),
+            Err(why) => Sender::Unverified(format!(
+                "{app} did not check out again before approval: {why}"
+            )),
         },
         other => other,
     };
     match policy.dialog {
-        true => offer_dialog(state, request_id, code, from, sender).into_iter().collect(),
+        true => offer_dialog(state, request_id, code, from, sender)
+            .into_iter()
+            .collect(),
         false => Vec::new(),
     }
 }
@@ -238,14 +277,23 @@ pub async fn decide(
 /// The re-check immediately before an approval with no operator step: the
 /// connection is still held by process `from` and no other, and that
 /// process still verifies as `app`.
-async fn still_the_same_app(state: &ClientServerState, peer: Option<SocketAddr>, from: Option<u32>, app: &SignedApp) -> Result<(), String> {
+async fn still_the_same_app(
+    state: &ClientServerState,
+    peer: Option<SocketAddr>,
+    from: Option<u32>,
+    app: &SignedApp,
+) -> Result<(), String> {
     let pid = from.ok_or("no process")?;
     let now_held = peer_holders_of(state, peer.map(axum::extract::ConnectInfo)).await;
     if now_held != [pid] {
-        return Err(format!("its connection is now held by {now_held:?}, not pid {pid} alone"));
+        return Err(format!(
+            "its connection is now held by {now_held:?}, not pid {pid} alone"
+        ));
     }
     let check = state.signed_app.clone();
-    let again = tokio::task::spawn_blocking(move || check(pid)).await.map_err(|e| e.to_string())??;
+    let again = tokio::task::spawn_blocking(move || check(pid))
+        .await
+        .map_err(|e| e.to_string())??;
     match &again == app {
         true => Ok(()),
         false => Err(format!("pid {pid} is now {again}")),
@@ -254,12 +302,20 @@ async fn still_the_same_app(state: &ClientServerState, peer: Option<SocketAddr>,
 
 /// Approves a trusted sender's request through the one approval path, with
 /// the notice. The serve-log line.
-fn approve_trusted(state: &ClientServerState, request_id: &str, app: &SignedApp, by: TrustedBy) -> String {
+fn approve_trusted(
+    state: &ClientServerState,
+    request_id: &str,
+    app: &SignedApp,
+    by: TrustedBy,
+) -> String {
     let how = Approval::Verified(SigningIdentity::from(app));
     match approve_as(&state.store, request_id, (state.now)(), &how) {
         Ok(name) => {
             (state.notify)(&paired_notice(app, by));
-            format!("darkmux client serve: paired {name} with no dialog: signed by {app} ({})", app.signer)
+            format!(
+                "darkmux client serve: paired {name} with no dialog: signed by {app} ({})",
+                app.signer
+            )
         }
         Err(e) => format!("darkmux client serve: could not approve {request_id} for {app}: {e:#}"),
     }
@@ -267,7 +323,13 @@ fn approve_trusted(state: &ClientServerState, request_id: &str, app: &SignedApp,
 
 /// Raises the dialog for a request on a thread of its own, when a slot is
 /// free; a line for the serve log when none is.
-fn offer_dialog(state: &ClientServerState, request_id: &str, code: &str, from: Option<u32>, sender: Sender) -> Option<String> {
+fn offer_dialog(
+    state: &ClientServerState,
+    request_id: &str,
+    code: &str,
+    from: Option<u32>,
+    sender: Sender,
+) -> Option<String> {
     let Some(slot) = state.dialogs.take(from) else {
         return Some(format!(
             "darkmux client serve: no dialog for pairing request {request_id}: its process has dialogs open already; \
@@ -287,7 +349,10 @@ fn offer_dialog(state: &ClientServerState, request_id: &str, code: &str, from: O
         let _slot = slot;
         let answer = (st.ask_allow)(&message, icon.as_deref(), DIALOG_TIMEOUT_SECS);
         let remember = remember.as_ref().map(SigningIdentity::from);
-        eprintln!("{}", act_on_answer(&st.store, &id, (st.now)(), answer, remember));
+        eprintln!(
+            "{}",
+            act_on_answer(&st.store, &id, (st.now)(), answer, remember)
+        );
     });
     None
 }
@@ -307,13 +372,35 @@ fn remembered_said(app: Option<&SigningIdentity>) -> String {
 /// Carries out the dialog's answer for request `request_id`: Allow
 /// approves (remembering `remember`), Don't Allow denies through the deny
 /// path, and no answer leaves it pending. The serve-log line.
-pub fn act_on_answer(store: &ClientStore, request_id: &str, now: u64, answer: AllowAnswer, remember: Option<SigningIdentity>) -> String {
+pub fn act_on_answer(
+    store: &ClientStore,
+    request_id: &str,
+    now: u64,
+    answer: AllowAnswer,
+    remember: Option<SigningIdentity>,
+) -> String {
     let said = match answer {
-        AllowAnswer::Allow => approve_as(store, request_id, now, &Approval::Dialog { remember: remember.clone() })
-            .map(|name| format!("approved as {name} in the dialog{}", remembered_said(remember.as_ref()))),
-        AllowAnswer::DontAllow => deny(store, request_id, now).map(|()| "denied in the dialog".to_string()),
+        AllowAnswer::Allow => approve_as(
+            store,
+            request_id,
+            now,
+            &Approval::Dialog {
+                remember: remember.clone(),
+            },
+        )
+        .map(|name| {
+            format!(
+                "approved as {name} in the dialog{}",
+                remembered_said(remember.as_ref())
+            )
+        }),
+        AllowAnswer::DontAllow => {
+            deny(store, request_id, now).map(|()| "denied in the dialog".to_string())
+        }
         AllowAnswer::NoAnswer => Ok("no answer in the dialog; left pending".to_string()),
-        AllowAnswer::NoDialog(why) => Ok(format!("no dialog ({why}); left pending for `darkmux client approve`")),
+        AllowAnswer::NoDialog(why) => Ok(format!(
+            "no dialog ({why}); left pending for `darkmux client approve`"
+        )),
     };
     match said {
         Ok(s) => format!("darkmux client serve: pairing request {request_id}: {s}"),

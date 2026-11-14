@@ -238,18 +238,27 @@ pub(crate) fn live_events(
     redaction: Option<std::sync::Arc<crate::redaction::Redaction>>,
 ) -> futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> {
     let rx = hub().subscribe();
-    Box::pin(futures::stream::unfold((rx, redaction), |(mut rx, redaction)| async move {
-        loop {
-            match rx.recv().await {
-                Ok(s) => {
-                    let data = crate::redaction::Redaction::for_reader(redaction.as_deref(), s.to_string());
-                    return Some((Ok(Event::default().event("live").data(data)), (rx, redaction)));
+    Box::pin(futures::stream::unfold(
+        (rx, redaction),
+        |(mut rx, redaction)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(s) => {
+                        let data = crate::redaction::Redaction::for_reader(
+                            redaction.as_deref(),
+                            s.to_string(),
+                        );
+                        return Some((
+                            Ok(Event::default().event("live").data(data)),
+                            (rx, redaction),
+                        ));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return None,
             }
-        }
-    }))
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -291,7 +300,12 @@ mod tests {
         let m = std::fs::symlink_metadata(&f).unwrap();
         assert_eq!(
             FileId::of(&m),
-            FileId { dev: m.dev(), ino: m.ino(), ctime: m.ctime(), ctime_nsec: m.ctime_nsec() }
+            FileId {
+                dev: m.dev(),
+                ino: m.ino(),
+                ctime: m.ctime(),
+                ctime_nsec: m.ctime_nsec()
+            }
         );
     }
 }

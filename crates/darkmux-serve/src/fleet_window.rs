@@ -592,7 +592,14 @@ pub(crate) fn read_fleet_cached(
         .windows
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .install(hub, result, (work, telemetry), scope, now, now + attempt.elapsed());
+        .install(
+            hub,
+            result,
+            (work, telemetry),
+            scope,
+            now,
+            now + attempt.elapsed(),
+        );
     drop(settle);
     read
 }
@@ -1128,7 +1135,10 @@ mod tests {
         let caches = seeded_past_ttl("redis://127.0.0.1:1", t0);
         let read = read_fleet_cached(&caches, FleetScope::Work, t0, || None);
         assert_eq!(read.state, SourceState::Off);
-        assert!(read.records.is_empty(), "a hub's window was served with no URL set");
+        assert!(
+            read.records.is_empty(),
+            "a hub's window was served with no URL set"
+        );
     }
 
     /// Another hub's fresh window, or its recent failure, is never served:
@@ -1161,12 +1171,18 @@ mod tests {
     #[test]
     fn a_refresh_of_a_hub_no_longer_held_is_dropped() {
         let t0 = SystemTime::now();
-        let caches = seeded_past_ttl("redis://127.0.0.1:2", t0 - std::time::Duration::from_secs(10));
+        let caches = seeded_past_ttl(
+            "redis://127.0.0.1:2",
+            t0 - std::time::Duration::from_secs(10),
+        );
         let mut windows = caches.windows.lock().unwrap();
         windows.refreshing = true;
         let other = StreamWindow {
             at: Some(t0),
-            records: Arc::new(vec![rec("5-0", "dispatch.tool"), rec("6-0", "dispatch.tool")]),
+            records: Arc::new(vec![
+                rec("5-0", "dispatch.tool"),
+                rec("6-0", "dispatch.tool"),
+            ]),
             ..StreamWindow::default()
         };
         let read = windows.install(
@@ -1178,7 +1194,11 @@ mod tests {
             t0,
         );
         assert!(!windows.refreshing);
-        assert_eq!(windows.work.records.len(), 1, "the other hub's refresh was installed");
+        assert_eq!(
+            windows.work.records.len(),
+            1,
+            "the other hub's refresh was installed"
+        );
         assert!(
             matches!(read.state, SourceState::Stale { .. }),
             "{:?}",
@@ -1575,9 +1595,20 @@ mod tests {
                 "machine_id": "studio", "machine_uid": "uid-studio", "payload": payload })
             .to_string()
         };
-        let opener = beat("2026-10-18T01:00:00Z", json!({ "turn_seq": 1, "cumulative_chars": 0, "generated_chars": 0, "prompt_chars": 90_000 }));
-        let report = beat("2026-10-18T01:00:09Z", json!({ "turn_seq": 1, "cumulative_chars": 0, "generated_chars": 0, "prompt_processed": 1024, "prompt_total": 20_480 }));
-        let progress = |r: &Value| (r["payload"]["prompt_processed"].as_u64(), r["payload"]["prompt_total"].as_u64());
+        let opener = beat(
+            "2026-10-18T01:00:00Z",
+            json!({ "turn_seq": 1, "cumulative_chars": 0, "generated_chars": 0, "prompt_chars": 90_000 }),
+        );
+        let report = beat(
+            "2026-10-18T01:00:09Z",
+            json!({ "turn_seq": 1, "cumulative_chars": 0, "generated_chars": 0, "prompt_processed": 1024, "prompt_total": 20_480 }),
+        );
+        let progress = |r: &Value| {
+            (
+                r["payload"]["prompt_processed"].as_u64(),
+                r["payload"]["prompt_total"].as_u64(),
+            )
+        };
 
         // The live tail (`/flow/:date/stream`): only the date filters an entry.
         assert!(crate::record_ts_matches_date(&report, "2026-10-18"));
@@ -1586,11 +1617,16 @@ mod tests {
         let entry = |id: &str, text: &str| {
             redis::Value::Array(vec![
                 redis::Value::BulkString(id.as_bytes().to_vec()),
-                redis::Value::Array(vec![redis::Value::BulkString(b"record".to_vec()), redis::Value::BulkString(text.as_bytes().to_vec())]),
+                redis::Value::Array(vec![
+                    redis::Value::BulkString(b"record".to_vec()),
+                    redis::Value::BulkString(text.as_bytes().to_vec()),
+                ]),
             ])
         };
         let raw = redis::Value::Array(vec![entry("2-0", &report), entry("1-0", &opener)]);
-        let hub = crate::records_from_xrevrange(raw, Some("2026-10-18"), 0).unwrap().records;
+        let hub = crate::records_from_xrevrange(raw, Some("2026-10-18"), 0)
+            .unwrap()
+            .records;
         assert_eq!(hub.len(), 2);
         assert_eq!(hub[0]["payload"]["prompt_chars"], 90_000);
         assert_eq!(progress(&hub[1]), (Some(1024), Some(20_480)));
@@ -1598,7 +1634,11 @@ mod tests {
         // writer's own copy (no hub id) is the same record as the hub's.
         let own = darkmux_flow::reader::parse_value(&report).unwrap();
         let union = crate::union_flow_records(hub.clone(), vec![own]);
-        assert_eq!(union.len(), 2, "the local copy of a hub record is one record: {union:?}");
+        assert_eq!(
+            union.len(),
+            2,
+            "the local copy of a hub record is one record: {union:?}"
+        );
         assert_eq!(progress(&union[1]), (Some(1024), Some(20_480)));
 
         // A replay route: the window drops a heartbeat's payload, the route
@@ -1607,10 +1647,14 @@ mod tests {
             Arc::new(FleetRecord::from_entry("1-0", &opener).unwrap()),
             Arc::new(FleetRecord::from_entry("2-0", &report).unwrap()),
         ]));
-        assert!(window.iter().all(|r| r.value().get("payload").is_none()), "the window holds heartbeats compact");
+        assert!(
+            window.iter().all(|r| r.value().get("payload").is_none()),
+            "the window holds heartbeats compact"
+        );
         let empty_archive = tempfile::TempDir::new().unwrap();
         for (field, id) in [("session_id", "s-peer"), ("mission_id", "m-peer")] {
-            let (served, _, _) = crate::collect_records_by_field(empty_archive.path(), &window, field, id);
+            let (served, _, _) =
+                crate::collect_records_by_field(empty_archive.path(), &window, field, id);
             assert_eq!(served.len(), 2, "{field}");
             assert_eq!(served[0]["payload"]["prompt_chars"], 90_000, "{field}");
             assert_eq!(progress(&served[1]), (Some(1024), Some(20_480)), "{field}");

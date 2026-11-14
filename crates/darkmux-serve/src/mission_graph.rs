@@ -270,7 +270,8 @@ pub fn abandoned_reason_of<'a>(
     abandoned: bool,
     steps: impl IntoIterator<Item = &'a Step>,
 ) -> Option<crate::runs::AbandonReason> {
-    (abandoned && steps.into_iter().any(Step::stopped_by_operator)).then_some(crate::runs::AbandonReason::Aborted)
+    (abandoned && steps.into_iter().any(Step::stopped_by_operator))
+        .then_some(crate::runs::AbandonReason::Aborted)
 }
 
 impl GraphNode {
@@ -292,7 +293,10 @@ fn shown_word<T: Serialize>(status: &T, reason: Option<crate::runs::AbandonReaso
     if reason == Some(crate::runs::AbandonReason::Aborted) {
         return "aborted".to_string();
     }
-    serde_json::to_value(status).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 /// One edge in the rendered graph. Same `camelCase` wire contract as
@@ -414,8 +418,7 @@ pub enum TaskDisplayStatus {
     Abandoned,
 }
 
-impl TaskDisplayStatus {
-}
+impl TaskDisplayStatus {}
 
 /// Derive a Task's DISPLAY status from its Steps' statuses — `Task`
 /// carries no `status` field of its own (#1230/#1341: only `Step` is
@@ -468,7 +471,10 @@ fn derive_task_status(steps: &[(NodeStatus, Option<u64>)]) -> TaskDisplayStatus 
     if steps.iter().any(|(s, _)| *s == NodeStatus::Error) {
         return TaskDisplayStatus::Error;
     }
-    if steps.iter().any(|(s, started)| *s == NodeStatus::Running && started.is_some()) {
+    if steps
+        .iter()
+        .any(|(s, started)| *s == NodeStatus::Running && started.is_some())
+    {
         return TaskDisplayStatus::Running;
     }
     if !steps.is_empty() && steps.iter().all(|(s, _)| *s == NodeStatus::Complete) {
@@ -477,10 +483,9 @@ fn derive_task_status(steps: &[(NodeStatus, Option<u64>)]) -> TaskDisplayStatus 
     if steps.iter().any(|(s, _)| *s == NodeStatus::Abandoned) {
         return TaskDisplayStatus::Abandoned;
     }
-    if steps
-        .iter()
-        .any(|(s, started)| *s == NodeStatus::Complete || (*s == NodeStatus::Running && started.is_none()))
-    {
+    if steps.iter().any(|(s, started)| {
+        *s == NodeStatus::Complete || (*s == NodeStatus::Running && started.is_none())
+    }) {
         return TaskDisplayStatus::Waiting;
     }
     TaskDisplayStatus::Planned
@@ -641,7 +646,8 @@ impl PhaseTaskCounts {
 fn phase_task_rollup(task_statuses: &[TaskDisplayStatus]) -> (PhaseDisplayStatus, PhaseTaskCounts) {
     let counts = PhaseTaskCounts::from_task_statuses(task_statuses);
     let live_running = counts.running > 0;
-    let live_waiting = !live_running && (counts.waiting > 0 || (counts.planned > 0 && counts.any_terminal()));
+    let live_waiting =
+        !live_running && (counts.waiting > 0 || (counts.planned > 0 && counts.any_terminal()));
     let status = if live_running {
         PhaseDisplayStatus::Running
     } else if live_waiting {
@@ -692,7 +698,11 @@ fn phase_status_note(status: PhaseDisplayStatus, counts: &PhaseTaskCounts) -> Op
     if counts.planned > 0 {
         parts.push(format!("{} planned", counts.planned));
     }
-    if parts.is_empty() { None } else { Some(parts.join(" · ")) }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
 }
 
 /// Whether the task rollup beats the persisted phase status. The ordinary
@@ -707,7 +717,9 @@ fn derived_overrides_persisted(derived: PhaseDisplayStatus, persisted: PhaseDisp
     let complete_hides = persisted == PhaseDisplayStatus::Complete
         && matches!(
             derived,
-            PhaseDisplayStatus::Degraded | PhaseDisplayStatus::Error | PhaseDisplayStatus::Abandoned
+            PhaseDisplayStatus::Degraded
+                | PhaseDisplayStatus::Error
+                | PhaseDisplayStatus::Abandoned
         );
     let running_hides =
         derived == PhaseDisplayStatus::Waiting && persisted == PhaseDisplayStatus::Running;
@@ -787,7 +799,11 @@ fn phase_display_status(
 ) -> (PhaseDisplayStatus, PhaseTaskCounts) {
     let (derived, counts) = phase_task_rollup(task_statuses);
     let persisted_status = PhaseDisplayStatus::from_node_status(phase_status_to_node(persisted));
-    let winner = if derived_overrides_persisted(derived, persisted_status) { derived } else { persisted_status };
+    let winner = if derived_overrides_persisted(derived, persisted_status) {
+        derived
+    } else {
+        persisted_status
+    };
     (winner, counts)
 }
 
@@ -961,9 +977,15 @@ fn step_kind_display_name(kind: &str) -> Option<&'static str> {
 /// completeness).
 pub fn resolve_step_label(kind: &str, step_id: &str) -> String {
     if kind.is_empty() {
-        return if step_id.is_empty() { "unknown".to_string() } else { step_id.to_string() };
+        return if step_id.is_empty() {
+            "unknown".to_string()
+        } else {
+            step_id.to_string()
+        };
     }
-    step_kind_display_name(kind).map(str::to_string).unwrap_or_else(|| kind.to_string())
+    step_kind_display_name(kind)
+        .map(str::to_string)
+        .unwrap_or_else(|| kind.to_string())
 }
 
 // ─── config-snapshot kind recovery for synthesized steps (#1402) ───────
@@ -988,8 +1010,14 @@ pub fn resolve_step_label(kind: &str, step_id: &str) -> String {
 /// expansion primitive was retired (see `darkmux_crew::mission_config`'s
 /// `MISSION_CONFIG_SCHEMA` doc, schema 2.0); every task's real id is now
 /// recoverable exactly via the placeholder-prefix substitution alone.
-fn kind_from_config_snapshot(mission_id: &str, real_task_id: &str, real_step_id: &str) -> Option<String> {
-    let config = darkmux_crew::lifecycle::load_config_snapshot(mission_id).ok().flatten()?;
+fn kind_from_config_snapshot(
+    mission_id: &str,
+    real_task_id: &str,
+    real_step_id: &str,
+) -> Option<String> {
+    let config = darkmux_crew::lifecycle::load_config_snapshot(mission_id)
+        .ok()
+        .flatten()?;
     for phase in &config.phases {
         // Mirrors `mission_launch::ensure_mission_and_phases_with_provenance`'s
         // deterministic composition rule (`format!("{mission_id}-{}", p.id)`)
@@ -997,7 +1025,8 @@ fn kind_from_config_snapshot(mission_id: &str, real_task_id: &str, real_step_id:
         // convention, so it's derivable here with no launch-time state.
         let real_phase_id = format!("{mission_id}-{}", phase.id);
         for task_cfg in &phase.tasks {
-            let candidate_task_id = substitute_id_placeholder_prefix(&task_cfg.id, &phase.id, &real_phase_id);
+            let candidate_task_id =
+                substitute_id_placeholder_prefix(&task_cfg.id, &phase.id, &real_phase_id);
             if candidate_task_id != real_task_id {
                 continue;
             }
@@ -1118,9 +1147,15 @@ pub fn stamp_session_steps(records: &mut [serde_json::Value], mission_id: &str) 
         if rec.pointer("/payload/step_id").is_some() {
             continue;
         }
-        let Some(step) = session_step(rec, mission_id) else { continue };
-        let Some(obj) = rec.as_object_mut() else { continue };
-        let payload = obj.entry("payload").or_insert_with(|| serde_json::json!({}));
+        let Some(step) = session_step(rec, mission_id) else {
+            continue;
+        };
+        let Some(obj) = rec.as_object_mut() else {
+            continue;
+        };
+        let payload = obj
+            .entry("payload")
+            .or_insert_with(|| serde_json::json!({}));
         if payload.is_null() {
             *payload = serde_json::json!({});
         }
@@ -1166,8 +1201,9 @@ where
             continue;
         }
         // One execution's terminal (an attempt, a map item): its own turns.
-        if let Some(darkmux_flow::Payload::DispatchComplete(p) | darkmux_flow::Payload::DispatchError(p)) =
-            darkmux_flow::reader::payload_of(&rec)
+        if let Some(
+            darkmux_flow::Payload::DispatchComplete(p) | darkmux_flow::Payload::DispatchError(p),
+        ) = darkmux_flow::reader::payload_of(&rec)
         {
             let entry = acc.entry(sid.to_string()).or_default();
             if let Some(n) = p.total_turns {
@@ -1178,7 +1214,14 @@ where
     acc.into_iter()
         .map(|(sid, a)| {
             let utility = (a.reported && a.utility > 0).then_some(a.utility);
-            (sid, StepFinals { tokens: a.reported.then_some(a.tokens), utility, turns: a.turns })
+            (
+                sid,
+                StepFinals {
+                    tokens: a.reported.then_some(a.tokens),
+                    utility,
+                    turns: a.turns,
+                },
+            )
         })
         .collect()
 }
@@ -1213,11 +1256,18 @@ struct FinalsAcc {
 /// of what the fold found (#1488 follow-up: the client already gates its
 /// live SSE fold on `startTs > 0`; this is the same invariant for the
 /// server's finalized total).
-fn gate_finals_by_started(started: bool, fin: Option<&StepFinals>) -> (Option<u64>, Option<u64>, Option<u64>) {
+fn gate_finals_by_started(
+    started: bool,
+    fin: Option<&StepFinals>,
+) -> (Option<u64>, Option<u64>, Option<u64>) {
     if !started {
         return (None, None, None);
     }
-    (fin.and_then(|f| f.tokens), fin.and_then(|f| f.utility), fin.and_then(|f| f.turns))
+    (
+        fin.and_then(|f| f.tokens),
+        fin.and_then(|f| f.utility),
+        fin.and_then(|f| f.turns),
+    )
 }
 
 /// Parse a flow day-file stem (`YYYY-MM-DD`) into days since the epoch.
@@ -1285,7 +1335,13 @@ fn backfill_step_finals(
     mission_id: &str,
     mission_created_ts: u64,
 ) -> BTreeMap<String, StepFinals> {
-    backfill_step_finals_bounded(flows_dir, step_ids, mission_id, mission_created_ts, MAX_BACKFILL_RECORDS)
+    backfill_step_finals_bounded(
+        flows_dir,
+        step_ids,
+        mission_id,
+        mission_created_ts,
+        MAX_BACKFILL_RECORDS,
+    )
 }
 
 /// [`backfill_step_finals`] with the record cap injectable for tests.
@@ -1438,9 +1494,12 @@ pub fn build_mission_graph(
     // (#1432 item 4) Every step id this mission declares, across all phases —
     // the correlation filter for the flow-record backfill below. Read once,
     // bounded to the mission's lifetime window (#1445 gate).
-    let all_step_ids: BTreeSet<String> =
-        all_tasks.iter().flat_map(|t| t.step_ids.iter().cloned()).collect();
-    let step_finals = backfill_step_finals(flows_dir, &all_step_ids, &mission.id, mission.created_ts);
+    let all_step_ids: BTreeSet<String> = all_tasks
+        .iter()
+        .flat_map(|t| t.step_ids.iter().cloned())
+        .collect();
+    let step_finals =
+        backfill_step_finals(flows_dir, &all_step_ids, &mission.id, mission.created_ts);
 
     for (phase_index, phase_id) in mission.phase_ids.iter().enumerate() {
         let Some(phase) = phase_by_id.remove(phase_id) else {
@@ -1488,8 +1547,11 @@ pub fn build_mission_graph(
                 })
                 .collect();
             let status = derive_task_status(&step_signals);
-            let persisted: Vec<&Step> =
-                task.step_ids.iter().filter_map(|sid| steps.get(sid)).collect();
+            let persisted: Vec<&Step> = task
+                .step_ids
+                .iter()
+                .filter_map(|sid| steps.get(sid))
+                .collect();
             let started_ts = persisted.iter().filter_map(|s| s.started_ts).min();
             let completed_ts = if status == TaskDisplayStatus::Complete {
                 persisted.iter().filter_map(|s| s.completed_ts).max()
@@ -1597,7 +1659,10 @@ pub fn build_mission_graph(
                 // (`derive_task_status`, unchanged) — a task genuinely IS
                 // one unit of work, so there is no mix to name here.
                 status_note: None,
-                abandoned_reason: abandoned_reason_of(status == TaskDisplayStatus::Abandoned, persisted.iter().copied()),
+                abandoned_reason: abandoned_reason_of(
+                    status == TaskDisplayStatus::Abandoned,
+                    persisted.iter().copied(),
+                ),
             });
 
             // (#1401) Cross-task dependency edges connect TASK nodes
@@ -1635,7 +1700,9 @@ pub fn build_mission_graph(
         let (phase_display, phase_counts) = phase_display_status(phase.status, &task_statuses);
         let phase_abandoned_reason = abandoned_reason_of(
             phase_display == PhaseDisplayStatus::Abandoned,
-            tasks.iter().flat_map(|t| t.step_ids.iter().filter_map(|sid| steps.get(sid))),
+            tasks
+                .iter()
+                .flat_map(|t| t.step_ids.iter().filter_map(|sid| steps.get(sid))),
         );
         // (#1472, #2406) A phase that now derives Complete OR Degraded
         // should carry a truthful `completed_ts` — the max of its tasks' —
@@ -1647,7 +1714,10 @@ pub fn build_mission_graph(
         // fabricated: left `None` if genuinely unknown (no complete tasks
         // with a timestamp).
         let phase_completed_ts = phase.completed_ts.or_else(|| {
-            if matches!(phase_display, PhaseDisplayStatus::Complete | PhaseDisplayStatus::Degraded) {
+            if matches!(
+                phase_display,
+                PhaseDisplayStatus::Complete | PhaseDisplayStatus::Degraded
+            ) {
                 task_completed_ts.iter().flatten().copied().max()
             } else {
                 None
@@ -1656,7 +1726,10 @@ pub fn build_mission_graph(
 
         nodes.push(GraphNode {
             id: phase.id.clone(),
-            label: phase.display_name.clone().unwrap_or_else(|| phase.id.clone()),
+            label: phase
+                .display_name
+                .clone()
+                .unwrap_or_else(|| phase.id.clone()),
             kind: NodeKind::Phase,
             status: GraphNodeStatus::Phase(phase_display),
             parent_id: None,
@@ -1705,7 +1778,10 @@ pub fn build_mission_graph(
 /// there), bounded and put on one line by the flow payload's own constructor.
 /// `None` for a step that did not error, or errored with no message.
 fn step_error_cause(step: &Step) -> Option<String> {
-    let message = step.output.as_deref().filter(|_| step.status == NodeStatus::Error)?;
+    let message = step
+        .output
+        .as_deref()
+        .filter(|_| step.status == NodeStatus::Error)?;
     let cause = darkmux_flow::payload::StepErrorPayload::from_message(message).cause;
     (!cause.is_empty()).then_some(cause)
 }
@@ -1747,7 +1823,10 @@ mod tests {
         });
         for (k, v) in extra.as_object().unwrap() {
             if k == "payload" {
-                rec["payload"].as_object_mut().unwrap().extend(v.as_object().unwrap().clone());
+                rec["payload"]
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(v.as_object().unwrap().clone());
             } else {
                 rec[k.as_str()] = v.clone();
             }
@@ -1759,7 +1838,10 @@ mod tests {
     fn fold_finals_usage_record_folds_the_steps_tokens_and_a_terminals_total_is_never_read() {
         let step_ids = ids(&["example-judge-step"]);
         let recs = vec![
-            usage_rec(4200, serde_json::json!({ "payload": { "step_id": "example-judge-step" } })),
+            usage_rec(
+                4200,
+                serde_json::json!({ "payload": { "step_id": "example-judge-step" } }),
+            ),
             // Neither a `step result` nor a terminal states tokens that count.
             serde_json::json!({ "action": "step.result",
                                 "payload": { "kind": "k", "step_id": "example-judge-step", "total_tokens": 99 } }),
@@ -1778,10 +1860,17 @@ mod tests {
         let step_ids = ids(&["s1"]);
         let recs = vec![
             usage_rec(100, serde_json::json!({ "payload": { "step_id": "s1" } })),
-            usage_rec(30, serde_json::json!({ "payload": { "step_id": "s1", "call_kind": "compaction", "purpose": "utility" } })),
+            usage_rec(
+                30,
+                serde_json::json!({ "payload": { "step_id": "s1", "call_kind": "compaction", "purpose": "utility" } }),
+            ),
         ];
         let out = fold_step_finals(recs, &step_ids, "m-this");
-        assert_eq!((out["s1"].tokens, out["s1"].utility), (Some(130), Some(30)), "{out:?}");
+        assert_eq!(
+            (out["s1"].tokens, out["s1"].utility),
+            (Some(130), Some(30)),
+            "{out:?}"
+        );
     }
 
     /// A usage record that reported no count leaves the step unmeasured.
@@ -1824,7 +1913,10 @@ mod tests {
     fn fold_finals_step_timing_record_does_not_disturb_a_sibling_step_result_record() {
         let step_ids = ids(&["s1"]);
         let recs = vec![
-            usage_rec(4200, serde_json::json!({ "mission_id": "m-this", "payload": { "step_id": "s1" } })),
+            usage_rec(
+                4200,
+                serde_json::json!({ "mission_id": "m-this", "payload": { "step_id": "s1" } }),
+            ),
             serde_json::json!({
                 "action": "step.timing",
                 "mission_id": "m-this",
@@ -1880,10 +1972,16 @@ mod tests {
         let recs = vec![
             serde_json::json!({ "action": "dispatch.error", "handle": "s1", "mission_id": "m-this",
                                 "payload": { "total_turns": 2 } }),
-            usage_rec(100, serde_json::json!({ "handle": "s1", "mission_id": "m-this" })),
+            usage_rec(
+                100,
+                serde_json::json!({ "handle": "s1", "mission_id": "m-this" }),
+            ),
             serde_json::json!({ "action": "dispatch.complete", "handle": "s1", "mission_id": "m-this",
                                 "payload": { "total_turns": 3 } }),
-            usage_rec(150, serde_json::json!({ "handle": "s1", "mission_id": "m-this" })),
+            usage_rec(
+                150,
+                serde_json::json!({ "handle": "s1", "mission_id": "m-this" }),
+            ),
         ];
         let out = fold_step_finals(recs, &step_ids, "m-this");
         assert_eq!(out["s1"].turns, Some(5), "{out:?}");
@@ -1927,11 +2025,15 @@ mod tests {
                 "mission_id": "m-other",
                 "payload": { "kind": "k", "total_tokens": 4200 }
             });
-            rec.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            rec.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
             rec
         };
         let recs = vec![
-            foreign(serde_json::json!({ "payload": { "kind": "k", "step_id": "example-judge-step", "total_tokens": 4200 } })),
+            foreign(
+                serde_json::json!({ "payload": { "kind": "k", "step_id": "example-judge-step", "total_tokens": 4200 } }),
+            ),
             foreign(serde_json::json!({ "session_id": "step-example-judge-step" })),
             foreign(serde_json::json!({ "handle": "example-judge-step" })),
         ];
@@ -1950,12 +2052,19 @@ mod tests {
         // history must keep rendering).
         let step_ids = ids(&["s1", "s2"]);
         let recs = vec![
-            usage_rec(100, serde_json::json!({ "mission_id": "m-this", "payload": { "step_id": "s1" } })),
+            usage_rec(
+                100,
+                serde_json::json!({ "mission_id": "m-this", "payload": { "step_id": "s1" } }),
+            ),
             usage_rec(200, serde_json::json!({ "payload": { "step_id": "s2" } })),
         ];
         let out = fold_step_finals(recs, &step_ids, "m-this");
         assert_eq!(out["s1"].tokens, Some(100), "own-stamped record must fold");
-        assert_eq!(out["s2"].tokens, Some(200), "legacy unstamped record must fold");
+        assert_eq!(
+            out["s2"].tokens,
+            Some(200),
+            "legacy unstamped record must fold"
+        );
     }
 
     #[test]
@@ -1986,16 +2095,24 @@ mod tests {
             "s1",
         )
         .wire();
-        let recs = |session: &str| vec![
-            serde_json::json!({ "action": "dispatch.complete", "session_id": session, "mission_id": mission,
+        let recs = |session: &str| {
+            vec![
+                serde_json::json!({ "action": "dispatch.complete", "session_id": session, "mission_id": mission,
                                 "payload": { "total_turns": 9 } }),
-            usage_rec(15200, serde_json::json!({ "session_id": session, "mission_id": mission })),
-        ];
+                usage_rec(
+                    15200,
+                    serde_json::json!({ "session_id": session, "mission_id": mission }),
+                ),
+            ]
+        };
         let out = fold_step_finals(recs(&current), &step_ids, mission);
         assert_eq!(out["s1"].tokens, Some(15200));
         assert_eq!(out["s1"].turns, Some(9));
         let old = fold_step_finals(recs("step-s1-twin-mission-1757-abc123"), &step_ids, mission);
-        assert!(old.get("s1").is_none_or(|f| f.tokens.is_none()), "a pre-5.0 step session names no step");
+        assert!(
+            old.get("s1").is_none_or(|f| f.tokens.is_none()),
+            "a pre-5.0 step session names no step"
+        );
     }
 
     /// (#1918 QA) The peel must not become a NEW cross-mission leak: a
@@ -2018,15 +2135,34 @@ mod tests {
             serde_json::json!({ "session_id": "step-s1", "mission_id": "m1", "payload": "not an object" }),
         ];
         stamp_session_steps(&mut recs, "m1");
-        let step = |i: usize| recs[i].pointer("/payload/step_id").and_then(|v| v.as_str()).map(str::to_string);
+        let step = |i: usize| {
+            recs[i]
+                .pointer("/payload/step_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
         assert_eq!(step(0), None, "a pre-5.0 step session names no step");
         assert_eq!(step(1), None, "nor does its run-scoped spelling");
         assert_eq!(step(2).as_deref(), Some("s1"));
-        assert_eq!(recs[2]["payload"]["total_tokens"], 3, "the rest of the payload is kept");
-        assert_eq!(step(3).as_deref(), Some("kept"), "a producer's own step_id is never replaced");
-        assert_eq!(step(4), None, "another run's step session names no step of this mission");
+        assert_eq!(
+            recs[2]["payload"]["total_tokens"], 3,
+            "the rest of the payload is kept"
+        );
+        assert_eq!(
+            step(3).as_deref(),
+            Some("kept"),
+            "a producer's own step_id is never replaced"
+        );
+        assert_eq!(
+            step(4),
+            None,
+            "another run's step session names no step of this mission"
+        );
         assert_eq!(step(5), None, "a task session names no step");
-        assert_eq!(recs[6]["payload"], "not an object", "a payload that is not an object is left alone");
+        assert_eq!(
+            recs[6]["payload"], "not an object",
+            "a payload that is not an object is left alone"
+        );
     }
 
     #[test]
@@ -2058,7 +2194,10 @@ mod tests {
             }),
         ];
         let out = fold_step_finals(recs, &step_ids, "m-this");
-        assert!(!out.contains_key("s1"), "no foreign totals may reach s1, got {out:#?}");
+        assert!(
+            !out.contains_key("s1"),
+            "no foreign totals may reach s1, got {out:#?}"
+        );
     }
 
     #[test]
@@ -2073,14 +2212,21 @@ mod tests {
             usage_rec(900, serde_json::json!({ "handle": "s1" })),
         ];
         let out = fold_step_finals(recs, &step_ids, "m-this");
-        assert_eq!(out["s1"].tokens, Some(1000), "100 + 900: one term per usage record");
+        assert_eq!(
+            out["s1"].tokens,
+            Some(1000),
+            "100 + 900: one term per usage record"
+        );
         assert_eq!(out["s1"].turns, Some(7), "2 + 5: one term per execution");
     }
 
     #[test]
     fn fold_finals_an_endpoint_bearing_usage_record_folds_its_total() {
         let step_ids = ids(&["s1"]);
-        let rec = usage_rec(50, serde_json::json!({ "payload": { "step_id": "s1", "endpoint": "https://api.example/v1" } }));
+        let rec = usage_rec(
+            50,
+            serde_json::json!({ "payload": { "step_id": "s1", "endpoint": "https://api.example/v1" } }),
+        );
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
         assert_eq!(out["s1"].tokens, Some(50));
     }
@@ -2096,7 +2242,10 @@ mod tests {
             serde_json::json!({ "action": "dispatch.turn", "handle": "mine" }),
         ];
         let out = fold_step_finals(recs, &step_ids, "m-this");
-        assert!(!out.contains_key("mine"), "no usage record -> no entry (honest absent)");
+        assert!(
+            !out.contains_key("mine"),
+            "no usage record -> no entry (honest absent)"
+        );
         assert!(!out.contains_key("someone-else"));
     }
 
@@ -2124,7 +2273,10 @@ mod tests {
             "payload": { "total_tokens": 500, "total_turns": 3 }
         });
         let out = fold_step_finals(vec![rec], &step_ids, "m-this");
-        assert!(!out.contains_key("s1"), "colon-era session id must not correlate");
+        assert!(
+            !out.contains_key("s1"),
+            "colon-era session id must not correlate"
+        );
     }
 
     // ─── (#1488 follow-up) planned steps show no phantom tokens ─────────
@@ -2149,19 +2301,34 @@ mod tests {
         // Simulates the confirmed collision: `fold_step_finals` found a
         // real sibling/earlier mission's finalized total under this step's
         // literal id, but the step itself never started.
-        let collided = StepFinals { tokens: Some(46_832), utility: Some(10), turns: Some(12) };
+        let collided = StepFinals {
+            tokens: Some(46_832),
+            utility: Some(10),
+            turns: Some(12),
+        };
         let (tokens, utility, turns) = gate_finals_by_started(false, Some(&collided));
         assert_eq!(utility, None);
-        assert_eq!(tokens, None, "a not-started step must never show a collided total");
+        assert_eq!(
+            tokens, None,
+            "a not-started step must never show a collided total"
+        );
         assert_eq!(turns, None);
     }
 
     #[test]
     fn gate_finals_by_started_keeps_a_started_steps_real_total() {
-        let real = StepFinals { tokens: Some(133_785), utility: Some(785), turns: Some(9) };
+        let real = StepFinals {
+            tokens: Some(133_785),
+            utility: Some(785),
+            turns: Some(9),
+        };
         let (tokens, utility, turns) = gate_finals_by_started(true, Some(&real));
         assert_eq!(utility, Some(785));
-        assert_eq!(tokens, Some(133_785), "a genuinely started step keeps its real total");
+        assert_eq!(
+            tokens,
+            Some(133_785),
+            "a genuinely started step keeps its real total"
+        );
         assert_eq!(turns, Some(9));
     }
 
@@ -2177,8 +2344,10 @@ mod tests {
     // ─── (#1445 gate must-fix) bounded backfill scan ────────────────────
 
     fn write_day_file(dir: &std::path::Path, stem: &str, lines: &[serde_json::Value]) {
-        let body: String =
-            lines.iter().map(|v| format!("{}\n", serde_json::to_string(v).unwrap())).collect();
+        let body: String = lines
+            .iter()
+            .map(|v| format!("{}\n", serde_json::to_string(v).unwrap()))
+            .collect();
         std::fs::write(dir.join(format!("{stem}.jsonl")), body).unwrap();
     }
 
@@ -2215,13 +2384,25 @@ mod tests {
         write_day_file(
             tmp.path(),
             "2026-07-17",
-            &[step_usage("s1", 100), step_usage("s1", 900), step_usage("s1", 950)],
+            &[
+                step_usage("s1", 100),
+                step_usage("s1", 900),
+                step_usage("s1", 950),
+            ],
         );
         let out = backfill_step_finals_bounded(tmp.path(), &step_ids, "m-this", created_ts, 1);
-        assert_eq!(out["s1"].tokens, Some(100), "cap stops parsing after the first record");
+        assert_eq!(
+            out["s1"].tokens,
+            Some(100),
+            "cap stops parsing after the first record"
+        );
         // The production cap folds all three.
         let out_full = backfill_step_finals(tmp.path(), &step_ids, "m-this", created_ts);
-        assert_eq!(out_full["s1"].tokens, Some(1950), "100 + 900 + 950: one term per execution");
+        assert_eq!(
+            out_full["s1"].tokens,
+            Some(1950),
+            "100 + 900 + 950: one term per execution"
+        );
     }
 
     #[test]
@@ -2236,7 +2417,11 @@ mod tests {
         )
         .unwrap();
         let out = backfill_step_finals(tmp.path(), &step_ids, "m-this", created_ts);
-        assert_eq!(out["s1"].tokens, Some(4200), "malformed lines skip; the good record folds");
+        assert_eq!(
+            out["s1"].tokens,
+            Some(4200),
+            "malformed lines skip; the good record folds"
+        );
     }
 
     #[test]
@@ -2254,7 +2439,11 @@ mod tests {
 
     #[test]
     fn layer_tasks_linear_chain_increases_depth() {
-        let tasks = vec![task("a", &[], &[]), task("b", &["a"], &[]), task("c", &["b"], &[])];
+        let tasks = vec![
+            task("a", &[], &[]),
+            task("b", &["a"], &[]),
+            task("c", &["b"], &[]),
+        ];
         let depths = layer_tasks_by_depth(&tasks);
         assert_eq!(depths["a"], 0);
         assert_eq!(depths["b"], 1);
@@ -2317,7 +2506,10 @@ mod tests {
         // dispatching" signal (#2517/#2525) — see the INVERTED case right
         // below, which is the whole point of this split.
         assert_eq!(
-            derive_task_status(&[(NodeStatus::Complete, None), (NodeStatus::Running, Some(100))]),
+            derive_task_status(&[
+                (NodeStatus::Complete, None),
+                (NodeStatus::Running, Some(100))
+            ]),
             TaskDisplayStatus::Running
         );
     }
@@ -2469,7 +2661,14 @@ mod tests {
             let [complete, errored, running, waiting, planned, abandoned] = expected_counts;
             assert_eq!(
                 counts,
-                PhaseTaskCounts { complete, errored, running, waiting, planned, abandoned },
+                PhaseTaskCounts {
+                    complete,
+                    errored,
+                    running,
+                    waiting,
+                    planned,
+                    abandoned
+                },
                 "case `{name}`: counts for {statuses:?}"
             );
         }
@@ -2486,7 +2685,14 @@ mod tests {
         assert_eq!(status, PhaseDisplayStatus::Running, "the phase is not over");
         assert_eq!(
             counts,
-            PhaseTaskCounts { complete: 7, errored: 1, running: 4, waiting: 0, planned: 0, abandoned: 0 }
+            PhaseTaskCounts {
+                complete: 7,
+                errored: 1,
+                running: 4,
+                waiting: 0,
+                planned: 0,
+                abandoned: 0
+            }
         );
         assert_eq!(
             phase_status_note(status, &counts).as_deref(),
@@ -2502,11 +2708,27 @@ mod tests {
         // phase's breakdown would just restate its own status word, so it
         // stays absent for Complete/Error/Abandoned/Planned regardless of
         // the counts passed.
-        let counts = PhaseTaskCounts { complete: 3, errored: 0, running: 0, waiting: 0, planned: 0, abandoned: 0 };
-        assert_eq!(phase_status_note(PhaseDisplayStatus::Complete, &counts), None);
+        let counts = PhaseTaskCounts {
+            complete: 3,
+            errored: 0,
+            running: 0,
+            waiting: 0,
+            planned: 0,
+            abandoned: 0,
+        };
+        assert_eq!(
+            phase_status_note(PhaseDisplayStatus::Complete, &counts),
+            None
+        );
         assert_eq!(phase_status_note(PhaseDisplayStatus::Error, &counts), None);
-        assert_eq!(phase_status_note(PhaseDisplayStatus::Abandoned, &counts), None);
-        assert_eq!(phase_status_note(PhaseDisplayStatus::Planned, &counts), None);
+        assert_eq!(
+            phase_status_note(PhaseDisplayStatus::Abandoned, &counts),
+            None
+        );
+        assert_eq!(
+            phase_status_note(PhaseDisplayStatus::Planned, &counts),
+            None
+        );
     }
 
     #[test]
@@ -2515,7 +2737,14 @@ mod tests {
         // `Running`/`Degraded` — its breakdown must render, or the
         // operator sees a bare "WAITING" chip with no explanation of what
         // it's waiting on.
-        let counts = PhaseTaskCounts { complete: 1, errored: 0, running: 0, waiting: 2, planned: 0, abandoned: 0 };
+        let counts = PhaseTaskCounts {
+            complete: 1,
+            errored: 0,
+            running: 0,
+            waiting: 2,
+            planned: 0,
+            abandoned: 0,
+        };
         assert_eq!(
             phase_status_note(PhaseDisplayStatus::Waiting, &counts).as_deref(),
             Some("1 complete · 2 waiting")
@@ -2533,7 +2762,11 @@ mod tests {
         assert_eq!(
             phase_display_status(
                 PhaseStatus::Running,
-                &[TaskDisplayStatus::Complete, TaskDisplayStatus::Complete, TaskDisplayStatus::Complete]
+                &[
+                    TaskDisplayStatus::Complete,
+                    TaskDisplayStatus::Complete,
+                    TaskDisplayStatus::Complete
+                ]
             )
             .0,
             PhaseDisplayStatus::Complete
@@ -2560,7 +2793,11 @@ mod tests {
         // failed phase, it's a MIXED one. Real output shipped; something
         // was lost. Fixed: Degraded, not Error.
         assert_eq!(
-            phase_display_status(PhaseStatus::Running, &[TaskDisplayStatus::Complete, TaskDisplayStatus::Error]).0,
+            phase_display_status(
+                PhaseStatus::Running,
+                &[TaskDisplayStatus::Complete, TaskDisplayStatus::Error]
+            )
+            .0,
             PhaseDisplayStatus::Degraded
         );
     }
@@ -2570,7 +2807,11 @@ mod tests {
         // #3074: Error ties Complete at rank 2, so a persisted Complete used
         // to win and a phase whose every task errored read "complete".
         assert_eq!(
-            phase_display_status(PhaseStatus::Complete, &[TaskDisplayStatus::Error, TaskDisplayStatus::Error]).0,
+            phase_display_status(
+                PhaseStatus::Complete,
+                &[TaskDisplayStatus::Error, TaskDisplayStatus::Error]
+            )
+            .0,
             PhaseDisplayStatus::Error
         );
         assert_eq!(
@@ -2596,7 +2837,11 @@ mod tests {
         // the mixed-with-some-complete case above), and Error still
         // outranks a persisted Running (rank 2 > 1).
         assert_eq!(
-            phase_display_status(PhaseStatus::Running, &[TaskDisplayStatus::Error, TaskDisplayStatus::Error]).0,
+            phase_display_status(
+                PhaseStatus::Running,
+                &[TaskDisplayStatus::Error, TaskDisplayStatus::Error]
+            )
+            .0,
             PhaseDisplayStatus::Error
         );
     }
@@ -2722,8 +2967,13 @@ mod tests {
         // `Abandoned` for the same input; before the post-review fix it
         // said `Degraded` and drove disk to `complete`, so one phase wore
         // three different words.
-        let task = derive_task_status(&[(NodeStatus::Complete, None), (NodeStatus::Abandoned, None)]);
-        assert_eq!(task, TaskDisplayStatus::Abandoned, "one unit of work, not two independent ones");
+        let task =
+            derive_task_status(&[(NodeStatus::Complete, None), (NodeStatus::Abandoned, None)]);
+        assert_eq!(
+            task,
+            TaskDisplayStatus::Abandoned,
+            "one unit of work, not two independent ones"
+        );
         assert_eq!(
             phase_display_status(PhaseStatus::Running, &[task]).0,
             PhaseDisplayStatus::Abandoned,
@@ -2786,11 +3036,23 @@ mod tests {
             output: output.map(String::from),
             stop_reason: None,
         };
-        let long = format!("reading workspace spec /x: Is a directory\n{}", "y".repeat(5000));
+        let long = format!(
+            "reading workspace spec /x: Is a directory\n{}",
+            "y".repeat(5000)
+        );
         let cause = step_error_cause(&step(NodeStatus::Error, Some(&long))).unwrap();
-        assert!(cause.starts_with("reading workspace spec /x: Is a directory"), "{cause}");
-        assert!(!cause.contains('\n') && cause.chars().count() <= 500, "bounded, one line");
-        assert_eq!(step_error_cause(&step(NodeStatus::Complete, Some("{\"ok\":true}"))), None);
+        assert!(
+            cause.starts_with("reading workspace spec /x: Is a directory"),
+            "{cause}"
+        );
+        assert!(
+            !cause.contains('\n') && cause.chars().count() <= 500,
+            "bounded, one line"
+        );
+        assert_eq!(
+            step_error_cause(&step(NodeStatus::Complete, Some("{\"ok\":true}"))),
+            None
+        );
         assert_eq!(step_error_cause(&step(NodeStatus::Error, None)), None);
     }
 
@@ -2799,15 +3061,27 @@ mod tests {
         // `model` wins when present (the namespaced identifier a dispatch.map
         // seat stamps).
         let cfg = serde_json::json!({ "model": "darkmux:qwen/qwen3.6-27b", "model_key": "qwen/qwen3.6-27b" });
-        assert_eq!(step_model_from_config(&cfg).as_deref(), Some("darkmux:qwen/qwen3.6-27b"));
+        assert_eq!(
+            step_model_from_config(&cfg).as_deref(),
+            Some("darkmux:qwen/qwen3.6-27b")
+        );
         // Falls back to `model_key` when `model` is absent.
         let cfg = serde_json::json!({ "model_key": "qwen/qwen3.6-27b" });
-        assert_eq!(step_model_from_config(&cfg).as_deref(), Some("qwen/qwen3.6-27b"));
+        assert_eq!(
+            step_model_from_config(&cfg).as_deref(),
+            Some("qwen/qwen3.6-27b")
+        );
         // A procedural / Tier 3 step with no model config → None (omit chip).
         assert_eq!(step_model_from_config(&serde_json::Value::Null), None);
-        assert_eq!(step_model_from_config(&serde_json::json!({ "concurrency": 3 })), None);
+        assert_eq!(
+            step_model_from_config(&serde_json::json!({ "concurrency": 3 })),
+            None
+        );
         // Empty / whitespace values are treated as absent, never a blank chip.
-        assert_eq!(step_model_from_config(&serde_json::json!({ "model": "   " })), None);
+        assert_eq!(
+            step_model_from_config(&serde_json::json!({ "model": "   " })),
+            None
+        );
     }
 
     #[test]
@@ -2818,7 +3092,10 @@ mod tests {
 
     #[test]
     fn resolve_step_label_falls_back_to_the_raw_kind_id_when_unrecognized() {
-        assert_eq!(resolve_step_label("some.custom.kind", "s1"), "some.custom.kind");
+        assert_eq!(
+            resolve_step_label("some.custom.kind", "s1"),
+            "some.custom.kind"
+        );
     }
 
     #[test]
@@ -2841,7 +3118,10 @@ mod tests {
     fn kind_from_config_snapshot_none_when_no_snapshot_exists() {
         // No mission dir at all under this id in the test's isolated
         // DARKMUX_HOME — the function must return None, not error.
-        assert_eq!(kind_from_config_snapshot("no-such-mission-xyz", "t1", "s1"), None);
+        assert_eq!(
+            kind_from_config_snapshot("no-such-mission-xyz", "t1", "s1"),
+            None
+        );
     }
 
     /// (#3074) A task whose `depends_on` names a task that is not in the graph
@@ -2871,13 +3151,31 @@ mod tests {
         .unwrap();
         darkmux_crew::lifecycle::save_phase(&phase).unwrap();
         darkmux_crew::lifecycle::save_task("m-missing-dep", &task("t-a", &[], &[])).unwrap();
-        darkmux_crew::lifecycle::save_task("m-missing-dep", &task("t-c", &["t-a", "nonexistent-task"], &[])).unwrap();
+        darkmux_crew::lifecycle::save_task(
+            "m-missing-dep",
+            &task("t-c", &["t-a", "nonexistent-task"], &[]),
+        )
+        .unwrap();
 
         let flows = tempfile::TempDir::new().unwrap();
-        let graph = build_mission_graph("m-missing-dep", flows.path()).unwrap().expect("graph emitted");
-        assert!(graph.nodes.iter().any(|n| n.id == "t-c"), "the fixture must reach the task nodes: {:?}", graph.nodes.len());
-        let dep_edges: Vec<&str> =
-            graph.edges.iter().filter(|e| e.kind == EdgeKind::DependsOn).map(|e| e.id.as_str()).collect();
-        assert_eq!(dep_edges, ["depends_on:t-a:t-c"], "only the real dependency gets an edge");
+        let graph = build_mission_graph("m-missing-dep", flows.path())
+            .unwrap()
+            .expect("graph emitted");
+        assert!(
+            graph.nodes.iter().any(|n| n.id == "t-c"),
+            "the fixture must reach the task nodes: {:?}",
+            graph.nodes.len()
+        );
+        let dep_edges: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::DependsOn)
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(
+            dep_edges,
+            ["depends_on:t-a:t-c"],
+            "only the real dependency gets an edge"
+        );
     }
 }

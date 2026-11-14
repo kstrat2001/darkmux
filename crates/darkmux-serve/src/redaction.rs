@@ -19,13 +19,13 @@
 //! and token holders see every value unchanged
 //! ([`crate::caller_is_local_or_holds_token`]).
 
+use crate::redaction_stream::StreamRedactor;
 use axum::extract::{ConnectInfo, Request};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use darkmux_types::url_authority::UrlAuthority;
-use crate::redaction_stream::StreamRedactor;
 use darkmux_types::panel_audience::Withheld;
+use darkmux_types::url_authority::UrlAuthority;
 use std::net::SocketAddr;
 
 /// Stands in for an address in a remote caller's output.
@@ -60,8 +60,14 @@ struct CacheKey {
 
 impl CacheKey {
     fn current() -> Self {
-        let roster = std::fs::metadata(darkmux_fleet::roster_path()).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
-        Self { roster, home: std::env::var("HOME").ok(), darkmux_home: std::env::var("DARKMUX_HOME").ok() }
+        let roster = std::fs::metadata(darkmux_fleet::roster_path())
+            .ok()
+            .and_then(|m| Some((m.modified().ok()?, m.len())));
+        Self {
+            roster,
+            home: std::env::var("HOME").ok(),
+            darkmux_home: std::env::var("DARKMUX_HOME").ok(),
+        }
     }
 }
 
@@ -73,7 +79,12 @@ struct RedactionCache {
 }
 
 impl RedactionCache {
-    fn get(&mut self, key: CacheKey, now: std::time::Instant, derive: impl FnOnce() -> Redaction) -> std::sync::Arc<Redaction> {
+    fn get(
+        &mut self,
+        key: CacheKey,
+        now: std::time::Instant,
+        derive: impl FnOnce() -> Redaction,
+    ) -> std::sync::Arc<Redaction> {
         if let Some((k, at, r)) = &self.entry {
             if *k == key && now.saturating_duration_since(*at) < REDACTION_CACHE_TTL {
                 return r.clone();
@@ -92,7 +103,11 @@ impl Redaction {
     pub(crate) fn derive_cached() -> std::sync::Arc<Self> {
         let key = CacheKey::current();
         let mut guard = REDACTION_CACHE.lock().unwrap_or_else(|p| p.into_inner());
-        guard.get_or_insert_with(RedactionCache::default).get(key, std::time::Instant::now(), Self::derive)
+        guard.get_or_insert_with(RedactionCache::default).get(
+            key,
+            std::time::Instant::now(),
+            Self::derive,
+        )
     }
 }
 
@@ -112,7 +127,13 @@ struct Needle {
 impl Needle {
     fn address(a: &str) -> Self {
         let bare = !a.contains(['.', ':']);
-        Self { #[cfg(test)] text: a.to_string(), lower: a.to_ascii_lowercase(), with: ADDRESS_HIDDEN, bare }
+        Self {
+            #[cfg(test)]
+            text: a.to_string(),
+            lower: a.to_ascii_lowercase(),
+            with: ADDRESS_HIDDEN,
+            bare,
+        }
     }
 }
 
@@ -122,8 +143,14 @@ impl Redaction {
     /// nothing it cannot name, and the caller still gets no `stderr_tail`.
     pub(crate) fn derive() -> Self {
         let roster = darkmux_fleet::load_roster().ok();
-        let machines: Vec<(&str, &str)> =
-            roster.iter().flat_map(|r| r.machines.values().map(|m| (m.id.as_str(), m.address.as_str()))).collect();
+        let machines: Vec<(&str, &str)> = roster
+            .iter()
+            .flat_map(|r| {
+                r.machines
+                    .values()
+                    .map(|m| (m.id.as_str(), m.address.as_str()))
+            })
+            .collect();
         let mut public: Vec<String> = Vec::new();
         for m in roster.iter().flat_map(|r| r.machines.values()) {
             public.extend(m.current_name.clone());
@@ -156,14 +183,21 @@ impl Redaction {
         darkmux_home: Option<String>,
     ) -> Self {
         let is_public = |s: &str| {
-            machines.iter().any(|(id, _)| id.eq_ignore_ascii_case(s)) || public.iter().any(|p| p.eq_ignore_ascii_case(s))
+            machines.iter().any(|(id, _)| id.eq_ignore_ascii_case(s))
+                || public.iter().any(|p| p.eq_ignore_ascii_case(s))
         };
         let mut all: Vec<String> = Vec::new();
-        for addr in machines.iter().map(|(_, a)| a.trim()).filter(|a| !a.is_empty()) {
+        for addr in machines
+            .iter()
+            .map(|(_, a)| a.trim())
+            .filter(|a| !a.is_empty())
+        {
             if !is_public(addr) {
                 all.push(addr.to_string());
             }
-            if let Some(host) = darkmux_types::panel_audience::address_host(addr).filter(|h| !is_public(h)) {
+            if let Some(host) =
+                darkmux_types::panel_audience::address_host(addr).filter(|h| !is_public(h))
+            {
                 all.push(host.to_string());
             }
         }
@@ -173,7 +207,9 @@ impl Redaction {
         // A directory as given and as the filesystem resolves it (`/tmp` is
         // `/private/tmp` on macOS): a verb may print either.
         let forms = |d: Option<String>| -> Vec<String> {
-            let given = d.map(|d| d.trim_end_matches('/').to_string()).filter(|d| d.len() > 1);
+            let given = d
+                .map(|d| d.trim_end_matches('/').to_string())
+                .filter(|d| d.len() > 1);
             let canon = given
                 .as_deref()
                 .and_then(|g| std::fs::canonicalize(g).ok())
@@ -184,11 +220,14 @@ impl Redaction {
             all
         };
         let homes = forms(home);
-        let mut dirs: Vec<(String, &'static str)> = homes.iter().cloned().map(|h| (h, "~")).collect();
+        let mut dirs: Vec<(String, &'static str)> =
+            homes.iter().cloned().map(|h| (h, "~")).collect();
         // A DARKMUX_HOME inside HOME (at a path boundary: `/Users/kainx/dm` is
         // not inside `/Users/kain`) is covered by the HOME rewrite.
         for dh in forms(darkmux_home) {
-            let inside = homes.iter().any(|h| dh == *h || dh.starts_with(&format!("{h}/")));
+            let inside = homes
+                .iter()
+                .any(|h| dh == *h || dh.starts_with(&format!("{h}/")));
             if !inside {
                 dirs.push((dh, "$DARKMUX_HOME"));
             }
@@ -199,7 +238,13 @@ impl Redaction {
         let needles = all
             .iter()
             .map(|a| Needle::address(a))
-            .chain(dirs.into_iter().map(|(d, with)| Needle { lower: d.to_ascii_lowercase(), #[cfg(test)] text: d.clone(), with, bare: false }))
+            .chain(dirs.into_iter().map(|(d, with)| Needle {
+                lower: d.to_ascii_lowercase(),
+                #[cfg(test)]
+                text: d.clone(),
+                with,
+                bare: false,
+            }))
             .collect();
         Self { needles }
     }
@@ -308,12 +353,16 @@ fn v4_is_host_fact(o: [u8; 4], text: &str, start: usize, end: usize) -> bool {
         || (o[0] == 172 && (16..=31).contains(&o[1]))
         || (o[0] == 192 && o[1] == 168)
         || (o[0] == 169 && o[1] == 254);
-    private || text[..start].ends_with("://") || text[..start].ends_with('@') || followed_by_port(&text[end..])
+    private
+        || text[..start].ends_with("://")
+        || text[..start].ends_with('@')
+        || followed_by_port(&text[end..])
 }
 
 /// Whether the text begins `:<digit>`: a `host:port` position.
 fn followed_by_port(rest: &str) -> bool {
-    rest.strip_prefix(':').is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+    rest.strip_prefix(':')
+        .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
 }
 
 fn ipv4_spans(text: &str, out: &mut Vec<Span>) {
@@ -336,7 +385,11 @@ fn ipv4_spans(text: &str, out: &mut Vec<Span>) {
             continue;
         }
         if parse_v4(&text[start..end]).is_some_and(|o| v4_is_host_fact(o, text, start, end)) {
-            out.push(Span { start, end, with: ADDRESS_HIDDEN });
+            out.push(Span {
+                start,
+                end,
+                with: ADDRESS_HIDDEN,
+            });
         }
     }
 }
@@ -346,7 +399,9 @@ fn ipv4_spans(text: &str, out: &mut Vec<Span>) {
 /// Loopback, unspecified and the rest stay visible.
 fn v6_is_host_fact(a: std::net::Ipv6Addr) -> bool {
     let first = a.segments()[0];
-    (0xfc00..=0xfdff).contains(&first) || (0x2000..=0x3fff).contains(&first) || (0xfe80..=0xfebf).contains(&first)
+    (0xfc00..=0xfdff).contains(&first)
+        || (0x2000..=0x3fff).contains(&first)
+        || (0xfe80..=0xfebf).contains(&first)
 }
 
 fn ipv6_spans(text: &str, out: &mut Vec<Span>) {
@@ -361,7 +416,10 @@ fn ipv6_spans(text: &str, out: &mut Vec<Span>) {
             continue;
         }
         let start = i;
-        i += b[i..].iter().take_while(|c| c.is_ascii_hexdigit() || **c == b':').count();
+        i += b[i..]
+            .iter()
+            .take_while(|c| c.is_ascii_hexdigit() || **c == b':')
+            .count();
         if b.get(i).is_some_and(|c| word_byte(*c)) {
             continue;
         }
@@ -383,8 +441,15 @@ fn zone_len(rest: &[u8]) -> usize {
     if rest.first() != Some(&b'%') {
         return 0;
     }
-    let zone = rest[1..].iter().take_while(|c| c.is_ascii_alphanumeric() || matches!(**c, b'_' | b'-')).count();
-    if zone > 0 { 1 + zone } else { 0 }
+    let zone = rest[1..]
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(**c, b'_' | b'-'))
+        .count();
+    if zone > 0 {
+        1 + zone
+    } else {
+        0
+    }
 }
 
 /// The host-fact IPv6 literal in the run `start..end`, if any: the whole run,
@@ -399,7 +464,11 @@ fn v6_in_run(text: &str, start: usize, end: usize, glued: bool) -> Option<Span> 
         let cand = &run[off..];
         for t in [cand, cand.strip_suffix(':').unwrap_or(cand)] {
             if t.parse::<std::net::Ipv6Addr>().is_ok_and(v6_is_host_fact) {
-                return Some(Span { start: start + off, end: start + off + t.len(), with: ADDRESS_HIDDEN });
+                return Some(Span {
+                    start: start + off,
+                    end: start + off + t.len(),
+                    with: ADDRESS_HIDDEN,
+                });
             }
         }
     }
@@ -413,9 +482,17 @@ fn tailnet_name_spans(text: &str, out: &mut Vec<Span>) {
         if continues_forward(&text[end..]) {
             continue;
         }
-        let label = text.as_bytes()[..dot].iter().rev().take_while(|c| c.is_ascii_alphanumeric() || **c == b'.' || **c == b'-').count();
+        let label = text.as_bytes()[..dot]
+            .iter()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || **c == b'.' || **c == b'-')
+            .count();
         if label > 0 {
-            out.push(Span { start: dot - label, end, with: ADDRESS_HIDDEN });
+            out.push(Span {
+                start: dot - label,
+                end,
+                with: ADDRESS_HIDDEN,
+            });
         }
     }
 }
@@ -433,16 +510,28 @@ fn home_spans(text: &str, out: &mut Vec<Span>) {
                 continue;
             }
             let from = i + prefix.len();
-            let name = text[from..].trim_end_matches('.').bytes().take_while(|c| c.is_ascii_alphanumeric() || matches!(*c, b'.' | b'_' | b'-')).count();
+            let name = text[from..]
+                .trim_end_matches('.')
+                .bytes()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(*c, b'.' | b'_' | b'-'))
+                .count();
             let name = text[from..from + name].trim_end_matches('.').len();
             if name > 0 {
-                out.push(Span { start: i, end: from + name, with: "~" });
+                out.push(Span {
+                    start: i,
+                    end: from + name,
+                    with: "~",
+                });
             }
         }
     }
     for i in find_ci(text, "/root") {
         if !continues_backward(&text[..i]) && !continues_forward(&text[i + 5..]) {
-            out.push(Span { start: i, end: i + 5, with: "~" });
+            out.push(Span {
+                start: i,
+                end: i + 5,
+                with: "~",
+            });
         }
     }
 }
@@ -456,10 +545,18 @@ fn needle_spans(text: &str, n: &Needle, out: &mut Vec<Span>) {
         }
         // A bare host (no dot, no port) is only a host fact where it is
         // addressing: `://studio`, `@studio`, `studio:8765`.
-        if n.bare && !(text[..start].ends_with("://") || text[..start].ends_with('@') || followed_by_port(&text[end..])) {
+        if n.bare
+            && !(text[..start].ends_with("://")
+                || text[..start].ends_with('@')
+                || followed_by_port(&text[end..]))
+        {
             continue;
         }
-        out.push(Span { start, end, with: n.with });
+        out.push(Span {
+            start,
+            end,
+            with: n.with,
+        });
     }
 }
 
@@ -491,7 +588,9 @@ pub(crate) fn redact_text<'a>(text: &'a str, r: &Redaction) -> std::borrow::Cow<
     // Every host fact has a `.`, a `:`, a `/` or an `@` in or beside it (a name
     // that is only a word is a fact solely as `host:port` or `://host`),
     // unless a renderer cut one short with `…` and that punctuation went.
-    if text.len() < 4 || !(text.bytes().any(|b| matches!(b, b'.' | b':' | b'/' | b'@')) || text.contains(CUT)) {
+    if text.len() < 4
+        || !(text.bytes().any(|b| matches!(b, b'.' | b':' | b'/' | b'@')) || text.contains(CUT))
+    {
         return std::borrow::Cow::Borrowed(text);
     }
     let mut spans = Vec::new();
@@ -523,7 +622,11 @@ const CUT: char = '…';
 fn cut_needle_spans(text: &str, r: &Redaction, out: &mut Vec<Span>) {
     for n in r.needles.iter().filter(|n| !n.bare) {
         for (start, end) in darkmux_types::panel_audience::cut_spans(text, &n.lower) {
-            out.push(Span { start, end, with: n.with });
+            out.push(Span {
+                start,
+                end,
+                with: n.with,
+            });
         }
     }
 }
@@ -540,11 +643,22 @@ fn cut_tailnet_spans(text: &str, out: &mut Vec<Span>) {
         let head = b[..e].iter().rev().take_while(|c| name_byte(c)).count();
         let after = e + CUT.len_utf8();
         let tail = b[after..].iter().take_while(|c| name_byte(c)).count();
-        let (h, t) = (text[e - head..e].to_ascii_lowercase(), text[after..after + tail].to_ascii_lowercase());
+        let (h, t) = (
+            text[e - head..e].to_ascii_lowercase(),
+            text[after..after + tail].to_ascii_lowercase(),
+        );
         let middle = t.ends_with("s.net") && (head > 0 || t.contains(".ts.net"));
-        let end_cut = tail == 0 && h.contains('.') && [".t", ".ts", ".ts.", ".ts.n", ".ts.ne"].iter().any(|s| h.ends_with(s));
+        let end_cut = tail == 0
+            && h.contains('.')
+            && [".t", ".ts", ".ts.", ".ts.n", ".ts.ne"]
+                .iter()
+                .any(|s| h.ends_with(s));
         if middle || end_cut {
-            out.push(Span { start: e - head, end: after + tail, with: ADDRESS_HIDDEN });
+            out.push(Span {
+                start: e - head,
+                end: after + tail,
+                with: ADDRESS_HIDDEN,
+            });
         }
     }
 }
@@ -566,7 +680,9 @@ fn classify_escape(rest: &str, r: &Redaction, w: &Withheld) -> (usize, String) {
         Some(b'[') => csi(rest, 2),
         Some(b']') => osc(rest, r, w),
         // A charset designation (`ESC ( B`) is three bytes.
-        Some(b'(' | b')' | b'*' | b'+') if bytes.get(2).is_some_and(u8::is_ascii_alphanumeric) => (3, String::new()),
+        Some(b'(' | b')' | b'*' | b'+') if bytes.get(2).is_some_and(u8::is_ascii_alphanumeric) => {
+            (3, String::new())
+        }
         _ => (1, String::new()),
     }
 }
@@ -574,9 +690,15 @@ fn classify_escape(rest: &str, r: &Redaction, w: &Withheld) -> (usize, String) {
 /// A CSI whose introducer is `intro` bytes long: kept only as SGR.
 fn csi(rest: &str, intro: usize) -> (usize, String) {
     let body = &rest.as_bytes()[intro..];
-    let params = body.iter().take_while(|b| b.is_ascii_digit() || **b == b';' || **b == b':').count();
+    let params = body
+        .iter()
+        .take_while(|b| b.is_ascii_digit() || **b == b';' || **b == b':')
+        .count();
     match body.get(params) {
-        Some(b'm') => (intro + params + 1, format!("\x1b[{}m", &rest[intro..intro + params])),
+        Some(b'm') => (
+            intro + params + 1,
+            format!("\x1b[{}m", &rest[intro..intro + params]),
+        ),
         Some(b) if (0x40..=0x7e).contains(b) => (intro + params + 1, String::new()),
         _ => (intro, String::new()),
     }
@@ -593,11 +715,18 @@ fn osc(rest: &str, r: &Redaction, w: &Withheld) -> (usize, String) {
         return (2, String::new());
     };
     let consumed = 2 + end + term_len;
-    let Some((_params, target)) = body[..end].strip_prefix("8;").and_then(|l| l.split_once(';')) else {
+    let Some((_params, target)) = body[..end]
+        .strip_prefix("8;")
+        .and_then(|l| l.split_once(';'))
+    else {
         return (consumed, String::new());
     };
-    let hidden = target.chars().any(char::is_control) || redact_text(target, r) != target || w.hits(target);
-    (consumed, format!("\x1b]8;;{}\x1b\\", if hidden { "" } else { target }))
+    let hidden =
+        target.chars().any(char::is_control) || redact_text(target, r) != target || w.hits(target);
+    (
+        consumed,
+        format!("\x1b]8;;{}\x1b\\", if hidden { "" } else { target }),
+    )
 }
 
 /// A panel's stdout for a remote caller. The text is split into escape
@@ -659,14 +788,20 @@ pub fn panel_withheld() -> Withheld {
     let read_json = |p: &std::path::Path| -> Option<serde_json::Value> {
         serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
     };
-    let config_path = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config;
-    let from_config = read_json(&config_path).map(|c| config_scrub_values(&c)).unwrap_or_default();
+    let config_path =
+        darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config;
+    let from_config = read_json(&config_path)
+        .map(|c| config_scrub_values(&c))
+        .unwrap_or_default();
 
     let path_str = |p: std::path::PathBuf| p.to_string_lossy().to_string();
     let mut locations = darkmux_types::config_access::resolved_locations();
     locations.extend(darkmux_lab::lab::registry::fixture_locations());
     locations.extend(darkmux_flow::redis_url().map(|u| u.expose_for_probe().to_string()));
-    for d in [std::env::temp_dir(), std::env::temp_dir().canonicalize().unwrap_or_default()] {
+    for d in [
+        std::env::temp_dir(),
+        std::env::temp_dir().canonicalize().unwrap_or_default(),
+    ] {
         locations.push(path_str(d));
     }
 
@@ -685,7 +820,9 @@ pub fn panel_withheld() -> Withheld {
     // An enum setting's value that is not one of its tokens is bad config,
     // which doctor's refusal quotes, whether it was set in `config.json` or
     // the environment: what it holds is not what the key means.
-    let bad_enum = darkmux_types::config_enum::bad_values().into_iter().map(|b| b.raw);
+    let bad_enum = darkmux_types::config_enum::bad_values()
+        .into_iter()
+        .map(|b| b.raw);
     Withheld::from_values(outside(from_config))
         .merged(Withheld::from_locations(outside(locations)))
         .merged(Withheld::from_values(credentials))
@@ -698,18 +835,38 @@ pub fn panel_withheld() -> Withheld {
 /// endpoint names into `public`; returns each endpoint's credential pointer.
 fn registry_sets(locations: &mut Vec<String>, public: &mut Vec<String>) -> Vec<String> {
     let mut credentials: Vec<String> = Vec::new();
-    let Some(reg_path) = darkmux_profiles::profiles::registry_path(None) else { return credentials };
+    let Some(reg_path) = darkmux_profiles::profiles::registry_path(None) else {
+        return credentials;
+    };
     locations.push(reg_path.to_string_lossy().to_string());
-    let registry: Option<serde_json::Value> =
-        std::fs::read_to_string(&reg_path).ok().and_then(|t| serde_json::from_str(&t).ok());
-    let Some(registry) = registry else { return credentials };
+    let registry: Option<serde_json::Value> = std::fs::read_to_string(&reg_path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok());
+    let Some(registry) = registry else {
+        return credentials;
+    };
     for section in ["profiles", "endpoints"] {
-        public.extend(registry.get(section).and_then(|m| m.as_object()).into_iter().flat_map(|m| m.keys().cloned()));
+        public.extend(
+            registry
+                .get(section)
+                .and_then(|m| m.as_object())
+                .into_iter()
+                .flat_map(|m| m.keys().cloned()),
+        );
     }
-    for ep in registry.get("endpoints").and_then(|e| e.as_object()).into_iter().flat_map(|m| m.values()) {
+    for ep in registry
+        .get("endpoints")
+        .and_then(|e| e.as_object())
+        .into_iter()
+        .flat_map(|m| m.values())
+    {
         locations.extend(ep.get("url").and_then(|u| u.as_str()).map(str::to_string));
         for key in ["keychain", "key_env"] {
-            credentials.extend(ep.pointer(&format!("/auth/{key}")).and_then(|v| v.as_str()).map(str::to_string));
+            credentials.extend(
+                ep.pointer(&format!("/auth/{key}"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            );
         }
     }
     credentials
@@ -724,7 +881,12 @@ fn outside_the_homes(values: Vec<String>) -> Vec<String> {
         .map(|h| h.trim_end_matches('/').to_string())
         .filter(|h| h.len() > 1)
         .collect();
-    let under_a_home = |v: &String| v.starts_with('~') || homes.iter().any(|h| v == h || v.starts_with(&format!("{h}/")));
+    let under_a_home = |v: &String| {
+        v.starts_with('~')
+            || homes
+                .iter()
+                .any(|h| v == h || v.starts_with(&format!("{h}/")))
+    };
     values.into_iter().filter(|v| !under_a_home(v)).collect()
 }
 
@@ -740,7 +902,8 @@ struct WithheldKey {
 impl WithheldKey {
     fn current() -> Self {
         let meta = |p: Option<std::path::PathBuf>| {
-            p.and_then(|p| std::fs::metadata(p).ok()).and_then(|m| Some((m.modified().ok()?, m.len())))
+            p.and_then(|p| std::fs::metadata(p).ok())
+                .and_then(|m| Some((m.modified().ok()?, m.len())))
         };
         let root = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser);
         let files = vec![
@@ -749,15 +912,17 @@ impl WithheldKey {
             meta(Some(root.root.join("lab-registry.json"))),
             meta(Some(darkmux_fleet::roster_path())),
         ];
-        let mut env: Vec<(String, String)> =
-            std::env::vars().filter(|(k, _)| k.starts_with("DARKMUX_") || k == "HOME" || k == "TMPDIR").collect();
+        let mut env: Vec<(String, String)> = std::env::vars()
+            .filter(|(k, _)| k.starts_with("DARKMUX_") || k == "HOME" || k == "TMPDIR")
+            .collect();
         env.sort();
         Self { files, env }
     }
 }
 
-static PANEL_WITHHELD_CACHE: std::sync::Mutex<Option<(WithheldKey, std::time::Instant, std::sync::Arc<Withheld>)>> =
-    std::sync::Mutex::new(None);
+static PANEL_WITHHELD_CACHE: std::sync::Mutex<
+    Option<(WithheldKey, std::time::Instant, std::sync::Arc<Withheld>)>,
+> = std::sync::Mutex::new(None);
 
 /// [`panel_withheld`], reused for at most [`REDACTION_CACHE_TTL`] while the
 /// files it read and the environment are unchanged: a console on a 3s
@@ -766,7 +931,9 @@ static PANEL_WITHHELD_CACHE: std::sync::Mutex<Option<(WithheldKey, std::time::In
 pub(crate) fn panel_withheld_cached() -> std::sync::Arc<Withheld> {
     let key = WithheldKey::current();
     let now = std::time::Instant::now();
-    let mut guard = PANEL_WITHHELD_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    let mut guard = PANEL_WITHHELD_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     if let Some((k, at, w)) = guard.as_ref() {
         if *k == key && now.saturating_duration_since(*at) < REDACTION_CACHE_TTL {
             return w.clone();
@@ -781,12 +948,20 @@ pub(crate) fn panel_withheld_cached() -> std::sync::Arc<Withheld> {
 impl Redaction {
     /// The addresses it hides, longest first.
     pub(crate) fn addresses(&self) -> Vec<&str> {
-        self.needles.iter().filter(|n| n.with == ADDRESS_HIDDEN).map(|n| n.text.as_str()).collect()
+        self.needles
+            .iter()
+            .filter(|n| n.with == ADDRESS_HIDDEN)
+            .map(|n| n.text.as_str())
+            .collect()
     }
 
     /// The directories it rewrites, with what each reads as.
     pub(crate) fn dirs(&self) -> Vec<(&str, &str)> {
-        self.needles.iter().filter(|n| n.with != ADDRESS_HIDDEN).map(|n| (n.text.as_str(), n.with)).collect()
+        self.needles
+            .iter()
+            .filter(|n| n.with != ADDRESS_HIDDEN)
+            .map(|n| (n.text.as_str(), n.with))
+            .collect()
     }
 }
 
@@ -816,20 +991,38 @@ impl Redaction {
 /// and no response is too big to serve; nothing passes through unfiltered
 /// ([`crate::redaction_stream`], #3073).
 pub(crate) async fn redact_reads(req: Request, next: Next) -> Response {
-    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
     let full_view = crate::caller_is_local_or_holds_token(peer, req.headers());
     let resp = next.run(req).await;
     if full_view {
         return resp;
     }
-    let is_json = resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.starts_with("application/json"));
+    let is_json = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|t| t.starts_with("application/json"));
     let (mut parts, body) = resp.into_parts();
     let Ok(r) = tokio::task::spawn_blocking(Redaction::derive_cached).await else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "response withheld: it could not be redacted for a remote reader\n").into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "response withheld: it could not be redacted for a remote reader\n",
+        )
+            .into_response();
     };
-    let redactor = if is_json { StreamRedactor::json(r) } else { StreamRedactor::text(r) };
+    let redactor = if is_json {
+        StreamRedactor::json(r)
+    } else {
+        StreamRedactor::text(r)
+    };
     parts.headers.remove(header::CONTENT_LENGTH);
-    Response::from_parts(parts, axum::body::Body::from_stream(redacted_chunks(body, redactor)))
+    Response::from_parts(
+        parts,
+        axum::body::Body::from_stream(redacted_chunks(body, redactor)),
+    )
 }
 
 /// How much of an arriving chunk is redacted per output chunk, so a handler that
@@ -838,7 +1031,9 @@ pub(crate) async fn redact_reads(req: Request, next: Next) -> Response {
 const REDACT_SLICE_BYTES: usize = 64 * 1024;
 
 struct RedactState {
-    chunks: std::pin::Pin<Box<dyn futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send>>,
+    chunks: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send>,
+    >,
     redactor: StreamRedactor,
     held: axum::body::Bytes,
     done: bool,
@@ -847,9 +1042,17 @@ struct RedactState {
 /// The body's bytes, each slice redacted as it passes, then the flush of what
 /// the last one left pending. A body error, or a JSON body that is not JSON
 /// (fail closed, #3073), ends the stream with that error.
-fn redacted_chunks(body: axum::body::Body, redactor: StreamRedactor) -> impl futures::Stream<Item = Result<Vec<u8>, axum::Error>> {
+fn redacted_chunks(
+    body: axum::body::Body,
+    redactor: StreamRedactor,
+) -> impl futures::Stream<Item = Result<Vec<u8>, axum::Error>> {
     use futures::StreamExt;
-    let state = RedactState { chunks: Box::pin(body.into_data_stream()), redactor, held: Default::default(), done: false };
+    let state = RedactState {
+        chunks: Box::pin(body.into_data_stream()),
+        redactor,
+        held: Default::default(),
+        done: false,
+    };
     futures::stream::unfold(state, |mut st| async move {
         loop {
             if st.done {
@@ -887,7 +1090,7 @@ fn redacted_chunks(body: axum::body::Body, redactor: StreamRedactor) -> impl fut
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet_view::tests::{peer_says, scripted, entry, identity};
+    use crate::fleet_view::tests::{entry, identity, peer_says, scripted};
     use crate::fleet_view::{AcceptsState, CardOutcome, CardSource, FleetContext};
     use crate::machine_card::tests::sample_card;
     use axum::body::{to_bytes, Body};
@@ -923,10 +1126,16 @@ mod tests {
             .unwrap();
             let vars: [(&'static str, String); 3] = [
                 ("DARKMUX_FLEET_FILE", fleet.display().to_string()),
-                ("DARKMUX_REDIS_URL", format!("redis://user:pw@{HUB_IP}:6379")),
+                (
+                    "DARKMUX_REDIS_URL",
+                    format!("redis://user:pw@{HUB_IP}:6379"),
+                ),
                 ("HOME", HOME.to_string()),
             ];
-            let saved = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
+            let saved = vars
+                .iter()
+                .map(|(k, _)| (*k, std::env::var_os(k)))
+                .collect();
             for (k, v) in &vars {
                 unsafe { std::env::set_var(k, v) };
             }
@@ -950,7 +1159,11 @@ mod tests {
     }
 
     async fn get(app: axum::Router, path: &str, from: &str) -> (u16, String) {
-        let mut req = Request::builder().uri(path).header("host", "localhost").body(Body::empty()).unwrap();
+        let mut req = Request::builder()
+            .uri(path)
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
         req.extensions_mut().insert(peer(from));
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status().as_u16();
@@ -966,12 +1179,30 @@ mod tests {
         let mut roster_entry = entry("peerone");
         roster_entry.address = format!("{PEER_IP}:8765");
         roster_entry.description = Some(format!("studio at {PEER_IP}"));
-        let s = scripted(identity("laptop", Some("LAPTOP-UID"), Some("n-laptop")), vec![roster_entry]);
+        let s = scripted(
+            identity("laptop", Some("LAPTOP-UID"), Some("n-laptop")),
+            vec![roster_entry],
+        );
         let mut card = sample_card();
-        card.profiles[0].description = Some(format!("the server at {HUB_IP}, notes in {HOME}/notes"));
+        card.profiles[0].description =
+            Some(format!("the server at {HUB_IP}, notes in {HOME}/notes"));
         card.specs.hub_configured = true;
-        peer_says(&s, "peerone", 0, CardOutcome::Available { card: Box::new(card), source: CardSource::Listener }, AcceptsState::Unknown);
-        crate::build_router_full(PathBuf::new(), None, None, FleetContext::with_sources(Arc::new(s)))
+        peer_says(
+            &s,
+            "peerone",
+            0,
+            CardOutcome::Available {
+                card: Box::new(card),
+                source: CardSource::Listener,
+            },
+            AcceptsState::Unknown,
+        );
+        crate::build_router_full(
+            PathBuf::new(),
+            None,
+            None,
+            FleetContext::with_sources(Arc::new(s)),
+        )
     }
 
     #[tokio::test]
@@ -981,9 +1212,15 @@ mod tests {
         let (status, body) = get(leaky_view_router(), "/fleet/view", REMOTE).await;
         assert_eq!(status, 200, "{body}");
         for secret in SECRETS {
-            assert!(!body.contains(secret), "a remote reader of /fleet/view found `{secret}`");
+            assert!(
+                !body.contains(secret),
+                "a remote reader of /fleet/view found `{secret}`"
+            );
         }
-        assert!(body.contains(ADDRESS_HIDDEN), "the hidden addresses read as a placeholder: {body}");
+        assert!(
+            body.contains(ADDRESS_HIDDEN),
+            "the hidden addresses read as a placeholder: {body}"
+        );
         assert!(body.contains("peerone"), "machine ids stay public");
     }
 
@@ -993,7 +1230,10 @@ mod tests {
         let _facts = HostFacts::set();
         let (_, body) = get(leaky_view_router(), "/fleet/view", LOCAL).await;
         for shown in [PEER_IP, HUB_IP, HOME] {
-            assert!(body.contains(shown), "this machine reads `{shown}` unchanged");
+            assert!(
+                body.contains(shown),
+                "this machine reads `{shown}` unchanged"
+            );
         }
     }
 
@@ -1009,11 +1249,20 @@ mod tests {
                 "cwd": format!("{HOME}/work"), "endpoint": format!("http://{HUB_IP}:1234/v1"),
                 "alt_endpoint": "http://[fd7a:115c:a1e0::53]:1234/v1", "peer": format!("{PEER_IP}:8765"),
             });
-            r.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            r.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
             r.to_string()
         };
-        let lines = [rec("dispatch.start", serde_json::json!({})), rec("dispatch.complete", serde_json::json!({"result": "stop"}))];
-        std::fs::write(dir.path().join(format!("{today}.jsonl")), lines.join("\n") + "\n").unwrap();
+        let lines = [
+            rec("dispatch.start", serde_json::json!({})),
+            rec("dispatch.complete", serde_json::json!({"result": "stop"})),
+        ];
+        std::fs::write(
+            dir.path().join(format!("{today}.jsonl")),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
         dir
     }
 
@@ -1032,23 +1281,44 @@ mod tests {
         let mut covered = 0;
         let mut flow_rows_seen = 0;
         for route in crate::routes::table() {
-            let crate::routes::Reply::Json(_) = route.reply else { continue };
+            let crate::routes::Reply::Json(_) = route.reply else {
+                continue;
+            };
             if route.path.starts_with("/panel/") {
                 continue;
             }
-            let id = if route.path.starts_with("/flow-dispatch/") { "s-1" } else { "m-1" };
+            let id = if route.path.starts_with("/flow-dispatch/") {
+                "s-1"
+            } else {
+                "m-1"
+            };
             let path = route.path.replace(":date", &today).replace(":id", id);
-            let (_, body) = get(crate::build_router(flows.path().to_path_buf()), &path, REMOTE).await;
+            let (_, body) = get(
+                crate::build_router(flows.path().to_path_buf()),
+                &path,
+                REMOTE,
+            )
+            .await;
             for secret in SECRETS.iter().chain([&SECRETS_V6]) {
-                assert!(!body.contains(secret), "{} showed a remote reader `{secret}`", route.path);
+                assert!(
+                    !body.contains(secret),
+                    "{} showed a remote reader `{secret}`",
+                    route.path
+                );
             }
             if body.contains("dispatch.complete") {
                 flow_rows_seen += 1;
-                assert!(body.contains(ADDRESS_HIDDEN), "{path}: the seeded rows read as hidden, not absent");
+                assert!(
+                    body.contains(ADDRESS_HIDDEN),
+                    "{path}: the seeded rows read as hidden, not absent"
+                );
             }
             covered += 1;
         }
-        assert!(covered >= 12, "the sweep must reach the daemon's JSON reads, reached {covered}");
+        assert!(
+            covered >= 12,
+            "the sweep must reach the daemon's JSON reads, reached {covered}"
+        );
         assert_eq!(flow_rows_seen, 3, "/flow/:date, /flow-mission/:id and /flow-dispatch/:id must each have read the seeded records");
     }
 
@@ -1060,7 +1330,12 @@ mod tests {
         let _facts = HostFacts::set();
         unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
         let flows = seed_flows();
-        let (_, body) = get(crate::build_router(flows.path().to_path_buf()), &format!("/flow/{}", darkmux_flow::day_utc_now()), LOCAL).await;
+        let (_, body) = get(
+            crate::build_router(flows.path().to_path_buf()),
+            &format!("/flow/{}", darkmux_flow::day_utc_now()),
+            LOCAL,
+        )
+        .await;
         for shown in [HUB_IP, "fd7a:115c:a1e0::53", HOME] {
             assert!(body.contains(shown), "this machine reads `{shown}`: {body}");
         }
@@ -1071,10 +1346,19 @@ mod tests {
     async fn roster_addresses_read_in_full_on_this_machine_and_hidden_remotely() {
         let _facts = HostFacts::set();
         let (_, local) = get(crate::build_router(PathBuf::new()), "/fleet/roster", LOCAL).await;
-        assert!(local.contains(PEER_IP) && local.contains(TAILNET_NAME), "{local}");
+        assert!(
+            local.contains(PEER_IP) && local.contains(TAILNET_NAME),
+            "{local}"
+        );
         let (_, remote) = get(crate::build_router(PathBuf::new()), "/fleet/roster", REMOTE).await;
-        assert!(!remote.contains(PEER_IP) && !remote.contains("example-hub"), "{remote}");
-        assert!(remote.contains("peerone"), "the machine id is public: {remote}");
+        assert!(
+            !remote.contains(PEER_IP) && !remote.contains("example-hub"),
+            "{remote}"
+        );
+        assert!(
+            remote.contains("peerone"),
+            "the machine id is public: {remote}"
+        );
     }
 
     #[tokio::test]
@@ -1085,8 +1369,14 @@ mod tests {
             let (_, body) = get(crate::build_router(PathBuf::new()), "/machine/specs", from).await;
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(json["hub_configured"], true, "{from}: {body}");
-            assert!(json.get("redis_url_redacted").is_none(), "the URL is not on the wire: {body}");
-            assert!(!body.contains(HUB_IP) && !body.contains("redis://"), "{from}: {body}");
+            assert!(
+                json.get("redis_url_redacted").is_none(),
+                "the URL is not on the wire: {body}"
+            );
+            assert!(
+                !body.contains(HUB_IP) && !body.contains("redis://"),
+                "{from}: {body}"
+            );
         }
     }
 
@@ -1101,8 +1391,14 @@ mod tests {
         let mut card = serde_json::to_value(sample_card()).unwrap();
         card["specs"] = serde_json::to_value(crate::gather_specs()).unwrap();
         let text = serde_json::to_string(&card).unwrap();
-        assert!(!text.contains("redis://"), "a card must not carry a redis URL: {text}");
-        assert!(!text.contains(HUB_IP), "a card must not carry the hub's address: {text}");
+        assert!(
+            !text.contains("redis://"),
+            "a card must not carry a redis URL: {text}"
+        );
+        assert!(
+            !text.contains(HUB_IP),
+            "a card must not carry the hub's address: {text}"
+        );
         assert_eq!(card["specs"]["hub_configured"], true);
     }
 
@@ -1110,15 +1406,24 @@ mod tests {
     #[serial_test::serial]
     fn literal_addresses_the_roster_does_not_list_are_hidden() {
         let r = Redaction::from_parts(&[], &[], None, None);
-        assert_eq!(r.line("hub 100.64.9.9:6379 and 127.0.0.1 and v4.0.0.1x"), format!("hub {ADDRESS_HIDDEN}:6379 and 127.0.0.1 and v4.0.0.1x"));
+        assert_eq!(
+            r.line("hub 100.64.9.9:6379 and 127.0.0.1 and v4.0.0.1x"),
+            format!("hub {ADDRESS_HIDDEN}:6379 and 127.0.0.1 and v4.0.0.1x")
+        );
         assert_eq!(r.line("box.example.ts.net."), format!("{ADDRESS_HIDDEN}."));
     }
 
     #[test]
     fn another_accounts_home_prefix_reads_as_a_tilde() {
         let r = Redaction::from_parts(&[], &[], None, None);
-        assert_eq!(r.line("see /Users/someone/notes and /home/ci-user/x"), "see ~/notes and ~/x");
-        assert_eq!(r.line("/Users/ and /usr/Users/x and /home/"), "/Users/ and /usr/Users/x and /home/");
+        assert_eq!(
+            r.line("see /Users/someone/notes and /home/ci-user/x"),
+            "see ~/notes and ~/x"
+        );
+        assert_eq!(
+            r.line("/Users/ and /usr/Users/x and /home/"),
+            "/Users/ and /usr/Users/x and /home/"
+        );
     }
 
     #[test]
@@ -1127,8 +1432,15 @@ mod tests {
         let _facts = HostFacts::set();
         unsafe { std::env::set_var("DARKMUX_REDIS_URL", "redis://u:p@hubname:6379") };
         let r = Redaction::derive();
-        assert_eq!(r.line("redis://hubname:6379 and hubname:7000"), format!("redis://{ADDRESS_HIDDEN}:6379 and {ADDRESS_HIDDEN}:7000"));
-        assert_eq!(r.line("the hubname word"), "the hubname word", "a bare name is not a host fact as a free word");
+        assert_eq!(
+            r.line("redis://hubname:6379 and hubname:7000"),
+            format!("redis://{ADDRESS_HIDDEN}:6379 and {ADDRESS_HIDDEN}:7000")
+        );
+        assert_eq!(
+            r.line("the hubname word"),
+            "the hubname word",
+            "a bare name is not a host fact as a free word"
+        );
     }
 
     /// (#3074) A hub password holding `#`, `/` or `?` must not make the host a
@@ -1142,7 +1454,11 @@ mod tests {
             let url = format!("redis://:{pw}@hubhost.example:6379");
             assert_eq!(url_host(&url).as_deref(), Some("hubhost.example"), "{pw}");
         }
-        assert_eq!(url_host("redis+unix:///tmp/x.sock?pass=s3"), None, "a socket has no host");
+        assert_eq!(
+            url_host("redis+unix:///tmp/x.sock?pass=s3"),
+            None,
+            "a socket has no host"
+        );
     }
 
     // ── the rules, unit by unit ────────────────────────────────────────
@@ -1157,7 +1473,11 @@ mod tests {
         let chars: Vec<char> = s.chars().collect();
         let keep = max - 1;
         let (head, tail) = (keep.div_ceil(2), keep - keep.div_ceil(2));
-        format!("{}…{}", chars[..head].iter().collect::<String>(), chars[chars.len() - tail..].iter().collect::<String>())
+        format!(
+            "{}…{}",
+            chars[..head].iter().collect::<String>(),
+            chars[chars.len() - tail..].iter().collect::<String>()
+        )
     }
 
     /// (5.0 security re-review C5) A cell cut short with `…`, in the middle
@@ -1166,24 +1486,45 @@ mod tests {
     /// still names it.
     #[test]
     fn a_cut_roster_address_or_tailnet_name_is_still_hidden() {
-        let r = Redaction::from_parts(&[("peerone", "peerone.lan-fake.example:8765")], &[], None, None);
+        let r = Redaction::from_parts(
+            &[("peerone", "peerone.lan-fake.example:8765")],
+            &[],
+            None,
+            None,
+        );
         for addr in ["peerone.lan-fake.example:8765", "peerone.lan-fake.example"] {
             for max in 6..addr.chars().count() {
                 let cut = middle_cut(addr, max);
-                assert_eq!(r.line(&format!("at {cut}  x")), format!("at {ADDRESS_HIDDEN}  x"), "{cut}");
+                assert_eq!(
+                    r.line(&format!("at {cut}  x")),
+                    format!("at {ADDRESS_HIDDEN}  x"),
+                    "{cut}"
+                );
             }
             let head: String = addr.chars().take(10).collect();
-            assert_eq!(r.line(&format!("at {head}…")), format!("at {ADDRESS_HIDDEN}"), "{head}…");
+            assert_eq!(
+                r.line(&format!("at {head}…")),
+                format!("at {ADDRESS_HIDDEN}"),
+                "{head}…"
+            );
         }
         // A tailnet name: cut in the middle with its `s.net` kept, or at its
         // end with its `.ts` kept.
         let name = "box.tailnet-example.ts.net";
         for max in 11..name.chars().count() {
             let cut = middle_cut(name, max);
-            assert_eq!(r.line(&format!("peer {cut}:8765")), format!("peer {ADDRESS_HIDDEN}:8765"), "{cut}");
+            assert_eq!(
+                r.line(&format!("peer {cut}:8765")),
+                format!("peer {ADDRESS_HIDDEN}:8765"),
+                "{cut}"
+            );
         }
         for head in ["box.tailnet-example.ts…", "box.tailnet-example.ts.n…"] {
-            assert_eq!(r.line(&format!("peer {head} up")), format!("peer {ADDRESS_HIDDEN} up"), "{head}");
+            assert_eq!(
+                r.line(&format!("peer {head} up")),
+                format!("peer {ADDRESS_HIDDEN} up"),
+                "{head}"
+            );
         }
         // Text that names neither keeps its `…`.
         assert_eq!(r.line("loading… done; v1.2…3.4"), "loading… done; v1.2…3.4");
@@ -1192,13 +1533,38 @@ mod tests {
     #[test]
     fn ipv4_is_hidden_when_private_or_addressing_and_prose_versions_survive() {
         let r = rules();
-        for hidden in ["100.64.7.7", "10.0.0.1", "172.16.0.1", "172.31.9.9", "192.168.1.5", "169.254.1.1"] {
-            assert_eq!(r.line(&format!("at {hidden} now")), format!("at {ADDRESS_HIDDEN} now"), "{hidden}");
+        for hidden in [
+            "100.64.7.7",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.9.9",
+            "192.168.1.5",
+            "169.254.1.1",
+        ] {
+            assert_eq!(
+                r.line(&format!("at {hidden} now")),
+                format!("at {ADDRESS_HIDDEN} now"),
+                "{hidden}"
+            );
         }
-        assert_eq!(r.line("http://8.8.8.8/x and 8.8.8.8:53 and me@8.8.8.8"), format!("http://{ADDRESS_HIDDEN}/x and {ADDRESS_HIDDEN}:53 and me@{ADDRESS_HIDDEN}"));
+        assert_eq!(
+            r.line("http://8.8.8.8/x and 8.8.8.8:53 and me@8.8.8.8"),
+            format!("http://{ADDRESS_HIDDEN}/x and {ADDRESS_HIDDEN}:53 and me@{ADDRESS_HIDDEN}")
+        );
         // `-` is a boundary for an IP literal.
-        assert_eq!(r.line("100.64.7.7-tail and ip-100.64.7.8"), format!("{ADDRESS_HIDDEN}-tail and ip-{ADDRESS_HIDDEN}"));
-        for kept in ["LM Studio 0.3.30.1", "1.2.3.4 in prose", "172.32.0.1", "127.0.0.1", "v4.0.0.1x", "100.64.7.7.example", "1.2.3.4.5"] {
+        assert_eq!(
+            r.line("100.64.7.7-tail and ip-100.64.7.8"),
+            format!("{ADDRESS_HIDDEN}-tail and ip-{ADDRESS_HIDDEN}")
+        );
+        for kept in [
+            "LM Studio 0.3.30.1",
+            "1.2.3.4 in prose",
+            "172.32.0.1",
+            "127.0.0.1",
+            "v4.0.0.1x",
+            "100.64.7.7.example",
+            "1.2.3.4.5",
+        ] {
             assert_eq!(r.line(kept), kept, "{kept}");
         }
     }
@@ -1206,17 +1572,39 @@ mod tests {
     #[test]
     fn ipv6_literals_are_hidden_except_loopback() {
         let r = rules();
-        assert_eq!(r.line("http://[fd7a:115c:a1e0::53]:1234/v1"), format!("http://[{ADDRESS_HIDDEN}]:1234/v1"));
-        assert_eq!(r.line("at fd7a:115c:a1e0:ab12:4843:cd96:625b:1 now"), format!("at {ADDRESS_HIDDEN} now"));
-        assert_eq!(r.line("fd7a:115c:a1e0::53: refused"), format!("{ADDRESS_HIDDEN}: refused"));
+        assert_eq!(
+            r.line("http://[fd7a:115c:a1e0::53]:1234/v1"),
+            format!("http://[{ADDRESS_HIDDEN}]:1234/v1")
+        );
+        assert_eq!(
+            r.line("at fd7a:115c:a1e0:ab12:4843:cd96:625b:1 now"),
+            format!("at {ADDRESS_HIDDEN} now")
+        );
+        assert_eq!(
+            r.line("fd7a:115c:a1e0::53: refused"),
+            format!("{ADDRESS_HIDDEN}: refused")
+        );
         // Glued to a label: the label's own letters can be hex digits (`bad`).
         assert_eq!(r.line("ip:fd7a::1"), format!("ip:{ADDRESS_HIDDEN}"));
-        assert_eq!(r.line("peer:fd7a:115c::53"), format!("peer:{ADDRESS_HIDDEN}"));
-        assert_eq!(r.line("bad:fd7a:115c:a1e0::53"), format!("bad:{ADDRESS_HIDDEN}"));
+        assert_eq!(
+            r.line("peer:fd7a:115c::53"),
+            format!("peer:{ADDRESS_HIDDEN}")
+        );
+        assert_eq!(
+            r.line("bad:fd7a:115c:a1e0::53"),
+            format!("bad:{ADDRESS_HIDDEN}")
+        );
         for hidden in ["2001:db8::1", "fe80::1", "fc00::5"] {
             assert_eq!(r.line(hidden), ADDRESS_HIDDEN, "{hidden}");
         }
-        for kept in ["::1", "[::1]:8765", "at 12:34:56 today", "darkmux::fleet", "a::b", "::"] {
+        for kept in [
+            "::1",
+            "[::1]:8765",
+            "at 12:34:56 today",
+            "darkmux::fleet",
+            "a::b",
+            "::",
+        ] {
             assert_eq!(r.line(kept), kept, "{kept}");
         }
     }
@@ -1226,9 +1614,19 @@ mod tests {
     #[test]
     fn an_ipv6_zone_goes_with_its_address() {
         let r = rules();
-        assert_eq!(r.line("peer fe80::1%en0 up"), format!("peer {ADDRESS_HIDDEN} up"));
-        assert_eq!(r.line("http://[fe80::1%25en0]:8765/x"), format!("http://[{ADDRESS_HIDDEN}]:8765/x"));
-        assert_eq!(r.line("::1%lo0 stays"), "::1%lo0 stays", "loopback stays, zone and all");
+        assert_eq!(
+            r.line("peer fe80::1%en0 up"),
+            format!("peer {ADDRESS_HIDDEN} up")
+        );
+        assert_eq!(
+            r.line("http://[fe80::1%25en0]:8765/x"),
+            format!("http://[{ADDRESS_HIDDEN}]:8765/x")
+        );
+        assert_eq!(
+            r.line("::1%lo0 stays"),
+            "::1%lo0 stays",
+            "loopback stays, zone and all"
+        );
     }
 
     /// (5.0 review item 8) An OSC 8 link whose target names a value the
@@ -1237,7 +1635,10 @@ mod tests {
     fn a_link_to_a_withheld_location_loses_its_target() {
         let w = Withheld::from_values(["/opt/fake-fixtures/alpha".to_string()]);
         let text = "\x1b]8;;file:///opt/fake-fixtures/alpha\x1b\\alpha\x1b]8;;\x1b\\\n";
-        assert_eq!(redact_panel_stdout(text, &rules(), &w), "\x1b]8;;\x1b\\alpha\x1b]8;;\x1b\\\n");
+        assert_eq!(
+            redact_panel_stdout(text, &rules(), &w),
+            "\x1b]8;;\x1b\\alpha\x1b]8;;\x1b\\\n"
+        );
     }
 
     /// (5.0 review items 1, 2 and 5) What a console panel withholds is read
@@ -1266,14 +1667,27 @@ mod tests {
         let vars = [
             ("DARKMUX_HOME", root.display().to_string()),
             ("HOME", dir.path().join("home").display().to_string()),
-            ("DARKMUX_HOST_SOURCE_SCRIPT", "/opt/fake-hostsrc/scenario.json".to_string()),
+            (
+                "DARKMUX_HOST_SOURCE_SCRIPT",
+                "/opt/fake-hostsrc/scenario.json".to_string(),
+            ),
             ("DARKMUX_MODS_DIR", "/opt/fake-mods".to_string()),
             // (5.0 security re-review N3) An enum setting holding a value that is
             // not one of its tokens is bad config, which doctor's refusal
             // quotes, wherever it was set.
-            ("DARKMUX_FLEET_MODE", "/opt/fake-env-enum-garbage".to_string()),
+            (
+                "DARKMUX_FLEET_MODE",
+                "/opt/fake-env-enum-garbage".to_string(),
+            ),
         ];
-        let saved: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).chain([("DARKMUX_FLEET_FILE", std::env::var_os("DARKMUX_FLEET_FILE")), ("DARKMUX_PROFILES", std::env::var_os("DARKMUX_PROFILES"))]).collect();
+        let saved: Vec<_> = vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var_os(k)))
+            .chain([
+                ("DARKMUX_FLEET_FILE", std::env::var_os("DARKMUX_FLEET_FILE")),
+                ("DARKMUX_PROFILES", std::env::var_os("DARKMUX_PROFILES")),
+            ])
+            .collect();
         for (k, v) in &vars {
             unsafe { std::env::set_var(k, v) };
         }
@@ -1287,11 +1701,22 @@ mod tests {
             }
         }
         let vals = w.values();
-        for want in ["/opt/fake-env-enum-garbage", "/opt/fake-hostsrc/scenario.json", "/opt/fake-mods", "/opt/fake-fixtures/alpha", "/Volumes/FakeWork/beta", "https://hosted-secret.example.com/v1", "other-key-item"] {
+        for want in [
+            "/opt/fake-env-enum-garbage",
+            "/opt/fake-hostsrc/scenario.json",
+            "/opt/fake-mods",
+            "/opt/fake-fixtures/alpha",
+            "/Volumes/FakeWork/beta",
+            "https://hosted-secret.example.com/v1",
+            "other-key-item",
+        ] {
             assert!(vals.iter().any(|v| v == want), "{want} in {vals:?}");
         }
         for public in ["hosted", "LAPTOP", "laptop", "relay"] {
-            assert!(!vals.iter().any(|v| v.eq_ignore_ascii_case(public)), "the public name {public} is not withheld: {vals:?}");
+            assert!(
+                !vals.iter().any(|v| v.eq_ignore_ascii_case(public)),
+                "the public name {public} is not withheld: {vals:?}"
+            );
         }
     }
 
@@ -1302,7 +1727,13 @@ mod tests {
             r.line("/Users/someone/a /home/ci-user/b /var/home/core/c /root/d /root"),
             "~/a ~/b ~/c ~/d ~"
         );
-        for kept in ["/rootfs/x", "/usr/home/x", "/Users/", "src/Users/x", "/home/"] {
+        for kept in [
+            "/rootfs/x",
+            "/usr/home/x",
+            "/Users/",
+            "src/Users/x",
+            "/home/",
+        ] {
             assert_eq!(r.line(kept), kept, "{kept}");
         }
     }
@@ -1311,8 +1742,16 @@ mod tests {
     /// and must be where it addresses, even as the whole string after `@`.
     #[test]
     fn a_bare_host_is_a_whole_word_and_an_at_sign_is_a_position() {
-        let r = Redaction::from_parts(&[("peerone", "studio"), ("peertwo", "kain-studio")], &[], None, None);
-        assert_eq!(r.line("lmstudio:1234 and lmstudio-community/x"), "lmstudio:1234 and lmstudio-community/x");
+        let r = Redaction::from_parts(
+            &[("peerone", "studio"), ("peertwo", "kain-studio")],
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(
+            r.line("lmstudio:1234 and lmstudio-community/x"),
+            "lmstudio:1234 and lmstudio-community/x"
+        );
         assert_eq!(r.line("studio:1234"), format!("{ADDRESS_HIDDEN}:1234"));
         assert_eq!(r.line("me@kain-studio"), format!("me@{ADDRESS_HIDDEN}"));
     }
@@ -1334,14 +1773,27 @@ mod tests {
                 Handler => handler.push(route.path),
                 Static => {
                     let path = route.path.replace(":date", &darkmux_flow::day_utc_now());
-                    let (_, body) = get(crate::build_router(flows.path().to_path_buf()), &path, REMOTE).await;
+                    let (_, body) = get(
+                        crate::build_router(flows.path().to_path_buf()),
+                        &path,
+                        REMOTE,
+                    )
+                    .await;
                     for secret in SECRETS {
-                        assert!(!body.contains(secret), "static route {} shows `{secret}`", route.path);
+                        assert!(
+                            !body.contains(secret),
+                            "static route {} shows `{secret}`",
+                            route.path
+                        );
                     }
                 }
             }
         }
-        assert_eq!(handler, ["/flow/:date/stream", "/panel/:id"], "a route that redacts for itself must be declared here on purpose");
+        assert_eq!(
+            handler,
+            ["/flow/:date/stream", "/panel/:id"],
+            "a route that redacts for itself must be declared here on purpose"
+        );
     }
 
     /// `CacheKey` follows a real `fleet.json` edit: a roster that changes between two
@@ -1352,7 +1804,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fleet = dir.path().join("fleet.json");
         let roster = |address: &str| {
-            format!(r#"{{"version":"2","machines":{{"peerone":{{"id":"peerone","address":"{address}","added_unix_ms":1}}}}}}"#)
+            format!(
+                r#"{{"version":"2","machines":{{"peerone":{{"id":"peerone","address":"{address}","added_unix_ms":1}}}}}}"#
+            )
         };
         let saved = std::env::var_os("DARKMUX_FLEET_FILE");
         unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &fleet) };
@@ -1360,13 +1814,24 @@ mod tests {
 
         std::fs::write(&fleet, roster("alpha.example:8765")).unwrap();
         let first = Redaction::derive_cached();
-        assert!(!first.line("see alpha.example").contains("alpha.example"), "the first roster's address is hidden");
-        assert!(first.line("see beta.example").contains("beta.example"), "an address not in the roster is not");
+        assert!(
+            !first.line("see alpha.example").contains("alpha.example"),
+            "the first roster's address is hidden"
+        );
+        assert!(
+            first.line("see beta.example").contains("beta.example"),
+            "an address not in the roster is not"
+        );
 
         // A longer address, so the length half of the key differs even on a coarse mtime.
         std::fs::write(&fleet, roster("beta.example.longer:8765")).unwrap();
         let second = Redaction::derive_cached();
-        assert!(!second.line("see beta.example.longer").contains("beta.example.longer"), "the edit is picked up inside the TTL");
+        assert!(
+            !second
+                .line("see beta.example.longer")
+                .contains("beta.example.longer"),
+            "the edit is picked up inside the TTL"
+        );
 
         match saved {
             Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v) },
@@ -1379,12 +1844,23 @@ mod tests {
     fn the_cache_derives_once_per_key_and_again_when_the_key_changes() {
         let derives = std::cell::Cell::new(0);
         let mut cache = RedactionCache::default();
-        let key = |m: u64| CacheKey { roster: Some((std::time::UNIX_EPOCH, m)), home: Some("/h".into()), darkmux_home: None };
+        let key = |m: u64| CacheKey {
+            roster: Some((std::time::UNIX_EPOCH, m)),
+            home: Some("/h".into()),
+            darkmux_home: None,
+        };
         let now = std::time::Instant::now();
-        let derive = || { derives.set(derives.get() + 1); Redaction::from_parts(&[], &[], None, None) };
+        let derive = || {
+            derives.set(derives.get() + 1);
+            Redaction::from_parts(&[], &[], None, None)
+        };
         cache.get(key(1), now, derive);
         cache.get(key(1), now, derive);
-        assert_eq!(derives.get(), 1, "an unchanged roster, HOME and DARKMUX_HOME reuse the derivation");
+        assert_eq!(
+            derives.get(),
+            1,
+            "an unchanged roster, HOME and DARKMUX_HOME reuse the derivation"
+        );
         cache.get(key(2), now, derive);
         assert_eq!(derives.get(), 2, "a changed fleet.json derives again");
         let mut other_home = key(2);
@@ -1392,13 +1868,25 @@ mod tests {
         cache.get(other_home.clone(), now, derive);
         assert_eq!(derives.get(), 3, "a changed HOME derives again");
         cache.get(other_home, now + REDACTION_CACHE_TTL, derive);
-        assert_eq!(derives.get(), 4, "an aged entry derives again, so a hub or machine-id change still lands");
+        assert_eq!(
+            derives.get(),
+            4,
+            "an aged entry derives again, so a hub or machine-id change still lands"
+        );
     }
 
     #[tokio::test]
     async fn a_non_json_reply_on_a_json_route_is_redacted_as_text_for_a_remote_reader() {
         let app = axum::Router::new()
-            .route("/t", axum::routing::get(|| async { ([("content-type", "text/plain")], "failed at 100.64.7.7 in /Users/someone/x") }))
+            .route(
+                "/t",
+                axum::routing::get(|| async {
+                    (
+                        [("content-type", "text/plain")],
+                        "failed at 100.64.7.7 in /Users/someone/x",
+                    )
+                }),
+            )
             .layer(axum::middleware::from_fn(redact_reads));
         let (_, remote) = get(app.clone(), "/t", REMOTE).await;
         assert_eq!(remote, format!("failed at {ADDRESS_HIDDEN} in ~/x"));
@@ -1414,11 +1902,20 @@ mod tests {
         let n = 100_000_000 / record.len() + 1;
         let body = format!("[{}]", vec![record.as_str(); n].join(","));
         let app = axum::Router::new()
-            .route("/t", axum::routing::get(move || { let b = body.clone(); async move { ([("content-type", "application/json")], b) } }))
+            .route(
+                "/t",
+                axum::routing::get(move || {
+                    let b = body.clone();
+                    async move { ([("content-type", "application/json")], b) }
+                }),
+            )
             .layer(axum::middleware::from_fn(redact_reads));
         let (status, remote) = get(app.clone(), "/t", REMOTE).await;
         assert_eq!(status, 200);
-        assert!(remote.len() > 100_000_000 && !remote.contains(PEER_IP), "served in full, redacted");
+        assert!(
+            remote.len() > 100_000_000 && !remote.contains(PEER_IP),
+            "served in full, redacted"
+        );
         let (_, local) = get(app, "/t", LOCAL).await;
         assert!(local.contains(PEER_IP), "a local reader sees it as built");
     }
@@ -1434,11 +1931,26 @@ mod tests {
         let body = format!("[{}]", vec![record.as_str(); 2000].join(","));
         let slices = body.len().div_ceil(64 * 1024);
         let app = axum::Router::new()
-            .route("/t", axum::routing::get(move || { let b = body.clone(); async move { ([("content-type", "application/json")], b) } }))
+            .route(
+                "/t",
+                axum::routing::get(move || {
+                    let b = body.clone();
+                    async move { ([("content-type", "application/json")], b) }
+                }),
+            )
             .layer(axum::middleware::from_fn(redact_reads));
-        let mut req = Request::builder().uri("/t").header("host", "localhost").body(Body::empty()).unwrap();
+        let mut req = Request::builder()
+            .uri("/t")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
         req.extensions_mut().insert(peer(REMOTE));
-        let mut chunks = app.oneshot(req).await.unwrap().into_body().into_data_stream();
+        let mut chunks = app
+            .oneshot(req)
+            .await
+            .unwrap()
+            .into_body()
+            .into_data_stream();
         let (mut largest, mut total, mut count) = (0, 0, 0);
         while let Some(c) = chunks.next().await {
             let c = c.unwrap();
@@ -1447,7 +1959,10 @@ mod tests {
             count += 1;
         }
         assert!(total > 2_000_000);
-        assert!(largest <= REDACT_SLICE_BYTES + record.len(), "a {largest} byte chunk");
+        assert!(
+            largest <= REDACT_SLICE_BYTES + record.len(),
+            "a {largest} byte chunk"
+        );
         // One output chunk per slice, plus the flush of what the last one left pending.
         assert!(count <= slices + 1, "{count} chunks for {slices} slices");
     }
@@ -1456,7 +1971,11 @@ mod tests {
     /// body ended in an error (a truncated response).
     async fn get_streamed(app: axum::Router, path: &str) -> (u16, String, bool) {
         use futures::StreamExt;
-        let mut req = Request::builder().uri(path).header("host", "localhost").body(Body::empty()).unwrap();
+        let mut req = Request::builder()
+            .uri(path)
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
         req.extensions_mut().insert(peer(REMOTE));
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status().as_u16();
@@ -1473,7 +1992,13 @@ mod tests {
 
     fn json_route(body: String) -> axum::Router {
         axum::Router::new()
-            .route("/t", axum::routing::get(move || { let b = body.clone(); async move { ([("content-type", "application/json")], b) } }))
+            .route(
+                "/t",
+                axum::routing::get(move || {
+                    let b = body.clone();
+                    async move { ([("content-type", "application/json")], b) }
+                }),
+            )
             .layer(axum::middleware::from_fn(redact_reads))
     }
 
@@ -1482,10 +2007,17 @@ mod tests {
     /// escaped facts (#3073).
     #[tokio::test]
     async fn a_malformed_json_reply_ends_the_stream_for_a_remote_reader() {
-        let (status, remote, errored) = get_streamed(json_route("{\"a\": 100.64.7.7 /Users/someone/x".into()), "/t").await;
+        let (status, remote, errored) = get_streamed(
+            json_route("{\"a\": 100.64.7.7 /Users/someone/x".into()),
+            "/t",
+        )
+        .await;
         assert_eq!(status, 200);
         assert!(errored, "the stream ends in an error: {remote}");
-        assert!(!remote.contains(PEER_IP) && !remote.contains("/Users/someone"), "{remote}");
+        assert!(
+            !remote.contains(PEER_IP) && !remote.contains("/Users/someone"),
+            "{remote}"
+        );
     }
 
     /// The error that truncates a malformed JSON reply says why, so whoever reads it in a
@@ -1493,9 +2025,16 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_json_reply_ends_in_an_error_that_names_why() {
         use futures::StreamExt;
-        let mut req = Request::builder().uri("/t").header("host", "localhost").body(Body::empty()).unwrap();
+        let mut req = Request::builder()
+            .uri("/t")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
         req.extensions_mut().insert(peer(REMOTE));
-        let resp = json_route("{\"a\": 100.64.7.7".into()).oneshot(req).await.unwrap();
+        let resp = json_route("{\"a\": 100.64.7.7".into())
+            .oneshot(req)
+            .await
+            .unwrap();
         let mut chunks = resp.into_body().into_data_stream();
         let mut error = None;
         while let Some(c) = chunks.next().await {
@@ -1504,7 +2043,10 @@ mod tests {
             }
         }
         let error = error.expect("the stream ends in an error");
-        assert!(error.contains("not valid JSON") && error.contains("withheld"), "{error:?}");
+        assert!(
+            error.contains("not valid JSON") && error.contains("withheld"),
+            "{error:?}"
+        );
     }
 
     /// The reviewer's proof: a real `axum::Json` handler, 130 levels deep (past serde_json's
@@ -1517,15 +2059,33 @@ mod tests {
             v = serde_json::json!([v]);
         }
         let app = axum::Router::new()
-            .route("/t", axum::routing::get(move || { let v = v.clone(); async move { axum::Json(v) } }))
+            .route(
+                "/t",
+                axum::routing::get(move || {
+                    let v = v.clone();
+                    async move { axum::Json(v) }
+                }),
+            )
             .layer(axum::middleware::from_fn(redact_reads));
         let (status, remote, errored) = get_streamed(app, "/t").await;
         assert_eq!(status, 200);
         assert!(!errored, "valid JSON of any depth is served");
-        assert!(!remote.contains(PEER_IP) && !remote.contains("/Users/someone"), "{remote}");
-        let inner = remote.strip_prefix(&"[".repeat(130)).and_then(|r| r.strip_suffix(&"]".repeat(130))).expect("130 levels kept");
-        let line = serde_json::from_str::<serde_json::Value>(inner).expect("valid JSON")["line"].as_str().unwrap().to_string();
-        assert!(line.starts_with("err\n") && line.contains(ADDRESS_HIDDEN), "{line}");
+        assert!(
+            !remote.contains(PEER_IP) && !remote.contains("/Users/someone"),
+            "{remote}"
+        );
+        let inner = remote
+            .strip_prefix(&"[".repeat(130))
+            .and_then(|r| r.strip_suffix(&"]".repeat(130)))
+            .expect("130 levels kept");
+        let line = serde_json::from_str::<serde_json::Value>(inner).expect("valid JSON")["line"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            line.starts_with("err\n") && line.contains(ADDRESS_HIDDEN),
+            "{line}"
+        );
     }
 
     /// JavaScript accepts `["\ud800", ...]` where serde_json refuses the lone surrogate; the
@@ -1535,7 +2095,10 @@ mod tests {
         let body = r#"["\ud800","\/Users\/kfake\/x","\n100.64.7.7"]"#.to_string();
         let (_, remote, errored) = get_streamed(json_route(body), "/t").await;
         assert!(errored, "fails closed: {remote}");
-        assert!(!remote.contains("kfake") && !remote.contains(PEER_IP) && !remote.contains("Users"), "{remote}");
+        assert!(
+            !remote.contains("kfake") && !remote.contains(PEER_IP) && !remote.contains("Users"),
+            "{remote}"
+        );
     }
 
     /// A route registered anywhere but the route table escapes the layer. The
@@ -1552,13 +2115,24 @@ mod tests {
         for entry in std::fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            if !name.ends_with(".rs") || name.ends_with("_tests.rs") || ["routes.rs", "fleet_listener.rs", "redaction.rs"].contains(&name.as_str()) {
+            if !name.ends_with(".rs")
+                || name.ends_with("_tests.rs")
+                || ["routes.rs", "fleet_listener.rs", "redaction.rs"].contains(&name.as_str())
+            {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
             // A file's test module comes last; only the code above it counts.
             let code = text.split("\n#[cfg(test)]\nmod tests").next().unwrap_or("");
-            let registers = [".route(", ".nest(", ".route_service(", ".nest_service(", ".fallback("].iter().any(|p| code.contains(p));
+            let registers = [
+                ".route(",
+                ".nest(",
+                ".route_service(",
+                ".nest_service(",
+                ".fallback(",
+            ]
+            .iter()
+            .any(|p| code.contains(p));
             if registers || (code.contains(".merge(") && code.contains("Router")) {
                 offenders.push(name);
             }
@@ -1574,9 +2148,17 @@ mod tests {
         let date = darkmux_flow::day_utc_now();
         std::fs::write(flows.join(format!("{date}.jsonl")), "").unwrap();
         let app = crate::build_router(flows.to_path_buf());
-        let mut req = Request::builder().uri(format!("/flow/{date}/stream")).header("host", "localhost").body(Body::empty()).unwrap();
+        let mut req = Request::builder()
+            .uri(format!("/flow/{date}/stream"))
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
         req.extensions_mut().insert(peer(from));
-        app.oneshot(req).await.unwrap().into_body().into_data_stream()
+        app.oneshot(req)
+            .await
+            .unwrap()
+            .into_body()
+            .into_data_stream()
     }
 
     async fn read_until(mut body: axum::body::BodyDataStream, marker: &str) -> String {
@@ -1597,7 +2179,10 @@ mod tests {
     fn append_flow_line(flows: &std::path::Path, line: &str) {
         use std::io::Write;
         let date = darkmux_flow::day_utc_now();
-        let mut f = std::fs::OpenOptions::new().append(true).open(flows.join(format!("{date}.jsonl"))).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(flows.join(format!("{date}.jsonl")))
+            .unwrap();
         writeln!(f, "{line}").unwrap();
     }
 
@@ -1611,9 +2196,16 @@ mod tests {
             let body = open_stream(from, flows.path()).await;
             append_flow_line(flows.path(), LEAKY_LINE);
             let seen = read_until(body, "end-of-line").await;
-            assert!(seen.contains("end-of-line"), "{from}: the line arrived: {seen}");
+            assert!(
+                seen.contains("end-of-line"),
+                "{from}: the line arrived: {seen}"
+            );
             for secret in ["fixture-home", "fd7a", PEER_IP] {
-                assert_eq!(!seen.contains(secret), hidden, "{from}: `{secret}` in {seen}");
+                assert_eq!(
+                    !seen.contains(secret),
+                    hidden,
+                    "{from}: `{secret}` in {seen}"
+                );
             }
         }
     }
@@ -1626,11 +2218,22 @@ mod tests {
         for (from, hidden) in [(REMOTE, true), (LOCAL, false)] {
             let flows = tempfile::tempdir().unwrap();
             let body = open_stream(from, flows.path()).await;
-            crate::live_hub::hub().send(std::sync::Arc::from(LEAKY_LINE.replace("end-of-line", "live-marker").as_str())).ok();
+            crate::live_hub::hub()
+                .send(std::sync::Arc::from(
+                    LEAKY_LINE.replace("end-of-line", "live-marker").as_str(),
+                ))
+                .ok();
             let seen = read_until(body, "live-marker").await;
-            assert!(seen.contains("live-marker"), "{from}: the sample arrived: {seen}");
+            assert!(
+                seen.contains("live-marker"),
+                "{from}: the sample arrived: {seen}"
+            );
             for secret in ["fixture-home", "fd7a", PEER_IP] {
-                assert_eq!(!seen.contains(secret), hidden, "{from}: `{secret}` in {seen}");
+                assert_eq!(
+                    !seen.contains(secret),
+                    hidden,
+                    "{from}: `{secret}` in {seen}"
+                );
             }
         }
     }
@@ -1647,6 +2250,12 @@ mod tests {
         let body = axum::response::sse::Sse::new(events);
         let resp = axum::response::IntoResponse::into_response(body);
         let seen = read_until(resp.into_body().into_data_stream(), "end-of-line").await;
-        assert!(seen.contains("end-of-line") && !seen.contains("fixture-home") && !seen.contains("fd7a") && !seen.contains(PEER_IP), "{seen}");
+        assert!(
+            seen.contains("end-of-line")
+                && !seen.contains("fixture-home")
+                && !seen.contains("fd7a")
+                && !seen.contains(PEER_IP),
+            "{seen}"
+        );
     }
 }

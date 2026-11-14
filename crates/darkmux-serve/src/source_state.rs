@@ -86,8 +86,13 @@ fn known_detail(wire: &str) -> &'static str {
 #[serde(tag = "state", rename_all = "snake_case")]
 enum WireSourceState {
     Ok,
-    Stale { age_ms: u64, detail: String },
-    Unavailable { detail: String },
+    Stale {
+        age_ms: u64,
+        detail: String,
+    },
+    Unavailable {
+        detail: String,
+    },
     Off,
     /// A state a newer darkmux states. It reads as `unavailable`, the cautious
     /// reading: never as `ok` or `off`, which would say the response is whole.
@@ -99,10 +104,17 @@ impl<'de> serde::Deserialize<'de> for SourceState {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Ok(match WireSourceState::deserialize(d)? {
             WireSourceState::Ok => SourceState::Ok,
-            WireSourceState::Stale { age_ms, detail } => SourceState::Stale { age_ms, detail: known_detail(&detail) },
-            WireSourceState::Unavailable { detail } => SourceState::Unavailable { detail: known_detail(&detail) },
+            WireSourceState::Stale { age_ms, detail } => SourceState::Stale {
+                age_ms,
+                detail: known_detail(&detail),
+            },
+            WireSourceState::Unavailable { detail } => SourceState::Unavailable {
+                detail: known_detail(&detail),
+            },
             WireSourceState::Off => SourceState::Off,
-            WireSourceState::Unrecognized => SourceState::Unavailable { detail: UNRECOGNIZED_DETAIL },
+            WireSourceState::Unrecognized => SourceState::Unavailable {
+                detail: UNRECOGNIZED_DETAIL,
+            },
         })
     }
 }
@@ -136,7 +148,12 @@ impl SourceState {
 /// state. It stays correct as sources are added: a response is complete only
 /// when EVERY tracked source is.
 pub(crate) fn coverage_meta(fleet: &SourceState) -> CoverageMeta {
-    CoverageMeta { sources: CoverageSources { fleet: fleet.clone() }, complete: fleet.is_complete() }
+    CoverageMeta {
+        sources: CoverageSources {
+            fleet: fleet.clone(),
+        },
+        complete: fleet.is_complete(),
+    }
 }
 
 #[cfg(test)]
@@ -152,11 +169,18 @@ mod tests {
         let known = crate::PRESENCE_READ_FAILED;
         assert_eq!(
             read(serde_json::json!({"state": "stale", "age_ms": 7, "detail": known})),
-            SourceState::Stale { age_ms: 7, detail: known }
+            SourceState::Stale {
+                age_ms: 7,
+                detail: known
+            }
         );
         assert_eq!(
-            read(serde_json::json!({"state": "unavailable", "detail": "\u{1b}[31m free text from a peer"})),
-            SourceState::Unavailable { detail: UNRECOGNIZED_DETAIL }
+            read(
+                serde_json::json!({"state": "unavailable", "detail": "\u{1b}[31m free text from a peer"})
+            ),
+            SourceState::Unavailable {
+                detail: UNRECOGNIZED_DETAIL
+            }
         );
     }
 
@@ -164,8 +188,16 @@ mod tests {
     /// that says the response is complete.
     #[test]
     fn a_state_from_a_newer_darkmux_reads_as_unavailable_not_as_ok() {
-        let read = serde_json::from_value::<SourceState>(serde_json::json!({"state": "delegated", "to": "a hub"})).unwrap();
-        assert_eq!(read, SourceState::Unavailable { detail: UNRECOGNIZED_DETAIL });
+        let read = serde_json::from_value::<SourceState>(
+            serde_json::json!({"state": "delegated", "to": "a hub"}),
+        )
+        .unwrap();
+        assert_eq!(
+            read,
+            SourceState::Unavailable {
+                detail: UNRECOGNIZED_DETAIL
+            }
+        );
         assert!(!read.is_complete());
     }
 
@@ -176,22 +208,41 @@ mod tests {
         // machine is not degraded) while `unavailable` must not, even though
         // both produce an empty result set.
         assert!(SourceState::Ok.is_complete());
-        assert!(SourceState::Off.is_complete(), "an unconfigured source is not a degradation");
+        assert!(
+            SourceState::Off.is_complete(),
+            "an unconfigured source is not a degradation"
+        );
         assert!(!SourceState::Unavailable { detail: "x" }.is_complete());
-        assert!(!SourceState::Stale { age_ms: 1, detail: "x" }.is_complete());
+        assert!(!SourceState::Stale {
+            age_ms: 1,
+            detail: "x"
+        }
+        .is_complete());
     }
 
     #[test]
     fn states_serialize_with_a_flat_tag_the_client_can_switch_on() {
-        assert_eq!(serde_json::to_value(SourceState::Ok).unwrap(), serde_json::json!({"state": "ok"}));
-        assert_eq!(serde_json::to_value(SourceState::Off).unwrap(), serde_json::json!({"state": "off"}));
         assert_eq!(
-            serde_json::to_value(SourceState::Stale { age_ms: 41_200, detail: "could not reach Redis" })
-                .unwrap(),
+            serde_json::to_value(SourceState::Ok).unwrap(),
+            serde_json::json!({"state": "ok"})
+        );
+        assert_eq!(
+            serde_json::to_value(SourceState::Off).unwrap(),
+            serde_json::json!({"state": "off"})
+        );
+        assert_eq!(
+            serde_json::to_value(SourceState::Stale {
+                age_ms: 41_200,
+                detail: "could not reach Redis"
+            })
+            .unwrap(),
             serde_json::json!({"state": "stale", "age_ms": 41_200, "detail": "could not reach Redis"})
         );
         assert_eq!(
-            serde_json::to_value(SourceState::Unavailable { detail: "could not reach Redis" }).unwrap(),
+            serde_json::to_value(SourceState::Unavailable {
+                detail: "could not reach Redis"
+            })
+            .unwrap(),
             serde_json::json!({"state": "unavailable", "detail": "could not reach Redis"})
         );
     }
@@ -220,6 +271,12 @@ mod tests {
         // warning for a fleet it was never configured to have.
         assert!(coverage_meta(&SourceState::Off).complete);
         assert!(!coverage_meta(&SourceState::Unavailable { detail: "x" }).complete);
-        assert!(!coverage_meta(&SourceState::Stale { age_ms: 5, detail: "x" }).complete);
+        assert!(
+            !coverage_meta(&SourceState::Stale {
+                age_ms: 5,
+                detail: "x"
+            })
+            .complete
+        );
     }
 }

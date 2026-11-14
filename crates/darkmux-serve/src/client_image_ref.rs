@@ -47,8 +47,21 @@ enum Kind {
 /// The attributes whose whole value is a URL (a Vue binding's `:` or
 /// `v-bind:` aside).
 pub const URL_ATTRIBUTES: &[&str] = &[
-    "src", "href", "poster", "content", "data-src", "data-href", "data-bg", "data-background",
-    "data-original", "background", "xlink:href", "icon", "srcset", "data-srcset", "imagesrcset",
+    "src",
+    "href",
+    "poster",
+    "content",
+    "data-src",
+    "data-href",
+    "data-bg",
+    "data-background",
+    "data-original",
+    "background",
+    "xlink:href",
+    "icon",
+    "srcset",
+    "data-srcset",
+    "imagesrcset",
 ];
 
 /// The attributes whose value is a list of `url descriptor` candidates.
@@ -56,7 +69,15 @@ const SRCSET_ATTRIBUTES: &[&str] = &["srcset", "data-srcset", "imagesrcset"];
 
 /// Keys (and attributes) whose value is words, never a URL.
 pub const TEXT_KEYS: &[&str] = &[
-    "alt", "title", "caption", "label", "description", "aria-label", "placeholder", "text", "summary",
+    "alt",
+    "title",
+    "caption",
+    "label",
+    "description",
+    "aria-label",
+    "placeholder",
+    "text",
+    "summary",
 ];
 
 /// The longest attribute or key name looked for: a longer run of name
@@ -113,10 +134,19 @@ fn kind_by_extension(ext: &str) -> Option<Kind> {
 fn outside_the_site(file: &str) -> bool {
     let name = file.rsplit('/').next().unwrap_or(file).to_ascii_uppercase();
     let stem = name.split('.').next().unwrap_or("");
-    let dated = ["CHANGELOG", "CHANGES", "HISTORY"].iter().any(|p| stem.starts_with(p));
+    let dated = ["CHANGELOG", "CHANGES", "HISTORY"]
+        .iter()
+        .any(|p| stem.starts_with(p));
     let named = matches!(
         stem,
-        "README" | "CONTRIBUTING" | "LICENSE" | "LICENCE" | "CODE_OF_CONDUCT" | "SECURITY" | "AGENTS" | "CLAUDE"
+        "README"
+            | "CONTRIBUTING"
+            | "LICENSE"
+            | "LICENCE"
+            | "CODE_OF_CONDUCT"
+            | "SECURITY"
+            | "AGENTS"
+            | "CLAUDE"
     );
     dated || named || file.split('/').any(|part| part == ".github")
 }
@@ -148,22 +178,54 @@ struct Page<'a> {
 impl<'a> Page<'a> {
     fn read(kind: Kind, src: &'a str) -> Page<'a> {
         let bytes = src.as_bytes();
-        let at = |c: u8| bytes.iter().enumerate().filter(move |(_, b)| **b == c).map(|(i, _)| i);
+        let at = |c: u8| {
+            bytes
+                .iter()
+                .enumerate()
+                .filter(move |(_, b)| **b == c)
+                .map(|(i, _)| i)
+        };
         let newlines = at(b'\n').collect();
-        let quotes = bytes.iter().enumerate().filter(|(_, b)| matches!(b, b'"' | b'\'')).map(|(i, _)| i).collect();
-        let mut scripts = if kind == Kind::Markup { element_bodies(src, "script") } else { Vec::new() };
+        let quotes = bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b, b'"' | b'\''))
+            .map(|(i, _)| i)
+            .collect();
+        let mut scripts = if kind == Kind::Markup {
+            element_bodies(src, "script")
+        } else {
+            Vec::new()
+        };
         if kind == Kind::Markup {
             scripts.extend(fenced(src, "---").map(|(a, b, _)| (a, b)));
             scripts.sort_unstable();
         }
-        let front = if kind == Kind::Markdown { fenced(src, "---").or_else(|| fenced(src, "+++")) } else { None };
+        let front = if kind == Kind::Markdown {
+            fenced(src, "---").or_else(|| fenced(src, "+++"))
+        } else {
+            None
+        };
         let skipped = merged(skipped_ranges(kind, src, &scripts));
         let stops = src
             .char_indices()
-            .filter(|(i, c)| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ')' | '<' | '>' | ',') || src[*i..].starts_with("&quot;"))
+            .filter(|(i, c)| {
+                c.is_whitespace()
+                    || matches!(c, '"' | '\'' | '`' | ')' | '<' | '>' | ',')
+                    || src[*i..].starts_with("&quot;")
+            })
             .map(|(i, _)| i)
             .collect();
-        Page { src, kind, newlines, quotes, stops, scripts, front, skipped }
+        Page {
+            src,
+            kind,
+            newlines,
+            quotes,
+            stops,
+            scripts,
+            front,
+            skipped,
+        }
     }
 
     /// Whether byte `at` is inside one of `ranges` (sorted, not overlapping).
@@ -175,7 +237,11 @@ impl<'a> Page<'a> {
     /// Where the line holding byte `at` starts.
     fn line_start(&self, at: usize) -> usize {
         let i = self.newlines.partition_point(|n| *n < at);
-        if i == 0 { 0 } else { self.newlines[i - 1] + 1 }
+        if i == 0 {
+            0
+        } else {
+            self.newlines[i - 1] + 1
+        }
     }
 
     /// The rest of the line from `at`, without its line break.
@@ -211,7 +277,9 @@ fn element_bodies(src: &str, tag: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(i) = src[from..].find(&open).map(|i| i + from) {
-        let Some(body) = src[i..].find('>').map(|j| i + j + 1) else { break };
+        let Some(body) = src[i..].find('>').map(|j| i + j + 1) else {
+            break;
+        };
         let end = src[body..].find(&close).map_or(src.len(), |j| body + j);
         out.push((body, end));
         from = end;
@@ -227,7 +295,11 @@ fn skipped_ranges(kind: Kind, src: &str, scripts: &[(usize, usize)]) -> Vec<(usi
         Kind::Markup => {
             let mut out = delimited(src, "<!--", "-->");
             out.extend(scripts.iter().flat_map(|r| js_comments(src, *r)));
-            out.extend(element_bodies(src, "style").into_iter().flat_map(|r| css_comments(src, r)));
+            out.extend(
+                element_bodies(src, "style")
+                    .into_iter()
+                    .flat_map(|r| css_comments(src, r)),
+            );
             out
         }
         Kind::Code => js_comments(src, whole[0]),
@@ -246,7 +318,9 @@ fn delimited(src: &str, open: &str, close: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(i) = src[from..].find(open).map(|i| i + from) {
-        let end = src[i + open.len()..].find(close).map_or(src.len(), |j| i + open.len() + j + close.len());
+        let end = src[i + open.len()..]
+            .find(close)
+            .map_or(src.len(), |j| i + open.len() + j + close.len());
         out.push((i, end));
         from = end;
     }
@@ -257,7 +331,10 @@ fn delimited(src: &str, open: &str, close: &str) -> Vec<(usize, usize)> {
 /// a `/*` in the page's text before a `<style>` never swallows one of its
 /// comments, and each element is read once.
 fn css_comments(src: &str, (start, end): (usize, usize)) -> Vec<(usize, usize)> {
-    delimited(&src[start..end], "/*", "*/").into_iter().map(|(a, b)| (a + start, b + start)).collect()
+    delimited(&src[start..end], "/*", "*/")
+        .into_iter()
+        .map(|(a, b)| (a + start, b + start))
+        .collect()
 }
 
 /// What a JavaScript lexer is inside.
@@ -403,7 +480,10 @@ fn fence_line(line: &str) -> Option<(u8, usize, bool)> {
     if line.len() - text.len() > 3 {
         return None;
     }
-    let c = *text.as_bytes().first().filter(|c| matches!(c, b'`' | b'~'))?;
+    let c = *text
+        .as_bytes()
+        .first()
+        .filter(|c| matches!(c, b'`' | b'~'))?;
     let run = text.bytes().take_while(|b| *b == c).count();
     (run >= 3).then(|| (c, run, text[run..].trim().is_empty()))
 }
@@ -434,7 +514,10 @@ fn used_at(page: &Page, s: usize, e: usize) -> bool {
 fn used_as(page: &Page, s: usize, e: usize) -> bool {
     let src = page.src;
     match page.kind {
-        Kind::Markup => in_url_attribute(page, s, e) || (Page::within(&page.scripts, s) && in_code_literal(src, s, e)),
+        Kind::Markup => {
+            in_url_attribute(page, s, e)
+                || (Page::within(&page.scripts, s) && in_code_literal(src, s, e))
+        }
         Kind::Code => in_code_literal(src, s, e),
         Kind::Markdown => in_markdown(page, s, e),
         Kind::Yaml => in_yaml_value(page, s, e),
@@ -471,7 +554,9 @@ const QUOTES: &[&str] = &["\"", "'", "`", "&quot;", "&#39;", "&apos;"];
 /// The quote (one of `quotes`) that ends right before `s`, and where it
 /// starts, when the same one also follows at `e`.
 fn quoted<'q>(src: &str, s: usize, e: usize, quotes: &[&'q str]) -> Option<(&'q str, usize)> {
-    let q = quotes.iter().find(|q| src[..s].ends_with(**q) && src[e..].starts_with(**q))?;
+    let q = quotes
+        .iter()
+        .find(|q| src[..s].ends_with(**q) && src[e..].starts_with(**q))?;
     Some((q, s - q.len()))
 }
 
@@ -539,7 +624,10 @@ fn trim_end_near(text: &str) -> Option<&str> {
 /// lowercased.
 fn bare_attribute(name: &str) -> String {
     let name = name.strip_prefix("v-bind").unwrap_or(name);
-    let name = name.strip_prefix("bind").filter(|n| n.starts_with(':')).unwrap_or(name);
+    let name = name
+        .strip_prefix("bind")
+        .filter(|n| n.starts_with(':'))
+        .unwrap_or(name);
     name.trim_start_matches(':').to_ascii_lowercase()
 }
 
@@ -553,7 +641,9 @@ fn is_url_attribute(name: &str) -> bool {
 fn in_url_attribute(page: &Page, s: usize, e: usize) -> bool {
     in_srcset(page, s, e)
         || match quoted(page.src, s, e, QUOTES) {
-            Some((q, at)) => attribute_value_at(page.src, at, e + q.len()).is_some_and(is_url_attribute),
+            Some((q, at)) => {
+                attribute_value_at(page.src, at, e + q.len()).is_some_and(is_url_attribute)
+            }
             None => false,
         }
 }
@@ -572,7 +662,11 @@ fn attribute_value_at(src: &str, open: usize, close: usize) -> Option<&str> {
         '"' | '\'' => wrapper,
         _ => return None,
     };
-    src[close..].trim_start().starts_with(closer).then(|| attribute_before(src, left.len() - 1)).flatten()
+    src[close..]
+        .trim_start()
+        .starts_with(closer)
+        .then(|| attribute_before(src, left.len() - 1))
+        .flatten()
 }
 
 /// One candidate of a srcset value: after its opening quote or a comma,
@@ -588,7 +682,9 @@ fn in_srcset(page: &Page, s: usize, e: usize) -> bool {
     let ended = src[e..].starts_with(|c: char| c.is_whitespace() || c == ',' || c == quote);
     first_or_next
         && ended
-        && attribute_before(src, q).map(bare_attribute).is_some_and(|n| SRCSET_ATTRIBUTES.contains(&n.as_str()))
+        && attribute_before(src, q)
+            .map(bare_attribute)
+            .is_some_and(|n| SRCSET_ATTRIBUTES.contains(&n.as_str()))
 }
 
 /// A whole string literal (`"x"`, `'x'`, `` `x` ``), unless it is the value
@@ -611,7 +707,8 @@ fn text_key_before(src: &str, at: usize) -> bool {
     let left = src[..at].trim_end();
     let left = left.strip_suffix('{').map_or(left, str::trim_end);
     match left.strip_suffix(':') {
-        Some(k) => name_at_end(k.trim_end().trim_end_matches(['"', '\'']), key_char).is_some_and(is_text_key),
+        Some(k) => name_at_end(k.trim_end().trim_end_matches(['"', '\'']), key_char)
+            .is_some_and(is_text_key),
         None => attribute_before(src, left.len()).is_some_and(is_text_key),
     }
 }
@@ -634,7 +731,8 @@ fn in_markdown_target(src: &str, s: usize, e: usize) -> bool {
         return false;
     }
     let rest = &src[close..];
-    rest.starts_with(')') || (rest.starts_with([' ', '\t']) && rest.trim_start().starts_with(['"', '\'', '(']))
+    rest.starts_with(')')
+        || (rest.starts_with([' ', '\t']) && rest.trim_start().starts_with(['"', '\'', '(']))
 }
 
 /// `s..e` widened by Markdown's optional `<...>` around a destination.
@@ -656,7 +754,10 @@ fn in_reference_definition(page: &Page, s: usize, e: usize) -> bool {
     }
     let head = page.src[start..open].trim_start_matches(' ');
     let defined = head.starts_with('[')
-        && head.trim_end().strip_suffix(':').is_some_and(|h| h.ends_with(']'))
+        && head
+            .trim_end()
+            .strip_suffix(':')
+            .is_some_and(|h| h.ends_with(']'))
         && head.ends_with([' ', '\t']);
     defined && {
         let rest = page.rest_of_line(close);
@@ -692,9 +793,14 @@ fn in_yaml_value(page: &Page, s: usize, e: usize) -> bool {
         return false;
     }
     let head = page.src[start..open].trim_start();
-    let keyed = head.strip_suffix(' ').map(str::trim_end).and_then(|h| h.strip_suffix(':'));
+    let keyed = head
+        .strip_suffix(' ')
+        .map(str::trim_end)
+        .and_then(|h| h.strip_suffix(':'));
     let valued = match keyed {
-        Some(key) => !key.is_empty() && !key.starts_with('#') && !is_text_key(key.trim_matches(['"', '\''])),
+        Some(key) => {
+            !key.is_empty() && !key.starts_with('#') && !is_text_key(key.trim_matches(['"', '\'']))
+        }
         None => head == "- ",
     };
     valued && ends_line(page, close)
@@ -712,7 +818,8 @@ fn in_toml_value(page: &Page, s: usize, e: usize) -> bool {
     }
     let head = page.src[start..at].trim();
     let key = head.strip_suffix('=').map(str::trim_end);
-    key.is_some_and(|k| !k.is_empty() && !k.starts_with('#') && !is_text_key(k)) && ends_line(page, e + q.len())
+    key.is_some_and(|k| !k.is_empty() && !k.starts_with('#') && !is_text_key(k))
+        && ends_line(page, e + q.len())
 }
 
 #[cfg(test)]
@@ -720,7 +827,10 @@ mod tests {
     use super::*;
 
     fn spans<'a>(file: &str, source: &'a str, wanted: &str) -> Vec<&'a str> {
-        find_reference(file, source, wanted, 3).into_iter().map(|(a, b)| &source[a..b]).collect()
+        find_reference(file, source, wanted, 3)
+            .into_iter()
+            .map(|(a, b)| &source[a..b])
+            .collect()
     }
 
     /// (review) Words in a page's text are never a reference it uses: not
@@ -729,17 +839,53 @@ mod tests {
     #[test]
     fn prose_quotes_code_spans_alt_text_and_readmes_are_never_references() {
         for (file, source, wanted) in [
-            ("page.html", "<p>Files: a.jpg, hero.jpg and b.jpg</p>", "hero.jpg"),
-            ("page.html", "<p>Replace \"hero.jpg\" with yours.</p>", "hero.jpg"),
-            ("page.html", "<p>Replace 'hero.jpg' or `hero.jpg`.</p>", "hero.jpg"),
-            ("page.html", "<p>The hero (hero.jpg) is big.</p>", "hero.jpg"),
-            ("post.md", "Use `/images/hero.jpg` for it.", "/images/hero.jpg"),
-            ("post.md", "Files: a.jpg, hero.jpg\n\nThe hero (hero.jpg) \"hero.jpg\"", "hero.jpg"),
+            (
+                "page.html",
+                "<p>Files: a.jpg, hero.jpg and b.jpg</p>",
+                "hero.jpg",
+            ),
+            (
+                "page.html",
+                "<p>Replace \"hero.jpg\" with yours.</p>",
+                "hero.jpg",
+            ),
+            (
+                "page.html",
+                "<p>Replace 'hero.jpg' or `hero.jpg`.</p>",
+                "hero.jpg",
+            ),
+            (
+                "page.html",
+                "<p>The hero (hero.jpg) is big.</p>",
+                "hero.jpg",
+            ),
+            (
+                "post.md",
+                "Use `/images/hero.jpg` for it.",
+                "/images/hero.jpg",
+            ),
+            (
+                "post.md",
+                "Files: a.jpg, hero.jpg\n\nThe hero (hero.jpg) \"hero.jpg\"",
+                "hero.jpg",
+            ),
             ("data.yml", "alt: /hero.jpg\n", "/hero.jpg"),
             ("post.md", "# Post\n\nimage: /hero.jpg\n", "/hero.jpg"),
-            ("post.md", "---\ntitle: x\n---\n\nimage: /hero.jpg\n", "/hero.jpg"),
-            ("post.md", "# Post\n\nimage: /hero.jpg\n\n---\n\nMore.\n", "/hero.jpg"),
-            ("post.md", "---\ntitle: x\n---\n\nimage: /hero.jpg\n\n---\n", "/hero.jpg"),
+            (
+                "post.md",
+                "---\ntitle: x\n---\n\nimage: /hero.jpg\n",
+                "/hero.jpg",
+            ),
+            (
+                "post.md",
+                "# Post\n\nimage: /hero.jpg\n\n---\n\nMore.\n",
+                "/hero.jpg",
+            ),
+            (
+                "post.md",
+                "---\ntitle: x\n---\n\nimage: /hero.jpg\n\n---\n",
+                "/hero.jpg",
+            ),
             ("README.md", "![logo](/hero.jpg)\n", "/hero.jpg"),
             ("docs/CHANGELOG.md", "![logo](/hero.jpg)\n", "/hero.jpg"),
             ("notes.txt", "src=\"/hero.jpg\"", "/hero.jpg"),
@@ -748,11 +894,19 @@ mod tests {
             ("changes-2024.md", "![logo](/hero.jpg)\n", "/hero.jpg"),
             ("AGENTS.md", "![logo](/hero.jpg)\n", "/hero.jpg"),
             ("CLAUDE.md", "![logo](/hero.jpg)\n", "/hero.jpg"),
-            ("site/.github/ISSUE_TEMPLATE/bug.md", "![logo](/hero.jpg)\n", "/hero.jpg"),
+            (
+                "site/.github/ISSUE_TEMPLATE/bug.md",
+                "![logo](/hero.jpg)\n",
+                "/hero.jpg",
+            ),
             ("page.html", "<p>画像は/hero.jpg</p>", "/hero.jpg"),
             ("page.html", "<p>🎉🎉/hero.jpg 🎉</p>", "/hero.jpg"),
             ("page.html", "<p>Café crème (/hero.jpg) é</p>", "/hero.jpg"),
-            ("a.css", "/* 画像 */ .a { background: 画像/hero.jpg; }", "/hero.jpg"),
+            (
+                "a.css",
+                "/* 画像 */ .a { background: 画像/hero.jpg; }",
+                "/hero.jpg",
+            ),
             ("data.yml", "# image: /hero.jpg\n", "/hero.jpg"),
             ("site.toml", "# image = \"/hero.jpg\"\n", "/hero.jpg"),
         ] {
@@ -762,10 +916,17 @@ mod tests {
             let source = "<img alt=\"hero.jpg\" src=\"hero.jpg\" />";
             let found = find_reference(file, source, "hero.jpg", 3);
             assert_eq!(found.len(), 1, "{file}: alt text is not a reference");
-            assert!(source[..found[0].0].ends_with("src=\""), "{file}: the src is");
+            assert!(
+                source[..found[0].0].ends_with("src=\""),
+                "{file}: the src is"
+            );
         }
         let js = "const images = [{ src: \"/hero.jpg\", alt: \"/hero.jpg\" }];";
-        assert_eq!(spans("main.ts", js, "/hero.jpg").len(), 1, "an alt key is text");
+        assert_eq!(
+            spans("main.ts", js, "/hero.jpg").len(),
+            1,
+            "an alt key is text"
+        );
     }
 
     /// (review) Code and comments are not where a site uses an image:
@@ -774,7 +935,10 @@ mod tests {
     #[test]
     fn code_blocks_and_comments_are_never_references() {
         for (file, source) in [
-            ("post.md", "```html\n<img src=\"/hero.jpg\">\n![x](/hero.jpg)\n```\n"),
+            (
+                "post.md",
+                "```html\n<img src=\"/hero.jpg\">\n![x](/hero.jpg)\n```\n",
+            ),
             ("post.md", "~~~\n[h]: /hero.jpg\n~~~\n"),
             ("post.md", "Use `<img src=\"/hero.jpg\">` here."),
             ("post.md", "Use `` ![x](/hero.jpg) `` here."),
@@ -785,9 +949,15 @@ mod tests {
             ("page.html", "<script>\n// load(\"/hero.jpg\")\n</script>"),
             ("a.css", "/* .a { background: url(/hero.jpg); } */"),
             ("page.html", "<style>/* url(/hero.jpg) */</style>"),
-            ("page.html", "<p>a /* b</p><style>.a {} /* url(/hero.jpg) */</style>"),
+            (
+                "page.html",
+                "<p>a /* b</p><style>.a {} /* url(/hero.jpg) */</style>",
+            ),
         ] {
-            assert!(spans(file, source, "/hero.jpg").is_empty(), "{file}: {source:?}");
+            assert!(
+                spans(file, source, "/hero.jpg").is_empty(),
+                "{file}: {source:?}"
+            );
         }
         // What surrounds the code still counts, and `//` inside a string is no comment.
         let md = "```\n![x](/hero.jpg)\n```\n\n`code` and ![Hero](/hero.jpg)\n";
@@ -804,7 +974,8 @@ mod tests {
     #[test]
     fn a_large_page_full_of_candidates_is_resolved_quickly() {
         let size = 1024 * 1024;
-        let prose = "<p>Here we see the entries every week, elsewhere eventually everyone enters.</p>\n";
+        let prose =
+            "<p>Here we see the entries every week, elsewhere eventually everyone enters.</p>\n";
         let body = prose.repeat(size / prose.len());
         let one_line = "var e=1;let ee=e+e;".repeat(size / 19);
         // Each holds what makes a scan long: a script or front matter at the
@@ -837,12 +1008,19 @@ mod tests {
             let started = std::time::Instant::now();
             let found = find_reference(file, page, "e", usize::MAX);
             let took = started.elapsed();
-            eprintln!("{file}: {} bytes, {} candidates checked: {took:?}", page.len(), page.matches('e').count());
+            eprintln!(
+                "{file}: {} bytes, {} candidates checked: {took:?}",
+                page.len(),
+                page.matches('e').count()
+            );
             assert_eq!(found.len(), *want, "{file}: {found:?}");
             // Linear is about 0.6 s per page in a debug build on a fast Mac,
             // slower on a CI runner; quadratic is hours. 10 s keeps that gap
             // without flaking on a loaded machine.
-            assert!(took < std::time::Duration::from_secs(10), "{file}: took {took:?}");
+            assert!(
+                took < std::time::Duration::from_secs(10),
+                "{file}: took {took:?}"
+            );
         }
     }
 
@@ -854,12 +1032,18 @@ mod tests {
             ("page.html", "<img src=\"/hero.jpg?v=2\">"),
             ("page.html", "<a href='/hero.jpg#top'>x</a>"),
             ("page.html", "<video poster=\"/hero.jpg\"></video>"),
-            ("page.html", "<meta property=\"og:image\" content=\"/hero.jpg\">"),
+            (
+                "page.html",
+                "<meta property=\"og:image\" content=\"/hero.jpg\">",
+            ),
             ("page.html", "<img data-src=\"/hero.jpg\">"),
             ("page.html", "<img srcset=\"/a.jpg 1x, /hero.jpg 2x\">"),
             ("page.html", "<img srcset=\"/hero.jpg 1x, /b.jpg 2x\">"),
             ("page.html", "<img srcset=\"/a.jpg 1x,\n\t/hero.jpg 2x\">"),
-            ("page.html", "<div style=\"background:url(&quot;/hero.jpg&quot;)\"></div>"),
+            (
+                "page.html",
+                "<div style=\"background:url(&quot;/hero.jpg&quot;)\"></div>",
+            ),
             ("page.html", "<div class=\"bg-[url(/hero.jpg)]\"></div>"),
             ("page.html", "<div class=\"bg-[url('/hero.jpg')]\"></div>"),
             ("page.html", "<script>const hero = \"/hero.jpg\";</script>"),
@@ -874,13 +1058,19 @@ mod tests {
             ("main.ts", "import hero from \"/hero.jpg\";"),
             ("main.ts", "const hero = '/hero.jpg';"),
             ("main.ts", "const u = `/hero.jpg`;"),
-            ("main.ts", "const Hero = styled.div`background: url(/hero.jpg);`;"),
+            (
+                "main.ts",
+                "const Hero = styled.div`background: url(/hero.jpg);`;",
+            ),
             ("post.md", "![Hero](/hero.jpg \"title\")"),
             ("post.md", "![Hero](</hero.jpg>)"),
             ("post.md", "[h]: /hero.jpg\n"),
             ("post.md", "[h]: </hero.jpg> \"t\"\n"),
             ("post.md", "---\nimage: /hero.jpg\n---\n# Post\n"),
-            ("post.md", "---\ntitle: x\nimage: \"/hero.jpg\" # cover\n---\n"),
+            (
+                "post.md",
+                "---\ntitle: x\nimage: \"/hero.jpg\" # cover\n---\n",
+            ),
             ("post.md", "+++\nimage = \"/hero.jpg\"\n+++\n"),
             ("post.md", "<img src=\"/hero.jpg\">\n"),
             ("data.yml", "hero:\n  - /hero.jpg\n  src: /hero.jpg"),
@@ -888,22 +1078,58 @@ mod tests {
             ("data.json", "{\"image\": \"/hero.jpg\"}"),
         ] {
             let found = spans(file, source, "/hero.jpg");
-            let want = if source.contains("  - /hero.jpg") { 2 } else { 1 };
+            let want = if source.contains("  - /hero.jpg") {
+                2
+            } else {
+                1
+            };
             assert_eq!(found.len(), want, "{file}: {source:?} -> {found:?}");
             assert!(found.iter().all(|s| *s == "/hero.jpg"), "{file}: {found:?}");
         }
-        assert_eq!(spans("page.html", "<img src=\"/héros/été.jpg\">", "/héros/été.jpg"), ["/héros/été.jpg"]);
-        assert_eq!(spans("page.html", "<img src=\"/画像/ヒーロー.jpg\">", "/画像/ヒーロー.jpg"), ["/画像/ヒーロー.jpg"]);
+        assert_eq!(
+            spans(
+                "page.html",
+                "<img src=\"/héros/été.jpg\">",
+                "/héros/été.jpg"
+            ),
+            ["/héros/été.jpg"]
+        );
+        assert_eq!(
+            spans(
+                "page.html",
+                "<img src=\"/画像/ヒーロー.jpg\">",
+                "/画像/ヒーロー.jpg"
+            ),
+            ["/画像/ヒーロー.jpg"]
+        );
         for source in [
             "<p>画像は</p><img src=\"/hero.jpg\">",
             "<img alt=\"🎉🎉\" src=\"/hero.jpg\"> 🎉",
             "<p>Café crème</p><div style=\"background:url(/hero.jpg)\">é</div>",
             "<div style=\"background:url(画像/hero.jpg)\"></div><img src=\"/hero.jpg\">",
         ] {
-            assert_eq!(spans("page.html", source, "/hero.jpg"), ["/hero.jpg"], "{source}");
+            assert_eq!(
+                spans("page.html", source, "/hero.jpg"),
+                ["/hero.jpg"],
+                "{source}"
+            );
         }
-        assert_eq!(spans("post.md", "---\ntitle: 画像\nimage: /hero.jpg\n---\n", "/hero.jpg"), ["/hero.jpg"]);
-        assert_eq!(spans("page.html", "<img src=\"/a.jpg?x=1&amp;y=2\">", "/a.jpg?x=1&y=2"), ["/a.jpg?x=1&amp;y=2"]);
+        assert_eq!(
+            spans(
+                "post.md",
+                "---\ntitle: 画像\nimage: /hero.jpg\n---\n",
+                "/hero.jpg"
+            ),
+            ["/hero.jpg"]
+        );
+        assert_eq!(
+            spans(
+                "page.html",
+                "<img src=\"/a.jpg?x=1&amp;y=2\">",
+                "/a.jpg?x=1&y=2"
+            ),
+            ["/a.jpg?x=1&amp;y=2"]
+        );
     }
 
     /// (review) A reference is a whole URL: never the tail or the head of a
@@ -913,17 +1139,40 @@ mod tests {
         for (source, wanted) in [
             ("<img src=\"/assets/hero.jpg\">", "hero.jpg"),
             ("<img src=\"/hero.jpg.bak\">", "/hero.jpg"),
-            ("<img src=\"my_hero.jpg\"><img src=\"x-hero.jpg\">", "hero.jpg"),
+            (
+                "<img src=\"my_hero.jpg\"><img src=\"x-hero.jpg\">",
+                "hero.jpg",
+            ),
             ("<img src=\"/img/logo@2x.png\">", "2x.png"),
-            ("<img src=\"https://cdn.x.com/hero.jpg\">", "//cdn.x.com/hero.jpg"),
+            (
+                "<img src=\"https://cdn.x.com/hero.jpg\">",
+                "//cdn.x.com/hero.jpg",
+            ),
             ("<img src=\"../hero.jpg\">", "./hero.jpg"),
-            ("<div style=\"background:url(/a/hero.jpg)\"></div>", "hero.jpg"),
-            ("<img srcset=\"/a/hero.jpg 1x, /b/hero.jpg 2x\">", "hero.jpg"),
+            (
+                "<div style=\"background:url(/a/hero.jpg)\"></div>",
+                "hero.jpg",
+            ),
+            (
+                "<img srcset=\"/a/hero.jpg 1x, /b/hero.jpg 2x\">",
+                "hero.jpg",
+            ),
         ] {
             assert!(spans("page.html", source, wanted).is_empty(), "{source}");
         }
-        for joined in ["/a+hero.jpg", "/a~hero.jpg", "/a:hero.jpg", "/a,hero.jpg", "/a=hero.jpg", "/a%20hero.jpg", "/a!hero.jpg"] {
-            assert!(spans("page.html", &format!("<img src=\"{joined}\">"), "hero.jpg").is_empty(), "{joined}");
+        for joined in [
+            "/a+hero.jpg",
+            "/a~hero.jpg",
+            "/a:hero.jpg",
+            "/a,hero.jpg",
+            "/a=hero.jpg",
+            "/a%20hero.jpg",
+            "/a!hero.jpg",
+        ] {
+            assert!(
+                spans("page.html", &format!("<img src=\"{joined}\">"), "hero.jpg").is_empty(),
+                "{joined}"
+            );
         }
         assert!(spans("main.ts", "const u = `${base}/hero.jpg`;", "/hero.jpg").is_empty());
         assert!(spans("post.md", "![Hero](/a/hero.jpg)", "hero.jpg").is_empty());

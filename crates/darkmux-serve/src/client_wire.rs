@@ -365,6 +365,9 @@ impl PreviewStage {
     /// The stage of a first use's fetch of a runtime darkmux manages
     /// (`name` `node`, shown as `display` `Node`): `getting_node`.
     pub fn getting(name: &str, display: &str, version: &str) -> Self {
-        PreviewStage { code: format!("getting_{name}"), detail: format!("getting {display} {version}, first use only") }
+        PreviewStage {
+            code: format!("getting_{name}"),
+            detail: format!("getting {display} {version}, first use only"),
+        }
     }
 }

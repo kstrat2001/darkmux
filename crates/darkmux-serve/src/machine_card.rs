@@ -40,9 +40,9 @@
 
 use crate::wire::MachineSpecsResponse;
 use darkmux_crew::power_policy::{self, PowerPolicyConfig, StartDecision};
-use darkmux_profiles::engine::availability::Availability;
 use darkmux_fleet::{Admitted, SeatSnapshot};
 use darkmux_flow::payload::{BatteryCharge, ChargeState, HostSampleNow, ThermalNow};
+use darkmux_profiles::engine::availability::Availability;
 use darkmux_types::config::{BusyPolicy, DeclaredFleetMode};
 use darkmux_types::{EndpointKind, ProfileRegistry};
 use serde::{Deserialize, Serialize};
@@ -200,7 +200,9 @@ impl CardGrant {
     /// decision, so it is `Unknown`, never `NotListed`.
     pub fn from_authorization(result: &Result<Admitted, darkmux_fleet::Refusal>) -> Self {
         match result {
-            Ok(admitted) => CardGrant::Listed { accepts: CardAccepts::from(admitted) },
+            Ok(admitted) => CardGrant::Listed {
+                accepts: CardAccepts::from(admitted),
+            },
             Err(darkmux_fleet::Refusal::NotAllowed { .. }) => CardGrant::NotListed,
             Err(_) => CardGrant::Unknown,
         }
@@ -432,8 +434,13 @@ const REGISTRY_UNREADABLE: &str = "this machine's profile registry could not be 
 /// target ([`darkmux_crew::target::target_for`]): a target that cannot be
 /// built (an undefined endpoint id, a bad URL, an unknown dialect) is
 /// `Unresolved`, never a guess at managed or unmanaged.
-fn kind_of(profile_name: &str, profile: &darkmux_types::Profile, model: &darkmux_types::ProfileModel) -> CardEndpointKind {
-    match darkmux_crew::target::target_for(profile_name.to_string(), profile.clone(), model.clone()) {
+fn kind_of(
+    profile_name: &str,
+    profile: &darkmux_types::Profile,
+    model: &darkmux_types::ProfileModel,
+) -> CardEndpointKind {
+    match darkmux_crew::target::target_for(profile_name.to_string(), profile.clone(), model.clone())
+    {
         Ok(target) => match target.kind {
             EndpointKind::Managed(_) => CardEndpointKind::Managed,
             EndpointKind::Unmanaged => CardEndpointKind::Unmanaged,
@@ -446,7 +453,9 @@ fn kind_of(profile_name: &str, profile: &darkmux_types::Profile, model: &darkmux
 /// differ, `Unresolved` when it declares none.
 fn profile_kind(models: &[CardModel]) -> CardEndpointKind {
     let mut kinds = models.iter().map(|m| m.endpoint_kind);
-    let Some(first) = kinds.next() else { return CardEndpointKind::Unresolved };
+    let Some(first) = kinds.next() else {
+        return CardEndpointKind::Unresolved;
+    };
     if kinds.all(|k| k == first) {
         first
     } else {
@@ -485,7 +494,11 @@ pub(crate) fn card_profiles(registry: &ProfileRegistry) -> Vec<CardProfile> {
 /// (#3450) Every model the card states, in [`card_profiles`]' order: the
 /// list an availability listing answers, one entry each.
 pub(crate) fn card_models(registry: &ProfileRegistry) -> Vec<darkmux_types::ProfileModel> {
-    registry.profiles.values().flat_map(|p| p.models.iter().cloned()).collect()
+    registry
+        .profiles
+        .values()
+        .flat_map(|p| p.models.iter().cloned())
+        .collect()
 }
 
 /// (#3450) Put a listing's answers (one per [`card_models`] entry) on the
@@ -550,14 +563,20 @@ impl AvailabilityCache {
     /// The listing for `models`. `wait`: list now when there is no fresh
     /// one (a CLI reader); otherwise answer with the last listing of these
     /// models, or `None`, and refresh behind.
-    pub(crate) fn get(&self, models: &[darkmux_types::ProfileModel], wait: bool) -> Option<Vec<Availability>> {
+    pub(crate) fn get(
+        &self,
+        models: &[darkmux_types::ProfileModel],
+        wait: bool,
+    ) -> Option<Vec<Availability>> {
         if models.is_empty() {
             return Some(Vec::new());
         }
         let key = serde_json::to_string(models).unwrap_or_default();
         let last = {
             let slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-            slot.as_ref().filter(|(k, ..)| *k == key).map(|(_, at, each)| (*at, each.clone()))
+            slot.as_ref()
+                .filter(|(k, ..)| *k == key)
+                .map(|(_, at, each)| (*at, each.clone()))
         };
         if let Some((at, each)) = &last {
             if crate::wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), self.ttl) {
@@ -566,12 +585,14 @@ impl AvailabilityCache {
         }
         if wait {
             let each = (self.list)(models);
-            *self.slot.lock().unwrap_or_else(|p| p.into_inner()) = Some((key, std::time::SystemTime::now(), each.clone()));
+            *self.slot.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some((key, std::time::SystemTime::now(), each.clone()));
             return Some(each);
         }
         self.refresh_behind(key, models.to_vec());
         let now = std::time::SystemTime::now();
-        last.filter(|(at, _)| crate::wall_clock_cache_is_fresh(*at, now, self.max_age)).map(|(_, each)| each)
+        last.filter(|(at, _)| crate::wall_clock_cache_is_fresh(*at, now, self.max_age))
+            .map(|(_, each)| each)
     }
 
     /// One listing on its own thread, unless one already runs.
@@ -580,14 +601,21 @@ impl AvailabilityCache {
         if self.refreshing.swap(true, Ordering::SeqCst) {
             return;
         }
-        let (list, slot, refreshing) = (self.list.clone(), self.slot.clone(), self.refreshing.clone());
-        let spawned = std::thread::Builder::new().name("card-availability".into()).spawn(move || {
-            // Cleared on every exit, a panicking listing included, so the
-            // next stale read lists again.
-            let _done = Cleared(refreshing);
-            let each = list(&models);
-            *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some((key, std::time::SystemTime::now(), each));
-        });
+        let (list, slot, refreshing) = (
+            self.list.clone(),
+            self.slot.clone(),
+            self.refreshing.clone(),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("card-availability".into())
+            .spawn(move || {
+                // Cleared on every exit, a panicking listing included, so the
+                // next stale read lists again.
+                let _done = Cleared(refreshing);
+                let each = list(&models);
+                *slot.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some((key, std::time::SystemTime::now(), each));
+            });
         if spawned.is_err() {
             self.refreshing.store(false, Ordering::SeqCst);
         }
@@ -608,9 +636,16 @@ impl Drop for Cleared {
 /// no engine.
 fn production_listing(models: &[darkmux_types::ProfileModel]) -> Vec<Availability> {
     if cfg!(test) {
-        return models.iter().map(|_| Availability::unknown("no engine is asked in a unit test")).collect();
+        return models
+            .iter()
+            .map(|_| Availability::unknown("no engine is asked in a unit test"))
+            .collect();
     }
-    darkmux_profiles::engine::availability::list(models, darkmux_crew::user_files::dispatch_refusal(None)).each
+    darkmux_profiles::engine::availability::list(
+        models,
+        darkmux_crew::user_files::dispatch_refusal(None),
+    )
+    .each
 }
 
 /// The one availability cache of a process.
@@ -622,7 +657,12 @@ fn process_availability_cache() -> &'static AvailabilityCache {
 /// A profile whose every model is the utility model: the listener refuses it
 /// (utility work is never taken from another machine), so it seats nothing.
 fn is_utility_only(profile: &CardProfile, utility: Option<&str>) -> bool {
-    utility.is_some() && !profile.models.is_empty() && profile.models.iter().all(|m| Some(m.id.as_str()) == utility)
+    utility.is_some()
+        && !profile.models.is_empty()
+        && profile
+            .models
+            .iter()
+            .all(|m| Some(m.id.as_str()) == utility)
 }
 
 /// The seat block from the listener's book and the profiles it can run.
@@ -648,8 +688,16 @@ pub(crate) fn card_seats(
     CardSeats {
         busy_policy: policy.into(),
         counts_own_work: false,
-        local: local.into_iter().map(|(model, held)| CardLocalSeat { model: model.to_string(), held_by_peer_job: held }).collect(),
-        unmanaged: CardUnmanagedSeats { held_by_peer_jobs: seats.unmanaged_held as u32 },
+        local: local
+            .into_iter()
+            .map(|(model, held)| CardLocalSeat {
+                model: model.to_string(),
+                held_by_peer_job: held,
+            })
+            .collect(),
+        unmanaged: CardUnmanagedSeats {
+            held_by_peer_jobs: seats.unmanaged_held as u32,
+        },
         waiting: seats.waiting as u32,
     }
 }
@@ -659,18 +707,23 @@ pub(crate) fn card_seats(
 /// one the launch pre-flight runs.
 pub(crate) fn card_governor(now: Option<&HostSampleNow>, cfg: &PowerPolicyConfig) -> CardGovernor {
     let battery = now.and_then(|n| n.battery.clone());
-    let sample = battery.as_ref().map(|b| darkmux_crew::host_probe::BatterySample {
-        charge_pct: b.charge_pct,
-        on_ac: b.on_ac,
-        charging: b.state == ChargeState::Charging,
-        state: b.state,
-        minutes_to_empty: b.minutes_to_empty,
-    });
+    let sample = battery
+        .as_ref()
+        .map(|b| darkmux_crew::host_probe::BatterySample {
+            charge_pct: b.charge_pct,
+            on_ac: b.on_ac,
+            charging: b.state == ChargeState::Charging,
+            state: b.state,
+            minutes_to_empty: b.minutes_to_empty,
+        });
     // (#3074) When there is no battery sample (or probe failed), publish
     // refusing_start as None so viewers render unknown rather than a confident false.
-    let refusing_start = sample
-        .as_ref()
-        .map(|s| matches!(power_policy::start_decision(Some(s), cfg), StartDecision::Refuse(_)));
+    let refusing_start = sample.as_ref().map(|s| {
+        matches!(
+            power_policy::start_decision(Some(s), cfg),
+            StartDecision::Refuse(_)
+        )
+    });
     CardGovernor {
         thermal: now.and_then(|n| n.thermal.clone()),
         battery,
@@ -687,8 +740,14 @@ pub(crate) fn card_governor(now: Option<&HostSampleNow>, cfg: &PowerPolicyConfig
 const RADIO_HOST_ROLE: &str = "radio-host";
 
 /// Whether any peer in the allow-list may dispatch the `radio-host` role here.
-fn serves_radio(list: &std::collections::BTreeMap<String, darkmux_types::config::AcceptWorkEntry>) -> bool {
-    list.values().any(|e| e.roles.as_ref().is_some_and(|r| r.iter().any(|role| role == RADIO_HOST_ROLE)))
+fn serves_radio(
+    list: &std::collections::BTreeMap<String, darkmux_types::config::AcceptWorkEntry>,
+) -> bool {
+    list.values().any(|e| {
+        e.roles
+            .as_ref()
+            .is_some_and(|r| r.iter().any(|role| role == RADIO_HOST_ROLE))
+    })
 }
 
 /// How many distinct profiles of `registry` the allow-list grants to at least
@@ -699,9 +758,15 @@ fn serves_profiles(
     registry: &[CardProfile],
     utility: Option<&str>,
 ) -> u32 {
-    let granted: std::collections::BTreeSet<&str> =
-        list.values().flat_map(|e| e.profiles.iter().flatten()).map(String::as_str).collect();
-    let n = registry.iter().filter(|p| granted.contains(p.name.as_str()) && !is_utility_only(p, utility)).count();
+    let granted: std::collections::BTreeSet<&str> = list
+        .values()
+        .flat_map(|e| e.profiles.iter().flatten())
+        .map(String::as_str)
+        .collect();
+    let n = registry
+        .iter()
+        .filter(|p| granted.contains(p.name.as_str()) && !is_utility_only(p, utility))
+        .count();
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
@@ -713,14 +778,17 @@ fn hosts_fleet_redis(
     redis_host: Option<&str>,
     local_node: impl FnOnce() -> Option<darkmux_fleet::NodeIdentity>,
 ) -> bool {
-    redis_enabled && redis_host.is_some_and(|host| darkmux_fleet::host_reaches_this_machine(host, local_node))
+    redis_enabled
+        && redis_host.is_some_and(|host| darkmux_fleet::host_reaches_this_machine(host, local_node))
 }
 
 /// The defaults this machine hands out, stated only by a hub.
 fn card_fleet_defaults(mode: DeclaredFleetMode) -> Option<CardFleetDefaults> {
     (mode == DeclaredFleetMode::Hub).then(|| CardFleetDefaults {
         version: FLEET_DEFAULTS_VERSION,
-        radio: CardRadioDefaults { answerer_profile: darkmux_types::config_access::fleet_defaults_radio_answerer_profile() },
+        radio: CardRadioDefaults {
+            answerer_profile: darkmux_types::config_access::fleet_defaults_radio_answerer_profile(),
+        },
     })
 }
 
@@ -746,32 +814,44 @@ pub(crate) fn gather_local_card_now() -> MachineCard {
 fn gather_card(wait_for_availability: bool) -> MachineCard {
     let started = std::time::Instant::now();
     let specs = crate::gather_served_specs();
-    let (profiles, default_profile, utility, profiles_error) = match darkmux_profiles::profiles::load_registry(None) {
-        Ok(loaded) => {
-            let mut profiles = card_profiles(&loaded.registry);
-            let each = process_availability_cache().get(&card_models(&loaded.registry), wait_for_availability);
-            state_availability(&mut profiles, each.as_deref());
-            let default = loaded
-                .registry
-                .default_profile
-                .clone()
-                .filter(|d| profiles.iter().any(|p| &p.name == d));
-            let utility = loaded.registry.utility_model_id().map(str::to_string);
-            (profiles, default, utility, None)
-        }
-        Err(e) => {
-            // Informational: the card itself carries the failure (`REGISTRY_UNREADABLE`), and a
-            // CLI read of the fleet view (`profile list --machine <x>`) gathers this card on
-            // the way. Printed for a log (non-terminal stderr, the daemon) or `--verbose`, quiet
-            // in a terminal.
-            darkmux_types::diag_eprintln!("darkmux serve: machine card: reading the profile registry failed ({e:#})");
-            (Vec::new(), None, None, Some(REGISTRY_UNREADABLE.to_string()))
-        }
-    };
+    let (profiles, default_profile, utility, profiles_error) =
+        match darkmux_profiles::profiles::load_registry(None) {
+            Ok(loaded) => {
+                let mut profiles = card_profiles(&loaded.registry);
+                let each = process_availability_cache()
+                    .get(&card_models(&loaded.registry), wait_for_availability);
+                state_availability(&mut profiles, each.as_deref());
+                let default = loaded
+                    .registry
+                    .default_profile
+                    .clone()
+                    .filter(|d| profiles.iter().any(|p| &p.name == d));
+                let utility = loaded.registry.utility_model_id().map(str::to_string);
+                (profiles, default, utility, None)
+            }
+            Err(e) => {
+                // Informational: the card itself carries the failure (`REGISTRY_UNREADABLE`), and a
+                // CLI read of the fleet view (`profile list --machine <x>`) gathers this card on
+                // the way. Printed for a log (non-terminal stderr, the daemon) or `--verbose`, quiet
+                // in a terminal.
+                darkmux_types::diag_eprintln!(
+                    "darkmux serve: machine card: reading the profile registry failed ({e:#})"
+                );
+                (
+                    Vec::new(),
+                    None,
+                    None,
+                    Some(REGISTRY_UNREADABLE.to_string()),
+                )
+            }
+        };
     let seats = crate::fleet_listener::listener_seats()
         .map(|(policy, snap)| card_seats(policy, &snap, &profiles, utility.as_deref()));
     let governor = card_governor(
-        crate::host_sampler::ring().snapshot().map(|l| l.now).as_ref(),
+        crate::host_sampler::ring()
+            .snapshot()
+            .map(|l| l.now)
+            .as_ref(),
         &PowerPolicyConfig::from_env(),
     );
     let fleet_mode = darkmux_types::config_access::declared_fleet_mode();
@@ -793,7 +873,11 @@ fn gather_card(wait_for_availability: bool) -> MachineCard {
         hosts_fleet_redis: Some(hosts_fleet_redis(
             darkmux_types::config_access::redis_enabled(),
             darkmux_types::config_access::redis_host().as_deref(),
-            || darkmux_fleet::configured_provider().ok().and_then(|p| p.local_node().ok()),
+            || {
+                darkmux_fleet::configured_provider()
+                    .ok()
+                    .and_then(|p| p.local_node().ok())
+            },
         )),
         serves_radio: allow_list.as_ref().map(serves_radio),
         serves_profiles,
@@ -821,7 +905,10 @@ pub(crate) struct CardCache {
 
 impl CardCache {
     pub(crate) fn new(ttl: Duration) -> Self {
-        Self { ttl, slot: std::sync::Mutex::new(None) }
+        Self {
+            ttl,
+            slot: std::sync::Mutex::new(None),
+        }
     }
 
     /// The cached card, or the result of `gather` stamped with this cache's
@@ -844,7 +931,9 @@ impl CardCache {
 /// and this machine's own row of the fleet view reads it.
 pub(crate) fn process_card_cache() -> std::sync::Arc<CardCache> {
     static CACHE: std::sync::OnceLock<std::sync::Arc<CardCache>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Arc::new(CardCache::new(CARD_CACHE_TTL))).clone()
+    CACHE
+        .get_or_init(|| std::sync::Arc::new(CardCache::new(CARD_CACHE_TTL)))
+        .clone()
 }
 
 #[cfg(test)]
@@ -857,7 +946,9 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("profiles.json");
         std::fs::write(&path, json.to_string()).unwrap();
-        darkmux_profiles::profiles::load_registry(Some(path.to_str().unwrap())).unwrap().registry
+        darkmux_profiles::profiles::load_registry(Some(path.to_str().unwrap()))
+            .unwrap()
+            .registry
     }
 
     fn mixed_registry() -> ProfileRegistry {
@@ -873,7 +964,9 @@ pub(crate) mod tests {
     }
 
     fn by_name<'a>(p: &'a [CardProfile], n: &str) -> &'a CardProfile {
-        p.iter().find(|x| x.name == n).unwrap_or_else(|| panic!("no profile {n} in {p:?}"))
+        p.iter()
+            .find(|x| x.name == n)
+            .unwrap_or_else(|| panic!("no profile {n} in {p:?}"))
     }
 
     /// The promise: a card's endpoint kinds ARE the registry's resolution.
@@ -883,12 +976,24 @@ pub(crate) mod tests {
     fn endpoint_kinds_match_the_registry_resolution() {
         let reg = mixed_registry();
         let cards = card_profiles(&reg);
-        assert_eq!(by_name(&cards, "local").endpoint_kind, CardEndpointKind::Managed);
-        assert_eq!(by_name(&cards, "cloud").endpoint_kind, CardEndpointKind::Unmanaged);
+        assert_eq!(
+            by_name(&cards, "local").endpoint_kind,
+            CardEndpointKind::Managed
+        );
+        assert_eq!(
+            by_name(&cards, "cloud").endpoint_kind,
+            CardEndpointKind::Unmanaged
+        );
         for (name, profile) in &reg.profiles {
             for model in &profile.models {
-                let target = darkmux_crew::target::target_for(name.clone(), profile.clone(), model.clone()).unwrap();
-                let card = by_name(&cards, name).models.iter().find(|m| m.id == model.id).unwrap();
+                let target =
+                    darkmux_crew::target::target_for(name.clone(), profile.clone(), model.clone())
+                        .unwrap();
+                let card = by_name(&cards, name)
+                    .models
+                    .iter()
+                    .find(|m| m.id == model.id)
+                    .unwrap();
                 let expected = match target.kind {
                     EndpointKind::Managed(_) => CardEndpointKind::Managed,
                     EndpointKind::Unmanaged => CardEndpointKind::Unmanaged,
@@ -902,10 +1007,16 @@ pub(crate) mod tests {
     #[test]
     fn a_profile_of_both_kinds_is_mixed_and_one_with_no_models_is_unresolved() {
         let cards = card_profiles(&mixed_registry());
-        assert_eq!(by_name(&cards, "both").endpoint_kind, CardEndpointKind::Mixed);
+        assert_eq!(
+            by_name(&cards, "both").endpoint_kind,
+            CardEndpointKind::Mixed
+        );
         let mut reg = ProfileRegistry::default();
         reg.profiles.insert("empty".into(), Profile::default());
-        assert_eq!(card_profiles(&reg)[0].endpoint_kind, CardEndpointKind::Unresolved);
+        assert_eq!(
+            card_profiles(&reg)[0].endpoint_kind,
+            CardEndpointKind::Unresolved
+        );
     }
 
     #[test]
@@ -916,9 +1027,18 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let mut reg = ProfileRegistry::default();
-        reg.profiles.insert("p".into(), Profile { models: vec![model], ..Default::default() });
+        reg.profiles.insert(
+            "p".into(),
+            Profile {
+                models: vec![model],
+                ..Default::default()
+            },
+        );
         let cards = card_profiles(&reg);
-        assert_eq!(cards[0].models[0].endpoint_kind, CardEndpointKind::Unresolved);
+        assert_eq!(
+            cards[0].models[0].endpoint_kind,
+            CardEndpointKind::Unresolved
+        );
         assert_eq!(cards[0].endpoint_kind, CardEndpointKind::Unresolved);
     }
 
@@ -930,11 +1050,19 @@ pub(crate) mod tests {
     }
 
     fn snap(local: &[&str], unmanaged: usize, waiting: usize) -> SeatSnapshot {
-        SeatSnapshot { local_held: local.iter().map(|s| s.to_string()).collect(), unmanaged_held: unmanaged, waiting }
+        SeatSnapshot {
+            local_held: local.iter().map(|s| s.to_string()).collect(),
+            unmanaged_held: unmanaged,
+            waiting,
+        }
     }
 
     fn seat_of<'a>(seats: &'a CardSeats, model: &str) -> &'a CardLocalSeat {
-        seats.local.iter().find(|s| s.model == model).unwrap_or_else(|| panic!("no seat for {model} in {seats:?}"))
+        seats
+            .local
+            .iter()
+            .find(|s| s.model == model)
+            .unwrap_or_else(|| panic!("no seat for {model} in {seats:?}"))
     }
 
     /// The promise: the seat block states what peers' jobs hold and NOTHING
@@ -945,14 +1073,28 @@ pub(crate) mod tests {
         let cards = card_profiles(&mixed_registry());
         let seats = card_seats(BusyPolicy::Queue, &snap(&["qwen-35b"], 1, 2), &cards, None);
         assert_eq!(seats.busy_policy, CardBusyPolicy::Queue);
-        assert!(!seats.counts_own_work, "the listener never sees this machine's own dispatches");
+        assert!(
+            !seats.counts_own_work,
+            "the listener never sees this machine's own dispatches"
+        );
         assert!(seat_of(&seats, "qwen-35b").held_by_peer_job);
-        assert!(!seat_of(&seats, "qwen-4b").held_by_peer_job, "the managed model nobody holds");
+        assert!(
+            !seat_of(&seats, "qwen-4b").held_by_peer_job,
+            "the managed model nobody holds"
+        );
         assert_eq!(seats.local.len(), 2);
-        assert_eq!(seats.unmanaged, CardUnmanagedSeats { held_by_peer_jobs: 1 });
+        assert_eq!(
+            seats.unmanaged,
+            CardUnmanagedSeats {
+                held_by_peer_jobs: 1
+            }
+        );
         assert_eq!(seats.waiting, 2);
         let wire = serde_json::to_string(&seats).unwrap();
-        assert!(!wire.contains("free"), "no seat field may read as free: {wire}");
+        assert!(
+            !wire.contains("free"),
+            "no seat field may read as free: {wire}"
+        );
     }
 
     /// A profile of only the utility model is refused by the listener, so its
@@ -967,22 +1109,44 @@ pub(crate) mod tests {
                 .map(|s| s.model)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(models(None), vec!["qwen-35b".to_string(), "qwen-4b".to_string()]);
-        assert_eq!(models(Some("qwen-4b")), vec!["qwen-35b".to_string(), "qwen-4b".to_string()], "qwen-4b is also in `both`, a work profile");
-        assert_eq!(models(Some("qwen-35b")), vec!["qwen-4b".to_string()], "`local` holds only the utility model");
+        assert_eq!(
+            models(None),
+            vec!["qwen-35b".to_string(), "qwen-4b".to_string()]
+        );
+        assert_eq!(
+            models(Some("qwen-4b")),
+            vec!["qwen-35b".to_string(), "qwen-4b".to_string()],
+            "qwen-4b is also in `both`, a work profile"
+        );
+        assert_eq!(
+            models(Some("qwen-35b")),
+            vec!["qwen-4b".to_string()],
+            "`local` holds only the utility model"
+        );
     }
 
     /// A model a peer job holds is listed even when no work profile names it.
     #[test]
     fn a_held_model_is_listed_whatever_the_profiles_say() {
         let seats = card_seats(BusyPolicy::Refuse, &snap(&["orphan"], 0, 0), &[], None);
-        assert_eq!(seats.local, vec![CardLocalSeat { model: "orphan".into(), held_by_peer_job: true }]);
+        assert_eq!(
+            seats.local,
+            vec![CardLocalSeat {
+                model: "orphan".into(),
+                held_by_peer_job: true
+            }]
+        );
     }
 
     #[test]
     fn held_endpoint_jobs_count() {
         let seats = card_seats(BusyPolicy::Refuse, &snap(&[], 4, 0), &[], None);
-        assert_eq!(seats.unmanaged, CardUnmanagedSeats { held_by_peer_jobs: 4 });
+        assert_eq!(
+            seats.unmanaged,
+            CardUnmanagedSeats {
+                held_by_peer_jobs: 4
+            }
+        );
     }
 
     fn now(thermal: Option<&str>, battery: Option<BatteryCharge>) -> HostSampleNow {
@@ -995,7 +1159,10 @@ pub(crate) mod tests {
             gpu_pct: None,
             gpu_mhz: None,
             gpu_mem_bytes: None,
-            thermal: thermal.map(|s| ThermalNow { state: s.into(), cpu_speed_limit_pct: 90 }),
+            thermal: thermal.map(|s| ThermalNow {
+                state: s.into(),
+                cpu_speed_limit_pct: 90,
+            }),
             battery,
             power_mw: None,
             package_power_mw: None,
@@ -1004,11 +1171,20 @@ pub(crate) mod tests {
     }
 
     fn charge(pct: u8) -> BatteryCharge {
-        BatteryCharge { charge_pct: pct, on_ac: false, state: ChargeState::Discharging, minutes_to_empty: None }
+        BatteryCharge {
+            charge_pct: pct,
+            on_ac: false,
+            state: ChargeState::Discharging,
+            minutes_to_empty: None,
+        }
     }
 
     fn cfg(refuse: bool) -> PowerPolicyConfig {
-        PowerPolicyConfig { min_battery_pct: 50, refuse_start_below_min: refuse, pause_running_below_min: true }
+        PowerPolicyConfig {
+            min_battery_pct: 50,
+            refuse_start_below_min: refuse,
+            pause_running_below_min: true,
+        }
     }
 
     #[test]
@@ -1016,22 +1192,51 @@ pub(crate) mod tests {
         let low = card_governor(Some(&now(Some("serious"), Some(charge(30)))), &cfg(true));
         assert_eq!(low.thermal.as_ref().unwrap().state, "serious");
         assert_eq!(low.battery.as_ref().unwrap().charge_pct, 30);
-        assert_eq!(low.battery_gate.refusing_start, Some(true), "30% is under a 50% floor the operator turned on");
-        assert_eq!((low.battery_gate.floor_pct, low.battery_gate.pause_running_below_min), (50, true));
+        assert_eq!(
+            low.battery_gate.refusing_start,
+            Some(true),
+            "30% is under a 50% floor the operator turned on"
+        );
+        assert_eq!(
+            (
+                low.battery_gate.floor_pct,
+                low.battery_gate.pause_running_below_min
+            ),
+            (50, true)
+        );
 
-        assert_eq!(card_governor(Some(&now(None, Some(charge(30)))), &cfg(false)).battery_gate.refusing_start, Some(false), "the policy is off");
-        assert_eq!(card_governor(Some(&now(None, Some(charge(50)))), &cfg(true)).battery_gate.refusing_start, Some(false), "at the floor starts");
+        assert_eq!(
+            card_governor(Some(&now(None, Some(charge(30)))), &cfg(false))
+                .battery_gate
+                .refusing_start,
+            Some(false),
+            "the policy is off"
+        );
+        assert_eq!(
+            card_governor(Some(&now(None, Some(charge(50)))), &cfg(true))
+                .battery_gate
+                .refusing_start,
+            Some(false),
+            "at the floor starts"
+        );
     }
 
     /// (#3074) A machine with no battery sample (or probe failed) has no
     /// measurement, so refusing_start is `None` (`null`), not a confident `false`.
     #[test]
     fn a_gate_nobody_measured_is_not_observed_rather_than_false() {
-        assert_eq!(card_governor(Some(&now(Some("nominal"), None)), &cfg(true)).battery_gate.refusing_start, None);
+        assert_eq!(
+            card_governor(Some(&now(Some("nominal"), None)), &cfg(true))
+                .battery_gate
+                .refusing_start,
+            None
+        );
         let nothing = card_governor(None, &cfg(true));
         assert!(nothing.thermal.is_none() && nothing.battery.is_none());
         assert_eq!(nothing.battery_gate.refusing_start, None);
-        assert!(serde_json::to_value(&nothing).unwrap()["battery_gate"]["refusing_start"].is_null());
+        assert!(
+            serde_json::to_value(&nothing).unwrap()["battery_gate"]["refusing_start"].is_null()
+        );
     }
 
     /// A profile whose dispatch target cannot be built is `unresolved`, by the
@@ -1052,13 +1257,25 @@ pub(crate) mod tests {
         let cards = card_profiles(&reg);
         for (name, profile) in &reg.profiles {
             for model in &profile.models {
-                let built = darkmux_crew::target::target_for(name.clone(), profile.clone(), model.clone()).is_ok();
+                let built =
+                    darkmux_crew::target::target_for(name.clone(), profile.clone(), model.clone())
+                        .is_ok();
                 let kind = by_name(&cards, name).models[0].endpoint_kind;
-                assert_eq!(kind == CardEndpointKind::Unresolved, !built, "{name}: the card and target_for must agree");
+                assert_eq!(
+                    kind == CardEndpointKind::Unresolved,
+                    !built,
+                    "{name}: the card and target_for must agree"
+                );
             }
         }
-        assert_eq!(by_name(&cards, "fine").endpoint_kind, CardEndpointKind::Unmanaged);
-        assert_eq!(by_name(&cards, "baddialect").endpoint_kind, CardEndpointKind::Unresolved);
+        assert_eq!(
+            by_name(&cards, "fine").endpoint_kind,
+            CardEndpointKind::Unmanaged
+        );
+        assert_eq!(
+            by_name(&cards, "baddialect").endpoint_kind,
+            CardEndpointKind::Unresolved
+        );
     }
 
     /// The card states no grant itself: the grant rides beside it in the
@@ -1067,15 +1284,32 @@ pub(crate) mod tests {
     fn the_cards_own_shape_has_no_grant_and_the_listeners_answer_carries_it() {
         let card = sample_card();
         assert!(serde_json::to_value(&card).unwrap().get("grant").is_none());
-        let accepts = CardAccepts { peer_name: "laptop".into(), profiles: vec!["deep".into()], roles: vec![], images: vec![], workspace: false };
-        let json = serde_json::to_value(ListenerCard { card, grant: CardGrant::Listed { accepts } }).unwrap();
+        let accepts = CardAccepts {
+            peer_name: "laptop".into(),
+            profiles: vec!["deep".into()],
+            roles: vec![],
+            images: vec![],
+            workspace: false,
+        };
+        let json = serde_json::to_value(ListenerCard {
+            card,
+            grant: CardGrant::Listed { accepts },
+        })
+        .unwrap();
         assert_eq!(json["grant"]["state"], "listed");
         assert_eq!(json["grant"]["accepts"]["peer_name"], "laptop");
         assert!(json["card"].get("grant").is_none() && json["card"].get("accepts").is_none());
     }
 
     fn admitted() -> Admitted {
-        Admitted { peer_name: "laptop".into(), node_id: "nLAPTOP".into(), profiles: vec!["deep".into()], roles: vec![], images: vec![], workspace: false }
+        Admitted {
+            peer_name: "laptop".into(),
+            node_id: "nLAPTOP".into(),
+            profiles: vec!["deep".into()],
+            roles: vec![],
+            images: vec![],
+            workspace: false,
+        }
     }
 
     /// The grant is what the allow-list said: an entry, no entry, or "could
@@ -1084,13 +1318,27 @@ pub(crate) mod tests {
     #[test]
     fn a_grant_is_listed_not_listed_or_unknown_and_never_guessed() {
         use darkmux_fleet::Refusal;
-        assert!(matches!(CardGrant::from_authorization(&Ok(admitted())), CardGrant::Listed { accepts } if accepts.peer_name == "laptop"));
-        assert_eq!(CardGrant::from_authorization(&Err(Refusal::NotAllowed { node_name: "phone".into(), ask: Default::default() })), CardGrant::NotListed);
+        assert!(
+            matches!(CardGrant::from_authorization(&Ok(admitted())), CardGrant::Listed { accepts } if accepts.peer_name == "laptop")
+        );
+        assert_eq!(
+            CardGrant::from_authorization(&Err(Refusal::NotAllowed {
+                node_name: "phone".into(),
+                ask: Default::default()
+            })),
+            CardGrant::NotListed
+        );
         for other in [
-            Refusal::AmbiguousEntry { names: vec!["a".into(), "b".into()] },
+            Refusal::AmbiguousEntry {
+                names: vec!["a".into(), "b".into()],
+            },
             Refusal::BadRequest("the allow-list cannot be read".into()),
         ] {
-            assert_eq!(CardGrant::from_authorization(&Err(other.clone())), CardGrant::Unknown, "{other:?}");
+            assert_eq!(
+                CardGrant::from_authorization(&Err(other.clone())),
+                CardGrant::Unknown,
+                "{other:?}"
+            );
         }
     }
 
@@ -1104,13 +1352,24 @@ pub(crate) mod tests {
         v["profiles"][0]["endpoint_kind"] = serde_json::json!("fleet");
         v["profiles"][0]["models"][0]["endpoint_kind"] = serde_json::json!("fleet");
         v["seats"]["busy_policy"] = serde_json::json!("preempt");
-        let card: MachineCard = serde_json::from_value(v).expect("an unknown enum value must not discard the card");
+        let card: MachineCard =
+            serde_json::from_value(v).expect("an unknown enum value must not discard the card");
         assert_eq!(card.profiles[0].endpoint_kind, CardEndpointKind::Unknown);
-        assert_eq!(card.profiles[0].models[0].endpoint_kind, CardEndpointKind::Unknown);
-        assert_eq!(card.seats.as_ref().unwrap().busy_policy, CardBusyPolicy::Unknown);
-        assert_eq!(card.profiles[0].name, "deep", "the rest of the card is intact");
+        assert_eq!(
+            card.profiles[0].models[0].endpoint_kind,
+            CardEndpointKind::Unknown
+        );
+        assert_eq!(
+            card.seats.as_ref().unwrap().busy_policy,
+            CardBusyPolicy::Unknown
+        );
+        assert_eq!(
+            card.profiles[0].name, "deep",
+            "the rest of the card is intact"
+        );
         assert_eq!(card.specs.machine_id.as_deref(), Some("studio"));
-        let grant: CardGrant = serde_json::from_value(serde_json::json!({"state": "delegated", "to": "x"})).unwrap();
+        let grant: CardGrant =
+            serde_json::from_value(serde_json::json!({"state": "delegated", "to": "x"})).unwrap();
         assert_eq!(grant, CardGrant::Unknown);
     }
 
@@ -1128,12 +1387,20 @@ pub(crate) mod tests {
         let cache = CardCache::new(Duration::from_secs(60));
         let first = cache.get(gather);
         let second = cache.get(gather);
-        assert_eq!(gathers.load(std::sync::atomic::Ordering::SeqCst), 1, "the second read came from the cache");
+        assert_eq!(
+            gathers.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second read came from the cache"
+        );
         assert_eq!((first.cache_ttl_ms, second.cache_ttl_ms), (60_000, 60_000));
         let expired = CardCache::new(Duration::ZERO);
         expired.get(gather);
         expired.get(gather);
-        assert_eq!(gathers.load(std::sync::atomic::Ordering::SeqCst), 3, "a zero TTL never serves a cached card");
+        assert_eq!(
+            gathers.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "a zero TTL never serves a cached card"
+        );
     }
 
     // ── availability (#3450) ───────────────────────────────────────────
@@ -1146,23 +1413,48 @@ pub(crate) mod tests {
         let reg = mixed_registry();
         let mut cards = card_profiles(&reg);
         let models = card_models(&reg);
-        assert_eq!(models.len(), cards.iter().map(|c| c.models.len()).sum::<usize>());
-        let each: Vec<Availability> = models.iter().map(|m| Availability::unavailable(format!("{} is off", m.id))).collect();
+        assert_eq!(
+            models.len(),
+            cards.iter().map(|c| c.models.len()).sum::<usize>()
+        );
+        let each: Vec<Availability> = models
+            .iter()
+            .map(|m| Availability::unavailable(format!("{} is off", m.id)))
+            .collect();
         state_availability(&mut cards, Some(&each));
         for card in &cards {
             for m in &card.models {
-                assert_eq!(m.availability.as_ref().and_then(|a| a.reason.clone()), Some(format!("{} is off", m.id)));
+                assert_eq!(
+                    m.availability.as_ref().and_then(|a| a.reason.clone()),
+                    Some(format!("{} is off", m.id))
+                );
             }
         }
         let mut none = card_profiles(&reg);
         state_availability(&mut none, None);
-        assert!(none.iter().flat_map(|c| &c.models).all(|m| m.availability.is_none()));
+        assert!(none
+            .iter()
+            .flat_map(|c| &c.models)
+            .all(|m| m.availability.is_none()));
         let json = serde_json::to_value(&none[0].models[0]).unwrap();
-        assert!(json.get("availability").is_none(), "not stated is absent: {json}");
+        assert!(
+            json.get("availability").is_none(),
+            "not stated is absent: {json}"
+        );
     }
 
-    fn listing_of(state: AvailabilityState) -> impl Fn(&[ProfileModel]) -> Vec<Availability> + Send + Sync + 'static {
-        move |models: &[ProfileModel]| models.iter().map(|_| Availability { state, reason: None }).collect()
+    fn listing_of(
+        state: AvailabilityState,
+    ) -> impl Fn(&[ProfileModel]) -> Vec<Availability> + Send + Sync + 'static {
+        move |models: &[ProfileModel]| {
+            models
+                .iter()
+                .map(|_| Availability {
+                    state,
+                    reason: None,
+                })
+                .collect()
+        }
     }
 
     /// The promise: the card never waits on a listing. Inside the TTL the
@@ -1171,7 +1463,11 @@ pub(crate) mod tests {
     /// another set's listing; and a reader that can wait (the CLI) lists.
     #[test]
     fn the_cards_availability_is_listed_behind_it_never_inline() {
-        let models = vec![ProfileModel { id: "m".into(), n_ctx: Some(8), ..Default::default() }];
+        let models = vec![ProfileModel {
+            id: "m".into(),
+            n_ctx: Some(8),
+            ..Default::default()
+        }];
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = calls.clone();
         let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
@@ -1182,18 +1478,43 @@ pub(crate) mod tests {
             listing_of(AvailabilityState::Startable)(m)
         });
         let blocked = gate.lock().unwrap();
-        assert_eq!(cache.get(&models, false), None, "nothing listed yet: nothing stated, and no wait");
+        assert_eq!(
+            cache.get(&models, false),
+            None,
+            "nothing listed yet: nothing stated, and no wait"
+        );
         drop(blocked);
         let first = (0..200).find_map(|_| {
             std::thread::sleep(Duration::from_millis(10));
             cache.get(&models, false)
         });
-        assert_eq!(first.map(|a| a[0].state), Some(AvailabilityState::Startable), "the refresh landed behind the card");
-        let other = vec![ProfileModel { id: "other".into(), ..Default::default() }];
-        assert_eq!(cache.get(&other, true).map(|a| a.len()), Some(1), "a reader that waits lists its own set");
-        let fresh = AvailabilityCache::new(Duration::from_secs(60), listing_of(AvailabilityState::Resident));
-        assert_eq!(fresh.get(&models, true).map(|a| a[0].state), Some(AvailabilityState::Resident));
-        assert_eq!(fresh.get(&other, false), None, "another set's listing never answers");
+        assert_eq!(
+            first.map(|a| a[0].state),
+            Some(AvailabilityState::Startable),
+            "the refresh landed behind the card"
+        );
+        let other = vec![ProfileModel {
+            id: "other".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            cache.get(&other, true).map(|a| a.len()),
+            Some(1),
+            "a reader that waits lists its own set"
+        );
+        let fresh = AvailabilityCache::new(
+            Duration::from_secs(60),
+            listing_of(AvailabilityState::Resident),
+        );
+        assert_eq!(
+            fresh.get(&models, true).map(|a| a[0].state),
+            Some(AvailabilityState::Resident)
+        );
+        assert_eq!(
+            fresh.get(&other, false),
+            None,
+            "another set's listing never answers"
+        );
         assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
     }
 
@@ -1201,7 +1522,10 @@ pub(crate) mod tests {
     /// next stale read lists again.
     #[test]
     fn a_listing_that_panics_is_retried_on_the_next_stale_read() {
-        let models = vec![ProfileModel { id: "m".into(), ..Default::default() }];
+        let models = vec![ProfileModel {
+            id: "m".into(),
+            ..Default::default()
+        }];
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = calls.clone();
         let cache = AvailabilityCache::new(Duration::ZERO, move |m: &[ProfileModel]| {
@@ -1214,7 +1538,11 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(10));
             cache.get(&models, false)
         });
-        assert_eq!(answered.map(|a| a[0].state), Some(AvailabilityState::Startable), "a later read listed again");
+        assert_eq!(
+            answered.map(|a| a[0].state),
+            Some(AvailabilityState::Startable),
+            "a later read listed again"
+        );
         assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
     }
 
@@ -1222,23 +1550,47 @@ pub(crate) mod tests {
     /// as current: a card read past it states none (and lists again behind).
     #[test]
     fn a_listing_past_its_bound_is_not_stated() {
-        let models = vec![ProfileModel { id: "m".into(), ..Default::default() }];
-        let cache = AvailabilityCache::new(Duration::ZERO, listing_of(AvailabilityState::Resident)).stated_for(Duration::ZERO);
-        assert!(cache.get(&models, true).is_some(), "a reader that waits gets its own listing");
-        assert_eq!(cache.get(&models, false), None, "a listing past its bound is not stated");
-        let kept = AvailabilityCache::new(Duration::ZERO, listing_of(AvailabilityState::Resident)).stated_for(Duration::from_secs(600));
+        let models = vec![ProfileModel {
+            id: "m".into(),
+            ..Default::default()
+        }];
+        let cache = AvailabilityCache::new(Duration::ZERO, listing_of(AvailabilityState::Resident))
+            .stated_for(Duration::ZERO);
+        assert!(
+            cache.get(&models, true).is_some(),
+            "a reader that waits gets its own listing"
+        );
+        assert_eq!(
+            cache.get(&models, false),
+            None,
+            "a listing past its bound is not stated"
+        );
+        let kept = AvailabilityCache::new(Duration::ZERO, listing_of(AvailabilityState::Resident))
+            .stated_for(Duration::from_secs(600));
         kept.get(&models, true);
-        assert!(kept.get(&models, false).is_some(), "inside its bound, the last listing answers while one refreshes");
+        assert!(
+            kept.get(&models, false).is_some(),
+            "inside its bound, the last listing answers while one refreshes"
+        );
     }
 
     // ── the declared role (#3022) ──────────────────────────────────────
 
     fn card_declaring(mode: DeclaredFleetMode, defaults: Option<CardFleetDefaults>) -> MachineCard {
-        MachineCard { fleet_mode: Some(mode), fleet_defaults: defaults, ..sample_card() }
+        MachineCard {
+            fleet_mode: Some(mode),
+            fleet_defaults: defaults,
+            ..sample_card()
+        }
     }
 
     fn defaults_with(version: u32, profile: Option<&str>) -> CardFleetDefaults {
-        CardFleetDefaults { version, radio: CardRadioDefaults { answerer_profile: profile.map(str::to_string) } }
+        CardFleetDefaults {
+            version,
+            radio: CardRadioDefaults {
+                answerer_profile: profile.map(str::to_string),
+            },
+        }
     }
 
     /// The promise: a card's defaults are taken only from a card that declares
@@ -1247,15 +1599,43 @@ pub(crate) mod tests {
     /// sets nothing.
     #[test]
     fn defaults_are_taken_only_from_a_hub_card_in_a_known_shape() {
-        let hub = card_declaring(DeclaredFleetMode::Hub, Some(defaults_with(FLEET_DEFAULTS_VERSION, Some("deep@studio"))));
-        assert_eq!(hub.hub_defaults().unwrap().radio.answerer_profile.as_deref(), Some("deep@studio"));
-        for mode in [DeclaredFleetMode::Peer, DeclaredFleetMode::Standalone, DeclaredFleetMode::Unknown] {
-            let card = card_declaring(mode, Some(defaults_with(FLEET_DEFAULTS_VERSION, Some("deep@studio"))));
-            assert!(card.hub_defaults().is_none(), "a {mode:?} card's defaults are refused");
+        let hub = card_declaring(
+            DeclaredFleetMode::Hub,
+            Some(defaults_with(FLEET_DEFAULTS_VERSION, Some("deep@studio"))),
+        );
+        assert_eq!(
+            hub.hub_defaults()
+                .unwrap()
+                .radio
+                .answerer_profile
+                .as_deref(),
+            Some("deep@studio")
+        );
+        for mode in [
+            DeclaredFleetMode::Peer,
+            DeclaredFleetMode::Standalone,
+            DeclaredFleetMode::Unknown,
+        ] {
+            let card = card_declaring(
+                mode,
+                Some(defaults_with(FLEET_DEFAULTS_VERSION, Some("deep@studio"))),
+            );
+            assert!(
+                card.hub_defaults().is_none(),
+                "a {mode:?} card's defaults are refused"
+            );
         }
-        let newer = card_declaring(DeclaredFleetMode::Hub, Some(defaults_with(FLEET_DEFAULTS_VERSION + 1, Some("x@y"))));
-        assert!(newer.hub_defaults().is_none(), "a block version this darkmux does not read is not guessed at");
-        assert!(card_declaring(DeclaredFleetMode::Hub, None).hub_defaults().is_none());
+        let newer = card_declaring(
+            DeclaredFleetMode::Hub,
+            Some(defaults_with(FLEET_DEFAULTS_VERSION + 1, Some("x@y"))),
+        );
+        assert!(
+            newer.hub_defaults().is_none(),
+            "a block version this darkmux does not read is not guessed at"
+        );
+        assert!(card_declaring(DeclaredFleetMode::Hub, None)
+            .hub_defaults()
+            .is_none());
     }
 
     /// A card from a newer darkmux with a mode this one does not name reads as
@@ -1292,9 +1672,15 @@ pub(crate) mod tests {
             card_fleet_defaults(darkmux_types::config_access::declared_fleet_mode())
         };
         let hub = card_for("hub").expect("a hub states its defaults");
-        assert_eq!((hub.version, hub.radio.answerer_profile.as_deref()), (FLEET_DEFAULTS_VERSION, Some("deep@studio")));
+        assert_eq!(
+            (hub.version, hub.radio.answerer_profile.as_deref()),
+            (FLEET_DEFAULTS_VERSION, Some("deep@studio"))
+        );
         for mode in ["peer", "standalone", "hubb"] {
-            assert!(card_for(mode).is_none(), "`{mode}` states no defaults even with the block set");
+            assert!(
+                card_for(mode).is_none(),
+                "`{mode}` states no defaults even with the block set"
+            );
         }
     }
 
@@ -1304,9 +1690,19 @@ pub(crate) mod tests {
     fn a_machine_hosts_the_fleet_redis_only_when_its_redis_host_is_itself() {
         let me = || Some(darkmux_fleet::test_node("n1", "hub", "100.64.0.1"));
         assert!(hosts_fleet_redis(true, Some("127.0.0.1"), me));
-        assert!(hosts_fleet_redis(true, Some("hub.tailnet-example.ts.net"), me));
-        assert!(!hosts_fleet_redis(true, Some("100.64.0.9"), me), "another machine's address");
-        assert!(!hosts_fleet_redis(false, Some("127.0.0.1"), me), "Redis off here");
+        assert!(hosts_fleet_redis(
+            true,
+            Some("hub.tailnet-example.ts.net"),
+            me
+        ));
+        assert!(
+            !hosts_fleet_redis(true, Some("100.64.0.9"), me),
+            "another machine's address"
+        );
+        assert!(
+            !hosts_fleet_redis(false, Some("127.0.0.1"), me),
+            "Redis off here"
+        );
         assert!(!hosts_fleet_redis(true, None, me), "no host");
     }
 
@@ -1347,7 +1743,11 @@ pub(crate) mod tests {
                     answering: true,
                 }],
                 lms_unreachable: false,
-                engine: Some(crate::wire::MachineEngine { name: darkmux_types::default_engine::LMSTUDIO.into(), reports_residency: true, usable: true }),
+                engine: Some(crate::wire::MachineEngine {
+                    name: darkmux_types::default_engine::LMSTUDIO.into(),
+                    reports_residency: true,
+                    usable: true,
+                }),
                 utility_model: None,
                 hub_configured: false,
                 generated_at_ms: 1_000,
@@ -1383,12 +1783,20 @@ pub(crate) mod tests {
             seats: Some(CardSeats {
                 busy_policy: CardBusyPolicy::Queue,
                 counts_own_work: false,
-                local: vec![CardLocalSeat { model: "qwen".into(), held_by_peer_job: true }],
-                unmanaged: CardUnmanagedSeats { held_by_peer_jobs: 1 },
+                local: vec![CardLocalSeat {
+                    model: "qwen".into(),
+                    held_by_peer_job: true,
+                }],
+                unmanaged: CardUnmanagedSeats {
+                    held_by_peer_jobs: 1,
+                },
                 waiting: 0,
             }),
             governor: CardGovernor {
-                thermal: Some(ThermalNow { state: "nominal".into(), cpu_speed_limit_pct: 100 }),
+                thermal: Some(ThermalNow {
+                    state: "nominal".into(),
+                    cpu_speed_limit_pct: 100,
+                }),
                 battery: None,
                 battery_gate: CardBatteryGate {
                     floor_pct: 20,
@@ -1403,7 +1811,9 @@ pub(crate) mod tests {
             serves_profiles: Some(2),
             fleet_defaults: Some(CardFleetDefaults {
                 version: FLEET_DEFAULTS_VERSION,
-                radio: CardRadioDefaults { answerer_profile: Some("deep@studio".into()) },
+                radio: CardRadioDefaults {
+                    answerer_profile: Some("deep@studio".into()),
+                },
             }),
             generated_at_ms: 2_000,
             gather_ms: 3,
@@ -1423,7 +1833,11 @@ pub(crate) mod tests {
         let written = serde_json::to_value(value).unwrap();
         if std::env::var_os("DARKMUX_REGENERATE_FIXTURES").is_some() {
             std::fs::create_dir_all(fixtures_dir()).unwrap();
-            std::fs::write(&path, format!("{}\n", serde_json::to_string_pretty(value).unwrap())).unwrap();
+            std::fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string_pretty(value).unwrap()),
+            )
+            .unwrap();
             return written;
         }
         let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_else(|e| {
@@ -1443,20 +1857,39 @@ pub(crate) mod tests {
     /// is what a sender reads to know what a peer takes.
     #[test]
     fn a_card_states_the_work_wire_version_this_build_speaks() {
-        assert_eq!(stated_work_version(), darkmux_fleet::WORK_JOB_SCHEMA_VERSION);
-        assert_eq!(sample_card().work_job_schema_version, darkmux_fleet::WORK_JOB_SCHEMA_VERSION);
+        assert_eq!(
+            stated_work_version(),
+            darkmux_fleet::WORK_JOB_SCHEMA_VERSION
+        );
+        assert_eq!(
+            sample_card().work_job_schema_version,
+            darkmux_fleet::WORK_JOB_SCHEMA_VERSION
+        );
     }
 
     /// The current version's fixtures parse as themselves, through the parser
     /// peers use.
     #[test]
     fn the_current_card_fixtures_still_parse() {
-        let card = fixture(&format!("machine-card-{CARD_SCHEMA_VERSION}.json"), &sample_card());
-        let card: MachineCard = serde_json::from_value(card).expect("the current card fixture parses");
+        let card = fixture(
+            &format!("machine-card-{CARD_SCHEMA_VERSION}.json"),
+            &sample_card(),
+        );
+        let card: MachineCard =
+            serde_json::from_value(card).expect("the current card fixture parses");
         assert_eq!(card.card_schema_version, CARD_SCHEMA_VERSION);
-        let listed = ListenerCard { card: sample_card(), grant: CardGrant::Listed { accepts: CardAccepts::from(&admitted()) } };
-        let listener = fixture(&format!("listener-card-{CARD_SCHEMA_VERSION}.json"), &listed);
-        let listener: ListenerCard = serde_json::from_value(listener).expect("the current listener fixture parses");
+        let listed = ListenerCard {
+            card: sample_card(),
+            grant: CardGrant::Listed {
+                accepts: CardAccepts::from(&admitted()),
+            },
+        };
+        let listener = fixture(
+            &format!("listener-card-{CARD_SCHEMA_VERSION}.json"),
+            &listed,
+        );
+        let listener: ListenerCard =
+            serde_json::from_value(listener).expect("the current listener fixture parses");
         assert!(matches!(listener.grant, CardGrant::Listed { .. }));
         assert_eq!(listener.card.profiles.len(), 2);
     }
@@ -1476,7 +1909,10 @@ pub(crate) mod tests {
         assert!(!serves_radio(&list), "an empty allow-list serves no radio");
         list.insert("a".to_string(), entry(None));
         list.insert("b".to_string(), entry(Some(vec!["coder"])));
-        assert!(!serves_radio(&list), "other roles and no roles do not count");
+        assert!(
+            !serves_radio(&list),
+            "other roles and no roles do not count"
+        );
         list.insert("c".to_string(), entry(Some(vec!["coder", "radio-host"])));
         assert!(serves_radio(&list), "one peer granted radio-host is enough");
     }
@@ -1484,11 +1920,21 @@ pub(crate) mod tests {
     /// The card says THAT the machine serves radio, never to whom.
     #[test]
     fn the_card_carries_the_flag_and_no_peer_names() {
-        let card = MachineCard { serves_radio: Some(true), ..sample_card() };
+        let card = MachineCard {
+            serves_radio: Some(true),
+            ..sample_card()
+        };
         let json = serde_json::to_value(&card).unwrap();
         assert_eq!(json["serves_radio"], serde_json::json!(true));
-        let absent = serde_json::to_value(MachineCard { serves_radio: None, ..sample_card() }).unwrap();
-        assert!(absent.get("serves_radio").is_none(), "not stated is absent, not false");
+        let absent = serde_json::to_value(MachineCard {
+            serves_radio: None,
+            ..sample_card()
+        })
+        .unwrap();
+        assert!(
+            absent.get("serves_radio").is_none(),
+            "not stated is absent, not false"
+        );
     }
 
     // ── serves_profiles (card schema 1.2) ─────────────────────────────
@@ -1508,16 +1954,30 @@ pub(crate) mod tests {
                 description: None,
                 is_default: false,
                 endpoint_kind: CardEndpointKind::Managed,
-                models: vec![CardModel { id: model.to_string(), n_ctx: None, endpoint_kind: CardEndpointKind::Managed, availability: None }],
+                models: vec![CardModel {
+                    id: model.to_string(),
+                    n_ctx: None,
+                    endpoint_kind: CardEndpointKind::Managed,
+                    availability: None,
+                }],
             })
             .collect()
     }
 
     #[test]
     fn serves_profiles_counts_distinct_granted_work_class_profiles() {
-        let registry = registry_of(&[("fast", "qwen-4b"), ("deep", "qwen-35b"), ("tiny", "util"), ("unused", "qwen-35b")]);
+        let registry = registry_of(&[
+            ("fast", "qwen-4b"),
+            ("deep", "qwen-35b"),
+            ("tiny", "util"),
+            ("unused", "qwen-35b"),
+        ]);
         let mut list = std::collections::BTreeMap::new();
-        assert_eq!(serves_profiles(&list, &registry, Some("util")), 0, "an empty allow-list serves none");
+        assert_eq!(
+            serves_profiles(&list, &registry, Some("util")),
+            0,
+            "an empty allow-list serves none"
+        );
         list.insert("a".to_string(), granting(vec!["fast", "deep"]));
         list.insert("b".to_string(), granting(vec!["fast", "ghost", "tiny"]));
         list.insert("c".to_string(), entry(None));
@@ -1526,14 +1986,29 @@ pub(crate) mod tests {
             2,
             "fast is granted twice but counts once; ghost is not in the registry; tiny runs only the utility model"
         );
-        assert_eq!(serves_profiles(&list, &registry, None), 3, "with no utility model, tiny is ordinary work");
+        assert_eq!(
+            serves_profiles(&list, &registry, None),
+            3,
+            "with no utility model, tiny is ordinary work"
+        );
     }
 
     #[test]
     fn serves_profiles_is_absent_when_not_stated_and_names_nobody() {
-        let absent = serde_json::to_value(MachineCard { serves_profiles: None, ..sample_card() }).unwrap();
-        assert!(absent.get("serves_profiles").is_none(), "not stated is absent, never 0");
-        let json = serde_json::to_value(MachineCard { serves_profiles: Some(3), ..sample_card() }).unwrap();
+        let absent = serde_json::to_value(MachineCard {
+            serves_profiles: None,
+            ..sample_card()
+        })
+        .unwrap();
+        assert!(
+            absent.get("serves_profiles").is_none(),
+            "not stated is absent, never 0"
+        );
+        let json = serde_json::to_value(MachineCard {
+            serves_profiles: Some(3),
+            ..sample_card()
+        })
+        .unwrap();
         assert_eq!(json["serves_profiles"], serde_json::json!(3));
     }
 
@@ -1559,7 +2034,9 @@ pub(crate) mod tests {
     fn shape_hash() -> String {
         let mut schema = serde_json::to_value(schemars::schema_for!(ListenerCard)).unwrap();
         canonical(&mut schema);
-        blake3::hash(schema.to_string().as_bytes()).to_hex().to_string()
+        blake3::hash(schema.to_string().as_bytes())
+            .to_hex()
+            .to_string()
     }
 
     /// The promise: the card's shape and [`CARD_SCHEMA_VERSION`] move
@@ -1584,7 +2061,9 @@ pub(crate) mod tests {
             return;
         }
         let golden = std::fs::read_to_string(&path).expect("card-shape.golden is missing");
-        let recorded = golden.lines().find(|l| l.starts_with(&format!("{CARD_SCHEMA_VERSION} ")));
+        let recorded = golden
+            .lines()
+            .find(|l| l.starts_with(&format!("{CARD_SCHEMA_VERSION} ")));
         assert_eq!(
             recorded,
             Some(line.as_str()),

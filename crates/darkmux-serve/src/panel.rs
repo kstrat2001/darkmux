@@ -176,9 +176,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::redaction::{redact_panel_stdout, Redaction};
-use darkmux_types::panel_audience::{self, Withheld};
 use crate::wire::PanelResponse;
 use crate::{current_millis, AppState};
+use darkmux_types::panel_audience::{self, Withheld};
 
 /// TTL for cached panel output. Short: panels are "state right now" views,
 /// and the underlying commands are cheap disk reads — the cache exists to
@@ -294,8 +294,14 @@ pub(crate) struct PanelOpt {
 const ALL_OPT: PanelOpt = PanelOpt {
     name: "all",
     values: &[
-        PanelOptValue { value: "recent", argv: &[] },
-        PanelOptValue { value: "all", argv: &["--all"] },
+        PanelOptValue {
+            value: "recent",
+            argv: &[],
+        },
+        PanelOptValue {
+            value: "all",
+            argv: &["--all"],
+        },
     ],
 };
 
@@ -314,10 +320,22 @@ const ALL_OPT: PanelOpt = PanelOpt {
 const RUN_LIST_KIND_OPT: PanelOpt = PanelOpt {
     name: "kind",
     values: &[
-        PanelOptValue { value: "all", argv: &[] },
-        PanelOptValue { value: "mission", argv: &["--kind", "mission"] },
-        PanelOptValue { value: "dispatch", argv: &["--kind", "dispatch"] },
-        PanelOptValue { value: "lab", argv: &["--kind", "lab"] },
+        PanelOptValue {
+            value: "all",
+            argv: &[],
+        },
+        PanelOptValue {
+            value: "mission",
+            argv: &["--kind", "mission"],
+        },
+        PanelOptValue {
+            value: "dispatch",
+            argv: &["--kind", "dispatch"],
+        },
+        PanelOptValue {
+            value: "lab",
+            argv: &["--kind", "lab"],
+        },
     ],
 };
 
@@ -330,8 +348,14 @@ const RUN_LIST_KIND_OPT: PanelOpt = PanelOpt {
 const RUN_LIST_USAGE_OPT: PanelOpt = PanelOpt {
     name: "usage",
     values: &[
-        PanelOptValue { value: "off", argv: &[] },
-        PanelOptValue { value: "on", argv: &["--usage"] },
+        PanelOptValue {
+            value: "off",
+            argv: &[],
+        },
+        PanelOptValue {
+            value: "on",
+            argv: &["--usage"],
+        },
     ],
 };
 
@@ -389,8 +413,14 @@ pub(crate) struct RosterOpt {
 const PROFILE_LIST_REMOTE_OPT: PanelOpt = PanelOpt {
     name: "remote",
     values: &[
-        PanelOptValue { value: "off", argv: &[] },
-        PanelOptValue { value: "on", argv: &["--remote"] },
+        PanelOptValue {
+            value: "off",
+            argv: &[],
+        },
+        PanelOptValue {
+            value: "on",
+            argv: &["--remote"],
+        },
     ],
 };
 
@@ -403,9 +433,15 @@ const ROSTER_MACHINE_FLAG: &str = "--machine";
 const POSITIONAL_SEPARATOR: &str = "--";
 
 /// `profile list --machine <name>`.
-const ROSTER_AS_FLAG: RosterOpt = RosterOpt { name: ROSTER_MACHINE_OPT, flag: Some(ROSTER_MACHINE_FLAG) };
+const ROSTER_AS_FLAG: RosterOpt = RosterOpt {
+    name: ROSTER_MACHINE_OPT,
+    flag: Some(ROSTER_MACHINE_FLAG),
+};
 /// `machine status -- <name>`.
-const ROSTER_AS_POSITIONAL: RosterOpt = RosterOpt { name: ROSTER_MACHINE_OPT, flag: None };
+const ROSTER_AS_POSITIONAL: RosterOpt = RosterOpt {
+    name: ROSTER_MACHINE_OPT,
+    flag: None,
+};
 
 /// Every allowlisted BASE panel id (#1911: this counts base verbs, not
 /// variants — a verb with declared opts is still one id here). Test-only
@@ -446,37 +482,85 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
         // withholds.
         //
         // Mission and run state, the same facts `/runs` serves.
-        "mission-status" => ("mission-status", &["mission", "status"], true, FLEET_PANEL_CACHE_TTL, MISSION_STATUS_OPTS),
+        "mission-status" => (
+            "mission-status",
+            &["mission", "status"],
+            true,
+            FLEET_PANEL_CACHE_TTL,
+            MISSION_STATUS_OPTS,
+        ),
         // The role manifests the crew loads; no machine or fleet state.
         "role-list" => ("role-list", &["role", "list"], true, PANEL_CACHE_TTL, &[]),
         // Resident models and their ownership, the same facts
         // `/machine/status` serves; an `lms` error names the configured
         // `lms_bin` path (withheld by the daemon's scrub).
-        "machine-status" => ("machine-status", &["machine", "status"], true, PANEL_CACHE_TTL, &[]),
+        "machine-status" => (
+            "machine-status",
+            &["machine", "status"],
+            true,
+            PANEL_CACHE_TTL,
+            &[],
+        ),
         // The fleet view's rows, the same facts `GET /fleet/view` serves
         // (liveness, the card each machine states about itself), worded as the
         // fleet lens's status line words them. A phone has no tooltips, so this
         // is the touch path for a machine's status and its reason. Names the
         // roster file's path.
-        "machine-list" => ("machine-list", &["machine", "list"], true, PANEL_CACHE_TTL, &[]),
+        "machine-list" => (
+            "machine-list",
+            &["machine", "list"],
+            true,
+            PANEL_CACHE_TTL,
+            &[],
+        ),
         // The whole config.json, which holds addresses, paths, URLs,
         // credential pointers, the listener's port and the `fleet.accept_work`
         // allow-list: its remote form withholds all of them.
-        "config-list" => ("config-list", &["config", "list"], true, PANEL_CACHE_TTL, &[]),
+        "config-list" => (
+            "config-list",
+            &["config", "list"],
+            true,
+            PANEL_CACHE_TTL,
+            &[],
+        ),
         // The flows and outbox directories, each hook's target URL and the
         // Redis URL (an overlay address): its remote form withholds them.
-        "flow-status" => ("flow-status", &["flow", "status"], true, PANEL_CACHE_TTL, &[]),
+        "flow-status" => (
+            "flow-status",
+            &["flow", "status"],
+            true,
+            PANEL_CACHE_TTL,
+            &[],
+        ),
         // Registered lab fixtures and their paths.
-        "lab-fixture-list" => ("lab-fixture-list", &["lab", "fixture", "list"], true, PANEL_CACHE_TTL, &[]),
+        "lab-fixture-list" => (
+            "lab-fixture-list",
+            &["lab", "fixture", "list"],
+            true,
+            PANEL_CACHE_TTL,
+            &[],
+        ),
         // (#1911) The CLI twin of the RUNS lens's union — see
         // `src/run_list.rs`'s own module doc. The same rows as `/runs`.
-        "run-list" => ("run-list", &["run", "list"], true, FLEET_PANEL_CACHE_TTL, RUN_LIST_OPTS),
+        "run-list" => (
+            "run-list",
+            &["run", "list"],
+            true,
+            FLEET_PANEL_CACHE_TTL,
+            RUN_LIST_OPTS,
+        ),
         // The profiles THIS machine's own grants let it use (its own
         // registry, or a roster peer's card), the same facts `machine list`
         // prints; it reveals only this machine's own allow-list entry on each
         // peer, not the peer's allow-list. An endpoint's host is withheld by
         // the daemon's scrub.
-        "profile-list" => ("profile-list", &["profile", "list"], true, PANEL_CACHE_TTL, PROFILE_LIST_OPTS),
+        "profile-list" => (
+            "profile-list",
+            &["profile", "list"],
+            true,
+            PANEL_CACHE_TTL,
+            PROFILE_LIST_OPTS,
+        ),
         // Manual-run only (#1286): never auto-refreshed by the viewer,
         // TTL 0 so an explicit re-run is always a real run, and rate-
         // floored server-side (see MANUAL_MIN_INTERVAL) because
@@ -504,7 +588,16 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
         "machine-status" => Some(ROSTER_AS_POSITIONAL),
         _ => None,
     };
-    Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl, spawn_timeout: spawn_timeout_for(id), opts, needs_fleet_snapshot, roster_opt })
+    Some(PanelSpec {
+        id,
+        argv,
+        auto_refresh,
+        cache_ttl: ttl,
+        spawn_timeout: spawn_timeout_for(id),
+        opts,
+        needs_fleet_snapshot,
+        roster_opt,
+    })
 }
 
 /// The spawn bound for panel `id`: `doctor` probes every peer and gets the long
@@ -542,14 +635,21 @@ struct ResolvedOpt {
 /// declared opt, defaulted when the client did not select it — so argv
 /// composition, the cache key, and the response echo can never disagree
 /// about which opts exist.
-fn resolve_opts(spec: &PanelSpec, requested: &HashMap<String, String>) -> Result<Vec<ResolvedOpt>, String> {
+fn resolve_opts(
+    spec: &PanelSpec,
+    requested: &HashMap<String, String>,
+) -> Result<Vec<ResolvedOpt>, String> {
     let legal_names: Vec<&'static str> = spec.opts.iter().map(|o| o.name).collect();
     for name in requested.keys() {
         if !spec.opts.iter().any(|o| o.name == name.as_str()) {
             return Err(format!(
                 "unknown option \"{name}\" for panel \"{}\": legal options: {}\n",
                 spec.id,
-                if legal_names.is_empty() { "(none)".to_string() } else { legal_names.join(", ") }
+                if legal_names.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    legal_names.join(", ")
+                }
             ));
         }
     }
@@ -557,7 +657,10 @@ fn resolve_opts(spec: &PanelSpec, requested: &HashMap<String, String>) -> Result
     let mut out = Vec::with_capacity(spec.opts.len());
     for opt in spec.opts {
         let default_value = opt.values[0].value;
-        let selected: &str = requested.get(opt.name).map(String::as_str).unwrap_or(default_value);
+        let selected: &str = requested
+            .get(opt.name)
+            .map(String::as_str)
+            .unwrap_or(default_value);
         let Some(pv) = opt.values.iter().find(|v| v.value == selected) else {
             let legal: Vec<&'static str> = opt.values.iter().map(|v| v.value).collect();
             return Err(format!(
@@ -567,7 +670,12 @@ fn resolve_opts(spec: &PanelSpec, requested: &HashMap<String, String>) -> Result
                 legal.join(", ")
             ));
         };
-        out.push(ResolvedOpt { name: opt.name, value: pv.value, argv: pv.argv, is_default: pv.value == default_value });
+        out.push(ResolvedOpt {
+            name: opt.name,
+            value: pv.value,
+            argv: pv.argv,
+            is_default: pv.value == default_value,
+        });
     }
     Ok(out)
 }
@@ -592,13 +700,20 @@ fn compose_argv(spec: &PanelSpec, resolved: &[ResolvedOpt]) -> Vec<&'static str>
 /// is empty and this function drops defaults entirely, "no selection" and
 /// "explicitly picked the default" produce the SAME key — one cache entry.
 fn variant_key(spec_id: &str, resolved: &[ResolvedOpt]) -> String {
-    let mut pairs: Vec<(&str, &str)> =
-        resolved.iter().filter(|r| !r.is_default).map(|r| (r.name, r.value)).collect();
+    let mut pairs: Vec<(&str, &str)> = resolved
+        .iter()
+        .filter(|r| !r.is_default)
+        .map(|r| (r.name, r.value))
+        .collect();
     pairs.sort_by_key(|(name, _)| *name);
     if pairs.is_empty() {
         spec_id.to_string()
     } else {
-        let joined = pairs.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join("&");
+        let joined = pairs
+            .iter()
+            .map(|(n, v)| format!("{n}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
         format!("{spec_id}?{joined}")
     }
 }
@@ -608,7 +723,10 @@ fn variant_key(spec_id: &str, resolved: &[ResolvedOpt]) -> String {
 /// when nothing was picked explicitly. Empty object for a panel with no
 /// declared opts.
 fn opts_map(resolved: &[ResolvedOpt]) -> std::collections::BTreeMap<String, String> {
-    resolved.iter().map(|r| (r.name.to_string(), r.value.to_string())).collect()
+    resolved
+        .iter()
+        .map(|r| (r.name.to_string(), r.value.to_string()))
+        .collect()
 }
 
 /// Take the roster-valued opt (if `spec` declares one) out of `requested` and
@@ -627,8 +745,12 @@ fn resolve_roster_opt(
     roster_ids: &[String],
     remote_on: bool,
 ) -> Result<Option<String>, String> {
-    let Some(RosterOpt { name, .. }) = spec.roster_opt else { return Ok(None) };
-    let Some(raw) = requested.remove(name) else { return Ok(None) };
+    let Some(RosterOpt { name, .. }) = spec.roster_opt else {
+        return Ok(None);
+    };
+    let Some(raw) = requested.remove(name) else {
+        return Ok(None);
+    };
     if raw.is_empty() {
         return Ok(None);
     }
@@ -636,7 +758,11 @@ fn resolve_roster_opt(
         return Err(format!(
             "unknown value \"{raw}\" for option \"{name}\" on panel \"{}\": legal values: {}\n",
             spec.id,
-            if roster_ids.is_empty() { "(the roster is empty)".to_string() } else { roster_ids.join(", ") }
+            if roster_ids.is_empty() {
+                "(the roster is empty)".to_string()
+            } else {
+                roster_ids.join(", ")
+            }
         ));
     };
     // (5.0 console review) A roster id reaches argv, so it must be a machine
@@ -666,9 +792,15 @@ fn with_roster_choice(
     key: String,
     mut echo: std::collections::BTreeMap<String, String>,
     machine: Option<&str>,
-) -> (Vec<String>, String, std::collections::BTreeMap<String, String>) {
+) -> (
+    Vec<String>,
+    String,
+    std::collections::BTreeMap<String, String>,
+) {
     let mut argv: Vec<String> = argv.into_iter().map(String::from).collect();
-    let (Some(id), Some(roster)) = (machine, spec.roster_opt) else { return (argv, key, echo) };
+    let (Some(id), Some(roster)) = (machine, spec.roster_opt) else {
+        return (argv, key, echo);
+    };
     match roster.flag {
         Some(flag) => argv.push(flag.to_string()),
         // A positional id follows `--`, so nothing in the roster can be read
@@ -678,14 +810,21 @@ fn with_roster_choice(
     argv.push(id.to_string());
     let joiner = if key.contains('?') { '&' } else { '?' };
     echo.insert(ROSTER_MACHINE_OPT.to_string(), id.to_string());
-    (argv, format!("{key}{joiner}{ROSTER_MACHINE_OPT}={id}"), echo)
+    (
+        argv,
+        format!("{key}{joiner}{ROSTER_MACHINE_OPT}={id}"),
+        echo,
+    )
 }
 
 /// The first key that appears twice in a raw query string, percent-decoded
 /// (`opt%2Ekind` and `opt.kind` are the same key), or `None`.
 fn duplicate_query_key(raw: &str) -> Option<String> {
     let mut seen = std::collections::HashSet::new();
-    raw.split('&').filter(|pair| !pair.is_empty()).map(|pair| decode_query_component(pair.split('=').next().unwrap_or(""))).find(|key| !seen.insert(key.clone()))
+    raw.split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| decode_query_component(pair.split('=').next().unwrap_or("")))
+        .find(|key| !seen.insert(key.clone()))
 }
 
 /// `application/x-www-form-urlencoded` decoding of one component: `+` is a
@@ -697,7 +836,11 @@ fn decode_query_component(raw: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        let escaped = match (bytes[i], bytes.get(i + 1).and_then(|b| hex(*b)), bytes.get(i + 2).and_then(|b| hex(*b))) {
+        let escaped = match (
+            bytes[i],
+            bytes.get(i + 1).and_then(|b| hex(*b)),
+            bytes.get(i + 2).and_then(|b| hex(*b)),
+        ) {
             (b'%', Some(hi), Some(lo)) => Some(hi * 16 + lo),
             _ => None,
         };
@@ -728,7 +871,12 @@ fn parse_cols(raw: &HashMap<String, String>) -> Option<u16> {
 /// prefixed with `opt.` (`cols`, or an unrelated param) is ignored here —
 /// `cols` is read separately by the caller.
 fn extract_opt_params(raw: &HashMap<String, String>) -> HashMap<String, String> {
-    raw.iter().filter_map(|(k, v)| k.strip_prefix("opt.").map(|name| (name.to_string(), v.clone()))).collect()
+    raw.iter()
+        .filter_map(|(k, v)| {
+            k.strip_prefix("opt.")
+                .map(|name| (name.to_string(), v.clone()))
+        })
+        .collect()
 }
 
 /// Whole-response cache entry.
@@ -756,7 +904,9 @@ struct CacheEntry {
 /// direction for a freshness gate is one extra (cheap, local) spawn, never
 /// serving a body whose real age is unknown as though it were fresh.
 fn cache_entry_is_fresh(captured: SystemTime, now: SystemTime, ttl: Duration) -> bool {
-    now.duration_since(captured).map(|age| age <= ttl).unwrap_or(false)
+    now.duration_since(captured)
+        .map(|age| age <= ttl)
+        .unwrap_or(false)
 }
 
 /// Wall-clock milliseconds between `captured` and `now`, for the `age_ms`
@@ -768,7 +918,9 @@ fn cache_entry_is_fresh(captured: SystemTime, now: SystemTime, ttl: Duration) ->
 /// on the same backward-jump condition), but the function stays correct
 /// on its own terms rather than relying on that caller's behavior.
 fn cache_entry_age_ms_at(captured: SystemTime, now: SystemTime) -> u64 {
-    now.duration_since(captured).map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)).unwrap_or(u64::MAX)
+    now.duration_since(captured)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(u64::MAX)
 }
 
 /// Panel state carried on [`AppState`]: the TTL cache plus the per-variant
@@ -839,12 +991,19 @@ pub(crate) enum Audience {
 /// range. Narrow steps where phones sit, where a few columns decide what a
 /// verb sheds; wide steps above. Starts at `clamp_cols`' floor, so every
 /// clamped width has a bucket, and holds its default (100).
-const COLS_BUCKETS: &[u16] = &[36, 40, 44, 48, 52, 56, 64, 72, 80, 90, 100, 120, 140, 160, 180, 200];
+const COLS_BUCKETS: &[u16] = &[
+    36, 40, 44, 48, 52, 56, 64, 72, 80, 90, 100, 120, 140, 160, 180, 200,
+];
 
 /// The width a clamped request renders at: the widest bucket no wider than
 /// it, so a render never overflows the space the caller has.
 fn bucket_cols(clamped: u16) -> u16 {
-    COLS_BUCKETS.iter().copied().take_while(|b| *b <= clamped).last().unwrap_or(COLS_BUCKETS[0])
+    COLS_BUCKETS
+        .iter()
+        .copied()
+        .take_while(|b| *b <= clamped)
+        .last()
+        .unwrap_or(COLS_BUCKETS[0])
 }
 
 fn clamp_cols(cols: Option<u16>) -> u16 {
@@ -903,7 +1062,11 @@ struct ManualClaim {
 ///
 /// There is no `.await` between the read and the insert, so a racer
 /// either observes the timestamp or genuinely arrived after the window.
-async fn admit_manual_run(panels: &PanelState, id: &'static str, audience: Audience) -> Result<ManualClaim, (StatusCode, String)> {
+async fn admit_manual_run(
+    panels: &PanelState,
+    id: &'static str,
+    audience: Audience,
+) -> Result<ManualClaim, (StatusCode, String)> {
     admit_manual_run_at(panels, id, audience, SystemTime::now()).await
 }
 
@@ -950,9 +1113,14 @@ async fn admit_manual_run_at(
     let mut last = panels.last_manual.lock().await;
     if let Some(&(prev, prev_instant)) = last.get(&(id, audience)) {
         let monotonic_elapsed = now_instant.duration_since(prev_instant);
-        if let Some(remaining) = manual_floor_wait(prev, now, monotonic_elapsed, MANUAL_MIN_INTERVAL) {
+        if let Some(remaining) =
+            manual_floor_wait(prev, now, monotonic_elapsed, MANUAL_MIN_INTERVAL)
+        {
             let wait = remaining.as_secs() + 1;
-            let since = now.duration_since(prev).unwrap_or(Duration::ZERO).max(monotonic_elapsed);
+            let since = now
+                .duration_since(prev)
+                .unwrap_or(Duration::ZERO)
+                .max(monotonic_elapsed);
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 format!(
@@ -965,7 +1133,10 @@ async fn admit_manual_run_at(
         }
     }
     // Claim the window under the SAME guard that just cleared it.
-    let claim = ManualClaim { audience, at: (now, now_instant) };
+    let claim = ManualClaim {
+        audience,
+        at: (now, now_instant),
+    };
     last.insert((id, audience), claim.at);
     Ok(claim)
 }
@@ -1037,7 +1208,10 @@ fn manual_floor_wait(
 /// panel is refused for who is asking: the read gate in front of this route
 /// already applied the read posture, and a caller that is not this machine is
 /// served the panel redacted (see the module doc).
-fn admit_panel_request(id: &str, headers: &axum::http::HeaderMap) -> Result<PanelSpec, (StatusCode, String)> {
+fn admit_panel_request(
+    id: &str,
+    headers: &axum::http::HeaderMap,
+) -> Result<PanelSpec, (StatusCode, String)> {
     // The preflight forcer — see PANEL_HEADER.
     if !headers.contains_key(PANEL_HEADER) {
         return Err((
@@ -1053,7 +1227,9 @@ fn admit_panel_request(id: &str, headers: &axum::http::HeaderMap) -> Result<Pane
     let Some(spec) = panel_spec(id) else {
         return Err((
             StatusCode::NOT_FOUND,
-            format!("unknown panel \"{id}\": panels are a fixed allowlist, not arbitrary commands\n"),
+            format!(
+                "unknown panel \"{id}\": panels are a fixed allowlist, not arbitrary commands\n"
+            ),
         ));
     };
     Ok(spec)
@@ -1067,21 +1243,37 @@ async fn resolve_selection(
     state: &AppState,
     spec: &PanelSpec,
     params: &HashMap<String, String>,
-) -> Result<(Vec<String>, String, std::collections::BTreeMap<String, String>), (StatusCode, String)> {
+) -> Result<
+    (
+        Vec<String>,
+        String,
+        std::collections::BTreeMap<String, String>,
+    ),
+    (StatusCode, String),
+> {
     let bad = |msg: String| (StatusCode::BAD_REQUEST, msg);
     let mut requested = extract_opt_params(params);
     let machine = match (spec.roster_opt, requested.contains_key(ROSTER_MACHINE_OPT)) {
         (Some(_), true) => {
             // The same names the CLI's `--machine` accepts: every roster id and
             // this machine's own (`FleetView::selector_names`).
-            let roster = crate::fleet_view::cached_view(state).await.map_err(|(code, msg)| (code, msg.to_string()))?.selector_names();
+            let roster = crate::fleet_view::cached_view(state)
+                .await
+                .map_err(|(code, msg)| (code, msg.to_string()))?
+                .selector_names();
             let remote_on = requested.get("remote").is_some_and(|v| v == "on");
             resolve_roster_opt(spec, &mut requested, &roster, remote_on).map_err(bad)?
         }
         _ => None,
     };
     let resolved = resolve_opts(spec, &requested).map_err(bad)?;
-    Ok(with_roster_choice(spec, compose_argv(spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), machine.as_deref()))
+    Ok(with_roster_choice(
+        spec,
+        compose_argv(spec, &resolved),
+        variant_key(spec.id, &resolved),
+        opts_map(&resolved),
+        machine.as_deref(),
+    ))
 }
 
 /// The ONE output filter for a caller that is not this machine or a token
@@ -1129,7 +1321,9 @@ pub(crate) async fn panel_handler(
     State(state): State<AppState>,
 ) -> Result<axum::Json<PanelResponse>, (StatusCode, String)> {
     let remote = !crate::caller_is_local_or_holds_token(peer.map(|c| c.0), &headers);
-    run_panel(&id, raw_query.0, params.0, remote, &headers, &state).await.map(axum::Json)
+    run_panel(&id, raw_query.0, params.0, remote, &headers, &state)
+        .await
+        .map(axum::Json)
 }
 
 /// A fresh remote body redacted against the sets as they stand now. Both
@@ -1138,10 +1332,19 @@ pub(crate) async fn panel_handler(
 /// what they read is unchanged (see `redaction`'s caches).
 async fn redact_fresh_for_remote(body: &mut PanelResponse) -> Result<(), (StatusCode, String)> {
     let (r, w, machine) = tokio::task::spawn_blocking(|| {
-        (Redaction::derive_cached(), crate::redaction::panel_withheld_cached(), darkmux_flow::resolve_machine_id())
+        (
+            Redaction::derive_cached(),
+            crate::redaction::panel_withheld_cached(),
+            darkmux_flow::resolve_machine_id(),
+        )
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("redacting panel \"{}\": {e}\n", body.panel)))?;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("redacting panel \"{}\": {e}\n", body.panel),
+        )
+    })?;
     redact_for_remote(body, &r, &w, machine.as_deref());
     Ok(())
 }
@@ -1160,7 +1363,10 @@ async fn run_panel(
     if let Some(key) = raw_query.as_deref().and_then(duplicate_query_key) {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("query key \"{key}\" appears more than once on panel \"{}\": send each key once\n", spec.id),
+            format!(
+                "query key \"{key}\" appears more than once on panel \"{}\": send each key once\n",
+                spec.id
+            ),
         ));
     }
     // Canonical &'static id straight off the spec — one table, no second
@@ -1198,7 +1404,10 @@ async fn run_panel(
     // one spawn.
     let flight = {
         let mut flights = state.panels.flights.lock().await;
-        flights.entry(key.clone()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        flights
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     };
     let _guard = flight.lock().await;
     // Re-check under the flight lock — a concurrent request may have filled
@@ -1219,11 +1428,18 @@ async fn run_panel(
     // failure) just skips the env var below, and the child falls back to
     // its own live read (`fleet_records_for_runs`'s own doc) — a snapshot
     // that couldn't be prepared is never a reason to fail the panel.
-    let fleet_snapshot = if spec.needs_fleet_snapshot { prepare_fleet_snapshot(id).await } else { None };
+    let fleet_snapshot = if spec.needs_fleet_snapshot {
+        prepare_fleet_snapshot(id).await
+    } else {
+        None
+    };
 
     let started = Instant::now();
     let exe = child_exe(&state.panels).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("resolving current_exe: {e}\n"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("resolving current_exe: {e}\n"),
+        )
     })?;
     let cmd = panel_command(exe, &final_argv, cols, id, remote, fleet_snapshot.as_ref());
 
@@ -1286,20 +1502,38 @@ enum Admitted {
 /// answered with the last remote run, never a new probe: polling from the
 /// tailnet can neither close this machine's window nor make it probe more
 /// than once per window.
-async fn admit_run(state: &AppState, spec: &PanelSpec, remote: bool, key: &str) -> Result<Admitted, (StatusCode, String)> {
+async fn admit_run(
+    state: &AppState,
+    spec: &PanelSpec,
+    remote: bool,
+    key: &str,
+) -> Result<Admitted, (StatusCode, String)> {
     if spec.auto_refresh {
         return Ok(Admitted::Run(None));
     }
-    let audience = if remote { Audience::Remote } else { Audience::Local };
+    let audience = if remote {
+        Audience::Remote
+    } else {
+        Audience::Local
+    };
     match admit_manual_run(&state.panels, spec.id, audience).await {
         Ok(claim) => Ok(Admitted::Run(Some(claim))),
-        Err(refused) if remote => last_remote_run(&state.panels, key).await.map(Admitted::Answer).ok_or(refused),
+        Err(refused) if remote => last_remote_run(&state.panels, key)
+            .await
+            .map(Admitted::Answer)
+            .ok_or(refused),
         Err(refused) => Err(refused),
     }
 }
 
 /// Keep a finished run where the next caller will find it.
-async fn keep_panel_run(state: &AppState, spec: &PanelSpec, remote: bool, key: String, body: &PanelResponse) {
+async fn keep_panel_run(
+    state: &AppState,
+    spec: &PanelSpec,
+    remote: bool,
+    key: String,
+    body: &PanelResponse,
+) {
     if spec.cache_ttl.is_zero() && !remote {
         // Manual panel: nothing cached (an explicit run is a real run), but
         // the floor's clock advances so the next caller is bounded. Keyed
@@ -1315,7 +1549,13 @@ async fn keep_panel_run(state: &AppState, spec: &PanelSpec, remote: bool, key: S
     let mut cache = state.panels.cache.lock().await;
     let now = SystemTime::now();
     cache.retain(|_, e| cache_entry_is_fresh(e.captured, now, PANEL_CACHE_RETAIN));
-    cache.insert(key, CacheEntry { body: body.clone(), captured: now });
+    cache.insert(
+        key,
+        CacheEntry {
+            body: body.clone(),
+            captured: now,
+        },
+    );
 }
 
 /// The child command that renders panel `id`.
@@ -1416,7 +1656,10 @@ async fn run_child(
     let id = spec.id;
     match tokio::time::timeout(spec.spawn_timeout, cmd.output()).await {
         Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("spawning panel \"{id}\": {e}\n"))),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("spawning panel \"{id}\": {e}\n"),
+        )),
         Err(_) => {
             if let Some(claim) = claim {
                 release_manual_run(panels, id, claim).await;
@@ -1426,7 +1669,11 @@ async fn run_child(
                 format!(
                     "panel \"{id}\" is slow: it did not finish within {}s; try again{}\n",
                     spec.spawn_timeout.as_secs(),
-                    if spec.auto_refresh { "" } else { "; this timeout did not use up the manual-run wait" }
+                    if spec.auto_refresh {
+                        ""
+                    } else {
+                        "; this timeout did not use up the manual-run wait"
+                    }
                 ),
             ))
         }
@@ -1452,7 +1699,10 @@ async fn release_manual_run(panels: &PanelState, id: &'static str, claim: Manual
 /// read as errors are kept first, then the most recent others, up to
 /// [`STDERR_TAIL_LINES`], in their original order.
 fn stderr_tail(raw: &str) -> String {
-    let lines: Vec<&str> = raw.lines().filter(|l| !l.starts_with("[darkmux-liveness]")).collect();
+    let lines: Vec<&str> = raw
+        .lines()
+        .filter(|l| !l.starts_with("[darkmux-liveness]"))
+        .collect();
     let is_error = |l: &str| {
         let l = l.trim_start().to_ascii_lowercase();
         // Rust prints `thread 'main' panicked at ...`, so the word is not a prefix.
@@ -1460,14 +1710,31 @@ fn stderr_tail(raw: &str) -> String {
     };
     let mut keep = vec![false; lines.len()];
     let mut budget = STDERR_TAIL_LINES;
-    for (i, _) in lines.iter().enumerate().rev().filter(|(_, l)| is_error(l)).take(budget) {
+    for (i, _) in lines
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, l)| is_error(l))
+        .take(budget)
+    {
         keep[i] = true;
         budget -= 1;
     }
-    for i in (0..lines.len()).rev().filter(|i| !keep[*i]).take(budget).collect::<Vec<_>>() {
+    for i in (0..lines.len())
+        .rev()
+        .filter(|i| !keep[*i])
+        .take(budget)
+        .collect::<Vec<_>>()
+    {
         keep[i] = true;
     }
-    lines.iter().zip(&keep).filter(|(_, k)| **k).map(|(l, _)| *l).collect::<Vec<_>>().join("\n")
+    lines
+        .iter()
+        .zip(&keep)
+        .filter(|(_, k)| **k)
+        .map(|(l, _)| *l)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// `stdout`, cut at a line boundary under [`PANEL_STDOUT_CAP_BYTES`] with a
@@ -1496,11 +1763,16 @@ fn capped_stdout(stdout: &str) -> String {
 /// never refused. `None` when no remote run has finished yet.
 async fn last_remote_run(panels: &PanelState, key: &str) -> Option<PanelResponse> {
     let cache = panels.cache.lock().await;
-    let any_width = key.rsplit_once(COLS_KEY_SEPARATOR).map_or(key, |(variant, _)| variant);
+    let any_width = key
+        .rsplit_once(COLS_KEY_SEPARATOR)
+        .map_or(key, |(variant, _)| variant);
     let entry = cache.get(key).or_else(|| {
         cache
             .iter()
-            .filter(|(k, _)| k.rsplit_once(COLS_KEY_SEPARATOR).is_some_and(|(variant, _)| variant == any_width))
+            .filter(|(k, _)| {
+                k.rsplit_once(COLS_KEY_SEPARATOR)
+                    .is_some_and(|(variant, _)| variant == any_width)
+            })
             .map(|(_, e)| e)
             .max_by_key(|e| e.captured)
     })?;
@@ -1537,7 +1809,10 @@ mod tests {
         assert!(panel_spec("mission-status").is_some());
         assert!(panel_spec("doctor").is_some());
         assert!(panel_spec("rm -rf /").is_none());
-        assert!(panel_spec("mission status").is_none(), "argv-looking ids are not ids");
+        assert!(
+            panel_spec("mission status").is_none(),
+            "argv-looking ids are not ids"
+        );
         assert!(panel_spec("").is_none());
     }
 
@@ -1546,8 +1821,12 @@ mod tests {
     #[test]
     fn every_listed_id_has_a_spec_and_reports_itself() {
         for id in PANEL_IDS {
-            let spec = panel_spec(id).unwrap_or_else(|| panic!("PANEL_IDS lists {id} with no spec"));
-            assert_eq!(spec.id, *id, "a spec must report the id it was looked up by");
+            let spec =
+                panel_spec(id).unwrap_or_else(|| panic!("PANEL_IDS lists {id} with no spec"));
+            assert_eq!(
+                spec.id, *id,
+                "a spec must report the id it was looked up by"
+            );
             assert!(!spec.argv.is_empty(), "{id} has empty argv");
         }
         // 8 as of `run-list` (#1911), 9 with `profile-list`, 10 with `machine-list` (5.0). Bumping this number is the doctrine
@@ -1561,7 +1840,11 @@ mod tests {
         // stop — an open value space is not an allowlist, and that surface
         // is a lens, not a panel. (`profile-list`'s `machine` is closed: the
         // roster's own names, see the module doc.)
-        assert_eq!(PANEL_IDS.len(), 10, "allowlist growth is a doctrine decision, not a drive-by");
+        assert_eq!(
+            PANEL_IDS.len(),
+            10,
+            "allowlist growth is a doctrine decision, not a drive-by"
+        );
     }
 
     /// (#1914, widened #1711) `run-list` and `mission-status` are the ONLY
@@ -1605,15 +1888,32 @@ mod tests {
     #[test]
     fn doctor_is_manual_only_and_uncached() {
         let d = panel_spec("doctor").unwrap();
-        assert!(!d.auto_refresh, "doctor probes: auto-polling it is the observer joining the observed");
-        assert!(d.cache_ttl.is_zero(), "an explicit doctor run must be a real run");
+        assert!(
+            !d.auto_refresh,
+            "doctor probes: auto-polling it is the observer joining the observed"
+        );
+        assert!(
+            d.cache_ttl.is_zero(),
+            "an explicit doctor run must be a real run"
+        );
         // …and every other panel IS auto-refreshable with a real TTL.
-        for id in
-            ["mission-status", "role-list", "machine-status", "machine-list", "config-list", "flow-status", "lab-fixture-list", "run-list"]
-        {
+        for id in [
+            "mission-status",
+            "role-list",
+            "machine-status",
+            "machine-list",
+            "config-list",
+            "flow-status",
+            "lab-fixture-list",
+            "run-list",
+        ] {
             let s = panel_spec(id).unwrap();
             assert!(s.auto_refresh, "{id}");
-            let want = if s.needs_fleet_snapshot { FLEET_PANEL_CACHE_TTL } else { PANEL_CACHE_TTL };
+            let want = if s.needs_fleet_snapshot {
+                FLEET_PANEL_CACHE_TTL
+            } else {
+                PANEL_CACHE_TTL
+            };
             assert_eq!(s.cache_ttl, want, "{id}");
         }
     }
@@ -1626,11 +1926,20 @@ mod tests {
         assert_eq!(bucket_cols(164), 160);
         assert_eq!(bucket_cols(200), 200);
         for w in 36..=200u16 {
-            assert!(bucket_cols(w) <= w && COLS_BUCKETS.contains(&bucket_cols(w)), "{w}");
+            assert!(
+                bucket_cols(w) <= w && COLS_BUCKETS.contains(&bucket_cols(w)),
+                "{w}"
+            );
         }
         assert!(COLS_BUCKETS.windows(2).all(|p| p[0] < p[1]), "ascending");
-        assert_eq!((COLS_BUCKETS[0], *COLS_BUCKETS.last().unwrap()), (clamp_cols(Some(0)), clamp_cols(Some(u16::MAX))));
-        assert!(COLS_BUCKETS.contains(&clamp_cols(None)), "the default width is a bucket");
+        assert_eq!(
+            (COLS_BUCKETS[0], *COLS_BUCKETS.last().unwrap()),
+            (clamp_cols(Some(0)), clamp_cols(Some(u16::MAX)))
+        );
+        assert!(
+            COLS_BUCKETS.contains(&clamp_cols(None)),
+            "the default width is a bucket"
+        );
     }
 
     #[test]
@@ -1642,7 +1951,11 @@ mod tests {
         // (#1613) A phone's real ask must survive the clamp unchanged. 390px
         // fits ~52 columns; the old floor of 60 rounded it UP, which is how a
         // narrow screen ended up rendering wider than itself.
-        assert_eq!(clamp_cols(Some(52)), 52, "a phone's width is not a floor violation");
+        assert_eq!(
+            clamp_cols(Some(52)),
+            52,
+            "a phone's width is not a floor violation"
+        );
         assert_eq!(clamp_cols(Some(46)), 46);
     }
 
@@ -1738,7 +2051,12 @@ mod tests {
         let mut total = 0usize;
         for id in PANEL_IDS {
             let spec = panel_spec(id).unwrap();
-            let variants: usize = spec.opts.iter().map(|o| o.values.len()).product::<usize>().max(1);
+            let variants: usize = spec
+                .opts
+                .iter()
+                .map(|o| o.values.len())
+                .product::<usize>()
+                .max(1);
             total += variants;
         }
         assert!(
@@ -1755,7 +2073,11 @@ mod tests {
         let spec = panel_spec("run-list").unwrap();
         let requested = HashMap::new();
         let resolved = resolve_opts(&spec, &requested).unwrap();
-        assert_eq!(resolved.len(), 3, "one resolved entry per DECLARED opt, defaulted");
+        assert_eq!(
+            resolved.len(),
+            3,
+            "one resolved entry per DECLARED opt, defaulted"
+        );
         assert_eq!(resolved[0].name, "kind");
         assert_eq!(resolved[0].value, "all");
         assert!(resolved[0].argv.is_empty());
@@ -1822,7 +2144,10 @@ mod tests {
         requested.insert("kind".to_string(), "mission".to_string());
         let err = resolve_opts(&spec, &requested).unwrap_err();
         assert!(err.contains("unknown option"), "{err}");
-        assert!(err.contains("(none)"), "a no-opts panel's legal set is empty: {err}");
+        assert!(
+            err.contains("(none)"),
+            "a no-opts panel's legal set is empty: {err}"
+        );
     }
 
     // ── declaration-order argv (#1911) ────────────────────────────────
@@ -1839,7 +2164,10 @@ mod tests {
         // implementation that walked `requested` pass roughly half the
         // time. Both permutations, plus an assertion on the resolved
         // NAMES, make this deterministic rather than probabilistic.
-        for pairs in [[("all", "all"), ("kind", "mission")], [("kind", "mission"), ("all", "all")]] {
+        for pairs in [
+            [("all", "all"), ("kind", "mission")],
+            [("kind", "mission"), ("all", "all")],
+        ] {
             let mut requested = HashMap::new();
             for (k, v) in pairs {
                 requested.insert(k.to_string(), v.to_string());
@@ -1847,7 +2175,10 @@ mod tests {
             let resolved = resolve_opts(&spec, &requested).unwrap();
             let names: Vec<&str> = resolved.iter().map(|r| r.name).collect();
             let declared: Vec<&str> = spec.opts.iter().map(|o| o.name).collect();
-            assert_eq!(names, declared, "resolved opts must be in DECLARATION order, not query order");
+            assert_eq!(
+                names, declared,
+                "resolved opts must be in DECLARATION order, not query order"
+            );
             let argv = compose_argv(&spec, &resolved);
             assert_eq!(
                 argv,
@@ -1864,19 +2195,40 @@ mod tests {
     #[test]
     fn run_list_declares_the_usage_toggle_as_its_last_opt() {
         let spec = panel_spec("run-list").unwrap();
-        let usage = spec.opts.iter().find(|o| o.name == "usage").expect("run-list declares a usage opt");
+        let usage = spec
+            .opts
+            .iter()
+            .find(|o| o.name == "usage")
+            .expect("run-list declares a usage opt");
         assert_eq!(usage.values.len(), 2);
-        assert_eq!((usage.values[0].value, usage.values[0].argv), ("off", &[][..]));
-        assert_eq!((usage.values[1].value, usage.values[1].argv), ("on", &["--usage"][..]));
-        assert_eq!(spec.opts.last().map(|o| o.name), Some("usage"), "declared last, so argv order is kind, all, usage");
+        assert_eq!(
+            (usage.values[0].value, usage.values[0].argv),
+            ("off", &[][..])
+        );
+        assert_eq!(
+            (usage.values[1].value, usage.values[1].argv),
+            ("on", &["--usage"][..])
+        );
+        assert_eq!(
+            spec.opts.last().map(|o| o.name),
+            Some("usage"),
+            "declared last, so argv order is kind, all, usage"
+        );
         let mut requested = HashMap::new();
         requested.insert("usage".to_string(), "on".to_string());
         requested.insert("all".to_string(), "all".to_string());
         let resolved = resolve_opts(&spec, &requested).unwrap();
-        assert_eq!(compose_argv(&spec, &resolved), vec!["run", "list", "--all", "--usage"]);
+        assert_eq!(
+            compose_argv(&spec, &resolved),
+            vec!["run", "list", "--all", "--usage"]
+        );
         assert_eq!(variant_key(spec.id, &resolved), "run-list?all=all&usage=on");
         // The other panel with opts does NOT grow the flag.
-        assert!(panel_spec("mission-status").unwrap().opts.iter().all(|o| o.name != "usage"));
+        assert!(panel_spec("mission-status")
+            .unwrap()
+            .opts
+            .iter()
+            .all(|o| o.name != "usage"));
     }
 
     // ── variant_key: cache-key canonicalization (#1911) ───────────────
@@ -1935,7 +2287,9 @@ mod tests {
         let resolved = resolve_opts(&spec, &HashMap::new()).unwrap();
         let map = opts_map(&resolved);
         let expected: std::collections::BTreeMap<String, String> =
-            [("kind", "all"), ("all", "recent"), ("usage", "off")].map(|(k, v)| (k.to_string(), v.to_string())).into();
+            [("kind", "all"), ("all", "recent"), ("usage", "off")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .into();
         assert_eq!(map, expected);
     }
 
@@ -1962,7 +2316,10 @@ mod tests {
         let spec = panel_spec("mission-status").unwrap();
         let requested: HashMap<String, String> = [("all".to_string(), "all".to_string())].into();
         let resolved = resolve_opts(&spec, &requested).unwrap();
-        assert_eq!(compose_argv(&spec, &resolved), vec!["mission", "status", "--all"]);
+        assert_eq!(
+            compose_argv(&spec, &resolved),
+            vec!["mission", "status", "--all"]
+        );
         assert_eq!(variant_key(spec.id, &resolved), "mission-status?all=all");
     }
 
@@ -2037,7 +2394,11 @@ mod tests {
         raw.insert("opt.kind".to_string(), "lab".to_string());
         raw.insert("kind".to_string(), "mission".to_string());
         let got = extract_opt_params(&raw);
-        assert_eq!(got.len(), 1, "only `opt.`-prefixed params are options: {got:?}");
+        assert_eq!(
+            got.len(),
+            1,
+            "only `opt.`-prefixed params are options: {got:?}"
+        );
         assert_eq!(got.get("kind"), Some(&"lab".to_string()));
     }
 
@@ -2055,7 +2416,11 @@ mod tests {
         let mut raw = HashMap::new();
         raw.insert("opt.".to_string(), "x".to_string());
         let got = extract_opt_params(&raw);
-        assert_eq!(got.get(""), Some(&"x".to_string()), "an empty name must survive to be 400'd, not vanish");
+        assert_eq!(
+            got.get(""),
+            Some(&"x".to_string()),
+            "an empty name must survive to be 400'd, not vanish"
+        );
     }
 
     /// The typed extractor this replaced rejected a malformed `cols` with
@@ -2067,7 +2432,11 @@ mod tests {
         for bad in ["abc", "", "99999", "-1", "80.5"] {
             let mut raw = HashMap::new();
             raw.insert("cols".to_string(), bad.to_string());
-            assert_eq!(parse_cols(&raw), None, "{bad:?} should fall back to the default width");
+            assert_eq!(
+                parse_cols(&raw),
+                None,
+                "{bad:?} should fall back to the default width"
+            );
         }
         let mut good = HashMap::new();
         good.insert("cols".to_string(), "80".to_string());
@@ -2110,10 +2479,20 @@ mod tests {
     /// the roster lacks is a 400 naming VALUES, not "unknown option".
     #[tokio::test]
     async fn handler_validates_the_profile_list_machine_against_the_roster() {
-        let (status, body) = panel_get("/panel/profile-list?opt.machine=no-such-machine-in-any-roster", true).await;
+        let (status, body) = panel_get(
+            "/panel/profile-list?opt.machine=no-such-machine-in-any-roster",
+            true,
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.contains("unknown value") && body.contains("legal values"), "{body}");
-        assert!(!body.contains("unknown option"), "machine is a declared opt of profile-list: {body}");
+        assert!(
+            body.contains("unknown value") && body.contains("legal values"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("unknown option"),
+            "machine is a declared opt of profile-list: {body}"
+        );
     }
 
     #[tokio::test]
@@ -2129,7 +2508,11 @@ mod tests {
     #[tokio::test]
     async fn handler_ignores_an_unprefixed_lookalike_param() {
         let (status, body) = panel_get("/panel/run-list?kind=bogus", true).await;
-        assert_ne!(status, StatusCode::BAD_REQUEST, "a non-`opt.` param must not be read as an option: {body}");
+        assert_ne!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a non-`opt.` param must not be read as an option: {body}"
+        );
     }
 
     /// An illegal opt value is a 400, never silently ignored.
@@ -2158,9 +2541,17 @@ mod tests {
     #[tokio::test]
     async fn handler_still_refuses_an_unknown_id_and_a_missing_header() {
         let (status, _) = panel_get("/panel/not-a-panel", true).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "the allowlist still closes over ids");
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the allowlist still closes over ids"
+        );
         let (status, _) = panel_get("/panel/run-list", false).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "the CORS-preflight header gate still applies");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the CORS-preflight header gate still applies"
+        );
     }
 
     // ── manual-run floor: keyed by base id, never by variant (#1911) ──
@@ -2178,7 +2569,10 @@ mod tests {
             let p = panels.clone();
             let a = admitted.clone();
             handles.push(tokio::spawn(async move {
-                if admit_manual_run(&p, "doctor", Audience::Local).await.is_ok() {
+                if admit_manual_run(&p, "doctor", Audience::Local)
+                    .await
+                    .is_ok()
+                {
                     a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
             }));
@@ -2222,7 +2616,11 @@ mod tests {
             .unwrap();
         // The first call either ran (200/500) or was refused for some other
         // reason; either way it must have CLAIMED the window.
-        assert_ne!(first.status(), StatusCode::TOO_MANY_REQUESTS, "first call must not be floored");
+        assert_ne!(
+            first.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "first call must not be floored"
+        );
 
         let second = app
             .oneshot(
@@ -2245,14 +2643,21 @@ mod tests {
     #[tokio::test]
     async fn manual_floor_is_open_before_any_run_is_recorded() {
         let panels = PanelState::default();
-        assert!(admit_manual_run(&panels, "doctor", Audience::Local).await.is_ok());
+        assert!(admit_manual_run(&panels, "doctor", Audience::Local)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
     async fn manual_floor_fires_on_the_second_call_within_the_window() {
         let panels = PanelState::default();
-        panels.last_manual.lock().await.insert(("doctor", Audience::Local), (SystemTime::now(), Instant::now()));
-        let err = admit_manual_run(&panels, "doctor", Audience::Local).await.unwrap_err();
+        panels.last_manual.lock().await.insert(
+            ("doctor", Audience::Local),
+            (SystemTime::now(), Instant::now()),
+        );
+        let err = admit_manual_run(&panels, "doctor", Audience::Local)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
         assert!(err.1.contains("floored"), "{}", err.1);
     }
@@ -2260,9 +2665,16 @@ mod tests {
     #[tokio::test]
     async fn manual_floor_is_independent_per_base_id() {
         let panels = PanelState::default();
-        panels.last_manual.lock().await.insert(("doctor", Audience::Local), (SystemTime::now(), Instant::now()));
+        panels.last_manual.lock().await.insert(
+            ("doctor", Audience::Local),
+            (SystemTime::now(), Instant::now()),
+        );
         // A DIFFERENT base id must not be floored by doctor's own run.
-        assert!(admit_manual_run(&panels, "some-other-manual-panel", Audience::Local).await.is_ok());
+        assert!(
+            admit_manual_run(&panels, "some-other-manual-panel", Audience::Local)
+                .await
+                .is_ok()
+        );
     }
 
     /// (#2479 audit, MUST FIX 4) The floor OPENING, through the REAL
@@ -2282,20 +2694,37 @@ mod tests {
     async fn admit_manual_run_at_opens_the_floor_through_the_real_call_site_after_the_window() {
         let panels = PanelState::default();
         let prev = SystemTime::now();
-        panels.last_manual.lock().await.insert(("doctor", Audience::Local), (prev, Instant::now()));
+        panels
+            .last_manual
+            .lock()
+            .await
+            .insert(("doctor", Audience::Local), (prev, Instant::now()));
         // Immediately after: still floored (sanity check this scenario
         // actually starts floored, so the assertion below is meaningful).
         assert!(
-            admit_manual_run_at(&panels, "doctor", Audience::Local, prev + Duration::from_secs(1)).await.is_err(),
+            admit_manual_run_at(
+                &panels,
+                "doctor",
+                Audience::Local,
+                prev + Duration::from_secs(1)
+            )
+            .await
+            .is_err(),
             "sanity: 1s after the previous run must still be floored"
         );
 
         // Reset, then check well past the window — through the SAME real
         // call site, not the pure function.
-        panels.last_manual.lock().await.insert(("doctor", Audience::Local), (prev, Instant::now()));
+        panels
+            .last_manual
+            .lock()
+            .await
+            .insert(("doctor", Audience::Local), (prev, Instant::now()));
         let well_past_the_window = prev + MANUAL_MIN_INTERVAL + Duration::from_secs(5);
         assert!(
-            admit_manual_run_at(&panels, "doctor", Audience::Local, well_past_the_window).await.is_ok(),
+            admit_manual_run_at(&panels, "doctor", Audience::Local, well_past_the_window)
+                .await
+                .is_ok(),
             "the floor must open once MANUAL_MIN_INTERVAL of real elapsed time has passed, \
              through the actual admission path a real request takes: an argument swap in the \
              manual_floor_wait call site would floor this forever"
@@ -2324,9 +2753,14 @@ mod tests {
     #[tokio::test]
     async fn manual_floor_stays_floored_across_repeated_checks_on_one_base_id() {
         let panels = PanelState::default();
-        panels.last_manual.lock().await.insert(("doctor", Audience::Local), (SystemTime::now(), Instant::now()));
+        panels.last_manual.lock().await.insert(
+            ("doctor", Audience::Local),
+            (SystemTime::now(), Instant::now()),
+        );
         for _ in 0..3 {
-            let err = admit_manual_run(&panels, "doctor", Audience::Local).await.unwrap_err();
+            let err = admit_manual_run(&panels, "doctor", Audience::Local)
+                .await
+                .unwrap_err();
             assert_eq!(
                 err.0,
                 StatusCode::TOO_MANY_REQUESTS,
@@ -2382,7 +2816,12 @@ mod tests {
         let prev = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
         let four_hours_later = prev + Duration::from_secs(4 * 60 * 60);
         assert_eq!(
-            manual_floor_wait(prev, four_hours_later, Duration::ZERO, Duration::from_secs(30)),
+            manual_floor_wait(
+                prev,
+                four_hours_later,
+                Duration::ZERO,
+                Duration::from_secs(30)
+            ),
             None,
             "a 4-hour real-time gap must admit outright, not report a remaining wait: the \
              defect this fix closes is exactly a deadline that stays 'in the future' across a \
@@ -2397,7 +2836,12 @@ mod tests {
         let prev = SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000);
         let ten_seconds_later = prev + Duration::from_secs(10);
         assert_eq!(
-            manual_floor_wait(prev, ten_seconds_later, Duration::ZERO, Duration::from_secs(30)),
+            manual_floor_wait(
+                prev,
+                ten_seconds_later,
+                Duration::ZERO,
+                Duration::from_secs(30)
+            ),
             Some(Duration::from_secs(20)),
             "10s into a 30s window must report 20s remaining"
         );
@@ -2525,7 +2969,10 @@ mod tests {
     }
 
     fn req(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -2534,8 +2981,15 @@ mod tests {
         assert_eq!(spec.argv, &["profile", "list"]);
         assert_eq!(spec.roster_opt, Some(ROSTER_AS_FLAG));
         assert!(!spec.needs_fleet_snapshot);
-        let others = PANEL_IDS.iter().filter(|id| !matches!(**id, "profile-list" | "machine-status"));
-        assert!(others.into_iter().all(|id| panel_spec(id).unwrap().roster_opt.is_none()), "only these two panels take a machine");
+        let others = PANEL_IDS
+            .iter()
+            .filter(|id| !matches!(**id, "profile-list" | "machine-status"));
+        assert!(
+            others
+                .into_iter()
+                .all(|id| panel_spec(id).unwrap().roster_opt.is_none()),
+            "only these two panels take a machine"
+        );
     }
 
     #[test]
@@ -2543,10 +2997,19 @@ mod tests {
         let spec = panel_spec("profile-list").unwrap();
         let mut requested = req(&[("machine", "STUDIO")]);
         let machine = resolve_roster_opt(&spec, &mut requested, &roster(), false).unwrap();
-        assert_eq!(machine.as_deref(), Some("studio"), "the roster's spelling, not the client's bytes");
+        assert_eq!(
+            machine.as_deref(),
+            Some("studio"),
+            "the roster's spelling, not the client's bytes"
+        );
         let resolved = resolve_opts(&spec, &requested).unwrap();
-        let (argv, key, echo) =
-            with_roster_choice(&spec, compose_argv(&spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), machine.as_deref());
+        let (argv, key, echo) = with_roster_choice(
+            &spec,
+            compose_argv(&spec, &resolved),
+            variant_key(spec.id, &resolved),
+            opts_map(&resolved),
+            machine.as_deref(),
+        );
         assert_eq!(argv, vec!["profile", "list", "--machine", "studio"]);
         assert_eq!(key, "profile-list?machine=studio");
         assert_eq!(echo.get("machine").map(String::as_str), Some("studio"));
@@ -2560,9 +3023,20 @@ mod tests {
             let machine = resolve_roster_opt(&spec, &mut requested, &roster(), false).unwrap();
             assert_eq!(machine, None);
             let resolved = resolve_opts(&spec, &requested).unwrap();
-            let (argv, key, echo) =
-                with_roster_choice(&spec, compose_argv(&spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), None);
-            assert_eq!((argv, key.as_str()), (vec!["profile".to_string(), "list".to_string()], "profile-list"));
+            let (argv, key, echo) = with_roster_choice(
+                &spec,
+                compose_argv(&spec, &resolved),
+                variant_key(spec.id, &resolved),
+                opts_map(&resolved),
+                None,
+            );
+            assert_eq!(
+                (argv, key.as_str()),
+                (
+                    vec!["profile".to_string(), "list".to_string()],
+                    "profile-list"
+                )
+            );
             assert!(!echo.contains_key("machine"));
         }
     }
@@ -2570,11 +3044,18 @@ mod tests {
     #[test]
     fn a_machine_that_is_not_in_the_roster_is_refused_naming_the_roster() {
         let spec = panel_spec("profile-list").unwrap();
-        for bad in ["nowhere", "studio --remote", "../studio", "studio&remote=on"] {
-            let err = resolve_roster_opt(&spec, &mut req(&[("machine", bad)]), &roster(), false).unwrap_err();
+        for bad in [
+            "nowhere",
+            "studio --remote",
+            "../studio",
+            "studio&remote=on",
+        ] {
+            let err = resolve_roster_opt(&spec, &mut req(&[("machine", bad)]), &roster(), false)
+                .unwrap_err();
             assert!(err.contains("legal values: studio, mini"), "{bad}: {err}");
         }
-        let empty = resolve_roster_opt(&spec, &mut req(&[("machine", "studio")]), &[], false).unwrap_err();
+        let empty =
+            resolve_roster_opt(&spec, &mut req(&[("machine", "studio")]), &[], false).unwrap_err();
         assert!(empty.contains("the roster is empty"), "{empty}");
     }
 
@@ -2584,17 +3065,28 @@ mod tests {
     fn this_machines_own_name_is_a_legal_machine_though_the_roster_does_not_list_it() {
         use crate::fleet_view::{gather_view, tests as fv, FLEET_VIEW_CACHE_TTL};
         let spec = panel_spec("profile-list").unwrap();
-        let s = fv::scripted(fv::identity("laptop", None, Some("nLAPTOP")), vec![fv::entry("studio")]);
+        let s = fv::scripted(
+            fv::identity("laptop", None, Some("nLAPTOP")),
+            vec![fv::entry("studio")],
+        );
         let names = gather_view(&s, FLEET_VIEW_CACHE_TTL).selector_names();
-        let machine = resolve_roster_opt(&spec, &mut req(&[("machine", "LAPTOP")]), &names, false).unwrap();
-        assert_eq!(machine.as_deref(), Some("laptop"), "the roster's own spelling of this machine");
-        assert!(resolve_roster_opt(&spec, &mut req(&[("machine", "studio")]), &names, false).is_ok());
+        let machine =
+            resolve_roster_opt(&spec, &mut req(&[("machine", "LAPTOP")]), &names, false).unwrap();
+        assert_eq!(
+            machine.as_deref(),
+            Some("laptop"),
+            "the roster's own spelling of this machine"
+        );
+        assert!(
+            resolve_roster_opt(&spec, &mut req(&[("machine", "studio")]), &names, false).is_ok()
+        );
     }
 
     #[test]
     fn a_machine_and_remote_together_are_refused() {
         let spec = panel_spec("profile-list").unwrap();
-        let err = resolve_roster_opt(&spec, &mut req(&[("machine", "studio")]), &roster(), true).unwrap_err();
+        let err = resolve_roster_opt(&spec, &mut req(&[("machine", "studio")]), &roster(), true)
+            .unwrap_err();
         assert!(err.contains("cannot be combined"), "{err}");
     }
 
@@ -2602,13 +3094,21 @@ mod tests {
     fn remote_is_a_static_toggle_and_machine_is_unknown_to_every_other_panel() {
         let spec = panel_spec("profile-list").unwrap();
         let resolved = resolve_opts(&spec, &req(&[("remote", "on")])).unwrap();
-        assert_eq!(compose_argv(&spec, &resolved), vec!["profile", "list", "--remote"]);
+        assert_eq!(
+            compose_argv(&spec, &resolved),
+            vec!["profile", "list", "--remote"]
+        );
         assert_eq!(variant_key(spec.id, &resolved), "profile-list?remote=on");
         // A panel with no roster opt leaves `machine` for `resolve_opts` to refuse.
         let run = panel_spec("run-list").unwrap();
         let mut requested = req(&[("machine", "studio")]);
-        assert_eq!(resolve_roster_opt(&run, &mut requested, &roster(), false), Ok(None));
-        assert!(resolve_opts(&run, &requested).unwrap_err().contains("unknown option \"machine\""));
+        assert_eq!(
+            resolve_roster_opt(&run, &mut requested, &roster(), false),
+            Ok(None)
+        );
+        assert!(resolve_opts(&run, &requested)
+            .unwrap_err()
+            .contains("unknown option \"machine\""));
     }
 
     // ── machine-list and machine-status's roster machine (5.0) ────────
@@ -2640,15 +3140,23 @@ mod tests {
         assert_eq!(argv, vec!["machine", "status", "--", "studio"]);
         assert_eq!(key, "machine-status?machine=studio");
         assert_eq!(echo.get("machine").map(String::as_str), Some("studio"));
-        let err = resolve_roster_opt(&spec, &mut req(&[("machine", "nowhere")]), &roster(), false).unwrap_err();
+        let err = resolve_roster_opt(&spec, &mut req(&[("machine", "nowhere")]), &roster(), false)
+            .unwrap_err();
         assert!(err.contains("legal values: studio, mini"), "{err}");
     }
 
     #[tokio::test]
     async fn handler_validates_the_machine_status_machine_against_the_roster() {
-        let (status, body) = panel_get("/panel/machine-status?opt.machine=no-such-machine-in-any-roster", true).await;
+        let (status, body) = panel_get(
+            "/panel/machine-status?opt.machine=no-such-machine-in-any-roster",
+            true,
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.contains("unknown value") && body.contains("legal values"), "{body}");
+        assert!(
+            body.contains("unknown value") && body.contains("legal values"),
+            "{body}"
+        );
     }
 
     // ── console review fixes (5.0) ────────────────────────────────────
@@ -2657,7 +3165,10 @@ mod tests {
     /// outlast one spawn; every other panel keeps the short TTL.
     #[test]
     fn fleet_reading_panels_cache_longer_than_one_cold_spawn() {
-        assert!(FLEET_PANEL_CACHE_TTL > Duration::from_secs(5), "TTL under one cold spawn re-spawns on every poll");
+        assert!(
+            FLEET_PANEL_CACHE_TTL > Duration::from_secs(5),
+            "TTL under one cold spawn re-spawns on every poll"
+        );
         for id in PANEL_IDS {
             let spec = panel_spec(id).unwrap();
             if spec.needs_fleet_snapshot {
@@ -2668,10 +3179,20 @@ mod tests {
 
     #[test]
     fn doctor_gets_more_spawn_time_than_the_fast_verbs() {
-        assert_eq!(panel_spec("doctor").unwrap().spawn_timeout, DOCTOR_SPAWN_TIMEOUT);
-        assert!(DOCTOR_SPAWN_TIMEOUT >= Duration::from_secs(21), "doctor measures 7s with black-holed peers");
+        assert_eq!(
+            panel_spec("doctor").unwrap().spawn_timeout,
+            DOCTOR_SPAWN_TIMEOUT
+        );
+        assert!(
+            DOCTOR_SPAWN_TIMEOUT >= Duration::from_secs(21),
+            "doctor measures 7s with black-holed peers"
+        );
         for id in PANEL_IDS.iter().filter(|id| **id != "doctor") {
-            assert_eq!(panel_spec(id).unwrap().spawn_timeout, PANEL_SPAWN_TIMEOUT, "{id}");
+            assert_eq!(
+                panel_spec(id).unwrap().spawn_timeout,
+                PANEL_SPAWN_TIMEOUT,
+                "{id}"
+            );
         }
     }
 
@@ -2688,12 +3209,18 @@ mod tests {
         let panels = PanelState::default();
         let mut spec = panel_spec("doctor").unwrap();
         spec.spawn_timeout = Duration::from_millis(50);
-        let claim = admit_manual_run(&panels, spec.id, Audience::Local).await.unwrap();
-        let (status, body) = run_child(&panels, &spec, Some(claim), sleeping_child()).await.unwrap_err();
+        let claim = admit_manual_run(&panels, spec.id, Audience::Local)
+            .await
+            .unwrap();
+        let (status, body) = run_child(&panels, &spec, Some(claim), sleeping_child())
+            .await
+            .unwrap_err();
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert!(body.contains("slow"), "{body}");
         assert!(!body.contains("wedged"), "{body}");
-        admit_manual_run(&panels, spec.id, Audience::Local).await.expect("the timeout must give the manual-run window back");
+        admit_manual_run(&panels, spec.id, Audience::Local)
+            .await
+            .expect("the timeout must give the manual-run window back");
     }
 
     /// An auto-refresh panel's timeout has no floor to release, and its
@@ -2703,9 +3230,14 @@ mod tests {
         let panels = PanelState::default();
         let mut spec = panel_spec("role-list").unwrap();
         spec.spawn_timeout = Duration::from_millis(50);
-        let (status, body) = run_child(&panels, &spec, None, sleeping_child()).await.unwrap_err();
+        let (status, body) = run_child(&panels, &spec, None, sleeping_child())
+            .await
+            .unwrap_err();
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-        assert!(body.contains("slow") && !body.contains("manual-run wait"), "{body}");
+        assert!(
+            body.contains("slow") && !body.contains("manual-run wait"),
+            "{body}"
+        );
     }
 
     /// A child that finishes keeps its floor claim: only a timeout releases.
@@ -2713,18 +3245,35 @@ mod tests {
     async fn a_finished_manual_spawn_still_holds_the_floor() {
         let panels = PanelState::default();
         let spec = panel_spec("doctor").unwrap();
-        let claim = admit_manual_run(&panels, spec.id, Audience::Local).await.unwrap();
+        let claim = admit_manual_run(&panels, spec.id, Audience::Local)
+            .await
+            .unwrap();
         let mut ok = tokio::process::Command::new("true");
         ok.kill_on_drop(true);
         run_child(&panels, &spec, Some(claim), ok).await.unwrap();
-        assert_eq!(admit_manual_run(&panels, spec.id, Audience::Local).await.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            admit_manual_run(&panels, spec.id, Audience::Local)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     #[test]
     fn a_repeated_query_key_is_found_even_when_encoded_differently() {
-        assert_eq!(duplicate_query_key("cols=80&opt.kind=lab&opt.kind=all"), Some("opt.kind".into()));
-        assert_eq!(duplicate_query_key("opt.all=all&opt%2Eall=recent"), Some("opt.all".into()));
-        assert_eq!(duplicate_query_key("cols=80&opt.kind=lab&opt.all=all"), None);
+        assert_eq!(
+            duplicate_query_key("cols=80&opt.kind=lab&opt.kind=all"),
+            Some("opt.kind".into())
+        );
+        assert_eq!(
+            duplicate_query_key("opt.all=all&opt%2Eall=recent"),
+            Some("opt.all".into())
+        );
+        assert_eq!(
+            duplicate_query_key("cols=80&opt.kind=lab&opt.all=all"),
+            None
+        );
         assert_eq!(duplicate_query_key(""), None);
         // The same VALUE twice is still a repeated key.
         assert_eq!(duplicate_query_key("cols=80&cols=80"), Some("cols".into()));
@@ -2734,7 +3283,10 @@ mod tests {
     async fn handler_refuses_a_repeated_query_key_naming_it() {
         let (status, body) = panel_get("/panel/run-list?opt.kind=lab&opt.kind=all", true).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.contains("\"opt.kind\"") && body.contains("more than once"), "{body}");
+        assert!(
+            body.contains("\"opt.kind\"") && body.contains("more than once"),
+            "{body}"
+        );
     }
 
     #[test]
@@ -2756,7 +3308,10 @@ mod tests {
         let tail = stderr_tail(&raw);
         let lines: Vec<&str> = tail.lines().collect();
         assert_eq!(lines.len(), STDERR_TAIL_LINES);
-        assert_eq!(lines[0], "error: first", "the error survives and keeps its place: {tail}");
+        assert_eq!(
+            lines[0], "error: first",
+            "the error survives and keeps its place: {tail}"
+        );
         assert_eq!(*lines.last().unwrap(), "note 29");
     }
 
@@ -2766,7 +3321,11 @@ mod tests {
         let big = line.repeat(PANEL_STDOUT_CAP_BYTES / 100 + 50);
         let out = capped_stdout(&big);
         assert!(out.len() < big.len());
-        assert!(out.contains("[output truncated:"), "{}", &out[out.len().saturating_sub(80)..]);
+        assert!(
+            out.contains("[output truncated:"),
+            "{}",
+            &out[out.len().saturating_sub(80)..]
+        );
         assert!(out.starts_with(&line));
         assert_eq!(capped_stdout("small\n"), "small\n");
     }
@@ -2777,7 +3336,13 @@ mod tests {
     fn a_flag_shaped_roster_id_is_refused() {
         for spec_id in ["profile-list", "machine-status"] {
             let spec = panel_spec(spec_id).unwrap();
-            let err = resolve_roster_opt(&spec, &mut req(&[("machine", "--all")]), &["--all".to_string()], false).unwrap_err();
+            let err = resolve_roster_opt(
+                &spec,
+                &mut req(&[("machine", "--all")]),
+                &["--all".to_string()],
+                false,
+            )
+            .unwrap_err();
             assert!(err.contains("not a legal machine name"), "{spec_id}: {err}");
         }
     }
@@ -2790,10 +3355,23 @@ mod tests {
             let mut requested = req(&[("machine", "studio")]);
             let machine = resolve_roster_opt(&spec, &mut requested, &roster(), false).unwrap();
             let resolved = resolve_opts(&spec, &requested).unwrap();
-            with_roster_choice(&spec, compose_argv(&spec, &resolved), variant_key(spec.id, &resolved), opts_map(&resolved), machine.as_deref()).0
+            with_roster_choice(
+                &spec,
+                compose_argv(&spec, &resolved),
+                variant_key(spec.id, &resolved),
+                opts_map(&resolved),
+                machine.as_deref(),
+            )
+            .0
         };
-        assert_eq!(argv_of("machine-status"), ["machine", "status", "--", "studio"]);
-        assert_eq!(argv_of("profile-list"), ["profile", "list", "--machine", "studio"]);
+        assert_eq!(
+            argv_of("machine-status"),
+            ["machine", "status", "--", "studio"]
+        );
+        assert_eq!(
+            argv_of("profile-list"),
+            ["profile", "list", "--machine", "studio"]
+        );
     }
 
     /// The panel table as JSON, for the console's own test to read. Written
@@ -2802,7 +3380,13 @@ mod tests {
     /// The tokens `with_roster_choice` puts before a chosen id: asked of that
     /// function itself, so the rule has one owner.
     fn argv_before_id(spec: &PanelSpec) -> Vec<String> {
-        let (argv, _, _) = with_roster_choice(spec, spec.argv.to_vec(), spec.id.to_string(), Default::default(), Some("ID"));
+        let (argv, _, _) = with_roster_choice(
+            spec,
+            spec.argv.to_vec(),
+            spec.id.to_string(),
+            Default::default(),
+            Some("ID"),
+        );
         argv[spec.argv.len()..argv.len() - 1].to_vec()
     }
 
@@ -2830,13 +3414,15 @@ mod tests {
             })
             .collect();
         let rendered = serde_json::to_string_pretty(&table).unwrap() + "\n";
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ui/src/lenses/console/panel-table.generated.json");
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ui/src/lenses/console/panel-table.generated.json");
         if std::env::var_os("DARKMUX_REGENERATE_FIXTURES").is_some() {
             std::fs::write(&path, &rendered).expect("writing the panel table fixture");
             return;
         }
-        let on_disk = std::fs::read_to_string(&path)
-            .expect("panel-table.generated.json is missing: regenerate with DARKMUX_REGENERATE_FIXTURES=1");
+        let on_disk = std::fs::read_to_string(&path).expect(
+            "panel-table.generated.json is missing: regenerate with DARKMUX_REGENERATE_FIXTURES=1",
+        );
         assert_eq!(
             rendered, on_disk,
             "the panel table changed: regenerate with `DARKMUX_REGENERATE_FIXTURES=1 cargo nextest run -p \
@@ -2866,7 +3452,10 @@ mod tests {
 
     fn redaction() -> Redaction {
         Redaction::from_parts(
-            &[("peerone", "peerone.tailnet.example:8765"), ("ten", "10.1.2.3")],
+            &[
+                ("peerone", "peerone.tailnet.example:8765"),
+                ("ten", "10.1.2.3"),
+            ],
             &[],
             Some("/Users/tester".into()),
             None,
@@ -2884,19 +3473,37 @@ mod tests {
     fn a_remote_caller_reads_stderr_redacted_with_no_roster_address_or_home_path() {
         let mut body = probe_body();
         let w = Withheld::from_values(["/opt/fake/bin/lms".to_string()]);
-        body.stderr_tail.push_str("\nerror: `/opt/fake/bin/lms` was not found");
+        body.stderr_tail
+            .push_str("\nerror: `/opt/fake/bin/lms` was not found");
         redact_for_remote(&mut body, &redaction(), &w, Some("studio"));
         let all = format!("{}{}", body.ansi_text, body.stderr_tail);
-        assert!(!all.contains("tailnet.example") && !all.contains("/Users/") && !all.contains("/opt/fake"), "{all}");
-        assert!(body.ansi_text.contains("at \x1b[2m(address hidden)\x1b[0m"), "{}", body.ansi_text);
-        assert!(body.ansi_text.contains("\x1b[2m~/.darkmux/fleet.json\x1b[0m"), "{}", body.ansi_text);
+        assert!(
+            !all.contains("tailnet.example")
+                && !all.contains("/Users/")
+                && !all.contains("/opt/fake"),
+            "{all}"
+        );
+        assert!(
+            body.ansi_text.contains("at \x1b[2m(address hidden)\x1b[0m"),
+            "{}",
+            body.ansi_text
+        );
+        assert!(
+            body.ansi_text
+                .contains("\x1b[2m~/.darkmux/fleet.json\x1b[0m"),
+            "{}",
+            body.ansi_text
+        );
         assert_eq!(
             body.stderr_tail,
             "the roster address for peerone (`(address hidden)`) does not resolve\nwarning: env var X (~/notebook) is ignored\n\
              error: `(shown on this machine only)` was not found",
             "stderr is shown redacted"
         );
-        assert_eq!(body.withheld, panel_audience::notice("darkmux machine status", Some("studio")));
+        assert_eq!(
+            body.withheld,
+            panel_audience::notice("darkmux machine status", Some("studio"))
+        );
     }
 
     /// Nothing withheld, nothing said: output with no host fact, no
@@ -2907,7 +3514,10 @@ mod tests {
         body.stderr_tail.clear();
         body.ansi_text = "role list\nanalyst coder\n".into();
         remote_view(&mut body, &redaction());
-        assert_eq!((body.stderr_tail.as_str(), body.withheld.as_str()), ("", ""));
+        assert_eq!(
+            (body.stderr_tail.as_str(), body.withheld.as_str()),
+            ("", "")
+        );
     }
 
     /// The panel extra set: a configured path and an endpoint URL the shared
@@ -2917,10 +3527,15 @@ mod tests {
     /// notice too.
     #[test]
     fn a_configured_location_is_withheld_and_the_notice_says_so() {
-        let w = Withheld::from_values(["/opt/fake/bin/lms".to_string(), "https://myres.example.com/v1".into()]);
+        let w = Withheld::from_values([
+            "/opt/fake/bin/lms".to_string(),
+            "https://myres.example.com/v1".into(),
+        ]);
         let mut body = probe_body();
         body.stderr_tail.clear();
-        body.ansi_text = "lms at \x1b[2m/opt/fake/bin/lms\x1b[0m; endpoint https://myres.example.com/v1\n".into();
+        body.ansi_text =
+            "lms at \x1b[2m/opt/fake/bin/lms\x1b[0m; endpoint https://myres.example.com/v1\n"
+                .into();
         redact_for_remote(&mut body, &redaction(), &w, Some("studio"));
         assert_eq!(
             body.ansi_text,
@@ -2930,22 +3545,48 @@ mod tests {
         let mut body = probe_body();
         body.stderr_tail.clear();
         body.ansi_text = "\"busy_policy\": \"(shown on this machine only)\"\n".into();
-        redact_for_remote(&mut body, &redaction(), &Withheld::default(), Some("studio"));
-        assert!(!body.withheld.is_empty(), "the verb's own remote form earns the notice");
+        redact_for_remote(
+            &mut body,
+            &redaction(),
+            &Withheld::default(),
+            Some("studio"),
+        );
+        assert!(
+            !body.withheld.is_empty(),
+            "the verb's own remote form earns the notice"
+        );
     }
 
     #[test]
     fn the_redaction_set_is_derived_from_the_roster_addresses_and_their_hosts() {
         let r = Redaction::from_parts(
-            &[("a", "Peer.Example:8765"), ("b", "[fd7a::1]:8765"), ("c", "10.0.0.4"), ("d", "")],
+            &[
+                ("a", "Peer.Example:8765"),
+                ("b", "[fd7a::1]:8765"),
+                ("c", "10.0.0.4"),
+                ("d", ""),
+            ],
             &[],
             Some("/".into()),
             None,
         );
-        for want in ["Peer.Example:8765", "Peer.Example", "[fd7a::1]:8765", "fd7a::1", "10.0.0.4"] {
-            assert!(r.addresses().contains(&want), "{want} in {:?}", r.addresses());
+        for want in [
+            "Peer.Example:8765",
+            "Peer.Example",
+            "[fd7a::1]:8765",
+            "fd7a::1",
+            "10.0.0.4",
+        ] {
+            assert!(
+                r.addresses().contains(&want),
+                "{want} in {:?}",
+                r.addresses()
+            );
         }
-        assert!(r.addresses().windows(2).all(|w| w[0].len() >= w[1].len()), "longest first");
+        assert!(
+            r.addresses().windows(2).all(|w| w[0].len() >= w[1].len()),
+            "longest first"
+        );
         assert!(r.dirs().is_empty(), "a bare / is not a home to rewrite");
     }
 
@@ -2967,7 +3608,12 @@ mod tests {
     #[test]
     fn short_hostnames_do_not_corrupt_ordinary_output() {
         let r = Redaction::from_parts(
-            &[("mac", "mac"), ("ana", "ana"), ("mini", "mini"), ("studio", "studio")],
+            &[
+                ("mac", "mac"),
+                ("ana", "ana"),
+                ("mini", "mini"),
+                ("studio", "studio"),
+            ],
             &[],
             Some("/Users/kain".into()),
             None,
@@ -2980,7 +3626,12 @@ mod tests {
     /// tokens go, never a substring of a word.
     #[test]
     fn a_short_address_is_hidden_only_as_a_whole_token() {
-        let r = Redaction::from_parts(&[("peerone", "mac.local"), ("peertwo", "ana.local")], &[], None, None);
+        let r = Redaction::from_parts(
+            &[("peerone", "mac.local"), ("peertwo", "ana.local")],
+            &[],
+            None,
+            None,
+        );
         assert_eq!(
             filtered(&r, "mac.local is up; macos aarch64; analyst; lmstudio-community/mac.local-x ana.local, (mac.local)"),
             "(address hidden) is up; macos aarch64; analyst; lmstudio-community/mac.local-x (address hidden), ((address hidden))"
@@ -2992,15 +3643,28 @@ mod tests {
     #[test]
     fn a_host_that_equals_a_roster_id_is_public_but_its_port_form_is_not() {
         let r = Redaction::from_parts(&[("studio", "studio:8765")], &[], None, None);
-        assert_eq!(filtered(&r, "studio at studio:8765"), "studio at (address hidden)");
+        assert_eq!(
+            filtered(&r, "studio at studio:8765"),
+            "studio at (address hidden)"
+        );
         // A name the roster learned from the machine's own card counts too.
-        let r = Redaction::from_parts(&[("peerone", "boxa.tailnet.example:8765")], &["boxa.tailnet.example".to_string()], None, None);
+        let r = Redaction::from_parts(
+            &[("peerone", "boxa.tailnet.example:8765")],
+            &["boxa.tailnet.example".to_string()],
+            None,
+            None,
+        );
         assert_eq!(filtered(&r, "boxa.tailnet.example"), "boxa.tailnet.example");
     }
 
     #[test]
     fn a_model_key_that_contains_a_host_as_a_substring_survives() {
-        let r = Redaction::from_parts(&[("peerone", "studio.example"), ("peertwo", "studio")], &[], None, None);
+        let r = Redaction::from_parts(
+            &[("peerone", "studio.example"), ("peertwo", "studio")],
+            &[],
+            None,
+            None,
+        );
         assert_eq!(
             filtered(&r, "lmstudio-community/qwen3-4b studio.example lmstudio:1234 lmstudio.example studio:1234"),
             "lmstudio-community/qwen3-4b (address hidden) lmstudio:1234 lmstudio.example (address hidden):1234"
@@ -3012,7 +3676,10 @@ mod tests {
     #[test]
     fn a_bare_roster_host_is_hidden_only_where_it_addresses() {
         let r = Redaction::from_parts(&[("peerone", "studio:8765")], &[], None, None);
-        assert_eq!(filtered(&r, "LM Studio: the Studio is busy"), "LM Studio: the Studio is busy");
+        assert_eq!(
+            filtered(&r, "LM Studio: the Studio is busy"),
+            "LM Studio: the Studio is busy"
+        );
         assert_eq!(
             filtered(&r, "at studio:8765 and http://studio/x and studio:9000 and me@studio"),
             "at (address hidden) and http://(address hidden)/x and (address hidden):9000 and me@(address hidden)"
@@ -3021,15 +3688,28 @@ mod tests {
 
     #[test]
     fn the_home_rewrite_respects_path_boundaries_and_covers_darkmux_home() {
-        let r = Redaction::from_parts(&[], &[], Some("/srv/kain".into()), Some("/Volumes/x/dm".into()));
+        let r = Redaction::from_parts(
+            &[],
+            &[],
+            Some("/srv/kain".into()),
+            Some("/Volumes/x/dm".into()),
+        );
         assert_eq!(
-            filtered(&r, "/srv/kain/a /srv/kainx/b /Volumes/x/dm/c /Volumes/x/dmz"),
+            filtered(
+                &r,
+                "/srv/kain/a /srv/kainx/b /Volumes/x/dm/c /Volumes/x/dmz"
+            ),
             "~/a /srv/kainx/b $DARKMUX_HOME/c /Volumes/x/dmz"
         );
         // Another account's home reads `~` whoever it is.
         assert_eq!(filtered(&r, "/Users/kainx/b"), "~/b");
         // A DARKMUX_HOME inside HOME is covered by the HOME rewrite.
-        let r = Redaction::from_parts(&[], &[], Some("/srv/kain".into()), Some("/srv/kain/.darkmux".into()));
+        let r = Redaction::from_parts(
+            &[],
+            &[],
+            Some("/srv/kain".into()),
+            Some("/srv/kain/.darkmux".into()),
+        );
         assert_eq!(filtered(&r, "/srv/kain/.darkmux/x"), "~/.darkmux/x");
     }
 
@@ -3058,20 +3738,42 @@ mod tests {
         )
         .unwrap();
         let probe = probe_body();
-        let (out, err, child) = (dir.path().join("out"), dir.path().join("err"), dir.path().join("child.sh"));
+        let (out, err, child) = (
+            dir.path().join("out"),
+            dir.path().join("err"),
+            dir.path().join("child.sh"),
+        );
         std::fs::write(&out, &probe.ansi_text).unwrap();
         std::fs::write(&err, &probe.stderr_tail).unwrap();
-        std::fs::write(&child, format!("#!/bin/sh\ncat '{}'\ncat '{}' >&2\n", out.display(), err.display())).unwrap();
-        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::write(
+            &child,
+            format!(
+                "#!/bin/sh\ncat '{}'\ncat '{}' >&2\n",
+                out.display(),
+                err.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         // (#2976) The first exec of a fresh executable is scanned; do it
         // outside the panel's spawn bound.
         let _ = std::process::Command::new(&child).output();
-        let (prev_fleet, prev_home) = (std::env::var("DARKMUX_FLEET_FILE").ok(), std::env::var("HOME").ok());
+        let (prev_fleet, prev_home) = (
+            std::env::var("DARKMUX_FLEET_FILE").ok(),
+            std::env::var("HOME").ok(),
+        );
         std::env::set_var("DARKMUX_FLEET_FILE", &roster);
         std::env::set_var("HOME", "/Users/tester");
         let mut state = app_state();
         state.panels.child_exe = Some(child);
-        state.panels.cache.lock().await.insert(audience_key("role-list", false, clamp_cols(None)), CacheEntry { body: probe, captured: SystemTime::now() });
+        state.panels.cache.lock().await.insert(
+            audience_key("role-list", false, clamp_cols(None)),
+            CacheEntry {
+                body: probe,
+                captured: SystemTime::now(),
+            },
+        );
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(PANEL_HEADER, "1".parse().unwrap());
         headers.insert("host", host.parse().unwrap());
@@ -3101,8 +3803,15 @@ mod tests {
     async fn the_handler_filters_a_remote_caller_and_leaves_this_machine_alone() {
         let remote = served_to("100.64.1.2:50000", "localhost:8765").await;
         let all = format!("{}{}", remote.ansi_text, remote.stderr_tail);
-        assert!(!all.contains("tailnet.example") && !all.contains("/Users/"), "{all}");
-        assert!(remote.stderr_tail.contains("does not resolve"), "stderr is shown redacted: {}", remote.stderr_tail);
+        assert!(
+            !all.contains("tailnet.example") && !all.contains("/Users/"),
+            "{all}"
+        );
+        assert!(
+            remote.stderr_tail.contains("does not resolve"),
+            "stderr is shown redacted: {}",
+            remote.stderr_tail
+        );
         assert!(!remote.withheld.is_empty());
 
         let local = served_to("127.0.0.1:50000", "localhost:8765").await;
@@ -3118,7 +3827,10 @@ mod tests {
             raw.push_str(&format!("note {i}\n"));
         }
         let tail = stderr_tail(&raw);
-        assert!(tail.lines().next().unwrap().contains("panicked at"), "{tail}");
+        assert!(
+            tail.lines().next().unwrap().contains("panicked at"),
+            "{tail}"
+        );
     }
 
     /// The release is only worth having while a timed-out run still sits
@@ -3135,13 +3847,30 @@ mod tests {
         let panels = PanelState::default();
         let mut spec = panel_spec("doctor").unwrap();
         spec.spawn_timeout = Duration::from_millis(50);
-        let first = admit_manual_run_at(&panels, "doctor", Audience::Local, SystemTime::now() - Duration::from_secs(120)).await.unwrap();
+        let first = admit_manual_run_at(
+            &panels,
+            "doctor",
+            Audience::Local,
+            SystemTime::now() - Duration::from_secs(120),
+        )
+        .await
+        .unwrap();
         // A second run is admitted (the first's window long open) and claims the floor.
-        let second = admit_manual_run(&panels, "doctor", Audience::Local).await.unwrap();
+        let second = admit_manual_run(&panels, "doctor", Audience::Local)
+            .await
+            .unwrap();
         assert_ne!(first, second);
         // The first run now times out: it must not release the second's claim.
-        run_child(&panels, &spec, Some(first), sleeping_child()).await.unwrap_err();
-        assert_eq!(admit_manual_run(&panels, "doctor", Audience::Local).await.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
+        run_child(&panels, &spec, Some(first), sleeping_child())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            admit_manual_run(&panels, "doctor", Audience::Local)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     /// ONE state: a remote caller is served through the spawn path, then this
@@ -3155,7 +3884,8 @@ mod tests {
         // The child prints a line naming the roster's address.
         let child = dir.path().join("child.sh");
         std::fs::write(&child, "#!/bin/sh\necho \"peer at example-host.example:8765 role list [$DARKMUX_PANEL_AUDIENCE]\"\n").unwrap();
-        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         // (#2976) macOS scans a freshly written executable on its first exec,
         // which can outlast the panel's spawn bound on a loaded host: exec it
         // once outside the bound.
@@ -3188,7 +3918,10 @@ mod tests {
             Some(v) => std::env::set_var("DARKMUX_FLEET_FILE", v),
             None => std::env::remove_var("DARKMUX_FLEET_FILE"),
         }
-        assert_eq!(remote.ansi_text.trim(), "peer at (address hidden) role list [remote]");
+        assert_eq!(
+            remote.ansi_text.trim(),
+            "peer at (address hidden) role list [remote]"
+        );
         assert_eq!(
             local.ansi_text.trim(),
             "peer at example-host.example:8765 role list []",
@@ -3205,7 +3938,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let child = dir.path().join("child.sh");
         std::fs::write(&child, "#!/bin/sh\necho \"width $COLUMNS\"\n").unwrap();
-        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         // (#2976) The first exec of a fresh executable is scanned; do it
         // outside the panel's spawn bound.
         let _ = std::process::Command::new(&child).output();
@@ -3215,12 +3949,16 @@ mod tests {
             let mut headers = axum::http::HeaderMap::new();
             headers.insert(PANEL_HEADER, "1".parse().unwrap());
             headers.insert("host", "localhost:8765".parse().unwrap());
-            let params: HashMap<String, String> = [("cols".to_string(), cols.to_string())].into_iter().collect();
+            let params: HashMap<String, String> = [("cols".to_string(), cols.to_string())]
+                .into_iter()
+                .collect();
             panel_handler(
                 Path("role-list".to_string()),
                 axum::extract::RawQuery(Some(format!("cols={cols}"))),
                 Query(params),
-                Some(axum::extract::ConnectInfo("127.0.0.1:50000".parse().unwrap())),
+                Some(axum::extract::ConnectInfo(
+                    "127.0.0.1:50000".parse().unwrap(),
+                )),
                 headers,
                 State(state.clone()),
             )
@@ -3229,16 +3967,31 @@ mod tests {
         let wide = serve("160").await.unwrap().0;
         let narrow_again = serve("40").await.unwrap().0;
         assert_eq!((narrow.cols, narrow.ansi_text.trim()), (40, "width 40"));
-        assert_eq!((wide.cols, wide.ansi_text.trim()), (160, "width 160"), "a wider caller gets its own render");
-        assert_eq!(narrow_again.ansi_text.trim(), "width 40", "callers at one width share the entry");
+        assert_eq!(
+            (wide.cols, wide.ansi_text.trim()),
+            (160, "width 160"),
+            "a wider caller gets its own render"
+        );
+        assert_eq!(
+            narrow_again.ansi_text.trim(),
+            "width 40",
+            "callers at one width share the entry"
+        );
     }
 
     /// Serve panel `id` at `cols` to `peer`, from `state`.
-    async fn serve_at(state: &AppState, id: &str, peer: &str, cols: u16) -> Result<PanelResponse, (StatusCode, String)> {
+    async fn serve_at(
+        state: &AppState,
+        id: &str,
+        peer: &str,
+        cols: u16,
+    ) -> Result<PanelResponse, (StatusCode, String)> {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(PANEL_HEADER, "1".parse().unwrap());
         headers.insert("host", "localhost:8765".parse().unwrap());
-        let params: HashMap<String, String> = [("cols".to_string(), cols.to_string())].into_iter().collect();
+        let params: HashMap<String, String> = [("cols".to_string(), cols.to_string())]
+            .into_iter()
+            .collect();
         panel_handler(
             Path(id.to_string()),
             axum::extract::RawQuery(Some(format!("cols={cols}"))),
@@ -3255,8 +4008,16 @@ mod tests {
     fn counting_child(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let runs = dir.join("runs.log");
         let child = dir.join("child.sh");
-        std::fs::write(&child, format!("#!/bin/sh\necho run >> '{}'\necho \"width $COLUMNS [$DARKMUX_PANEL_AUDIENCE]\"\n", runs.display())).unwrap();
-        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::write(
+            &child,
+            format!(
+                "#!/bin/sh\necho run >> '{}'\necho \"width $COLUMNS [$DARKMUX_PANEL_AUDIENCE]\"\n",
+                runs.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         // (#2976) The first exec of a fresh executable is scanned; do it
         // outside the panel's spawn bound.
         let _ = std::process::Command::new(&child).output();
@@ -3274,14 +4035,32 @@ mod tests {
         let (child, runs) = counting_child(dir.path());
         let mut state = app_state();
         state.panels.child_exe = Some(child);
-        let first = serve_at(&state, "doctor", "100.64.1.2:50000", 40).await.expect("a remote caller runs doctor");
+        let first = serve_at(&state, "doctor", "100.64.1.2:50000", 40)
+            .await
+            .expect("a remote caller runs doctor");
         // Another panel's newer remote run is never the fallback.
         let mut stranger = probe_body();
         stranger.ansi_text = "another panel".into();
-        state.panels.cache.lock().await.insert(audience_key("role-list", true, 160), CacheEntry { body: stranger, captured: SystemTime::now() });
-        let other = serve_at(&state, "doctor", "100.64.9.9:50000", 160).await.expect("a remote caller at another width is answered");
-        assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1, "no new probe inside the floor");
-        assert_eq!((other.cols, other.ansi_text), (first.cols, first.ansi_text), "it reads the last remote run, at that run's width");
+        state.panels.cache.lock().await.insert(
+            audience_key("role-list", true, 160),
+            CacheEntry {
+                body: stranger,
+                captured: SystemTime::now(),
+            },
+        );
+        let other = serve_at(&state, "doctor", "100.64.9.9:50000", 160)
+            .await
+            .expect("a remote caller at another width is answered");
+        assert_eq!(
+            std::fs::read_to_string(&runs).unwrap().lines().count(),
+            1,
+            "no new probe inside the floor"
+        );
+        assert_eq!(
+            (other.cols, other.ansi_text),
+            (first.cols, first.ansi_text),
+            "it reads the last remote run, at that run's width"
+        );
     }
 
     /// Every width a caller can ask for renders at one of a few widths, so a
@@ -3296,12 +4075,24 @@ mod tests {
         let mut state = app_state();
         state.panels.child_exe = Some(child);
         for cols in 36..=200u16 {
-            let body = serve_at(&state, "role-list", "100.64.1.2:50000", cols).await.unwrap();
-            assert!(body.cols <= cols, "rendered {} for a caller that asked for {cols}", body.cols);
-            assert_eq!(body.ansi_text.trim(), format!("width {} [remote]", body.cols));
+            let body = serve_at(&state, "role-list", "100.64.1.2:50000", cols)
+                .await
+                .unwrap();
+            assert!(
+                body.cols <= cols,
+                "rendered {} for a caller that asked for {cols}",
+                body.cols
+            );
+            assert_eq!(
+                body.ansi_text.trim(),
+                format!("width {} [remote]", body.cols)
+            );
         }
         let spawned = std::fs::read_to_string(&runs).unwrap().lines().count();
-        assert!(spawned <= COLS_BUCKETS.len(), "{spawned} renders for one sweep");
+        assert!(
+            spawned <= COLS_BUCKETS.len(),
+            "{spawned} renders for one sweep"
+        );
         assert!(state.panels.cache.lock().await.len() <= COLS_BUCKETS.len());
     }
 
@@ -3312,7 +4103,10 @@ mod tests {
     async fn keeping_a_run_drops_entries_past_the_retention() {
         for id in PANEL_IDS {
             let spec = panel_spec(id).unwrap();
-            assert!(spec.cache_ttl <= PANEL_CACHE_RETAIN, "{id}: its TTL outlives the retention");
+            assert!(
+                spec.cache_ttl <= PANEL_CACHE_RETAIN,
+                "{id}: its TTL outlives the retention"
+            );
         }
         assert!(MANUAL_MIN_INTERVAL <= PANEL_CACHE_RETAIN);
         let state = app_state();
@@ -3321,8 +4115,20 @@ mod tests {
         let young = SystemTime::now() - Duration::from_secs(1);
         {
             let mut cache = state.panels.cache.lock().await;
-            cache.insert("old".into(), CacheEntry { body: probe_body(), captured: old });
-            cache.insert("young".into(), CacheEntry { body: probe_body(), captured: young });
+            cache.insert(
+                "old".into(),
+                CacheEntry {
+                    body: probe_body(),
+                    captured: old,
+                },
+            );
+            cache.insert(
+                "young".into(),
+                CacheEntry {
+                    body: probe_body(),
+                    captured: young,
+                },
+            );
         }
         keep_panel_run(&state, &spec, false, "new".into(), &probe_body()).await;
         let cache = state.panels.cache.lock().await;
@@ -3343,8 +4149,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runs = dir.path().join("runs.log");
         let child = dir.path().join("child.sh");
-        std::fs::write(&child, format!("#!/bin/sh\necho run >> '{}'\necho \"doctor [$DARKMUX_PANEL_AUDIENCE]\"\n", runs.display())).unwrap();
-        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::write(
+            &child,
+            format!(
+                "#!/bin/sh\necho run >> '{}'\necho \"doctor [$DARKMUX_PANEL_AUDIENCE]\"\n",
+                runs.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         // (#2976) The first exec of a fresh executable is scanned; do it
         // outside the panel's spawn bound.
         let _ = std::process::Command::new(&child).output();
@@ -3364,17 +4178,44 @@ mod tests {
                 State(state.clone()),
             )
         };
-        let spawned = || std::fs::read_to_string(&runs).map(|t| t.lines().count()).unwrap_or(0);
-        let remote = serve("100.64.1.2:50000").await.expect("a remote caller runs doctor").0;
-        assert!(remote.ansi_text.contains("doctor [remote]"), "{}", remote.ansi_text);
+        let spawned = || {
+            std::fs::read_to_string(&runs)
+                .map(|t| t.lines().count())
+                .unwrap_or(0)
+        };
+        let remote = serve("100.64.1.2:50000")
+            .await
+            .expect("a remote caller runs doctor")
+            .0;
+        assert!(
+            remote.ansi_text.contains("doctor [remote]"),
+            "{}",
+            remote.ansi_text
+        );
         let local = serve("127.0.0.1:50000").await;
-        assert!(local.is_ok(), "a remote run must not floor this machine's doctor: {:?}", local.err());
+        assert!(
+            local.is_ok(),
+            "a remote run must not floor this machine's doctor: {:?}",
+            local.err()
+        );
         assert!(local.unwrap().0.ansi_text.contains("doctor []"));
         assert_eq!(spawned(), 2);
-        let again = serve("100.64.9.9:50000").await.expect("a remote caller inside the window is answered").0;
-        assert_eq!(spawned(), 2, "a remote caller inside the window does not start a probe");
-        assert_eq!(again.ansi_text, remote.ansi_text, "it reads the last remote run");
-        let (code, _) = serve("127.0.0.1:50000").await.expect_err("this machine's own floor still holds");
+        let again = serve("100.64.9.9:50000")
+            .await
+            .expect("a remote caller inside the window is answered")
+            .0;
+        assert_eq!(
+            spawned(),
+            2,
+            "a remote caller inside the window does not start a probe"
+        );
+        assert_eq!(
+            again.ansi_text, remote.ansi_text,
+            "it reads the last remote run"
+        );
+        let (code, _) = serve("127.0.0.1:50000")
+            .await
+            .expect_err("this machine's own floor still holds");
         assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -3403,12 +4244,19 @@ mod tests {
             "#!/bin/sh\necho \"audience=[$DARKMUX_PANEL_AUDIENCE] peer at example-host.example:8765\"\necho 'warning: something local' >&2\n",
         )
         .unwrap();
-        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         // (#2976) The first exec of a fresh executable is scanned; do it
         // outside the panel's spawn bound.
         let _ = std::process::Command::new(&child).output();
-        let saved: Vec<(&str, Option<String>)> =
-            ["DARKMUX_FLEET_FILE", "DARKMUX_MACHINE_ID", panel_audience::AUDIENCE_ENV].iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        let saved: Vec<(&str, Option<String>)> = [
+            "DARKMUX_FLEET_FILE",
+            "DARKMUX_MACHINE_ID",
+            panel_audience::AUDIENCE_ENV,
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect();
         std::env::set_var("DARKMUX_FLEET_FILE", &roster);
         std::env::set_var("DARKMUX_MACHINE_ID", "studio");
         // A daemon started from a shell that happened to export the audience
@@ -3440,25 +4288,42 @@ mod tests {
             };
             let text = remote["ansi_text"].as_str().unwrap_or_default();
             if !text.contains("audience=[remote]") {
-                failures.push(format!("{id}: the child was not asked for its remote form: {text}"));
+                failures.push(format!(
+                    "{id}: the child was not asked for its remote form: {text}"
+                ));
             }
             if text.contains("example-host") {
-                failures.push(format!("{id}: a roster address reached a remote caller: {text}"));
+                failures.push(format!(
+                    "{id}: a roster address reached a remote caller: {text}"
+                ));
             }
             if remote["stderr_tail"] != "warning: something local" {
-                failures.push(format!("{id}: a remote caller did not read stderr (redacted): {}", remote["stderr_tail"]));
+                failures.push(format!(
+                    "{id}: a remote caller did not read stderr (redacted): {}",
+                    remote["stderr_tail"]
+                ));
             }
             let notice = remote["withheld"].as_str().unwrap_or_default();
             let command = format!("darkmux {}", panel_spec(id).unwrap().argv.join(" "));
-            if !(notice.contains("shown on this machine only") && notice.contains(&command) && notice.contains("studio")) {
-                failures.push(format!("{id}: no notice naming `{command}` and the machine: {notice:?}"));
+            if !(notice.contains("shown on this machine only")
+                && notice.contains(&command)
+                && notice.contains("studio"))
+            {
+                failures.push(format!(
+                    "{id}: no notice naming `{command}` and the machine: {notice:?}"
+                ));
             }
-            let local = serde_json::to_value(&serve(id, "127.0.0.1:50000").await.unwrap().0).unwrap();
+            let local =
+                serde_json::to_value(&serve(id, "127.0.0.1:50000").await.unwrap().0).unwrap();
             let text = local["ansi_text"].as_str().unwrap_or_default();
             if !text.contains("audience=[] peer at example-host.example:8765") {
-                failures.push(format!("{id}: this machine did not get the full output: {text}"));
+                failures.push(format!(
+                    "{id}: this machine did not get the full output: {text}"
+                ));
             }
-            if local["stderr_tail"] != "warning: something local" || local["withheld"].as_str().unwrap_or_default() != "" {
+            if local["stderr_tail"] != "warning: something local"
+                || local["withheld"].as_str().unwrap_or_default() != ""
+            {
                 failures.push(format!("{id}: this machine lost its stderr or was told something was withheld: {local}"));
             }
         }
@@ -3495,12 +4360,20 @@ mod tests {
         std::fs::write(&out, "hosted: unmanaged @ old-fake-endpoint.example.com\n").unwrap();
         let child = dir.path().join("child.sh");
         std::fs::write(&child, format!("#!/bin/sh\ncat '{}'\n", out.display())).unwrap();
-        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&child, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         // (#2976) The first exec of a fresh executable is scanned; do it
         // outside the panel's spawn bound.
         let _ = std::process::Command::new(&child).output();
-        let keys = ["DARKMUX_HOME", "HOME", "DARKMUX_FLEET_FILE", "DARKMUX_PROFILES", "DARKMUX_REDIS_URL"];
-        let saved: Vec<(&str, Option<String>)> = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        let keys = [
+            "DARKMUX_HOME",
+            "HOME",
+            "DARKMUX_FLEET_FILE",
+            "DARKMUX_PROFILES",
+            "DARKMUX_REDIS_URL",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
         std::env::set_var("DARKMUX_HOME", &root);
         std::env::set_var("HOME", dir.path().join("home"));
         std::env::set_var("DARKMUX_FLEET_FILE", root.join("fleet.json"));
@@ -3516,7 +4389,9 @@ mod tests {
                 Path("profile-list".to_string()),
                 axum::extract::RawQuery(None),
                 Query(HashMap::new()),
-                Some(axum::extract::ConnectInfo("100.64.1.2:50000".parse().unwrap())),
+                Some(axum::extract::ConnectInfo(
+                    "100.64.1.2:50000".parse().unwrap(),
+                )),
                 headers,
                 State(state.clone()),
             )
@@ -3533,15 +4408,25 @@ mod tests {
         let first = first.unwrap();
         assert!(!first.contains("old-fake-endpoint"), "{first}");
         let (second, age_ms) = second.unwrap();
-        assert!(age_ms > 0 || second == first, "the second request is the cached body: {second}");
-        assert!(!second.contains("old-fake-endpoint"), "a rotated location leaked from the cache: {second}");
+        assert!(
+            age_ms > 0 || second == first,
+            "the second request is the cached body: {second}"
+        );
+        assert!(
+            !second.contains("old-fake-endpoint"),
+            "a rotated location leaked from the cache: {second}"
+        );
     }
 
     // ── real panel output: colored, punctuated, linked ─────────────────
 
     fn real_redaction() -> Redaction {
         Redaction::from_parts(
-            &[("studio", "studio.tailnet.example:8765"), ("mini", "100.64.1.2"), ("macbox", "mac.local")],
+            &[
+                ("studio", "studio.tailnet.example:8765"),
+                ("mini", "100.64.1.2"),
+                ("macbox", "mac.local"),
+            ],
             &[],
             Some("/Users/kain".into()),
             Some("/Users/kainx/dm".into()),
@@ -3554,12 +4439,24 @@ mod tests {
     fn an_address_or_path_next_to_a_color_code_is_still_redacted() {
         let r = real_redaction();
         for (input, want) in [
-            ("roster: \x1b[2m/Users/kain/.darkmux/fleet.json", "roster: \x1b[2m~/.darkmux/fleet.json"),
-            ("\x1b[2mstudio.tailnet.example\x1b[0m", "\x1b[2m(address hidden)\x1b[0m"),
-            ("\x1b[0mstudio.tailnet.example:8765", "\x1b[0m(address hidden)"),
+            (
+                "roster: \x1b[2m/Users/kain/.darkmux/fleet.json",
+                "roster: \x1b[2m~/.darkmux/fleet.json",
+            ),
+            (
+                "\x1b[2mstudio.tailnet.example\x1b[0m",
+                "\x1b[2m(address hidden)\x1b[0m",
+            ),
+            (
+                "\x1b[0mstudio.tailnet.example:8765",
+                "\x1b[0m(address hidden)",
+            ),
             ("\x1b[2m100.64.1.2", "\x1b[2m(address hidden)"),
             ("\x1b[1mmac.local", "\x1b[1m(address hidden)"),
-            ("\x1b[38;5;208m/Users/kain\x1b[39m", "\x1b[38;5;208m~\x1b[39m"),
+            (
+                "\x1b[38;5;208m/Users/kain\x1b[39m",
+                "\x1b[38;5;208m~\x1b[39m",
+            ),
         ] {
             assert_eq!(filtered(&r, input), want, "{input:?}");
         }
@@ -3573,12 +4470,18 @@ mod tests {
             ("is studio.tailnet.example.", "is (address hidden)."),
             ("at 100.64.1.2.", "at (address hidden)."),
             ("in /Users/kain.", "in ~."),
-            ("(100.64.1.2), mac.local.\n", "((address hidden)), (address hidden).\n"),
+            (
+                "(100.64.1.2), mac.local.\n",
+                "((address hidden)), (address hidden).\n",
+            ),
         ] {
             assert_eq!(filtered(&r, input), want, "{input:?}");
         }
         // A dot followed by a word character still continues the name.
-        assert_eq!(filtered(&r, "100.64.1.2.5 mac.local.example"), "100.64.1.2.5 mac.local.example");
+        assert_eq!(
+            filtered(&r, "100.64.1.2.5 mac.local.example"),
+            "100.64.1.2.5 mac.local.example"
+        );
     }
 
     #[test]
@@ -3602,19 +4505,41 @@ mod tests {
     fn darkmux_home_is_trimmed_and_nested_at_a_path_boundary() {
         // `/Users/kainx/dm` is not inside `/Users/kain`, so it is its own rewrite.
         let r = real_redaction();
-        assert_eq!(filtered(&r, "/Users/kainx/dm/cfg /Users/kain/a"), "$DARKMUX_HOME/cfg ~/a");
+        assert_eq!(
+            filtered(&r, "/Users/kainx/dm/cfg /Users/kain/a"),
+            "$DARKMUX_HOME/cfg ~/a"
+        );
         // A trailing slash on either directory does not stop the match.
-        let r = Redaction::from_parts(&[], &[], Some("/Users/kain/".into()), Some("/Volumes/x/dm/".into()));
-        assert_eq!(filtered(&r, "/Users/kain/a /Volumes/x/dm/b"), "~/a $DARKMUX_HOME/b");
+        let r = Redaction::from_parts(
+            &[],
+            &[],
+            Some("/Users/kain/".into()),
+            Some("/Volumes/x/dm/".into()),
+        );
+        assert_eq!(
+            filtered(&r, "/Users/kain/a /Volumes/x/dm/b"),
+            "~/a $DARKMUX_HOME/b"
+        );
         // Inside HOME at a boundary: covered by the HOME rewrite.
-        let r = Redaction::from_parts(&[], &[], Some("/Users/kain".into()), Some("/Users/kain/dm/".into()));
+        let r = Redaction::from_parts(
+            &[],
+            &[],
+            Some("/Users/kain".into()),
+            Some("/Users/kain/dm/".into()),
+        );
         assert_eq!(filtered(&r, "/Users/kain/dm/x"), "~/dm/x");
     }
 
     #[test]
     fn the_earlier_over_redaction_fixtures_still_hold_with_colors() {
-        let r = Redaction::from_parts(&[("peerone", "mac"), ("peertwo", "studio")], &[], Some("/Users/kain".into()), None);
-        let text = "\x1b[1mdarkmux machine list\x1b[0m\nmacos aarch64 analyst lmstudio-community/x\n";
+        let r = Redaction::from_parts(
+            &[("peerone", "mac"), ("peertwo", "studio")],
+            &[],
+            Some("/Users/kain".into()),
+            None,
+        );
+        let text =
+            "\x1b[1mdarkmux machine list\x1b[0m\nmacos aarch64 analyst lmstudio-community/x\n";
         assert_eq!(filtered(&r, text), text);
     }
 
@@ -3630,11 +4555,17 @@ mod tests {
         std::fs::create_dir_all(real.join("fx")).unwrap();
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let (link, real) = (link.to_string_lossy().to_string(), real.to_string_lossy().to_string());
+        let (link, real) = (
+            link.to_string_lossy().to_string(),
+            real.to_string_lossy().to_string(),
+        );
         assert_ne!(link, real);
         // As DARKMUX_HOME (outside HOME) ...
         let r = Redaction::from_parts(&[], &[], Some("/Users/kain".into()), Some(link.clone()));
-        assert_eq!(filtered(&r, &format!("{link}/a {real}/fx")), "$DARKMUX_HOME/a $DARKMUX_HOME/fx");
+        assert_eq!(
+            filtered(&r, &format!("{link}/a {real}/fx")),
+            "$DARKMUX_HOME/a $DARKMUX_HOME/fx"
+        );
         // ... and as HOME.
         let r = Redaction::from_parts(&[], &[], Some(format!("{link}/")), None);
         assert_eq!(filtered(&r, &format!("{link}/a {real}/fx")), "~/a ~/fx");
@@ -3648,10 +4579,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(home.join("dm")).unwrap();
-        let (h, dm) = (home.to_string_lossy().to_string(), home.join("dm").to_string_lossy().to_string());
+        let (h, dm) = (
+            home.to_string_lossy().to_string(),
+            home.join("dm").to_string_lossy().to_string(),
+        );
         let r = Redaction::from_parts(&[], &[], Some(h.clone()), Some(dm.clone()));
         assert_eq!(filtered(&r, &format!("{dm}/x")), "~/dm/x");
-        assert!(r.dirs().iter().all(|(_, label)| *label == "~"), "{:?}", r.dirs());
+        assert!(
+            r.dirs().iter().all(|(_, label)| *label == "~"),
+            "{:?}",
+            r.dirs()
+        );
         // A sibling that merely shares the prefix is not inside it.
         std::fs::create_dir_all(format!("{h}x/dm")).ok();
         let r = Redaction::from_parts(&[], &[], Some(h.clone()), Some(format!("{h}x/dm")));
@@ -3674,7 +4612,10 @@ mod tests {
             // A charset designation is dropped.
             ("a\x1b(Bb", "ab"),
             // OSC 8: params stripped, target kept, terminator normalized to ST.
-            ("\x1b]8;id=7;/#mission=m-1\x07m-1\x1b]8;;\x07", "\x1b]8;;/#mission=m-1\x1b\\m-1\x1b]8;;\x1b\\"),
+            (
+                "\x1b]8;id=7;/#mission=m-1\x07m-1\x1b]8;;\x07",
+                "\x1b]8;;/#mission=m-1\x1b\\m-1\x1b]8;;\x1b\\",
+            ),
         ] {
             assert_eq!(filtered(&r, input), want, "{input:?}");
         }
@@ -3688,7 +4629,10 @@ mod tests {
         for (input, want) in [
             ("\x1b[/Users/kain/.darkmux", "~/.darkmux"),
             ("x \x1b]0;/Users/kain no terminator", "x 0;~ no terminator"),
-            ("x \x1b]8;;http://studio.tailnet.example:8765/", "x 8;;http://(address hidden)/"),
+            (
+                "x \x1b]8;;http://studio.tailnet.example:8765/",
+                "x 8;;http://(address hidden)/",
+            ),
             ("tail \x1b[", "tail "),
             ("tail \x1b", "tail "),
         ] {

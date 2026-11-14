@@ -93,8 +93,10 @@ impl UsageSum {
 // `darkmux_crew::usage`, so the endpoint budget's rolling-window sum (in
 // `darkmux_crew::budget`, below this crate in the dependency graph) and this
 // fold read a record the same way. Re-exported here unchanged.
-pub use darkmux_crew::usage::{is_usage_record, usage_contribution, usage_purpose, UsageAmount, MAX_COUNT};
 use darkmux_crew::usage::{amount_of, payload_of};
+pub use darkmux_crew::usage::{
+    is_usage_record, usage_contribution, usage_purpose, UsageAmount, MAX_COUNT,
+};
 
 /// THE sum over a slice of records: [`UsageFold`] driven to completion.
 pub fn sum_usage<'a>(records: impl IntoIterator<Item = &'a serde_json::Value>) -> UsageSum {
@@ -166,7 +168,14 @@ pub struct UsageSplit {
 
 impl UsageSplit {
     fn of_sum(s: &UsageSum) -> Self {
-        Self { calls: s.usage_records, total: s.total, input: s.prompt, cached: s.cached, generated: s.completion, unreported: s.usage_records - s.reported }
+        Self {
+            calls: s.usage_records,
+            total: s.total,
+            input: s.prompt,
+            cached: s.cached,
+            generated: s.completion,
+            unreported: s.usage_records - s.reported,
+        }
     }
 
     fn merge(&mut self, o: &UsageSplit) {
@@ -229,7 +238,10 @@ struct GroupKey {
 
 /// The text a record carries under `k`, empty read as absent.
 fn text_of(v: &serde_json::Value, k: &str) -> Option<String> {
-    v.get(k).and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(str::to_string)
+    v.get(k)
+        .and_then(|x| x.as_str())
+        .filter(|x| !x.is_empty())
+        .map(str::to_string)
 }
 
 /// The machine a record names: the record's own `machine_uid`/`machine_id`,
@@ -238,7 +250,9 @@ fn text_of(v: &serde_json::Value, k: &str) -> Option<String> {
 /// the display name.
 fn machine_of(v: &serde_json::Value) -> (Option<String>, Option<String>) {
     let name = text_of(v, "machine_id");
-    let key = text_of(v, "machine_uid").map(|u| u.to_ascii_uppercase()).or_else(|| name.clone());
+    let key = text_of(v, "machine_uid")
+        .map(|u| u.to_ascii_uppercase())
+        .or_else(|| name.clone());
     (key, name)
 }
 
@@ -247,8 +261,18 @@ fn group_key(v: &serde_json::Value) -> GroupKey {
     let requested = text_of(p, "requested_model");
     let reported = text_of(p, "reported_model").filter(|r| Some(r) != requested.as_ref());
     let endpoint_id = text_of(p, "endpoint_id");
-    let endpoint = if endpoint_id.is_some() { None } else { text_of(p, "endpoint") };
-    GroupKey { machine: machine_of(v).0, endpoint, endpoint_id, requested, reported }
+    let endpoint = if endpoint_id.is_some() {
+        None
+    } else {
+        text_of(p, "endpoint")
+    };
+    GroupKey {
+        machine: machine_of(v).0,
+        endpoint,
+        endpoint_id,
+        requested,
+        reported,
+    }
 }
 
 /// The display facts of one record that are NOT part of its group's key:
@@ -262,7 +286,11 @@ struct GroupLabel {
 }
 
 fn group_label(v: &serde_json::Value) -> GroupLabel {
-    GroupLabel { machine: machine_of(v).1, endpoint: text_of(payload_of(v), "endpoint"), ts: text_of(v, "ts").unwrap_or_default() }
+    GroupLabel {
+        machine: machine_of(v).1,
+        endpoint: text_of(payload_of(v), "endpoint"),
+        ts: text_of(v, "ts").unwrap_or_default(),
+    }
 }
 
 /// The fold: feed it every record in a window (any order), then `finish`.
@@ -294,7 +322,14 @@ struct RunEntry {
 
 impl UsageFold {
     pub fn new(since: Option<String>) -> Self {
-        Self { since, runs: Vec::new(), run_index: HashMap::new(), groups: HashMap::new(), machine_ts: HashMap::new(), no_run: UsageSplit::default() }
+        Self {
+            since,
+            runs: Vec::new(),
+            run_index: HashMap::new(),
+            groups: HashMap::new(),
+            machine_ts: HashMap::new(),
+            no_run: UsageSplit::default(),
+        }
     }
 
     /// The entry of the (session, mission) `v` names, created on first sight.
@@ -304,7 +339,12 @@ impl UsageFold {
         if let Some(&i) = self.run_index.get(&key) {
             return i;
         }
-        self.runs.push(RunEntry { session_id: key.0.clone(), mission_id: key.1.clone(), sum: UsageSum::default(), first_ts: None });
+        self.runs.push(RunEntry {
+            session_id: key.0.clone(),
+            mission_id: key.1.clone(),
+            sum: UsageSum::default(),
+            first_ts: None,
+        });
         self.run_index.insert(key, self.runs.len() - 1);
         self.runs.len() - 1
     }
@@ -332,7 +372,10 @@ impl UsageFold {
         let i = self.run_slot(v);
         let entry = &mut self.runs[i];
         entry.sum.add(&amount);
-        let ts = v.get("ts").and_then(|t| t.as_str()).and_then(crate::runs::parse_flow_ts);
+        let ts = v
+            .get("ts")
+            .and_then(|t| t.as_str())
+            .and_then(crate::runs::parse_flow_ts);
         entry.first_ts = match (entry.first_ts, ts) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -344,21 +387,27 @@ impl UsageFold {
     }
 
     fn group(&mut self, key: GroupKey, label: GroupLabel, amount: &UsageAmount) {
-        let g = self.groups.entry(key.clone()).or_insert_with(|| UsageGroup {
-            machine: None,
-            endpoint: None,
-            endpoint_id: key.endpoint_id.clone(),
-            requested_model: key.requested.clone(),
-            reported_model: key.reported.clone(),
-            work: UsageSplit::default(),
-            utility: UsageSplit::default(),
-        });
+        let g = self
+            .groups
+            .entry(key.clone())
+            .or_insert_with(|| UsageGroup {
+                machine: None,
+                endpoint: None,
+                endpoint_id: key.endpoint_id.clone(),
+                requested_model: key.requested.clone(),
+                reported_model: key.reported.clone(),
+                work: UsageSplit::default(),
+                utility: UsageSplit::default(),
+            });
         if let Some(seen) = label.endpoint {
             if g.endpoint.as_ref().is_none_or(|kept| seen < *kept) {
                 g.endpoint = Some(seen);
             }
         }
-        let newest = self.machine_ts.get(&key).is_none_or(|seen| label.ts >= *seen);
+        let newest = self
+            .machine_ts
+            .get(&key)
+            .is_none_or(|seen| label.ts >= *seen);
         if label.machine.is_some() && newest {
             g.machine = label.machine;
             self.machine_ts.insert(key, label.ts);
@@ -379,10 +428,16 @@ impl UsageFold {
         for (i, entry) in self.runs.iter().enumerate() {
             overall.merge(&entry.sum);
             if !entry.session_id.is_empty() {
-                by_session.entry(entry.session_id.clone()).or_default().push(i);
+                by_session
+                    .entry(entry.session_id.clone())
+                    .or_default()
+                    .push(i);
             }
             if !entry.mission_id.is_empty() {
-                by_mission.entry(entry.mission_id.clone()).or_default().push(i);
+                by_mission
+                    .entry(entry.mission_id.clone())
+                    .or_default()
+                    .push(i);
             }
         }
         let mut groups: Vec<UsageGroup> = self.groups.into_values().collect();
@@ -397,17 +452,31 @@ impl UsageFold {
                 .then_with(|| a.reported_model.cmp(&b.reported_model))
         });
         // The entries naming no run are `no_run`'s: never a row's to claim.
-        let no_run_entries: HashSet<usize> =
-            self.runs.iter().enumerate().filter(|(_, e)| e.session_id.is_empty() && e.mission_id.is_empty()).map(|(i, _)| i).collect();
+        let no_run_entries: HashSet<usize> = self
+            .runs
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.session_id.is_empty() && e.mission_id.is_empty())
+            .map(|(i, _)| i)
+            .collect();
         let first_ts = self.runs.iter().map(|e| e.first_ts).collect();
-        let runs = self.runs.into_iter().map(|e| (e.mission_id, e.sum)).collect();
+        let runs = self
+            .runs
+            .into_iter()
+            .map(|e| (e.mission_id, e.sum))
+            .collect();
         UsageIndex {
             runs,
             by_session,
             by_mission,
             claimed: std::cell::RefCell::new(no_run_entries),
             first_ts,
-            breakdown: UsageBreakdown { overall, groups, no_run: self.no_run, unlisted: UsageSplit::default() },
+            breakdown: UsageBreakdown {
+                overall,
+                groups,
+                no_run: self.no_run,
+                unlisted: UsageSplit::default(),
+            },
         }
     }
 }
@@ -464,7 +533,11 @@ impl UsageIndex {
     /// and a mission must never read the other's share of it (review
     /// CONSIDER 2). Without one (a ghost, a lab run) the session is read
     /// whole.
-    fn candidates<'a>(&self, mission_id: Option<&str>, session_ids: impl IntoIterator<Item = &'a str>) -> Vec<usize> {
+    fn candidates<'a>(
+        &self,
+        mission_id: Option<&str>,
+        session_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<usize> {
         let mission_id = mission_id.filter(|m| !m.is_empty());
         let mut seen: HashSet<usize> = HashSet::new();
         let mut out = Vec::new();
@@ -478,7 +551,9 @@ impl UsageIndex {
         for sid in session_ids {
             for &i in self.by_session.get(sid).into_iter().flatten() {
                 let owner = self.runs[i].0.as_str();
-                if (owner.is_empty() || mission_id.is_none() || mission_id == Some(owner)) && seen.insert(i) {
+                if (owner.is_empty() || mission_id.is_none() || mission_id == Some(owner))
+                    && seen.insert(i)
+                {
                     out.push(i);
                 }
             }
@@ -490,7 +565,12 @@ impl UsageIndex {
     /// `None` when nothing was measured: no entry matched, or none of the
     /// matched entries' records reported a count.
     fn sum_of(&self, entries: &[usize]) -> Option<u64> {
-        let (total, reported) = entries.iter().fold((0u64, 0u64), |(t, r), &i| (t.saturating_add(self.runs[i].1.total), r + self.runs[i].1.reported));
+        let (total, reported) = entries.iter().fold((0u64, 0u64), |(t, r), &i| {
+            (
+                t.saturating_add(self.runs[i].1.total),
+                r + self.runs[i].1.reported,
+            )
+        });
         (reported > 0).then_some(total)
     }
 
@@ -502,12 +582,21 @@ impl UsageIndex {
     /// the rows and the records, never of build or hash order. Entries no row
     /// wins are [`Self::unlisted`].
     pub fn attribute(&self, rows: &[RowClaim]) -> Vec<Option<u64>> {
-        let cands: Vec<Vec<usize>> =
-            rows.iter().map(|r| self.candidates(r.mission_id.as_deref(), r.session_ids.iter().map(String::as_str))).collect();
+        let cands: Vec<Vec<usize>> = rows
+            .iter()
+            .map(|r| {
+                self.candidates(
+                    r.mission_id.as_deref(),
+                    r.session_ids.iter().map(String::as_str),
+                )
+            })
+            .collect();
         let mut winner: HashMap<usize, usize> = HashMap::new();
         for (ri, entries) in cands.iter().enumerate() {
             for &e in entries {
-                let better = winner.get(&e).is_none_or(|&w| rows[ri].rank(self.first_ts[e]) < rows[w].rank(self.first_ts[e]));
+                let better = winner.get(&e).is_none_or(|&w| {
+                    rows[ri].rank(self.first_ts[e]) < rows[w].rank(self.first_ts[e])
+                });
                 if better {
                     winner.insert(e, ri);
                 }
@@ -536,7 +625,11 @@ impl UsageIndex {
     }
 
     #[cfg(test)]
-    pub fn tokens_for<'a>(&self, mission_id: Option<&str>, session_ids: impl IntoIterator<Item = &'a str>) -> Option<u64> {
+    pub fn tokens_for<'a>(
+        &self,
+        mission_id: Option<&str>,
+        session_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Option<u64> {
         self.sum_of(&self.candidates(mission_id, session_ids))
     }
 
@@ -558,7 +651,9 @@ pub fn parse_since(spec: &str, now_secs: u64) -> Result<u64, String> {
     if let Some(secs) = crate::runs::parse_flow_ts(&format!("{spec}T00:00:00Z")) {
         return Ok(secs);
     }
-    let unit_at = spec.find(|c: char| !c.is_ascii_digit()).unwrap_or(spec.len());
+    let unit_at = spec
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(spec.len());
     let (digits, unit) = spec.split_at(unit_at);
     let per_unit: u64 = match unit {
         "s" => 1,
@@ -585,7 +680,12 @@ pub fn iso_from_epoch(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (y, m, d) = crate::runs::civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60)
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 #[cfg(test)]
@@ -601,7 +701,8 @@ mod tests {
             .filter(|l| !l.trim().is_empty())
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        let expected = serde_json::from_str(&std::fs::read_to_string(dir.join(expected)).unwrap()).unwrap();
+        let expected =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(expected)).unwrap()).unwrap();
         (records, expected)
     }
 
@@ -614,15 +715,34 @@ mod tests {
     /// else as 0, and judge "reported" by that same reading.
     #[test]
     fn shared_domain_goldens_match_the_viewer() {
-        for (records_file, expected_file) in [("domain.jsonl", "domain-expected.json"), ("clamp.jsonl", "clamp-expected.json")] {
+        for (records_file, expected_file) in [
+            ("domain.jsonl", "domain-expected.json"),
+            ("clamp.jsonl", "clamp-expected.json"),
+        ] {
             let (records, expected) = golden_named(records_file, expected_file);
             let idx = fold_all(&records, None);
             let s = &idx.breakdown.overall;
-            assert_eq!(shape(s.total, s.prompt, s.completion, s.cached), expected["overall"], "{records_file}: overall");
-            assert_eq!(s.usage_records, expected["usage_records"].as_u64().unwrap(), "{records_file}");
-            assert_eq!(s.reported, expected["reported_entries"].as_u64().unwrap(), "{records_file}: reported");
+            assert_eq!(
+                shape(s.total, s.prompt, s.completion, s.cached),
+                expected["overall"],
+                "{records_file}: overall"
+            );
+            assert_eq!(
+                s.usage_records,
+                expected["usage_records"].as_u64().unwrap(),
+                "{records_file}"
+            );
+            assert_eq!(
+                s.reported,
+                expected["reported_entries"].as_u64().unwrap(),
+                "{records_file}: reported"
+            );
             if let Some(by_model) = expected.get("by_requested_model") {
-                assert_eq!(breakdown_by(&records, "requested_model"), *by_model, "{records_file}");
+                assert_eq!(
+                    breakdown_by(&records, "requested_model"),
+                    *by_model,
+                    "{records_file}"
+                );
             }
         }
     }
@@ -631,15 +751,35 @@ mod tests {
     /// saturates rather than wrapping (release) or panicking (debug).
     #[test]
     fn sums_saturate_instead_of_overflowing() {
-        let huge = UsageAmount { total: u64::MAX, prompt: u64::MAX, completion: u64::MAX, cached: Some(u64::MAX), purpose: UsagePurpose::Utility, reported: true, spend: Some(u64::MAX) };
+        let huge = UsageAmount {
+            total: u64::MAX,
+            prompt: u64::MAX,
+            completion: u64::MAX,
+            cached: Some(u64::MAX),
+            purpose: UsagePurpose::Utility,
+            reported: true,
+            spend: Some(u64::MAX),
+        };
         let mut sum = UsageSum::default();
         sum.add(&huge);
         sum.add(&huge);
-        assert_eq!((sum.total, sum.prompt, sum.completion, sum.cached, sum.utility), (u64::MAX, u64::MAX, u64::MAX, Some(u64::MAX), u64::MAX));
+        assert_eq!(
+            (
+                sum.total,
+                sum.prompt,
+                sum.completion,
+                sum.cached,
+                sum.utility
+            ),
+            (u64::MAX, u64::MAX, u64::MAX, Some(u64::MAX), u64::MAX)
+        );
         let mut split = UsageSplit::default();
         split.add(&huge);
         split.add(&huge);
-        assert_eq!((split.total, split.input, split.generated, split.cached), (u64::MAX, u64::MAX, u64::MAX, Some(u64::MAX)));
+        assert_eq!(
+            (split.total, split.input, split.generated, split.cached),
+            (u64::MAX, u64::MAX, u64::MAX, Some(u64::MAX))
+        );
         // And the fold's overall, across two runs at the maximum.
         let rec = |sid: &str| serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":sid,"payload":{"total_tokens":1e300,"prompt_tokens":1e300}});
         let mut fold = UsageFold::new(None);
@@ -658,9 +798,24 @@ mod tests {
     #[test]
     fn a_resumed_executions_records_count_under_their_own_sessions() {
         let usage = |sid: &str, total: u64| serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":sid,"mission_id":"m","execution_id":"exec-shared","payload":{"token_source":"provider","total_tokens":total}});
-        let idx = fold_all(&[usage("sess-first", 100), usage("sess-resumed", 40), usage("sess-resumed", 2)], None);
-        assert_eq!(idx.tokens_for_session("sess-first"), Some(100), "the first session reads only its own");
-        assert_eq!(idx.tokens_for_session("sess-resumed"), Some(42), "and the resumed one has its own, not `-`");
+        let idx = fold_all(
+            &[
+                usage("sess-first", 100),
+                usage("sess-resumed", 40),
+                usage("sess-resumed", 2),
+            ],
+            None,
+        );
+        assert_eq!(
+            idx.tokens_for_session("sess-first"),
+            Some(100),
+            "the first session reads only its own"
+        );
+        assert_eq!(
+            idx.tokens_for_session("sess-resumed"),
+            Some(42),
+            "and the resumed one has its own, not `-`"
+        );
         assert_eq!(idx.breakdown.overall.total, 142);
     }
 
@@ -683,12 +838,25 @@ mod tests {
         let routing = serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","handle":"radio-router","payload":{"purpose":"utility","call_kind":"single_shot","token_source":"provider","total_tokens":9}});
         let idx = fold_all(&[run, routing.clone(), routing], None);
         assert_eq!(idx.breakdown.overall.total, 118);
-        assert_eq!((idx.breakdown.no_run.calls, idx.breakdown.no_run.total), (2, 18));
-        assert_eq!(idx.tokens_for_session("s1").unwrap() + idx.breakdown.no_run.total, idx.breakdown.overall.total);
+        assert_eq!(
+            (idx.breakdown.no_run.calls, idx.breakdown.no_run.total),
+            (2, 18)
+        );
+        assert_eq!(
+            idx.tokens_for_session("s1").unwrap() + idx.breakdown.no_run.total,
+            idx.breakdown.overall.total
+        );
     }
 
     /// One usage record as the machine that EXECUTED the call wrote it.
-    fn usage_on(machine: &str, uid: &str, endpoint_id: Option<&str>, purpose: &str, model: &str, total: Option<u64>) -> serde_json::Value {
+    fn usage_on(
+        machine: &str,
+        uid: &str,
+        endpoint_id: Option<&str>,
+        purpose: &str,
+        model: &str,
+        total: Option<u64>,
+    ) -> serde_json::Value {
         let mut p = serde_json::json!({"call_kind":"single_shot","purpose":purpose,"requested_model":model,"endpoint":"http://localhost:1234/v1"});
         match total {
             Some(t) => {
@@ -711,13 +879,27 @@ mod tests {
     #[test]
     fn one_localhost_on_two_machines_is_two_groups() {
         let records = [
-            usage_on("MacBook-Pro", "UID-A", None, "work", "darkmux:phi-4", Some(100)),
+            usage_on(
+                "MacBook-Pro",
+                "UID-A",
+                None,
+                "work",
+                "darkmux:phi-4",
+                Some(100),
+            ),
             usage_on("studio", "UID-B", None, "work", "darkmux:phi-4", Some(30)),
         ];
         let b = fold_all(&records, None).breakdown;
         assert_eq!(b.groups.len(), 2, "{:#?}", b.groups);
-        let by: std::collections::BTreeMap<_, _> = b.groups.iter().map(|g| (g.machine.clone().unwrap(), g.total())).collect();
-        assert_eq!(by, [("MacBook-Pro".to_string(), 100), ("studio".to_string(), 30)].into());
+        let by: std::collections::BTreeMap<_, _> = b
+            .groups
+            .iter()
+            .map(|g| (g.machine.clone().unwrap(), g.total()))
+            .collect();
+        assert_eq!(
+            by,
+            [("MacBook-Pro".to_string(), 100), ("studio".to_string(), 30)].into()
+        );
         assert_eq!(b.overall.total, 130);
     }
 
@@ -732,7 +914,10 @@ mod tests {
         for order in [[old.clone(), new.clone()], [new, old]] {
             let g = fold_all(&order, None).breakdown.groups;
             assert_eq!(g.len(), 1, "{g:#?}");
-            assert_eq!((g[0].machine.as_deref(), g[0].total()), (Some("studio-renamed"), 30));
+            assert_eq!(
+                (g[0].machine.as_deref(), g[0].total()),
+                (Some("studio-renamed"), 30)
+            );
         }
     }
 
@@ -741,16 +926,38 @@ mod tests {
     /// (each machine's spend is enforced locally), summed by the overall.
     #[test]
     fn a_hosted_endpoint_used_from_two_machines_is_two_rows_keyed_by_its_id() {
-        let mut other_label = usage_on("MacBook-Pro", "UID-A", Some("azure"), "work", "gpt", Some(50));
+        let mut other_label = usage_on(
+            "MacBook-Pro",
+            "UID-A",
+            Some("azure"),
+            "work",
+            "gpt",
+            Some(50),
+        );
         other_label["payload"]["endpoint"] = "https://x.example/gpt".into();
         let records = [
-            usage_on("MacBook-Pro", "UID-A", Some("azure"), "work", "gpt", Some(100)),
+            usage_on(
+                "MacBook-Pro",
+                "UID-A",
+                Some("azure"),
+                "work",
+                "gpt",
+                Some(100),
+            ),
             other_label,
             usage_on("studio", "UID-B", Some("azure"), "work", "gpt", Some(7)),
         ];
         let b = fold_all(&records, None).breakdown;
-        assert_eq!(b.groups.len(), 2, "one id on one machine is one row whatever its label: {:#?}", b.groups);
-        assert!(b.groups.iter().all(|g| g.endpoint_id.as_deref() == Some("azure")));
+        assert_eq!(
+            b.groups.len(),
+            2,
+            "one id on one machine is one row whatever its label: {:#?}",
+            b.groups
+        );
+        assert!(b
+            .groups
+            .iter()
+            .all(|g| g.endpoint_id.as_deref() == Some("azure")));
         assert_eq!(b.groups[0].total(), 150);
         assert_eq!(b.overall.total, 157);
     }
@@ -768,7 +975,10 @@ mod tests {
         let idx = fold_all(&[asker_start, exec, asker_end], None);
         let g = &idx.breakdown.groups;
         assert_eq!(g.len(), 1, "{g:#?}");
-        assert_eq!((g[0].machine.as_deref(), g[0].work.calls, g[0].total()), (Some("studio"), 1, 60));
+        assert_eq!(
+            (g[0].machine.as_deref(), g[0].work.calls, g[0].total()),
+            (Some("studio"), 1, 60)
+        );
         assert_eq!(idx.breakdown.overall.total, 60);
     }
 
@@ -776,13 +986,33 @@ mod tests {
     #[test]
     fn a_utility_call_lands_in_the_utility_split_of_its_machines_row() {
         let records = [
-            usage_on("MacBook-Pro", "UID-A", None, "utility", "darkmux:qwen3-4b", Some(9)),
-            usage_on("MacBook-Pro", "UID-A", None, "work", "darkmux:coder", Some(90)),
+            usage_on(
+                "MacBook-Pro",
+                "UID-A",
+                None,
+                "utility",
+                "darkmux:qwen3-4b",
+                Some(9),
+            ),
+            usage_on(
+                "MacBook-Pro",
+                "UID-A",
+                None,
+                "work",
+                "darkmux:coder",
+                Some(90),
+            ),
         ];
         let g = fold_all(&records, None).breakdown.groups;
-        let util = g.iter().find(|g| g.requested_model.as_deref() == Some("darkmux:qwen3-4b")).unwrap();
+        let util = g
+            .iter()
+            .find(|g| g.requested_model.as_deref() == Some("darkmux:qwen3-4b"))
+            .unwrap();
         assert_eq!((util.utility.total, util.work.calls), (9, 0));
-        let work = g.iter().find(|g| g.requested_model.as_deref() == Some("darkmux:coder")).unwrap();
+        let work = g
+            .iter()
+            .find(|g| g.requested_model.as_deref() == Some("darkmux:coder"))
+            .unwrap();
         assert_eq!((work.work.total, work.utility.calls), (90, 0));
     }
 
@@ -798,8 +1028,15 @@ mod tests {
         ];
         let g = fold_all(&records, None).breakdown.groups;
         assert_eq!(g.len(), 1);
-        assert_eq!((g[0].work.calls, g[0].work.total, g[0].work.unreported), (2, 40, 1));
-        assert_eq!(usage_contribution(&records[0]).unwrap().spend, None, "the window ledger reads it as unmetered");
+        assert_eq!(
+            (g[0].work.calls, g[0].work.total, g[0].work.unreported),
+            (2, 40, 1)
+        );
+        assert_eq!(
+            usage_contribution(&records[0]).unwrap().spend,
+            None,
+            "the window ledger reads it as unmetered"
+        );
     }
 
     fn fold_all(records: &[serde_json::Value], since: Option<&str>) -> UsageIndex {
@@ -821,7 +1058,11 @@ mod tests {
         let refs: Vec<&serde_json::Value> = records.iter().collect();
         let mut out: std::collections::BTreeMap<String, u64> = Default::default();
         let mut add = |r: &serde_json::Value, a: &UsageAmount| {
-            let k = payload_of(r).get(field).and_then(|v| v.as_str()).unwrap_or("(none)").to_string();
+            let k = payload_of(r)
+                .get(field)
+                .and_then(|v| v.as_str())
+                .unwrap_or("(none)")
+                .to_string();
             *out.entry(k).or_default() += a.total;
         };
         for r in &refs {
@@ -839,9 +1080,16 @@ mod tests {
         let (records, expected) = golden();
         let idx = fold_all(&records, None);
         let s = &idx.breakdown.overall;
-        assert_eq!(shape(s.total, s.prompt, s.completion, s.cached), expected["overall"], "overall");
+        assert_eq!(
+            shape(s.total, s.prompt, s.completion, s.cached),
+            expected["overall"],
+            "overall"
+        );
         assert_eq!(s.usage_records, expected["usage_records"].as_u64().unwrap());
-        assert_eq!(s.utility, expected["by_purpose"]["utility"]["total"].as_u64().unwrap());
+        assert_eq!(
+            s.utility,
+            expected["by_purpose"]["utility"]["total"].as_u64().unwrap()
+        );
 
         // The groups, re-summed by purpose, are the golden's by_purpose.
         let (mut work, mut util) = (UsageSplit::default(), UsageSplit::default());
@@ -858,9 +1106,20 @@ mod tests {
         }
         let purpose_shape = |s: &UsageSplit| serde_json::json!({ "total": s.total, "input": s.input, "generated": s.generated });
         assert_eq!(purpose_shape(&work), expected["by_purpose"]["work"], "work");
-        assert_eq!(purpose_shape(&util), expected["by_purpose"]["utility"], "utility");
-        assert_eq!(shape(work.total, work.input, work.generated, work.cached), expected["excluding_utility"]);
-        assert_eq!(work.calls + util.calls, s.usage_records, "every counted record lands in one split");
+        assert_eq!(
+            purpose_shape(&util),
+            expected["by_purpose"]["utility"],
+            "utility"
+        );
+        assert_eq!(
+            shape(work.total, work.input, work.generated, work.cached),
+            expected["excluding_utility"]
+        );
+        assert_eq!(
+            work.calls + util.calls,
+            s.usage_records,
+            "every counted record lands in one split"
+        );
 
         // The groups, re-keyed on one field, are the golden's per-field maps.
         let by = |field: &str| {
@@ -877,9 +1136,15 @@ mod tests {
         };
         assert_eq!(by("endpoint"), expected["by_endpoint"]);
         assert_eq!(by("requested_model"), expected["by_requested_model"]);
-        assert_eq!(breakdown_by(&records, "call_kind"), expected["by_call_kind"]);
+        assert_eq!(
+            breakdown_by(&records, "call_kind"),
+            expected["by_call_kind"]
+        );
         assert_eq!(breakdown_by(&records, "endpoint"), expected["by_endpoint"]);
-        assert_eq!(breakdown_by(&records, "requested_model"), expected["by_requested_model"]);
+        assert_eq!(
+            breakdown_by(&records, "requested_model"),
+            expected["by_requested_model"]
+        );
 
         // `sum_usage` is the same fold.
         assert_eq!(&sum_usage(records.iter()), s);
@@ -891,9 +1156,7 @@ mod tests {
     /// the lower receive key would win instead.
     #[test]
     fn attribute_anchors_on_the_first_record_and_prefers_the_row_whose_span_holds_it() {
-        let rec = |ts: &str| {
-            serde_json::json!({ "ts": ts, "action": "telemetry.tokens", "category": "telemetry", "source": "tokens", "session_id": "s1", "payload": { "total_tokens": 7 } })
-        };
+        let rec = |ts: &str| serde_json::json!({ "ts": ts, "action": "telemetry.tokens", "category": "telemetry", "source": "tokens", "session_id": "s1", "payload": { "total_tokens": 7 } });
         let mut fold = UsageFold::new(None);
         for ts in ["1970-01-01T00:00:20Z", "1970-01-01T00:00:10Z"] {
             fold.add(&rec(ts));
@@ -909,20 +1172,42 @@ mod tests {
         };
         // r1 spans the first record (10) only; r2 spans the last (20) only and ranks lower on key.
         let tokens = idx.attribute(&[row("r1", 5, Some(12), 9), row("r2", 15, None, 1)]);
-        assert_eq!(tokens, vec![Some(14), None], "the entry goes to the row spanning its first record");
+        assert_eq!(
+            tokens,
+            vec![Some(14), None],
+            "the entry goes to the row spanning its first record"
+        );
     }
 
     /// (#3067) Among rows that could read one entry, the row whose span holds
     /// the entry's first record wins, then the lower receive key, then the id.
     #[test]
     fn a_rows_rank_prefers_the_span_that_holds_the_record_then_the_receive_key_then_the_id() {
-        let row = |started: Option<u64>, ended: Option<u64>, key: u64, id: &str| RowClaim { started, ended, receive_key: key, id: id.into(), ..Default::default() };
+        let row = |started: Option<u64>, ended: Option<u64>, key: u64, id: &str| RowClaim {
+            started,
+            ended,
+            receive_key: key,
+            id: id.into(),
+            ..Default::default()
+        };
         let holds = row(Some(10), Some(20), 9, "z");
         let misses = row(Some(30), None, 1, "a");
-        assert!(holds.rank(Some(15)) < misses.rank(Some(15)), "span first, whatever the key");
-        assert!(row(Some(10), None, 1, "z").rank(Some(15)) < row(Some(10), None, 2, "a").rank(Some(15)), "then the key");
-        assert!(row(Some(10), None, 1, "a").rank(Some(15)) < row(Some(10), None, 1, "b").rank(Some(15)), "then the id");
-        assert!(row(None, None, 1, "a").rank(Some(15)) > holds.rank(Some(15)), "a row with no start holds nothing");
+        assert!(
+            holds.rank(Some(15)) < misses.rank(Some(15)),
+            "span first, whatever the key"
+        );
+        assert!(
+            row(Some(10), None, 1, "z").rank(Some(15)) < row(Some(10), None, 2, "a").rank(Some(15)),
+            "then the key"
+        );
+        assert!(
+            row(Some(10), None, 1, "a").rank(Some(15)) < row(Some(10), None, 1, "b").rank(Some(15)),
+            "then the id"
+        );
+        assert!(
+            row(None, None, 1, "a").rank(Some(15)) > holds.rank(Some(15)),
+            "a row with no start holds nothing"
+        );
     }
 
     /// A `dispatch complete` carries no tokens here, whatever its payload
@@ -933,14 +1218,22 @@ mod tests {
     fn a_dispatch_complete_is_never_read_for_tokens() {
         let (records, _) = golden();
         let idx = fold_all(&records, None);
-        assert_eq!(idx.tokens_for_session("crew-dispatch-old-1"), None, "its 1,000 live only on a complete");
+        assert_eq!(
+            idx.tokens_for_session("crew-dispatch-old-1"),
+            None,
+            "its 1,000 live only on a complete"
+        );
         let only_absent = vec![
             serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"s-abs","payload":{"token_source":"absent","call_kind":"turn"}}),
             serde_json::json!({"action":"dispatch.complete","session_id":"s-abs","payload":{"total_tokens":500}}),
         ];
         let idx = fold_all(&only_absent, None);
         assert_eq!(idx.breakdown.overall.total, 0);
-        assert_eq!(idx.tokens_for_session("s-abs"), None, "nothing measured reads as absent, never 0");
+        assert_eq!(
+            idx.tokens_for_session("s-abs"),
+            None,
+            "nothing measured reads as absent, never 0"
+        );
     }
 
     /// Per-run attribution: a mission's tokens are the keys carrying its
@@ -952,14 +1245,26 @@ mod tests {
         // m-golden's keyed records: step-coder (300 = 120+90+180... see
         // golden: coder turns 120+180 + compaction 90 = 390), analyst 500,
         // task-probe 183, step-fixer 80 => 1153.
-        assert_eq!(idx.tokens_for(Some("m-golden"), std::iter::empty()), Some(1153));
+        assert_eq!(
+            idx.tokens_for(Some("m-golden"), std::iter::empty()),
+            Some(1153)
+        );
         // Naming a step session the mission_id already covers adds nothing.
-        assert_eq!(idx.tokens_for(Some("m-golden"), ["step-coder-m-golden"]), Some(1153));
+        assert_eq!(
+            idx.tokens_for(Some("m-golden"), ["step-coder-m-golden"]),
+            Some(1153)
+        );
         // A session alone.
         assert_eq!(idx.tokens_for_session("step-coder-m-golden"), Some(390));
         // The radio session has no mission_id: reachable by session only.
-        assert_eq!(idx.tokens_for_session("crew-dispatch-radio-router-1"), Some(35));
-        assert_eq!(idx.tokens_for(Some("no-such-mission"), std::iter::empty()), None);
+        assert_eq!(
+            idx.tokens_for_session("crew-dispatch-radio-router-1"),
+            Some(35)
+        );
+        assert_eq!(
+            idx.tokens_for(Some("no-such-mission"), std::iter::empty()),
+            None
+        );
         // Whole-window total is the plain sum of every key.
         assert_eq!(idx.breakdown.overall.total, 1228);
     }
@@ -969,14 +1274,32 @@ mod tests {
     #[test]
     fn since_keeps_only_the_windows_share_of_a_run() {
         let usage = |ts: &str, total: u64| serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"S1","ts":ts,"payload":{"call_kind":"turn","purpose":"work","requested_model":"m","endpoint":"http://h/v1","token_source":"provider","total_tokens":total}});
-        let records = vec![usage("2026-09-26T08:01:00Z", 120), usage("2026-09-26T08:02:00Z", 90), usage("2026-09-26T09:30:00Z", 180)];
+        let records = vec![
+            usage("2026-09-26T08:01:00Z", 120),
+            usage("2026-09-26T08:02:00Z", 90),
+            usage("2026-09-26T09:30:00Z", 180),
+        ];
         let whole = fold_all(&records, None);
         assert_eq!(whole.tokens_for_session("S1"), Some(390));
         let bounded = fold_all(&records, Some("2026-09-26T09:00:00Z"));
-        assert_eq!((bounded.breakdown.overall.total, bounded.tokens_for_session("S1")), (180, Some(180)));
+        assert_eq!(
+            (
+                bounded.breakdown.overall.total,
+                bounded.tokens_for_session("S1")
+            ),
+            (180, Some(180))
+        );
         let none = fold_all(&records, Some("2026-09-26T10:00:00Z"));
-        assert_eq!(none.tokens_for_session("S1"), None, "nothing measured in the window");
-        assert!(none.breakdown.groups.is_empty(), "no (none) group: {:?}", none.breakdown.groups);
+        assert_eq!(
+            none.tokens_for_session("S1"),
+            None,
+            "nothing measured in the window"
+        );
+        assert!(
+            none.breakdown.groups.is_empty(),
+            "no (none) group: {:?}",
+            none.breakdown.groups
+        );
     }
 
     /// (review CONSIDER 2) Two missions whose steps share a session id (the
@@ -1011,10 +1334,20 @@ mod tests {
             }
             serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"s","payload":p})
         };
-        let idx = fold_all(&[rec(None, 10), rec(Some("qwen"), 20), rec(Some("qwen-served"), 40)], None);
+        let idx = fold_all(
+            &[
+                rec(None, 10),
+                rec(Some("qwen"), 20),
+                rec(Some("qwen-served"), 40),
+            ],
+            None,
+        );
         let g = &idx.breakdown.groups;
         assert_eq!(g.len(), 2, "{g:#?}");
-        assert_eq!((g[0].reported_model.as_deref(), g[0].total()), (Some("qwen-served"), 40));
+        assert_eq!(
+            (g[0].reported_model.as_deref(), g[0].total()),
+            (Some("qwen-served"), 40)
+        );
         assert_eq!((g[1].reported_model.as_deref(), g[1].total()), (None, 30));
     }
 
@@ -1033,9 +1366,20 @@ mod tests {
             .expect("util-4b group");
         // 90 (compaction, purpose utility) + 35 (radio, purpose utility) +
         // 20 (compaction with NO purpose: read as utility) = 145; no work.
-        assert_eq!((lm.utility.total, lm.utility.calls, lm.work.total), (145, 3, 0));
-        let qa = idx.breakdown.groups.iter().find(|g| g.requested_model.as_deref() == Some("qwen-a")).unwrap();
-        assert_eq!((qa.work.total, qa.work.cached, qa.utility.total), (360, Some(40), 0));
+        assert_eq!(
+            (lm.utility.total, lm.utility.calls, lm.work.total),
+            (145, 3, 0)
+        );
+        let qa = idx
+            .breakdown
+            .groups
+            .iter()
+            .find(|g| g.requested_model.as_deref() == Some("qwen-a"))
+            .unwrap();
+        assert_eq!(
+            (qa.work.total, qa.work.cached, qa.utility.total),
+            (360, Some(40), 0)
+        );
     }
 
     /// `cached` is absent, never 0, until a record reports it.
@@ -1043,12 +1387,23 @@ mod tests {
     fn cached_is_absent_until_reported() {
         let (records, _) = golden();
         let idx = fold_all(&records, None);
-        let qb = idx.breakdown.groups.iter().find(|g| g.requested_model.as_deref() == Some("qwen-b")).unwrap();
+        let qb = idx
+            .breakdown
+            .groups
+            .iter()
+            .find(|g| g.requested_model.as_deref() == Some("qwen-b"))
+            .unwrap();
         assert_eq!(qb.work.cached, None);
         assert_eq!(idx.breakdown.overall.cached, Some(140));
         let none = fold_all(&records[..2], None);
         assert_eq!(none.breakdown.overall.cached, None);
-        assert_eq!(serde_json::to_value(&none.breakdown.overall).unwrap().get("cached"), None, "absent on the wire");
+        assert_eq!(
+            serde_json::to_value(&none.breakdown.overall)
+                .unwrap()
+                .get("cached"),
+            None,
+            "absent on the wire"
+        );
     }
 
     /// `since` drops records stamped before the bound, inclusive at it.
@@ -1066,10 +1421,16 @@ mod tests {
         // A bound after the old-2 turn: only the fixer's 80 remain.
         let idx = fold_all(&records, Some("2026-09-26T10:16:00Z"));
         assert_eq!(idx.breakdown.overall.total, 80);
-        assert_eq!(idx.tokens_for_session("crew-dispatch-old-2"), None, "nothing of it is in the window");
+        assert_eq!(
+            idx.tokens_for_session("crew-dispatch-old-2"),
+            None,
+            "nothing of it is in the window"
+        );
         // A record with no ts is kept.
         let idx = fold_all(
-            &[serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"s","payload":{"total_tokens":7}})],
+            &[
+                serde_json::json!({"action":"telemetry.tokens","category":"telemetry","source":"tokens","session_id":"s","payload":{"total_tokens":7}}),
+            ],
             Some("2030-01-01T00:00:00Z"),
         );
         assert_eq!(idx.breakdown.overall.total, 7);
@@ -1086,7 +1447,11 @@ mod tests {
         assert_eq!(parse_since("24h", NOW), Ok(NOW - 86_400));
         assert_eq!(parse_since("7d", NOW), Ok(NOW - 7 * 86_400));
         assert_eq!(parse_since("2w", NOW), Ok(NOW - 14 * 86_400));
-        assert_eq!(parse_since(" 1d ", NOW), Ok(NOW - 86_400), "whitespace tolerated");
+        assert_eq!(
+            parse_since(" 1d ", NOW),
+            Ok(NOW - 86_400),
+            "whitespace tolerated"
+        );
     }
 
     #[test]
@@ -1099,9 +1464,22 @@ mod tests {
 
     #[test]
     fn parse_since_rejects_what_it_cannot_read_by_naming_both_forms() {
-        for bad in ["", "abc", "7", "7x", "0d", "-1d", "2026-13-01", "2026/09/20", "1.5h"] {
+        for bad in [
+            "",
+            "abc",
+            "7",
+            "7x",
+            "0d",
+            "-1d",
+            "2026-13-01",
+            "2026/09/20",
+            "1.5h",
+        ] {
             let err = parse_since(bad, NOW).unwrap_err();
-            assert!(err.contains("24h") && err.contains("YYYY-MM-DD"), "{bad:?}: {err}");
+            assert!(
+                err.contains("24h") && err.contains("YYYY-MM-DD"),
+                "{bad:?}: {err}"
+            );
         }
     }
 }

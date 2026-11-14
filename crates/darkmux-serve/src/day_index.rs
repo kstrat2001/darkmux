@@ -60,7 +60,8 @@ impl DaySummary {
             }
         }
         if darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::DispatchStart) {
-            self.dispatches.extend(darkmux_flow::reader::execution_id_of(v).map(|id| id.to_string()));
+            self.dispatches
+                .extend(darkmux_flow::reader::execution_id_of(v).map(|id| id.to_string()));
         }
         if let (Some(id), Some(uid)) = (field("machine_id"), field("machine_uid")) {
             if !self.uids.contains_key(id) {
@@ -130,7 +131,9 @@ struct DayFile {
 
 impl DayIndex {
     pub(crate) const fn new() -> Self {
-        Self { slot: Mutex::new(None) }
+        Self {
+            slot: Mutex::new(None),
+        }
     }
 
     /// Every `YYYY-MM-DD.jsonl` day file in `flows_dir`, oldest first, each
@@ -151,7 +154,11 @@ impl DayIndex {
     /// Lines parsed off disk so far for the directory last read.
     #[cfg(test)]
     pub(crate) fn lines_parsed(&self) -> u64 {
-        self.slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map_or(0, |s| s.lines_parsed)
+        self.slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map_or(0, |s| s.lines_parsed)
     }
 }
 
@@ -168,7 +175,11 @@ impl DirIndex {
             #[cfg(not(test))]
             let parsed = &mut 0u64;
             if file.refresh(&path, parsed) {
-                out.push(IndexedDay { date, path, summary: file.current.clone() });
+                out.push(IndexedDay {
+                    date,
+                    path,
+                    summary: file.current.clone(),
+                });
             } else {
                 self.days.remove(&date);
             }
@@ -181,12 +192,20 @@ impl DayFile {
     /// Bring this file's summary up to date with the bytes on disk. `false`
     /// when the file cannot be read (a walk skips it).
     fn refresh(&mut self, path: &Path, parsed: &mut u64) -> bool {
-        let Ok(meta) = std::fs::metadata(path) else { return false };
-        let stamp = Stamp { id: crate::flow_window::file_id(&meta), len: meta.len(), modified: meta.modified().ok() };
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        let stamp = Stamp {
+            id: crate::flow_window::file_id(&meta),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        };
         if self.stamp == Some(stamp) {
             return true;
         }
-        let Ok(mut file) = std::fs::File::open(path) else { return false };
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return false;
+        };
         self.restart_unless_appended(&mut file, stamp);
         self.stamp = Some(stamp);
         if self.stopped || stamp.len == self.committed {
@@ -195,7 +214,12 @@ impl DayFile {
         }
         let start = self.committed;
         let mut buf = Vec::with_capacity((stamp.len - start) as usize);
-        if file.seek(SeekFrom::Start(start)).is_err() || (&mut file).take(stamp.len - start).read_to_end(&mut buf).is_err() {
+        if file.seek(SeekFrom::Start(start)).is_err()
+            || (&mut file)
+                .take(stamp.len - start)
+                .read_to_end(&mut buf)
+                .is_err()
+        {
             self.stamp = None;
             return false;
         }
@@ -213,7 +237,10 @@ impl DayFile {
     /// truncation), or different last bytes (a rewrite in place).
     fn restart_unless_appended(&mut self, file: &mut std::fs::File, stamp: Stamp) {
         let same_file = self.stamp.is_some_and(|s| s.id == stamp.id);
-        if !same_file || stamp.len < self.committed || crate::flow_window::last_bytes(file, self.committed) != self.last {
+        if !same_file
+            || stamp.len < self.committed
+            || crate::flow_window::last_bytes(file, self.committed) != self.last
+        {
             *self = DayFile::default();
         }
     }
@@ -221,7 +248,9 @@ impl DayFile {
     /// Summarize `whole` (newline-terminated lines), stopping the file at a
     /// non-UTF-8 one.
     fn keep_lines(&mut self, whole: &[u8], parsed: &mut u64) {
-        let Some((_, lines)) = whole.split_last() else { return };
+        let Some((_, lines)) = whole.split_last() else {
+            return;
+        };
         let kept = Arc::make_mut(&mut self.kept);
         for raw in lines.split(|b| *b == b'\n') {
             match parse_line(raw, parsed) {
@@ -287,11 +316,22 @@ mod tests {
     }
 
     fn append(path: &Path, text: &str) {
-        std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap().write_all(text.as_bytes()).unwrap();
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
     }
 
     fn summary_of(index: &DayIndex, dir: &Path, date: &str) -> DaySummary {
-        index.days(dir).into_iter().find(|d| d.date == date).map(|d| (*d.summary).clone()).unwrap()
+        index
+            .days(dir)
+            .into_iter()
+            .find(|d| d.date == date)
+            .map(|d| (*d.summary).clone())
+            .unwrap()
     }
 
     const START: &str = r#"{"action":"dispatch.start","session_id":"s1","mission_id":"m1","execution_id":"e1","machine_id":"laptop","machine_uid":"U1"}"#;
@@ -302,19 +342,34 @@ mod tests {
     fn an_appended_file_is_read_only_past_what_was_read_and_equals_a_walk() {
         let dir = tempfile::tempdir().unwrap();
         let day = dir.path().join("2026-11-10.jsonl");
-        append(&day, &format!("{{\"_type\":\"schema\"}}\n{START}\n\n{STEP}\n"));
+        append(
+            &day,
+            &format!("{{\"_type\":\"schema\"}}\n{START}\n\n{STEP}\n"),
+        );
         let index = DayIndex::new();
         assert_eq!(summary_of(&index, dir.path(), "2026-11-10"), walked(&day));
         let first = index.lines_parsed();
         assert_eq!(summary_of(&index, dir.path(), "2026-11-10"), walked(&day));
-        assert_eq!(index.lines_parsed(), first, "an unchanged file is not read again");
+        assert_eq!(
+            index.lines_parsed(),
+            first,
+            "an unchanged file is not read again"
+        );
         append(&day, &format!("{OTHER}\n"));
         let s = summary_of(&index, dir.path(), "2026-11-10");
         assert_eq!(s, walked(&day));
-        assert_eq!(index.lines_parsed(), first + 1, "only the appended line is parsed");
+        assert_eq!(
+            index.lines_parsed(),
+            first + 1,
+            "only the appended line is parsed"
+        );
         assert_eq!(s.records, 3);
         assert_eq!(s.dispatches.iter().collect::<Vec<_>>(), ["e1", "e2"]);
-        assert_eq!(s.uids.get("laptop").map(String::as_str), Some("U1"), "the first uid a name carried wins");
+        assert_eq!(
+            s.uids.get("laptop").map(String::as_str),
+            Some("U1"),
+            "the first uid a name carried wins"
+        );
     }
 
     #[test]
@@ -327,7 +382,11 @@ mod tests {
         assert_eq!(s, walked(&day));
         assert!(s.sessions.contains("s2"));
         append(&day, &format!("\n{STEP}\n"));
-        assert_eq!(summary_of(&index, dir.path(), "2026-11-10"), walked(&day), "the tail is read whole once ended");
+        assert_eq!(
+            summary_of(&index, dir.path(), "2026-11-10"),
+            walked(&day),
+            "the tail is read whole once ended"
+        );
     }
 
     #[test]
@@ -371,10 +430,20 @@ mod tests {
     #[test]
     fn only_dated_day_files_are_indexed_oldest_first() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["2026-11-10.jsonl", "2026-11-09.jsonl", "notes.jsonl", "2026-11.jsonl", "2026-11-08.json"] {
+        for name in [
+            "2026-11-10.jsonl",
+            "2026-11-09.jsonl",
+            "notes.jsonl",
+            "2026-11.jsonl",
+            "2026-11-08.json",
+        ] {
             append(&dir.path().join(name), &format!("{START}\n"));
         }
-        let dates: Vec<String> = DayIndex::new().days(dir.path()).into_iter().map(|d| d.date).collect();
+        let dates: Vec<String> = DayIndex::new()
+            .days(dir.path())
+            .into_iter()
+            .map(|d| d.date)
+            .collect();
         assert_eq!(dates, ["2026-11-09", "2026-11-10"]);
     }
 }

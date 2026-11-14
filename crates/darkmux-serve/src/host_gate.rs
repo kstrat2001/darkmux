@@ -61,12 +61,17 @@ impl HostNames {
     /// roster's hosts.
     pub(crate) fn production() -> Self {
         Self::from_source(Box::new(|| {
-            let node = darkmux_fleet::configured_provider_or_unavailable().local_node().ok();
+            let node = darkmux_fleet::configured_provider_or_unavailable()
+                .local_node()
+                .ok();
             let roster: Vec<String> = darkmux_fleet::load_roster()
                 .map(|r| r.machines.into_values().map(|m| m.address).collect())
                 .unwrap_or_default();
             let complete = node.is_some();
-            (names_of(os_hostname().as_deref(), node.as_ref(), &roster), complete)
+            (
+                names_of(os_hostname().as_deref(), node.as_ref(), &roster),
+                complete,
+            )
         }))
     }
 
@@ -78,7 +83,11 @@ impl HostNames {
     }
 
     fn from_source(source: Box<NameSource>) -> Self {
-        Self { source, known: Mutex::new(None), reading: tokio::sync::Mutex::new(()) }
+        Self {
+            source,
+            known: Mutex::new(None),
+            reading: tokio::sync::Mutex::new(()),
+        }
     }
 
     /// The kept names; with `current`, only while they are too young to
@@ -86,7 +95,11 @@ impl HostNames {
     fn kept(&self, current: bool) -> Option<Arc<HashSet<String>>> {
         let guard = self.known.lock().unwrap_or_else(|p| p.into_inner());
         let kept = guard.as_ref()?;
-        let interval = if kept.complete { REFRESH_AFTER } else { RETRY_INCOMPLETE_AFTER };
+        let interval = if kept.complete {
+            REFRESH_AFTER
+        } else {
+            RETRY_INCOMPLETE_AFTER
+        };
         (!current || kept.at.elapsed() < interval).then(|| kept.names.clone())
     }
 
@@ -105,7 +118,11 @@ impl HostNames {
             return false;
         };
         let names = Arc::new(names);
-        *self.known.lock().unwrap_or_else(|p| p.into_inner()) = Some(Kept { at: Instant::now(), names: names.clone(), complete });
+        *self.known.lock().unwrap_or_else(|p| p.into_inner()) = Some(Kept {
+            at: Instant::now(),
+            names: names.clone(),
+            complete,
+        });
         names.contains(name)
     }
 }
@@ -144,7 +161,12 @@ pub(crate) fn names_of(
         out.insert(normalize(&node.name));
         out.extend(node.dns_name.as_deref().map(normalize));
     }
-    out.extend(addresses.iter().filter_map(|a| darkmux_fleet::address_host(a)).map(|h| normalize(&h)));
+    out.extend(
+        addresses
+            .iter()
+            .filter_map(|a| darkmux_fleet::address_host(a))
+            .map(|h| normalize(&h)),
+    );
     out.retain(|n| !n.is_empty() && n.parse::<std::net::IpAddr>().is_err());
     out
 }
@@ -160,7 +182,10 @@ fn os_hostname() -> Option<String> {
         return None;
     }
     let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-    std::str::from_utf8(&buf[..end]).ok().map(str::to_string).filter(|s| !s.is_empty())
+    std::str::from_utf8(&buf[..end])
+        .ok()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(not(unix))]
@@ -189,13 +214,19 @@ fn claim_of(headers: &axum::http::HeaderMap) -> HostClaim {
     if values.next().is_some() {
         return HostClaim::Malformed;
     }
-    value.to_str().map_or(HostClaim::Malformed, |raw| claim_of_value(raw.trim()))
+    value
+        .to_str()
+        .map_or(HostClaim::Malformed, |raw| claim_of_value(raw.trim()))
 }
 
 /// One `Host` value read: `[v6]` or `[v6]:port`, else `name` or `name:port`.
 fn claim_of_value(raw: &str) -> HostClaim {
     if let Some(rest) = raw.strip_prefix('[') {
-        return if bracketed_v6(rest) { HostClaim::Address } else { HostClaim::Malformed };
+        return if bracketed_v6(rest) {
+            HostClaim::Address
+        } else {
+            HostClaim::Malformed
+        };
     }
     let (name, port) = match raw.rsplit_once(':') {
         Some((n, p)) => (n, Some(p)),
@@ -215,13 +246,20 @@ fn claim_of_value(raw: &str) -> HostClaim {
 fn bracketed_v6(rest: &str) -> bool {
     rest.split_once(']').is_some_and(|(ip, port)| {
         ip.parse::<std::net::Ipv6Addr>().is_ok()
-            && (port.is_empty() || port.strip_prefix(':').is_some_and(|p| p.parse::<u16>().is_ok()))
+            && (port.is_empty()
+                || port
+                    .strip_prefix(':')
+                    .is_some_and(|p| p.parse::<u16>().is_ok()))
     })
 }
 
 /// The gate itself: every request but one whose `Host` names this machine
 /// is refused.
-pub(crate) async fn host_gate_mw(State(names): State<Arc<HostNames>>, req: Request, next: Next) -> Response {
+pub(crate) async fn host_gate_mw(
+    State(names): State<Arc<HostNames>>,
+    req: Request,
+    next: Next,
+) -> Response {
     let allowed = match claim_of(req.headers()) {
         HostClaim::Absent | HostClaim::Address => true,
         HostClaim::Name(name) => names.answers_to(&name).await,
@@ -257,23 +295,49 @@ mod tests {
 
     #[test]
     fn a_host_is_read_as_an_address_a_name_or_malformed() {
-        for addr in ["localhost", "LOCALHOST:8765", "127.0.0.1", "127.0.0.1:8765", "[::1]", "[::1]:8765", "100.64.0.7:8090", "192.168.1.20"] {
+        for addr in [
+            "localhost",
+            "LOCALHOST:8765",
+            "127.0.0.1",
+            "127.0.0.1:8765",
+            "[::1]",
+            "[::1]:8765",
+            "100.64.0.7:8090",
+            "192.168.1.20",
+        ] {
             assert_eq!(claim_of(&headers(&[addr])), HostClaim::Address, "{addr}");
         }
-        assert_eq!(claim_of(&headers(&["Studio.Tailnet.ts.net.:8090"])), HostClaim::Name("studio.tailnet.ts.net".into()));
-        assert_eq!(claim_of(&headers(&["evil.example"])), HostClaim::Name("evil.example".into()));
+        assert_eq!(
+            claim_of(&headers(&["Studio.Tailnet.ts.net.:8090"])),
+            HostClaim::Name("studio.tailnet.ts.net".into())
+        );
+        assert_eq!(
+            claim_of(&headers(&["evil.example"])),
+            HostClaim::Name("evil.example".into())
+        );
         assert_eq!(claim_of(&headers(&[])), HostClaim::Absent);
         for bad in ["evil.example:http", ":8765", "[::1", "[nope]:1"] {
             assert_eq!(claim_of(&headers(&[bad])), HostClaim::Malformed, "{bad}");
         }
-        assert_eq!(claim_of(&headers(&["localhost", "evil.example"])), HostClaim::Malformed, "two Hosts");
+        assert_eq!(
+            claim_of(&headers(&["localhost", "evil.example"])),
+            HostClaim::Malformed,
+            "two Hosts"
+        );
     }
 
     #[test]
     fn this_machines_names_come_from_its_host_name_its_node_and_the_roster() {
         let node = darkmux_fleet::test_node("nLAPTOP", "laptop", "100.64.0.1");
-        let node = darkmux_fleet::NodeIdentity { dns_name: Some("laptop.tailnet-example.ts.net".into()), ..node };
-        let roster = vec!["studio.tailnet-example.ts.net:8765".to_string(), "http://Mini:9000/".to_string(), "100.64.0.9:8765".to_string()];
+        let node = darkmux_fleet::NodeIdentity {
+            dns_name: Some("laptop.tailnet-example.ts.net".into()),
+            ..node
+        };
+        let roster = vec![
+            "studio.tailnet-example.ts.net:8765".to_string(),
+            "http://Mini:9000/".to_string(),
+            "100.64.0.9:8765".to_string(),
+        ];
         let names = names_of(Some("Kains-MacBook-Pro.local"), Some(&node), &roster);
         for want in [
             "kains-macbook-pro.local",
@@ -285,7 +349,10 @@ mod tests {
         ] {
             assert!(names.contains(want), "{want} in {names:?}");
         }
-        assert!(!names.iter().any(|n| n.parse::<std::net::IpAddr>().is_ok()), "no IP literal is kept: {names:?}");
+        assert!(
+            !names.iter().any(|n| n.parse::<std::net::IpAddr>().is_ok()),
+            "no IP literal is kept: {names:?}"
+        );
         assert!(names_of(None, None, &[]).is_empty());
     }
 
@@ -301,7 +368,11 @@ mod tests {
         assert!(!names.answers_to("evil.example").await);
         assert!(!names.answers_to("evil2.example").await);
         assert!(names.answers_to("laptop").await);
-        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1, "foreign names inside the interval read nothing");
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "foreign names inside the interval read nothing"
+        );
     }
 
     /// After a boot the overlay network may not answer the first read, and a
@@ -326,11 +397,17 @@ mod tests {
             let kept = g.as_mut().unwrap();
             kept.at = Instant::now().checked_sub(by).unwrap();
         };
-        assert!(!names.answers_to("laptop").await, "the overlay did not answer the first read");
+        assert!(
+            !names.answers_to("laptop").await,
+            "the overlay did not answer the first read"
+        );
         assert!(!names.answers_to("laptop").await);
         assert_eq!(count(), 1, "the retry is bounded");
         age(RETRY_INCOMPLETE_AFTER + Duration::from_millis(100));
-        assert!(names.answers_to("laptop").await, "a short wait later the miss re-reads");
+        assert!(
+            names.answers_to("laptop").await,
+            "a short wait later the miss re-reads"
+        );
         assert_eq!(count(), 2);
         age(RETRY_INCOMPLETE_AFTER + Duration::from_millis(100));
         assert!(!names.answers_to("evil.example").await);

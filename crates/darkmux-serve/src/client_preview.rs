@@ -235,15 +235,18 @@ use crate::client_wire::{PreviewStage, PreviewState};
 #[cfg(unix)]
 #[path = "client_preview_at.rs"]
 pub(crate) mod at;
-use darkmux_sandbox::{Access, BackendKind, DockerBackend, Limits, Mount, Network, SandboxBackend, SandboxHandle, SandboxPolicy};
+use darkmux_sandbox::{
+    Access, BackendKind, DockerBackend, Limits, Mount, Network, SandboxBackend, SandboxHandle,
+    SandboxPolicy,
+};
 
 /// (#3112) Previews in a sandbox on the host: the toolchain grant and the
 /// listener watch.
 #[path = "client_preview_on_host.rs"]
 mod on_host;
 pub use darkmux_sandbox::toolchain::Toolchain;
-pub use on_host::OnHost;
 use darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
+pub use on_host::OnHost;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -481,7 +484,11 @@ pub enum RecipeSource {
     /// darkmux cloned (read like a template's), else `approved`, the recipe
     /// the user approved for it, kept beside the workspace. A run's commit or
     /// work-tree edit changes neither.
-    ClonedCommit { git_dir: PathBuf, commit: String, approved: Option<String> },
+    ClonedCommit {
+        git_dir: PathBuf,
+        commit: String,
+        approved: Option<String>,
+    },
 }
 
 impl RecipeSource {
@@ -491,10 +498,16 @@ impl RecipeSource {
     pub fn load(&self) -> Result<Recipe, RecipeRefusal> {
         match self {
             RecipeSource::Checkout(checkout) => load_recipe(checkout),
-            RecipeSource::TemplateCommit { git_dir, commit } => {
-                without_checkout_files(parse_recipe(&read_recipe_at_commit(git_dir, commit)?)?, "a project made from a template", "the template's recipe")
-            }
-            RecipeSource::ClonedCommit { git_dir, commit, approved } => {
+            RecipeSource::TemplateCommit { git_dir, commit } => without_checkout_files(
+                parse_recipe(&read_recipe_at_commit(git_dir, commit)?)?,
+                "a project made from a template",
+                "the template's recipe",
+            ),
+            RecipeSource::ClonedCommit {
+                git_dir,
+                commit,
+                approved,
+            } => {
                 let text = match (read_recipe_at_commit(git_dir, commit), approved) {
                     (Err(RecipeRefusal::NotFound(_)), Some(approved)) => approved.clone(),
                     (read, _) => read?,
@@ -515,7 +528,11 @@ impl RecipeSource {
 
 /// A recipe from a source with no checkout of the user's (`what`) to copy
 /// `env_from_source` files from: refused naming the key when it lists any.
-fn without_checkout_files(recipe: Recipe, what: &str, whose: &str) -> Result<Recipe, RecipeRefusal> {
+fn without_checkout_files(
+    recipe: Recipe,
+    what: &str,
+    whose: &str,
+) -> Result<Recipe, RecipeRefusal> {
     if recipe.env_from_source.is_empty() {
         return Ok(recipe);
     }
@@ -754,7 +771,8 @@ pub struct Previews {
 pub fn plain_relative(p: &str) -> bool {
     !p.is_empty()
         && !Path::new(p).is_absolute()
-        && p.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+        && p.split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 /// A free TCP port on 127.0.0.1, by asking the OS.
@@ -956,8 +974,14 @@ pub fn preview_policy(spec: &ContainerSpec) -> SandboxPolicy {
     };
     let workspace = mount(&spec.workspace, WORKSPACE_AT, Access::ReadWrite);
     let workdir = darkmux_sandbox::backend_of(spec.backend).place(&workspace);
-    let read_only = spec.read_only.iter().map(|p| mount(p, &p.display().to_string(), Access::ReadOnly));
-    let home = spec.user.iter().map(|_| ("HOME".to_string(), "/tmp".to_string()));
+    let read_only = spec
+        .read_only
+        .iter()
+        .map(|p| mount(p, &p.display().to_string(), Access::ReadOnly));
+    let home = spec
+        .user
+        .iter()
+        .map(|_| ("HOME".to_string(), "/tmp".to_string()));
     SandboxPolicy {
         name: spec.name.clone(),
         image: spec.image.clone(),
@@ -974,7 +998,13 @@ pub fn preview_policy(spec: &ContainerSpec) -> SandboxPolicy {
                 (k.to_string(), v.to_string())
             })
             .collect(),
-        mounts: [workspace, mount(&spec.heartbeat, HEARTBEAT_AT, Access::ReadOnly)].into_iter().chain(read_only).collect(),
+        mounts: [
+            workspace,
+            mount(&spec.heartbeat, HEARTBEAT_AT, Access::ReadOnly),
+        ]
+        .into_iter()
+        .chain(read_only)
+        .collect(),
         ports: spec.ports.to_vec(),
         stdin: false,
         host_alias: None,
@@ -983,7 +1013,14 @@ pub fn preview_policy(spec: &ContainerSpec) -> SandboxPolicy {
         workdir: Some(workdir),
         // The runtime image's own entrypoint never wraps the script; a
         // sandbox on the host has no image, and runs the host's shell.
-        entrypoint: Some(if spec.backend.on_host() { "/bin/sh" } else { "sh" }.to_string()),
+        entrypoint: Some(
+            if spec.backend.on_host() {
+                "/bin/sh"
+            } else {
+                "sh"
+            }
+            .to_string(),
+        ),
         command: vec!["-c".to_string(), spec.script.clone()],
     }
 }
@@ -994,7 +1031,9 @@ pub fn preview_policy(spec: &ContainerSpec) -> SandboxPolicy {
 /// container by name.
 pub fn docker_create_args(spec: &ContainerSpec) -> Vec<String> {
     let (cmd, _) = DockerBackend.create(&preview_policy(spec));
-    cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    cmd.get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// A Docker preview container's handle, by its name. (#3112) A preview's
@@ -1089,7 +1128,13 @@ fn env_value(value: &str, port: u16, hmr_port: u16, kind: BackendKind, has_host:
 
 /// [`container_env`] under `kind`, after `path` (the toolchain's `PATH` on
 /// the host, which the recipe may override).
-fn container_env_for(recipe: &Recipe, port: u16, hmr_port: u16, kind: BackendKind, path: Option<&str>) -> Vec<(String, String)> {
+fn container_env_for(
+    recipe: &Recipe,
+    port: u16,
+    hmr_port: u16,
+    kind: BackendKind,
+    path: Option<&str>,
+) -> Vec<(String, String)> {
     let mut recipe_env: Vec<(&String, &String)> = recipe.env.iter().collect();
     recipe_env.sort();
     // (#3112) `{host}` means the dev server's address from recipe 1.1 on; a
@@ -1097,7 +1142,11 @@ fn container_env_for(recipe: &Recipe, port: u16, hmr_port: u16, kind: BackendKin
     let has_host = recipe.schema_version != "1.0";
     path.map(|p| ("PATH".to_string(), p.to_string()))
         .into_iter()
-        .chain(POLLING_ENV.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+        .chain(
+            POLLING_ENV
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        )
         .chain(
             recipe_env
                 .into_iter()
@@ -1123,7 +1172,12 @@ pub trait PreviewContainers: Send + Sync {
     /// container's is its image's ([`Toolchain::default`]). (#3561) A step
     /// an app may show while it is resolved (a first use's Node fetch) goes
     /// to `stage`, then `None` once it is done.
-    fn toolchain(&self, recipe: &Recipe, workdir: &Path, stage: &dyn Fn(Option<PreviewStage>)) -> Result<Toolchain, String> {
+    fn toolchain(
+        &self,
+        recipe: &Recipe,
+        workdir: &Path,
+        stage: &dyn Fn(Option<PreviewStage>),
+    ) -> Result<Toolchain, String> {
         let _ = (recipe, workdir, stage);
         Ok(Toolchain::default())
     }
@@ -1150,7 +1204,10 @@ pub trait PreviewContainers: Send + Sync {
     /// loopback, which stop a preview on the host (its sandbox holds it to
     /// those ports but not to the loopback, #3559); `Err` when they cannot be
     /// read. A container publishes only its loopback ports: nothing to watch.
-    fn exposed(&self, ports: [u16; 2]) -> Result<Vec<(u16, darkmux_platform::PortListener)>, String> {
+    fn exposed(
+        &self,
+        ports: [u16; 2],
+    ) -> Result<Vec<(u16, darkmux_platform::PortListener)>, String> {
         let _ = ports;
         Ok(Vec::new())
     }
@@ -1249,7 +1306,10 @@ impl PreviewContainers for Docker {
         };
         let handle = handle(name);
         let backend = darkmux_sandbox::for_handle(&handle);
-        let _ = run_bounded(quiet(backend.stop(&handle, Duration::from_secs(5))), DOCKER_CALL_BOUND);
+        let _ = run_bounded(
+            quiet(backend.stop(&handle, Duration::from_secs(5))),
+            DOCKER_CALL_BOUND,
+        );
         let _ = run_bounded(quiet(backend.remove(&handle)), DOCKER_CALL_BOUND);
     }
 
@@ -1265,7 +1325,11 @@ impl PreviewContainers for Docker {
 /// ps` here, at `client serve`'s start.
 fn reap_preview_orphans() -> Vec<String> {
     use darkmux_crew::orphan_reaper::{host_liveness, reap_tick_named, LocalHost, ReapTick};
-    match reap_tick_named(PREVIEW_CONTAINER_PREFIX, LocalHost::this_host().as_ref(), host_liveness) {
+    match reap_tick_named(
+        PREVIEW_CONTAINER_PREFIX,
+        LocalHost::this_host().as_ref(),
+        host_liveness,
+    ) {
         ReapTick::Listed { reaped } => reaped.into_iter().map(|(o, _)| o.name).collect(),
         ReapTick::ListingUnavailable => Vec::new(),
     }
@@ -1292,7 +1356,8 @@ impl Previews {
         // Under the entries lock, so a start holding it either finished
         // registering its entry (which `stop_all` then finds) or sees this.
         let _entries = self.entries.lock().unwrap();
-        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Whether [`Previews::begin_shutdown`] ran.
@@ -1319,7 +1384,11 @@ impl Previews {
 
     /// (#3112) The same previews running sandboxes of `kind` with
     /// `containers`.
-    pub fn with_backend(mut self, kind: BackendKind, containers: Arc<dyn PreviewContainers>) -> Self {
+    pub fn with_backend(
+        mut self,
+        kind: BackendKind,
+        containers: Arc<dyn PreviewContainers>,
+    ) -> Self {
         self.backends.retain(|(k, _)| *k != kind);
         self.backends.push((kind, containers));
         self
@@ -1328,8 +1397,15 @@ impl Previews {
     /// What runs a preview's sandbox in `kind`, or why nothing here does:
     /// a backend previews have no runner for yet is refused, never run in
     /// another.
-    fn containers_for(&self, kind: BackendKind) -> Result<Arc<dyn PreviewContainers>, RecipeRefusal> {
-        let found = self.backends.iter().find(|(k, _)| *k == kind).map(|(_, c)| c.clone());
+    fn containers_for(
+        &self,
+        kind: BackendKind,
+    ) -> Result<Arc<dyn PreviewContainers>, RecipeRefusal> {
+        let found = self
+            .backends
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, c)| c.clone());
         found.or_else(|| (self.containers.kind() == kind).then(|| self.containers.clone())).ok_or_else(|| {
             RecipeRefusal::Unreadable(format!(
                 "previews cannot run in {} yet; to run them in a container, `darkmux config set {} {}`",
@@ -1358,8 +1434,10 @@ impl Previews {
             .parent()
             .map(|p| p.join("previews"))
             .unwrap_or_else(|| PathBuf::from("previews"));
-        Self::new(dir, Arc::new(Docker { image: None }))
-            .with_backend(BackendKind::Seatbelt, Arc::new(OnHost::new(BackendKind::Seatbelt)))
+        Self::new(dir, Arc::new(Docker { image: None })).with_backend(
+            BackendKind::Seatbelt,
+            Arc::new(OnHost::new(BackendKind::Seatbelt)),
+        )
     }
 
     fn snapshot(name: &str, e: &Entry) -> PreviewState {
@@ -1420,7 +1498,8 @@ impl Previews {
         let mut entries = self.entries.lock().unwrap();
         if self.stopping() {
             return Err(RecipeRefusal::Unreadable(
-                "darkmux client serve is stopping; start the preview again once it is back".to_string(),
+                "darkmux client serve is stopping; start the preview again once it is back"
+                    .to_string(),
             ));
         }
         if let Some(e) = entries.get(name) {
@@ -1822,18 +1901,37 @@ struct InstallPlan {
 /// the bare hash it always was, so a record says which backend installed.
 fn install_plan_in(kind: BackendKind, recipe: &Recipe, at: &RunIn, image: &str) -> InstallPlan {
     let Some(install) = &recipe.install else {
-        return InstallPlan { due: false, fingerprint: None, switched_from: None };
+        return InstallPlan {
+            due: false,
+            fingerprint: None,
+            switched_from: None,
+        };
     };
     let hash = install_fingerprint(&at.workdir, &install.command, image);
-    let fingerprint = if kind.on_host() { format!("{}:{hash}", darkmux_sandbox::setting_value(kind)) } else { hash };
+    let fingerprint = if kind.on_host() {
+        format!("{}:{hash}", darkmux_sandbox::setting_value(kind))
+    } else {
+        hash
+    };
     let recorded = recorded_install(at);
     let Some(p) = &install.unless_exists else {
-        return InstallPlan { due: true, fingerprint: Some(fingerprint), switched_from: None };
+        return InstallPlan {
+            due: true,
+            fingerprint: Some(fingerprint),
+            switched_from: None,
+        };
     };
     let present = std::fs::symlink_metadata(at.workdir.join(p)).is_ok();
-    let switched_from = recorded.as_deref().map(recorded_backend).filter(|made| present && *made != kind);
+    let switched_from = recorded
+        .as_deref()
+        .map(recorded_backend)
+        .filter(|made| present && *made != kind);
     let due = !present || recorded.as_deref() != Some(fingerprint.as_str());
-    InstallPlan { due, fingerprint: Some(fingerprint), switched_from }
+    InstallPlan {
+        due,
+        fingerprint: Some(fingerprint),
+        switched_from,
+    }
 }
 
 /// The backend that made an install record: the one its tag names, else
@@ -1882,7 +1980,8 @@ fn remove_inside(workdir: &Path, rel: &str) -> Result<(), String> {
     }
     check_unlinked_inside(workdir, rel, "install.unless_exists", "delete")?;
     #[cfg(unix)]
-    return at::remove(workdir, rel).map_err(|e| format!("deleting {rel} in {}: {e}", workdir.display()));
+    return at::remove(workdir, rel)
+        .map_err(|e| format!("deleting {rel} in {}: {e}", workdir.display()));
     #[cfg(not(unix))]
     remove_by_path(&workdir.join(rel))
 }
@@ -1921,7 +2020,8 @@ fn copy_env_from_source(recipe: &Recipe, workdir: &Path, checkout: &Path) -> Res
         }
         if std::fs::symlink_metadata(&from).is_ok_and(|m| m.is_file()) {
             check_unlinked_inside(workdir, f, "env_from_source", "copy")?;
-            copy_unlinked(checkout, workdir, f).map_err(|e| format!("copying {f} from {}: {e}", checkout.display()))?;
+            copy_unlinked(checkout, workdir, f)
+                .map_err(|e| format!("copying {f} from {}: {e}", checkout.display()))?;
         }
     }
     Ok(())
@@ -1943,14 +2043,22 @@ fn copy_unlinked(checkout: &Path, workdir: &Path, rel: &str) -> std::io::Result<
 fn copy_unlinked(checkout: &Path, workdir: &Path, rel: &str) -> std::io::Result<()> {
     let mut write = std::fs::OpenOptions::new();
     write.write(true).create_new(true);
-    std::io::copy(&mut std::fs::File::open(checkout.join(rel))?, &mut write.open(workdir.join(rel))?).map(|_| ())
+    std::io::copy(
+        &mut std::fs::File::open(checkout.join(rel))?,
+        &mut write.open(workdir.join(rel))?,
+    )
+    .map(|_| ())
 }
 
 /// The first component of `rel` under `root` that is a symlink: every
 /// folder on the way, and the last name too when `with_last`.
 fn first_link(root: &Path, rel: &str, with_last: bool) -> Option<PathBuf> {
     let parts: Vec<_> = Path::new(rel).components().collect();
-    let upto = if with_last { parts.len() } else { parts.len().saturating_sub(1) };
+    let upto = if with_last {
+        parts.len()
+    } else {
+        parts.len().saturating_sub(1)
+    };
     let mut at = root.to_path_buf();
     for part in &parts[..upto] {
         at.push(part);
@@ -1986,7 +2094,9 @@ fn check_unlinked_inside(workdir: &Path, rel: &str, key: &str, verb: &str) -> Re
     if inside {
         Ok(())
     } else {
-        Err(format!("{key}: {rel} is outside the workspace; refusing to {verb} it"))
+        Err(format!(
+            "{key}: {rel} is outside the workspace; refusing to {verb} it"
+        ))
     }
 }
 
@@ -1999,7 +2109,15 @@ fn spec_for(
     resolved: (String, Option<String>),
     host_labels: Vec<String>,
 ) -> ContainerSpec {
-    spec_in(BackendKind::Docker, recipe, at, install_due, resolved, host_labels, &Toolchain::default())
+    spec_in(
+        BackendKind::Docker,
+        recipe,
+        at,
+        install_due,
+        resolved,
+        host_labels,
+        &Toolchain::default(),
+    )
 }
 
 /// (#3112) The preview's sandbox spec under `kind`: the watchdog reads the
@@ -2019,7 +2137,11 @@ fn spec_in(
     labels.push(format!("{WORKSPACE_LABEL}={}", at.name));
     let name = container_name(at);
     let heartbeat = heartbeat_dir(at, &name);
-    let beat_at = darkmux_sandbox::backend_of(kind).place(&Mount { host: heartbeat.clone(), at: HEARTBEAT_AT.to_string(), access: Access::ReadOnly });
+    let beat_at = darkmux_sandbox::backend_of(kind).place(&Mount {
+        host: heartbeat.clone(),
+        at: HEARTBEAT_AT.to_string(),
+        access: Access::ReadOnly,
+    });
     let on_host = kind.on_host();
     ContainerSpec {
         heartbeat,
@@ -2033,12 +2155,31 @@ fn spec_in(
         env: {
             // (#3561) A managed runtime's additions (Node's listen preload),
             // appended to the recipe's own.
-            let mut env = container_env_for(recipe, at.port, at.hmr_port, kind, toolchain.path.as_deref());
+            let mut env = container_env_for(
+                recipe,
+                at.port,
+                at.hmr_port,
+                kind,
+                toolchain.path.as_deref(),
+            );
             toolchain.append_env(&mut env);
             env
         },
-        script: container_script(recipe, install_due, &Watch::production_at(&beat_at)).replacen(STARTED_LINE, started_line(kind), 1),
-        read_only: if on_host { toolchain.read_only.iter().cloned().chain([at.log.clone()]).collect() } else { Vec::new() },
+        script: container_script(recipe, install_due, &Watch::production_at(&beat_at)).replacen(
+            STARTED_LINE,
+            started_line(kind),
+            1,
+        ),
+        read_only: if on_host {
+            toolchain
+                .read_only
+                .iter()
+                .cloned()
+                .chain([at.log.clone()])
+                .collect()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -2106,7 +2247,11 @@ fn serve(
     )?;
     // Ready: wait for it to end, and say why unless it was stopped. On the
     // host, watch its listeners meanwhile.
-    let status = if kind.on_host() { watch_until_ended(entry, &mut child, (&spec.name, containers), at)? } else { child.wait() };
+    let status = if kind.on_host() {
+        watch_until_ended(entry, &mut child, (&spec.name, containers), at)?
+    } else {
+        child.wait()
+    };
     Err(Halt::Failed(exit_reason_in(kind, recipe, &at.log, status)))
 }
 
@@ -2120,14 +2265,27 @@ fn planned_spec(
     containers: &dyn PreviewContainers,
 ) -> Result<(ContainerSpec, Option<String>), Halt> {
     let kind = containers.kind();
-    let resolved = containers
-        .image_and_user()
-        .map_err(|e| if kind.on_host() { format!("a preview runs in {}: {e}", darkmux_sandbox::placed_in(kind)) } else { format!("a preview runs in a container: {e}") })?;
-    let toolchain = containers.toolchain(recipe, &at.workdir, &|stage| entry.lock().unwrap().stage = stage);
+    let resolved = containers.image_and_user().map_err(|e| {
+        if kind.on_host() {
+            format!(
+                "a preview runs in {}: {e}",
+                darkmux_sandbox::placed_in(kind)
+            )
+        } else {
+            format!("a preview runs in a container: {e}")
+        }
+    })?;
+    let toolchain = containers.toolchain(recipe, &at.workdir, &|stage| {
+        entry.lock().unwrap().stage = stage
+    });
     entry.lock().unwrap().stage = None;
     let toolchain = toolchain?;
     // On the host the toolchain stands in for the image an install counts.
-    let image = if kind.on_host() { format!("{}|{}", resolved.0, toolchain.identity) } else { resolved.0.clone() };
+    let image = if kind.on_host() {
+        format!("{}|{}", resolved.0, toolchain.identity)
+    } else {
+        resolved.0.clone()
+    };
     let plan = install_plan_in(kind, recipe, at, &image);
     if let Some(made) = plan.switched_from {
         reinstall_for(kind, made, recipe, at)?;
@@ -2137,18 +2295,42 @@ fn planned_spec(
     }
     // Recorded once the dev server line shows the install succeeded.
     let installed = plan.fingerprint.filter(|_| plan.due);
-    Ok((spec_in(kind, recipe, at, plan.due, resolved, containers.host_labels(), &toolchain), installed))
+    Ok((
+        spec_in(
+            kind,
+            recipe,
+            at,
+            plan.due,
+            resolved,
+            containers.host_labels(),
+            &toolchain,
+        ),
+        installed,
+    ))
 }
 
 /// (#3112) The install there now was made in `made`, not `kind`: deletes
 /// the recipe's `unless_exists` path in darkmux's workspace copy (never the
 /// user's checkout), saying so in the preview's log and the serve log, so
 /// the install runs again for `kind`.
-fn reinstall_for(kind: BackendKind, made: BackendKind, recipe: &Recipe, at: &RunIn) -> Result<(), Halt> {
-    let Some(rel) = recipe.install.as_ref().and_then(|i| i.unless_exists.as_deref()) else {
+fn reinstall_for(
+    kind: BackendKind,
+    made: BackendKind,
+    recipe: &Recipe,
+    at: &RunIn,
+) -> Result<(), Halt> {
+    let Some(rel) = recipe
+        .install
+        .as_ref()
+        .and_then(|i| i.unless_exists.as_deref())
+    else {
         return Ok(());
     };
-    if at.checkout.as_deref().is_some_and(|c| same_dir(c, &at.workdir)) {
+    if at
+        .checkout
+        .as_deref()
+        .is_some_and(|c| same_dir(c, &at.workdir))
+    {
         return Err(Halt::Failed(format!(
             "{} is your own checkout, not darkmux's workspace; refusing to delete {rel} in it to reinstall",
             at.workdir.display()
@@ -2164,7 +2346,8 @@ fn reinstall_for(kind: BackendKind, made: BackendKind, recipe: &Recipe, at: &Run
     );
     eprintln!("darkmux client serve: preview {}: {line}", at.name);
     if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(&at.log) {
-        let _ = std::io::Write::write_all(&mut log, format!("darkmux-preview: {line}\n").as_bytes());
+        let _ =
+            std::io::Write::write_all(&mut log, format!("darkmux-preview: {line}\n").as_bytes());
     }
     Ok(())
 }
@@ -2223,7 +2406,11 @@ impl ExposureWatch {
 /// (#3112) Reads the listeners of the sandbox `child` leads; one beyond the
 /// loopback (or none readable) removes the sandbox, waits for `child`, and
 /// halts saying why.
-fn stop_if_exposed(child: &mut std::process::Child, (name, containers): (&str, &dyn PreviewContainers), at: &RunIn) -> Result<(), Halt> {
+fn stop_if_exposed(
+    child: &mut std::process::Child,
+    (name, containers): (&str, &dyn PreviewContainers),
+    at: &RunIn,
+) -> Result<(), Halt> {
     let checked = check_exposure(containers, at);
     if checked.is_err() {
         containers.remove(name);
@@ -2238,7 +2425,12 @@ fn stop_if_exposed(child: &mut std::process::Child, (name, containers): (&str, &
 fn check_exposure(containers: &dyn PreviewContainers, at: &RunIn) -> Result<(), Halt> {
     match containers.exposed([at.port, at.hmr_port]) {
         Ok(found) if found.is_empty() => Ok(()),
-        Ok(found) => Err(Halt::Failed(on_host::exposure_reason(containers.kind(), &found, at.port, at.hmr_port))),
+        Ok(found) => Err(Halt::Failed(on_host::exposure_reason(
+            containers.kind(),
+            &found,
+            at.port,
+            at.hmr_port,
+        ))),
         Err(why) => Err(Halt::Failed(why)),
     }
 }
@@ -2264,7 +2456,11 @@ fn exit_reason_in(
 ) -> String {
     let text = std::fs::read_to_string(log).unwrap_or_default();
     let status = status.map(|s| s.to_string()).unwrap_or_default();
-    let noun = if kind.on_host() { "sandbox" } else { "container" };
+    let noun = if kind.on_host() {
+        "sandbox"
+    } else {
+        "container"
+    };
     if !text.lines().any(|l| l == started_line(kind)) {
         let said = text
             .lines()
@@ -2335,7 +2531,11 @@ fn wait_ready(
 ) -> Result<(), Halt> {
     let path = ready_path(recipe);
     let mut serving_since = None;
-    let mut watch = ExposureWatch { on_host: containers.kind().on_host(), checked: Instant::now(), every: at.exposure_every };
+    let mut watch = ExposureWatch {
+        on_host: containers.kind().on_host(),
+        checked: Instant::now(),
+        every: at.exposure_every,
+    };
     loop {
         ended_or_stopped(entry, child, recipe, at)?;
         if serving_since.is_none() && log_has(&at.log, SERVING_LINE) {
@@ -2367,7 +2567,12 @@ fn ended_or_stopped(
 ) -> Result<(), Halt> {
     if let Ok(Some(status)) = child.try_wait() {
         let kind = entry.lock().unwrap().containers.kind();
-        return Err(Halt::Failed(exit_reason_in(kind, recipe, &at.log, Ok(status))));
+        return Err(Halt::Failed(exit_reason_in(
+            kind,
+            recipe,
+            &at.log,
+            Ok(status),
+        )));
     }
     if entry.lock().unwrap().status == Status::Stopped {
         let _ = child.wait();
@@ -2496,8 +2701,15 @@ pub(crate) struct HostEmulator {
 
 #[cfg(test)]
 impl PreviewContainers for HostEmulator {
-    fn toolchain(&self, _recipe: &Recipe, _workdir: &Path, stage: &dyn Fn(Option<PreviewStage>)) -> Result<Toolchain, String> {
-        let Some((takes, fails)) = self.fetch.lock().unwrap().clone() else { return Ok(Toolchain::default()) };
+    fn toolchain(
+        &self,
+        _recipe: &Recipe,
+        _workdir: &Path,
+        stage: &dyn Fn(Option<PreviewStage>),
+    ) -> Result<Toolchain, String> {
+        let Some((takes, fails)) = self.fetch.lock().unwrap().clone() else {
+            return Ok(Toolchain::default());
+        };
         stage(Some(PreviewStage::getting("node", "Node", "26.13.1")));
         std::thread::sleep(takes);
         if !*self.fetch_leaves_stage.lock().unwrap() {
@@ -2516,13 +2728,22 @@ impl PreviewContainers for HostEmulator {
 
     fn not_ready_reason(&self, name: &str, port: u16) -> String {
         if *self.on_host.lock().unwrap() {
-            on_host::not_ready_reason(self.kind(), port, darkmux_platform::current().tcp_port_listeners(port).as_deref())
+            on_host::not_ready_reason(
+                self.kind(),
+                port,
+                darkmux_platform::current()
+                    .tcp_port_listeners(port)
+                    .as_deref(),
+            )
         } else {
             not_ready_reason(port, self.listeners(name).as_deref())
         }
     }
 
-    fn exposed(&self, ports: [u16; 2]) -> Result<Vec<(u16, darkmux_platform::PortListener)>, String> {
+    fn exposed(
+        &self,
+        ports: [u16; 2],
+    ) -> Result<Vec<(u16, darkmux_platform::PortListener)>, String> {
         if *self.on_host.lock().unwrap() {
             on_host::exposed_in(darkmux_platform::current(), self.kind(), ports)
         } else {
@@ -2668,9 +2889,15 @@ mod tests {
         unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
         let (h, made) = (handle("darkmux-preview-x"), Docker { image: None }.kind());
         unsafe {
-            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_SANDBOX", v),
+                None => std::env::remove_var("DARKMUX_SANDBOX"),
+            }
         }
-        assert_eq!((h.backend, made), (BackendKind::Docker, BackendKind::Docker));
+        assert_eq!(
+            (h.backend, made),
+            (BackendKind::Docker, BackendKind::Docker)
+        );
         assert_eq!(darkmux_sandbox::for_handle(&h).kind(), BackendKind::Docker);
     }
 
@@ -2679,7 +2906,18 @@ mod tests {
         for good in [".env", "node_modules", "config/.env.local"] {
             assert!(plain_relative(good), "{good}");
         }
-        for bad in ["", "/etc/passwd", "../.env", "a/../../b", "./x", "node_modules/", "node_modules/.", "a//b", "a/./b", "."] {
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../.env",
+            "a/../../b",
+            "./x",
+            "node_modules/",
+            "node_modules/.",
+            "a//b",
+            "a/./b",
+            ".",
+        ] {
             assert!(!plain_relative(bad), "{bad:?}");
         }
     }
@@ -2738,10 +2976,18 @@ mod tests {
         let wt = a_workspace(dir.path(), "sleep 30");
         let (previews, emu) = emulated(dir.path());
         let previews = previews.with_ready_within(Duration::from_millis(400));
-        previews.start("w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
+        previews
+            .start("w", &wt, &RecipeSource::Checkout(wt.clone()))
+            .unwrap();
         let v = until_failed(&previews, "w");
         assert_eq!(v["status"], "failed", "{v}");
-        assert!(v["error"].as_str().unwrap().contains("must listen on 0.0.0.0"), "{v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("must listen on 0.0.0.0"),
+            "{v}"
+        );
         previews.stop("w");
         drop(emu);
     }
@@ -2766,7 +3012,11 @@ mod tests {
             calls.display()
         );
         std::fs::write(dir.path().join("docker"), script).unwrap();
-        std::fs::set_permissions(dir.path().join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            dir.path().join("docker"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         let prev = std::env::var_os("PATH").unwrap_or_default();
         let mut path = std::ffi::OsString::from(dir.path());
         path.push(":");
@@ -2786,24 +3036,49 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_docker_cli_is_driven_as_previews_need() {
-        let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "npm run dev"}));
+        let recipe =
+            a_recipe(serde_json::json!({"schema_version": "1.0", "command": "npm run dev"}));
         let mut spec = a_spec(&recipe, None);
-        let docker = Docker { image: Some("sha256:pinned".into()) };
+        let docker = Docker {
+            image: Some("sha256:pinned".into()),
+        };
         let log = tempfile::NamedTempFile::new().unwrap();
         with_fake_docker(|calls| {
             docker.create(&spec).expect("created");
             spec.name = "darkmux-preview-fail".into();
             let err = docker.create(&spec).unwrap_err();
-            assert!(err.contains("docker create") && err.contains("no such image"), "{err}");
-            assert_eq!(docker.listeners("darkmux-preview-site").as_deref(), Some("0: 00000000:1004 00000000:0000 0A\n"));
-            assert_eq!(docker.listeners("darkmux-preview-quiet"), None, "nothing printed");
-            docker.start("darkmux-preview-site", log.path()).unwrap().wait().unwrap();
-            assert!(std::fs::read_to_string(log.path()).unwrap().contains("attached to darkmux-preview-site"));
+            assert!(
+                err.contains("docker create") && err.contains("no such image"),
+                "{err}"
+            );
+            assert_eq!(
+                docker.listeners("darkmux-preview-site").as_deref(),
+                Some("0: 00000000:1004 00000000:0000 0A\n")
+            );
+            assert_eq!(
+                docker.listeners("darkmux-preview-quiet"),
+                None,
+                "nothing printed"
+            );
+            docker
+                .start("darkmux-preview-site", log.path())
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert!(std::fs::read_to_string(log.path())
+                .unwrap()
+                .contains("attached to darkmux-preview-site"));
             let said = std::fs::read_to_string(calls).unwrap();
             let expected = docker_create_args(&a_spec(&recipe, None)).join(" ");
-            assert!(said.starts_with(&expected), "create gets the spec's arguments: {said}");
+            assert!(
+                said.starts_with(&expected),
+                "create gets the spec's arguments: {said}"
+            );
             assert!(said.contains("start -a darkmux-preview-site"), "{said}");
-            assert!(said.contains("exec darkmux-preview-site cat /proc/net/tcp /proc/net/tcp6"), "{said}");
+            assert!(
+                said.contains("exec darkmux-preview-site cat /proc/net/tcp /proc/net/tcp6"),
+                "{said}"
+            );
             docker.remove("darkmux-preview-site");
             let said = std::fs::read_to_string(calls).unwrap();
             assert!(
@@ -2822,7 +3097,11 @@ mod tests {
     fn the_preview_image_is_the_pinned_one_or_the_resolved_runtime_image() {
         let user = darkmux_crew::dispatch_internal::runtime_container_user().unwrap();
         with_fake_docker(|_| {
-            let pinned = Docker { image: Some("sha256:pinned".into()) }.image_and_user().unwrap();
+            let pinned = Docker {
+                image: Some("sha256:pinned".into()),
+            }
+            .image_and_user()
+            .unwrap();
             assert_eq!(pinned, ("sha256:pinned".to_string(), user.clone()));
             let err = Docker { image: None }.image_and_user().unwrap_err();
             assert!(err.contains("docker version"), "{err}");
@@ -2918,20 +3197,42 @@ mod tests {
     /// option.
     #[test]
     fn a_preview_container_is_created_with_exactly_these_options() {
-        let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "npm run dev"}));
+        let recipe =
+            a_recipe(serde_json::json!({"schema_version": "1.0", "command": "npm run dev"}));
         let spec = a_spec(&recipe, Some("501:20".into()));
         let args = docker_create_args(&spec);
         let (head, tail) = args.split_at(args.len() - 6);
-        assert_eq!(tail, ["--entrypoint", "sh", "--", "sha256:runtime", "-c", spec.script.as_str()]);
+        assert_eq!(
+            tail,
+            [
+                "--entrypoint",
+                "sh",
+                "--",
+                "sha256:runtime",
+                "-c",
+                spec.script.as_str()
+            ]
+        );
         assert_eq!(head[0], "create");
         let mut options = Vec::new();
         let mut it = head[1..].iter();
         while let Some(a) = it.next() {
             let takes_value = ["--name", "--label", "-v", "-w", "-p", "-e"].contains(&a.as_str());
-            options.push(if takes_value { format!("{a} {}", it.next().unwrap()) } else { a.clone() });
+            options.push(if takes_value {
+                format!("{a} {}", it.next().unwrap())
+            } else {
+                a.clone()
+            });
         }
-        let env: Vec<String> = options.iter().filter(|o| o.starts_with("-e ")).cloned().collect();
-        let mut options: Vec<String> = options.into_iter().filter(|o| !o.starts_with("-e ")).collect();
+        let env: Vec<String> = options
+            .iter()
+            .filter(|o| o.starts_with("-e "))
+            .cloned()
+            .collect();
+        let mut options: Vec<String> = options
+            .into_iter()
+            .filter(|o| !o.starts_with("-e "))
+            .collect();
         options.sort();
         let mut want: Vec<String> = [
             "--rm",
@@ -2956,7 +3257,10 @@ mod tests {
         assert_eq!(options, want);
         let mut want_env = vec!["-e HOME=/tmp".to_string()];
         want_env.extend(spec.env.iter().map(|(k, v)| format!("-e {k}={v}")));
-        assert_eq!(env, want_env, "HOME first, then the spec's environment in order");
+        assert_eq!(
+            env, want_env,
+            "HOME first, then the spec's environment in order"
+        );
     }
 
     /// (#3456) No host environment reaches the container: its environment
@@ -3149,7 +3453,10 @@ mod tests {
         }
         unsafe { libc::kill(-group, libc::SIGKILL) };
         let said = std::fs::read_to_string(out.path()).unwrap();
-        assert!(said.contains(STALE_LINE), "the watchdog saw it stale: {said}");
+        assert!(
+            said.contains(STALE_LINE),
+            "the watchdog saw it stale: {said}"
+        );
         assert!(ended.is_some(), "a script that ignores TERM is still ended");
     }
 
@@ -3521,8 +3828,16 @@ mod tests {
         std::fs::write(wt.join("package.json"), "{}").unwrap();
         std::fs::write(wt.join("package-lock.json"), "{}").unwrap();
         let locked = fp(&wt);
-        std::fs::write(wt.join("package.json"), "{\"dependencies\": {\"left-pad\": \"1\"}}").unwrap();
-        assert_ne!(fp(&wt), locked, "a changed package.json counts beside a lockfile");
+        std::fs::write(
+            wt.join("package.json"),
+            "{\"dependencies\": {\"left-pad\": \"1\"}}",
+        )
+        .unwrap();
+        assert_ne!(
+            fp(&wt),
+            locked,
+            "a changed package.json counts beside a lockfile"
+        );
         for bun in ["bun.lock", "bun.lockb"] {
             std::fs::write(wt.join(bun), "one").unwrap();
             let before = fp(&wt);
@@ -3539,7 +3854,11 @@ mod tests {
     fn clean_never_deletes_through_a_planted_link_named_with_a_trailing_slash() {
         for unless in ["node_modules/", "node_modules/."] {
             let dir = tempfile::tempdir().unwrap();
-            let (wt, mine, outside) = (dir.path().join("w"), dir.path().join("mine"), dir.path().join("outside"));
+            let (wt, mine, outside) = (
+                dir.path().join("w"),
+                dir.path().join("mine"),
+                dir.path().join("outside"),
+            );
             for d in [&wt, &mine.join(".darkmux"), &outside] {
                 std::fs::create_dir_all(d).unwrap();
             }
@@ -3551,7 +3870,10 @@ mod tests {
             std::fs::write(mine.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
             let (previews, _emu) = emulated(dir.path());
             let out = previews.clean("w", &wt, &RecipeSource::Checkout(mine));
-            assert!(outside.join("precious.txt").exists(), "{unless}: deleted outside the workspace through the link");
+            assert!(
+                outside.join("precious.txt").exists(),
+                "{unless}: deleted outside the workspace through the link"
+            );
             assert!(out.is_err(), "{unless}: the recipe is refused");
         }
     }
@@ -3568,7 +3890,10 @@ mod tests {
         std::fs::write(outside.join("deps/precious.txt"), "mine").unwrap();
         std::os::unix::fs::symlink(&outside, wt.join("web")).unwrap();
         let err = remove_inside(&wt, "web/deps").unwrap_err();
-        assert!(outside.join("deps/precious.txt").exists(), "deleted through the symlinked folder");
+        assert!(
+            outside.join("deps/precious.txt").exists(),
+            "deleted through the symlinked folder"
+        );
         assert!(err.contains("delete") && !err.contains("copy"), "{err}");
     }
 
@@ -3640,7 +3965,9 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(src.path().join("web")).unwrap();
         std::fs::write(src.path().join("web/.env"), "SECRET=1\n").unwrap();
-        let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "x", "env_from_source": ["web/.env"]}));
+        let recipe = a_recipe(
+            serde_json::json!({"schema_version": "1.0", "command": "x", "env_from_source": ["web/.env"]}),
+        );
         let escapes = race_a_swapped_folder(
             |wt| {
                 let _ = copy_env_from_source(&recipe, wt, src.path());
@@ -3662,7 +3989,11 @@ mod tests {
     fn env_from_source_never_reads_through_a_link_in_the_checkout() {
         for (file, link_at) in [(".env", ".env"), ("config/.env", "config")] {
             let dir = tempfile::tempdir().unwrap();
-            let (wt, checkout, secrets) = (dir.path().join("w"), dir.path().join("mine"), dir.path().join("secrets"));
+            let (wt, checkout, secrets) = (
+                dir.path().join("w"),
+                dir.path().join("mine"),
+                dir.path().join("secrets"),
+            );
             for d in [&wt, &checkout.join(".darkmux"), &secrets] {
                 std::fs::create_dir_all(d).unwrap();
             }
@@ -3677,11 +4008,19 @@ mod tests {
             });
             std::fs::write(checkout.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
             let (previews, _emu) = emulated(dir.path());
-            previews.start("w", &wt, &RecipeSource::Checkout(checkout.clone())).unwrap();
+            previews
+                .start("w", &wt, &RecipeSource::Checkout(checkout.clone()))
+                .unwrap();
             let v = until_failed(&previews, "w");
-            assert!(!wt.join(file).exists(), "{file}: copied through the checkout's link");
+            assert!(
+                !wt.join(file).exists(),
+                "{file}: copied through the checkout's link"
+            );
             assert_eq!(v["status"], "failed", "{file}: {v}");
-            assert!(v["error"].as_str().unwrap().contains("symlink"), "{file}: {v}");
+            assert!(
+                v["error"].as_str().unwrap().contains("symlink"),
+                "{file}: {v}"
+            );
         }
     }
 
@@ -3797,7 +4136,9 @@ mod tests {
         let wt = a_workspace(dir.path(), "sleep 30");
         let (previews, emu) = emulated(dir.path());
         *emu.fetch.lock().unwrap() = Some((Duration::from_millis(600), None));
-        previews.start("w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
+        previews
+            .start("w", &wt, &RecipeSource::Checkout(wt.clone()))
+            .unwrap();
         let mut seen = None;
         for _ in 0..100 {
             let v = serde_json::to_value(previews.status("w").unwrap()).unwrap();
@@ -3810,7 +4151,10 @@ mod tests {
         let v = seen.expect("the preview never showed its stage");
         assert_eq!(v["status"], "starting", "{v}");
         assert_eq!(v["stage"]["code"], "getting_node", "{v}");
-        assert_eq!(v["stage"]["detail"], "getting Node 26.13.1, first use only", "{v}");
+        assert_eq!(
+            v["stage"]["detail"], "getting Node 26.13.1, first use only",
+            "{v}"
+        );
         let mut after = serde_json::Value::Null;
         for _ in 0..200 {
             after = serde_json::to_value(previews.status("w").unwrap()).unwrap();
@@ -3823,12 +4167,26 @@ mod tests {
         previews.stop("w");
 
         let (previews, emu) = emulated(dir.path());
-        *emu.fetch.lock().unwrap() = Some((Duration::ZERO, Some("does not match the SHA-256 darkmux pins".into())));
-        previews.start("w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
+        *emu.fetch.lock().unwrap() = Some((
+            Duration::ZERO,
+            Some("does not match the SHA-256 darkmux pins".into()),
+        ));
+        previews
+            .start("w", &wt, &RecipeSource::Checkout(wt.clone()))
+            .unwrap();
         let v = until_failed(&previews, "w");
-        assert!(v["error"].as_str().unwrap().contains("does not match the SHA-256"), "{v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("does not match the SHA-256"),
+            "{v}"
+        );
         assert!(v.get("stage").is_none(), "{v}");
-        assert!(emu.specs.lock().unwrap().is_empty(), "a preview whose Node failed still started");
+        assert!(
+            emu.specs.lock().unwrap().is_empty(),
+            "a preview whose Node failed still started"
+        );
     }
 
     /// (#3561 re-review) The preview itself clears its stage once its
@@ -3841,14 +4199,19 @@ mod tests {
         let (previews, emu) = emulated(dir.path());
         *emu.fetch.lock().unwrap() = Some((Duration::from_millis(100), None));
         *emu.fetch_leaves_stage.lock().unwrap() = true;
-        previews.start("w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
+        previews
+            .start("w", &wt, &RecipeSource::Checkout(wt.clone()))
+            .unwrap();
         for _ in 0..200 {
             if !emu.specs.lock().unwrap().is_empty() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(!emu.specs.lock().unwrap().is_empty(), "the preview never got past its toolchain");
+        assert!(
+            !emu.specs.lock().unwrap().is_empty(),
+            "the preview never got past its toolchain"
+        );
         let v = serde_json::to_value(previews.status("w").unwrap()).unwrap();
         assert!(v.get("stage").is_none(), "the stage stuck: {v}");
         previews.stop("w");
@@ -3990,7 +4353,10 @@ mod tests {
         let refused = previews.start("w", &wt, &RecipeSource::Checkout(wt.clone()));
         assert!(refused.is_err_and(|e| e.message().contains("stopping")));
         std::thread::sleep(Duration::from_millis(200));
-        assert!(emu.specs.lock().unwrap().is_empty(), "a container was created");
+        assert!(
+            emu.specs.lock().unwrap().is_empty(),
+            "a container was created"
+        );
     }
 
     /// Shutting down stops every preview at once, not one after another:
@@ -4005,10 +4371,19 @@ mod tests {
             std::fs::create_dir_all(wt.join(".darkmux")).unwrap();
             let recipe = serde_json::json!({"schema_version": "1.0", "command": "sleep 30"});
             std::fs::write(wt.join(".darkmux/preview.json"), recipe.to_string()).unwrap();
-            previews.start(name, &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
+            previews
+                .start(name, &wt, &RecipeSource::Checkout(wt.clone()))
+                .unwrap();
         }
         for _ in 0..300 {
-            if emu.specs.lock().unwrap().len() == 3 && previews.entries.lock().unwrap().values().all(|e| e.lock().unwrap().container.is_some()) {
+            if emu.specs.lock().unwrap().len() == 3
+                && previews
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .all(|e| e.lock().unwrap().container.is_some())
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -4018,8 +4393,15 @@ mod tests {
         let stopped = previews.stop_all();
         let took = started.elapsed();
         assert_eq!(stopped, ["w1", "w2", "w3"]);
-        assert_eq!(emu.removed.lock().unwrap().len(), 3, "every container removed");
-        assert!(took < Duration::from_millis(2500), "stopped one after another: {took:?}");
+        assert_eq!(
+            emu.removed.lock().unwrap().len(),
+            3,
+            "every container removed"
+        );
+        assert!(
+            took < Duration::from_millis(2500),
+            "stopped one after another: {took:?}"
+        );
     }
 
     /// (#3459) A preview nobody has asked about for `idle_minutes` is
@@ -4098,8 +4480,16 @@ mod tests {
             "needs {image} present locally; this test never pulls it"
         );
         let dir = tempfile::tempdir().unwrap();
-        let previews = Previews::new(dir.path().join("p"), Arc::new(Docker { image: Some(image) }));
-        let ((), name) = super::tests_shared::preview_with_no_host_files_or_host_env(dir.path(), previews, BackendKind::Docker, |_, _| ());
+        let previews = Previews::new(
+            dir.path().join("p"),
+            Arc::new(Docker { image: Some(image) }),
+        );
+        let ((), name) = super::tests_shared::preview_with_no_host_files_or_host_env(
+            dir.path(),
+            previews,
+            BackendKind::Docker,
+            |_, _| (),
+        );
         let listed = std::process::Command::new("docker")
             .args([
                 "ps",

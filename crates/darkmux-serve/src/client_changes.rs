@@ -25,19 +25,45 @@ pub(crate) enum ChangesError {
 /// every blob (raw bytes, no filter or textconv). A submodule, or a changed
 /// name that is not UTF-8 (the reply's paths are strings), is
 /// [`ChangesError::Unreadable`].
-pub(crate) fn branch_files(wc: &WorkCopy, base: &str, head: &str, cap: usize) -> Result<Vec<BranchFile>, ChangesError> {
-    let listing = crate::client_git::run(wc, None, &["diff", "--no-renames", "--raw", "--no-abbrev", "-z", base, head])
-        .ok_or(ChangesError::Listing)?;
+pub(crate) fn branch_files(
+    wc: &WorkCopy,
+    base: &str,
+    head: &str,
+    cap: usize,
+) -> Result<Vec<BranchFile>, ChangesError> {
+    let listing = crate::client_git::run(
+        wc,
+        None,
+        &[
+            "diff",
+            "--no-renames",
+            "--raw",
+            "--no-abbrev",
+            "-z",
+            base,
+            head,
+        ],
+    )
+    .ok_or(ChangesError::Listing)?;
     let changes = parse_raw(&listing.stdout);
     // Blobs are read up to the first file that can't be, so a cap passed
     // before it still answers TooLarge.
-    let wanted: Vec<&Change> = changes.iter().take_while(|c| c.readable()).filter(|c| !c.deleted).collect();
+    let wanted: Vec<&Change> = changes
+        .iter()
+        .take_while(|c| c.readable())
+        .filter(|c| !c.deleted)
+        .collect();
     let mut blobs = read_blobs(wc, &wanted, cap)?.into_iter();
     let mut files = Vec::with_capacity(changes.len());
     for change in &changes {
         let path = String::from_utf8_lossy(&change.path).into_owned();
         if change.deleted {
-            files.push(BranchFile { path, deleted: Some(true), mode: None, content: None });
+            files.push(BranchFile {
+                path,
+                deleted: Some(true),
+                mode: None,
+                content: None,
+            });
             continue;
         }
         let Some(blob) = blobs.next() else {
@@ -79,7 +105,9 @@ fn parse_raw(raw: &[u8]) -> Vec<Change> {
     while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
         let meta = String::from_utf8_lossy(meta);
         let parts: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
-        let [_, mode, _, oid, status] = parts.as_slice() else { continue };
+        let [_, mode, _, oid, status] = parts.as_slice() else {
+            continue;
+        };
         out.push(Change {
             path: path.to_vec(),
             deleted: status.starts_with('D'),
@@ -98,7 +126,8 @@ fn read_blobs(wc: &WorkCopy, wanted: &[&Change], cap: usize) -> Result<Vec<Vec<u
     let Some(first) = wanted.first() else {
         return Ok(Vec::new());
     };
-    let unreadable = |c: &Change| ChangesError::Unreadable(String::from_utf8_lossy(&c.path).into_owned());
+    let unreadable =
+        |c: &Change| ChangesError::Unreadable(String::from_utf8_lossy(&c.path).into_owned());
     let mut child = crate::client_git::command(wc, None, &["cat-file", "--batch"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

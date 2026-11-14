@@ -68,12 +68,22 @@ pub(crate) struct Route {
 macro_rules! json {
     ($ty:ty, $path:literal, $handler:expr) => {{
         let _: Option<$ty> = None;
-        Route { path: $path, reply: Reply::Json(stringify!($ty)), handler: get($handler), redacts_itself: false }
+        Route {
+            path: $path,
+            reply: Reply::Json(stringify!($ty)),
+            handler: get($handler),
+            redacts_itself: false,
+        }
     }};
 }
 
 fn plain(path: &'static str, reply: Reply, handler: MethodRouter<AppState>) -> Route {
-    Route { path, reply, handler, redacts_itself: false }
+    Route {
+        path,
+        reply,
+        handler,
+        redacts_itself: false,
+    }
 }
 
 /// Every route the viewer daemon serves.
@@ -85,33 +95,100 @@ pub(crate) fn table() -> Vec<Route> {
         plain("/play/:date", Reply::Html, get(play_html)),
         json!(HealthResponse, "/health", health),
         json!(FlowRecordsResponse, "/flow/:date", flow_handler),
-        plain("/flow/:date/stream", Reply::EventStream, get(flow_stream_handler)),
+        plain(
+            "/flow/:date/stream",
+            Reply::EventStream,
+            get(flow_stream_handler),
+        ),
         json!(FlowDaysResponse, "/flow-days", flow_days_handler),
-        json!(FlowMissionsResponse, "/flow-missions", flow_missions_handler),
-        json!(FlowRecordsResponse, "/flow-mission/:id", flow_mission_handler),
-        json!(FlowRecordsResponse, "/flow-dispatch/:id", flow_dispatch_handler),
-        json!(MachineStatusResponse, "/machine/status", machine_status_handler),
-        json!(MachineSpecsResponse, "/machine/specs", machine_specs_handler),
-        json!(MachineResourcesResponse, "/machine/resources", machine_resources_handler),
+        json!(
+            FlowMissionsResponse,
+            "/flow-missions",
+            flow_missions_handler
+        ),
+        json!(
+            FlowRecordsResponse,
+            "/flow-mission/:id",
+            flow_mission_handler
+        ),
+        json!(
+            FlowRecordsResponse,
+            "/flow-dispatch/:id",
+            flow_dispatch_handler
+        ),
+        json!(
+            MachineStatusResponse,
+            "/machine/status",
+            machine_status_handler
+        ),
+        json!(
+            MachineSpecsResponse,
+            "/machine/specs",
+            machine_specs_handler
+        ),
+        json!(
+            MachineResourcesResponse,
+            "/machine/resources",
+            machine_resources_handler
+        ),
         json!(MissionsResponse, "/missions", missions_handler),
         json!(RunsResponse, "/runs", runs_handler),
-        Route { redacts_itself: true, ..json!(PanelResponse, "/panel/:id", panel::panel_handler) },
+        Route {
+            redacts_itself: true,
+            ..json!(PanelResponse, "/panel/:id", panel::panel_handler)
+        },
         json!(PhasesResponse, "/phases", phases_handler),
-        json!(mission_graph::MissionGraph, "/mission/:id/graph.json", mission_graph_json_handler),
-        plain("/manifest.webmanifest", Reply::Manifest, get(web_manifest_handler)),
-        plain("/apple-touch-icon.png", Reply::Png, get(apple_touch_icon_handler)),
+        json!(
+            mission_graph::MissionGraph,
+            "/mission/:id/graph.json",
+            mission_graph_json_handler
+        ),
+        plain(
+            "/manifest.webmanifest",
+            Reply::Manifest,
+            get(web_manifest_handler),
+        ),
+        plain(
+            "/apple-touch-icon.png",
+            Reply::Png,
+            get(apple_touch_icon_handler),
+        ),
         plain("/icon-192.png", Reply::Png, get(icon_192_handler)),
         plain("/favicon-32.png", Reply::Png, get(favicon_32_handler)),
         plain("/favicon-16.png", Reply::Png, get(favicon_16_handler)),
         plain("/icon-512.png", Reply::Png, get(icon_512_handler)),
-        plain("/icon-512-maskable.png", Reply::Png, get(icon_512_maskable_handler)),
-        json!(FleetDispatchesLiveResponse, "/fleet/dispatches/live", fleet_dispatches_live_handler),
-        json!(FleetMachinesLiveResponse, "/fleet/machines/live", fleet_machines_live_handler),
+        plain(
+            "/icon-512-maskable.png",
+            Reply::Png,
+            get(icon_512_maskable_handler),
+        ),
+        json!(
+            FleetDispatchesLiveResponse,
+            "/fleet/dispatches/live",
+            fleet_dispatches_live_handler
+        ),
+        json!(
+            FleetMachinesLiveResponse,
+            "/fleet/machines/live",
+            fleet_machines_live_handler
+        ),
         json!(FleetRosterResponse, "/fleet/roster", fleet_roster_handler),
-        json!(fleet_view::FleetView, "/fleet/view", fleet_view::fleet_view_handler),
+        json!(
+            fleet_view::FleetView,
+            "/fleet/view",
+            fleet_view::fleet_view_handler
+        ),
         json!(LabRunsResponse, "/lab/runs", lab_runs_handler),
-        json!(LabRunDetailResponse, "/lab/run/detail", lab_run_detail_handler),
-        json!(LabRunEventsResponse, "/lab/run/events", lab_run_events_handler),
+        json!(
+            LabRunDetailResponse,
+            "/lab/run/detail",
+            lab_run_detail_handler
+        ),
+        json!(
+            LabRunEventsResponse,
+            "/lab/run/events",
+            lab_run_events_handler
+        ),
     ]
 }
 
@@ -137,7 +214,12 @@ pub(crate) struct ClientRoute {
 macro_rules! client_json {
     ($method:ident, $ty:ty, $path:expr, $handler:expr) => {{
         let _: Option<$ty> = None;
-        ClientRoute { method: stringify!($method), path: $path, reply: stringify!($ty), handler: axum::routing::$method($handler) }
+        ClientRoute {
+            method: stringify!($method),
+            path: $path,
+            reply: stringify!($ty),
+            handler: axum::routing::$method($handler),
+        }
     }};
 }
 
@@ -153,21 +235,76 @@ pub(crate) fn client_table() -> Vec<ClientRoute> {
         client_json!(get, ClientProfiles, "/client/profiles", profiles_handler),
         client_json!(post, WorkAccepted, "/client/work", work_handler),
         client_json!(get, WorkState, "/client/work/:work_id", work_status_handler),
-        client_json!(post, StatusWord, "/client/work/:work_id/cancel", cancel_handler),
+        client_json!(
+            post,
+            StatusWord,
+            "/client/work/:work_id/cancel",
+            cancel_handler
+        ),
         client_json!(post, KeepReply, "/client/work/:work_id/keep", keep_handler),
-        client_json!(post, DiscardReply, "/client/work/:work_id/discard", discard_handler),
+        client_json!(
+            post,
+            DiscardReply,
+            "/client/work/:work_id/discard",
+            discard_handler
+        ),
         client_json!(post, UndoReply, "/client/work/:work_id/undo", undo_handler),
         client_json!(get, RecipeReply, "/client/recipe", recipe_handler),
-        client_json!(post, WorkspaceInfo, "/client/workspaces", workspace_create_handler),
-        client_json!(get, WorkspaceInfo, "/client/workspaces/:name", workspace_status_handler),
-        client_json!(delete, WorkspaceRemoved, "/client/workspaces/:name", workspace_remove_handler),
-        client_json!(get, BranchChanges, "/client/workspaces/:name/changes", workspace_changes_handler),
-        client_json!(post, EditReply, "/client/workspaces/:name/edit", workspace_edit_handler),
+        client_json!(
+            post,
+            WorkspaceInfo,
+            "/client/workspaces",
+            workspace_create_handler
+        ),
+        client_json!(
+            get,
+            WorkspaceInfo,
+            "/client/workspaces/:name",
+            workspace_status_handler
+        ),
+        client_json!(
+            delete,
+            WorkspaceRemoved,
+            "/client/workspaces/:name",
+            workspace_remove_handler
+        ),
+        client_json!(
+            get,
+            BranchChanges,
+            "/client/workspaces/:name/changes",
+            workspace_changes_handler
+        ),
+        client_json!(
+            post,
+            EditReply,
+            "/client/workspaces/:name/edit",
+            workspace_edit_handler
+        ),
         client_json!(post, ImageReply, IMAGE_ROUTE, workspace_image_handler),
-        client_json!(post, PreviewState, "/client/workspaces/:name/preview", preview_start_handler),
-        client_json!(get, PreviewState, "/client/workspaces/:name/preview", preview_status_handler),
-        client_json!(delete, StatusWord, "/client/workspaces/:name/preview", preview_stop_handler),
-        client_json!(put, RecipeReply, "/client/workspaces/:name/recipe", recipe_set_handler),
+        client_json!(
+            post,
+            PreviewState,
+            "/client/workspaces/:name/preview",
+            preview_start_handler
+        ),
+        client_json!(
+            get,
+            PreviewState,
+            "/client/workspaces/:name/preview",
+            preview_status_handler
+        ),
+        client_json!(
+            delete,
+            StatusWord,
+            "/client/workspaces/:name/preview",
+            preview_stop_handler
+        ),
+        client_json!(
+            put,
+            RecipeReply,
+            "/client/workspaces/:name/recipe",
+            recipe_set_handler
+        ),
     ]
 }
 
@@ -185,12 +322,19 @@ pub(crate) fn client_router(state: crate::client_pairing::ClientServerState) -> 
     }
     by_path
         .into_iter()
-        .fold(Router::new(), |router, (path, handler)| router.route(path, handler))
+        .fold(Router::new(), |router, (path, handler)| {
+            router.route(path, handler)
+        })
         .fallback(cp::no_such_route)
         .method_not_allowed_fallback(cp::method_not_allowed)
-        .layer(axum::middleware::from_fn_with_state(state.clone(), cp::only_this_machines_apps))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            cp::only_this_machines_apps,
+        ))
         // (#3468) A panic in a handler answers a coded 500 (`ClientError`).
-        .layer(tower_http::catch_panic::CatchPanicLayer::custom(cp::panic_response))
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            cp::panic_response,
+        ))
         .with_state(state)
 }
 
@@ -228,9 +372,24 @@ fn client_schemas() -> Vec<serde_json::Value> {
         schemars::schema_for!(T).as_value().clone()
     }
     vec![
-        of::<ClientError>(), of::<PairAccepted>(), of::<PairPoll>(), of::<Whoami>(), of::<ClientProfiles>(),
-        of::<WorkAccepted>(), of::<WorkState>(), of::<StatusWord>(), of::<KeepReply>(), of::<DiscardReply>(),
-        of::<UndoReply>(), of::<RecipeReply>(), of::<WorkspaceInfo>(), of::<WorkspaceRemoved>(), of::<BranchChanges>(), of::<PreviewState>(), of::<EditReply>(), of::<ImageReply>(),
+        of::<ClientError>(),
+        of::<PairAccepted>(),
+        of::<PairPoll>(),
+        of::<Whoami>(),
+        of::<ClientProfiles>(),
+        of::<WorkAccepted>(),
+        of::<WorkState>(),
+        of::<StatusWord>(),
+        of::<KeepReply>(),
+        of::<DiscardReply>(),
+        of::<UndoReply>(),
+        of::<RecipeReply>(),
+        of::<WorkspaceInfo>(),
+        of::<WorkspaceRemoved>(),
+        of::<BranchChanges>(),
+        of::<PreviewState>(),
+        of::<EditReply>(),
+        of::<ImageReply>(),
     ]
 }
 
@@ -248,7 +407,11 @@ fn schema_lines(schema: &serde_json::Value, out: &mut std::collections::BTreeSet
 }
 
 #[cfg(test)]
-fn type_lines(name: &str, schema: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+fn type_lines(
+    name: &str,
+    schema: &serde_json::Value,
+    out: &mut std::collections::BTreeSet<String>,
+) {
     match schema.get("properties").and_then(|p| p.as_object()) {
         Some(_) => {
             for member in object_members(schema) {
@@ -264,12 +427,29 @@ fn type_lines(name: &str, schema: &serde_json::Value, out: &mut std::collections
 /// `name: type` (`name?: type` when not required) for each property.
 #[cfg(test)]
 fn object_members(schema: &serde_json::Value) -> Vec<String> {
-    let required: Vec<&str> =
-        schema.get("required").and_then(|r| r.as_array()).map(|r| r.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
-    let props = schema.get("properties").and_then(|p| p.as_object()).cloned().unwrap_or_default();
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let props = schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .cloned()
+        .unwrap_or_default();
     props
         .iter()
-        .map(|(k, v)| format!("{k}{}: {}", if required.contains(&k.as_str()) { "" } else { "?" }, schema_type(v)))
+        .map(|(k, v)| {
+            format!(
+                "{k}{}: {}",
+                if required.contains(&k.as_str()) {
+                    ""
+                } else {
+                    "?"
+                },
+                schema_type(v)
+            )
+        })
         .collect()
 }
 
@@ -290,13 +470,22 @@ fn composite_type(v: &serde_json::Value) -> Option<String> {
         return Some(c.to_string());
     }
     if let Some(e) = v.get("enum").and_then(|e| e.as_array()) {
-        return Some(e.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" | "));
+        return Some(
+            e.iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(" | "),
+        );
     }
-    let alts = v.get("oneOf").or_else(|| v.get("anyOf")).and_then(|a| a.as_array());
+    let alts = v
+        .get("oneOf")
+        .or_else(|| v.get("anyOf"))
+        .and_then(|a| a.as_array());
     if let Some(alts) = alts {
         return Some(alts.iter().map(schema_type).collect::<Vec<_>>().join(" | "));
     }
-    v.get("properties").map(|_| format!("{{ {} }}", object_members(v).join(", ")))
+    v.get("properties")
+        .map(|_| format!("{{ {} }}", object_members(v).join(", ")))
 }
 
 /// The schema's JSON `type` (one or a union of several).
@@ -307,14 +496,22 @@ fn json_type(v: &serde_json::Value) -> String {
         Some(serde_json::Value::Array(ts)) => ts.iter().filter_map(|t| t.as_str()).collect(),
         _ => return "any".to_string(),
     };
-    types.iter().map(|t| one_json_type(t, v)).collect::<Vec<_>>().join(" | ")
+    types
+        .iter()
+        .map(|t| one_json_type(t, v))
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 /// One JSON type, with an array's items and a map's values.
 #[cfg(test)]
 fn one_json_type(t: &str, v: &serde_json::Value) -> String {
     match (t, v.get("additionalProperties")) {
-        ("array", _) => format!("Array<{}>", v.get("items").map_or_else(|| "any".to_string(), schema_type)),
+        ("array", _) => format!(
+            "Array<{}>",
+            v.get("items")
+                .map_or_else(|| "any".to_string(), schema_type)
+        ),
         ("object", Some(a)) if a.is_object() => format!("Record<string, {}>", schema_type(a)),
         (other, _) => other.to_string(),
     }
@@ -348,7 +545,10 @@ impl Route {
 /// A route's handler, behind the redaction layer when its stance is `Layer`.
 fn with_read_redaction(route: &Route) -> MethodRouter<AppState> {
     match route.redaction() {
-        RouteRedaction::Layer => route.handler.clone().layer(axum::middleware::from_fn(crate::redaction::redact_reads)),
+        RouteRedaction::Layer => route
+            .handler
+            .clone()
+            .layer(axum::middleware::from_fn(crate::redaction::redact_reads)),
         RouteRedaction::Handler | RouteRedaction::Static => route.handler.clone(),
     }
 }
@@ -357,13 +557,20 @@ fn with_read_redaction(route: &Route) -> MethodRouter<AppState> {
 /// or hung request; the long-lived event stream (#925) is kept apart so that
 /// timeout never applies to it.
 pub(crate) fn router() -> Router<AppState> {
-    let (streaming, timed): (Vec<Route>, Vec<Route>) =
-        table().into_iter().partition(|r| r.reply == Reply::EventStream);
+    let (streaming, timed): (Vec<Route>, Vec<Route>) = table()
+        .into_iter()
+        .partition(|r| r.reply == Reply::EventStream);
     let timed = timed
         .into_iter()
-        .fold(Router::new(), |router, r| router.route(r.path, with_read_redaction(&r)))
-        .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(crate::REQUEST_TIMEOUT_SECS)));
-    let streaming = streaming.into_iter().fold(Router::new(), |router, r| router.route(r.path, r.handler));
+        .fold(Router::new(), |router, r| {
+            router.route(r.path, with_read_redaction(&r))
+        })
+        .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(
+            crate::REQUEST_TIMEOUT_SECS,
+        )));
+    let streaming = streaming
+        .into_iter()
+        .fold(Router::new(), |router, r| router.route(r.path, r.handler));
     timed.merge(streaming)
 }
 
@@ -382,13 +589,17 @@ fn ts_members(src: &str) -> Vec<String> {
         rest = rest[i..].find("*/").map_or("", |j| &rest[i + j + 2..]);
     }
     text.push_str(rest);
-    let body = text.split_once("export type ").and_then(|(_, t)| t.split_once('=')).map_or("", |(_, b)| b.trim());
+    let body = text
+        .split_once("export type ")
+        .and_then(|(_, t)| t.split_once('='))
+        .map_or("", |(_, b)| b.trim());
     let body = body.trim_end().trim_end_matches(';').trim();
     let (inner, sep) = match body.strip_prefix('{').and_then(|b| b.strip_suffix('}')) {
         Some(inner) => (inner, ','),
         None => (body, '|'),
     };
-    let (mut parts, mut depth, mut quote, mut cur) = (Vec::new(), 0i32, None::<char>, String::new());
+    let (mut parts, mut depth, mut quote, mut cur) =
+        (Vec::new(), 0i32, None::<char>, String::new());
     for c in inner.chars() {
         match (quote, c) {
             (Some(q), c) if c == q => quote = None,
@@ -404,7 +615,11 @@ fn ts_members(src: &str) -> Vec<String> {
         cur.push(c);
     }
     parts.push(cur);
-    parts.iter().map(|p| p.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|p| !p.is_empty()).collect()
+    parts
+        .iter()
+        .map(|p| p.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 /// The table as the golden renders it: one `GET <path>  <reply>` line per route,
@@ -414,7 +629,10 @@ fn ts_members(src: &str) -> Vec<String> {
 /// lets a PR add lines here and refuses one that removes or changes a line.
 #[cfg(test)]
 pub(crate) fn render_table() -> String {
-    let mut out: String = table().iter().map(|r| format!("GET {}  {}\n", r.path, r.reply.render())).collect();
+    let mut out: String = table()
+        .iter()
+        .map(|r| format!("GET {}  {}\n", r.path, r.reply.render()))
+        .collect();
     out.push_str(&format!(
         "POST {}  ndjson (darkmux_fleet submission; fleet listener, not the viewer daemon)\n",
         darkmux_fleet::SUBMISSION_PATH
@@ -425,7 +643,8 @@ pub(crate) fn render_table() -> String {
     ));
     out.push_str(&render_client_table());
     out.push_str("\n# response types: Type.field: type, from the generated TypeScript twins\n");
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ui/src/types/generated");
+    let dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ui/src/types/generated");
     let mut seen = std::collections::BTreeSet::new();
     for r in table() {
         let Reply::Json(ty) = r.reply else { continue };
@@ -433,8 +652,12 @@ pub(crate) fn render_table() -> String {
         if !seen.insert(name) {
             continue;
         }
-        let src = std::fs::read_to_string(dir.join(format!("{name}.ts")))
-            .unwrap_or_else(|e| panic!("{} answers with {ty}, whose generated {name}.ts is unreadable: {e}", r.path));
+        let src = std::fs::read_to_string(dir.join(format!("{name}.ts"))).unwrap_or_else(|e| {
+            panic!(
+                "{} answers with {ty}, whose generated {name}.ts is unreadable: {e}",
+                r.path
+            )
+        });
         for member in ts_members(&src) {
             out.push_str(&format!("{name}.{member}\n"));
         }
@@ -479,9 +702,17 @@ mod tests {
         let object = "import type { A } from \"./A\";\n/** doc */\nexport type T = { a: Array<A>, \n/** why */\nb?: string | null, c: { x: number, y: number }, d: \"p,q\", };\n";
         assert_eq!(
             ts_members(object),
-            ["a: Array<A>", "b?: string | null", "c: { x: number, y: number }", "d: \"p,q\""]
+            [
+                "a: Array<A>",
+                "b?: string | null",
+                "c: { x: number, y: number }",
+                "d: \"p,q\""
+            ]
         );
-        assert_eq!(ts_members("export type U = \"on\" | \"off\" | { k: number };"), ["\"on\"", "\"off\"", "{ k: number }"]);
+        assert_eq!(
+            ts_members("export type U = \"on\" | \"off\" | { k: number };"),
+            ["\"on\"", "\"off\"", "{ k: number }"]
+        );
     }
 
     /// No two routes share a path, and every path is unique in the router.
@@ -535,15 +766,30 @@ mod tests {
             let app = crate::build_router_local(flows.path().to_path_buf());
             async move {
                 let res = app
-                    .oneshot(Request::builder().uri(uri).header("x-darkmux-panel", "1").body(Body::empty()).unwrap())
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header("x-darkmux-panel", "1")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
                     .await
                     .unwrap();
                 let status = res.status();
-                (status, axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap())
+                (
+                    status,
+                    axum::body::to_bytes(res.into_body(), 1 << 20)
+                        .await
+                        .unwrap(),
+                )
             }
         };
-        for r in table().into_iter().filter(|r| r.reply != Reply::EventStream) {
-            let (status, body) = answer(r.path.replace(":date", "2026-01-01").replace(":id", "x")).await;
+        for r in table()
+            .into_iter()
+            .filter(|r| r.reply != Reply::EventStream)
+        {
+            let (status, body) =
+                answer(r.path.replace(":date", "2026-01-01").replace(":id", "x")).await;
             assert!(
                 !(status == StatusCode::NOT_FOUND && body.is_empty()),
                 "{} is in the table but the router does not serve it",
@@ -559,7 +805,12 @@ mod tests {
     fn client_routes_are_unique() {
         let mut seen = std::collections::BTreeSet::new();
         for r in client_table() {
-            assert!(seen.insert((r.method, r.path)), "{} {} is registered twice", r.method, r.path);
+            assert!(
+                seen.insert((r.method, r.path)),
+                "{} {} is registered twice",
+                r.method,
+                r.path
+            );
         }
     }
 
@@ -579,18 +830,35 @@ mod tests {
             )),
             ..state
         };
-        let answer = |method: &str, uri: String| {
-            let app = client_router(state.clone());
-            let mut req = Request::builder().method(method).uri(uri).header("host", "localhost").body(Body::empty()).unwrap();
-            req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5555))));
-            async move {
-                let res = app.oneshot(req).await.unwrap();
-                let status = res.status();
-                (status, axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap())
-            }
-        };
+        let answer =
+            |method: &str, uri: String| {
+                let app = client_router(state.clone());
+                let mut req = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("host", "localhost")
+                    .body(Body::empty())
+                    .unwrap();
+                req.extensions_mut().insert(axum::extract::ConnectInfo(
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 5555)),
+                ));
+                async move {
+                    let res = app.oneshot(req).await.unwrap();
+                    let status = res.status();
+                    (
+                        status,
+                        axum::body::to_bytes(res.into_body(), 1 << 20)
+                            .await
+                            .unwrap(),
+                    )
+                }
+            };
         for r in client_table() {
-            let uri = r.path.replace(":request_id", "r-x").replace(":work_id", "w-x").replace(":name", "nope");
+            let uri = r
+                .path
+                .replace(":request_id", "r-x")
+                .replace(":work_id", "w-x")
+                .replace(":name", "nope");
             let (status, body) = answer(&r.method.to_uppercase(), uri).await;
             let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert!(
@@ -602,7 +870,10 @@ mod tests {
         }
         let (status, body) = answer("GET", "/client/not-in-the-table".to_string()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "no such route");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+            "no such route"
+        );
     }
 
     /// Routes retired for the major release answer 404, not a redirect: a

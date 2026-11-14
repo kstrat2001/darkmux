@@ -33,7 +33,9 @@ pub(crate) fn resolve_toolchain(
 ) -> Result<Toolchain, String> {
     use darkmux_sandbox::toolchain::{resolve, Ask};
     let backend = darkmux_sandbox::backend_of(kind);
-    let commands = std::iter::once(recipe.command.as_str()).chain(recipe.install.as_ref().map(|i| i.command.as_str())).collect();
+    let commands = std::iter::once(recipe.command.as_str())
+        .chain(recipe.install.as_ref().map(|i| i.command.as_str()))
+        .collect();
     resolve(&Ask {
         commands,
         workdir: Some(workdir),
@@ -50,14 +52,27 @@ pub(crate) fn resolve_toolchain(
 /// fetched on first use with `getting_<runtime>` as its stage meanwhile;
 /// one the project does not declare and that cannot be had is skipped,
 /// said on the serve log.
-fn managed_runtimes(workdir: &Path, stage: &dyn Fn(Option<PreviewStage>)) -> Result<Vec<darkmux_crew::managed_toolchain::Installed>, String> {
+fn managed_runtimes(
+    workdir: &Path,
+    stage: &dyn Fn(Option<PreviewStage>),
+) -> Result<Vec<darkmux_crew::managed_toolchain::Installed>, String> {
     use darkmux_crew::managed_toolchain::{for_sandbox, Note};
-    for_sandbox(&[workdir], darkmux_flow::payload::ToolchainUse::Preview, None, &mut |n| {
-        if let (Some(line), Note::Unavailable { .. } | Note::Notice { .. }) = (darkmux_crew::managed_toolchain::said(n), n) {
-            eprintln!("darkmux client serve: preview of {}: {line}", workdir.display());
-        }
-        stage(preview_stage(n));
-    })
+    for_sandbox(
+        &[workdir],
+        darkmux_flow::payload::ToolchainUse::Preview,
+        None,
+        &mut |n| {
+            if let (Some(line), Note::Unavailable { .. } | Note::Notice { .. }) =
+                (darkmux_crew::managed_toolchain::said(n), n)
+            {
+                eprintln!(
+                    "darkmux client serve: preview of {}: {line}",
+                    workdir.display()
+                );
+            }
+            stage(preview_stage(n));
+        },
+    )
 }
 
 /// (#3561) The stage a preview shows for a step: `getting_<runtime>` while
@@ -67,25 +82,47 @@ fn managed_runtimes(workdir: &Path, stage: &dyn Fn(Option<PreviewStage>)) -> Res
 pub(crate) fn preview_stage(n: &darkmux_crew::managed_toolchain::Note) -> Option<PreviewStage> {
     use darkmux_crew::managed_toolchain::Note;
     match n {
-        Note::Fetching { runtime, pin } => Some(PreviewStage::getting(runtime.name, runtime.display, &pin.version.to_string())),
-        Note::Ready { .. } | Note::Failed { .. } | Note::Unavailable { .. } | Note::Notice { .. } => None,
+        Note::Fetching { runtime, pin } => Some(PreviewStage::getting(
+            runtime.name,
+            runtime.display,
+            &pin.version.to_string(),
+        )),
+        Note::Ready { .. }
+        | Note::Failed { .. }
+        | Note::Unavailable { .. }
+        | Note::Notice { .. } => None,
     }
 }
 
 /// The listeners bound beyond the loopback: every address (`0.0.0.0`,
 /// `::`) or any other address not on it.
 pub(crate) fn beyond_loopback(listeners: &[PortListener]) -> Vec<PortListener> {
-    listeners.iter().filter(|l| !l.on_loopback()).cloned().collect()
+    listeners
+        .iter()
+        .filter(|l| !l.on_loopback())
+        .cloned()
+        .collect()
 }
 
 /// Why a preview on the host was stopped: each listener beyond the
 /// loopback on its two ports, what darkmux gave the dev server, the fix.
-pub(crate) fn exposure_reason(kind: BackendKind, exposed: &[(u16, PortListener)], port: u16, hmr_port: u16) -> String {
+pub(crate) fn exposure_reason(
+    kind: BackendKind,
+    exposed: &[(u16, PortListener)],
+    port: u16,
+    hmr_port: u16,
+) -> String {
     let named: Vec<String> = exposed
         .iter()
         .map(|(on, l)| {
             let at = l.named_at(*on);
-            let role = if *on == port { "the app port" } else if *on == hmr_port { "the HMR port" } else { "a port" };
+            let role = if *on == port {
+                "the app port"
+            } else if *on == hmr_port {
+                "the HMR port"
+            } else {
+                "a port"
+            };
             match l.pid {
                 Some(pid) => format!("{at} ({role}, pid {pid})"),
                 None => format!("{at} ({role})"),
@@ -105,7 +142,11 @@ pub(crate) fn exposure_reason(kind: BackendKind, exposed: &[(u16, PortListener)]
 
 /// Why a dev server on the host never answered on `port`, from what
 /// listens on it (`None`: unknown).
-pub(crate) fn not_ready_reason(kind: BackendKind, port: u16, listeners: Option<&[PortListener]>) -> String {
+pub(crate) fn not_ready_reason(
+    kind: BackendKind,
+    port: u16,
+    listeners: Option<&[PortListener]>,
+) -> String {
     let sandbox = darkmux_sandbox::placed_in(kind);
     let v6_loopback = std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST);
     match listeners {
@@ -127,10 +168,17 @@ pub(crate) fn not_ready_reason(kind: BackendKind, port: u16, listeners: Option<&
 /// forking can race). Each port's read is asked once more when it does not
 /// read; a second miss is an error naming why (the watch then stops the
 /// preview: it cannot vouch for it), never "nothing listens".
-pub(crate) fn exposed_in(platform: &dyn darkmux_platform::Platform, kind: BackendKind, ports: [u16; 2]) -> Result<Vec<(u16, PortListener)>, String> {
+pub(crate) fn exposed_in(
+    platform: &dyn darkmux_platform::Platform,
+    kind: BackendKind,
+    ports: [u16; 2],
+) -> Result<Vec<(u16, PortListener)>, String> {
     let mut exposed = Vec::new();
     for port in ports {
-        let Some(all) = platform.tcp_port_listeners(port).or_else(|| platform.tcp_port_listeners(port)) else {
+        let Some(all) = platform
+            .tcp_port_listeners(port)
+            .or_else(|| platform.tcp_port_listeners(port))
+        else {
             return Err(format!(
                 "stopped the preview: darkmux cannot read what listens on its port {port} here, and a preview in {} \
                  must be watched (its sandbox cannot hold a bind to the loopback, #3559). To run previews in a \
@@ -160,11 +208,17 @@ const CALL_BOUND: Duration = Duration::from_secs(30);
 
 impl OnHost {
     pub fn new(kind: BackendKind) -> Self {
-        OnHost { kind, ports: Mutex::new(HashMap::new()) }
+        OnHost {
+            kind,
+            ports: Mutex::new(HashMap::new()),
+        }
     }
 
     fn handle(&self, name: &str) -> SandboxHandle {
-        SandboxHandle { backend: self.kind, id: name.to_string() }
+        SandboxHandle {
+            backend: self.kind,
+            id: name.to_string(),
+        }
     }
 }
 
@@ -173,7 +227,11 @@ impl OnHost {
 /// to the sandbox once it left the sandbox's process group (the ports come
 /// from the ephemeral range, so another app may hold one by chance), and a
 /// stop kills only what it can prove is the sandbox's.
-pub(crate) fn lingering(platform: &dyn darkmux_platform::Platform, name: &str, ports: [u16; 2]) -> Vec<String> {
+pub(crate) fn lingering(
+    platform: &dyn darkmux_platform::Platform,
+    name: &str,
+    ports: [u16; 2],
+) -> Vec<String> {
     ports
         .iter()
         .flat_map(|&port| platform.tcp_port_listeners(port).unwrap_or_default().into_iter().map(move |l| (port, l)))
@@ -200,11 +258,24 @@ impl PreviewContainers for OnHost {
 
     /// (#3561) darkmux's verified Node first (with its listen preload), then
     /// this machine's PATH.
-    fn toolchain(&self, recipe: &Recipe, workdir: &Path, stage: &dyn Fn(Option<PreviewStage>)) -> Result<Toolchain, String> {
+    fn toolchain(
+        &self,
+        recipe: &Recipe,
+        workdir: &Path,
+        stage: &dyn Fn(Option<PreviewStage>),
+    ) -> Result<Toolchain, String> {
         let installed = managed_runtimes(workdir, stage)?;
-        let home = std::env::var_os("HOME").map(PathBuf::from).map(|h| h.canonicalize().unwrap_or(h));
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|h| h.canonicalize().unwrap_or(h));
         let path = std::env::var("PATH").unwrap_or_default();
-        resolve_toolchain(recipe, self.kind, workdir, (&path, home.as_deref()), &darkmux_crew::managed_toolchain::managed(&installed))
+        resolve_toolchain(
+            recipe,
+            self.kind,
+            workdir,
+            (&path, home.as_deref()),
+            &darkmux_crew::managed_toolchain::managed(&installed),
+        )
     }
 
     fn host_labels(&self) -> Vec<String> {
@@ -218,25 +289,42 @@ impl PreviewContainers for OnHost {
         let (cmd, _) = darkmux_sandbox::backend_of(self.kind).create(&super::preview_policy(spec));
         match run_bounded(cmd, CALL_BOUND) {
             Bounded::Finished { success: true, .. } => {
-                self.ports.lock().unwrap().insert(spec.name.clone(), spec.ports);
+                self.ports
+                    .lock()
+                    .unwrap()
+                    .insert(spec.name.clone(), spec.ports);
                 Ok(())
             }
-            Bounded::Finished { stderr, .. } => Err(format!("making the preview's sandbox: {}", String::from_utf8_lossy(&stderr).trim())),
-            other => Err(format!("making the preview's sandbox did not finish: {other:?}")),
+            Bounded::Finished { stderr, .. } => Err(format!(
+                "making the preview's sandbox: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            )),
+            other => Err(format!(
+                "making the preview's sandbox did not finish: {other:?}"
+            )),
         }
     }
 
     fn start(&self, name: &str, log: &Path) -> Result<std::process::Child, String> {
-        let out = std::fs::OpenOptions::new().append(true).create(true).open(log).map_err(|e| format!("opening {}: {e}", log.display()))?;
-        let err = out.try_clone().map_err(|e| format!("opening {}: {e}", log.display()))?;
+        let out = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(log)
+            .map_err(|e| format!("opening {}: {e}", log.display()))?;
+        let err = out
+            .try_clone()
+            .map_err(|e| format!("opening {}: {e}", log.display()))?;
         let handle = self.handle(name);
         let mut cmd = darkmux_sandbox::for_handle(&handle).start(&handle);
-        cmd.stdin(std::process::Stdio::null()).stdout(out).stderr(err);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(out)
+            .stderr(err);
         // The backend's launcher leads a process group of its own (under
         // Seatbelt, a session of its own, #3559, so no group is set here: a
         // group leader cannot start a session): a Ctrl-C at `client serve`
         // reaches darkmux, which removes every preview itself.
-        cmd.spawn().map_err(|e| format!("starting the preview's sandbox: {e}"))
+        cmd.spawn()
+            .map_err(|e| format!("starting the preview's sandbox: {e}"))
     }
 
     fn listeners(&self, _name: &str) -> Option<String> {
@@ -244,7 +332,13 @@ impl PreviewContainers for OnHost {
     }
 
     fn not_ready_reason(&self, _name: &str, port: u16) -> String {
-        not_ready_reason(self.kind, port, darkmux_platform::current().tcp_port_listeners(port).as_deref())
+        not_ready_reason(
+            self.kind,
+            port,
+            darkmux_platform::current()
+                .tcp_port_listeners(port)
+                .as_deref(),
+        )
     }
 
     fn exposed(&self, ports: [u16; 2]) -> Result<Vec<(u16, PortListener)>, String> {
@@ -254,12 +348,16 @@ impl PreviewContainers for OnHost {
     fn remove(&self, name: &str) {
         use darkmux_crew::bounded_command::run_bounded;
         let quiet = |mut c: std::process::Command| {
-            c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            c.stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
             c
         };
         let handle = self.handle(name);
         let backend = darkmux_sandbox::for_handle(&handle);
-        let _ = run_bounded(quiet(backend.stop(&handle, Duration::from_secs(5))), CALL_BOUND);
+        let _ = run_bounded(
+            quiet(backend.stop(&handle, Duration::from_secs(5))),
+            CALL_BOUND,
+        );
         let _ = run_bounded(quiet(backend.remove(&handle)), CALL_BOUND);
         if let Some(ports) = self.ports.lock().unwrap().remove(name) {
             for line in lingering(darkmux_platform::current(), name, ports) {

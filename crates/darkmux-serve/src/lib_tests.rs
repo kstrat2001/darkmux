@@ -1,824 +1,1119 @@
-    use super::*;
 
-    /// (#2915) `/machine/specs`' `utility_model` carries the binding's
-    /// declared window, `null` when undeclared, beside the residency match
-    /// (by namespaced identifier or bare key).
-    #[test]
-    fn the_startup_banner_says_the_listener_is_off_when_it_is() {
-        let auth = ServeAuth { read_auth: false, token_present: true };
-        let on = auth_banner_lines(auth, true);
-        assert!(on[1].contains("requires it plus a verified sender"), "{}", on[1]);
-        let off = auth_banner_lines(auth, false);
-        assert!(off[1].contains("listener is off"), "{}", off[1]);
-        assert!(!off[1].contains("requires it"), "{}", off[1]);
-    }
+use super::*;
 
-    #[test]
-    fn utility_model_carries_the_declared_window() {
-        let lm = |identifier: &str, model: &str| darkmux_types::LoadedModel {
-            identifier: identifier.into(),
-            model: model.into(),
-            status: "idle".into(),
-            size: "2 GB".into(),
-            context: 120_000,
-            queued: None,
-        };
-        let v = serde_json::to_value(utility_model("darkmux:util-4b", Some(120_000), &[lm("darkmux:util-4b", "util-4b")])).unwrap();
-        assert_eq!(v, serde_json::json!({ "id": "darkmux:util-4b", "loaded": true, "n_ctx": 120_000 }));
-        let bare = utility_model("util-4b", None, &[lm("darkmux:util-4b", "util-4b")]);
-        assert!(bare.loaded, "matched by bare key");
-        assert!(bare.n_ctx.is_none(), "undeclared is null, never a guess: {bare:?}");
-        assert!(!utility_model("util-4b", None, &[]).loaded);
-    }
-    use axum::body::{Body, to_bytes};
-    use axum::http::Request;
-    use std::{fs, path::PathBuf};
-    use tower::util::ServiceExt;
-    use tempfile::TempDir;
+/// (#2915) `/machine/specs`' `utility_model` carries the binding's
+/// declared window, `null` when undeclared, beside the residency match
+/// (by namespaced identifier or bare key).
+#[test]
+fn the_startup_banner_says_the_listener_is_off_when_it_is() {
+    let auth = ServeAuth {
+        read_auth: false,
+        token_present: true,
+    };
+    let on = auth_banner_lines(auth, true);
+    assert!(
+        on[1].contains("requires it plus a verified sender"),
+        "{}",
+        on[1]
+    );
+    let off = auth_banner_lines(auth, false);
+    assert!(off[1].contains("listener is off"), "{}", off[1]);
+    assert!(!off[1].contains("requires it"), "{}", off[1]);
+}
 
-    /// XSS guard, layer 1: the served document must contain ZERO inline
-    /// event-handler attributes. Originally written against the legacy
-    /// viewer (hand-written JS routing clicks through one delegated listener
-    /// reading `data-act`/`data-arg`); retargeted at `next.html` (#1806 —
-    /// the legacy viewer is retired) because the guard's premise — no
-    /// `on<event>="…"` HTML attribute anywhere in the served document — is
-    /// just as meaningful against the React port's built bundle. React's
-    /// synthetic event system never emits inline HTML handler attributes
-    /// (it wires listeners via JS, not `onclick="…"` markup), so a genuine
-    /// zero-hit result here is real signal, not a premise that stopped
-    /// applying — verified empirically against `next.html` before this
-    /// retarget landed. JS-side property assignment (`x.onclick=…`) is fine
-    /// and not matched. Not a general XSS proof against a minified bundle:
-    /// it is blind to an escaped-quote `onerror=\"…\"` sitting inside a JS
-    /// string literal, and to a no-leading-whitespace object-literal shape
-    /// like `{onclick:"…"}` (no attribute syntax for the byte scanner to
-    /// find). Its practical value is narrower — guarding `ui/index.html`
-    /// shell regressions — not a substitute for the real XSS walk in
-    /// `tests/e2e/viewer-xss.spec.js`.
-    ///
-    /// (#1868 QA finding) This test does NOT also guard
-    /// `dangerouslySetInnerHTML`, despite an earlier version of this doc
-    /// claiming it did. It can't: `next.html` is a SINGLE bundled document
-    /// (react + react-dom + reactflow + this app's own code, inlined by
-    /// `vite-plugin-singlefile`) and React's own runtime legitimately
-    /// contains the literal string `dangerouslySetInnerHTML` dozens of
-    /// times (it has to reference the prop name to validate/guard against
-    /// misuse) — a whole-bundle scan for that string always fails, on
-    /// React's own code, regardless of whether darkmux's app code uses it.
-    /// The real check (`ui/src/no-danger.test.ts`) runs source-side, before
-    /// bundling, where the app's own files are cleanly distinguishable from
-    /// the framework's.
-    #[test]
-    fn viewer_has_no_inline_event_handlers() {
-        let html = include_str!("../assets/next.html");
-        // Scan the WHOLE inline-handler attribute class, not a fixed name list:
-        // an HTML `on<event>=` attribute is leading whitespace, `on`, lowercase
-        // letters, optional whitespace, `=`, then a quote. Matches onclick/
-        // ontoggle/oninput/onkeydown/onsubmit/… alike, so reintroducing ANY of
-        // them fails the build. (`x.onclick=` JS property assignment is NOT
-        // matched — it has no leading-whitespace `on…="` attribute shape.)
-        let bytes = html.as_bytes();
-        for (i, w) in bytes.windows(3).enumerate() {
-            if matches!(w[0], b' ' | b'\t' | b'\n') && w[1] == b'o' && w[2] == b'n' {
-                let mut j = i + 3;
-                while j < bytes.len() && bytes[j].is_ascii_lowercase() {
-                    j += 1;
+#[test]
+fn utility_model_carries_the_declared_window() {
+    let lm = |identifier: &str, model: &str| darkmux_types::LoadedModel {
+        identifier: identifier.into(),
+        model: model.into(),
+        status: "idle".into(),
+        size: "2 GB".into(),
+        context: 120_000,
+        queued: None,
+    };
+    let v = serde_json::to_value(utility_model(
+        "darkmux:util-4b",
+        Some(120_000),
+        &[lm("darkmux:util-4b", "util-4b")],
+    ))
+    .unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({ "id": "darkmux:util-4b", "loaded": true, "n_ctx": 120_000 })
+    );
+    let bare = utility_model("util-4b", None, &[lm("darkmux:util-4b", "util-4b")]);
+    assert!(bare.loaded, "matched by bare key");
+    assert!(
+        bare.n_ctx.is_none(),
+        "undeclared is null, never a guess: {bare:?}"
+    );
+    assert!(!utility_model("util-4b", None, &[]).loaded);
+}
+use axum::body::{to_bytes, Body};
+use axum::http::Request;
+use std::{fs, path::PathBuf};
+use tempfile::TempDir;
+use tower::util::ServiceExt;
+
+/// XSS guard, layer 1: the served document must contain ZERO inline
+/// event-handler attributes. Originally written against the legacy
+/// viewer (hand-written JS routing clicks through one delegated listener
+/// reading `data-act`/`data-arg`); retargeted at `next.html` (#1806 —
+/// the legacy viewer is retired) because the guard's premise — no
+/// `on<event>="…"` HTML attribute anywhere in the served document — is
+/// just as meaningful against the React port's built bundle. React's
+/// synthetic event system never emits inline HTML handler attributes
+/// (it wires listeners via JS, not `onclick="…"` markup), so a genuine
+/// zero-hit result here is real signal, not a premise that stopped
+/// applying — verified empirically against `next.html` before this
+/// retarget landed. JS-side property assignment (`x.onclick=…`) is fine
+/// and not matched. Not a general XSS proof against a minified bundle:
+/// it is blind to an escaped-quote `onerror=\"…\"` sitting inside a JS
+/// string literal, and to a no-leading-whitespace object-literal shape
+/// like `{onclick:"…"}` (no attribute syntax for the byte scanner to
+/// find). Its practical value is narrower — guarding `ui/index.html`
+/// shell regressions — not a substitute for the real XSS walk in
+/// `tests/e2e/viewer-xss.spec.js`.
+///
+/// (#1868 QA finding) This test does NOT also guard
+/// `dangerouslySetInnerHTML`, despite an earlier version of this doc
+/// claiming it did. It can't: `next.html` is a SINGLE bundled document
+/// (react + react-dom + reactflow + this app's own code, inlined by
+/// `vite-plugin-singlefile`) and React's own runtime legitimately
+/// contains the literal string `dangerouslySetInnerHTML` dozens of
+/// times (it has to reference the prop name to validate/guard against
+/// misuse) — a whole-bundle scan for that string always fails, on
+/// React's own code, regardless of whether darkmux's app code uses it.
+/// The real check (`ui/src/no-danger.test.ts`) runs source-side, before
+/// bundling, where the app's own files are cleanly distinguishable from
+/// the framework's.
+#[test]
+fn viewer_has_no_inline_event_handlers() {
+    let html = include_str!("../assets/next.html");
+    // Scan the WHOLE inline-handler attribute class, not a fixed name list:
+    // an HTML `on<event>=` attribute is leading whitespace, `on`, lowercase
+    // letters, optional whitespace, `=`, then a quote. Matches onclick/
+    // ontoggle/oninput/onkeydown/onsubmit/… alike, so reintroducing ANY of
+    // them fails the build. (`x.onclick=` JS property assignment is NOT
+    // matched — it has no leading-whitespace `on…="` attribute shape.)
+    let bytes = html.as_bytes();
+    for (i, w) in bytes.windows(3).enumerate() {
+        if matches!(w[0], b' ' | b'\t' | b'\n') && w[1] == b'o' && w[2] == b'n' {
+            let mut j = i + 3;
+            while j < bytes.len() && bytes[j].is_ascii_lowercase() {
+                j += 1;
+            }
+            let mut k = j;
+            while k < bytes.len() && matches!(bytes[k], b' ' | b'\t') {
+                k += 1;
+            }
+            if j > i + 3 && bytes.get(k) == Some(&b'=') {
+                let mut q = k + 1;
+                while q < bytes.len() && matches!(bytes[q], b' ' | b'\t') {
+                    q += 1;
                 }
-                let mut k = j;
-                while k < bytes.len() && matches!(bytes[k], b' ' | b'\t') {
-                    k += 1;
-                }
-                if j > i + 3 && bytes.get(k) == Some(&b'=') {
-                    let mut q = k + 1;
-                    while q < bytes.len() && matches!(bytes[q], b' ' | b'\t') {
-                        q += 1;
-                    }
-                    if matches!(bytes.get(q), Some(b'"') | Some(b'\'')) {
-                        let attr = String::from_utf8_lossy(&bytes[i + 1..j]);
-                        panic!(
-                            "next.html contains inline event handler `{attr}=…` \
+                if matches!(bytes.get(q), Some(b'"') | Some(b'\'')) {
+                    let attr = String::from_utf8_lossy(&bytes[i + 1..j]);
+                    panic!(
+                        "next.html contains inline event handler `{attr}=…` \
                              (byte {i}) — the React port must never emit one \
                              (XSS hardening)"
-                        );
-                    }
+                    );
                 }
             }
         }
-        // No `javascript:` URL sinks either (an href/src carrying a
-        // record-derived scheme would dodge the attribute scan above).
+    }
+    // No `javascript:` URL sinks either (an href/src carrying a
+    // record-derived scheme would dodge the attribute scan above).
+    assert!(
+        !html.to_lowercase().contains("javascript:"),
+        "next.html contains a javascript: URL — not allowed (XSS hardening)"
+    );
+}
+
+// The following four viewer-source-scanning tests were retired in #1806
+// along with `viewer.html` itself, rather than retargeted at
+// `crates/darkmux-serve/assets/next.html`:
+//
+//   - `viewer_has_no_raw_record_interpolations` (XSS guard, layer 2 —
+//     curated `${...}`-template needles like `${m}`/`${sid}`/`${role}`)
+//   - `live_tail_dedups_records` (#794 — `SEEN_KEYS`/`recKey`/
+//     `LIVE_ES.onmessage` source-text assertions)
+//   - `savings_hero_breakdown_is_classed_and_currency_free` (#803 —
+//     `function hybridNote(`/`function renderFleet(` region bounds,
+//     `${esc(...)}` interpolation needles)
+//   - `wt_sum_panel_is_live_gated_and_escaped` (#1387 — `function
+//     wtSumPanel(` boundary, `${esc(...)}` interpolation needles)
+//
+// Each asserted on EXACT source-code text — legacy function names,
+// variable names, and hand-written `${...}` template-literal
+// interpolation syntax — that is specific to the legacy viewer's
+// hand-written vanilla-JS implementation. None of that text exists in
+// `next.html` (a Vite-bundled, minified React app with no source-level
+// resemblance), so retargeting `include_str!` alone would not preserve
+// these tests' intent: every needle search would either find nothing
+// (an `.expect()`/`assert!` failure unrelated to any real regression)
+// or — worse — silently pass vacuously for the wrong reason. The
+// properties they were guarding (output encoding at the render edge,
+// live-tail dedup, tokens-only savings copy) still matter for the port,
+// but proving them needs port-shaped tests written against the port's
+// own render output, not a source-text scan of code that no longer
+// exists. XSS/escaping coverage for the port lives in
+// `tests/e2e/viewer-xss.spec.js` (walks the port with the same
+// attacker-controlled fixture, asserting zero unescaped payload
+// surfaces — see #1806's own audit of that suite). Live-tail dedup and
+// the savings-hero/wt-sum-panel copy have no ported equivalent test
+// yet; that gap is real and belongs to whoever next touches those
+// features on the port, not to a source-text scan pointed at a file
+// that no longer exists.
+
+/// The XSS regression fixture must stay a valid FLOW_SCHEMA day file —
+/// the manual walkthrough (copy to ~/.darkmux/flows/2026-01-01.jsonl,
+/// `darkmux serve`, open /play/2026-01-01, assert window.__xss is
+/// undefined) only proves anything if the records take the real ingest
+/// path rather than being skipped as malformed.
+#[test]
+fn xss_fixture_is_schema_valid() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/xss-flow.jsonl"
+    );
+    let raw = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+    let mut n = 0;
+    for (i, line) in raw.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        darkmux_flow::reader::parse_record(line).unwrap_or_else(|| {
+            panic!(
+                "xss-flow.jsonl line {} is not a valid FlowRecord\n  {line}",
+                i + 1
+            )
+        });
+        n += 1;
+    }
+    assert!(n >= 10, "xss fixture suspiciously small ({n} records)");
+    // The payloads themselves must be present, or the walkthrough is a no-op.
+    assert!(
+        raw.contains("window.__xss"),
+        "fixture lost its XSS payloads"
+    );
+    assert!(
+        raw.contains("onerror="),
+        "fixture lost its HTML-injection payloads"
+    );
+}
+
+/// The darkmux.com/demo dataset is a *real* FLOW_SCHEMA flow file: the demo
+/// page is the canonical viewer in playback mode loading this `.jsonl`,
+/// identical to a local `/play`. Guard that it stays an exact `FlowRecord`
+/// set — if a line drifts off-schema the demo would render wrong (or the
+/// playback path would choke), so it must deserialize line-for-line.
+#[test]
+fn demo_flow_dataset_is_schema_valid() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/demo/demo-flow.jsonl"
+    );
+    let raw = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+    let mut recs = Vec::new();
+    for (i, line) in raw.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let r = darkmux_flow::reader::parse_record(line).unwrap_or_else(|| {
+            panic!(
+                "demo-flow.jsonl line {} is not a valid FlowRecord\n  {line}",
+                i + 1
+            )
+        });
+        recs.push(r);
+    }
+    assert!(!recs.is_empty(), "demo dataset is empty");
+    // The demo flare is data-driven: the viewer's mission crumb and the
+    // `#mission=<id>` MAP lens resolve through the missions the world
+    // publishes (#2032 replays a REAL finalized mission, no hand-authored
+    // `demo` mission any more), so every mission-scoped flow record must
+    // name a mission `docs/demo/demo-missions.json` lists — an orphan id
+    // would render a crumb that leads nowhere.
+    let flow_missions: std::collections::BTreeSet<_> = recs
+        .iter()
+        .filter_map(|r| r.mission_id.as_deref())
+        .collect();
+    assert!(
+        !flow_missions.is_empty(),
+        "demo dataset must carry mission-scoped records (the demo flare)"
+    );
+    let missions_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/demo/demo-missions.json"
+    );
+    let missions: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(missions_path)
+            .unwrap_or_else(|e| panic!("reading {missions_path}: {e}")),
+    )
+    .expect("demo-missions.json is JSON");
+    let listed: std::collections::BTreeSet<_> = missions["missions"]
+        .as_array()
+        .expect("demo-missions.json carries a `missions` array")
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    for m in &flow_missions {
         assert!(
-            !html.to_lowercase().contains("javascript:"),
-            "next.html contains a javascript: URL — not allowed (XSS hardening)"
+            listed.contains(m),
+            "flow record mission `{m}` is not a mission demo-missions.json lists ({listed:?})"
         );
     }
+    let machines: std::collections::BTreeSet<_> = recs
+        .iter()
+        .filter_map(|r| r.machine_id.as_deref())
+        .collect();
+    assert!(
+        machines.len() >= 3,
+        "demo should showcase a multi-machine fleet, got {machines:?}"
+    );
+}
 
-    // The following four viewer-source-scanning tests were retired in #1806
-    // along with `viewer.html` itself, rather than retargeted at
-    // `crates/darkmux-serve/assets/next.html`:
-    //
-    //   - `viewer_has_no_raw_record_interpolations` (XSS guard, layer 2 —
-    //     curated `${...}`-template needles like `${m}`/`${sid}`/`${role}`)
-    //   - `live_tail_dedups_records` (#794 — `SEEN_KEYS`/`recKey`/
-    //     `LIVE_ES.onmessage` source-text assertions)
-    //   - `savings_hero_breakdown_is_classed_and_currency_free` (#803 —
-    //     `function hybridNote(`/`function renderFleet(` region bounds,
-    //     `${esc(...)}` interpolation needles)
-    //   - `wt_sum_panel_is_live_gated_and_escaped` (#1387 — `function
-    //     wtSumPanel(` boundary, `${esc(...)}` interpolation needles)
-    //
-    // Each asserted on EXACT source-code text — legacy function names,
-    // variable names, and hand-written `${...}` template-literal
-    // interpolation syntax — that is specific to the legacy viewer's
-    // hand-written vanilla-JS implementation. None of that text exists in
-    // `next.html` (a Vite-bundled, minified React app with no source-level
-    // resemblance), so retargeting `include_str!` alone would not preserve
-    // these tests' intent: every needle search would either find nothing
-    // (an `.expect()`/`assert!` failure unrelated to any real regression)
-    // or — worse — silently pass vacuously for the wrong reason. The
-    // properties they were guarding (output encoding at the render edge,
-    // live-tail dedup, tokens-only savings copy) still matter for the port,
-    // but proving them needs port-shaped tests written against the port's
-    // own render output, not a source-text scan of code that no longer
-    // exists. XSS/escaping coverage for the port lives in
-    // `tests/e2e/viewer-xss.spec.js` (walks the port with the same
-    // attacker-controlled fixture, asserting zero unescaped payload
-    // surfaces — see #1806's own audit of that suite). Live-tail dedup and
-    // the savings-hero/wt-sum-panel copy have no ported equivalent test
-    // yet; that gap is real and belongs to whoever next touches those
-    // features on the port, not to a source-text scan pointed at a file
-    // that no longer exists.
-
-    /// The XSS regression fixture must stay a valid FLOW_SCHEMA day file —
-    /// the manual walkthrough (copy to ~/.darkmux/flows/2026-01-01.jsonl,
-    /// `darkmux serve`, open /play/2026-01-01, assert window.__xss is
-    /// undefined) only proves anything if the records take the real ingest
-    /// path rather than being skipped as malformed.
-    #[test]
-    fn xss_fixture_is_schema_valid() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../tests/fixtures/xss-flow.jsonl"
-        );
-        let raw = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
-        let mut n = 0;
-        for (i, line) in raw.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            darkmux_flow::reader::parse_record(line).unwrap_or_else(|| {
-                panic!("xss-flow.jsonl line {} is not a valid FlowRecord\n  {line}", i + 1)
-            });
-            n += 1;
-        }
-        assert!(n >= 10, "xss fixture suspiciously small ({n} records)");
-        // The payloads themselves must be present, or the walkthrough is a no-op.
-        assert!(raw.contains("window.__xss"), "fixture lost its XSS payloads");
-        assert!(raw.contains("onerror="), "fixture lost its HTML-injection payloads");
-    }
-
-    /// The darkmux.com/demo dataset is a *real* FLOW_SCHEMA flow file: the demo
-    /// page is the canonical viewer in playback mode loading this `.jsonl`,
-    /// identical to a local `/play`. Guard that it stays an exact `FlowRecord`
-    /// set — if a line drifts off-schema the demo would render wrong (or the
-    /// playback path would choke), so it must deserialize line-for-line.
-    #[test]
-    fn demo_flow_dataset_is_schema_valid() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/demo/demo-flow.jsonl");
-        let raw = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
-        let mut recs = Vec::new();
-        for (i, line) in raw.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let r = darkmux_flow::reader::parse_record(line).unwrap_or_else(|| {
-                panic!("demo-flow.jsonl line {} is not a valid FlowRecord\n  {line}", i + 1)
-            });
-            recs.push(r);
-        }
-        assert!(!recs.is_empty(), "demo dataset is empty");
-        // The demo flare is data-driven: the viewer's mission crumb and the
-        // `#mission=<id>` MAP lens resolve through the missions the world
-        // publishes (#2032 replays a REAL finalized mission, no hand-authored
-        // `demo` mission any more), so every mission-scoped flow record must
-        // name a mission `docs/demo/demo-missions.json` lists — an orphan id
-        // would render a crumb that leads nowhere.
-        let flow_missions: std::collections::BTreeSet<_> =
-            recs.iter().filter_map(|r| r.mission_id.as_deref()).collect();
-        assert!(!flow_missions.is_empty(), "demo dataset must carry mission-scoped records (the demo flare)");
-        let missions_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/demo/demo-missions.json");
-        let missions: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(missions_path).unwrap_or_else(|e| panic!("reading {missions_path}: {e}")),
+#[tokio::test]
+async fn health_returns_200_with_versions() {
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
         )
-        .expect("demo-missions.json is JSON");
-        let listed: std::collections::BTreeSet<_> = missions["missions"]
-            .as_array()
-            .expect("demo-missions.json carries a `missions` array")
-            .iter()
-            .filter_map(|m| m["id"].as_str())
-            .collect();
-        for m in &flow_missions {
-            assert!(listed.contains(m), "flow record mission `{m}` is not a mission demo-missions.json lists ({listed:?})");
-        }
-        let machines: std::collections::BTreeSet<_> =
-            recs.iter().filter_map(|r| r.machine_id.as_deref()).collect();
-        assert!(
-            machines.len() >= 3,
-            "demo should showcase a multi-machine fleet, got {machines:?}"
-        );
-    }
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn health_returns_200_with_versions() {
+    assert_eq!(response.status(), 200);
+
+    let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(!json["darkmux_version"].as_str().unwrap().is_empty());
+    assert!(!json["flow_schema_version"].as_str().unwrap().is_empty());
+}
+
+/// `/health` carries the lifecycle policy: the viewer's one cheap read of
+/// the numbers every run is judged by, never a `/runs` build.
+#[tokio::test]
+async fn health_carries_the_lifecycle_policy() {
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let policy = crate::runs::runs_policy();
+    assert_eq!(
+        json["lifecycle_policy"]["stale_after_ms"].as_u64(),
+        Some(policy.stale_after_ms)
+    );
+    assert_eq!(
+        json["lifecycle_policy"]["budget_wait_grace_ms"].as_u64(),
+        Some(policy.budget_wait_grace_ms)
+    );
+}
+
+/// (#1530 dogfood) The viewer document carries cache VALIDATORS. Serving
+/// a ~256 KB page with no `ETag` and no `Cache-Control` left the browser
+/// to pick between a full re-download every load and a heuristically
+/// cached (stale) copy — the operator hit BOTH during the 2.3.0 release
+/// dogfood.
+///
+/// `/mission/:id/graph` dropped out of this loop (#1868): it is now a
+/// 308 redirect, not an HTML document, so it carries no `ETag`/
+/// `Cache-Control` pair to assert here — see
+/// `mission_graph_route_redirects_into_the_port` for its own coverage.
+#[tokio::test]
+async fn html_documents_carry_cache_validators() {
+    for uri in ["/", "/play/2026-07-28"] {
         let app = build_router_local(PathBuf::new());
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
-
-        assert_eq!(response.status(), 200);
-
-        let bytes = to_bytes(response.into_body(), 1024)
-            .await
-            .unwrap();
-
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(!json["darkmux_version"].as_str().unwrap().is_empty());
-        assert!(!json["flow_schema_version"].as_str().unwrap().is_empty());
-    }
-
-    /// `/health` carries the lifecycle policy: the viewer's one cheap read of
-    /// the numbers every run is judged by, never a `/runs` build.
-    #[tokio::test]
-    async fn health_carries_the_lifecycle_policy() {
-        let app = build_router_local(PathBuf::new());
-        let response = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
-        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let policy = crate::runs::runs_policy();
-        assert_eq!(json["lifecycle_policy"]["stale_after_ms"].as_u64(), Some(policy.stale_after_ms));
-        assert_eq!(json["lifecycle_policy"]["budget_wait_grace_ms"].as_u64(), Some(policy.budget_wait_grace_ms));
-    }
-
-    /// (#1530 dogfood) The viewer document carries cache VALIDATORS. Serving
-    /// a ~256 KB page with no `ETag` and no `Cache-Control` left the browser
-    /// to pick between a full re-download every load and a heuristically
-    /// cached (stale) copy — the operator hit BOTH during the 2.3.0 release
-    /// dogfood.
-    ///
-    /// `/mission/:id/graph` dropped out of this loop (#1868): it is now a
-    /// 308 redirect, not an HTML document, so it carries no `ETag`/
-    /// `Cache-Control` pair to assert here — see
-    /// `mission_graph_route_redirects_into_the_port` for its own coverage.
-    #[tokio::test]
-    async fn html_documents_carry_cache_validators() {
-        for uri in ["/", "/play/2026-07-28"] {
-            let app = build_router_local(PathBuf::new());
-            let response = app
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), 200, "{uri} did not 200");
-            let h = response.headers();
-            assert_eq!(
-                h.get("cache-control").and_then(|v| v.to_str().ok()),
-                Some("no-cache"),
-                "{uri} must revalidate — it changes on every darkmux build"
-            );
-            let etag = h
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default()
-                .to_string();
-            assert!(etag.starts_with('"') && etag.ends_with('"'), "{uri} etag `{etag}` is not quoted");
-        }
-    }
-
-    /// A matching `If-None-Match` gets a zero-body `304`, so the common
-    /// reload costs a validator round-trip instead of the whole document.
-    #[tokio::test]
-    async fn matching_if_none_match_gets_304_with_no_body() {
-        let first = build_router_local(PathBuf::new())
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let etag = first.headers().get("etag").unwrap().to_str().unwrap().to_string();
-
-        let second = build_router_local(PathBuf::new())
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .header("if-none-match", &etag)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(second.status(), 304, "matching etag should not re-send the document");
-        let bytes = to_bytes(second.into_body(), 1024).await.unwrap();
-        assert!(bytes.is_empty(), "304 must carry no body");
-    }
-
-    /// A STALE validator must still get the full document — otherwise the
-    /// fix would trade "always stale" for "never updates".
-    #[tokio::test]
-    async fn stale_if_none_match_gets_the_full_document() {
-        let response = build_router_local(PathBuf::new())
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .header("if-none-match", "\"0000000000000000\"")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024).await.unwrap();
-        assert!(!bytes.is_empty(), "a stale validator must re-send the body");
-    }
-
-    /// `/` and `/play/:date` inject DIFFERENT mode metas into the same source
-    /// document, so they must not collide on one validator — otherwise a
-    /// browser that loaded one would be told the other is unchanged.
-    #[tokio::test]
-    async fn live_and_playback_documents_have_distinct_etags() {
-        let live = build_router_local(PathBuf::new())
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let play = build_router_local(PathBuf::new())
-            .oneshot(Request::builder().uri("/play/2026-07-28").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_ne!(
-            live.headers().get("etag").unwrap(),
-            play.headers().get("etag").unwrap(),
-            "live and playback documents differ, so their validators must too"
+        assert_eq!(response.status(), 200, "{uri} did not 200");
+        let h = response.headers();
+        assert_eq!(
+            h.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-cache"),
+            "{uri} must revalidate — it changes on every darkmux build"
         );
-    }
-
-    #[tokio::test]
-    async fn root_serves_viewer_html() {
-        // #554: GET / serves the observability viewer (same-origin host
-        // for the viewer's /flow/:date fetches). Since the flip (#1800) that
-        // viewer is the React port; the mode-meta contract asserted here is
-        // unchanged by which document it is injected into, and BOTH apps read
-        // it — legacy in `boot()`, the port in `injectedPlaybackDate()`.
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), 200);
-        let ct = response
-            .headers()
-            .get("content-type")
+        let etag = h
+            .get("etag")
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        assert!(ct.starts_with("text/html"), "content-type was `{ct}`");
-
-        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
-            .await
-            .unwrap();
-        let body = String::from_utf8(bytes.to_vec()).unwrap();
-        let lower = body.to_lowercase();
         assert!(
-            lower.contains("<!doctype") || lower.contains("<html"),
-            "GET / body is not HTML"
-        );
-        // #624 follow-up: GET / injects darkmux-mode=live so the viewer's
-        // boot() knows to start the SSE tail. No darkmux-date meta on the
-        // live route — the viewer falls back to URL-driven targetDate().
-        assert!(
-            body.contains(r#"<meta name="darkmux-mode" content="live">"#),
-            "live meta absent from GET / body"
-        );
-        assert!(
-            !body.contains(r#"<meta name="darkmux-date""#),
-            "live route should not inject a date meta"
+            etag.starts_with('"') && etag.ends_with('"'),
+            "{uri} etag `{etag}` is not quoted"
         );
     }
+}
 
-    /// The flip itself: `GET /` serves the React port, not the legacy viewer.
-    ///
-    /// This test previously asserted the OPPOSITE — `next_route_does_not_
-    /// disturb_the_legacy_root_route`, which guarded `/`'s legacy body while
-    /// `/next` was additive. Inverting it is the point of this change, so it
-    /// is inverted here rather than deleted: the assertion that `/` changed
-    /// hands is exactly what a future reader needs to find.
-    #[tokio::test]
-    async fn root_serves_the_react_port_not_the_legacy_viewer() {
-        let app = build_router_local(PathBuf::new());
+/// A matching `If-None-Match` gets a zero-body `304`, so the common
+/// reload costs a validator round-trip instead of the whole document.
+#[tokio::test]
+async fn matching_if_none_match_gets_304_with_no_body() {
+    let first = build_router_local(PathBuf::new())
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let etag = first
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let second = build_router_local(PathBuf::new())
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("if-none-match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        304,
+        "matching etag should not re-send the document"
+    );
+    let bytes = to_bytes(second.into_body(), 1024).await.unwrap();
+    assert!(bytes.is_empty(), "304 must carry no body");
+}
+
+/// A STALE validator must still get the full document — otherwise the
+/// fix would trade "always stale" for "never updates".
+#[tokio::test]
+async fn stale_if_none_match_gets_the_full_document() {
+    let response = build_router_local(PathBuf::new())
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("if-none-match", "\"0000000000000000\"")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(!bytes.is_empty(), "a stale validator must re-send the body");
+}
+
+/// `/` and `/play/:date` inject DIFFERENT mode metas into the same source
+/// document, so they must not collide on one validator — otherwise a
+/// browser that loaded one would be told the other is unchanged.
+#[tokio::test]
+async fn live_and_playback_documents_have_distinct_etags() {
+    let live = build_router_local(PathBuf::new())
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let play = build_router_local(PathBuf::new())
+        .oneshot(
+            Request::builder()
+                .uri("/play/2026-07-28")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        live.headers().get("etag").unwrap(),
+        play.headers().get("etag").unwrap(),
+        "live and playback documents differ, so their validators must too"
+    );
+}
+
+#[tokio::test]
+async fn root_serves_viewer_html() {
+    // #554: GET / serves the observability viewer (same-origin host
+    // for the viewer's /flow/:date fetches). Since the flip (#1800) that
+    // viewer is the React port; the mode-meta contract asserted here is
+    // unchanged by which document it is injected into, and BOTH apps read
+    // it — legacy in `boot()`, the port in `injectedPlaybackDate()`.
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let ct = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(ct.starts_with("text/html"), "content-type was `{ct}`");
+
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    let lower = body.to_lowercase();
+    assert!(
+        lower.contains("<!doctype") || lower.contains("<html"),
+        "GET / body is not HTML"
+    );
+    // #624 follow-up: GET / injects darkmux-mode=live so the viewer's
+    // boot() knows to start the SSE tail. No darkmux-date meta on the
+    // live route — the viewer falls back to URL-driven targetDate().
+    assert!(
+        body.contains(r#"<meta name="darkmux-mode" content="live">"#),
+        "live meta absent from GET / body"
+    );
+    assert!(
+        !body.contains(r#"<meta name="darkmux-date""#),
+        "live route should not inject a date meta"
+    );
+}
+
+/// The flip itself: `GET /` serves the React port, not the legacy viewer.
+///
+/// This test previously asserted the OPPOSITE — `next_route_does_not_
+/// disturb_the_legacy_root_route`, which guarded `/`'s legacy body while
+/// `/next` was additive. Inverting it is the point of this change, so it
+/// is inverted here rather than deleted: the assertion that `/` changed
+/// hands is exactly what a future reader needs to find.
+#[tokio::test]
+async fn root_serves_the_react_port_not_the_legacy_viewer() {
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    let lower = body.to_lowercase();
+
+    // The singlefile build inlines its JS — no external chunk to 404 on.
+    assert!(
+        !lower.contains("src=\"/assets/") && !lower.contains("src='./assets/"),
+        "GET / references an external asset — the singlefile build should have inlined it"
+    );
+    // A POSITIVE identification of the port, so this cannot pass merely
+    // because some unrelated body also lacks external assets. The legacy
+    // viewer is a hand-written document with no bundler banner; the port
+    // is a Vite singlefile build and carries its own root node.
+    assert!(
+        body.contains(r#"id="root""#),
+        "GET / does not look like the React port's document"
+    );
+    // And the legacy viewer's own top-level JS, which the port has no
+    // reason to contain. `id="stage"` is NOT usable for this: the port
+    // reproduces that element deliberately (the parity extractor selects
+    // it in BOTH apps), which is exactly the trap an inverted test invites.
+    assert!(
+        !body.contains("function renderFleet()"),
+        "GET / still contains the legacy viewer's renderFleet — the flip did not take"
+    );
+}
+
+#[tokio::test]
+async fn play_serves_viewer_html_with_playback_meta() {
+    // #624 follow-up: GET /play/<date> serves the same viewer HTML with
+    // darkmux-mode=play + darkmux-date=<date> so the client skips the SSE
+    // tail and stays in replay mode for the captured day.
+    //
+    // (the flip, #1800) These two metas became LOAD-BEARING FOR ROUTING,
+    // not just for mode. `/play/<date>` puts the date in the response
+    // body and nowhere in the URL the client can route on — no hash, no
+    // query. Legacy read them at boot; the port did not, because until
+    // the flip `/play/:date` served legacy and the port was live-only. So
+    // the flip had to teach the port to read them
+    // (`lib/injectedMeta.ts`'s `injectedPlaybackDate`), or `/play/<date>`
+    // would have rendered TODAY's live fleet view under yesterday's
+    // address — silently, and in exactly the confidently-wrong way the
+    // #1800 gate spent its whole scope eliminating.
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/play/2026-06-03")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        body.contains(r#"<meta name="darkmux-mode" content="play">"#),
+        "play meta absent from GET /play/<date> body"
+    );
+    assert!(
+        body.contains(r#"<meta name="darkmux-date" content="2026-06-03">"#),
+        "date meta absent from GET /play/<date> body"
+    );
+}
+
+#[tokio::test]
+async fn play_rejects_malformed_date_with_404() {
+    // The handler delegates date validation to `is_valid_date`, which
+    // checks SHAPE (10 chars, dashes at positions 4 and 7, digits
+    // elsewhere) but not calendar values. "2026-13-99" passes the shape
+    // check; the daemon returns 200 + empty viewer for it because the
+    // resulting /flow/<date> lookup returns no records — that's
+    // acceptable. We test only shape-rejection cases here.
+    let app = build_router_local(PathBuf::new());
+    for bad in ["garbage", "26-6-3", "2026/06/03", "2026-06-3", "2026-6-03"] {
         let response = app
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
-            .await
-            .unwrap();
-        let body = String::from_utf8(bytes.to_vec()).unwrap();
-        let lower = body.to_lowercase();
-
-        // The singlefile build inlines its JS — no external chunk to 404 on.
-        assert!(
-            !lower.contains("src=\"/assets/") && !lower.contains("src='./assets/"),
-            "GET / references an external asset — the singlefile build should have inlined it"
-        );
-        // A POSITIVE identification of the port, so this cannot pass merely
-        // because some unrelated body also lacks external assets. The legacy
-        // viewer is a hand-written document with no bundler banner; the port
-        // is a Vite singlefile build and carries its own root node.
-        assert!(
-            body.contains(r#"id="root""#),
-            "GET / does not look like the React port's document"
-        );
-        // And the legacy viewer's own top-level JS, which the port has no
-        // reason to contain. `id="stage"` is NOT usable for this: the port
-        // reproduces that element deliberately (the parity extractor selects
-        // it in BOTH apps), which is exactly the trap an inverted test invites.
-        assert!(
-            !body.contains("function renderFleet()"),
-            "GET / still contains the legacy viewer's renderFleet — the flip did not take"
-        );
-    }
-
-    #[tokio::test]
-    async fn play_serves_viewer_html_with_playback_meta() {
-        // #624 follow-up: GET /play/<date> serves the same viewer HTML with
-        // darkmux-mode=play + darkmux-date=<date> so the client skips the SSE
-        // tail and stays in replay mode for the captured day.
-        //
-        // (the flip, #1800) These two metas became LOAD-BEARING FOR ROUTING,
-        // not just for mode. `/play/<date>` puts the date in the response
-        // body and nowhere in the URL the client can route on — no hash, no
-        // query. Legacy read them at boot; the port did not, because until
-        // the flip `/play/:date` served legacy and the port was live-only. So
-        // the flip had to teach the port to read them
-        // (`lib/injectedMeta.ts`'s `injectedPlaybackDate`), or `/play/<date>`
-        // would have rendered TODAY's live fleet view under yesterday's
-        // address — silently, and in exactly the confidently-wrong way the
-        // #1800 gate spent its whole scope eliminating.
-        let app = build_router_local(PathBuf::new());
-        let response = app
+            .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/play/2026-06-03")
+                    .uri(format!("/play/{bad}"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), 200);
-        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
-            .await
-            .unwrap();
-        let body = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(
-            body.contains(r#"<meta name="darkmux-mode" content="play">"#),
-            "play meta absent from GET /play/<date> body"
-        );
-        assert!(
-            body.contains(r#"<meta name="darkmux-date" content="2026-06-03">"#),
-            "date meta absent from GET /play/<date> body"
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "expected 404 for /play/{bad}"
         );
     }
+}
 
-    #[tokio::test]
-    async fn play_rejects_malformed_date_with_404() {
-        // The handler delegates date validation to `is_valid_date`, which
-        // checks SHAPE (10 chars, dashes at positions 4 and 7, digits
-        // elsewhere) but not calendar values. "2026-13-99" passes the shape
-        // check; the daemon returns 200 + empty viewer for it because the
-        // resulting /flow/<date> lookup returns no records — that's
-        // acceptable. We test only shape-rejection cases here.
-        let app = build_router_local(PathBuf::new());
-        for bad in ["garbage", "26-6-3", "2026/06/03", "2026-06-3", "2026-6-03"] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(format!("/play/{bad}"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                response.status(),
-                StatusCode::NOT_FOUND,
-                "expected 404 for /play/{bad}"
-            );
-        }
+#[test]
+fn inject_mode_meta_inserts_after_head_open_tag() {
+    let html = "<!doctype html><html><head>\n<title>x</title></head><body></body></html>";
+    let live = inject_mode_meta(html, "live", None);
+    assert!(live.contains(r#"<meta name="darkmux-mode" content="live">"#));
+    assert!(!live.contains(r#"<meta name="darkmux-date""#));
+    // Order matters: meta must come AFTER <head> open tag, BEFORE <title>
+    let head_pos = live.find("<head>").unwrap();
+    let meta_pos = live.find(r#"<meta name="darkmux-mode""#).unwrap();
+    let title_pos = live.find("<title>").unwrap();
+    assert!(head_pos < meta_pos && meta_pos < title_pos);
+
+    let play = inject_mode_meta(html, "play", Some("2026-06-03"));
+    assert!(play.contains(r#"<meta name="darkmux-mode" content="play">"#));
+    assert!(play.contains(r#"<meta name="darkmux-date" content="2026-06-03">"#));
+}
+
+#[tokio::test]
+async fn root_route_does_not_shadow_api_routes() {
+    // Adding GET / must not collide with the noun-prefixed API routes.
+    // `/health` has no external deps, so a clean 200 here proves the
+    // router still dispatches the API surface after `/` was added.
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "/health regressed after adding GET /"
+    );
+}
+
+#[tokio::test]
+async fn fleet_dispatches_live_carries_sessions_plus_a_coverage_state() {
+    // GET /fleet/dispatches/live (#638) must always answer 200 and never
+    // 500 on a Redis blip — the live viewer keys "running" on this.
+    // It now answers with an OBJECT so an empty `sessions` can be
+    // distinguished from an unreadable substrate: the viewer used to
+    // render both as "nothing live", which is what turned a dead Redis
+    // into fleet-wide dead-looking seats (#1483).
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/fleet/dispatches/live")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        body["dispatches"].is_array(),
+        "live dispatches must be a JSON array under `dispatches`"
+    );
+    assert!(
+        body["meta"]["sources"]["fleet"]["state"].is_string(),
+        "coverage state must be reported"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+// MUST be serial: the guard below reads `DARKMUX_REDIS_URL`, and other
+// tests in this binary `set_var` it mid-run. `#[serial]` only excludes
+// OTHER serial tests, so as a plain test this would race them — either
+// silently early-returning (a probe that passes without executing, on
+// exactly the CI machines it was written for) or failing spuriously when
+// the var appears between the guard and the handler's own live re-read.
+async fn live_endpoints_report_off_not_degraded_when_redis_is_unconfigured() {
+    // The inverted case, and the one a naive implementation gets wrong:
+    // with no Redis configured (CI, and every single-machine install),
+    // the empty result is CORRECT — `off`, `complete: true`. If this ever
+    // reports `unavailable`/`complete: false`, every standalone operator
+    // gets a permanent false warning about a fleet they never had.
+    //
+    // Guarded on the environment rather than asserted blindly: a
+    // developer box with a live Redis legitimately answers `ok` here, and
+    // a test that passes for the wrong reason is worse than no test.
+    if darkmux_flow::redis_url().is_some() {
+        eprintln!(
+            "skipping: this machine has Redis configured, so `off` is not the expected state"
+        );
+        return;
     }
-
-    #[test]
-    fn inject_mode_meta_inserts_after_head_open_tag() {
-        let html = "<!doctype html><html><head>\n<title>x</title></head><body></body></html>";
-        let live = inject_mode_meta(html, "live", None);
-        assert!(live.contains(r#"<meta name="darkmux-mode" content="live">"#));
-        assert!(!live.contains(r#"<meta name="darkmux-date""#));
-        // Order matters: meta must come AFTER <head> open tag, BEFORE <title>
-        let head_pos = live.find("<head>").unwrap();
-        let meta_pos = live.find(r#"<meta name="darkmux-mode""#).unwrap();
-        let title_pos = live.find("<title>").unwrap();
-        assert!(head_pos < meta_pos && meta_pos < title_pos);
-
-        let play = inject_mode_meta(html, "play", Some("2026-06-03"));
-        assert!(play.contains(r#"<meta name="darkmux-mode" content="play">"#));
-        assert!(play.contains(r#"<meta name="darkmux-date" content="2026-06-03">"#));
-    }
-
-    #[tokio::test]
-    async fn root_route_does_not_shadow_api_routes() {
-        // Adding GET / must not collide with the noun-prefixed API routes.
-        // `/health` has no external deps, so a clean 200 here proves the
-        // router still dispatches the API surface after `/` was added.
+    for uri in ["/fleet/dispatches/live", "/fleet/machines/live"] {
         let app = build_router_local(PathBuf::new());
         let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), 200, "/health regressed after adding GET /");
-    }
-
-    #[tokio::test]
-    async fn fleet_dispatches_live_carries_sessions_plus_a_coverage_state() {
-        // GET /fleet/dispatches/live (#638) must always answer 200 and never
-        // 500 on a Redis blip — the live viewer keys "running" on this.
-        // It now answers with an OBJECT so an empty `sessions` can be
-        // distinguished from an unreadable substrate: the viewer used to
-        // render both as "nothing live", which is what turned a dead Redis
-        // into fleet-wide dead-looking seats (#1483).
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/fleet/dispatches/live")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
         let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(body["dispatches"].is_array(), "live dispatches must be a JSON array under `dispatches`");
-        assert!(body["meta"]["sources"]["fleet"]["state"].is_string(), "coverage state must be reported");
+        assert_eq!(
+            body["meta"]["sources"]["fleet"]["state"], "off",
+            "{uri}: an unconfigured fleet is not a degradation"
+        );
+        assert_eq!(
+            body["meta"]["complete"], true,
+            "{uri}: `off` must still read as complete"
+        );
     }
+}
 
-    #[tokio::test]
-    #[serial_test::serial]
-    // MUST be serial: the guard below reads `DARKMUX_REDIS_URL`, and other
-    // tests in this binary `set_var` it mid-run. `#[serial]` only excludes
-    // OTHER serial tests, so as a plain test this would race them — either
-    // silently early-returning (a probe that passes without executing, on
-    // exactly the CI machines it was written for) or failing spuriously when
-    // the var appears between the guard and the handler's own live re-read.
-    async fn live_endpoints_report_off_not_degraded_when_redis_is_unconfigured() {
-        // The inverted case, and the one a naive implementation gets wrong:
-        // with no Redis configured (CI, and every single-machine install),
-        // the empty result is CORRECT — `off`, `complete: true`. If this ever
-        // reports `unavailable`/`complete: false`, every standalone operator
-        // gets a permanent false warning about a fleet they never had.
-        //
-        // Guarded on the environment rather than asserted blindly: a
-        // developer box with a live Redis legitimately answers `ok` here, and
-        // a test that passes for the wrong reason is worse than no test.
-        if darkmux_flow::redis_url().is_some() {
-            eprintln!("skipping: this machine has Redis configured, so `off` is not the expected state");
-            return;
-        }
-        for uri in ["/fleet/dispatches/live", "/fleet/machines/live"] {
-            let app = build_router_local(PathBuf::new());
-            let response = app
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(
-                body["meta"]["sources"]["fleet"]["state"], "off",
-                "{uri}: an unconfigured fleet is not a degradation"
-            );
-            assert_eq!(body["meta"]["complete"], true, "{uri}: `off` must still read as complete");
-        }
-    }
+#[tokio::test]
+async fn fleet_machines_live_carries_machines_plus_a_coverage_state() {
+    // GET /fleet/machines/live (#638) — the same contract as the sessions
+    // endpoint: always 200, never a 500 on a Redis blip, and now an
+    // object whose `meta` says whether the empty case was observed or
+    // merely assumed.
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/fleet/machines/live")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        body["machines"].is_array(),
+        "live machines must be a JSON array under `machines`"
+    );
+    assert!(
+        body["meta"]["sources"]["fleet"]["state"].is_string(),
+        "coverage state must be reported"
+    );
+}
 
-    #[tokio::test]
-    async fn fleet_machines_live_carries_machines_plus_a_coverage_state() {
-        // GET /fleet/machines/live (#638) — the same contract as the sessions
-        // endpoint: always 200, never a 500 on a Redis blip, and now an
-        // object whose `meta` says whether the empty case was observed or
-        // merely assumed.
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/fleet/machines/live")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(body["machines"].is_array(), "live machines must be a JSON array under `machines`");
-        assert!(body["meta"]["sources"]["fleet"]["state"].is_string(), "coverage state must be reported");
-    }
-
-    /// GET /fleet/roster (#1855) — the declared topology, independent of
-    /// presence. This is the endpoint the "rostered-but-silent machine
-    /// vanishes entirely" fix reads: a machine the operator added via
-    /// `darkmux machine add` must be nameable even when it has never once
-    /// beaten and has zero flow records, and this is the only place that
-    /// data can come from — `/fleet/machines/live` structurally cannot
-    /// answer it (presence-only by design).
-    #[tokio::test]
-    #[serial_test::serial] // mutates DARKMUX_FLEET_FILE
-    async fn fleet_roster_reports_a_rostered_machine_that_has_never_beaten() {
-        let tmp = TempDir::new().unwrap();
-        let roster_path = tmp.path().join("fleet.json");
-        fs::write(
+/// GET /fleet/roster (#1855) — the declared topology, independent of
+/// presence. This is the endpoint the "rostered-but-silent machine
+/// vanishes entirely" fix reads: a machine the operator added via
+/// `darkmux machine add` must be nameable even when it has never once
+/// beaten and has zero flow records, and this is the only place that
+/// data can come from — `/fleet/machines/live` structurally cannot
+/// answer it (presence-only by design).
+#[tokio::test]
+#[serial_test::serial] // mutates DARKMUX_FLEET_FILE
+async fn fleet_roster_reports_a_rostered_machine_that_has_never_beaten() {
+    let tmp = TempDir::new().unwrap();
+    let roster_path = tmp.path().join("fleet.json");
+    fs::write(
             &roster_path,
             r#"{"version":"2","machines":{"studio":{"id":"studio","address":"100.64.1.2:8765","description":"hub","added_unix_ms":1000}}}"#,
         )
         .unwrap();
-        let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
-        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &roster_path) };
+    let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
+    unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &roster_path) };
 
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(Request::builder().uri("/fleet/roster").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/fleet/roster")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-        match prev {
-            Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v) },
-            None => unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") },
-        }
+    match prev {
+        Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v) },
+        None => unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") },
+    }
 
-        assert!(body["error"].is_null(), "a valid roster file must not report an error: {body}");
-        let machines = body["machines"].as_array().expect("machines must be an array");
-        assert_eq!(machines.len(), 1, "the rostered-but-never-beaten machine must still appear: {body}");
-        assert_eq!(machines[0]["id"], "studio");
-        assert_eq!(machines[0]["address"], "100.64.1.2:8765");
-        // (#2768) This fixture's raw JSON predates `machine_uid` entirely (no
-        // key in the literal above) — the lenient-on-read contract
-        // (`#[serde(default)]`) must load it without error and answer with
-        // an explicit `null`, never omit the key or synthesize a value. A
-        // consumer checking "is this identity known" must see `null`, not
-        // have to distinguish "absent key" from "known-empty".
-        assert!(
+    assert!(
+        body["error"].is_null(),
+        "a valid roster file must not report an error: {body}"
+    );
+    let machines = body["machines"]
+        .as_array()
+        .expect("machines must be an array");
+    assert_eq!(
+        machines.len(),
+        1,
+        "the rostered-but-never-beaten machine must still appear: {body}"
+    );
+    assert_eq!(machines[0]["id"], "studio");
+    assert_eq!(machines[0]["address"], "100.64.1.2:8765");
+    // (#2768) This fixture's raw JSON predates `machine_uid` entirely (no
+    // key in the literal above) — the lenient-on-read contract
+    // (`#[serde(default)]`) must load it without error and answer with
+    // an explicit `null`, never omit the key or synthesize a value. A
+    // consumer checking "is this identity known" must see `null`, not
+    // have to distinguish "absent key" from "known-empty".
+    assert!(
             machines[0]["machine_uid"].is_null(),
             "a pre-#2768 roster entry must surface machine_uid as null, not omit or fabricate it: {body}"
         );
-    }
+}
 
-    /// (#2768) The other half: a roster entry that DOES carry a resolved
-    /// `machine_uid` — either `machine add`'s self-registration path or an
-    /// operator hand-edit — round-trips it over the wire unchanged, so the
-    /// viewer's uid join has something real to match against.
-    #[tokio::test]
-    #[serial_test::serial] // mutates DARKMUX_FLEET_FILE
-    async fn fleet_roster_reports_a_resolved_machine_uid_when_present() {
-        let tmp = TempDir::new().unwrap();
-        let roster_path = tmp.path().join("fleet.json");
-        fs::write(
+/// (#2768) The other half: a roster entry that DOES carry a resolved
+/// `machine_uid` — either `machine add`'s self-registration path or an
+/// operator hand-edit — round-trips it over the wire unchanged, so the
+/// viewer's uid join has something real to match against.
+#[tokio::test]
+#[serial_test::serial] // mutates DARKMUX_FLEET_FILE
+async fn fleet_roster_reports_a_resolved_machine_uid_when_present() {
+    let tmp = TempDir::new().unwrap();
+    let roster_path = tmp.path().join("fleet.json");
+    fs::write(
             &roster_path,
             r#"{"version":"2","machines":{"laptop":{"id":"laptop","address":"127.0.0.1:8765","added_unix_ms":1000,"machine_uid":"00000000-0000-4000-8000-ABCDEF000020"}}}"#,
         )
         .unwrap();
-        let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
-        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &roster_path) };
+    let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
+    unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &roster_path) };
 
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(Request::builder().uri("/fleet/roster").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/fleet/roster")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-        match prev {
-            Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v) },
-            None => unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") },
-        }
-
-        let machines = body["machines"].as_array().expect("machines must be an array");
-        assert_eq!(machines.len(), 1);
-        assert_eq!(machines[0]["id"], "laptop");
-        assert_eq!(machines[0]["machine_uid"], "00000000-0000-4000-8000-ABCDEF000020");
+    match prev {
+        Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v) },
+        None => unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") },
     }
 
-    /// The inverted case: no roster file at all (the fresh-install/
-    /// standalone-machine default) must answer an EMPTY roster with no
-    /// error, not a 500 or a fabricated entry. `load_roster`'s own contract
-    /// (missing file ⇒ empty roster) is what this pins at the HTTP layer.
-    #[tokio::test]
-    #[serial_test::serial] // mutates DARKMUX_FLEET_FILE
-    async fn fleet_roster_is_empty_and_errorless_when_no_roster_file_exists() {
-        let tmp = TempDir::new().unwrap(); // deliberately no fleet.json inside
-        let roster_path = tmp.path().join("fleet.json");
-        let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
-        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &roster_path) };
+    let machines = body["machines"]
+        .as_array()
+        .expect("machines must be an array");
+    assert_eq!(machines.len(), 1);
+    assert_eq!(machines[0]["id"], "laptop");
+    assert_eq!(
+        machines[0]["machine_uid"],
+        "00000000-0000-4000-8000-ABCDEF000020"
+    );
+}
 
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(Request::builder().uri("/fleet/roster").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+/// The inverted case: no roster file at all (the fresh-install/
+/// standalone-machine default) must answer an EMPTY roster with no
+/// error, not a 500 or a fabricated entry. `load_roster`'s own contract
+/// (missing file ⇒ empty roster) is what this pins at the HTTP layer.
+#[tokio::test]
+#[serial_test::serial] // mutates DARKMUX_FLEET_FILE
+async fn fleet_roster_is_empty_and_errorless_when_no_roster_file_exists() {
+    let tmp = TempDir::new().unwrap(); // deliberately no fleet.json inside
+    let roster_path = tmp.path().join("fleet.json");
+    let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
+    unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &roster_path) };
 
-        match prev {
-            Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v) },
-            None => unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") },
-        }
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/fleet/roster")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-        assert!(body["error"].is_null(), "a missing roster file is not an error: {body}");
-        assert_eq!(
-            body["machines"].as_array().expect("machines must be an array").len(),
-            0,
-            "no roster file must mean zero machines, not a fabricated one: {body}"
-        );
+    match prev {
+        Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v) },
+        None => unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") },
     }
 
-    /// (CONSIDER 4, #1855 follow-up review) A PRESENT-but-corrupt roster
-    /// file must report `error` as an actual non-empty STRING, not merely
-    /// something that satisfies `is_null()`. The two prior tests above both
-    /// asserted `body["error"].is_null()` in the SUCCESS case, and
-    /// `serde_json::Value::Null` is also what an entirely MISSING `error`
-    /// key resolves to (`Value::get` returns `Value::Null` for a missing
-    /// index) — so both tests stayed green through a mutation that deleted
-    /// the `error` field from the response body outright. This test uses
-    /// `.as_str()` instead, which returns `None` (and panics the
-    /// `.expect`) for BOTH a missing key and a null value, closing that
-    /// gap: it fails for a mutation neither existing test would have
-    /// caught. See `ROSTER_READ_FAILED`'s own doc for why the string is a
-    /// fixed literal rather than the underlying parse error text.
-    #[tokio::test]
-    #[serial_test::serial] // mutates DARKMUX_FLEET_FILE
-    async fn fleet_roster_reports_the_parse_error_for_a_present_but_corrupt_file() {
-        let tmp = TempDir::new().unwrap();
-        let roster_path = tmp.path().join("fleet.json");
-        fs::write(&roster_path, b"{not valid json at all").unwrap();
-        let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
-        unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &roster_path) };
+    assert!(
+        body["error"].is_null(),
+        "a missing roster file is not an error: {body}"
+    );
+    assert_eq!(
+        body["machines"]
+            .as_array()
+            .expect("machines must be an array")
+            .len(),
+        0,
+        "no roster file must mean zero machines, not a fabricated one: {body}"
+    );
+}
 
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(Request::builder().uri("/fleet/roster").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200, "a corrupt roster file must not 500");
-        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+/// (CONSIDER 4, #1855 follow-up review) A PRESENT-but-corrupt roster
+/// file must report `error` as an actual non-empty STRING, not merely
+/// something that satisfies `is_null()`. The two prior tests above both
+/// asserted `body["error"].is_null()` in the SUCCESS case, and
+/// `serde_json::Value::Null` is also what an entirely MISSING `error`
+/// key resolves to (`Value::get` returns `Value::Null` for a missing
+/// index) — so both tests stayed green through a mutation that deleted
+/// the `error` field from the response body outright. This test uses
+/// `.as_str()` instead, which returns `None` (and panics the
+/// `.expect`) for BOTH a missing key and a null value, closing that
+/// gap: it fails for a mutation neither existing test would have
+/// caught. See `ROSTER_READ_FAILED`'s own doc for why the string is a
+/// fixed literal rather than the underlying parse error text.
+#[tokio::test]
+#[serial_test::serial] // mutates DARKMUX_FLEET_FILE
+async fn fleet_roster_reports_the_parse_error_for_a_present_but_corrupt_file() {
+    let tmp = TempDir::new().unwrap();
+    let roster_path = tmp.path().join("fleet.json");
+    fs::write(&roster_path, b"{not valid json at all").unwrap();
+    let prev = std::env::var("DARKMUX_FLEET_FILE").ok();
+    unsafe { std::env::set_var("DARKMUX_FLEET_FILE", &roster_path) };
 
-        match prev {
-            Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v) },
-            None => unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") },
-        }
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/fleet/roster")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "a corrupt roster file must not 500");
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-        let error = body["error"]
+    match prev {
+        Some(v) => unsafe { std::env::set_var("DARKMUX_FLEET_FILE", v) },
+        None => unsafe { std::env::remove_var("DARKMUX_FLEET_FILE") },
+    }
+
+    let error = body["error"]
             .as_str()
             .expect("a corrupt roster file must report a non-null STRING error, not merely a missing/null field");
-        assert!(!error.is_empty(), "the error literal must not be empty: {body}");
-        // The literal, never the underlying parse error text (which would
-        // embed the temp-dir path) — see ROSTER_READ_FAILED's own doc.
-        assert_eq!(error, "the fleet roster file exists but could not be parsed");
-        assert_eq!(
-            body["machines"].as_array().expect("machines must be an array").len(),
-            0,
-            "a corrupt roster must not fabricate machines: {body}"
+    assert!(
+        !error.is_empty(),
+        "the error literal must not be empty: {body}"
+    );
+    // The literal, never the underlying parse error text (which would
+    // embed the temp-dir path) — see ROSTER_READ_FAILED's own doc.
+    assert_eq!(
+        error,
+        "the fleet roster file exists but could not be parsed"
+    );
+    assert_eq!(
+        body["machines"]
+            .as_array()
+            .expect("machines must be an array")
+            .len(),
+        0,
+        "a corrupt roster must not fabricate machines: {body}"
+    );
+}
+
+#[tokio::test]
+async fn machine_status_returns_200_with_structured_body() {
+    // The handler calls into `lms::list_loaded()`, which shells out to
+    // the `lms` binary. CI runners don't have it on PATH, so we expect
+    // `lms_unreachable: true` and `models: []` rather than a 500. This
+    // is the contract the `darkmux machine status <id>` peer read relies
+    // on — degraded state shows up as a visible signal, not as a fetch
+    // error. (#1426 — route renamed from /model/status.)
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/machine/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    // Structural assertions — operator-facing fields the viewer reads.
+    assert!(json.get("models").is_some(), "missing `models` array");
+    assert!(json["models"].is_array());
+    assert!(
+        json.get("lms_unreachable").is_some(),
+        "missing `lms_unreachable` flag"
+    );
+    assert!(json["lms_unreachable"].is_boolean());
+    let generated = json["generated_at_ms"]
+        .as_u64()
+        .expect("`generated_at_ms` must be a u64 epoch-millis");
+    // Sanity: timestamp should be after 2024 and before year 2100 — a
+    // wide check, just to ensure it's actually populated.
+    assert!(generated > 1_700_000_000_000);
+    assert!(generated < 4_000_000_000_000);
+}
+
+// ─── #275 PR-A: /machine/specs endpoint ──────────────────────────
+
+/// GET /machine/specs returns a JSON object with the local machine's
+/// versioned spec sheet — version + machine_id + RAM + CPU + OS
+/// + loaded models + redacted Redis URL. Tested at the contract level
+/// rather than the value level so the test doesn't depend on the
+/// machine actually running it.
+#[tokio::test]
+#[serial_test::serial]
+async fn machine_specs_endpoint_returns_versioned_payload() {
+    // Defensive — make sure no env from another test bleeds in.
+    unsafe {
+        std::env::remove_var("DARKMUX_REDIS_URL");
+        std::env::remove_var("DARKMUX_MACHINE_ID");
+    }
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/machine/specs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "expected 200 from /machine/specs"
+    );
+
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+    // Top-level contract — fields are present (values may be null on
+    // non-macOS / missing-lms runners, but the keys must exist).
+    for key in [
+        "darkmux_version",
+        "flow_schema_version",
+        "machine_id",
+        // (#2814) The KEY must be present even where the probe answers
+        // `None` (non-macOS CI, a failed `ioreg`) — the viewer's
+        // "self is never unknown" join reads `machine_uid ?? fall back to
+        // the name path", and a missing key and a null value have to mean
+        // the same thing to it.
+        "machine_uid",
+        "os",
+        "ram_total_bytes",
+        "ram_free_for_ai_bytes",
+        "cpu_brand",
+        "loaded_models",
+        "hub_configured",
+        "generated_at_ms",
+    ] {
+        assert!(
+            json.get(key).is_some(),
+            "/machine/specs response missing key `{key}`: {json}"
         );
     }
+    // `darkmux_version` must equal the build's CARGO_PKG_VERSION.
+    assert_eq!(
+        json["darkmux_version"].as_str(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    // `loaded_models` is an array even when lms is unreachable.
+    assert!(json["loaded_models"].is_array());
+}
 
-    #[tokio::test]
-    async fn machine_status_returns_200_with_structured_body() {
-        // The handler calls into `lms::list_loaded()`, which shells out to
-        // the `lms` binary. CI runners don't have it on PATH, so we expect
-        // `lms_unreachable: true` and `models: []` rather than a 500. This
-        // is the contract the `darkmux machine status <id>` peer read relies
-        // on — degraded state shows up as a visible signal, not as a fetch
-        // error. (#1426 — route renamed from /model/status.)
-        let app = build_router_local(PathBuf::new());
-        let response = app
+/// (#316 stage 3.2) A fake `lms` for the two machine reads below: `ps
+/// --json` reports one resident, every other verb fails.
+fn fake_lms_with_one_resident(dir: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("lms");
+    fs::write(
+            &bin,
+            "#!/bin/sh\n[ \"$1\" = ps ] || exit 1\necho '[{\"identifier\":\"darkmux:m\",\"modelKey\":\"m\",\"status\":\"idle\",\"sizeBytes\":1000000000,\"contextLength\":4096}]'\n",
+        )
+        .unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// Run `f` with `DARKMUX_LMS_BIN` set to `bin`, restoring it after.
+fn with_lms_bin<T>(bin: &std::path::Path, f: impl FnOnce() -> T) -> T {
+    let prev = std::env::var_os("DARKMUX_LMS_BIN");
+    // SAFETY: callers are #[serial].
+    unsafe { std::env::set_var("DARKMUX_LMS_BIN", bin) };
+    let out = f();
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+            None => std::env::remove_var("DARKMUX_LMS_BIN"),
+        }
+    }
+    out
+}
+
+/// (#316 stage 3.2) GET /machine/status carries what `lms ps` reports,
+/// and an `lms` that cannot run is `lms_unreachable`, never an empty
+/// reachable listing.
+#[tokio::test]
+#[serial_test::serial]
+async fn machine_status_carries_the_engines_listing() {
+    let tmp = TempDir::new().unwrap();
+    let bin = fake_lms_with_one_resident(tmp.path());
+    let status = |bin: PathBuf| async move {
+        let prev = std::env::var_os("DARKMUX_LMS_BIN");
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
+        let response = build_router_local(PathBuf::new())
             .oneshot(
                 Request::builder()
                     .uri("/machine/status")
@@ -827,169 +1122,42 @@
             )
             .await
             .unwrap();
-
-        assert_eq!(response.status(), 200);
-
-        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-
-        // Structural assertions — operator-facing fields the viewer reads.
-        assert!(json.get("models").is_some(), "missing `models` array");
-        assert!(json["models"].is_array());
-        assert!(
-            json.get("lms_unreachable").is_some(),
-            "missing `lms_unreachable` flag"
-        );
-        assert!(json["lms_unreachable"].is_boolean());
-        let generated = json["generated_at_ms"]
-            .as_u64()
-            .expect("`generated_at_ms` must be a u64 epoch-millis");
-        // Sanity: timestamp should be after 2024 and before year 2100 — a
-        // wide check, just to ensure it's actually populated.
-        assert!(generated > 1_700_000_000_000);
-        assert!(generated < 4_000_000_000_000);
-    }
-
-    // ─── #275 PR-A: /machine/specs endpoint ──────────────────────────
-
-    /// GET /machine/specs returns a JSON object with the local machine's
-    /// versioned spec sheet — version + machine_id + RAM + CPU + OS
-    /// + loaded models + redacted Redis URL. Tested at the contract level
-    /// rather than the value level so the test doesn't depend on the
-    /// machine actually running it.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn machine_specs_endpoint_returns_versioned_payload() {
-        // Defensive — make sure no env from another test bleeds in.
-        unsafe {
-            std::env::remove_var("DARKMUX_REDIS_URL");
-            std::env::remove_var("DARKMUX_MACHINE_ID");
-        }
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/machine/specs")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "expected 200 from /machine/specs");
-
-        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
-        // Top-level contract — fields are present (values may be null on
-        // non-macOS / missing-lms runners, but the keys must exist).
-        for key in [
-            "darkmux_version",
-            "flow_schema_version",
-            "machine_id",
-            // (#2814) The KEY must be present even where the probe answers
-            // `None` (non-macOS CI, a failed `ioreg`) — the viewer's
-            // "self is never unknown" join reads `machine_uid ?? fall back to
-            // the name path", and a missing key and a null value have to mean
-            // the same thing to it.
-            "machine_uid",
-            "os",
-            "ram_total_bytes",
-            "ram_free_for_ai_bytes",
-            "cpu_brand",
-            "loaded_models",
-            "hub_configured",
-            "generated_at_ms",
-        ] {
-            assert!(
-                json.get(key).is_some(),
-                "/machine/specs response missing key `{key}`: {json}"
-            );
-        }
-        // `darkmux_version` must equal the build's CARGO_PKG_VERSION.
-        assert_eq!(
-            json["darkmux_version"].as_str(),
-            Some(env!("CARGO_PKG_VERSION"))
-        );
-        // `loaded_models` is an array even when lms is unreachable.
-        assert!(json["loaded_models"].is_array());
-    }
-
-    /// (#316 stage 3.2) A fake `lms` for the two machine reads below: `ps
-    /// --json` reports one resident, every other verb fails.
-    fn fake_lms_with_one_resident(dir: &std::path::Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let bin = dir.join("lms");
-        fs::write(
-            &bin,
-            "#!/bin/sh\n[ \"$1\" = ps ] || exit 1\necho '[{\"identifier\":\"darkmux:m\",\"modelKey\":\"m\",\"status\":\"idle\",\"sizeBytes\":1000000000,\"contextLength\":4096}]'\n",
-        )
-        .unwrap();
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-        bin
-    }
-
-    /// Run `f` with `DARKMUX_LMS_BIN` set to `bin`, restoring it after.
-    fn with_lms_bin<T>(bin: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let prev = std::env::var_os("DARKMUX_LMS_BIN");
-        // SAFETY: callers are #[serial].
-        unsafe { std::env::set_var("DARKMUX_LMS_BIN", bin) };
-        let out = f();
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
                 None => std::env::remove_var("DARKMUX_LMS_BIN"),
             }
         }
-        out
-    }
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    let listed = status(bin).await;
+    assert_eq!(listed["lms_unreachable"], false, "{listed}");
+    assert_eq!(listed["models"][0]["identifier"], "darkmux:m", "{listed}");
+    assert_eq!(
+        listed["models"].as_array().map(Vec::len),
+        Some(1),
+        "{listed}"
+    );
 
-    /// (#316 stage 3.2) GET /machine/status carries what `lms ps` reports,
-    /// and an `lms` that cannot run is `lms_unreachable`, never an empty
-    /// reachable listing.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn machine_status_carries_the_engines_listing() {
-        let tmp = TempDir::new().unwrap();
-        let bin = fake_lms_with_one_resident(tmp.path());
-        let status = |bin: PathBuf| async move {
-            let prev = std::env::var_os("DARKMUX_LMS_BIN");
-            // SAFETY: #[serial]; restored below.
-            unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
-            let response = build_router_local(PathBuf::new())
-                .oneshot(Request::builder().uri("/machine/status").body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            unsafe {
-                match prev {
-                    Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
-                    None => std::env::remove_var("DARKMUX_LMS_BIN"),
-                }
-            }
-            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-        };
-        let listed = status(bin).await;
-        assert_eq!(listed["lms_unreachable"], false, "{listed}");
-        assert_eq!(listed["models"][0]["identifier"], "darkmux:m", "{listed}");
-        assert_eq!(listed["models"].as_array().map(Vec::len), Some(1), "{listed}");
+    let failed = status(tmp.path().join("no-such-lms")).await;
+    assert_eq!(failed["lms_unreachable"], true, "{failed}");
+    assert_eq!(failed["models"], serde_json::json!([]), "{failed}");
+}
 
-        let failed = status(tmp.path().join("no-such-lms")).await;
-        assert_eq!(failed["lms_unreachable"], true, "{failed}");
-        assert_eq!(failed["models"], serde_json::json!([]), "{failed}");
-    }
-
-    /// (#3428) The daemon's residents read is shared and kept for
-    /// [`SERVED_RESIDENTS_TTL`]: `/machine/status`, `/machine/specs` and the
-    /// machine card (every peer's fleet view reads it about every 5s) cost
-    /// one `lms ps` between them, not one each. `generated_at_ms` is when that
-    /// read happened, so a cached answer says how old it is.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn the_machine_routes_and_the_card_share_one_residents_read() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = TempDir::new().unwrap();
-        let calls = tmp.path().join("ps-calls");
-        let bin = tmp.path().join("lms");
-        fs::write(
+/// (#3428) The daemon's residents read is shared and kept for
+/// [`SERVED_RESIDENTS_TTL`]: `/machine/status`, `/machine/specs` and the
+/// machine card (every peer's fleet view reads it about every 5s) cost
+/// one `lms ps` between them, not one each. `generated_at_ms` is when that
+/// read happened, so a cached answer says how old it is.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_machine_routes_and_the_card_share_one_residents_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let calls = tmp.path().join("ps-calls");
+    let bin = tmp.path().join("lms");
+    fs::write(
             &bin,
             format!(
                 "#!/bin/sh\n[ \"$1\" = ps ] || exit 1\necho x >> '{}'\necho '[{{\"identifier\":\"darkmux:m\",\"modelKey\":\"m\",\"status\":\"idle\",\"sizeBytes\":1000000000,\"contextLength\":4096}}]'\n",
@@ -997,3811 +1165,4853 @@
             ),
         )
         .unwrap();
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-        let prev = std::env::var_os("DARKMUX_LMS_BIN");
-        // SAFETY: #[serial]; restored below.
-        unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
-        let get = |uri: &'static str| async move {
-            let response = build_router_local(PathBuf::new())
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-        };
-        let status = get("/machine/status").await;
-        let specs = get("/machine/specs").await;
-        let card = tokio::task::spawn_blocking(crate::machine_card::gather_local_card).await.unwrap();
-        let again = get("/machine/status").await;
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
-                None => std::env::remove_var("DARKMUX_LMS_BIN"),
-            }
-        }
-        let ps_calls = fs::read_to_string(&calls).map(|s| s.lines().count()).unwrap_or(0);
-        assert_eq!(ps_calls, 1, "one `lms ps` for every read inside the TTL");
-        assert_eq!(status["models"][0]["identifier"], "darkmux:m", "{status}");
-        assert_eq!(specs["loaded_models"][0]["identifier"], "darkmux:m", "{specs}");
-        assert_eq!(card.specs.loaded_models.len(), 1);
-        assert_eq!(again["generated_at_ms"], status["generated_at_ms"], "a cached answer keeps its read time");
-    }
-
-    /// (#3428 review) The spec sheet's AI headroom is computed with the
-    /// residents it lists, at the same read, and says when that was. Headroom
-    /// is `reclaimable + resident − margin`: a cached residents list beside a
-    /// live reclaimable reading counted a just-unloaded model twice (+40 GiB,
-    /// measured by the review).
-    #[test]
-    fn the_spec_sheet_takes_its_headroom_and_time_from_one_residents_read() {
-        let read = ResidentsRead {
-            residents: EngineResidents {
-                engine: wire::MachineEngine { name: "lmstudio".into(), reports_residency: true, usable: true },
-                models: Vec::new(),
-                unknown: None,
-                servers: Vec::new(),
-            },
-            ram_free_for_ai_bytes: Some(12_345),
-            read_at_ms: 42,
-        };
-        let specs = gather_specs_from(read);
-        assert_eq!(specs.ram_free_for_ai_bytes, Some(12_345), "the read's headroom, not a fresh one");
-        assert_eq!(specs.generated_at_ms, 42, "when the read happened");
-    }
-
-    /// (#316 stage 3.2) The spec sheet's `loaded_models` is what `lms ps`
-    /// reports, and an `lms` that cannot run is `lms_unreachable`.
-    #[test]
-    #[serial_test::serial]
-    fn gather_specs_carries_the_engines_listing() {
-        let tmp = TempDir::new().unwrap();
-        let bin = fake_lms_with_one_resident(tmp.path());
-        let listed = with_lms_bin(&bin, gather_specs);
-        assert!(!listed.lms_unreachable);
-        let ids: Vec<&str> = listed.loaded_models.iter().map(|m| m.identifier.as_str()).collect();
-        assert_eq!(ids, vec!["darkmux:m"]);
-
-        let failed = with_lms_bin(&tmp.path().join("no-such-lms"), gather_specs);
-        assert!(failed.lms_unreachable);
-        assert!(failed.loaded_models.is_empty());
-    }
-
-    /// (#3450) A process standing in for a server darkmux started: alive,
-    /// leading its own group, recorded under `<home>/run/engines/` as darkmux
-    /// records one. Killed with its group when dropped.
-    pub(crate) struct RecordedServer {
-        pub(crate) child: std::process::Child,
-    }
-
-    impl RecordedServer {
-        pub(crate) fn start(endpoint: &str, engine: &str, model: &str, n_ctx: u32) -> Self {
-            Self::start_on(endpoint, engine, model, n_ctx, 1)
-        }
-
-        /// [`RecordedServer::start`], recorded on `port`.
-        pub(crate) fn start_on(endpoint: &str, engine: &str, model: &str, n_ctx: u32, port: u16) -> Self {
-            let mut cmd = std::process::Command::new("sleep");
-            cmd.arg("30");
-            std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-            let child = cmd.spawn().unwrap();
-            let stamp = (0..50)
-                .find_map(|_| {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    darkmux_platform::current().process_start_stamp(child.id())
-                })
-                .expect("a start stamp");
-            let rec = darkmux_types::engine_record::EngineRecord {
-                schema: darkmux_types::engine_record::ENGINE_RECORD_SCHEMA,
-                endpoint: endpoint.into(),
-                engine: engine.into(),
-                model: model.into(),
-                n_ctx,
-                port,
-                pid: child.id(),
-                start_stamp: stamp,
-                owner_pid: std::process::id(),
-                argv: vec!["tensorfold-native".into(), "--name".into(), format!("darkmux:{model}")],
-                log: "/dev/null".into(),
-                started_at_ms: 1_000,
-                engine_version: "tensorfold-native 1.2.4".into(),
-            };
-            darkmux_types::engine_record::write_in(&darkmux_types::engine_record::dir(), &rec).unwrap();
-            RecordedServer { child }
-        }
-    }
-
-    impl Drop for RecordedServer {
-        fn drop(&mut self) {
-            let _ = darkmux_types::child_registry::kill_group(self.child.id(), darkmux_types::child_registry::SIGKILL);
-            let _ = self.child.wait();
-        }
-    }
-
-    /// (#3450) The one residents read lists the servers darkmux started from
-    /// their records, and `/machine/status` and the spec sheet (so the card)
-    /// carry them beside the engine's own residents, even when the engine
-    /// could not be asked.
-    #[test]
-    #[serial_test::serial]
-    fn the_residents_read_lists_darkmuxs_engine_servers() {
-        let _home = CrewDirGuard::new();
-        let tmp = TempDir::new().unwrap();
-        let _server = RecordedServer::start("tf", "tensorfold", "TensorFold/q38", 262_144);
-        let read = with_lms_bin(&tmp.path().join("no-such-lms"), ResidentsRead::now);
-        let listed: Vec<(&str, &str, u32)> =
-            read.residents.servers.iter().map(|s| (s.endpoint.as_str(), s.model.as_str(), s.n_ctx)).collect();
-        assert_eq!(listed, vec![("tf", "TensorFold/q38", 262_144)]);
-        assert!(read.residents.unknown.is_some(), "the fixture's lms cannot run");
-        let status = machine_status_body(read.residents.clone(), read.read_at_ms);
-        assert_eq!(status.engine_servers.len(), 1);
-        assert_eq!(status.engine_servers[0].served_name, "darkmux:TensorFold/q38");
-        let specs = gather_specs_from(read);
-        assert_eq!(specs.engine_servers.len(), 1);
-    }
-
-    /// (#3450 review) A peer reads this machine's card within
-    /// `PEER_CARD_TIMEOUT` (2 s), and the card's specs come from the one
-    /// residents read: asking each of darkmux's servers whether it answers
-    /// must not add up per server. Three servers that accept a connection and
-    /// never answer still leave the read well inside the peer's timeout.
-    #[test]
-    #[serial_test::serial]
-    fn a_card_read_with_silent_servers_returns_well_inside_a_peers_timeout() {
-        let _home = CrewDirGuard::new();
-        let tmp = TempDir::new().unwrap();
-        let silent: Vec<std::net::TcpListener> = (0..3).map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap()).collect();
-        let _servers: Vec<RecordedServer> = silent
-            .iter()
-            .enumerate()
-            .map(|(i, l)| RecordedServer::start_on(&format!("tf{i}"), "tensorfold", "TensorFold/q38", 8192, l.local_addr().unwrap().port()))
-            .collect();
-        let started = std::time::Instant::now();
-        let specs = with_lms_bin(&tmp.path().join("no-such-lms"), || gather_specs_from(ResidentsRead::now()));
-        let took = started.elapsed();
-        assert_eq!(specs.engine_servers.len(), 3);
-        assert!(specs.engine_servers.iter().all(|s| !s.answering), "a silent server is not answering");
-        assert!(took < std::time::Duration::from_secs(1), "the read took {took:?} with 3 silent servers");
-    }
-
-    /// Run `f` with each `(var, value)` set (`None` removes it), restoring after.
-    fn with_env<T>(vars: &[(&str, Option<&std::ffi::OsStr>)], f: impl FnOnce() -> T) -> T {
-        let prev: Vec<_> = vars.iter().map(|(k, _)| (k.to_string(), std::env::var_os(k))).collect();
-        for (k, v) in vars {
-            // SAFETY: callers are #[serial]; restored below.
-            unsafe {
-                match v {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-        let out = f();
-        for (k, v) in prev {
-            // SAFETY: as above.
-            unsafe {
-                match v {
-                    Some(v) => std::env::set_var(&k, v),
-                    None => std::env::remove_var(&k),
-                }
-            }
-        }
-        out
-    }
-
-    /// (#316 stage 4.5) The machine surfaces name this machine's engine, and
-    /// an engine that does not report what it holds reads as that, never as
-    /// unreachable (which painted an mlx machine broken) and never as an
-    /// empty machine. A setting naming no usable engine is unreachable.
-    #[test]
-    #[serial_test::serial]
-    fn the_machine_surfaces_name_the_engine_and_read_an_unreported_one_as_unreported() {
-        let tmp = TempDir::new().unwrap();
-        let registry = tmp.path().join("profiles.json");
-        fs::write(&registry, r#"{"profiles":{"p":{"models":[{"id":"m"}]}},"endpoints":{"mlx":{"url":"http://127.0.0.1:1/v1"}}}"#).unwrap();
-        let bin = fake_lms_with_one_resident(tmp.path());
-        let on = |engine: &str| {
-            with_env(
-                &[
-                    ("DARKMUX_PROFILES", Some(registry.as_os_str())),
-                    ("DARKMUX_DEFAULT_ENGINE", Some(std::ffi::OsStr::new(engine))),
-                    ("DARKMUX_LMS_BIN", Some(bin.as_os_str())),
-                ],
-                || {
-                    let r = local_engine_residents();
-                    ((r.engine, r.models, r.unknown.is_some()), gather_specs())
-                },
-            )
-        };
-
-        let ((engine, models, unreachable), specs) = on("mlx");
-        assert_eq!(engine, wire::MachineEngine { name: "mlx".into(), reports_residency: false, usable: true });
-        // Unknown on the wire (`lms_unreachable`), so a reader older than
-        // `engine` never reads it as an empty machine; `engine` says why.
-        assert!(models.is_empty() && unreachable, "not reported is unknown, never empty");
-        assert_eq!((specs.engine, specs.lms_unreachable), (Some(engine), true));
-
-        let ((engine, models, unreachable), _) = on("lmstudio");
-        assert_eq!(engine, wire::MachineEngine { name: "lmstudio".into(), reports_residency: true, usable: true });
-        assert_eq!((models.len(), unreachable), (1, false));
-
-        let ((engine, _, unreachable), _) = on("nope");
-        assert_eq!((engine.name.as_str(), engine.usable, unreachable), ("nope", false, true));
-    }
-
-    // ─── #1286: /machine/resources endpoint (the memory-ledger lens feed) ───
-
-    /// (#3428) A cached `/machine/resources` ledger is served only for the
-    /// engine and `lms` binary it was gathered with, like the residents read
-    /// beside it: in one process (release-verify's `cargo test`) a test that
-    /// points `lms` elsewhere was served an earlier test's ledger.
-    #[test]
-    #[serial_test::serial]
-    fn a_cached_machine_ledger_is_served_only_for_its_engine_and_lms() {
-        let prev = std::env::var("DARKMUX_LMS_BIN").ok();
-        unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms-a") };
-        let ledger = darkmux_profiles::engine::local().ledger();
-        *super::MACHINE_RESOURCES_CACHE.lock().unwrap() =
-            Some((super::machine_resources_key(), std::time::SystemTime::now(), ledger));
-        let same = super::machine_resources_cached_fresh().is_some();
-        unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms-b") };
-        let other = super::machine_resources_cached_fresh().is_some();
-        unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms-a") };
-        let prev_engine = std::env::var("DARKMUX_DEFAULT_ENGINE").ok();
-        unsafe { std::env::set_var("DARKMUX_DEFAULT_ENGINE", "darkmux-serve-test-engine") };
-        let other_engine = super::machine_resources_cached_fresh().is_some();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
-                None => std::env::remove_var("DARKMUX_LMS_BIN"),
-            }
-            match prev_engine {
-                Some(v) => std::env::set_var("DARKMUX_DEFAULT_ENGINE", v),
-                None => std::env::remove_var("DARKMUX_DEFAULT_ENGINE"),
-            }
-        }
-        *super::MACHINE_RESOURCES_CACHE.lock().unwrap() = None;
-        assert!(same, "a fresh ledger of this lms was not served");
-        assert!(!other, "another lms's ledger was served");
-        assert!(!other_engine, "another engine's ledger was served");
-    }
-
-    /// GET /machine/resources returns the memory ledger with the fields the
-    /// machine lens reads, plus the recorded cadence knob (`cache_ttl_ms`)
-    /// and the observer-cost stamp (`gather_ms`) — the #1286 observer-effect
-    /// constraints made visible in the payload. `lms` is pointed at a
-    /// nonexistent binary so the test NEVER calls the operator's real
-    /// LMStudio (and with no ls entries the arch reader opens no files);
-    /// probe failures must degrade to `messages` (#1821 — renamed from
-    /// `warnings`; a probe failure is `error` severity), never a 500.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn machine_memory_endpoint_returns_ledger_with_observer_stamps() {
-        let prev = std::env::var("DARKMUX_LMS_BIN").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms");
-        }
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/machine/resources")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
-                None => std::env::remove_var("DARKMUX_LMS_BIN"),
-            }
-        }
-        assert_eq!(response.status(), StatusCode::OK, "expected 200 from /machine/resources");
-        let bytes = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
-        for key in [
-            "schema_version",
-            "generated_at_ms",
-            "gather_ms",
-            "limit_bytes",
-            "limit_source",
-            "pool",
-            "pressure",
-            "models",
-            "machine",
-            "attribution",
-            "attribution_note",
-            "messages",
-            "cache_ttl_ms",
-        ] {
-            assert!(
-                json.get(key).is_some(),
-                "/machine/resources response missing key `{key}`: {json}"
-            );
-        }
-        assert!(json["models"].is_array());
-        assert!(json["machine"]["state"].is_string());
-        // The nonexistent lms degrades loud — the payload documents it.
-        assert!(
-            json["messages"].as_array().is_some_and(|w| !w.is_empty()),
-            "missing-lms probes must surface as messages: {json}"
-        );
-        // (#3428) At least the viewer's 3s poll, so an open drawer costs one
-        // gather per 10s rather than one per poll.
-        assert_eq!(json["cache_ttl_ms"].as_u64(), Some(10_000));
-    }
-
-    /// (#316 stage 3.6) GET /machine/resources is the local engine's ledger:
-    /// the resident `lms ps` reports is its row.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn machine_resources_carries_the_engines_residents() {
-        let tmp = TempDir::new().unwrap();
-        let bin = fake_lms_with_one_resident(tmp.path());
-        // The handler caches a ledger process-wide for 2 s; a sibling test in
-        // the same process (plain `cargo test`) would otherwise answer this one.
-        *MACHINE_RESOURCES_CACHE.lock().unwrap() = None;
-        let prev = std::env::var_os("DARKMUX_LMS_BIN");
-        // SAFETY: #[serial]; restored below.
-        unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    let prev = std::env::var_os("DARKMUX_LMS_BIN");
+    // SAFETY: #[serial]; restored below.
+    unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
+    let get = |uri: &'static str| async move {
         let response = build_router_local(PathBuf::new())
-            .oneshot(Request::builder().uri("/machine/resources").body(Body::empty()).unwrap())
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    let status = get("/machine/status").await;
+    let specs = get("/machine/specs").await;
+    let card = tokio::task::spawn_blocking(crate::machine_card::gather_local_card)
+        .await
+        .unwrap();
+    let again = get("/machine/status").await;
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+            None => std::env::remove_var("DARKMUX_LMS_BIN"),
+        }
+    }
+    let ps_calls = fs::read_to_string(&calls)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    assert_eq!(ps_calls, 1, "one `lms ps` for every read inside the TTL");
+    assert_eq!(status["models"][0]["identifier"], "darkmux:m", "{status}");
+    assert_eq!(
+        specs["loaded_models"][0]["identifier"], "darkmux:m",
+        "{specs}"
+    );
+    assert_eq!(card.specs.loaded_models.len(), 1);
+    assert_eq!(
+        again["generated_at_ms"], status["generated_at_ms"],
+        "a cached answer keeps its read time"
+    );
+}
+
+/// (#3428 review) The spec sheet's AI headroom is computed with the
+/// residents it lists, at the same read, and says when that was. Headroom
+/// is `reclaimable + resident − margin`: a cached residents list beside a
+/// live reclaimable reading counted a just-unloaded model twice (+40 GiB,
+/// measured by the review).
+#[test]
+fn the_spec_sheet_takes_its_headroom_and_time_from_one_residents_read() {
+    let read = ResidentsRead {
+        residents: EngineResidents {
+            engine: wire::MachineEngine {
+                name: "lmstudio".into(),
+                reports_residency: true,
+                usable: true,
+            },
+            models: Vec::new(),
+            unknown: None,
+            servers: Vec::new(),
+        },
+        ram_free_for_ai_bytes: Some(12_345),
+        read_at_ms: 42,
+    };
+    let specs = gather_specs_from(read);
+    assert_eq!(
+        specs.ram_free_for_ai_bytes,
+        Some(12_345),
+        "the read's headroom, not a fresh one"
+    );
+    assert_eq!(specs.generated_at_ms, 42, "when the read happened");
+}
+
+/// (#316 stage 3.2) The spec sheet's `loaded_models` is what `lms ps`
+/// reports, and an `lms` that cannot run is `lms_unreachable`.
+#[test]
+#[serial_test::serial]
+fn gather_specs_carries_the_engines_listing() {
+    let tmp = TempDir::new().unwrap();
+    let bin = fake_lms_with_one_resident(tmp.path());
+    let listed = with_lms_bin(&bin, gather_specs);
+    assert!(!listed.lms_unreachable);
+    let ids: Vec<&str> = listed
+        .loaded_models
+        .iter()
+        .map(|m| m.identifier.as_str())
+        .collect();
+    assert_eq!(ids, vec!["darkmux:m"]);
+
+    let failed = with_lms_bin(&tmp.path().join("no-such-lms"), gather_specs);
+    assert!(failed.lms_unreachable);
+    assert!(failed.loaded_models.is_empty());
+}
+
+/// (#3450) A process standing in for a server darkmux started: alive,
+/// leading its own group, recorded under `<home>/run/engines/` as darkmux
+/// records one. Killed with its group when dropped.
+pub(crate) struct RecordedServer {
+    pub(crate) child: std::process::Child,
+}
+
+impl RecordedServer {
+    pub(crate) fn start(endpoint: &str, engine: &str, model: &str, n_ctx: u32) -> Self {
+        Self::start_on(endpoint, engine, model, n_ctx, 1)
+    }
+
+    /// [`RecordedServer::start`], recorded on `port`.
+    pub(crate) fn start_on(
+        endpoint: &str,
+        engine: &str,
+        model: &str,
+        n_ctx: u32,
+        port: u16,
+    ) -> Self {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let child = cmd.spawn().unwrap();
+        let stamp = (0..50)
+            .find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                darkmux_platform::current().process_start_stamp(child.id())
+            })
+            .expect("a start stamp");
+        let rec = darkmux_types::engine_record::EngineRecord {
+            schema: darkmux_types::engine_record::ENGINE_RECORD_SCHEMA,
+            endpoint: endpoint.into(),
+            engine: engine.into(),
+            model: model.into(),
+            n_ctx,
+            port,
+            pid: child.id(),
+            start_stamp: stamp,
+            owner_pid: std::process::id(),
+            argv: vec![
+                "tensorfold-native".into(),
+                "--name".into(),
+                format!("darkmux:{model}"),
+            ],
+            log: "/dev/null".into(),
+            started_at_ms: 1_000,
+            engine_version: "tensorfold-native 1.2.4".into(),
+        };
+        darkmux_types::engine_record::write_in(&darkmux_types::engine_record::dir(), &rec).unwrap();
+        RecordedServer { child }
+    }
+}
+
+impl Drop for RecordedServer {
+    fn drop(&mut self) {
+        let _ = darkmux_types::child_registry::kill_group(
+            self.child.id(),
+            darkmux_types::child_registry::SIGKILL,
+        );
+        let _ = self.child.wait();
+    }
+}
+
+/// (#3450) The one residents read lists the servers darkmux started from
+/// their records, and `/machine/status` and the spec sheet (so the card)
+/// carry them beside the engine's own residents, even when the engine
+/// could not be asked.
+#[test]
+#[serial_test::serial]
+fn the_residents_read_lists_darkmuxs_engine_servers() {
+    let _home = CrewDirGuard::new();
+    let tmp = TempDir::new().unwrap();
+    let _server = RecordedServer::start("tf", "tensorfold", "TensorFold/q38", 262_144);
+    let read = with_lms_bin(&tmp.path().join("no-such-lms"), ResidentsRead::now);
+    let listed: Vec<(&str, &str, u32)> = read
+        .residents
+        .servers
+        .iter()
+        .map(|s| (s.endpoint.as_str(), s.model.as_str(), s.n_ctx))
+        .collect();
+    assert_eq!(listed, vec![("tf", "TensorFold/q38", 262_144)]);
+    assert!(
+        read.residents.unknown.is_some(),
+        "the fixture's lms cannot run"
+    );
+    let status = machine_status_body(read.residents.clone(), read.read_at_ms);
+    assert_eq!(status.engine_servers.len(), 1);
+    assert_eq!(
+        status.engine_servers[0].served_name,
+        "darkmux:TensorFold/q38"
+    );
+    let specs = gather_specs_from(read);
+    assert_eq!(specs.engine_servers.len(), 1);
+}
+
+/// (#3450 review) A peer reads this machine's card within
+/// `PEER_CARD_TIMEOUT` (2 s), and the card's specs come from the one
+/// residents read: asking each of darkmux's servers whether it answers
+/// must not add up per server. Three servers that accept a connection and
+/// never answer still leave the read well inside the peer's timeout.
+#[test]
+#[serial_test::serial]
+fn a_card_read_with_silent_servers_returns_well_inside_a_peers_timeout() {
+    let _home = CrewDirGuard::new();
+    let tmp = TempDir::new().unwrap();
+    let silent: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let _servers: Vec<RecordedServer> = silent
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            RecordedServer::start_on(
+                &format!("tf{i}"),
+                "tensorfold",
+                "TensorFold/q38",
+                8192,
+                l.local_addr().unwrap().port(),
+            )
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let specs = with_lms_bin(&tmp.path().join("no-such-lms"), || {
+        gather_specs_from(ResidentsRead::now())
+    });
+    let took = started.elapsed();
+    assert_eq!(specs.engine_servers.len(), 3);
+    assert!(
+        specs.engine_servers.iter().all(|s| !s.answering),
+        "a silent server is not answering"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(1),
+        "the read took {took:?} with 3 silent servers"
+    );
+}
+
+/// Run `f` with each `(var, value)` set (`None` removes it), restoring after.
+fn with_env<T>(vars: &[(&str, Option<&std::ffi::OsStr>)], f: impl FnOnce() -> T) -> T {
+    let prev: Vec<_> = vars
+        .iter()
+        .map(|(k, _)| (k.to_string(), std::env::var_os(k)))
+        .collect();
+    for (k, v) in vars {
+        // SAFETY: callers are #[serial]; restored below.
         unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
-                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
             }
         }
-        let bytes = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
-        let ids: Vec<&str> = json["models"].as_array().unwrap().iter().filter_map(|m| m["identifier"].as_str()).collect();
-        assert_eq!(ids, vec!["darkmux:m"], "{json}");
     }
-
-    /// (#2107, #1833, #2108) GET /machine/resources carries a `load` block —
-    /// the daemon-side continuous host sampler's `now`/`window` — once the
-    /// ring holds samples. Injects fabricated samples straight into the
-    /// process-wide ring via `HostSamplerRing::push_for_test` (no real
-    /// sampler thread, no real host probe) so the ROUTE's shape is exercised
-    /// deterministically. `#[serial]`: the ring and the ledger cache are
-    /// both process-wide statics shared with the sibling test above.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn machine_resources_endpoint_carries_the_daemon_load_block_once_sampled() {
-        let prev = std::env::var("DARKMUX_LMS_BIN").ok();
+    let out = f();
+    for (k, v) in prev {
+        // SAFETY: as above.
         unsafe {
-            std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms");
-        }
-        let ring = host_sampler::ring();
-        ring.push_for_test(0, 50, 60, 70, 5);
-        ring.push_for_test(2_000, 90, 65, 85, 6);
-        ring.push_for_test(4_000, 40, 62, 30, 4);
-
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/machine/resources")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
-                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            match v {
+                Some(v) => std::env::set_var(&k, v),
+                None => std::env::remove_var(&k),
             }
         }
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
-
-        let load = &json["load"];
-        assert!(load.is_object(), "expected a `load` block: {json}");
-        assert_eq!(load["now"]["cpu_pct"], 40, "now reflects the LATEST injected sample");
-        assert_eq!(load["now"]["mem_pct"], 62);
-        assert_eq!(load["now"]["gpu_pct"], 30);
-        assert_eq!(load["now"]["sampled_at_ms"], 4_000);
-        // (#2108, host-sample-shape v2) the observer cost is per-sample and
-        // lives inside `now`; the window's metric keys are the ROUTE's own
-        // `mean`/`p95`/`max` under the metric's full name.
-        assert_eq!(load["now"]["sampler_cost_ms"], 4);
-        assert_eq!(load["window"]["samples"], 3);
-        assert_eq!(load["window"]["interval_ms"], 2_000, "measured, not nominal");
-        assert_eq!(load["window"]["span_ms"], 4_000);
-        assert_eq!(load["window"]["cpu_pct"]["max"], 90);
-        assert_eq!(load["window"]["cpu_pct"]["mean"], 60.0);
-        // Sources the injected samples never carried stay null rather than
-        // being coerced to a zeroed placeholder.
-        assert!(load["now"]["thermal"].is_null());
-        assert!(load["window"]["energy_mwh"].is_null());
     }
+    out
+}
 
-    /// /machine/specs MUST redact the Redis URL's password. Wide-open
-    /// redaction is already in place via `flow::RawRedisUrl` (#216); this
-    /// test pins that the new endpoint doesn't bypass it.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn machine_specs_endpoint_redacts_redis_password() {
-        unsafe {
-            std::env::set_var("DARKMUX_REDIS_URL", "redis://user:s3cr3t-p4ss@example.com:6379");
+/// (#316 stage 4.5) The machine surfaces name this machine's engine, and
+/// an engine that does not report what it holds reads as that, never as
+/// unreachable (which painted an mlx machine broken) and never as an
+/// empty machine. A setting naming no usable engine is unreachable.
+#[test]
+#[serial_test::serial]
+fn the_machine_surfaces_name_the_engine_and_read_an_unreported_one_as_unreported() {
+    let tmp = TempDir::new().unwrap();
+    let registry = tmp.path().join("profiles.json");
+    fs::write(&registry, r#"{"profiles":{"p":{"models":[{"id":"m"}]}},"endpoints":{"mlx":{"url":"http://127.0.0.1:1/v1"}}}"#).unwrap();
+    let bin = fake_lms_with_one_resident(tmp.path());
+    let on = |engine: &str| {
+        with_env(
+            &[
+                ("DARKMUX_PROFILES", Some(registry.as_os_str())),
+                ("DARKMUX_DEFAULT_ENGINE", Some(std::ffi::OsStr::new(engine))),
+                ("DARKMUX_LMS_BIN", Some(bin.as_os_str())),
+            ],
+            || {
+                let r = local_engine_residents();
+                ((r.engine, r.models, r.unknown.is_some()), gather_specs())
+            },
+        )
+    };
+
+    let ((engine, models, unreachable), specs) = on("mlx");
+    assert_eq!(
+        engine,
+        wire::MachineEngine {
+            name: "mlx".into(),
+            reports_residency: false,
+            usable: true
         }
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/machine/specs")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+    );
+    // Unknown on the wire (`lms_unreachable`), so a reader older than
+    // `engine` never reads it as an empty machine; `engine` says why.
+    assert!(
+        models.is_empty() && unreachable,
+        "not reported is unknown, never empty"
+    );
+    assert_eq!((specs.engine, specs.lms_unreachable), (Some(engine), true));
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        let body_str = String::from_utf8_lossy(&bytes).into_owned();
-        // The literal password must NOT appear anywhere in the body.
+    let ((engine, models, unreachable), _) = on("lmstudio");
+    assert_eq!(
+        engine,
+        wire::MachineEngine {
+            name: "lmstudio".into(),
+            reports_residency: true,
+            usable: true
+        }
+    );
+    assert_eq!((models.len(), unreachable), (1, false));
+
+    let ((engine, _, unreachable), _) = on("nope");
+    assert_eq!(
+        (engine.name.as_str(), engine.usable, unreachable),
+        ("nope", false, true)
+    );
+}
+
+// ─── #1286: /machine/resources endpoint (the memory-ledger lens feed) ───
+
+/// (#3428) A cached `/machine/resources` ledger is served only for the
+/// engine and `lms` binary it was gathered with, like the residents read
+/// beside it: in one process (release-verify's `cargo test`) a test that
+/// points `lms` elsewhere was served an earlier test's ledger.
+#[test]
+#[serial_test::serial]
+fn a_cached_machine_ledger_is_served_only_for_its_engine_and_lms() {
+    let prev = std::env::var("DARKMUX_LMS_BIN").ok();
+    unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms-a") };
+    let ledger = darkmux_profiles::engine::local().ledger();
+    *super::MACHINE_RESOURCES_CACHE.lock().unwrap() = Some((
+        super::machine_resources_key(),
+        std::time::SystemTime::now(),
+        ledger,
+    ));
+    let same = super::machine_resources_cached_fresh().is_some();
+    unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms-b") };
+    let other = super::machine_resources_cached_fresh().is_some();
+    unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms-a") };
+    let prev_engine = std::env::var("DARKMUX_DEFAULT_ENGINE").ok();
+    unsafe { std::env::set_var("DARKMUX_DEFAULT_ENGINE", "darkmux-serve-test-engine") };
+    let other_engine = super::machine_resources_cached_fresh().is_some();
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+            None => std::env::remove_var("DARKMUX_LMS_BIN"),
+        }
+        match prev_engine {
+            Some(v) => std::env::set_var("DARKMUX_DEFAULT_ENGINE", v),
+            None => std::env::remove_var("DARKMUX_DEFAULT_ENGINE"),
+        }
+    }
+    *super::MACHINE_RESOURCES_CACHE.lock().unwrap() = None;
+    assert!(same, "a fresh ledger of this lms was not served");
+    assert!(!other, "another lms's ledger was served");
+    assert!(!other_engine, "another engine's ledger was served");
+}
+
+/// GET /machine/resources returns the memory ledger with the fields the
+/// machine lens reads, plus the recorded cadence knob (`cache_ttl_ms`)
+/// and the observer-cost stamp (`gather_ms`) — the #1286 observer-effect
+/// constraints made visible in the payload. `lms` is pointed at a
+/// nonexistent binary so the test NEVER calls the operator's real
+/// LMStudio (and with no ls entries the arch reader opens no files);
+/// probe failures must degrade to `messages` (#1821 — renamed from
+/// `warnings`; a probe failure is `error` severity), never a 500.
+#[tokio::test]
+#[serial_test::serial]
+async fn machine_memory_endpoint_returns_ledger_with_observer_stamps() {
+    let prev = std::env::var("DARKMUX_LMS_BIN").ok();
+    unsafe {
+        std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms");
+    }
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/machine/resources")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+            None => std::env::remove_var("DARKMUX_LMS_BIN"),
+        }
+    }
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "expected 200 from /machine/resources"
+    );
+    let bytes = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+    for key in [
+        "schema_version",
+        "generated_at_ms",
+        "gather_ms",
+        "limit_bytes",
+        "limit_source",
+        "pool",
+        "pressure",
+        "models",
+        "machine",
+        "attribution",
+        "attribution_note",
+        "messages",
+        "cache_ttl_ms",
+    ] {
         assert!(
-            !body_str.contains("s3cr3t-p4ss"),
-            "Redis password leaked through /machine/specs: {body_str}"
+            json.get(key).is_some(),
+            "/machine/resources response missing key `{key}`: {json}"
         );
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        // Only WHETHER a hub is configured is stated, never where (#3072).
-        assert_eq!(json["hub_configured"], true);
-        assert!(!body_str.contains("example.com"), "the hub's host is not on the wire: {body_str}");
     }
+    assert!(json["models"].is_array());
+    assert!(json["machine"]["state"].is_string());
+    // The nonexistent lms degrades loud — the payload documents it.
+    assert!(
+        json["messages"].as_array().is_some_and(|w| !w.is_empty()),
+        "missing-lms probes must surface as messages: {json}"
+    );
+    // (#3428) At least the viewer's 3s poll, so an open drawer costs one
+    // gather per 10s rather than one per poll.
+    assert_eq!(json["cache_ttl_ms"].as_u64(), Some(10_000));
+}
 
-    /// /machine/specs reports operator-stamped provenance — `machine_id`
-    /// from `DARKMUX_MACHINE_ID` (default: hostname). The former
-    /// `machine_tier` field was dropped in #590 (machine-capacity tier
-    /// no longer routes work).
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn machine_specs_endpoint_reports_machine_id_from_env() {
-        unsafe {
-            std::env::set_var("DARKMUX_MACHINE_ID", "test-laptop");
+/// (#316 stage 3.6) GET /machine/resources is the local engine's ledger:
+/// the resident `lms ps` reports is its row.
+#[tokio::test]
+#[serial_test::serial]
+async fn machine_resources_carries_the_engines_residents() {
+    let tmp = TempDir::new().unwrap();
+    let bin = fake_lms_with_one_resident(tmp.path());
+    // The handler caches a ledger process-wide for 2 s; a sibling test in
+    // the same process (plain `cargo test`) would otherwise answer this one.
+    *MACHINE_RESOURCES_CACHE.lock().unwrap() = None;
+    let prev = std::env::var_os("DARKMUX_LMS_BIN");
+    // SAFETY: #[serial]; restored below.
+    unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
+    let response = build_router_local(PathBuf::new())
+        .oneshot(
+            Request::builder()
+                .uri("/machine/resources")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+            None => std::env::remove_var("DARKMUX_LMS_BIN"),
         }
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/machine/specs")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        unsafe {
-            std::env::remove_var("DARKMUX_MACHINE_ID");
+    }
+    let bytes = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+    let ids: Vec<&str> = json["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["identifier"].as_str())
+        .collect();
+    assert_eq!(ids, vec!["darkmux:m"], "{json}");
+}
+
+/// (#2107, #1833, #2108) GET /machine/resources carries a `load` block —
+/// the daemon-side continuous host sampler's `now`/`window` — once the
+/// ring holds samples. Injects fabricated samples straight into the
+/// process-wide ring via `HostSamplerRing::push_for_test` (no real
+/// sampler thread, no real host probe) so the ROUTE's shape is exercised
+/// deterministically. `#[serial]`: the ring and the ledger cache are
+/// both process-wide statics shared with the sibling test above.
+#[tokio::test]
+#[serial_test::serial]
+async fn machine_resources_endpoint_carries_the_daemon_load_block_once_sampled() {
+    let prev = std::env::var("DARKMUX_LMS_BIN").ok();
+    unsafe {
+        std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms");
+    }
+    let ring = host_sampler::ring();
+    ring.push_for_test(0, 50, 60, 70, 5);
+    ring.push_for_test(2_000, 90, 65, 85, 6);
+    ring.push_for_test(4_000, 40, 62, 30, 4);
+
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/machine/resources")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+            None => std::env::remove_var("DARKMUX_LMS_BIN"),
         }
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            json["machine_id"].as_str(),
-            Some("test-laptop"),
-            "machine_id env not surfaced: {json}"
-        );
-        assert!(
-            json.get("machine_tier").is_none(),
-            "machine_tier must be absent post-#590: {json}"
+    }
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+
+    let load = &json["load"];
+    assert!(load.is_object(), "expected a `load` block: {json}");
+    assert_eq!(
+        load["now"]["cpu_pct"], 40,
+        "now reflects the LATEST injected sample"
+    );
+    assert_eq!(load["now"]["mem_pct"], 62);
+    assert_eq!(load["now"]["gpu_pct"], 30);
+    assert_eq!(load["now"]["sampled_at_ms"], 4_000);
+    // (#2108, host-sample-shape v2) the observer cost is per-sample and
+    // lives inside `now`; the window's metric keys are the ROUTE's own
+    // `mean`/`p95`/`max` under the metric's full name.
+    assert_eq!(load["now"]["sampler_cost_ms"], 4);
+    assert_eq!(load["window"]["samples"], 3);
+    assert_eq!(
+        load["window"]["interval_ms"], 2_000,
+        "measured, not nominal"
+    );
+    assert_eq!(load["window"]["span_ms"], 4_000);
+    assert_eq!(load["window"]["cpu_pct"]["max"], 90);
+    assert_eq!(load["window"]["cpu_pct"]["mean"], 60.0);
+    // Sources the injected samples never carried stay null rather than
+    // being coerced to a zeroed placeholder.
+    assert!(load["now"]["thermal"].is_null());
+    assert!(load["window"]["energy_mwh"].is_null());
+}
+
+/// /machine/specs MUST redact the Redis URL's password. Wide-open
+/// redaction is already in place via `flow::RawRedisUrl` (#216); this
+/// test pins that the new endpoint doesn't bypass it.
+#[tokio::test]
+#[serial_test::serial]
+async fn machine_specs_endpoint_redacts_redis_password() {
+    unsafe {
+        std::env::set_var(
+            "DARKMUX_REDIS_URL",
+            "redis://user:s3cr3t-p4ss@example.com:6379",
         );
     }
-
-    #[tokio::test]
-    async fn flow_returns_empty_array_for_missing_date() {
-        // Post-#701: a missing day is an empty JSON array (200), not a 404 —
-        // "flow records for date X" is an empty collection, not an absent
-        // resource. (The old `.jsonl` route returned 404 here; it's retired.)
-        let tmp = TempDir::new().unwrap();
-        let app = build_router_local(tmp.path().to_path_buf());
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/flow/2999-01-01")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["records"], serde_json::json!([]));
-        assert_eq!(body["count"], 0);
-        assert_eq!(body["truncated"], false);
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/machine/specs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    unsafe {
+        std::env::remove_var("DARKMUX_REDIS_URL");
     }
 
-    #[tokio::test]
-    async fn flow_since_filters_records_inclusively() {
-        // (#1173) The live viewer's incremental reconcile passes `?since=<iso-ts>`
-        // so a long-open tab stops re-parsing the whole day. Flow ts are uniform
-        // second-precision UTC, so the filter is a plain lexical `>=` (inclusive).
-        let tmp = TempDir::new().unwrap();
-        fs::write(
-            tmp.path().join("2026-07-03.jsonl"),
-            "{\"ts\":\"2026-07-03T00:00:10Z\",\"action\":\"a\",\"session_id\":\"S\"}\n\
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body_str = String::from_utf8_lossy(&bytes).into_owned();
+    // The literal password must NOT appear anywhere in the body.
+    assert!(
+        !body_str.contains("s3cr3t-p4ss"),
+        "Redis password leaked through /machine/specs: {body_str}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // Only WHETHER a hub is configured is stated, never where (#3072).
+    assert_eq!(json["hub_configured"], true);
+    assert!(
+        !body_str.contains("example.com"),
+        "the hub's host is not on the wire: {body_str}"
+    );
+}
+
+/// /machine/specs reports operator-stamped provenance — `machine_id`
+/// from `DARKMUX_MACHINE_ID` (default: hostname). The former
+/// `machine_tier` field was dropped in #590 (machine-capacity tier
+/// no longer routes work).
+#[tokio::test]
+#[serial_test::serial]
+async fn machine_specs_endpoint_reports_machine_id_from_env() {
+    unsafe {
+        std::env::set_var("DARKMUX_MACHINE_ID", "test-laptop");
+    }
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/machine/specs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    unsafe {
+        std::env::remove_var("DARKMUX_MACHINE_ID");
+    }
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        json["machine_id"].as_str(),
+        Some("test-laptop"),
+        "machine_id env not surfaced: {json}"
+    );
+    assert!(
+        json.get("machine_tier").is_none(),
+        "machine_tier must be absent post-#590: {json}"
+    );
+}
+
+#[tokio::test]
+async fn flow_returns_empty_array_for_missing_date() {
+    // Post-#701: a missing day is an empty JSON array (200), not a 404 —
+    // "flow records for date X" is an empty collection, not an absent
+    // resource. (The old `.jsonl` route returned 404 here; it's retired.)
+    let tmp = TempDir::new().unwrap();
+    let app = build_router_local(tmp.path().to_path_buf());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/flow/2999-01-01")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["records"], serde_json::json!([]));
+    assert_eq!(body["count"], 0);
+    assert_eq!(body["truncated"], false);
+}
+
+#[tokio::test]
+async fn flow_since_filters_records_inclusively() {
+    // (#1173) The live viewer's incremental reconcile passes `?since=<iso-ts>`
+    // so a long-open tab stops re-parsing the whole day. Flow ts are uniform
+    // second-precision UTC, so the filter is a plain lexical `>=` (inclusive).
+    let tmp = TempDir::new().unwrap();
+    fs::write(
+        tmp.path().join("2026-07-03.jsonl"),
+        "{\"ts\":\"2026-07-03T00:00:10Z\",\"action\":\"a\",\"session_id\":\"S\"}\n\
              {\"ts\":\"2026-07-03T00:00:20Z\",\"action\":\"b\",\"session_id\":\"S\"}\n\
              {\"ts\":\"2026-07-03T00:00:30Z\",\"action\":\"c\",\"session_id\":\"S\"}\n",
+    )
+    .unwrap();
+    let app = build_router_local(tmp.path().to_path_buf());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/flow/2026-07-03?since=2026-07-03T00:00:20Z")
+                .body(Body::empty())
+                .unwrap(),
         )
+        .await
         .unwrap();
-        let app = build_router_local(tmp.path().to_path_buf());
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/flow/2026-07-03?since=2026-07-03T00:00:20Z")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let recs = body["records"]
+        .as_array()
+        .expect("the envelope's records")
+        .clone();
+    let actions: Vec<&str> = recs.iter().filter_map(|r| r["action"].as_str()).collect();
+    assert_eq!(
+        actions,
+        vec!["b", "c"],
+        "since is inclusive; the earlier record drops"
+    );
+}
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let recs = body["records"].as_array().expect("the envelope's records").clone();
-        let actions: Vec<&str> = recs.iter().filter_map(|r| r["action"].as_str()).collect();
-        assert_eq!(actions, vec!["b", "c"], "since is inclusive; the earlier record drops");
-    }
-
-    #[tokio::test]
-    async fn flow_without_since_returns_all_records() {
-        // No `?since=` → the whole day, unchanged (backward-compatible).
-        let tmp = TempDir::new().unwrap();
-        fs::write(
-            tmp.path().join("2026-07-03.jsonl"),
-            "{\"ts\":\"2026-07-03T00:00:10Z\",\"action\":\"a\"}\n\
+#[tokio::test]
+async fn flow_without_since_returns_all_records() {
+    // No `?since=` → the whole day, unchanged (backward-compatible).
+    let tmp = TempDir::new().unwrap();
+    fs::write(
+        tmp.path().join("2026-07-03.jsonl"),
+        "{\"ts\":\"2026-07-03T00:00:10Z\",\"action\":\"a\"}\n\
              {\"ts\":\"2026-07-03T00:00:20Z\",\"action\":\"b\"}\n",
+    )
+    .unwrap();
+    let app = build_router_local(tmp.path().to_path_buf());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/flow/2026-07-03")
+                .body(Body::empty())
+                .unwrap(),
         )
+        .await
         .unwrap();
-        let app = build_router_local(tmp.path().to_path_buf());
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/flow/2026-07-03")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let recs = body["records"].as_array().expect("the envelope's records");
+    assert_eq!(recs.len(), 2, "no since → all records returned");
+    assert_eq!(
+        body["count"], 2,
+        "count is the records length, as /flow-mission/:id has it"
+    );
+}
 
-        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let recs = body["records"].as_array().expect("the envelope's records");
-        assert_eq!(recs.len(), 2, "no since → all records returned");
-        assert_eq!(body["count"], 2, "count is the records length, as /flow-mission/:id has it");
-    }
-
-    #[tokio::test]
-    async fn flow_days_lists_days_newest_first_with_summaries() {
-        // #691: the catalog endpoint scans the flows dir and summarizes each
-        // day so the viewer's picker can offer historical playback by date.
-        let tmp = TempDir::new().unwrap();
-        // Two days; one with a mission + a dispatch, one bare. A schema header
-        // line must not count as a record. A non-date file is ignored.
-        fs::write(
+#[tokio::test]
+async fn flow_days_lists_days_newest_first_with_summaries() {
+    // #691: the catalog endpoint scans the flows dir and summarizes each
+    // day so the viewer's picker can offer historical playback by date.
+    let tmp = TempDir::new().unwrap();
+    // Two days; one with a mission + a dispatch, one bare. A schema header
+    // line must not count as a record. A non-date file is ignored.
+    fs::write(
             tmp.path().join("2026-05-14.jsonl"),
             "{\"_type\":\"schema\",\"version\":\"1.0.0\"}\n\
              {\"action\":\"dispatch.start\",\"handle\":\"coder\",\"session_id\":\"S1\",\"execution_id\":\"exec-S1\",\"mission_id\":\"demo\"}\n\
              {\"action\":\"dispatch.turn\",\"handle\":\"coder\",\"session_id\":\"S1\",\"execution_id\":\"exec-S1\",\"mission_id\":\"demo\"}\n",
         )
         .unwrap();
-        fs::write(
-            tmp.path().join("2026-05-12.jsonl"),
-            "{\"action\":\"operator.note\",\"handle\":\"x\"}\n",
+    fs::write(
+        tmp.path().join("2026-05-12.jsonl"),
+        "{\"action\":\"operator.note\",\"handle\":\"x\"}\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("not-a-day.jsonl"), "garbage\n").unwrap();
+    fs::write(tmp.path().join("README.txt"), "ignore me\n").unwrap();
+
+    let app = build_router_local(tmp.path().to_path_buf());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/flow-days")
+                .body(Body::empty())
+                .unwrap(),
         )
+        .await
         .unwrap();
-        fs::write(tmp.path().join("not-a-day.jsonl"), "garbage\n").unwrap();
-        fs::write(tmp.path().join("README.txt"), "ignore me\n").unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let days = json["days"].as_array().expect("days array");
 
-        let app = build_router_local(tmp.path().to_path_buf());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/flow-days")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let days = json["days"].as_array().expect("days array");
+    assert_eq!(
+        days.len(),
+        2,
+        "two valid date files (non-date files ignored)"
+    );
+    // Newest first.
+    assert_eq!(days[0]["date"], "2026-05-14");
+    assert_eq!(days[1]["date"], "2026-05-12");
+    // Summary: schema header excluded → 2 records; mission + 1 dispatch.
+    assert_eq!(days[0]["records"], 2);
+    assert_eq!(days[0]["dispatches"], 1);
+    assert_eq!(days[0]["missions"], serde_json::json!(["demo"]));
+    assert_eq!(days[1]["records"], 1);
+    assert_eq!(days[1]["dispatches"], 0);
+    assert_eq!(days[1]["missions"], serde_json::json!([]));
+}
 
-        assert_eq!(days.len(), 2, "two valid date files (non-date files ignored)");
-        // Newest first.
-        assert_eq!(days[0]["date"], "2026-05-14");
-        assert_eq!(days[1]["date"], "2026-05-12");
-        // Summary: schema header excluded → 2 records; mission + 1 dispatch.
-        assert_eq!(days[0]["records"], 2);
-        assert_eq!(days[0]["dispatches"], 1);
-        assert_eq!(days[0]["missions"], serde_json::json!(["demo"]));
-        assert_eq!(days[1]["records"], 1);
-        assert_eq!(days[1]["dispatches"], 0);
-        assert_eq!(days[1]["missions"], serde_json::json!([]));
-    }
+#[tokio::test]
+async fn flow_days_empty_dir_is_empty_array() {
+    let tmp = TempDir::new().unwrap();
+    let app = build_router_local(tmp.path().to_path_buf());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/flow-days")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["days"], serde_json::json!([]));
+}
 
-    #[tokio::test]
-    async fn flow_days_empty_dir_is_empty_array() {
-        let tmp = TempDir::new().unwrap();
-        let app = build_router_local(tmp.path().to_path_buf());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/flow-days")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["days"], serde_json::json!([]));
-    }
-
-    #[tokio::test]
-    async fn flow_missions_rolls_up_a_mission_across_days() {
-        // #691: a mission spanning two day files is ONE catalog entry, not two.
-        let tmp = TempDir::new().unwrap();
-        fs::write(
+#[tokio::test]
+async fn flow_missions_rolls_up_a_mission_across_days() {
+    // #691: a mission spanning two day files is ONE catalog entry, not two.
+    let tmp = TempDir::new().unwrap();
+    fs::write(
             tmp.path().join("2026-05-12.jsonl"),
             "{\"_type\":\"schema\",\"version\":\"1.0.0\"}\n\
              {\"action\":\"dispatch.start\",\"session_id\":\"S1\",\"execution_id\":\"exec-S1\",\"mission_id\":\"m1\",\"machine_id\":\"studio\",\"ts\":\"2026-05-12T10:00:00Z\"}\n\
              {\"action\":\"dispatch.turn\",\"session_id\":\"S1\",\"execution_id\":\"exec-S1\",\"mission_id\":\"m1\",\"machine_id\":\"studio\",\"ts\":\"2026-05-12T10:01:00Z\"}\n",
         ).unwrap();
-        fs::write(
+    fs::write(
             tmp.path().join("2026-05-14.jsonl"),
             "{\"action\":\"dispatch.start\",\"session_id\":\"S2\",\"execution_id\":\"exec-S2\",\"mission_id\":\"m1\",\"machine_id\":\"laptop\",\"ts\":\"2026-05-14T09:00:00Z\"}\n\
              {\"action\":\"dispatch.turn\",\"session_id\":\"S2\",\"execution_id\":\"exec-S2\",\"mission_id\":\"m1\",\"machine_id\":\"laptop\",\"ts\":\"2026-05-14T09:01:00Z\"}\n\
              {\"action\":\"dispatch.start\",\"session_id\":\"S3\",\"execution_id\":\"exec-S3\",\"mission_id\":\"m2\",\"machine_id\":\"studio\",\"ts\":\"2026-05-14T09:05:00Z\"}\n",
         ).unwrap();
 
-        let app = build_router_local(tmp.path().to_path_buf());
-        let response = app
-            .oneshot(Request::builder().uri("/flow-missions").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let missions = json["missions"].as_array().expect("missions array");
-        assert_eq!(missions.len(), 2, "two distinct missions");
-        let m1 = missions.iter().find(|m| m["mission_id"] == "m1").expect("m1 present");
-        assert_eq!(m1["records"], 4, "m1's records span BOTH day files");
-        assert_eq!(m1["dispatches"], 2, "S1 + S2");
-        assert_eq!(m1["first_date"], "2026-05-12");
-        assert_eq!(m1["last_date"], "2026-05-14");
-        assert_eq!(m1["first_ts"], "2026-05-12T10:00:00Z");
-        assert_eq!(m1["last_ts"], "2026-05-14T09:01:00Z");
-        assert_eq!(m1["machines"], serde_json::json!(["laptop", "studio"]));
-        // Newest activity first: m2's last dispatch (09:05) is newer than m1's (09:01).
-        assert_eq!(missions[0]["mission_id"], "m2");
-    }
-
-    /// (#3428) The missions catalog re-reads only the day files that changed
-    /// since its last scan: the viewer polls it, and every poll used to
-    /// re-parse every day file on the machine (159 files, 441 MB measured).
-    /// What it answers is unchanged: an appended record shows on the next scan.
-    #[test]
-    #[serial_test::serial]
-    fn a_repeated_missions_scan_rereads_only_the_day_files_that_changed() {
-        use std::io::Write;
-        let reads = || super::MISSION_DAY_FILE_READS.load(std::sync::atomic::Ordering::Relaxed);
-        let tmp = TempDir::new().unwrap();
-        let rec = |mission: &str, exec: &str, ts: &str| {
-            format!("{{\"action\":\"dispatch.start\",\"execution_id\":\"{exec}\",\"mission_id\":\"{mission}\",\"machine_id\":\"laptop\",\"ts\":\"{ts}\"}}\n")
-        };
-        fs::write(tmp.path().join("2026-05-12.jsonl"), rec("m1", "exec-00000001-0000-0001", "2026-05-12T10:00:00Z")).unwrap();
-        fs::write(tmp.path().join("2026-05-14.jsonl"), rec("m1", "exec-00000002-0000-0001", "2026-05-14T09:00:00Z")).unwrap();
-        let before = reads();
-        let first = super::scan_flow_missions(tmp.path(), &[]);
-        assert_eq!(reads() - before, 2);
-        let before = reads();
-        let second = super::scan_flow_missions(tmp.path(), &[]);
-        assert_eq!(reads() - before, 0, "nothing changed, nothing re-read");
-        assert_eq!(serde_json::to_value(&first).unwrap(), serde_json::to_value(&second).unwrap());
-
-        let mut today = fs::OpenOptions::new().append(true).open(tmp.path().join("2026-05-14.jsonl")).unwrap();
-        today.write_all(rec("m2", "exec-00000003-0000-0001", "2026-05-14T09:05:00Z").as_bytes()).unwrap();
-        drop(today);
-        let before = reads();
-        let third = super::scan_flow_missions(tmp.path(), &[]);
-        assert_eq!(reads() - before, 1, "only the day that grew");
-        assert_eq!(third.len(), 2, "the appended mission shows");
-        let m1 = third.iter().find(|m| m.mission_id == "m1").unwrap();
-        assert_eq!((m1.records, m1.dispatches, m1.first_date.as_str()), (2, 2, "2026-05-12"));
-
-        // A write the clock didn't see (a coarse-mtime filesystem): the length
-        // alone says the file changed.
-        let path = tmp.path().join("2026-05-14.jsonl");
-        let stamped = fs::metadata(&path).unwrap().modified().unwrap();
-        let mut today = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        today.write_all(rec("m3", "exec-00000004-0000-0001", "2026-05-14T09:06:00Z").as_bytes()).unwrap();
-        today.set_modified(stamped).unwrap();
-        drop(today);
-        let fourth = super::scan_flow_missions(tmp.path(), &[]);
-        assert_eq!(fourth.len(), 3, "a grown file is re-read though its mtime did not move");
-    }
-
-    /// (#3435 review) A day file that could not be read is never kept as
-    /// read: a past day's file never changes, so a kept failure (a transient
-    /// `EMFILE` or `EIO`, here an unreadable mode) would erase its missions
-    /// from the catalog until the daemon restarted.
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn a_day_file_that_could_not_be_read_is_read_again() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("2026-05-12.jsonl");
-        fs::write(&path, "{\"action\":\"dispatch.start\",\"execution_id\":\"exec-00000001-0000-0001\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:00:00Z\"}\n").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
-        let during = super::scan_flow_missions(tmp.path(), &[]);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        if fs::File::open(&path).is_ok() && !during.is_empty() {
-            eprintln!("skipping: running with permission to read a 0o000 file");
-            return;
-        }
-        let after = super::scan_flow_missions(tmp.path(), &[]);
-        assert!(during.is_empty());
-        assert_eq!(after.len(), 1, "readable again: its mission shows");
-    }
-
-    /// #1705: a mission that ran on a PEER reaches the missions lens even
-    /// though nothing about it was ever written to this machine's flows dir.
-    #[test]
-    fn scan_flow_missions_includes_a_mission_seen_only_in_the_fleet_stream() {
-        let tmp = TempDir::new().unwrap(); // deliberately empty
-        let fleet = vec![serde_json::json!({
-            "action": "dispatch.start",
-            "session_id": "S-peer",
-            "mission_id": "m-on-the-hub",
-            "machine_id": "m1-max-32gb-studio",
-            "machine_uid": "PEER-UID",
-            "ts": "2026-05-14T09:00:00Z",
-        })];
-        let missions = super::scan_flow_missions(tmp.path(), &fleet);
-        let m = missions
-            .iter()
-            .find(|m| m.mission_id == "m-on-the-hub")
-            .expect("a peer's mission must appear in the missions lens");
-        assert_eq!(m.records, 1);
-        assert_eq!(m.machines, vec!["m1-max-32gb-studio".to_string()]);
-        assert_eq!(m.first_date, "2026-05-14", "the date comes from the record's own ts");
-    }
-
-    /// The de-dup, tested where it is actually OBSERVABLE. This machine's
-    /// records are written to BOTH sinks, and the per-mission `records`
-    /// counter is the one field a double-fold inflates — the aggregate folds
-    /// are otherwise idempotent, so a run-row count would pass either way.
-    #[test]
-    fn scan_flow_missions_counts_a_record_in_both_sinks_exactly_once() {
-        let tmp = TempDir::new().unwrap();
-        let record = serde_json::json!({
-            "action": "dispatch.start",
-            "session_id": "S-mine",
-            "execution_id": "exec-mine",
-            "mission_id": "m-mine",
-            "machine_id": "MacBook-Pro",
-            "machine_uid": "MY-UID",
-            "ts": "2026-05-14T09:00:00Z",
-        });
-        // The SAME record on disk and in the stream — exactly what a Tee sink
-        // produces for local work.
-        fs::write(
-            tmp.path().join("2026-05-14.jsonl"),
-            format!("{}\n", serde_json::to_string(&record).unwrap()),
+    let app = build_router_local(tmp.path().to_path_buf());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/flow-missions")
+                .body(Body::empty())
+                .unwrap(),
         )
+        .await
         .unwrap();
-        let missions = super::scan_flow_missions(tmp.path(), std::slice::from_ref(&record));
-        let m = missions.iter().find(|m| m.mission_id == "m-mine").expect("mission present");
-        assert_eq!(
-            m.records, 1,
-            "a record present in both sinks must be counted once — without the shared \
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let missions = json["missions"].as_array().expect("missions array");
+    assert_eq!(missions.len(), 2, "two distinct missions");
+    let m1 = missions
+        .iter()
+        .find(|m| m["mission_id"] == "m1")
+        .expect("m1 present");
+    assert_eq!(m1["records"], 4, "m1's records span BOTH day files");
+    assert_eq!(m1["dispatches"], 2, "S1 + S2");
+    assert_eq!(m1["first_date"], "2026-05-12");
+    assert_eq!(m1["last_date"], "2026-05-14");
+    assert_eq!(m1["first_ts"], "2026-05-12T10:00:00Z");
+    assert_eq!(m1["last_ts"], "2026-05-14T09:01:00Z");
+    assert_eq!(m1["machines"], serde_json::json!(["laptop", "studio"]));
+    // Newest activity first: m2's last dispatch (09:05) is newer than m1's (09:01).
+    assert_eq!(missions[0]["mission_id"], "m2");
+}
+
+/// (#3428) The missions catalog re-reads only the day files that changed
+/// since its last scan: the viewer polls it, and every poll used to
+/// re-parse every day file on the machine (159 files, 441 MB measured).
+/// What it answers is unchanged: an appended record shows on the next scan.
+#[test]
+#[serial_test::serial]
+fn a_repeated_missions_scan_rereads_only_the_day_files_that_changed() {
+    use std::io::Write;
+    let reads = || super::MISSION_DAY_FILE_READS.load(std::sync::atomic::Ordering::Relaxed);
+    let tmp = TempDir::new().unwrap();
+    let rec = |mission: &str, exec: &str, ts: &str| {
+        format!("{{\"action\":\"dispatch.start\",\"execution_id\":\"{exec}\",\"mission_id\":\"{mission}\",\"machine_id\":\"laptop\",\"ts\":\"{ts}\"}}\n")
+    };
+    fs::write(
+        tmp.path().join("2026-05-12.jsonl"),
+        rec("m1", "exec-00000001-0000-0001", "2026-05-12T10:00:00Z"),
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("2026-05-14.jsonl"),
+        rec("m1", "exec-00000002-0000-0001", "2026-05-14T09:00:00Z"),
+    )
+    .unwrap();
+    let before = reads();
+    let first = super::scan_flow_missions(tmp.path(), &[]);
+    assert_eq!(reads() - before, 2);
+    let before = reads();
+    let second = super::scan_flow_missions(tmp.path(), &[]);
+    assert_eq!(reads() - before, 0, "nothing changed, nothing re-read");
+    assert_eq!(
+        serde_json::to_value(&first).unwrap(),
+        serde_json::to_value(&second).unwrap()
+    );
+
+    let mut today = fs::OpenOptions::new()
+        .append(true)
+        .open(tmp.path().join("2026-05-14.jsonl"))
+        .unwrap();
+    today
+        .write_all(rec("m2", "exec-00000003-0000-0001", "2026-05-14T09:05:00Z").as_bytes())
+        .unwrap();
+    drop(today);
+    let before = reads();
+    let third = super::scan_flow_missions(tmp.path(), &[]);
+    assert_eq!(reads() - before, 1, "only the day that grew");
+    assert_eq!(third.len(), 2, "the appended mission shows");
+    let m1 = third.iter().find(|m| m.mission_id == "m1").unwrap();
+    assert_eq!(
+        (m1.records, m1.dispatches, m1.first_date.as_str()),
+        (2, 2, "2026-05-12")
+    );
+
+    // A write the clock didn't see (a coarse-mtime filesystem): the length
+    // alone says the file changed.
+    let path = tmp.path().join("2026-05-14.jsonl");
+    let stamped = fs::metadata(&path).unwrap().modified().unwrap();
+    let mut today = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    today
+        .write_all(rec("m3", "exec-00000004-0000-0001", "2026-05-14T09:06:00Z").as_bytes())
+        .unwrap();
+    today.set_modified(stamped).unwrap();
+    drop(today);
+    let fourth = super::scan_flow_missions(tmp.path(), &[]);
+    assert_eq!(
+        fourth.len(),
+        3,
+        "a grown file is re-read though its mtime did not move"
+    );
+}
+
+/// (#3435 review) A day file that could not be read is never kept as
+/// read: a past day's file never changes, so a kept failure (a transient
+/// `EMFILE` or `EIO`, here an unreadable mode) would erase its missions
+/// from the catalog until the daemon restarted.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn a_day_file_that_could_not_be_read_is_read_again() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("2026-05-12.jsonl");
+    fs::write(&path, "{\"action\":\"dispatch.start\",\"execution_id\":\"exec-00000001-0000-0001\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:00:00Z\"}\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    let during = super::scan_flow_missions(tmp.path(), &[]);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    if fs::File::open(&path).is_ok() && !during.is_empty() {
+        eprintln!("skipping: running with permission to read a 0o000 file");
+        return;
+    }
+    let after = super::scan_flow_missions(tmp.path(), &[]);
+    assert!(during.is_empty());
+    assert_eq!(after.len(), 1, "readable again: its mission shows");
+}
+
+/// #1705: a mission that ran on a PEER reaches the missions lens even
+/// though nothing about it was ever written to this machine's flows dir.
+#[test]
+fn scan_flow_missions_includes_a_mission_seen_only_in_the_fleet_stream() {
+    let tmp = TempDir::new().unwrap(); // deliberately empty
+    let fleet = vec![serde_json::json!({
+        "action": "dispatch.start",
+        "session_id": "S-peer",
+        "mission_id": "m-on-the-hub",
+        "machine_id": "m1-max-32gb-studio",
+        "machine_uid": "PEER-UID",
+        "ts": "2026-05-14T09:00:00Z",
+    })];
+    let missions = super::scan_flow_missions(tmp.path(), &fleet);
+    let m = missions
+        .iter()
+        .find(|m| m.mission_id == "m-on-the-hub")
+        .expect("a peer's mission must appear in the missions lens");
+    assert_eq!(m.records, 1);
+    assert_eq!(m.machines, vec!["m1-max-32gb-studio".to_string()]);
+    assert_eq!(
+        m.first_date, "2026-05-14",
+        "the date comes from the record's own ts"
+    );
+}
+
+/// The de-dup, tested where it is actually OBSERVABLE. This machine's
+/// records are written to BOTH sinks, and the per-mission `records`
+/// counter is the one field a double-fold inflates — the aggregate folds
+/// are otherwise idempotent, so a run-row count would pass either way.
+#[test]
+fn scan_flow_missions_counts_a_record_in_both_sinks_exactly_once() {
+    let tmp = TempDir::new().unwrap();
+    let record = serde_json::json!({
+        "action": "dispatch.start",
+        "session_id": "S-mine",
+        "execution_id": "exec-mine",
+        "mission_id": "m-mine",
+        "machine_id": "MacBook-Pro",
+        "machine_uid": "MY-UID",
+        "ts": "2026-05-14T09:00:00Z",
+    });
+    // The SAME record on disk and in the stream — exactly what a Tee sink
+    // produces for local work.
+    fs::write(
+        tmp.path().join("2026-05-14.jsonl"),
+        format!("{}\n", serde_json::to_string(&record).unwrap()),
+    )
+    .unwrap();
+    let missions = super::scan_flow_missions(tmp.path(), std::slice::from_ref(&record));
+    let m = missions
+        .iter()
+        .find(|m| m.mission_id == "m-mine")
+        .expect("mission present");
+    assert_eq!(
+        m.records, 1,
+        "a record present in both sinks must be counted once — without the shared \
              identity de-dup this reads 2, and every local dispatch is double-counted"
+    );
+}
+
+/// A map step's items share the task's session; each is its own execution.
+/// The catalog counts executions, so a 3-item map reads 3 in both the day
+/// picker and the missions lens (a session count reads 1).
+#[test]
+fn catalog_counts_executions_not_sessions_for_a_three_item_map() {
+    let tmp = TempDir::new().unwrap();
+    let lines: Vec<String> = (1..=3)
+        .map(|i| {
+            serde_json::to_string(&serde_json::json!({
+                "action": "dispatch.start",
+                "session_id": "S-map",
+                "execution_id": format!("exec-0000000{i}-0000-0001"),
+                "mission_id": "m-map",
+                "machine_id": "MacBook-Pro",
+                "ts": format!("2026-05-14T09:0{i}:00Z"),
+            }))
+            .unwrap()
+        })
+        .collect();
+    fs::write(tmp.path().join("2026-05-14.jsonl"), lines.join("\n") + "\n").unwrap();
+    let days = super::scan_flow_days(tmp.path());
+    assert_eq!(days[0].dispatches, 3, "day picker counts executions");
+    let missions = super::scan_flow_missions(tmp.path(), &[]);
+    let m = missions
+        .iter()
+        .find(|m| m.mission_id == "m-map")
+        .expect("mission present");
+    assert_eq!(m.dispatches, 3, "missions lens counts executions");
+}
+
+#[tokio::test]
+async fn flow_mission_returns_records_across_days_chronologically() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(
+        tmp.path().join("2026-05-12.jsonl"),
+        "{\"session_id\":\"S1\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:00:00Z\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("2026-05-14.jsonl"),
+        "{\"session_id\":\"S2\",\"mission_id\":\"m1\",\"ts\":\"2026-05-14T09:00:00Z\"}\n\
+             {\"session_id\":\"S3\",\"mission_id\":\"m2\",\"ts\":\"2026-05-14T09:05:00Z\"}\n",
+    )
+    .unwrap();
+    let app = build_router_local(tmp.path().to_path_buf());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/flow-mission/m1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let records = json["records"].as_array().expect("records array");
+    assert_eq!(records.len(), 2, "both m1 records across days; m2 excluded");
+    assert_eq!(json["truncated"], false);
+    // Chronological: the 05-12 record precedes the 05-14 record.
+    assert_eq!(records[0]["ts"], "2026-05-12T10:00:00Z");
+    assert_eq!(records[1]["ts"], "2026-05-14T09:00:00Z");
+}
+
+/// The replay routes poll every 5 s, and used to parse the whole flow
+/// history on every poll. Only the day files that hold the id are parsed
+/// now; an id no day holds parses none.
+#[test]
+fn a_replay_parses_only_the_day_files_that_hold_its_id() {
+    let tmp = TempDir::new().unwrap();
+    let day = |date: &str, mission: &str, session: &str, n: usize| {
+        let line = format!("{{\"session_id\":\"{session}\",\"mission_id\":\"{mission}\",\"ts\":\"{date}T10:00:00Z\"}}\n");
+        fs::write(tmp.path().join(format!("{date}.jsonl")), line.repeat(n)).unwrap();
+    };
+    day("2026-05-12", "m-old", "s-old", 50);
+    day("2026-05-13", "m1", "s1", 3);
+    day("2026-05-14", "m-new", "s-new", 70);
+    let empty = crate::FleetRecords::default();
+    for (field, id) in [("mission_id", "m1"), ("session_id", "s1")] {
+        let (records, truncated, scanned) =
+            super::collect_records_by_field(tmp.path(), empty.clone(), field, id);
+        assert_eq!((records.len(), truncated), (3, false), "{field}");
+        assert_eq!(
+            scanned, 3,
+            "{field}: only the day that holds {id} is parsed"
         );
     }
+    let (records, _, scanned) =
+        super::collect_records_by_field(tmp.path(), empty.clone(), "session_id", "s-nowhere");
+    assert_eq!(
+        (records.len(), scanned),
+        (0, 0),
+        "an id no day holds parses nothing"
+    );
+    // A record for the id appended to another day is found on the next poll.
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(tmp.path().join("2026-05-14.jsonl"))
+        .unwrap();
+    std::io::Write::write_all(
+        &mut f,
+        b"{\"session_id\":\"s1\",\"mission_id\":\"m1\",\"ts\":\"2026-05-14T11:00:00Z\"}\n",
+    )
+    .unwrap();
+    let (records, _, _) = super::collect_records_by_field(tmp.path(), empty, "session_id", "s1");
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[3]["ts"], "2026-05-14T11:00:00Z");
+}
 
-    /// A map step's items share the task's session; each is its own execution.
-    /// The catalog counts executions, so a 3-item map reads 3 in both the day
-    /// picker and the missions lens (a session count reads 1).
-    #[test]
-    fn catalog_counts_executions_not_sessions_for_a_three_item_map() {
-        let tmp = TempDir::new().unwrap();
-        let lines: Vec<String> = (1..=3)
-            .map(|i| {
-                serde_json::to_string(&serde_json::json!({
-                    "action": "dispatch.start",
-                    "session_id": "S-map",
-                    "execution_id": format!("exec-0000000{i}-0000-0001"),
-                    "mission_id": "m-map",
-                    "machine_id": "MacBook-Pro",
-                    "ts": format!("2026-05-14T09:0{i}:00Z"),
-                }))
-                .unwrap()
-            })
-            .collect();
-        fs::write(tmp.path().join("2026-05-14.jsonl"), lines.join("\n") + "\n").unwrap();
-        let days = super::scan_flow_days(tmp.path());
-        assert_eq!(days[0].dispatches, 3, "day picker counts executions");
-        let missions = super::scan_flow_missions(tmp.path(), &[]);
-        let m = missions.iter().find(|m| m.mission_id == "m-map").expect("mission present");
-        assert_eq!(m.dispatches, 3, "missions lens counts executions");
-    }
-
-    #[tokio::test]
-    async fn flow_mission_returns_records_across_days_chronologically() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(
-            tmp.path().join("2026-05-12.jsonl"),
-            "{\"session_id\":\"S1\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:00:00Z\"}\n",
-        ).unwrap();
-        fs::write(
-            tmp.path().join("2026-05-14.jsonl"),
-            "{\"session_id\":\"S2\",\"mission_id\":\"m1\",\"ts\":\"2026-05-14T09:00:00Z\"}\n\
-             {\"session_id\":\"S3\",\"mission_id\":\"m2\",\"ts\":\"2026-05-14T09:05:00Z\"}\n",
-        ).unwrap();
-        let app = build_router_local(tmp.path().to_path_buf());
-        let response = app
-            .oneshot(Request::builder().uri("/flow-mission/m1").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let records = json["records"].as_array().expect("records array");
-        assert_eq!(records.len(), 2, "both m1 records across days; m2 excluded");
-        assert_eq!(json["truncated"], false);
-        // Chronological: the 05-12 record precedes the 05-14 record.
-        assert_eq!(records[0]["ts"], "2026-05-12T10:00:00Z");
-        assert_eq!(records[1]["ts"], "2026-05-14T09:00:00Z");
-    }
-
-    /// The replay routes poll every 5 s, and used to parse the whole flow
-    /// history on every poll. Only the day files that hold the id are parsed
-    /// now; an id no day holds parses none.
-    #[test]
-    fn a_replay_parses_only_the_day_files_that_hold_its_id() {
-        let tmp = TempDir::new().unwrap();
-        let day = |date: &str, mission: &str, session: &str, n: usize| {
-            let line = format!("{{\"session_id\":\"{session}\",\"mission_id\":\"{mission}\",\"ts\":\"{date}T10:00:00Z\"}}\n");
-            fs::write(tmp.path().join(format!("{date}.jsonl")), line.repeat(n)).unwrap();
-        };
-        day("2026-05-12", "m-old", "s-old", 50);
-        day("2026-05-13", "m1", "s1", 3);
-        day("2026-05-14", "m-new", "s-new", 70);
-        let empty = crate::FleetRecords::default();
-        for (field, id) in [("mission_id", "m1"), ("session_id", "s1")] {
-            let (records, truncated, scanned) = super::collect_records_by_field(tmp.path(), empty.clone(), field, id);
-            assert_eq!((records.len(), truncated), (3, false), "{field}");
-            assert_eq!(scanned, 3, "{field}: only the day that holds {id} is parsed");
-        }
-        let (records, _, scanned) = super::collect_records_by_field(tmp.path(), empty.clone(), "session_id", "s-nowhere");
-        assert_eq!((records.len(), scanned), (0, 0), "an id no day holds parses nothing");
-        // A record for the id appended to another day is found on the next poll.
-        let mut f = fs::OpenOptions::new().append(true).open(tmp.path().join("2026-05-14.jsonl")).unwrap();
-        std::io::Write::write_all(&mut f, b"{\"session_id\":\"s1\",\"mission_id\":\"m1\",\"ts\":\"2026-05-14T11:00:00Z\"}\n").unwrap();
-        let (records, _, _) = super::collect_records_by_field(tmp.path(), empty, "session_id", "s1");
-        assert_eq!(records.len(), 4);
-        assert_eq!(records[3]["ts"], "2026-05-14T11:00:00Z");
-    }
-
-    /// A mission's records reach the viewer with their step named as
-    /// `payload.step_id`, read from the session string here, since the
-    /// viewer never parses a session id.
-    #[tokio::test]
-    async fn flow_mission_names_the_step_a_session_meant() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(
+/// A mission's records reach the viewer with their step named as
+/// `payload.step_id`, read from the session string here, since the
+/// viewer never parses a session id.
+#[tokio::test]
+async fn flow_mission_names_the_step_a_session_meant() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(
             tmp.path().join("2026-05-12.jsonl"),
             "{\"session_id\":\"m1.step.judge-1\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:00:00Z\",\"payload\":{\"total_tokens\":5}}\n",
         ).unwrap();
-        let json = get_json(&tmp, "/flow-mission/m1").await;
-        assert_eq!(json["records"][0]["payload"]["step_id"], "judge-1", "{json}");
-    }
+    let json = get_json(&tmp, "/flow-mission/m1").await;
+    assert_eq!(
+        json["records"][0]["payload"]["step_id"], "judge-1",
+        "{json}"
+    );
+}
 
-    #[tokio::test]
-    async fn flow_dispatch_returns_only_that_sessions_records() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(
-            tmp.path().join("2026-05-12.jsonl"),
-            "{\"session_id\":\"S1\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:00:00Z\"}\n\
+#[tokio::test]
+async fn flow_dispatch_returns_only_that_sessions_records() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(
+        tmp.path().join("2026-05-12.jsonl"),
+        "{\"session_id\":\"S1\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:00:00Z\"}\n\
              {\"session_id\":\"S2\",\"mission_id\":\"m1\",\"ts\":\"2026-05-12T10:05:00Z\"}\n",
-        ).unwrap();
-        let app = build_router_local(tmp.path().to_path_buf());
-        let response = app
-            .oneshot(Request::builder().uri("/flow-dispatch/S1").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let records = json["records"].as_array().expect("records array");
-        assert_eq!(records.len(), 1, "only S1 (S2 excluded)");
-        assert_eq!(records[0]["session_id"], "S1");
-    }
+    )
+    .unwrap();
+    let app = build_router_local(tmp.path().to_path_buf());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/flow-dispatch/S1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let records = json["records"].as_array().expect("records array");
+    assert_eq!(records.len(), 1, "only S1 (S2 excluded)");
+    assert_eq!(records[0]["session_id"], "S1");
+}
 
-    /// (found live 2026-09-06) `meta` must stamp the consumer-side scan
-    /// cost — `scan_ms`, `days_scanned`, `records_scanned` — the same way
-    /// the producer side already stamps `sampler_cost_ms`/
-    /// `liveness_probe_ms`. `days_scanned` must equal the BOUNDED day
-    /// count the host-sample join actually opened, not the total day
-    /// files on the machine — three day files exist here, but the run's
-    /// own window sits in exactly one.
-    #[tokio::test]
-    async fn flow_dispatch_meta_stamps_the_bounded_scan_cost() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(
+/// (found live 2026-09-06) `meta` must stamp the consumer-side scan
+/// cost — `scan_ms`, `days_scanned`, `records_scanned` — the same way
+/// the producer side already stamps `sampler_cost_ms`/
+/// `liveness_probe_ms`. `days_scanned` must equal the BOUNDED day
+/// count the host-sample join actually opened, not the total day
+/// files on the machine — three day files exist here, but the run's
+/// own window sits in exactly one.
+#[tokio::test]
+async fn flow_dispatch_meta_stamps_the_bounded_scan_cost() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(
             tmp.path().join("2026-05-11.jsonl"),
             "{\"ts\":\"2026-05-11T10:00:00Z\",\"action\":\"machine.telemetry\",\"machine_uid\":\"m-1\",\"payload\":{\"cpu\":1}}\n",
         ).unwrap();
-        fs::write(
+    fs::write(
             tmp.path().join("2026-05-12.jsonl"),
             "{\"ts\":\"2026-05-12T10:00:00Z\",\"action\":\"dispatch.start\",\"session_id\":\"S1\",\"machine_uid\":\"m-1\"}\n\
              {\"ts\":\"2026-05-12T10:00:05Z\",\"action\":\"machine.telemetry\",\"machine_uid\":\"m-1\",\"payload\":{\"cpu\":2}}\n\
              {\"ts\":\"2026-05-12T10:00:10Z\",\"action\":\"dispatch.complete\",\"session_id\":\"S1\",\"machine_uid\":\"m-1\"}\n",
         ).unwrap();
-        fs::write(
+    fs::write(
             tmp.path().join("2026-05-13.jsonl"),
             "{\"ts\":\"2026-05-13T10:00:00Z\",\"action\":\"machine.telemetry\",\"machine_uid\":\"m-1\",\"payload\":{\"cpu\":3}}\n",
         ).unwrap();
-        let app = build_router_local(tmp.path().to_path_buf());
-        let response = app
-            .oneshot(Request::builder().uri("/flow-dispatch/S1").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let meta = &json["meta"];
-        assert!(meta["scan_ms"].is_u64(), "scan_ms must be present: {meta}");
-        assert!(meta["records_scanned"].is_u64(), "records_scanned must be present: {meta}");
-        assert_eq!(
+    let app = build_router_local(tmp.path().to_path_buf());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/flow-dispatch/S1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let meta = &json["meta"];
+    assert!(meta["scan_ms"].is_u64(), "scan_ms must be present: {meta}");
+    assert!(
+        meta["records_scanned"].is_u64(),
+        "records_scanned must be present: {meta}"
+    );
+    assert_eq!(
             meta["days_scanned"], 1,
             "the run's window sits entirely in 2026-05-12 — the 05-11/05-13 files must not be opened: {meta}"
         );
-        let telemetry: Vec<&serde_json::Value> =
-            json["records"].as_array().unwrap().iter().filter(|r| r["action"] == "machine.telemetry").collect();
-        assert_eq!(telemetry.len(), 1, "only the in-window, same-day sample joins: {:?}", json["records"]);
-        assert_eq!(telemetry[0]["payload"]["cpu"], serde_json::json!(2));
+    let telemetry: Vec<&serde_json::Value> = json["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["action"] == "machine.telemetry")
+        .collect();
+    assert_eq!(
+        telemetry.len(),
+        1,
+        "only the in-window, same-day sample joins: {:?}",
+        json["records"]
+    );
+    assert_eq!(telemetry[0]["payload"]["cpu"], serde_json::json!(2));
+}
+
+#[tokio::test]
+async fn flow_catalog_rejects_invalid_id() {
+    let tmp = TempDir::new().unwrap();
+    let app = build_router_local(tmp.path().to_path_buf());
+    let long = "a".repeat(200); // > 128-char cap → invalid
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/flow-mission/{long}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn flow_returns_400_for_malformed_date() {
+    let tmp = TempDir::new().unwrap();
+    let app = build_router_local(tmp.path().to_path_buf());
+
+    // Non-date shape → rejected by the format validator.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/flow/not-a-date")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // A trailing `.jsonl` is no longer a recognized shape (route retired
+    // in #701) — it fails the bare-date validator → 400.
+    let response2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/flow/2026-05-14.jsonl")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response2.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn flow_returns_records_as_json_array_when_present() {
+    // The bare-date route reads the local `<date>.jsonl` file (Redis
+    // unset) and returns its records as a JSON array.
+    // (#811) The config tier is empty by construction in this test build
+    // (the test-support dev-dep), so config.json can't supply a Redis URL.
+    // The ENV tier is separate: drop DARKMUX_REDIS_URL (serial-guarded so it
+    // can't race the sibling tests that set it) so redis_url() is "off" and
+    // the handler reads the tmp local file instead of the operator's Redis.
+    unsafe {
+        std::env::remove_var("DARKMUX_REDIS_URL");
     }
+    let tmp = TempDir::new().unwrap();
+    let content =
+        "{\"_type\":\"schema\",\"version\":\"1.0.0\"}\n{\"action\":\"x\",\"handle\":\"test\"}\n";
+    fs::write(tmp.path().join("2026-05-14.jsonl"), content).unwrap();
 
-    #[tokio::test]
-    async fn flow_catalog_rejects_invalid_id() {
-        let tmp = TempDir::new().unwrap();
-        let app = build_router_local(tmp.path().to_path_buf());
-        let long = "a".repeat(200); // > 128-char cap → invalid
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/flow-mission/{long}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let app = build_router_local(tmp.path().to_path_buf());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/flow/2026-05-14")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let ct = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        ct.starts_with("application/json"),
+        "content-type was `{ct}`"
+    );
+
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let arr = body["records"].clone();
+    // (found live 2026-09-06) The day file's `{"_type":"schema",…}`
+    // header line is NOT a flow record — `push_flow_line` now skips it,
+    // same as `for_each_record_in_day_file` always has, so it no
+    // longer shows up as a headerless "record 0" in this response.
+    let items = arr.as_array().expect("expected a JSON array");
+    assert_eq!(
+        items.len(),
+        1,
+        "the schema header is excluded — only the real record remains"
+    );
+    assert!(
+        items.iter().any(|r| r["handle"] == "test"),
+        "the dispatch record should be present: {arr}"
+    );
+}
+
+/// Localhost-origin requests get CORS headers (topology viewer on any
+/// local port can read the response).
+#[tokio::test]
+/// Post-#270/#273: localhost dev-server origins are NOT allowed by
+/// default. The same browser tab that runs an operator's localhost
+/// app should not be able to exfiltrate fleet-wide flow data via
+/// CORS. Operators with a legitimate dev-server-origin need set
+/// `DARKMUX_DAEMON_CORS_ORIGINS` to opt that origin in.
+///
+/// `#[serial]` because the sibling `cors_allows_origin_in_env_override`
+/// sets `DARKMUX_DAEMON_CORS_ORIGINS` and the default-deny assertion
+/// races against it under cargo's parallel runner. (Race surfaced
+/// post-merge in CI on main; not flagged on PR-level CI.)
+#[serial_test::serial]
+async fn cors_denies_localhost_origin_by_default() {
+    // Defensive — make sure no inherited env from another test changes the default behavior.
+    unsafe {
+        std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS");
     }
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("Origin", "http://localhost:5173")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn flow_returns_400_for_malformed_date() {
-        let tmp = TempDir::new().unwrap();
-        let app = build_router_local(tmp.path().to_path_buf());
-
-        // Non-date shape → rejected by the format validator.
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/flow/not-a-date")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        // A trailing `.jsonl` is no longer a recognized shape (route retired
-        // in #701) — it fails the bare-date validator → 400.
-        let response2 = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/flow/2026-05-14.jsonl")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response2.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn flow_returns_records_as_json_array_when_present() {
-        // The bare-date route reads the local `<date>.jsonl` file (Redis
-        // unset) and returns its records as a JSON array.
-        // (#811) The config tier is empty by construction in this test build
-        // (the test-support dev-dep), so config.json can't supply a Redis URL.
-        // The ENV tier is separate: drop DARKMUX_REDIS_URL (serial-guarded so it
-        // can't race the sibling tests that set it) so redis_url() is "off" and
-        // the handler reads the tmp local file instead of the operator's Redis.
-        unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
-        let tmp = TempDir::new().unwrap();
-        let content = "{\"_type\":\"schema\",\"version\":\"1.0.0\"}\n{\"action\":\"x\",\"handle\":\"test\"}\n";
-        fs::write(tmp.path().join("2026-05-14.jsonl"), content).unwrap();
-
-        let app = build_router_local(tmp.path().to_path_buf());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/flow/2026-05-14")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let ct = response
+    assert!(
+        !response
             .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        assert!(ct.starts_with("application/json"), "content-type was `{ct}`");
+            .contains_key("access-control-allow-origin"),
+        "localhost origin must NOT receive CORS headers by default (#273)"
+    );
+}
 
-        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let arr = body["records"].clone();
-        // (found live 2026-09-06) The day file's `{"_type":"schema",…}`
-        // header line is NOT a flow record — `push_flow_line` now skips it,
-        // same as `for_each_record_in_day_file` always has, so it no
-        // longer shows up as a headerless "record 0" in this response.
-        let items = arr.as_array().expect("expected a JSON array");
-        assert_eq!(items.len(), 1, "the schema header is excluded — only the real record remains");
-        assert!(
-            items.iter().any(|r| r["handle"] == "test"),
-            "the dispatch record should be present: {arr}"
+/// 127.0.0.1 variant — same as localhost; denied by default post-#273.
+/// `#[serial]` for the same reason as `cors_denies_localhost_origin_by_default`.
+#[tokio::test]
+#[serial_test::serial]
+async fn cors_denies_loopback_ip_origin_by_default() {
+    unsafe {
+        std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS");
+    }
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("Origin", "http://127.0.0.1:8765")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !response
+            .headers()
+            .contains_key("access-control-allow-origin"),
+        "127.0.0.1 origin must NOT receive CORS headers by default (#273)"
+    );
+}
+
+/// Operator-opt-in: `DARKMUX_DAEMON_CORS_ORIGINS` IS the allowlist —
+/// since #2155 the default is EMPTY (it used to be "null only", which
+/// this comment described until `null` stopped being unconditional).
+/// Comma-separated. Origins in the list receive CORS headers. (#273)
+#[tokio::test]
+#[serial_test::serial]
+async fn cors_allows_origin_in_env_override() {
+    unsafe {
+        std::env::set_var(
+            "DARKMUX_DAEMON_CORS_ORIGINS",
+            "http://localhost:5173,http://localhost:3000",
         );
     }
-
-    /// Localhost-origin requests get CORS headers (topology viewer on any
-    /// local port can read the response).
-    #[tokio::test]
-    /// Post-#270/#273: localhost dev-server origins are NOT allowed by
-    /// default. The same browser tab that runs an operator's localhost
-    /// app should not be able to exfiltrate fleet-wide flow data via
-    /// CORS. Operators with a legitimate dev-server-origin need set
-    /// `DARKMUX_DAEMON_CORS_ORIGINS` to opt that origin in.
-    ///
-    /// `#[serial]` because the sibling `cors_allows_origin_in_env_override`
-    /// sets `DARKMUX_DAEMON_CORS_ORIGINS` and the default-deny assertion
-    /// races against it under cargo's parallel runner. (Race surfaced
-    /// post-merge in CI on main; not flagged on PR-level CI.)
-    #[serial_test::serial]
-    async fn cors_denies_localhost_origin_by_default() {
-        // Defensive — make sure no inherited env from another test changes the default behavior.
-        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .header("Origin", "http://localhost:5173")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            !response.headers().contains_key("access-control-allow-origin"),
-            "localhost origin must NOT receive CORS headers by default (#273)"
-        );
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("Origin", "http://localhost:5173")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    unsafe {
+        std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS");
     }
 
-    /// 127.0.0.1 variant — same as localhost; denied by default post-#273.
-    /// `#[serial]` for the same reason as `cors_denies_localhost_origin_by_default`.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn cors_denies_loopback_ip_origin_by_default() {
-        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .header("Origin", "http://127.0.0.1:8765")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    assert!(
+        response
+            .headers()
+            .contains_key("access-control-allow-origin"),
+        "origin in DARKMUX_DAEMON_CORS_ORIGINS must receive CORS headers (#273)"
+    );
+}
 
-        assert!(
-            !response.headers().contains_key("access-control-allow-origin"),
-            "127.0.0.1 origin must NOT receive CORS headers by default (#273)"
-        );
-    }
+// ─── (#881) serve daemon auth ─────────────────────────────────────
+// Under test-support the config tier is empty (#811), so a serve token
+// resolves ONLY from the DARKMUX_SERVE_TOKEN env var and read auth ONLY
+// from DARKMUX_SERVE_READ_AUTH — set/scrub them, #[serial] to avoid
+// racing other env-mutating tests.
 
-    /// Operator-opt-in: `DARKMUX_DAEMON_CORS_ORIGINS` IS the allowlist —
-    /// since #2155 the default is EMPTY (it used to be "null only", which
-    /// this comment described until `null` stopped being unconditional).
-    /// Comma-separated. Origins in the list receive CORS headers. (#273)
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn cors_allows_origin_in_env_override() {
-        unsafe {
-            std::env::set_var(
-                "DARKMUX_DAEMON_CORS_ORIGINS",
-                "http://localhost:5173,http://localhost:3000",
-            );
+const TEST_TOKEN: &str = "sek-test-12345";
+
+/// The serve auth environment a test runs under. (#2988 follow-up) The
+/// serve token and read auth are separate switches: the token is the
+/// execution credential, read auth decides whether READS need it.
+#[derive(Clone, Copy, Debug)]
+enum AuthEnv {
+    /// No token, read auth off: the default install.
+    Off,
+    /// A fleet token resolves, read auth off: reads stay open.
+    TokenOnly,
+    /// A token resolves and read auth is on.
+    ReadAuth,
+    /// Read auth on and no token resolves (`serve` refuses to start;
+    /// the gate itself must still fail closed).
+    ReadAuthNoToken,
+}
+
+fn apply_auth_env(a: AuthEnv) {
+    let (token, read) = match a {
+        AuthEnv::Off => (false, false),
+        AuthEnv::TokenOnly => (true, false),
+        AuthEnv::ReadAuth => (true, true),
+        AuthEnv::ReadAuthNoToken => (false, true),
+    };
+    unsafe {
+        if token {
+            std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN);
+        } else {
+            std::env::remove_var("DARKMUX_SERVE_TOKEN");
         }
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .header("Origin", "http://localhost:5173")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
-
-        assert!(
-            response.headers().contains_key("access-control-allow-origin"),
-            "origin in DARKMUX_DAEMON_CORS_ORIGINS must receive CORS headers (#273)"
-        );
-    }
-
-    // ─── (#881) serve daemon auth ─────────────────────────────────────
-    // Under test-support the config tier is empty (#811), so a serve token
-    // resolves ONLY from the DARKMUX_SERVE_TOKEN env var and read auth ONLY
-    // from DARKMUX_SERVE_READ_AUTH — set/scrub them, #[serial] to avoid
-    // racing other env-mutating tests.
-
-    const TEST_TOKEN: &str = "sek-test-12345";
-
-    /// The serve auth environment a test runs under. (#2988 follow-up) The
-    /// serve token and read auth are separate switches: the token is the
-    /// execution credential, read auth decides whether READS need it.
-    #[derive(Clone, Copy, Debug)]
-    enum AuthEnv {
-        /// No token, read auth off: the default install.
-        Off,
-        /// A fleet token resolves, read auth off: reads stay open.
-        TokenOnly,
-        /// A token resolves and read auth is on.
-        ReadAuth,
-        /// Read auth on and no token resolves (`serve` refuses to start;
-        /// the gate itself must still fail closed).
-        ReadAuthNoToken,
-    }
-
-    fn apply_auth_env(a: AuthEnv) {
-        let (token, read) = match a {
-            AuthEnv::Off => (false, false),
-            AuthEnv::TokenOnly => (true, false),
-            AuthEnv::ReadAuth => (true, true),
-            AuthEnv::ReadAuthNoToken => (false, true),
-        };
-        unsafe {
-            if token {
-                std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN);
-            } else {
-                std::env::remove_var("DARKMUX_SERVE_TOKEN");
-            }
-            if read {
-                std::env::set_var("DARKMUX_SERVE_READ_AUTH", "on");
-            } else {
-                std::env::remove_var("DARKMUX_SERVE_READ_AUTH");
-            }
+        if read {
+            std::env::set_var("DARKMUX_SERVE_READ_AUTH", "on");
+        } else {
+            std::env::remove_var("DARKMUX_SERVE_READ_AUTH");
         }
     }
+}
 
-    /// Token set AND read auth on: the posture every "requires the token
-    /// from a remote peer" test is about.
-    fn set_read_auth_env() {
-        apply_auth_env(AuthEnv::ReadAuth);
-    }
+/// Token set AND read auth on: the posture every "requires the token
+/// from a remote peer" test is about.
+fn set_read_auth_env() {
+    apply_auth_env(AuthEnv::ReadAuth);
+}
 
-    fn clear_auth_env() {
-        apply_auth_env(AuthEnv::Off);
-    }
+fn clear_auth_env() {
+    apply_auth_env(AuthEnv::Off);
+}
 
-    /// Status of a GET `uri` from `peer` carrying `headers`, through the
-    /// real router, under `auth`.
-    async fn read_status(
-        auth: AuthEnv,
-        peer: ConnectInfo<SocketAddr>,
-        uri: &str,
-        headers: &[(&str, &str)],
-    ) -> StatusCode {
-        apply_auth_env(auth);
-        let app = build_router_local(PathBuf::new());
-        let mut b = Request::builder().uri(uri);
-        for (k, v) in headers {
-            b = b.header(*k, *v);
-        }
-        let mut req = b.body(Body::empty()).unwrap();
-        req.extensions_mut().insert(peer);
-        let resp = app.oneshot(req).await.unwrap();
-        clear_auth_env();
-        resp.status()
+/// Status of a GET `uri` from `peer` carrying `headers`, through the
+/// real router, under `auth`.
+async fn read_status(
+    auth: AuthEnv,
+    peer: ConnectInfo<SocketAddr>,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> StatusCode {
+    apply_auth_env(auth);
+    let app = build_router_local(PathBuf::new());
+    let mut b = Request::builder().uri(uri);
+    for (k, v) in headers {
+        b = b.header(*k, *v);
     }
-    fn remote_peer() -> ConnectInfo<SocketAddr> {
-        ConnectInfo("10.0.0.9:5555".parse::<SocketAddr>().unwrap())
-    }
+    let mut req = b.body(Body::empty()).unwrap();
+    req.extensions_mut().insert(peer);
+    let resp = app.oneshot(req).await.unwrap();
+    clear_auth_env();
+    resp.status()
+}
+fn remote_peer() -> ConnectInfo<SocketAddr> {
+    ConnectInfo("10.0.0.9:5555".parse::<SocketAddr>().unwrap())
+}
 
-    /// (#1663) The loopback twin of [`remote_peer`], and the reason it now
-    /// exists: `auth_mw` used to treat an ABSENT `ConnectInfo` as loopback,
-    /// so a test got the auth exemption by saying nothing. That made the
-    /// whole remote gate depend on one wiring call in `run()`, guarded only
-    /// by a comment. The middleware now fails closed, so a test that wants
-    /// the loopback exemption has to STATE it — which is also the honest
-    /// thing for the test to say, since the production loopback path always
-    /// has a peer address.
-    fn loopback_peer() -> ConnectInfo<SocketAddr> {
-        ConnectInfo("127.0.0.1:5555".parse::<SocketAddr>().unwrap())
-    }
+/// (#1663) The loopback twin of [`remote_peer`], and the reason it now
+/// exists: `auth_mw` used to treat an ABSENT `ConnectInfo` as loopback,
+/// so a test got the auth exemption by saying nothing. That made the
+/// whole remote gate depend on one wiring call in `run()`, guarded only
+/// by a comment. The middleware now fails closed, so a test that wants
+/// the loopback exemption has to STATE it — which is also the honest
+/// thing for the test to say, since the production loopback path always
+/// has a peer address.
+fn loopback_peer() -> ConnectInfo<SocketAddr> {
+    ConnectInfo("127.0.0.1:5555".parse::<SocketAddr>().unwrap())
+}
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn flow_open_on_loopback_even_with_token() {
-        // The router-wide gate exempts loopback peers. (#1663) The peer is
-        // now INJECTED rather than implied by an absent `ConnectInfo` — the
-        // exemption is a thing this test states, not one it inherits from a
-        // fail-open default.
-        set_read_auth_env();
-        let app = build_router_local(PathBuf::new());
-        let mut req = Request::builder().uri("/flow-days").body(Body::empty()).unwrap();
-        req.extensions_mut().insert(loopback_peer());
-        let resp = app.oneshot(req).await.unwrap();
-        clear_auth_env();
-        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
+#[tokio::test]
+#[serial_test::serial]
+async fn flow_open_on_loopback_even_with_token() {
+    // The router-wide gate exempts loopback peers. (#1663) The peer is
+    // now INJECTED rather than implied by an absent `ConnectInfo` — the
+    // exemption is a thing this test states, not one it inherits from a
+    // fail-open default.
+    set_read_auth_env();
+    let app = build_router_local(PathBuf::new());
+    let mut req = Request::builder()
+        .uri("/flow-days")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut().insert(loopback_peer());
+    let resp = app.oneshot(req).await.unwrap();
+    clear_auth_env();
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+}
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn an_absent_peer_address_requires_the_token_rather_than_assuming_loopback() {
-        // (#1663) THE regression this fix exists to make impossible.
-        //
-        // `auth_mw` used to treat an absent `ConnectInfo` as loopback, so the
-        // entire remote gate depended on one wiring call —
-        // `into_make_service_with_connect_info` in `run()` — guarded by
-        // nothing but a comment asking the next person not to change it.
-        // Downgrading that to `into_make_service()` in any refactor makes
-        // every peer look loopback: a tailnet-exposed daemon then serves flow
-        // records, machine specs, mission state, and worktree summaries
-        // unauthenticated, with all tests green and NOTHING visible to the
-        // operator — the viewer keeps working, because loopback was exempt
-        // either way. The bypass is visible only to whoever is on the tailnet.
-        //
-        // Failing closed converts that silent, invisible hole into 401s on
-        // the first remote request. This test pins the direction: no peer
-        // information means no exemption.
-        set_read_auth_env();
-        // The BARE router, deliberately — NOT `build_router_local`. This test
-        // is about what happens when no peer is known, so the harness must not
-        // supply one; with the loopback layer it would assert nothing.
-        let app = build_router(PathBuf::new());
-        // Deliberately NO ConnectInfo — the shape a de-wired router produces.
-        let resp = app
-            .oneshot(Request::builder().uri("/flow-days").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        clear_auth_env();
-        assert_eq!(
+#[tokio::test]
+#[serial_test::serial]
+async fn an_absent_peer_address_requires_the_token_rather_than_assuming_loopback() {
+    // (#1663) THE regression this fix exists to make impossible.
+    //
+    // `auth_mw` used to treat an absent `ConnectInfo` as loopback, so the
+    // entire remote gate depended on one wiring call —
+    // `into_make_service_with_connect_info` in `run()` — guarded by
+    // nothing but a comment asking the next person not to change it.
+    // Downgrading that to `into_make_service()` in any refactor makes
+    // every peer look loopback: a tailnet-exposed daemon then serves flow
+    // records, machine specs, mission state, and worktree summaries
+    // unauthenticated, with all tests green and NOTHING visible to the
+    // operator — the viewer keeps working, because loopback was exempt
+    // either way. The bypass is visible only to whoever is on the tailnet.
+    //
+    // Failing closed converts that silent, invisible hole into 401s on
+    // the first remote request. This test pins the direction: no peer
+    // information means no exemption.
+    set_read_auth_env();
+    // The BARE router, deliberately — NOT `build_router_local`. This test
+    // is about what happens when no peer is known, so the harness must not
+    // supply one; with the loopback layer it would assert nothing.
+    let app = build_router(PathBuf::new());
+    // Deliberately NO ConnectInfo — the shape a de-wired router produces.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/flow-days")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    clear_auth_env();
+    assert_eq!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
             "an unknown peer must be treated as remote — absence of evidence is not evidence of loopback"
         );
-    }
+}
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn an_absent_peer_address_still_passes_when_it_carries_the_token() {
-        // The control: failing closed must not break a legitimate remote
-        // client. Unknown peer + valid token is still authorized, so this is
-        // a gate, not a blanket refusal.
-        set_read_auth_env();
-        // Bare router for the same reason as its sibling above: the absent
-        // peer IS the condition under test.
-        let app = build_router(PathBuf::new());
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/flow-days")
-                    .header("Authorization", format!("Bearer {TEST_TOKEN}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        clear_auth_env();
-        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn flow_requires_token_from_remote_peer() {
-        set_read_auth_env();
-        let app = build_router_local(PathBuf::new());
-        let mut req = Request::builder().uri("/flow-days").body(Body::empty()).unwrap();
-        req.extensions_mut().insert(remote_peer());
-        let resp = app.oneshot(req).await.unwrap();
-        clear_auth_env();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    /// (#1247 Part 3 / #1262 review round) The lab routes must ride the SAME
-    /// remote-only bearer gate as the rest of the read surface — guards
-    /// against a future refactor special-casing `/lab/*` out of `auth_mw`
-    /// (they serve local run artifacts, no less sensitive than flow records).
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn lab_runs_requires_token_from_remote_peer() {
-        set_read_auth_env();
-        let app = build_router_local(PathBuf::new());
-        let mut req = Request::builder().uri("/lab/runs").body(Body::empty()).unwrap();
-        req.extensions_mut().insert(remote_peer());
-        let resp = app.oneshot(req).await.unwrap();
-        clear_auth_env();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn flow_accepts_remote_peer_with_token() {
-        set_read_auth_env();
-        let app = build_router_local(PathBuf::new());
-        let mut req = Request::builder()
-            .uri("/flow-days")
-            .header("Authorization", format!("Bearer {TEST_TOKEN}"))
-            .body(Body::empty())
-            .unwrap();
-        req.extensions_mut().insert(remote_peer());
-        let resp = app.oneshot(req).await.unwrap();
-        clear_auth_env();
-        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    // ─── (#2988) a proxied loopback request is not this machine ─────────
-    // `tailscale serve` (the documented way a hub reaches the tailnet)
-    // proxies every tailnet peer to loopback. With read auth on, the gate
-    // must ask `is_local_request` — loopback AND no proxy header — or every
-    // peer behind the proxy reads the whole surface without the token.
-
-    /// Status of a loopback `/flow-days` request carrying `headers`.
-    async fn loopback_flow_status(auth: AuthEnv, headers: &[(&str, &str)]) -> StatusCode {
-        read_status(auth, loopback_peer(), "/flow-days", headers).await
-    }
-
-    const BEARER: &str = "Bearer sek-test-12345";
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn auth_on_plain_loopback_is_allowed_without_the_token() {
-        assert_ne!(loopback_flow_status(AuthEnv::ReadAuth, &[]).await, StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn auth_on_loopback_with_x_forwarded_for_and_no_token_is_refused() {
-        let status = loopback_flow_status(AuthEnv::ReadAuth, &[("X-Forwarded-For", "100.64.0.7")]).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "a tailnet peer behind `tailscale serve` is not loopback");
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn auth_on_loopback_with_x_forwarded_for_and_the_token_is_allowed() {
-        let status = loopback_flow_status(
-            AuthEnv::ReadAuth,
-            &[("X-Forwarded-For", "100.64.0.7"), ("Authorization", BEARER)],
+#[tokio::test]
+#[serial_test::serial]
+async fn an_absent_peer_address_still_passes_when_it_carries_the_token() {
+    // The control: failing closed must not break a legitimate remote
+    // client. Unknown peer + valid token is still authorized, so this is
+    // a gate, not a blanket refusal.
+    set_read_auth_env();
+    // Bare router for the same reason as its sibling above: the absent
+    // peer IS the condition under test.
+    let app = build_router(PathBuf::new());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/flow-days")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
         )
-        .await;
-        assert_ne!(status, StatusCode::UNAUTHORIZED);
-    }
+        .await
+        .unwrap();
+    clear_auth_env();
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+}
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn auth_on_loopback_with_tailscale_user_login_and_no_token_is_refused() {
-        let status =
-            loopback_flow_status(AuthEnv::ReadAuth, &[("Tailscale-User-Login", "someone@example.com")]).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-    }
+#[tokio::test]
+#[serial_test::serial]
+async fn flow_requires_token_from_remote_peer() {
+    set_read_auth_env();
+    let app = build_router_local(PathBuf::new());
+    let mut req = Request::builder()
+        .uri("/flow-days")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut().insert(remote_peer());
+    let resp = app.oneshot(req).await.unwrap();
+    clear_auth_env();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn auth_on_loopback_with_forwarded_and_no_token_is_refused() {
-        let status = loopback_flow_status(AuthEnv::ReadAuth, &[("Forwarded", "for=100.64.0.7")]).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-    }
+/// (#1247 Part 3 / #1262 review round) The lab routes must ride the SAME
+/// remote-only bearer gate as the rest of the read surface — guards
+/// against a future refactor special-casing `/lab/*` out of `auth_mw`
+/// (they serve local run artifacts, no less sensitive than flow records).
+#[tokio::test]
+#[serial_test::serial]
+async fn lab_runs_requires_token_from_remote_peer() {
+    set_read_auth_env();
+    let app = build_router_local(PathBuf::new());
+    let mut req = Request::builder()
+        .uri("/lab/runs")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut().insert(remote_peer());
+    let resp = app.oneshot(req).await.unwrap();
+    clear_auth_env();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
 
-    /// Auth OFF (no token resolves, read auth off — the default): reads
-    /// stay open to everything, proxied or not.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn auth_off_every_loopback_shape_is_allowed() {
-        clear_auth_env();
-        assert!(!darkmux_flow::serve_token_present(), "the default resolves no token");
-        for headers in [
-            &[][..],
-            &[("X-Forwarded-For", "100.64.0.7")][..],
-            &[("X-Forwarded-For", "100.64.0.7"), ("Authorization", BEARER)][..],
-            &[("Tailscale-User-Login", "someone@example.com")][..],
-            &[("Forwarded", "for=100.64.0.7")][..],
-        ] {
-            assert_ne!(loopback_flow_status(AuthEnv::Off, headers).await, StatusCode::UNAUTHORIZED, "{headers:?}");
-        }
-    }
+#[tokio::test]
+#[serial_test::serial]
+async fn flow_accepts_remote_peer_with_token() {
+    set_read_auth_env();
+    let app = build_router_local(PathBuf::new());
+    let mut req = Request::builder()
+        .uri("/flow-days")
+        .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut().insert(remote_peer());
+    let resp = app.oneshot(req).await.unwrap();
+    clear_auth_env();
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+}
 
-    /// (#2988 follow-up) A fleet token is the EXECUTION credential; it no
-    /// longer closes the read surface. With a token present and read auth
-    /// off, a viewer load through `tailscale serve`, a JSON read and a
-    /// direct remote read all pass without the token.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_fleet_token_with_read_auth_off_leaves_reads_open() {
-        let proxied = [("X-Forwarded-For", "100.64.0.7"), ("Tailscale-User-Login", "someone@example.com")];
-        for uri in ["/", "/flow-days", "/runs", "/flow-dispatch/some-session", "/mission/m/graph.json"] {
-            let s = read_status(AuthEnv::TokenOnly, loopback_peer(), uri, &proxied).await;
-            assert_ne!(s, StatusCode::UNAUTHORIZED, "proxied {uri}");
-            let s = read_status(AuthEnv::TokenOnly, remote_peer(), uri, &[]).await;
-            assert_ne!(s, StatusCode::UNAUTHORIZED, "remote {uri}");
-        }
-    }
+// ─── (#2988) a proxied loopback request is not this machine ─────────
+// `tailscale serve` (the documented way a hub reaches the tailnet)
+// proxies every tailnet peer to loopback. With read auth on, the gate
+// must ask `is_local_request` — loopback AND no proxy header — or every
+// peer behind the proxy reads the whole surface without the token.
 
-    /// Read auth on with no token resolvable: `serve` refuses to start
-    /// (`serve_auth_preflight`), and the gate itself still fails closed —
-    /// a remote or proxied read gets 401, this machine still reads.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn read_auth_on_without_a_token_fails_closed() {
-        let s = read_status(AuthEnv::ReadAuthNoToken, remote_peer(), "/flow-days", &[]).await;
-        assert_eq!(s, StatusCode::UNAUTHORIZED);
-        let s = read_status(AuthEnv::ReadAuthNoToken, loopback_peer(), "/flow-days", &[("X-Forwarded-For", "100.64.0.7")]).await;
-        assert_eq!(s, StatusCode::UNAUTHORIZED);
-        let s = read_status(AuthEnv::ReadAuthNoToken, loopback_peer(), "/flow-days", &[]).await;
-        assert_ne!(s, StatusCode::UNAUTHORIZED);
-    }
+/// Status of a loopback `/flow-days` request carrying `headers`.
+async fn loopback_flow_status(auth: AuthEnv, headers: &[(&str, &str)]) -> StatusCode {
+    read_status(auth, loopback_peer(), "/flow-days", headers).await
+}
 
-    /// The read routes accept GET only: nothing on this router starts work.
-    /// A POST to a read route is 405, never a 2xx, under every posture.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn the_read_router_starts_no_work() {
-        for auth in [AuthEnv::Off, AuthEnv::TokenOnly] {
-            apply_auth_env(auth);
-            let app = build_router_local(PathBuf::new());
-            for uri in ["/", "/flow-days", "/runs", "/panel/doctor", "/flow-dispatch/s"] {
-                let mut req = Request::builder().method("POST").uri(uri).body(Body::empty()).unwrap();
-                req.extensions_mut().insert(loopback_peer());
-                let resp = app.clone().oneshot(req).await.unwrap();
-                assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{auth:?} POST {uri}");
-            }
-            clear_auth_env();
-        }
-    }
+const BEARER: &str = "Bearer sek-test-12345";
 
-    /// The `/health` body for a loopback request carrying `headers`,
-    /// through the real router and handler.
-    async fn loopback_health(headers: &[(&str, &str)]) -> serde_json::Value {
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_on_plain_loopback_is_allowed_without_the_token() {
+    assert_ne!(
+        loopback_flow_status(AuthEnv::ReadAuth, &[]).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_on_loopback_with_x_forwarded_for_and_no_token_is_refused() {
+    let status =
+        loopback_flow_status(AuthEnv::ReadAuth, &[("X-Forwarded-For", "100.64.0.7")]).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a tailnet peer behind `tailscale serve` is not loopback"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_on_loopback_with_x_forwarded_for_and_the_token_is_allowed() {
+    let status = loopback_flow_status(
+        AuthEnv::ReadAuth,
+        &[("X-Forwarded-For", "100.64.0.7"), ("Authorization", BEARER)],
+    )
+    .await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_on_loopback_with_tailscale_user_login_and_no_token_is_refused() {
+    let status = loopback_flow_status(
+        AuthEnv::ReadAuth,
+        &[("Tailscale-User-Login", "someone@example.com")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_on_loopback_with_forwarded_and_no_token_is_refused() {
+    let status = loopback_flow_status(AuthEnv::ReadAuth, &[("Forwarded", "for=100.64.0.7")]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Auth OFF (no token resolves, read auth off — the default): reads
+/// stay open to everything, proxied or not.
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_off_every_loopback_shape_is_allowed() {
+    clear_auth_env();
+    assert!(
+        !darkmux_flow::serve_token_present(),
+        "the default resolves no token"
+    );
+    for headers in [
+        &[][..],
+        &[("X-Forwarded-For", "100.64.0.7")][..],
+        &[("X-Forwarded-For", "100.64.0.7"), ("Authorization", BEARER)][..],
+        &[("Tailscale-User-Login", "someone@example.com")][..],
+        &[("Forwarded", "for=100.64.0.7")][..],
+    ] {
+        assert_ne!(
+            loopback_flow_status(AuthEnv::Off, headers).await,
+            StatusCode::UNAUTHORIZED,
+            "{headers:?}"
+        );
+    }
+}
+
+/// (#2988 follow-up) A fleet token is the EXECUTION credential; it no
+/// longer closes the read surface. With a token present and read auth
+/// off, a viewer load through `tailscale serve`, a JSON read and a
+/// direct remote read all pass without the token.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_fleet_token_with_read_auth_off_leaves_reads_open() {
+    let proxied = [
+        ("X-Forwarded-For", "100.64.0.7"),
+        ("Tailscale-User-Login", "someone@example.com"),
+    ];
+    for uri in [
+        "/",
+        "/flow-days",
+        "/runs",
+        "/flow-dispatch/some-session",
+        "/mission/m/graph.json",
+    ] {
+        let s = read_status(AuthEnv::TokenOnly, loopback_peer(), uri, &proxied).await;
+        assert_ne!(s, StatusCode::UNAUTHORIZED, "proxied {uri}");
+        let s = read_status(AuthEnv::TokenOnly, remote_peer(), uri, &[]).await;
+        assert_ne!(s, StatusCode::UNAUTHORIZED, "remote {uri}");
+    }
+}
+
+/// Read auth on with no token resolvable: `serve` refuses to start
+/// (`serve_auth_preflight`), and the gate itself still fails closed —
+/// a remote or proxied read gets 401, this machine still reads.
+#[tokio::test]
+#[serial_test::serial]
+async fn read_auth_on_without_a_token_fails_closed() {
+    let s = read_status(AuthEnv::ReadAuthNoToken, remote_peer(), "/flow-days", &[]).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let s = read_status(
+        AuthEnv::ReadAuthNoToken,
+        loopback_peer(),
+        "/flow-days",
+        &[("X-Forwarded-For", "100.64.0.7")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let s = read_status(AuthEnv::ReadAuthNoToken, loopback_peer(), "/flow-days", &[]).await;
+    assert_ne!(s, StatusCode::UNAUTHORIZED);
+}
+
+/// The read routes accept GET only: nothing on this router starts work.
+/// A POST to a read route is 405, never a 2xx, under every posture.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_read_router_starts_no_work() {
+    for auth in [AuthEnv::Off, AuthEnv::TokenOnly] {
+        apply_auth_env(auth);
         let app = build_router_local(PathBuf::new());
-        let mut b = Request::builder().uri("/health");
-        for (k, v) in headers {
-            b = b.header(*k, *v);
-        }
-        let mut req = b.body(Body::empty()).unwrap();
-        req.extensions_mut().insert(loopback_peer());
-        let resp = app.oneshot(req).await.unwrap();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    }
-
-    /// `/health` tells this machine whether the DAEMON resolved a fleet token
-    /// (never its value), and a peer, or a proxied request, learns nothing.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn health_reports_token_presence_to_this_machine_only() {
-        let k = "DARKMUX_SERVE_TOKEN";
-        let prev = std::env::var(k).ok();
-        unsafe { std::env::set_var(k, "not-a-real-token") };
-        let set = loopback_health(&[]).await;
-        let proxied = loopback_health(&[("X-Forwarded-For", "100.64.0.7")]).await;
-        unsafe { std::env::remove_var(k) };
-        let unset = loopback_health(&[]).await;
-        unsafe {
-            if let Some(v) = prev {
-                std::env::set_var(k, v)
-            }
-        }
-        assert_eq!(set["fleet_token_set"], true, "{set}");
-        assert!(proxied["fleet_token_set"].is_null(), "{proxied}");
-        assert_eq!(unset["fleet_token_set"], false, "{unset}");
-        assert!(!set.to_string().contains("not-a-real-token"), "the value never appears");
-    }
-
-    /// (#3423) `/health` tells this machine whether the daemon's OWN `PATH`
-    /// finds `docker` (never the path): a brew service once ran with launchd's
-    /// bare PATH and failed every dispatch while the operator's shell found
-    /// docker fine (#3418). A peer, or a proxied request, learns nothing.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn health_reports_whether_the_daemon_finds_docker_to_this_machine_only() {
-        // Its own process: it empties `PATH`, which a test spawning git
-        // alongside in this binary would read.
-        darkmux_types::run_in_own_process!();
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("docker"), "").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir.path().join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let prev = std::env::var_os("PATH");
-        unsafe { std::env::set_var("PATH", dir.path()) };
-        let found = loopback_health(&[]).await;
-        let proxied = loopback_health(&[("X-Forwarded-For", "100.64.0.7")]).await;
-        unsafe { std::env::set_var("PATH", "/nonexistent-darkmux-test-dir") };
-        let missing = loopback_health(&[]).await;
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-        assert_eq!(found["docker_on_path"], true, "{found}");
-        assert!(proxied["docker_on_path"].is_null(), "{proxied}");
-        assert_eq!(missing["docker_on_path"], false, "{missing}");
-        assert!(!found.to_string().contains(&dir.path().display().to_string()), "the path never appears");
-        // (#3112) The sandbox the daemon runs isolated work in, to this
-        // machine only (a test build's default is Docker on every host).
-        assert_eq!(found["sandbox"], "docker", "{found}");
-        assert!(proxied["sandbox"].is_null(), "{proxied}");
-    }
-
-    /// (#3112 review) The daemon pins nothing: a process it starts reads
-    /// `config.json` as it is then, so `config set runtime.sandbox` takes
-    /// effect for them at once and they report its true source. `/health`
-    /// says both: `sandbox`, what this daemon's own work runs in (its
-    /// start-time setting), and `sandbox_configured`, what a process started
-    /// now (every child included) runs in.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn health_names_the_daemons_own_sandbox_and_the_configured_one() {
-        darkmux_types::run_in_own_process!();
-        let home = tempfile::TempDir::new().unwrap();
-        let (prev_home, prev_sb) = (std::env::var_os("DARKMUX_HOME"), std::env::var_os("DARKMUX_SANDBOX"));
-        unsafe {
-            std::env::set_var("DARKMUX_HOME", home.path());
-            std::env::remove_var("DARKMUX_SANDBOX");
-        }
-        std::fs::write(home.path().join("config.json"), r#"{"runtime": {"sandbox": "docker"}}"#).unwrap();
-        let docker = loopback_health(&[]).await;
-        let seatbelt_here = darkmux_sandbox::SeatbeltBackend::available();
-        if seatbelt_here {
-            std::fs::write(home.path().join("config.json"), r#"{"runtime": {"sandbox": "seatbelt"}}"#).unwrap();
-        }
-        let after_set = loopback_health(&[]).await;
-        unsafe {
-            match prev_home { Some(v) => std::env::set_var("DARKMUX_HOME", v), None => std::env::remove_var("DARKMUX_HOME") }
-            if let Some(v) = prev_sb { std::env::set_var("DARKMUX_SANDBOX", v) }
-        }
-        assert_eq!(docker["sandbox"], "docker", "{docker}");
-        assert_eq!(docker["sandbox_configured"], "docker", "{docker}");
-        if seatbelt_here {
-            assert_eq!(after_set["sandbox"], "docker", "this daemon keeps its start-time setting: {after_set}");
-            assert_eq!(after_set["sandbox_configured"], "seatbelt", "what a process started now runs in: {after_set}");
-            assert!(!after_set["docker_on_path"].is_null(), "its own work still needs docker: {after_set}");
-        }
-        let src = include_str!("lib.rs");
-        assert!(!src.contains("fn pin_sandbox_for_children"), "the daemon pins no sandbox into its children's environment");
-    }
-
-    /// (#3112) A daemon whose sandbox is Seatbelt needs no docker: `/health`
-    /// says which sandbox it runs, and does not answer `docker_on_path`.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn health_under_seatbelt_names_it_and_asks_nothing_of_docker() {
-        darkmux_types::run_in_own_process!();
-        if !darkmux_sandbox::SeatbeltBackend::available() {
-            return; // Seatbelt is refused off macOS; nothing to show here.
-        }
-        let prev = std::env::var_os("DARKMUX_SANDBOX");
-        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
-        let health = loopback_health(&[]).await;
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_SANDBOX", v),
-                None => std::env::remove_var("DARKMUX_SANDBOX"),
-            }
-        }
-        assert_eq!(health["sandbox"], "seatbelt", "{health}");
-        assert!(health["docker_on_path"].is_null(), "{health}");
-    }
-
-    /// `/health` tells this machine whether the daemon can publish to the
-    /// fleet hub: unreachable (since when, and why), then connected once the
-    /// hub answers. A proxied loopback request, which is a peer, learns nothing.
-    /// Drives the real handler; the sink's own transitions are tested against a
-    /// real Redis in `darkmux-flow`.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn health_reports_the_hub_link_to_this_machine_only() {
-        use darkmux_flow::HubLink;
-        darkmux_flow::set_hub_link_for_tests(Some(HubLink::Unreachable {
-            since: "2026-10-01T03:04:05Z".into(),
-            reason: "Connection refused (os error 61)".into(),
-        }));
-        let down = loopback_health(&[]).await;
-        let down_proxied = loopback_health(&[("X-Forwarded-For", "100.64.0.7")]).await;
-        darkmux_flow::set_hub_link_for_tests(Some(HubLink::Connected));
-        let up = loopback_health(&[]).await;
-        darkmux_flow::set_hub_link_for_tests(None);
-        let none = loopback_health(&[]).await;
-        assert_eq!(down["hub_link"]["state"], "unreachable", "{down}");
-        assert_eq!(down["hub_link"]["since"], "2026-10-01T03:04:05Z", "{down}");
-        assert_eq!(down["hub_link"]["reason"], "Connection refused (os error 61)", "{down}");
-        assert!(down_proxied["hub_link"].is_null(), "a peer is not told: {down_proxied}");
-        assert_eq!(up["hub_link"]["state"], "connected", "{up}");
-        assert!(none["hub_link"].is_null(), "no hub configured: {none}");
-    }
-
-    /// (#2916 stage 2 review C5) The `/health` fields for this machine only
-    /// are withheld from a loopback request that came through a reverse
-    /// proxy (`tailscale serve` puts every tailnet peer on loopback), and
-    /// shown to a plain loopback request. Drives the real handler.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn health_withholds_this_machine_fields_from_a_proxied_loopback_request() {
-        *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() =
-            Some(darkmux_types::config::BusyPolicy::Queue);
-        let local = loopback_health(&[]).await;
-        assert!(local["open_file_limit"].is_number(), "this machine sees its own limit: {local}");
-        assert_eq!(local["fleet_busy"]["policy"], "queue", "{local}");
-        for proxied in [
-            ("X-Forwarded-For", "100.64.0.7"),
-            ("Tailscale-User-Login", "someone@example.com"),
-            ("Forwarded", "for=100.64.0.7"),
+        for uri in [
+            "/",
+            "/flow-days",
+            "/runs",
+            "/panel/doctor",
+            "/flow-dispatch/s",
         ] {
-            let v = loopback_health(&[proxied]).await;
-            assert!(v["open_file_limit"].is_null(), "{proxied:?} is a peer, not this machine: {v}");
-            assert!(v["fleet_busy"].is_null(), "{proxied:?}: {v}");
+            let mut req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(loopback_peer());
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{auth:?} POST {uri}"
+            );
         }
-        // Process-global: leave it as the process started.
-        *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() = None;
+        clear_auth_env();
     }
+}
 
-    /// The listener's detail (its address and why it is up or down) and the
-    /// open-file limit are this machine's business: a peer's `/health` shows
-    /// the coarse word and no limit, and this machine's shows both.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn health_gives_a_non_local_caller_only_the_coarse_listener_word_and_no_file_limit() {
-        *crate::fleet_listener::LISTENER_STATE.lock().unwrap() =
-            Some(("listening", "listening on 100.64.0.2:8766".to_string()));
-        let local = loopback_health(&[]).await;
-        let proxied = loopback_health(&[("X-Forwarded-For", "100.64.0.7")]).await;
-        *crate::fleet_listener::LISTENER_STATE.lock().unwrap() = None;
-        assert_eq!(local["fleet_listener"], "listening on 100.64.0.2:8766", "{local}");
-        assert!(local["open_file_limit"].is_number(), "{local}");
-        assert_eq!(proxied["fleet_listener"], "listening", "a peer learns the word, not the address: {proxied}");
-        assert!(!proxied.to_string().contains("100.64.0.2"), "{proxied}");
-        assert!(proxied["open_file_limit"].is_null(), "{proxied}");
+/// The `/health` body for a loopback request carrying `headers`,
+/// through the real router and handler.
+async fn loopback_health(headers: &[(&str, &str)]) -> serde_json::Value {
+    let app = build_router_local(PathBuf::new());
+    let mut b = Request::builder().uri("/health");
+    for (k, v) in headers {
+        b = b.header(*k, *v);
     }
+    let mut req = b.body(Body::empty()).unwrap();
+    req.extensions_mut().insert(loopback_peer());
+    let resp = app.oneshot(req).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
 
-    /// Every header a reverse proxy adds is, ALONE, enough to make a loopback
-    /// request "not this machine". The list here is written out on purpose: a
-    /// test that iterates `PROXY_HEADERS` stays green when an entry is deleted.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn each_proxy_header_alone_makes_a_loopback_request_non_local() {
-        const EXPECTED: [&str; 15] = [
-            "x-forwarded-for",
-            "x-forwarded-host",
-            "x-forwarded-proto",
-            "x-forwarded-port",
-            "x-forwarded-server",
-            "x-real-ip",
-            "forwarded",
-            "via",
-            "cf-connecting-ip",
-            "true-client-ip",
-            "tailscale-user-login",
-            "tailscale-user-name",
-            "tailscale-headers-info",
-            "tailscale-funnel-request",
-            "tailscale-app-capabilities",
-        ];
-        assert_eq!(PROXY_HEADERS.len(), EXPECTED.len(), "a header was added or removed: update this list on purpose");
-        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let bound: SocketAddr = "127.0.0.1:8765".parse().unwrap();
-        assert!(is_local_at(Some(lo), &headers_with(&[("Host", "localhost:8765")]), Some(bound)), "the inverse: no proxy header is local");
-        for h in EXPECTED {
-            let hm = headers_with(&[("Host", "localhost:8765"), (h, "x")]);
-            assert!(!is_local_at(Some(lo), &hm, Some(bound)), "{h} alone must make the request non-local");
-            let v = loopback_health(&[("Host", "localhost:8765"), (h, "x")]).await;
-            assert!(v["open_file_limit"].is_null(), "/health shows this machine's limit behind {h}: {v}");
+/// `/health` tells this machine whether the DAEMON resolved a fleet token
+/// (never its value), and a peer, or a proxied request, learns nothing.
+#[tokio::test]
+#[serial_test::serial]
+async fn health_reports_token_presence_to_this_machine_only() {
+    let k = "DARKMUX_SERVE_TOKEN";
+    let prev = std::env::var(k).ok();
+    unsafe { std::env::set_var(k, "not-a-real-token") };
+    let set = loopback_health(&[]).await;
+    let proxied = loopback_health(&[("X-Forwarded-For", "100.64.0.7")]).await;
+    unsafe { std::env::remove_var(k) };
+    let unset = loopback_health(&[]).await;
+    unsafe {
+        if let Some(v) = prev {
+            std::env::set_var(k, v)
         }
     }
+    assert_eq!(set["fleet_token_set"], true, "{set}");
+    assert!(proxied["fleet_token_set"].is_null(), "{proxied}");
+    assert_eq!(unset["fleet_token_set"], false, "{unset}");
+    assert!(
+        !set.to_string().contains("not-a-real-token"),
+        "the value never appears"
+    );
+}
 
-    fn headers_with(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
-        let mut hm = axum::http::HeaderMap::new();
-        for (k, v) in pairs {
-            hm.append(axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
-        }
-        hm
-    }
-
-    #[test]
-    fn is_local_request_needs_a_loopback_peer_and_no_proxy_header() {
-        let named = headers_with(&[("Host", "localhost:8765")]);
-        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let v6: SocketAddr = "[::1]:5000".parse().unwrap();
-        let remote: SocketAddr = "100.64.0.7:5000".parse().unwrap();
-        assert!(is_local_request(Some(lo), &named));
-        assert!(is_local_request(Some(v6), &named));
-        assert!(!is_local_request(Some(remote), &named));
-        assert!(!is_local_request(None, &named), "no address is not local");
-        for h in PROXY_HEADERS {
-            let hm = headers_with(&[("Host", "localhost:8765"), (h, "x")]);
-            assert!(!is_local_request(Some(lo), &hm), "{h}");
-        }
-    }
-
-    // ─── (#2988 review) a local request names this machine ────────────
-    // A loopback peer is not enough: a browser tab on an attacker's page,
-    // rebound by DNS to 127.0.0.1, connects from loopback carrying the
-    // attacker's Host. A header-less proxy's Host is the tailnet name.
-
-    const REBOUND: &[(&str, &str)] =
-        &[("Host", "attacker.example:8765"), ("Origin", "http://attacker.example:8765")];
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn auth_on_loopback_with_a_rebinding_host_and_no_token_is_refused() {
-        assert_eq!(loopback_flow_status(AuthEnv::ReadAuth, REBOUND).await, StatusCode::MISDIRECTED_REQUEST);
-    }
-
-    /// A page cannot hold the token, so a token beside a foreign `Host` is
-    /// not a reason to answer it.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn auth_on_loopback_with_a_rebinding_host_and_the_token_is_still_refused() {
-        let status = loopback_flow_status(
-            AuthEnv::ReadAuth,
-            &[("Host", "attacker.example:8765"), ("Authorization", BEARER)],
+/// (#3423) `/health` tells this machine whether the daemon's OWN `PATH`
+/// finds `docker` (never the path): a brew service once ran with launchd's
+/// bare PATH and failed every dispatch while the operator's shell found
+/// docker fine (#3418). A peer, or a proxied request, learns nothing.
+#[tokio::test]
+#[serial_test::serial]
+async fn health_reports_whether_the_daemon_finds_docker_to_this_machine_only() {
+    // Its own process: it empties `PATH`, which a test spawning git
+    // alongside in this binary would read.
+    darkmux_types::run_in_own_process!();
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("docker"), "").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            dir.path().join("docker"),
+            std::fs::Permissions::from_mode(0o755),
         )
-        .await;
-        assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+        .unwrap();
     }
+    let prev = std::env::var_os("PATH");
+    unsafe { std::env::set_var("PATH", dir.path()) };
+    let found = loopback_health(&[]).await;
+    let proxied = loopback_health(&[("X-Forwarded-For", "100.64.0.7")]).await;
+    unsafe { std::env::set_var("PATH", "/nonexistent-darkmux-test-dir") };
+    let missing = loopback_health(&[]).await;
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+    assert_eq!(found["docker_on_path"], true, "{found}");
+    assert!(proxied["docker_on_path"].is_null(), "{proxied}");
+    assert_eq!(missing["docker_on_path"], false, "{missing}");
+    assert!(
+        !found
+            .to_string()
+            .contains(&dir.path().display().to_string()),
+        "the path never appears"
+    );
+    // (#3112) The sandbox the daemon runs isolated work in, to this
+    // machine only (a test build's default is Docker on every host).
+    assert_eq!(found["sandbox"], "docker", "{found}");
+    assert!(proxied["sandbox"].is_null(), "{proxied}");
+}
 
-    /// (DNS rebinding) With read auth off, the default install, a page whose
-    /// name was re-resolved to 127.0.0.1 used to be served like a tailnet
-    /// peer: redacted, but every flow record's content intact. Whatever the
-    /// posture and the peer, a `Host` that names no address of this machine
-    /// is refused, on every route, before anything is read.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_foreign_host_is_refused_whatever_the_read_posture() {
-        for auth in [AuthEnv::Off, AuthEnv::TokenOnly, AuthEnv::ReadAuth] {
-            for path in ["/flow-days", "/flow/2026-05-14", "/runs", "/health", "/fleet/roster"] {
-                for peer in [loopback_peer(), remote_peer()] {
-                    for host in ["attacker.example:8765", "attacker.example", "localhost.attacker.example", "127.0.0.1.nip.io:8765"] {
-                        let status = read_status(auth, peer, path, &[("Host", host), ("Origin", "http://attacker.example:8765")]).await;
-                        assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{path} Host {host} from {:?}", peer.0);
-                    }
+/// (#3112 review) The daemon pins nothing: a process it starts reads
+/// `config.json` as it is then, so `config set runtime.sandbox` takes
+/// effect for them at once and they report its true source. `/health`
+/// says both: `sandbox`, what this daemon's own work runs in (its
+/// start-time setting), and `sandbox_configured`, what a process started
+/// now (every child included) runs in.
+#[tokio::test]
+#[serial_test::serial]
+async fn health_names_the_daemons_own_sandbox_and_the_configured_one() {
+    darkmux_types::run_in_own_process!();
+    let home = tempfile::TempDir::new().unwrap();
+    let (prev_home, prev_sb) = (
+        std::env::var_os("DARKMUX_HOME"),
+        std::env::var_os("DARKMUX_SANDBOX"),
+    );
+    unsafe {
+        std::env::set_var("DARKMUX_HOME", home.path());
+        std::env::remove_var("DARKMUX_SANDBOX");
+    }
+    std::fs::write(
+        home.path().join("config.json"),
+        r#"{"runtime": {"sandbox": "docker"}}"#,
+    )
+    .unwrap();
+    let docker = loopback_health(&[]).await;
+    let seatbelt_here = darkmux_sandbox::SeatbeltBackend::available();
+    if seatbelt_here {
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"runtime": {"sandbox": "seatbelt"}}"#,
+        )
+        .unwrap();
+    }
+    let after_set = loopback_health(&[]).await;
+    unsafe {
+        match prev_home {
+            Some(v) => std::env::set_var("DARKMUX_HOME", v),
+            None => std::env::remove_var("DARKMUX_HOME"),
+        }
+        if let Some(v) = prev_sb {
+            std::env::set_var("DARKMUX_SANDBOX", v)
+        }
+    }
+    assert_eq!(docker["sandbox"], "docker", "{docker}");
+    assert_eq!(docker["sandbox_configured"], "docker", "{docker}");
+    if seatbelt_here {
+        assert_eq!(
+            after_set["sandbox"], "docker",
+            "this daemon keeps its start-time setting: {after_set}"
+        );
+        assert_eq!(
+            after_set["sandbox_configured"], "seatbelt",
+            "what a process started now runs in: {after_set}"
+        );
+        assert!(
+            !after_set["docker_on_path"].is_null(),
+            "its own work still needs docker: {after_set}"
+        );
+    }
+    let src = include_str!("lib.rs");
+    assert!(
+        !src.contains("fn pin_sandbox_for_children"),
+        "the daemon pins no sandbox into its children's environment"
+    );
+}
+
+/// (#3112) A daemon whose sandbox is Seatbelt needs no docker: `/health`
+/// says which sandbox it runs, and does not answer `docker_on_path`.
+#[tokio::test]
+#[serial_test::serial]
+async fn health_under_seatbelt_names_it_and_asks_nothing_of_docker() {
+    darkmux_types::run_in_own_process!();
+    if !darkmux_sandbox::SeatbeltBackend::available() {
+        return; // Seatbelt is refused off macOS; nothing to show here.
+    }
+    let prev = std::env::var_os("DARKMUX_SANDBOX");
+    unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
+    let health = loopback_health(&[]).await;
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_SANDBOX", v),
+            None => std::env::remove_var("DARKMUX_SANDBOX"),
+        }
+    }
+    assert_eq!(health["sandbox"], "seatbelt", "{health}");
+    assert!(health["docker_on_path"].is_null(), "{health}");
+}
+
+/// `/health` tells this machine whether the daemon can publish to the
+/// fleet hub: unreachable (since when, and why), then connected once the
+/// hub answers. A proxied loopback request, which is a peer, learns nothing.
+/// Drives the real handler; the sink's own transitions are tested against a
+/// real Redis in `darkmux-flow`.
+#[tokio::test]
+#[serial_test::serial]
+async fn health_reports_the_hub_link_to_this_machine_only() {
+    use darkmux_flow::HubLink;
+    darkmux_flow::set_hub_link_for_tests(Some(HubLink::Unreachable {
+        since: "2026-10-01T03:04:05Z".into(),
+        reason: "Connection refused (os error 61)".into(),
+    }));
+    let down = loopback_health(&[]).await;
+    let down_proxied = loopback_health(&[("X-Forwarded-For", "100.64.0.7")]).await;
+    darkmux_flow::set_hub_link_for_tests(Some(HubLink::Connected));
+    let up = loopback_health(&[]).await;
+    darkmux_flow::set_hub_link_for_tests(None);
+    let none = loopback_health(&[]).await;
+    assert_eq!(down["hub_link"]["state"], "unreachable", "{down}");
+    assert_eq!(down["hub_link"]["since"], "2026-10-01T03:04:05Z", "{down}");
+    assert_eq!(
+        down["hub_link"]["reason"], "Connection refused (os error 61)",
+        "{down}"
+    );
+    assert!(
+        down_proxied["hub_link"].is_null(),
+        "a peer is not told: {down_proxied}"
+    );
+    assert_eq!(up["hub_link"]["state"], "connected", "{up}");
+    assert!(none["hub_link"].is_null(), "no hub configured: {none}");
+}
+
+/// (#2916 stage 2 review C5) The `/health` fields for this machine only
+/// are withheld from a loopback request that came through a reverse
+/// proxy (`tailscale serve` puts every tailnet peer on loopback), and
+/// shown to a plain loopback request. Drives the real handler.
+#[tokio::test]
+#[serial_test::serial]
+async fn health_withholds_this_machine_fields_from_a_proxied_loopback_request() {
+    *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() =
+        Some(darkmux_types::config::BusyPolicy::Queue);
+    let local = loopback_health(&[]).await;
+    assert!(
+        local["open_file_limit"].is_number(),
+        "this machine sees its own limit: {local}"
+    );
+    assert_eq!(local["fleet_busy"]["policy"], "queue", "{local}");
+    for proxied in [
+        ("X-Forwarded-For", "100.64.0.7"),
+        ("Tailscale-User-Login", "someone@example.com"),
+        ("Forwarded", "for=100.64.0.7"),
+    ] {
+        let v = loopback_health(&[proxied]).await;
+        assert!(
+            v["open_file_limit"].is_null(),
+            "{proxied:?} is a peer, not this machine: {v}"
+        );
+        assert!(v["fleet_busy"].is_null(), "{proxied:?}: {v}");
+    }
+    // Process-global: leave it as the process started.
+    *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() = None;
+}
+
+/// The listener's detail (its address and why it is up or down) and the
+/// open-file limit are this machine's business: a peer's `/health` shows
+/// the coarse word and no limit, and this machine's shows both.
+#[tokio::test]
+#[serial_test::serial]
+async fn health_gives_a_non_local_caller_only_the_coarse_listener_word_and_no_file_limit() {
+    *crate::fleet_listener::LISTENER_STATE.lock().unwrap() =
+        Some(("listening", "listening on 100.64.0.2:8766".to_string()));
+    let local = loopback_health(&[]).await;
+    let proxied = loopback_health(&[("X-Forwarded-For", "100.64.0.7")]).await;
+    *crate::fleet_listener::LISTENER_STATE.lock().unwrap() = None;
+    assert_eq!(
+        local["fleet_listener"], "listening on 100.64.0.2:8766",
+        "{local}"
+    );
+    assert!(local["open_file_limit"].is_number(), "{local}");
+    assert_eq!(
+        proxied["fleet_listener"], "listening",
+        "a peer learns the word, not the address: {proxied}"
+    );
+    assert!(!proxied.to_string().contains("100.64.0.2"), "{proxied}");
+    assert!(proxied["open_file_limit"].is_null(), "{proxied}");
+}
+
+/// Every header a reverse proxy adds is, ALONE, enough to make a loopback
+/// request "not this machine". The list here is written out on purpose: a
+/// test that iterates `PROXY_HEADERS` stays green when an entry is deleted.
+#[tokio::test]
+#[serial_test::serial]
+async fn each_proxy_header_alone_makes_a_loopback_request_non_local() {
+    const EXPECTED: [&str; 15] = [
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-port",
+        "x-forwarded-server",
+        "x-real-ip",
+        "forwarded",
+        "via",
+        "cf-connecting-ip",
+        "true-client-ip",
+        "tailscale-user-login",
+        "tailscale-user-name",
+        "tailscale-headers-info",
+        "tailscale-funnel-request",
+        "tailscale-app-capabilities",
+    ];
+    assert_eq!(
+        PROXY_HEADERS.len(),
+        EXPECTED.len(),
+        "a header was added or removed: update this list on purpose"
+    );
+    let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let bound: SocketAddr = "127.0.0.1:8765".parse().unwrap();
+    assert!(
+        is_local_at(
+            Some(lo),
+            &headers_with(&[("Host", "localhost:8765")]),
+            Some(bound)
+        ),
+        "the inverse: no proxy header is local"
+    );
+    for h in EXPECTED {
+        let hm = headers_with(&[("Host", "localhost:8765"), (h, "x")]);
+        assert!(
+            !is_local_at(Some(lo), &hm, Some(bound)),
+            "{h} alone must make the request non-local"
+        );
+        let v = loopback_health(&[("Host", "localhost:8765"), (h, "x")]).await;
+        assert!(
+            v["open_file_limit"].is_null(),
+            "/health shows this machine's limit behind {h}: {v}"
+        );
+    }
+}
+
+fn headers_with(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
+    let mut hm = axum::http::HeaderMap::new();
+    for (k, v) in pairs {
+        hm.append(
+            axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            v.parse().unwrap(),
+        );
+    }
+    hm
+}
+
+#[test]
+fn is_local_request_needs_a_loopback_peer_and_no_proxy_header() {
+    let named = headers_with(&[("Host", "localhost:8765")]);
+    let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let v6: SocketAddr = "[::1]:5000".parse().unwrap();
+    let remote: SocketAddr = "100.64.0.7:5000".parse().unwrap();
+    assert!(is_local_request(Some(lo), &named));
+    assert!(is_local_request(Some(v6), &named));
+    assert!(!is_local_request(Some(remote), &named));
+    assert!(!is_local_request(None, &named), "no address is not local");
+    for h in PROXY_HEADERS {
+        let hm = headers_with(&[("Host", "localhost:8765"), (h, "x")]);
+        assert!(!is_local_request(Some(lo), &hm), "{h}");
+    }
+}
+
+// ─── (#2988 review) a local request names this machine ────────────
+// A loopback peer is not enough: a browser tab on an attacker's page,
+// rebound by DNS to 127.0.0.1, connects from loopback carrying the
+// attacker's Host. A header-less proxy's Host is the tailnet name.
+
+const REBOUND: &[(&str, &str)] = &[
+    ("Host", "attacker.example:8765"),
+    ("Origin", "http://attacker.example:8765"),
+];
+
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_on_loopback_with_a_rebinding_host_and_no_token_is_refused() {
+    assert_eq!(
+        loopback_flow_status(AuthEnv::ReadAuth, REBOUND).await,
+        StatusCode::MISDIRECTED_REQUEST
+    );
+}
+
+/// A page cannot hold the token, so a token beside a foreign `Host` is
+/// not a reason to answer it.
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_on_loopback_with_a_rebinding_host_and_the_token_is_still_refused() {
+    let status = loopback_flow_status(
+        AuthEnv::ReadAuth,
+        &[("Host", "attacker.example:8765"), ("Authorization", BEARER)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+}
+
+/// (DNS rebinding) With read auth off, the default install, a page whose
+/// name was re-resolved to 127.0.0.1 used to be served like a tailnet
+/// peer: redacted, but every flow record's content intact. Whatever the
+/// posture and the peer, a `Host` that names no address of this machine
+/// is refused, on every route, before anything is read.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_foreign_host_is_refused_whatever_the_read_posture() {
+    for auth in [AuthEnv::Off, AuthEnv::TokenOnly, AuthEnv::ReadAuth] {
+        for path in [
+            "/flow-days",
+            "/flow/2026-05-14",
+            "/runs",
+            "/health",
+            "/fleet/roster",
+        ] {
+            for peer in [loopback_peer(), remote_peer()] {
+                for host in [
+                    "attacker.example:8765",
+                    "attacker.example",
+                    "localhost.attacker.example",
+                    "127.0.0.1.nip.io:8765",
+                ] {
+                    let status = read_status(
+                        auth,
+                        peer,
+                        path,
+                        &[("Host", host), ("Origin", "http://attacker.example:8765")],
+                    )
+                    .await;
+                    assert_eq!(
+                        status,
+                        StatusCode::MISDIRECTED_REQUEST,
+                        "{path} Host {host} from {:?}",
+                        peer.0
+                    );
                 }
             }
         }
     }
+}
 
-    /// The names this machine answers to keep working: loopback, any IP
-    /// literal (a tailnet or LAN address), and this machine's own names
-    /// (the test router knows one, `host_gate::TEST_MACHINE_NAME`).
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn every_name_this_machine_answers_to_passes_the_host_gate() {
-        let tailnet = crate::host_gate::TEST_MACHINE_NAME;
-        let tailnet_port = format!("{tailnet}:8090");
-        let tailnet_dot = format!("{}.", tailnet.to_ascii_uppercase());
-        let hosts = [
-            "localhost", "localhost:8765", "127.0.0.1:8765", "[::1]:8765", "100.64.0.7:8090", "192.168.1.20", "[fd7a:115c:a1e0::1]:8090",
-            tailnet, tailnet_port.as_str(), tailnet_dot.as_str(),
-        ];
-        for host in hosts {
-            let off = read_status(AuthEnv::Off, remote_peer(), "/flow-days", &[("Host", host)]).await;
-            assert_eq!(off, StatusCode::OK, "Host {host} with read auth off");
-            let local = loopback_flow_status(AuthEnv::ReadAuth, &[("Host", host)]).await;
-            assert_ne!(local, StatusCode::MISDIRECTED_REQUEST, "Host {host} with read auth on");
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn auth_on_loopback_with_a_local_host_name_is_allowed_without_the_token() {
-        for host in ["localhost", "localhost:8765", "LocalHost:8765", "127.0.0.1", "127.0.0.1:8765", "[::1]", "[::1]:8765"] {
-            let status = loopback_flow_status(AuthEnv::ReadAuth, &[("Host", host)]).await;
-            assert_ne!(status, StatusCode::UNAUTHORIZED, "Host: {host}");
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn auth_on_loopback_with_a_tailnet_host_and_no_token_is_refused() {
-        // What a header-less `tailscale serve --tcp` proxy sends.
-        let status = loopback_flow_status(AuthEnv::ReadAuth, &[("Host", "hub.tailnet-test.example")]).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-    }
-
-    /// The router as `run()` builds it: no layer that supplies a Host.
-    async fn bare_router_status(headers: &[(&str, &str)], peer: ConnectInfo<SocketAddr>) -> StatusCode {
-        apply_auth_env(AuthEnv::ReadAuth);
-        let app = build_router(PathBuf::new());
-        let mut b = Request::builder().uri("/flow-days");
-        for (k, v) in headers {
-            b = b.header(*k, *v);
-        }
-        let mut req = b.body(Body::empty()).unwrap();
-        req.extensions_mut().insert(peer);
-        let resp = app.oneshot(req).await.unwrap();
-        clear_auth_env();
-        resp.status()
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn auth_on_loopback_with_no_host_header_is_refused() {
-        assert_eq!(bare_router_status(&[], loopback_peer()).await, StatusCode::UNAUTHORIZED);
+/// The names this machine answers to keep working: loopback, any IP
+/// literal (a tailnet or LAN address), and this machine's own names
+/// (the test router knows one, `host_gate::TEST_MACHINE_NAME`).
+#[tokio::test]
+#[serial_test::serial]
+async fn every_name_this_machine_answers_to_passes_the_host_gate() {
+    let tailnet = crate::host_gate::TEST_MACHINE_NAME;
+    let tailnet_port = format!("{tailnet}:8090");
+    let tailnet_dot = format!("{}.", tailnet.to_ascii_uppercase());
+    let hosts = [
+        "localhost",
+        "localhost:8765",
+        "127.0.0.1:8765",
+        "[::1]:8765",
+        "100.64.0.7:8090",
+        "192.168.1.20",
+        "[fd7a:115c:a1e0::1]:8090",
+        tailnet,
+        tailnet_port.as_str(),
+        tailnet_dot.as_str(),
+    ];
+    for host in hosts {
+        let off = read_status(AuthEnv::Off, remote_peer(), "/flow-days", &[("Host", host)]).await;
+        assert_eq!(off, StatusCode::OK, "Host {host} with read auth off");
+        let local = loopback_flow_status(AuthEnv::ReadAuth, &[("Host", host)]).await;
         assert_ne!(
-            bare_router_status(&[("Host", "localhost:8765")], loopback_peer()).await,
+            local,
+            StatusCode::MISDIRECTED_REQUEST,
+            "Host {host} with read auth on"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_on_loopback_with_a_local_host_name_is_allowed_without_the_token() {
+    for host in [
+        "localhost",
+        "localhost:8765",
+        "LocalHost:8765",
+        "127.0.0.1",
+        "127.0.0.1:8765",
+        "[::1]",
+        "[::1]:8765",
+    ] {
+        let status = loopback_flow_status(AuthEnv::ReadAuth, &[("Host", host)]).await;
+        assert_ne!(status, StatusCode::UNAUTHORIZED, "Host: {host}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_on_loopback_with_a_tailnet_host_and_no_token_is_refused() {
+    // What a header-less `tailscale serve --tcp` proxy sends.
+    let status =
+        loopback_flow_status(AuthEnv::ReadAuth, &[("Host", "hub.tailnet-test.example")]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// The router as `run()` builds it: no layer that supplies a Host.
+async fn bare_router_status(headers: &[(&str, &str)], peer: ConnectInfo<SocketAddr>) -> StatusCode {
+    apply_auth_env(AuthEnv::ReadAuth);
+    let app = build_router(PathBuf::new());
+    let mut b = Request::builder().uri("/flow-days");
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    let mut req = b.body(Body::empty()).unwrap();
+    req.extensions_mut().insert(peer);
+    let resp = app.oneshot(req).await.unwrap();
+    clear_auth_env();
+    resp.status()
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_on_loopback_with_no_host_header_is_refused() {
+    assert_eq!(
+        bare_router_status(&[], loopback_peer()).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_ne!(
+        bare_router_status(&[("Host", "localhost:8765")], loopback_peer()).await,
+        StatusCode::UNAUTHORIZED,
+        "the same request with a local Host passes"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn auth_on_an_ipv4_mapped_loopback_peer_is_local() {
+    let mapped = ConnectInfo("[::ffff:127.0.0.1]:5555".parse::<SocketAddr>().unwrap());
+    let status = bare_router_status(&[("Host", "localhost")], mapped).await;
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a v4-mapped loopback peer is this machine"
+    );
+}
+
+#[test]
+fn an_ipv4_mapped_loopback_peer_is_local_and_a_mapped_remote_is_not() {
+    let h = headers_with(&[("Host", "localhost")]);
+    assert!(is_local_request(
+        Some("[::ffff:127.0.0.1]:5000".parse().unwrap()),
+        &h
+    ));
+    assert!(!is_local_request(
+        Some("[::ffff:100.64.0.7]:5000".parse().unwrap()),
+        &h
+    ));
+}
+
+/// The Host rule against a known bind address: the bind's own host, with
+/// or without the bound port; a different port or name is not this daemon.
+#[test]
+fn the_host_rule_accepts_the_bind_address_and_only_its_port() {
+    let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let bound: Option<SocketAddr> = Some("100.64.0.5:8765".parse().unwrap());
+    let ok = |host: &str| is_local_at(Some(lo), &headers_with(&[("Host", host)]), bound);
+    for host in [
+        "100.64.0.5",
+        "100.64.0.5:8765",
+        "localhost",
+        "localhost:8765",
+        "[::1]:8765",
+        "127.0.0.1:8765",
+    ] {
+        assert!(ok(host), "{host}");
+    }
+    for host in [
+        "100.64.0.5:9999",
+        "localhost:9999",
+        "attacker.example",
+        "attacker.example:8765",
+        "100.64.0.6",
+        "",
+        "localhost:notaport",
+        "::1",
+    ] {
+        assert!(!ok(host), "{host:?}");
+    }
+    // A wildcard bind names no host: only the loopback names count.
+    let wild: Option<SocketAddr> = Some("0.0.0.0:8765".parse().unwrap());
+    assert!(!is_local_at(
+        Some(lo),
+        &headers_with(&[("Host", "0.0.0.0:8765")]),
+        wild
+    ));
+    assert!(is_local_at(
+        Some(lo),
+        &headers_with(&[("Host", "localhost:8765")]),
+        wild
+    ));
+}
+
+#[test]
+fn two_host_headers_are_not_local() {
+    let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let two = headers_with(&[("Host", "localhost"), ("Host", "attacker.example")]);
+    assert!(!is_local_at(Some(lo), &two, None));
+    assert!(
+        !is_local_at(Some(lo), &axum::http::HeaderMap::new(), None),
+        "no Host is not local"
+    );
+}
+
+/// The daemon records the address it bound; `is_local_request` reads it.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_recorded_bind_address_bounds_the_host_port() {
+    record_bound_addr(Some("127.0.0.1:8765".parse().unwrap()));
+    let wrong_port = loopback_flow_status(AuthEnv::ReadAuth, &[("Host", "localhost:9999")]).await;
+    let right_port = loopback_flow_status(AuthEnv::ReadAuth, &[("Host", "localhost:8765")]).await;
+    record_bound_addr(None);
+    assert_eq!(wrong_port, StatusCode::UNAUTHORIZED);
+    assert_ne!(right_port, StatusCode::UNAUTHORIZED);
+}
+
+/// `/health`'s this-machine fields follow the same predicate; a rebound
+/// request is refused before `/health` answers at all.
+#[tokio::test]
+#[serial_test::serial]
+async fn health_withholds_this_machine_fields_from_a_rebound_or_hostless_request() {
+    *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() =
+        Some(darkmux_types::config::BusyPolicy::Queue);
+    let rebound = read_status(AuthEnv::Off, loopback_peer(), "/health", REBOUND).await;
+    assert_eq!(rebound, StatusCode::MISDIRECTED_REQUEST);
+    let app = build_router(PathBuf::new());
+    let mut req = Request::builder()
+        .uri("/health")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut().insert(loopback_peer());
+    let resp = app.oneshot(req).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let hostless: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(hostless["open_file_limit"].is_null(), "{hostless}");
+    assert!(hostless["fleet_busy"].is_null(), "{hostless}");
+    let local = loopback_health(&[("Host", "localhost:8765")]).await;
+    assert!(local["open_file_limit"].is_number(), "{local}");
+    *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() = None;
+}
+
+// ─── panels follow the read posture, whatever they print (5.0) ─────
+// No panel is refused for who is asking: a caller the read posture admits
+// is served every panel, redacted when it is not this machine (see
+// `panel.rs`'s module doc). `?opt.bogus=1` makes a request that PASSES
+// the gate answer 400 before anything spawns; a refused one answers 401.
+
+async fn panel_status(
+    auth: AuthEnv,
+    peer: ConnectInfo<SocketAddr>,
+    id: &str,
+    headers: &[(&str, &str)],
+) -> StatusCode {
+    apply_auth_env(auth);
+    let app = build_router_local(PathBuf::new());
+    let mut b = Request::builder()
+        .uri(format!("/panel/{id}?opt.bogus=1"))
+        .header(crate::panel::PANEL_HEADER, "1");
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    let mut req = b.body(Body::empty()).unwrap();
+    req.extensions_mut().insert(peer);
+    let resp = app.oneshot(req).await.unwrap();
+    clear_auth_env();
+    resp.status()
+}
+
+/// Every panel, including the three that print the execution surface
+/// (`doctor`, `config-list`, `flow-status`; they used to need this machine
+/// or the token whatever the posture): with read auth off a tailnet peer
+/// and a proxied request pass the gate (and are served the redacted
+/// form), and a rebinding Host is refused by the host gate; with read
+/// auth on, a caller with no token is refused, as on every read route.
+#[tokio::test]
+#[serial_test::serial]
+async fn every_panel_follows_the_read_posture() {
+    for id in crate::panel::PANEL_IDS {
+        let s = panel_status(AuthEnv::Off, remote_peer(), id, &[]).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{id} with read auth off");
+        let s = panel_status(AuthEnv::TokenOnly, remote_peer(), id, &[]).await;
+        assert_eq!(
+            s,
+            StatusCode::BAD_REQUEST,
+            "{id}: a token alone does not close reads"
+        );
+        let proxied = panel_status(
+            AuthEnv::Off,
+            loopback_peer(),
+            id,
+            &[("X-Forwarded-For", "100.64.0.7")],
+        )
+        .await;
+        assert_eq!(proxied, StatusCode::BAD_REQUEST, "{id} through a proxy");
+        let rebound = panel_status(
+            AuthEnv::Off,
+            loopback_peer(),
+            id,
+            &[("Host", "attacker.example:8765")],
+        )
+        .await;
+        assert_eq!(
+            rebound,
+            StatusCode::MISDIRECTED_REQUEST,
+            "{id}: a rebinding Host is refused"
+        );
+        let s = panel_status(AuthEnv::ReadAuth, remote_peer(), id, &[]).await;
+        assert_eq!(
+            s,
             StatusCode::UNAUTHORIZED,
-            "the same request with a local Host passes"
+            "{id} with read auth on, no token"
         );
     }
+}
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn auth_on_an_ipv4_mapped_loopback_peer_is_local() {
-        let mapped = ConnectInfo("[::ffff:127.0.0.1]:5555".parse::<SocketAddr>().unwrap());
-        let status = bare_router_status(&[("Host", "localhost")], mapped).await;
-        assert_ne!(status, StatusCode::UNAUTHORIZED, "a v4-mapped loopback peer is this machine");
-    }
-
-    #[test]
-    fn an_ipv4_mapped_loopback_peer_is_local_and_a_mapped_remote_is_not() {
-        let h = headers_with(&[("Host", "localhost")]);
-        assert!(is_local_request(Some("[::ffff:127.0.0.1]:5000".parse().unwrap()), &h));
-        assert!(!is_local_request(Some("[::ffff:100.64.0.7]:5000".parse().unwrap()), &h));
-    }
-
-    /// The Host rule against a known bind address: the bind's own host, with
-    /// or without the bound port; a different port or name is not this daemon.
-    #[test]
-    fn the_host_rule_accepts_the_bind_address_and_only_its_port() {
-        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let bound: Option<SocketAddr> = Some("100.64.0.5:8765".parse().unwrap());
-        let ok = |host: &str| is_local_at(Some(lo), &headers_with(&[("Host", host)]), bound);
-        for host in ["100.64.0.5", "100.64.0.5:8765", "localhost", "localhost:8765", "[::1]:8765", "127.0.0.1:8765"] {
-            assert!(ok(host), "{host}");
-        }
-        for host in ["100.64.0.5:9999", "localhost:9999", "attacker.example", "attacker.example:8765", "100.64.0.6", "", "localhost:notaport", "::1"] {
-            assert!(!ok(host), "{host:?}");
-        }
-        // A wildcard bind names no host: only the loopback names count.
-        let wild: Option<SocketAddr> = Some("0.0.0.0:8765".parse().unwrap());
-        assert!(!is_local_at(Some(lo), &headers_with(&[("Host", "0.0.0.0:8765")]), wild));
-        assert!(is_local_at(Some(lo), &headers_with(&[("Host", "localhost:8765")]), wild));
-    }
-
-    #[test]
-    fn two_host_headers_are_not_local() {
-        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let two = headers_with(&[("Host", "localhost"), ("Host", "attacker.example")]);
-        assert!(!is_local_at(Some(lo), &two, None));
-        assert!(!is_local_at(Some(lo), &axum::http::HeaderMap::new(), None), "no Host is not local");
-    }
-
-    /// The daemon records the address it bound; `is_local_request` reads it.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn the_recorded_bind_address_bounds_the_host_port() {
-        record_bound_addr(Some("127.0.0.1:8765".parse().unwrap()));
-        let wrong_port = loopback_flow_status(AuthEnv::ReadAuth, &[("Host", "localhost:9999")]).await;
-        let right_port = loopback_flow_status(AuthEnv::ReadAuth, &[("Host", "localhost:8765")]).await;
-        record_bound_addr(None);
-        assert_eq!(wrong_port, StatusCode::UNAUTHORIZED);
-        assert_ne!(right_port, StatusCode::UNAUTHORIZED);
-    }
-
-    /// `/health`'s this-machine fields follow the same predicate; a rebound
-    /// request is refused before `/health` answers at all.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn health_withholds_this_machine_fields_from_a_rebound_or_hostless_request() {
-        *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() =
-            Some(darkmux_types::config::BusyPolicy::Queue);
-        let rebound = read_status(AuthEnv::Off, loopback_peer(), "/health", REBOUND).await;
-        assert_eq!(rebound, StatusCode::MISDIRECTED_REQUEST);
-        let app = build_router(PathBuf::new());
-        let mut req = Request::builder().uri("/health").body(Body::empty()).unwrap();
-        req.extensions_mut().insert(loopback_peer());
-        let resp = app.oneshot(req).await.unwrap();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let hostless: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(hostless["open_file_limit"].is_null(), "{hostless}");
-        assert!(hostless["fleet_busy"].is_null(), "{hostless}");
-        let local = loopback_health(&[("Host", "localhost:8765")]).await;
-        assert!(local["open_file_limit"].is_number(), "{local}");
-        *crate::fleet_listener::LISTENER_BUSY.lock().unwrap() = None;
-    }
-
-    // ─── panels follow the read posture, whatever they print (5.0) ─────
-    // No panel is refused for who is asking: a caller the read posture admits
-    // is served every panel, redacted when it is not this machine (see
-    // `panel.rs`'s module doc). `?opt.bogus=1` makes a request that PASSES
-    // the gate answer 400 before anything spawns; a refused one answers 401.
-
-    async fn panel_status(
-        auth: AuthEnv,
-        peer: ConnectInfo<SocketAddr>,
-        id: &str,
-        headers: &[(&str, &str)],
-    ) -> StatusCode {
-        apply_auth_env(auth);
-        let app = build_router_local(PathBuf::new());
-        let mut b = Request::builder().uri(format!("/panel/{id}?opt.bogus=1")).header(crate::panel::PANEL_HEADER, "1");
-        for (k, v) in headers {
-            b = b.header(*k, *v);
-        }
-        let mut req = b.body(Body::empty()).unwrap();
-        req.extensions_mut().insert(peer);
-        let resp = app.oneshot(req).await.unwrap();
-        clear_auth_env();
-        resp.status()
-    }
-
-    /// Every panel, including the three that print the execution surface
-    /// (`doctor`, `config-list`, `flow-status`; they used to need this machine
-    /// or the token whatever the posture): with read auth off a tailnet peer
-    /// and a proxied request pass the gate (and are served the redacted
-    /// form), and a rebinding Host is refused by the host gate; with read
-    /// auth on, a caller with no token is refused, as on every read route.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn every_panel_follows_the_read_posture() {
-        for id in crate::panel::PANEL_IDS {
-            let s = panel_status(AuthEnv::Off, remote_peer(), id, &[]).await;
-            assert_eq!(s, StatusCode::BAD_REQUEST, "{id} with read auth off");
-            let s = panel_status(AuthEnv::TokenOnly, remote_peer(), id, &[]).await;
-            assert_eq!(s, StatusCode::BAD_REQUEST, "{id}: a token alone does not close reads");
-            let proxied = panel_status(AuthEnv::Off, loopback_peer(), id, &[("X-Forwarded-For", "100.64.0.7")]).await;
-            assert_eq!(proxied, StatusCode::BAD_REQUEST, "{id} through a proxy");
-            let rebound = panel_status(AuthEnv::Off, loopback_peer(), id, &[("Host", "attacker.example:8765")]).await;
-            assert_eq!(rebound, StatusCode::MISDIRECTED_REQUEST, "{id}: a rebinding Host is refused");
-            let s = panel_status(AuthEnv::ReadAuth, remote_peer(), id, &[]).await;
-            assert_eq!(s, StatusCode::UNAUTHORIZED, "{id} with read auth on, no token");
-        }
-    }
-
-    /// This machine and a token holder pass the gate for every panel; a wrong
-    /// token is still refused where reads need one.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn every_panel_serves_this_machine_and_the_token() {
-        for id in crate::panel::PANEL_IDS {
-            let local = panel_status(AuthEnv::ReadAuth, loopback_peer(), id, &[]).await;
-            assert_eq!(local, StatusCode::BAD_REQUEST, "{id}: this machine passes the gate");
-            let token = panel_status(AuthEnv::ReadAuth, remote_peer(), id, &[("Authorization", BEARER)]).await;
-            assert_eq!(token, StatusCode::BAD_REQUEST, "{id}: the token passes the gate");
-            let wrong = panel_status(AuthEnv::ReadAuth, remote_peer(), id, &[("Authorization", "Bearer wrong")]).await;
-            assert_eq!(wrong, StatusCode::UNAUTHORIZED, "{id}: a wrong token does not");
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn health_exempt_from_remote_gate() {
-        set_read_auth_env();
-        let app = build_router_local(PathBuf::new());
-        let mut req = Request::builder().uri("/health").body(Body::empty()).unwrap();
-        req.extensions_mut().insert(remote_peer());
-        let resp = app.oneshot(req).await.unwrap();
-        clear_auth_env();
-        // /health must answer even an unauthenticated remote peer (doctor's
-        // reachability probe + external liveness checks).
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    /// (#2988 review) `serve` runs the config gate every other entry point
-    /// runs, so a config that fails it never starts a daemon. A retired
-    /// `runtime.daemon_auth_enabled` is refused by name with both
-    /// replacements. `run` would serve forever on a config it accepted, so
-    /// the call is bounded: a hang is the failure.
-    #[test]
-    #[serial_test::serial]
-    fn serve_refuses_to_start_on_a_config_that_fails_the_gate() {
-        let cfg: darkmux_types::config::DarkmuxConfig =
-            serde_json::from_str(r#"{"runtime": {"daemon_auth_enabled": true}}"#).unwrap();
-        let _guard = darkmux_types::config_access::set_config_for_test(cfg);
-        let dir = tempfile::tempdir().unwrap();
-        let flows = dir.path().to_path_buf();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(run(0, "127.0.0.1".to_string(), flows, None).map_err(|e| format!("{e:#}")));
-        });
-        let outcome = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("serve must refuse, not start");
-        let refusal = outcome.expect_err("serve started on a config that fails the gate");
-        for says in ["runtime.daemon_auth_enabled", "serve.token_keychain", "serve.read_auth"] {
-            assert!(refusal.contains(says), "{says}: {refusal}");
-        }
-    }
-
-    const NO_AUTH: ServeAuth = ServeAuth { read_auth: false, token_present: false };
-    const TOKEN_ONLY: ServeAuth = ServeAuth { read_auth: false, token_present: true };
-    const READ_AUTH: ServeAuth = ServeAuth { read_auth: true, token_present: true };
-    const READ_NO_TOKEN: ServeAuth = ServeAuth { read_auth: true, token_present: false };
-
-    /// (#2988 follow-up) A fleet token alone does not close the read
-    /// surface, so it no longer licenses a non-loopback bind: that needs
-    /// read auth on (and a token for it to check).
-    #[test]
-    fn a_non_loopback_bind_needs_read_auth_not_just_a_token() {
-        for bind in ["0.0.0.0", "100.64.0.5", "::", "garbage"] {
-            let err = serve_auth_preflight(bind, TOKEN_ONLY).unwrap_err();
-            assert!(err.contains("serve.read_auth"), "names the switch: {err}");
-        }
-        assert!(serve_auth_preflight("127.0.0.1", TOKEN_ONLY).is_ok(), "loopback + fleet token is the hub default");
-    }
-
-    /// Read auth on with no token to check would 401 every remote read with
-    /// no way to pass, so `serve` refuses to start, on any bind.
-    #[test]
-    fn read_auth_without_a_token_refuses_to_start() {
-        for bind in ["127.0.0.1", "::1", "100.64.0.5"] {
-            let err = serve_auth_preflight(bind, READ_NO_TOKEN).unwrap_err();
-            assert!(err.contains("serve.read_auth") && err.contains("darkmux-serve-token"), "{err}");
-        }
-    }
-
-    #[test]
-    fn bind_gate_allows_loopback_without_token() {
-        assert!(serve_auth_preflight("127.0.0.1", NO_AUTH).is_ok());
-        assert!(serve_auth_preflight("::1", NO_AUTH).is_ok());
-        assert!(serve_auth_preflight("127.0.0.5", NO_AUTH).is_ok());
-        assert!(serve_auth_preflight("::ffff:127.0.0.1", NO_AUTH).is_ok(), "a v4-mapped loopback bind is loopback");
-        assert!(serve_auth_preflight("::ffff:100.64.0.5", NO_AUTH).is_err(), "a mapped tailnet bind is not");
-    }
-
-    /// (#2782 C5) The gate above says v6 loopback is legal; before this the
-    /// daemon could not actually START on it, because `run` built its
-    /// `SocketAddr` with a bare `format!("{bind}:{port}")` — `"::1:8765"`,
-    /// which does not parse. Four #2782 surfaces meanwhile render IPv6 as
-    /// supported. This pins that the bind the daemon computes agrees with
-    /// what those surfaces print.
-    #[test]
-    fn an_ipv6_bind_resolves_to_a_bindable_socket_addr() {
-        let v6_loopback = listen_socket_addr("::1", 8765).expect("`::1` must bind");
-        assert_eq!(v6_loopback, "[::1]:8765".parse::<std::net::SocketAddr>().unwrap());
-        assert!(v6_loopback.is_ipv6() && v6_loopback.ip().is_loopback());
-        // The gate that says this configuration is legal, restated against
-        // the address actually computed for it.
-        assert!(serve_auth_preflight("::1", NO_AUTH).is_ok());
-
-        let v6_wildcard = listen_socket_addr("::", 8799).expect("`::` must bind");
-        assert_eq!(v6_wildcard.port(), 8799);
-        assert!(v6_wildcard.ip().is_unspecified(), "a wildcard stays a wildcard");
-
-        // v4 and the empty/default cases are unchanged.
+/// This machine and a token holder pass the gate for every panel; a wrong
+/// token is still refused where reads need one.
+#[tokio::test]
+#[serial_test::serial]
+async fn every_panel_serves_this_machine_and_the_token() {
+    for id in crate::panel::PANEL_IDS {
+        let local = panel_status(AuthEnv::ReadAuth, loopback_peer(), id, &[]).await;
         assert_eq!(
-            listen_socket_addr("127.0.0.1", 8765).unwrap(),
-            "127.0.0.1:8765".parse::<std::net::SocketAddr>().unwrap()
+            local,
+            StatusCode::BAD_REQUEST,
+            "{id}: this machine passes the gate"
         );
+        let token = panel_status(
+            AuthEnv::ReadAuth,
+            remote_peer(),
+            id,
+            &[("Authorization", BEARER)],
+        )
+        .await;
         assert_eq!(
-            listen_socket_addr("0.0.0.0", 8799).unwrap(),
-            "0.0.0.0:8799".parse::<std::net::SocketAddr>().unwrap()
+            token,
+            StatusCode::BAD_REQUEST,
+            "{id}: the token passes the gate"
         );
+        let wrong = panel_status(
+            AuthEnv::ReadAuth,
+            remote_peer(),
+            id,
+            &[("Authorization", "Bearer wrong")],
+        )
+        .await;
         assert_eq!(
-            listen_socket_addr("", 8765).unwrap(),
-            "127.0.0.1:8765".parse::<std::net::SocketAddr>().unwrap(),
-            "an empty bind falls back to the built-in default"
+            wrong,
+            StatusCode::UNAUTHORIZED,
+            "{id}: a wrong token does not"
         );
-
-        // A hostname is still refused — unchanged behavior, deliberately not
-        // widened here — but the error names the bind and what is accepted
-        // rather than bare `invalid socket address syntax`.
-        let err = listen_socket_addr("localhost", 8765).unwrap_err().to_string();
-        assert!(err.contains("localhost"), "{err}");
-        assert!(err.contains("serve.bind"), "points at the knob: {err}");
     }
+}
 
-    #[test]
-    fn bind_gate_refuses_nonloopback_without_token() {
-        assert!(serve_auth_preflight("0.0.0.0", NO_AUTH).is_err());
-        assert!(serve_auth_preflight("100.64.0.5", NO_AUTH).is_err()); // a Tailnet IP
-        assert!(serve_auth_preflight("192.168.1.10", NO_AUTH).is_err());
-        assert!(serve_auth_preflight("::", NO_AUTH).is_err()); // IPv6 unspecified
-        assert!(serve_auth_preflight("2001:db8::1", NO_AUTH).is_err()); // global IPv6
+#[tokio::test]
+#[serial_test::serial]
+async fn health_exempt_from_remote_gate() {
+    set_read_auth_env();
+    let app = build_router_local(PathBuf::new());
+    let mut req = Request::builder()
+        .uri("/health")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut().insert(remote_peer());
+    let resp = app.oneshot(req).await.unwrap();
+    clear_auth_env();
+    // /health must answer even an unauthenticated remote peer (doctor's
+    // reachability probe + external liveness checks).
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// (#2988 review) `serve` runs the config gate every other entry point
+/// runs, so a config that fails it never starts a daemon. A retired
+/// `runtime.daemon_auth_enabled` is refused by name with both
+/// replacements. `run` would serve forever on a config it accepted, so
+/// the call is bounded: a hang is the failure.
+#[test]
+#[serial_test::serial]
+fn serve_refuses_to_start_on_a_config_that_fails_the_gate() {
+    let cfg: darkmux_types::config::DarkmuxConfig =
+        serde_json::from_str(r#"{"runtime": {"daemon_auth_enabled": true}}"#).unwrap();
+    let _guard = darkmux_types::config_access::set_config_for_test(cfg);
+    let dir = tempfile::tempdir().unwrap();
+    let flows = dir.path().to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run(0, "127.0.0.1".to_string(), flows, None).map_err(|e| format!("{e:#}")));
+    });
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("serve must refuse, not start");
+    let refusal = outcome.expect_err("serve started on a config that fails the gate");
+    for says in [
+        "runtime.daemon_auth_enabled",
+        "serve.token_keychain",
+        "serve.read_auth",
+    ] {
+        assert!(refusal.contains(says), "{says}: {refusal}");
     }
+}
 
-    #[test]
-    fn bind_gate_allows_nonloopback_with_token() {
-        assert!(serve_auth_preflight("0.0.0.0", READ_AUTH).is_ok());
-        assert!(serve_auth_preflight("100.64.0.5", READ_AUTH).is_ok());
+const NO_AUTH: ServeAuth = ServeAuth {
+    read_auth: false,
+    token_present: false,
+};
+const TOKEN_ONLY: ServeAuth = ServeAuth {
+    read_auth: false,
+    token_present: true,
+};
+const READ_AUTH: ServeAuth = ServeAuth {
+    read_auth: true,
+    token_present: true,
+};
+const READ_NO_TOKEN: ServeAuth = ServeAuth {
+    read_auth: true,
+    token_present: false,
+};
+
+/// (#2988 follow-up) A fleet token alone does not close the read
+/// surface, so it no longer licenses a non-loopback bind: that needs
+/// read auth on (and a token for it to check).
+#[test]
+fn a_non_loopback_bind_needs_read_auth_not_just_a_token() {
+    for bind in ["0.0.0.0", "100.64.0.5", "::", "garbage"] {
+        let err = serve_auth_preflight(bind, TOKEN_ONLY).unwrap_err();
+        assert!(err.contains("serve.read_auth"), "names the switch: {err}");
     }
+    assert!(
+        serve_auth_preflight("127.0.0.1", TOKEN_ONLY).is_ok(),
+        "loopback + fleet token is the hub default"
+    );
+}
 
-    #[test]
-    fn bind_gate_treats_unparseable_as_nonloopback() {
-        // A bind string that isn't an IP is conservatively non-loopback.
-        assert!(serve_auth_preflight("garbage", NO_AUTH).is_err());
-        assert!(serve_auth_preflight("garbage", READ_AUTH).is_ok());
+/// Read auth on with no token to check would 401 every remote read with
+/// no way to pass, so `serve` refuses to start, on any bind.
+#[test]
+fn read_auth_without_a_token_refuses_to_start() {
+    for bind in ["127.0.0.1", "::1", "100.64.0.5"] {
+        let err = serve_auth_preflight(bind, READ_NO_TOKEN).unwrap_err();
+        assert!(
+            err.contains("serve.read_auth") && err.contains("darkmux-serve-token"),
+            "{err}"
+        );
     }
+}
 
-    #[test]
-    fn tokens_match_is_exact() {
-        assert!(!tokens_match(b"abcd", b"abc")); // longer presented token (#3073)
-        assert!(tokens_match(b"", b""));
-        assert!(tokens_match(b"abc", b"abc"));
-        assert!(!tokens_match(b"abc", b"abd"));
-        assert!(!tokens_match(b"abc", b"abcd")); // length differs
-        assert!(!tokens_match(b"", b"x"));
-    }
+#[test]
+fn bind_gate_allows_loopback_without_token() {
+    assert!(serve_auth_preflight("127.0.0.1", NO_AUTH).is_ok());
+    assert!(serve_auth_preflight("::1", NO_AUTH).is_ok());
+    assert!(serve_auth_preflight("127.0.0.5", NO_AUTH).is_ok());
+    assert!(
+        serve_auth_preflight("::ffff:127.0.0.1", NO_AUTH).is_ok(),
+        "a v4-mapped loopback bind is loopback"
+    );
+    assert!(
+        serve_auth_preflight("::ffff:100.64.0.5", NO_AUTH).is_err(),
+        "a mapped tailnet bind is not"
+    );
+}
 
-    // ─── #294 try_send_or_drop_newest ─────────────────────────────────
+/// (#2782 C5) The gate above says v6 loopback is legal; before this the
+/// daemon could not actually START on it, because `run` built its
+/// `SocketAddr` with a bare `format!("{bind}:{port}")` — `"::1:8765"`,
+/// which does not parse. Four #2782 surfaces meanwhile render IPv6 as
+/// supported. This pins that the bind the daemon computes agrees with
+/// what those surfaces print.
+#[test]
+fn an_ipv6_bind_resolves_to_a_bindable_socket_addr() {
+    let v6_loopback = listen_socket_addr("::1", 8765).expect("`::1` must bind");
+    assert_eq!(
+        v6_loopback,
+        "[::1]:8765".parse::<std::net::SocketAddr>().unwrap()
+    );
+    assert!(v6_loopback.is_ipv6() && v6_loopback.ip().is_loopback());
+    // The gate that says this configuration is legal, restated against
+    // the address actually computed for it.
+    assert!(serve_auth_preflight("::1", NO_AUTH).is_ok());
 
-    /// Bounded channel + producer outpaces consumer → SendOutcome::
-    /// Dropped returned; the records that fit make it through. Pre-
-    /// #294, the channel was unbounded and would grow indefinitely.
-    #[tokio::test]
-    async fn try_send_or_drop_newest_drops_when_channel_full() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(2);
+    let v6_wildcard = listen_socket_addr("::", 8799).expect("`::` must bind");
+    assert_eq!(v6_wildcard.port(), 8799);
+    assert!(
+        v6_wildcard.ip().is_unspecified(),
+        "a wildcard stays a wildcard"
+    );
 
+    // v4 and the empty/default cases are unchanged.
+    assert_eq!(
+        listen_socket_addr("127.0.0.1", 8765).unwrap(),
+        "127.0.0.1:8765".parse::<std::net::SocketAddr>().unwrap()
+    );
+    assert_eq!(
+        listen_socket_addr("0.0.0.0", 8799).unwrap(),
+        "0.0.0.0:8799".parse::<std::net::SocketAddr>().unwrap()
+    );
+    assert_eq!(
+        listen_socket_addr("", 8765).unwrap(),
+        "127.0.0.1:8765".parse::<std::net::SocketAddr>().unwrap(),
+        "an empty bind falls back to the built-in default"
+    );
+
+    // A hostname is still refused — unchanged behavior, deliberately not
+    // widened here — but the error names the bind and what is accepted
+    // rather than bare `invalid socket address syntax`.
+    let err = listen_socket_addr("localhost", 8765)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("localhost"), "{err}");
+    assert!(err.contains("serve.bind"), "points at the knob: {err}");
+}
+
+#[test]
+fn bind_gate_refuses_nonloopback_without_token() {
+    assert!(serve_auth_preflight("0.0.0.0", NO_AUTH).is_err());
+    assert!(serve_auth_preflight("100.64.0.5", NO_AUTH).is_err()); // a Tailnet IP
+    assert!(serve_auth_preflight("192.168.1.10", NO_AUTH).is_err());
+    assert!(serve_auth_preflight("::", NO_AUTH).is_err()); // IPv6 unspecified
+    assert!(serve_auth_preflight("2001:db8::1", NO_AUTH).is_err()); // global IPv6
+}
+
+#[test]
+fn bind_gate_allows_nonloopback_with_token() {
+    assert!(serve_auth_preflight("0.0.0.0", READ_AUTH).is_ok());
+    assert!(serve_auth_preflight("100.64.0.5", READ_AUTH).is_ok());
+}
+
+#[test]
+fn bind_gate_treats_unparseable_as_nonloopback() {
+    // A bind string that isn't an IP is conservatively non-loopback.
+    assert!(serve_auth_preflight("garbage", NO_AUTH).is_err());
+    assert!(serve_auth_preflight("garbage", READ_AUTH).is_ok());
+}
+
+#[test]
+fn tokens_match_is_exact() {
+    assert!(!tokens_match(b"abcd", b"abc")); // longer presented token (#3073)
+    assert!(tokens_match(b"", b""));
+    assert!(tokens_match(b"abc", b"abc"));
+    assert!(!tokens_match(b"abc", b"abd"));
+    assert!(!tokens_match(b"abc", b"abcd")); // length differs
+    assert!(!tokens_match(b"", b"x"));
+}
+
+// ─── #294 try_send_or_drop_newest ─────────────────────────────────
+
+/// Bounded channel + producer outpaces consumer → SendOutcome::
+/// Dropped returned; the records that fit make it through. Pre-
+/// #294, the channel was unbounded and would grow indefinitely.
+#[tokio::test]
+async fn try_send_or_drop_newest_drops_when_channel_full() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(2);
+
+    assert_eq!(
+        try_send_or_drop_newest(&tx, "a".to_string()),
+        SendOutcome::Sent
+    );
+    assert_eq!(
+        try_send_or_drop_newest(&tx, "b".to_string()),
+        SendOutcome::Sent
+    );
+    // Capacity is 2; third send should drop (newest-dropped).
+    assert_eq!(
+        try_send_or_drop_newest(&tx, "c".to_string()),
+        SendOutcome::Dropped
+    );
+    assert_eq!(
+        try_send_or_drop_newest(&tx, "d".to_string()),
+        SendOutcome::Dropped
+    );
+
+    // The consumer pulls — gets the records that fit (a, b);
+    // c and d were dropped (drop-newest semantics).
+    assert_eq!(rx.recv().await, Some("a".to_string()));
+    assert_eq!(rx.recv().await, Some("b".to_string()));
+}
+
+/// Receiver dropped → SendOutcome::Closed returned.
+#[tokio::test]
+async fn try_send_or_drop_newest_signals_closed_on_receiver_drop() {
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(16);
+    drop(rx); // consumer leaves
+    assert_eq!(
+        try_send_or_drop_newest(&tx, "post-drop".to_string()),
+        SendOutcome::Closed
+    );
+}
+
+/// Consumer that drains keeps up — no drops.
+#[tokio::test]
+async fn try_send_or_drop_newest_no_drops_when_consumer_keeps_up() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(2);
+    for i in 0..10 {
         assert_eq!(
-            try_send_or_drop_newest(&tx, "a".to_string()),
+            try_send_or_drop_newest(&tx, format!("r{i}")),
             SendOutcome::Sent
         );
-        assert_eq!(
-            try_send_or_drop_newest(&tx, "b".to_string()),
-            SendOutcome::Sent
-        );
-        // Capacity is 2; third send should drop (newest-dropped).
-        assert_eq!(
-            try_send_or_drop_newest(&tx, "c".to_string()),
-            SendOutcome::Dropped
-        );
-        assert_eq!(
-            try_send_or_drop_newest(&tx, "d".to_string()),
-            SendOutcome::Dropped
-        );
-
-        // The consumer pulls — gets the records that fit (a, b);
-        // c and d were dropped (drop-newest semantics).
-        assert_eq!(rx.recv().await, Some("a".to_string()));
-        assert_eq!(rx.recv().await, Some("b".to_string()));
+        // Consumer drains immediately after each send.
+        let _ = rx.recv().await;
     }
+}
 
-    /// Receiver dropped → SendOutcome::Closed returned.
-    #[tokio::test]
-    async fn try_send_or_drop_newest_signals_closed_on_receiver_drop() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<String>(16);
-        drop(rx); // consumer leaves
-        assert_eq!(
-            try_send_or_drop_newest(&tx, "post-drop".to_string()),
-            SendOutcome::Closed
+// ─── #288 normalize trailing-slash + case + reject wildcard ─────────
+
+/// Operator types `http://localhost:5173/` (trailing slash, what
+/// you copy out of a browser address bar) → must allow the
+/// browser's actual Origin `http://localhost:5173` (no trailing
+/// slash). Pre-#288 this was a silent deny.
+#[tokio::test]
+#[serial_test::serial]
+async fn cors_env_normalizes_trailing_slash_in_origin() {
+    unsafe {
+        std::env::set_var(
+            "DARKMUX_DAEMON_CORS_ORIGINS",
+            "http://localhost:5173/", // trailing slash
         );
     }
-
-    /// Consumer that drains keeps up — no drops.
-    #[tokio::test]
-    async fn try_send_or_drop_newest_no_drops_when_consumer_keeps_up() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(2);
-        for i in 0..10 {
-            assert_eq!(
-                try_send_or_drop_newest(&tx, format!("r{i}")),
-                SendOutcome::Sent
-            );
-            // Consumer drains immediately after each send.
-            let _ = rx.recv().await;
-        }
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("Origin", "http://localhost:5173") // no slash
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    unsafe {
+        std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS");
     }
 
-    // ─── #288 normalize trailing-slash + case + reject wildcard ─────────
+    assert!(
+        response
+            .headers()
+            .contains_key("access-control-allow-origin"),
+        "trailing slash in env entry should still allow the canonical Origin (#288)"
+    );
+}
 
-    /// Operator types `http://localhost:5173/` (trailing slash, what
-    /// you copy out of a browser address bar) → must allow the
-    /// browser's actual Origin `http://localhost:5173` (no trailing
-    /// slash). Pre-#288 this was a silent deny.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn cors_env_normalizes_trailing_slash_in_origin() {
-        unsafe {
-            std::env::set_var(
-                "DARKMUX_DAEMON_CORS_ORIGINS",
-                "http://localhost:5173/", // trailing slash
-            );
-        }
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .header("Origin", "http://localhost:5173") // no slash
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
-
-        assert!(
-            response.headers().contains_key("access-control-allow-origin"),
-            "trailing slash in env entry should still allow the canonical Origin (#288)"
-        );
+/// Operator types `HTTP://Localhost:5173` (uppercase scheme+host)
+/// → must allow the browser's lowercase Origin. Pre-#288 silent
+/// deny.
+#[tokio::test]
+#[serial_test::serial]
+async fn cors_env_normalizes_uppercase_scheme_and_host() {
+    unsafe {
+        std::env::set_var("DARKMUX_DAEMON_CORS_ORIGINS", "HTTP://Localhost:5173");
+    }
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("Origin", "http://localhost:5173")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    unsafe {
+        std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS");
     }
 
-    /// Operator types `HTTP://Localhost:5173` (uppercase scheme+host)
-    /// → must allow the browser's lowercase Origin. Pre-#288 silent
-    /// deny.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn cors_env_normalizes_uppercase_scheme_and_host() {
-        unsafe {
-            std::env::set_var(
-                "DARKMUX_DAEMON_CORS_ORIGINS",
-                "HTTP://Localhost:5173",
-            );
-        }
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .header("Origin", "http://localhost:5173")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
+    assert!(
+        response
+            .headers()
+            .contains_key("access-control-allow-origin"),
+        "uppercase scheme+host in env entry should still allow the canonical Origin (#288)"
+    );
+}
 
-        assert!(
-            response.headers().contains_key("access-control-allow-origin"),
-            "uppercase scheme+host in env entry should still allow the canonical Origin (#288)"
-        );
+/// Literal `*` in the env value is non-functional (browsers don't
+/// send `*` as Origin) — the parser MUST reject it with a stderr
+/// warning so operators who paste a wildcard don't think it works.
+/// The end-to-end behavior: a request with arbitrary external
+/// Origin must still be denied.
+#[tokio::test]
+#[serial_test::serial]
+async fn cors_env_rejects_literal_wildcard() {
+    unsafe {
+        std::env::set_var("DARKMUX_DAEMON_CORS_ORIGINS", "*");
+    }
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("Origin", "https://malicious.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    unsafe {
+        std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS");
     }
 
-    /// Literal `*` in the env value is non-functional (browsers don't
-    /// send `*` as Origin) — the parser MUST reject it with a stderr
-    /// warning so operators who paste a wildcard don't think it works.
-    /// The end-to-end behavior: a request with arbitrary external
-    /// Origin must still be denied.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn cors_env_rejects_literal_wildcard() {
-        unsafe { std::env::set_var("DARKMUX_DAEMON_CORS_ORIGINS", "*"); }
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .header("Origin", "https://malicious.example.com")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
+    assert!(
+        !response
+            .headers()
+            .contains_key("access-control-allow-origin"),
+        "literal `*` in env must NOT wildcard-allow arbitrary origins (#288)"
+    );
+}
 
-        assert!(
-            !response.headers().contains_key("access-control-allow-origin"),
-            "literal `*` in env must NOT wildcard-allow arbitrary origins (#288)"
-        );
+// ─── parse_cors_origins / normalize_cors_origin unit tests ──────────
+
+#[test]
+fn normalize_cors_origin_strips_trailing_slash() {
+    assert_eq!(
+        normalize_cors_origin("http://localhost:5173/"),
+        "http://localhost:5173"
+    );
+    assert_eq!(
+        normalize_cors_origin("http://localhost:5173"),
+        "http://localhost:5173"
+    );
+}
+
+#[test]
+fn normalize_cors_origin_lowercases_scheme_and_host() {
+    assert_eq!(
+        normalize_cors_origin("HTTP://Localhost:5173"),
+        "http://localhost:5173"
+    );
+    assert_eq!(
+        normalize_cors_origin("HTTPS://Example.COM"),
+        "https://example.com"
+    );
+}
+
+/// Realistic operator paste-from-browser-bar shape: both case +
+/// trailing slash. Each transform tested independently above;
+/// this guards the combined case (which is what operators
+/// actually paste).
+#[test]
+fn normalize_cors_origin_handles_uppercase_and_trailing_slash_together() {
+    assert_eq!(
+        normalize_cors_origin("HTTP://Localhost:5173/"),
+        "http://localhost:5173"
+    );
+}
+
+#[test]
+fn normalize_cors_origin_handles_no_scheme() {
+    // Edge case: operator types just `localhost:5173` without scheme.
+    // Defensible: lowercase as a string.
+    assert_eq!(normalize_cors_origin("Localhost:5173"), "localhost:5173");
+}
+
+#[test]
+fn parse_cors_origins_filters_empty_and_normalizes() {
+    let result = parse_cors_origins("HTTP://Localhost:5173/,, http://other:3000 ,");
+    assert_eq!(result.len(), 2);
+    assert!(result.contains(&"http://localhost:5173".to_string()));
+    assert!(result.contains(&"http://other:3000".to_string()));
+}
+
+#[test]
+fn parse_cors_origins_rejects_literal_wildcard() {
+    let result = parse_cors_origins("*,http://localhost:5173");
+    assert_eq!(result, vec!["http://localhost:5173".to_string()]);
+    // Wildcard entry filtered; non-wildcard entry preserved + normalized.
+}
+
+#[test]
+fn parse_cors_origins_empty_returns_empty_vec() {
+    assert!(parse_cors_origins("").is_empty());
+    assert!(parse_cors_origins("   ").is_empty());
+    assert!(parse_cors_origins(",,,").is_empty());
+}
+
+/// Negative side of the env-override: a localhost port NOT in the
+/// override list still gets denied.
+#[tokio::test]
+#[serial_test::serial]
+async fn cors_denies_localhost_port_not_in_env_override() {
+    unsafe {
+        std::env::set_var("DARKMUX_DAEMON_CORS_ORIGINS", "http://localhost:5173");
+    }
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("Origin", "http://localhost:9999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    unsafe {
+        std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS");
     }
 
-    // ─── parse_cors_origins / normalize_cors_origin unit tests ──────────
+    assert!(
+        !response
+            .headers()
+            .contains_key("access-control-allow-origin"),
+        "localhost port outside the env override list must still be denied (#273)"
+    );
+}
 
-    #[test]
-    fn normalize_cors_origin_strips_trailing_slash() {
-        assert_eq!(
-            normalize_cors_origin("http://localhost:5173/"),
-            "http://localhost:5173"
-        );
-        assert_eq!(
-            normalize_cors_origin("http://localhost:5173"),
-            "http://localhost:5173"
-        );
+/// (#2155) `null` is the origin a `file://` page sends, but it is ALSO
+/// the origin of a sandboxed iframe (`<iframe sandbox="allow-scripts">`)
+/// that any site the operator visits can embed. Unconditionally
+/// allowing `null` therefore let an arbitrary web page read the
+/// daemon's read routes (flow records, machine specs, mission/run
+/// state, worktree summaries) via CORS, against both loopback and the
+/// tailnet URL. `null` must now be denied by default, same as any
+/// other origin not on the allowlist — the operator opts a genuine
+/// `file://` viewer back in via `DARKMUX_DAEMON_CORS_ORIGINS=null`
+/// (see `cors_allows_null_origin_when_allowlisted` below).
+///
+/// `#[serial]` for the same reason as the other default-deny
+/// assertions: a sibling test sets `DARKMUX_DAEMON_CORS_ORIGINS` and
+/// would race the default-deny read under cargo's parallel runner.
+#[tokio::test]
+#[serial_test::serial]
+async fn cors_denies_null_origin_by_default() {
+    unsafe {
+        std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS");
+    }
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("Origin", "null")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !response
+            .headers()
+            .contains_key("access-control-allow-origin"),
+        "null origin (e.g. a sandboxed iframe) must NOT receive CORS headers by default (#2155)"
+    );
+}
+
+/// The escape hatch for `cors_denies_null_origin_by_default`: an
+/// operator who genuinely runs a `file://` viewer restores the old
+/// behavior by naming `null` explicitly in
+/// `DARKMUX_DAEMON_CORS_ORIGINS`. `parse_cors_origins` already passes
+/// `null` through as an exact-match string (it's not the literal `*`
+/// wildcard it special-cases), so this is a plain allowlist entry —
+/// without this test, a future "simplification" could quietly remove
+/// the opt-in path entirely and this would read as a pure deletion.
+#[tokio::test]
+#[serial_test::serial]
+async fn cors_allows_null_origin_when_allowlisted() {
+    unsafe {
+        std::env::set_var("DARKMUX_DAEMON_CORS_ORIGINS", "null");
+    }
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("Origin", "null")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    unsafe {
+        std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS");
     }
 
-    #[test]
-    fn normalize_cors_origin_lowercases_scheme_and_host() {
-        assert_eq!(
-            normalize_cors_origin("HTTP://Localhost:5173"),
-            "http://localhost:5173"
-        );
-        assert_eq!(
-            normalize_cors_origin("HTTPS://Example.COM"),
-            "https://example.com"
-        );
-    }
-
-    /// Realistic operator paste-from-browser-bar shape: both case +
-    /// trailing slash. Each transform tested independently above;
-    /// this guards the combined case (which is what operators
-    /// actually paste).
-    #[test]
-    fn normalize_cors_origin_handles_uppercase_and_trailing_slash_together() {
-        assert_eq!(
-            normalize_cors_origin("HTTP://Localhost:5173/"),
-            "http://localhost:5173"
-        );
-    }
-
-    #[test]
-    fn normalize_cors_origin_handles_no_scheme() {
-        // Edge case: operator types just `localhost:5173` without scheme.
-        // Defensible: lowercase as a string.
-        assert_eq!(normalize_cors_origin("Localhost:5173"), "localhost:5173");
-    }
-
-    #[test]
-    fn parse_cors_origins_filters_empty_and_normalizes() {
-        let result = parse_cors_origins("HTTP://Localhost:5173/,, http://other:3000 ,");
-        assert_eq!(result.len(), 2);
-        assert!(result.contains(&"http://localhost:5173".to_string()));
-        assert!(result.contains(&"http://other:3000".to_string()));
-    }
-
-    #[test]
-    fn parse_cors_origins_rejects_literal_wildcard() {
-        let result = parse_cors_origins("*,http://localhost:5173");
-        assert_eq!(result, vec!["http://localhost:5173".to_string()]);
-        // Wildcard entry filtered; non-wildcard entry preserved + normalized.
-    }
-
-    #[test]
-    fn parse_cors_origins_empty_returns_empty_vec() {
-        assert!(parse_cors_origins("").is_empty());
-        assert!(parse_cors_origins("   ").is_empty());
-        assert!(parse_cors_origins(",,,").is_empty());
-    }
-
-    /// Negative side of the env-override: a localhost port NOT in the
-    /// override list still gets denied.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn cors_denies_localhost_port_not_in_env_override() {
-        unsafe {
-            std::env::set_var(
-                "DARKMUX_DAEMON_CORS_ORIGINS",
-                "http://localhost:5173",
-            );
-        }
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .header("Origin", "http://localhost:9999")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
-
-        assert!(
-            !response.headers().contains_key("access-control-allow-origin"),
-            "localhost port outside the env override list must still be denied (#273)"
-        );
-    }
-
-    /// (#2155) `null` is the origin a `file://` page sends, but it is ALSO
-    /// the origin of a sandboxed iframe (`<iframe sandbox="allow-scripts">`)
-    /// that any site the operator visits can embed. Unconditionally
-    /// allowing `null` therefore let an arbitrary web page read the
-    /// daemon's read routes (flow records, machine specs, mission/run
-    /// state, worktree summaries) via CORS, against both loopback and the
-    /// tailnet URL. `null` must now be denied by default, same as any
-    /// other origin not on the allowlist — the operator opts a genuine
-    /// `file://` viewer back in via `DARKMUX_DAEMON_CORS_ORIGINS=null`
-    /// (see `cors_allows_null_origin_when_allowlisted` below).
-    ///
-    /// `#[serial]` for the same reason as the other default-deny
-    /// assertions: a sibling test sets `DARKMUX_DAEMON_CORS_ORIGINS` and
-    /// would race the default-deny read under cargo's parallel runner.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn cors_denies_null_origin_by_default() {
-        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .header("Origin", "null")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            !response.headers().contains_key("access-control-allow-origin"),
-            "null origin (e.g. a sandboxed iframe) must NOT receive CORS headers by default (#2155)"
-        );
-    }
-
-    /// The escape hatch for `cors_denies_null_origin_by_default`: an
-    /// operator who genuinely runs a `file://` viewer restores the old
-    /// behavior by naming `null` explicitly in
-    /// `DARKMUX_DAEMON_CORS_ORIGINS`. `parse_cors_origins` already passes
-    /// `null` through as an exact-match string (it's not the literal `*`
-    /// wildcard it special-cases), so this is a plain allowlist entry —
-    /// without this test, a future "simplification" could quietly remove
-    /// the opt-in path entirely and this would read as a pure deletion.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn cors_allows_null_origin_when_allowlisted() {
-        unsafe { std::env::set_var("DARKMUX_DAEMON_CORS_ORIGINS", "null"); }
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .header("Origin", "null")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        unsafe { std::env::remove_var("DARKMUX_DAEMON_CORS_ORIGINS"); }
-
-        assert!(
+    assert!(
             response.headers().contains_key("access-control-allow-origin"),
             "null origin must receive CORS headers once the operator names it in DARKMUX_DAEMON_CORS_ORIGINS (#2155)"
         );
+}
+
+/// Arbitrary external origins must NOT get CORS headers — this is the
+/// cross-origin exfiltration guard (#225). The response body is still
+/// returned (CORS is browser-enforced); the missing header causes the
+/// browser to block the script from reading it.
+#[tokio::test]
+async fn cors_denies_external_origin() {
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("Origin", "https://malicious.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !response
+            .headers()
+            .contains_key("access-control-allow-origin"),
+        "external origin must NOT receive CORS headers"
+    );
+}
+
+// ─── SSE / tail_lines tests ─────────────────────────────────────────
+//
+// Tests assert against `tail_lines` (the testable core of the file tail)
+// so they verify actual line content. The `Event` wrapper (`redacted_events`)
+// is covered at the handler by `redaction.rs`'s stream tests.
+
+use futures::StreamExt;
+use std::time::Duration;
+
+/// Pop the next line off a stream within `timeout`. Returns None if
+/// the stream produced nothing in the window.
+async fn next_line<S>(stream: &mut S, timeout: Duration) -> Option<String>
+where
+    S: futures::Stream<Item = String> + Unpin,
+{
+    tokio::time::timeout(timeout, stream.next())
+        .await
+        .ok()
+        .flatten()
+}
+
+#[tokio::test]
+async fn tail_stream_emits_appended_lines() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("test.jsonl");
+    std::fs::File::create(&path).unwrap();
+
+    let stream = tail_lines(path.clone(), 0);
+    tokio::pin!(stream);
+
+    // Append a line after the stream started.
+    let written = r#"{"action":"hi"}"#;
+    std::fs::write(&path, format!("{written}\n")).unwrap();
+
+    let got = next_line(&mut stream, Duration::from_millis(1500)).await;
+    assert_eq!(
+        got.as_deref(),
+        Some(written),
+        "expected appended line verbatim"
+    );
+}
+
+/// (D5, #3035) `GET /flow/:date` answers the same envelope `/flow-mission/:id`
+/// and `/flow-dispatch/:id` do: records, count, truncated, generated_at_ms,
+/// and a coverage `meta` (no Redis configured reads as `off`, complete).
+#[tokio::test]
+#[serial_test::serial]
+async fn flow_date_route_answers_the_records_envelope() {
+    unsafe {
+        std::env::remove_var("DARKMUX_REDIS_URL");
     }
+    let flows = archive();
+    let json = get_json(&flows, "/flow/2026-05-14").await;
+    assert!(
+        json.is_object(),
+        "the route answers an envelope, not a bare array: {json}"
+    );
+    assert_eq!(json["count"], 2);
+    assert_eq!(json["truncated"], false);
+    assert!(
+        json["generated_at_ms"].as_u64().is_some_and(|n| n > 0),
+        "{json}"
+    );
+    assert_eq!(json["meta"]["complete"], true, "{json}");
+    assert_eq!(json["meta"]["sources"]["fleet"]["state"], "off", "{json}");
+    assert_eq!(json["meta"]["days_scanned"], 1);
+    assert_eq!(json["meta"]["records_scanned"], 2);
+}
 
-    /// Arbitrary external origins must NOT get CORS headers — this is the
-    /// cross-origin exfiltration guard (#225). The response body is still
-    /// returned (CORS is browser-enforced); the missing header causes the
-    /// browser to block the script from reading it.
-    #[tokio::test]
-    async fn cors_denies_external_origin() {
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .header("Origin", "https://malicious.example.com")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+// ─── routes that serve records serve them as written ────────────────────
+//
+// Nothing is upgraded on read (#3036): a record carries the spelling it
+// was written with, and one a release retired reads as an unknown action.
 
-        assert!(
-            !response.headers().contains_key("access-control-allow-origin"),
-            "external origin must NOT receive CORS headers"
-        );
-    }
-
-    // ─── SSE / tail_lines tests ─────────────────────────────────────────
-    //
-    // Tests assert against `tail_lines` (the testable core of the file tail)
-    // so they verify actual line content. The `Event` wrapper (`redacted_events`)
-    // is covered at the handler by `redaction.rs`'s stream tests.
-
-    use futures::StreamExt;
-    use std::time::Duration;
-
-    /// Pop the next line off a stream within `timeout`. Returns None if
-    /// the stream produced nothing in the window.
-    async fn next_line<S>(stream: &mut S, timeout: Duration) -> Option<String>
-    where
-        S: futures::Stream<Item = String> + Unpin,
-    {
-        tokio::time::timeout(timeout, stream.next()).await.ok().flatten()
-    }
-
-    #[tokio::test]
-    async fn tail_stream_emits_appended_lines() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("test.jsonl");
-        std::fs::File::create(&path).unwrap();
-
-        let stream = tail_lines(path.clone(), 0);
-        tokio::pin!(stream);
-
-        // Append a line after the stream started.
-        let written = r#"{"action":"hi"}"#;
-        std::fs::write(&path, format!("{written}\n")).unwrap();
-
-        let got = next_line(&mut stream, Duration::from_millis(1500)).await;
-        assert_eq!(got.as_deref(), Some(written), "expected appended line verbatim");
-    }
-
-    /// (D5, #3035) `GET /flow/:date` answers the same envelope `/flow-mission/:id`
-    /// and `/flow-dispatch/:id` do: records, count, truncated, generated_at_ms,
-    /// and a coverage `meta` (no Redis configured reads as `off`, complete).
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn flow_date_route_answers_the_records_envelope() {
-        unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
-        let flows = archive();
-        let json = get_json(&flows, "/flow/2026-05-14").await;
-        assert!(json.is_object(), "the route answers an envelope, not a bare array: {json}");
-        assert_eq!(json["count"], 2);
-        assert_eq!(json["truncated"], false);
-        assert!(json["generated_at_ms"].as_u64().is_some_and(|n| n > 0), "{json}");
-        assert_eq!(json["meta"]["complete"], true, "{json}");
-        assert_eq!(json["meta"]["sources"]["fleet"]["state"], "off", "{json}");
-        assert_eq!(json["meta"]["days_scanned"], 1);
-        assert_eq!(json["meta"]["records_scanned"], 2);
-    }
-
-    // ─── routes that serve records serve them as written ────────────────────
-    //
-    // Nothing is upgraded on read (#3036): a record carries the spelling it
-    // was written with, and one a release retired reads as an unknown action.
-
-    const DAY: &str = "{\"ts\":\"2026-05-14T09:00:00Z\",\"action\":\"dispatch.start\",\"session_id\":\"S1\",\"mission_id\":\"m1\",\"execution_id\":\"exec-1\",\"machine_id\":\"mac\"}\n\
+const DAY: &str = "{\"ts\":\"2026-05-14T09:00:00Z\",\"action\":\"dispatch.start\",\"session_id\":\"S1\",\"mission_id\":\"m1\",\"execution_id\":\"exec-1\",\"machine_id\":\"mac\"}\n\
          {\"ts\":\"2026-05-14T09:00:05Z\",\"action\":\"dispatch.complete\",\"session_id\":\"S1\",\"mission_id\":\"m1\",\"execution_id\":\"exec-1\",\"machine_id\":\"mac\"}\n";
 
-    fn archive() -> TempDir {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("2026-05-14.jsonl"), DAY).unwrap();
-        tmp
-    }
+fn archive() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("2026-05-14.jsonl"), DAY).unwrap();
+    tmp
+}
 
-    async fn get_json(flows: &TempDir, uri: &str) -> serde_json::Value {
-        let response = build_router_local(flows.path().to_path_buf())
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "{uri}");
-        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap()
-    }
+async fn get_json(flows: &TempDir, uri: &str) -> serde_json::Value {
+    let response = build_router_local(flows.path().to_path_buf())
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap()
+}
 
-    fn actions_of(records: &serde_json::Value) -> Vec<&str> {
-        records.as_array().expect("records array").iter().filter_map(|r| r["action"].as_str()).collect()
-    }
+fn actions_of(records: &serde_json::Value) -> Vec<&str> {
+    records
+        .as_array()
+        .expect("records array")
+        .iter()
+        .filter_map(|r| r["action"].as_str())
+        .collect()
+}
 
-    #[tokio::test]
-    async fn flow_date_route_serves_the_day_as_written() {
-        let flows = archive();
-        let json = get_json(&flows, "/flow/2026-05-14").await;
-        assert_eq!(actions_of(&json["records"]), vec!["dispatch.start", "dispatch.complete"]);
-        let since = get_json(&flows, "/flow/2026-05-14?since=2026-05-14T09:00:05Z").await;
-        assert_eq!(actions_of(&since["records"]), vec!["dispatch.complete"]);
-    }
+#[tokio::test]
+async fn flow_date_route_serves_the_day_as_written() {
+    let flows = archive();
+    let json = get_json(&flows, "/flow/2026-05-14").await;
+    assert_eq!(
+        actions_of(&json["records"]),
+        vec!["dispatch.start", "dispatch.complete"]
+    );
+    let since = get_json(&flows, "/flow/2026-05-14?since=2026-05-14T09:00:05Z").await;
+    assert_eq!(actions_of(&since["records"]), vec!["dispatch.complete"]);
+}
 
-    /// (#3036) A pre-5.0 day file is served with its retired spelling and no
-    /// synthesized execution: nothing is rewritten on the way out.
-    #[tokio::test]
-    async fn flow_date_route_serves_a_retired_spelling_as_written() {
-        let tmp = TempDir::new().unwrap();
-        // flow-action-guard:allow-start — a retired spelling is this test's input
-        let old = "{\"ts\":\"2026-05-14T09:00:00Z\",\"action\":\"dispatch start\",\"session_id\":\"S1\",\"mission_id\":\"m1\"}\n";
-        fs::write(tmp.path().join("2026-05-14.jsonl"), old).unwrap();
-        let json = get_json(&tmp, "/flow/2026-05-14").await;
-        assert_eq!(json["records"][0]["action"], "dispatch start");
-        // flow-action-guard:allow-end
-        assert!(json["records"][0].get("execution_id").is_none(), "{json}");
-    }
+/// (#3036) A pre-5.0 day file is served with its retired spelling and no
+/// synthesized execution: nothing is rewritten on the way out.
+#[tokio::test]
+async fn flow_date_route_serves_a_retired_spelling_as_written() {
+    let tmp = TempDir::new().unwrap();
+    // flow-action-guard:allow-start — a retired spelling is this test's input
+    let old = "{\"ts\":\"2026-05-14T09:00:00Z\",\"action\":\"dispatch start\",\"session_id\":\"S1\",\"mission_id\":\"m1\"}\n";
+    fs::write(tmp.path().join("2026-05-14.jsonl"), old).unwrap();
+    let json = get_json(&tmp, "/flow/2026-05-14").await;
+    assert_eq!(json["records"][0]["action"], "dispatch start");
+    // flow-action-guard:allow-end
+    assert!(json["records"][0].get("execution_id").is_none(), "{json}");
+}
 
-    #[tokio::test]
-    async fn flow_mission_route_serves_the_mission_as_written() {
-        let json = get_json(&archive(), "/flow-mission/m1").await;
-        assert_eq!(actions_of(&json["records"]), vec!["dispatch.start", "dispatch.complete"]);
-    }
+#[tokio::test]
+async fn flow_mission_route_serves_the_mission_as_written() {
+    let json = get_json(&archive(), "/flow-mission/m1").await;
+    assert_eq!(
+        actions_of(&json["records"]),
+        vec!["dispatch.start", "dispatch.complete"]
+    );
+}
 
-    #[tokio::test]
-    async fn flow_dispatch_route_serves_the_session_as_written() {
-        let json = get_json(&archive(), "/flow-dispatch/S1").await;
-        assert_eq!(actions_of(&json["records"]), vec!["dispatch.start", "dispatch.complete"]);
-    }
+#[tokio::test]
+async fn flow_dispatch_route_serves_the_session_as_written() {
+    let json = get_json(&archive(), "/flow-dispatch/S1").await;
+    assert_eq!(
+        actions_of(&json["records"]),
+        vec!["dispatch.start", "dispatch.complete"]
+    );
+}
 
-    #[tokio::test]
-    async fn flow_days_route_counts_a_dispatch_start() {
-        let json = get_json(&archive(), "/flow-days").await;
-        assert_eq!(json["days"][0]["dispatches"], 1, "{json}");
-    }
+#[tokio::test]
+async fn flow_days_route_counts_a_dispatch_start() {
+    let json = get_json(&archive(), "/flow-days").await;
+    assert_eq!(json["days"][0]["dispatches"], 1, "{json}");
+}
 
-    #[tokio::test]
-    async fn flow_missions_route_counts_a_dispatch_start() {
-        let json = get_json(&archive(), "/flow-missions").await;
-        let m1 = json["missions"].as_array().unwrap().iter().find(|m| m["mission_id"] == "m1").expect("m1");
-        assert_eq!(m1["dispatches"], 1, "{json}");
-    }
+#[tokio::test]
+async fn flow_missions_route_counts_a_dispatch_start() {
+    let json = get_json(&archive(), "/flow-missions").await;
+    let m1 = json["missions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["mission_id"] == "m1")
+        .expect("m1");
+    assert_eq!(m1["dispatches"], 1, "{json}");
+}
 
-    /// `/flow/:date`'s Redis backfill (`records_from_xrevrange`) answers the
-    /// `XREVRANGE` entries oldest first.
-    #[test]
-    fn redis_backfill_serves_records_oldest_first() {
-        let entry = |id: &str, json: &str| {
-            redis::Value::Array(vec![
-                redis::Value::BulkString(id.as_bytes().to_vec()),
-                redis::Value::Array(vec![
-                    redis::Value::BulkString(b"record".to_vec()),
-                    redis::Value::BulkString(json.as_bytes().to_vec()),
-                ]),
-            ])
-        };
-        let raw = redis::Value::Array(vec![
-            entry("2-0", r#"{"ts":"2026-05-14T09:00:05Z","action":"dispatch.complete"}"#),
-            entry("1-0", r#"{"ts":"2026-05-14T09:00:00Z","action":"dispatch.start"}"#),
-        ]);
-        let records = super::records_from_xrevrange(raw, Some("2026-05-14"), UNTRIMMED).unwrap().records;
-        assert_eq!(actions_of(&serde_json::Value::Array(records)), vec!["dispatch.start", "dispatch.complete"]);
-    }
-
-    /// (#3017) A record read off the hub carries the hub's own stream id as
-    /// `hub_id`: the receive order the viewer orders cross-machine records
-    /// by, never each machine's own `ts`.
-    #[test]
-    fn redis_backfill_stamps_each_record_with_its_hub_id() {
-        let raw = redis::Value::Array(vec![xentry(2_000, "2026-05-14T09:00:05Z"), xentry(1_000, "2026-05-14T09:00:00Z")]);
-        let records = super::records_from_xrevrange(raw, Some("2026-05-14"), UNTRIMMED).unwrap().records;
-        let ids: Vec<_> = records.iter().map(|r| r["hub_id"].as_str().unwrap_or("")).collect();
-        assert_eq!(ids, vec!["1000-0", "2000-0"]);
-    }
-
-    /// (#2101) Work records and machine samples are read from two streams and
-    /// come back as one run in hub order, whichever stream each came from.
-    #[test]
-    fn work_and_telemetry_reads_merge_in_hub_order() {
-        let r = |id: &str, action: &str| serde_json::json!({"hub_id": id, "action": action});
-        let work = vec![r("1000-0", "dispatch.start"), r("3000-0", "dispatch.complete")];
-        let telemetry = vec![r("2000-0", "machine.telemetry"), r("2000-1", "machine.telemetry"), r("4000-0", "machine.telemetry")];
-        let merged = super::merge_by_hub_id(work, telemetry);
-        let ids: Vec<_> = merged.iter().map(|m| m["hub_id"].as_str().unwrap()).collect();
-        assert_eq!(ids, ["1000-0", "2000-0", "2000-1", "3000-0", "4000-0"]);
-        assert!(super::merge_by_hub_id(Vec::new(), Vec::new()).is_empty());
-    }
-
-    #[test]
-    fn a_live_tail_line_carries_its_hub_id() {
-        let line = super::stamp_hub_id_line(r#"{"ts":"2026-05-14T09:00:00Z","action":"operator.note"}"#, Some("1000-3"));
-        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["hub_id"], "1000-3");
-        assert_eq!(v["action"], "operator.note");
-        // A line that is not a JSON object passes through untouched.
-        assert_eq!(super::stamp_hub_id_line("not json", Some("1-0")), "not json");
-    }
-
-    /// The SSE tail's parse of one `XREAD` reply: every entry advances the
-    /// cursor, a record of another day and an entry with no record field
-    /// included; only the day's records come back, each with its hub id;
-    /// shapes that are not blocks or entries are skipped.
-    #[test]
-    fn an_xread_reply_parses_to_the_days_lines_and_the_next_cursor() {
-        use redis::Value::{Array, BulkString, Int, Nil, SimpleString};
-        let no_record = Array(vec![BulkString(b"3000-0".to_vec()), Int(7)]);
-        let block = Array(vec![
-            BulkString(b"darkmux:flow".to_vec()),
-            Array(vec![
-                xentry(1000, "2026-05-14T09:00:00Z"),
-                Int(1),
-                Array(vec![BulkString(b"lonely".to_vec())]),
-                xentry(2000, "2026-05-13T23:59:59Z"),
-                no_record,
-            ]),
-        ]);
-        let reply = Array(vec![Int(0), Array(vec![BulkString(b"short".to_vec())]), block]);
-        let (lines, cursor) = super::parse_xread_reply(reply, "500-0", "2026-05-14").unwrap();
-        assert_eq!(cursor, "3000-0");
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        let v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-        assert_eq!(v["hub_id"], "1000-0");
-
-        // A BLOCK timeout: nothing new, the cursor stays.
-        let (lines, cursor) = super::parse_xread_reply(Nil, "500-0", "2026-05-14").unwrap();
-        assert!(lines.is_empty());
-        assert_eq!(cursor, "500-0");
-        assert!(super::parse_xread_reply(SimpleString("OK".into()), "500-0", "2026-05-14").is_err());
-    }
-
-    fn runs_sources(dir: &str) -> (std::path::PathBuf, Option<std::path::PathBuf>) {
-        (std::path::PathBuf::from(dir), None)
-    }
-
-    fn built_runs(sources: &(std::path::PathBuf, Option<std::path::PathBuf>), inputs: u64, at: std::time::SystemTime) -> super::BuiltRuns {
-        super::BuiltRuns {
-            sources: sources.clone(),
-            inputs,
-            at,
-            built_at_ms: 0,
-            rows: Vec::new(),
-            off_rows: Default::default(),
-            fleet_state: super::source_state::SourceState::Ok,
-        }
-    }
-
-    /// (#3428) A `/runs` build is served again only for the same sources and
-    /// inputs, and only inside [`RUNS_CACHE_TTL`] of when it was built.
-    #[test]
-    fn a_runs_build_is_reused_only_for_its_sources_and_inputs_inside_the_ttl() {
-        let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let (a, b) = (runs_sources("/a"), runs_sources("/b"));
-        let mut cache = super::RunsCache::default();
-        assert!(cache.fresh(&a, 1, at).is_none(), "nothing built yet");
-        cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
-        let just_inside = at + super::RUNS_CACHE_TTL - Duration::from_millis(1);
-        assert!(cache.fresh(&a, 1, just_inside).is_some());
-        assert!(cache.fresh(&a, 2, at).is_none(), "new inputs");
-        assert!(cache.fresh(&b, 1, at).is_none(), "other sources");
-        assert!(cache.fresh(&a, 1, at + super::RUNS_CACHE_TTL).is_none(), "past the TTL");
-    }
-
-    /// (#3428) A failed `/runs` build is not retried by every waiting request:
-    /// those for the same sources back off for [`RUNS_CACHE_TTL`] from when it
-    /// failed, and a later good build ends the backoff.
-    #[test]
-    fn a_failed_runs_build_backs_off_its_sources_for_the_ttl() {
-        let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let (a, b) = (runs_sources("/a"), runs_sources("/b"));
-        let mut cache = super::RunsCache::default();
-        assert!(!cache.backing_off(&a, at));
-        assert!(cache.record(a.clone(), Err("a panicked build".into()), at).is_none());
-        assert!(cache.backing_off(&a, at + super::RUNS_CACHE_TTL - Duration::from_millis(1)));
-        assert!(!cache.backing_off(&a, at + super::RUNS_CACHE_TTL), "past the TTL");
-        assert!(!cache.backing_off(&b, at), "other sources");
-        let later = at + Duration::from_millis(1);
-        assert!(cache.record(a.clone(), Ok(built_runs(&a, 1, later)), later).is_some());
-        assert!(!cache.backing_off(&a, later), "a good build ends the backoff");
-        assert!(cache.fresh(&a, 1, later).is_some());
-    }
-
-    /// (#3428) A build past [`RUNS_CACHE_TTL`] whose inputs are unchanged is
-    /// served at once instead of making the request wait on a rebuild, while
-    /// it is younger than [`RUNS_STALE_BOUND`], and only the first such
-    /// request starts the rebuild. New inputs, other sources, or a build past
-    /// the bound (the first poll after an idle hour) still wait for a build:
-    /// the fingerprint misses missions, lab runs and elapsed-time statuses.
-    #[test]
-    fn an_unchanged_runs_build_is_served_while_one_rebuild_runs_inside_the_bound() {
-        let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let past_ttl = at + super::RUNS_CACHE_TTL;
-        let (a, b) = (runs_sources("/a"), runs_sources("/b"));
-        let mut cache = super::RunsCache::default();
-        assert!(cache.stale(&a, 1, past_ttl).is_none(), "nothing built yet");
-        cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
-        let (built, ticket) = cache.stale(&a, 1, past_ttl).expect("an unchanged build is served");
-        assert_eq!(built.inputs, 1);
-        assert!(ticket.is_some(), "the first request starts the rebuild");
-        let (_, second) = cache.stale(&a, 1, past_ttl).expect("served while it rebuilds");
-        assert!(second.is_none(), "a second rebuild started while one runs");
-        assert!(cache.stale(&a, 2, past_ttl).is_none(), "new inputs were served an old build");
-        assert!(cache.stale(&b, 1, past_ttl).is_none(), "other sources were served this build");
-        let just_inside = at + super::RUNS_STALE_BOUND - Duration::from_millis(1);
-        assert!(cache.stale(&a, 1, just_inside).is_some());
-        assert!(
-            cache.stale(&a, 1, at + super::RUNS_STALE_BOUND).is_none(),
-            "a build past the bound was served instead of waiting for a new one"
-        );
-    }
-
-    /// (#3428) A background rebuild is kept only while it is the current one:
-    /// a foreground build (new inputs, or past the bound) supersedes it and
-    /// its result is dropped. A superseded rebuild still running holds off
-    /// the next until it returns, so at most one runs at a time.
-    #[test]
-    fn a_background_runs_rebuild_is_kept_only_while_it_is_the_current_one() {
-        let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let a = runs_sources("/a");
-        let past_ttl = at + super::RUNS_CACHE_TTL;
-        let mut cache = super::RunsCache::default();
-        cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
-        let first = cache.stale(&a, 1, past_ttl).expect("served").1.expect("starts");
-        cache.install_rebuild(&first, a.clone(), Ok(built_runs(&a, 1, past_ttl)), past_ttl);
-        drop(first);
-        assert!(cache.fresh(&a, 1, past_ttl).is_some(), "the rebuild was not kept");
-
-        // A rebuild runs; a foreground build supersedes it.
-        let later = past_ttl + super::RUNS_CACHE_TTL;
-        let r1 = cache.stale(&a, 1, later).expect("served").1.expect("starts");
-        cache.record(a.clone(), Ok(built_runs(&a, 1, later)), later);
-        let r2_at = later + super::RUNS_CACHE_TTL;
-        assert!(
-            cache.stale(&a, 1, r2_at).expect("served").1.is_none(),
-            "a rebuild started beside a superseded one still running"
-        );
-        cache.install_rebuild(&r1, a.clone(), Ok(built_runs(&a, 1, r2_at)), r2_at);
-        drop(r1);
-        assert!(cache.fresh(&a, 1, later).is_some(), "a superseded rebuild replaced the foreground build");
-        assert!(cache.fresh(&a, 1, r2_at).is_none(), "a superseded rebuild was kept");
-        let r2 = cache.stale(&a, 1, r2_at).expect("served").1.expect("r1 returned, so r2 starts");
-        cache.install_rebuild(&r2, a.clone(), Ok(built_runs(&a, 1, r2_at)), r2_at);
-        assert!(cache.fresh(&a, 1, r2_at).is_some(), "the current rebuild was not kept");
-    }
-
-    /// (#3428) A background rebuild that lands after a newer build failed
-    /// does not end that failure's backoff.
-    #[test]
-    fn a_background_runs_rebuild_does_not_end_a_newer_failures_backoff() {
-        let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let a = runs_sources("/a");
-        let past_ttl = at + super::RUNS_CACHE_TTL;
-        let mut cache = super::RunsCache::default();
-        cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
-        let rebuild = cache.stale(&a, 1, past_ttl).expect("served").1.expect("starts");
-        assert!(cache.record(a.clone(), Err("a panicked build of new inputs".into()), past_ttl).is_none());
-        cache.install_rebuild(&rebuild, a.clone(), Ok(built_runs(&a, 1, past_ttl)), past_ttl);
-        assert!(cache.backing_off(&a, past_ttl), "the newer failure's backoff was ended");
-    }
-
-    /// (#3428) A rebuild that never lands (its task dropped with a runtime
-    /// that shut down mid-build, as a test's does) cannot stop later
-    /// rebuilds: dropping its ticket ends its claim.
-    #[test]
-    fn a_lost_runs_rebuild_does_not_stop_later_rebuilds() {
-        let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let (a, b) = (runs_sources("/a"), runs_sources("/b"));
-        let past_ttl = at + super::RUNS_CACHE_TTL;
-        let mut cache = super::RunsCache::default();
-        cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
-        drop(cache.stale(&a, 1, past_ttl).expect("served").1.expect("starts, then is lost"));
-        assert!(cache.stale(&a, 1, past_ttl).expect("served").1.is_some(), "a lost rebuild stopped a's");
-        cache.record(b.clone(), Ok(built_runs(&b, 1, at)), at);
-        assert!(cache.stale(&b, 1, past_ttl).expect("served").1.is_some(), "a lost rebuild stopped b's");
-    }
-
-    fn xentry(ms: u64, ts: &str) -> redis::Value {
+/// `/flow/:date`'s Redis backfill (`records_from_xrevrange`) answers the
+/// `XREVRANGE` entries oldest first.
+#[test]
+fn redis_backfill_serves_records_oldest_first() {
+    let entry = |id: &str, json: &str| {
         redis::Value::Array(vec![
-            redis::Value::BulkString(format!("{ms}-0").into_bytes()),
+            redis::Value::BulkString(id.as_bytes().to_vec()),
             redis::Value::Array(vec![
                 redis::Value::BulkString(b"record".to_vec()),
-                redis::Value::BulkString(format!(r#"{{"ts":"{ts}","action":"operator.note"}}"#).into_bytes()),
+                redis::Value::BulkString(json.as_bytes().to_vec()),
             ]),
         ])
+    };
+    let raw = redis::Value::Array(vec![
+        entry(
+            "2-0",
+            r#"{"ts":"2026-05-14T09:00:05Z","action":"dispatch.complete"}"#,
+        ),
+        entry(
+            "1-0",
+            r#"{"ts":"2026-05-14T09:00:00Z","action":"dispatch.start"}"#,
+        ),
+    ]);
+    let records = super::records_from_xrevrange(raw, Some("2026-05-14"), UNTRIMMED)
+        .unwrap()
+        .records;
+    assert_eq!(
+        actions_of(&serde_json::Value::Array(records)),
+        vec!["dispatch.start", "dispatch.complete"]
+    );
+}
+
+/// (#3017) A record read off the hub carries the hub's own stream id as
+/// `hub_id`: the receive order the viewer orders cross-machine records
+/// by, never each machine's own `ts`.
+#[test]
+fn redis_backfill_stamps_each_record_with_its_hub_id() {
+    let raw = redis::Value::Array(vec![
+        xentry(2_000, "2026-05-14T09:00:05Z"),
+        xentry(1_000, "2026-05-14T09:00:00Z"),
+    ]);
+    let records = super::records_from_xrevrange(raw, Some("2026-05-14"), UNTRIMMED)
+        .unwrap()
+        .records;
+    let ids: Vec<_> = records
+        .iter()
+        .map(|r| r["hub_id"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(ids, vec!["1000-0", "2000-0"]);
+}
+
+/// (#2101) Work records and machine samples are read from two streams and
+/// come back as one run in hub order, whichever stream each came from.
+#[test]
+fn work_and_telemetry_reads_merge_in_hub_order() {
+    let r = |id: &str, action: &str| serde_json::json!({"hub_id": id, "action": action});
+    let work = vec![
+        r("1000-0", "dispatch.start"),
+        r("3000-0", "dispatch.complete"),
+    ];
+    let telemetry = vec![
+        r("2000-0", "machine.telemetry"),
+        r("2000-1", "machine.telemetry"),
+        r("4000-0", "machine.telemetry"),
+    ];
+    let merged = super::merge_by_hub_id(work, telemetry);
+    let ids: Vec<_> = merged
+        .iter()
+        .map(|m| m["hub_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["1000-0", "2000-0", "2000-1", "3000-0", "4000-0"]);
+    assert!(super::merge_by_hub_id(Vec::new(), Vec::new()).is_empty());
+}
+
+#[test]
+fn a_live_tail_line_carries_its_hub_id() {
+    let line = super::stamp_hub_id_line(
+        r#"{"ts":"2026-05-14T09:00:00Z","action":"operator.note"}"#,
+        Some("1000-3"),
+    );
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(v["hub_id"], "1000-3");
+    assert_eq!(v["action"], "operator.note");
+    // A line that is not a JSON object passes through untouched.
+    assert_eq!(
+        super::stamp_hub_id_line("not json", Some("1-0")),
+        "not json"
+    );
+}
+
+/// The SSE tail's parse of one `XREAD` reply: every entry advances the
+/// cursor, a record of another day and an entry with no record field
+/// included; only the day's records come back, each with its hub id;
+/// shapes that are not blocks or entries are skipped.
+#[test]
+fn an_xread_reply_parses_to_the_days_lines_and_the_next_cursor() {
+    use redis::Value::{Array, BulkString, Int, Nil, SimpleString};
+    let no_record = Array(vec![BulkString(b"3000-0".to_vec()), Int(7)]);
+    let block = Array(vec![
+        BulkString(b"darkmux:flow".to_vec()),
+        Array(vec![
+            xentry(1000, "2026-05-14T09:00:00Z"),
+            Int(1),
+            Array(vec![BulkString(b"lonely".to_vec())]),
+            xentry(2000, "2026-05-13T23:59:59Z"),
+            no_record,
+        ]),
+    ]);
+    let reply = Array(vec![
+        Int(0),
+        Array(vec![BulkString(b"short".to_vec())]),
+        block,
+    ]);
+    let (lines, cursor) = super::parse_xread_reply(reply, "500-0", "2026-05-14").unwrap();
+    assert_eq!(cursor, "3000-0");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    assert_eq!(v["hub_id"], "1000-0");
+
+    // A BLOCK timeout: nothing new, the cursor stays.
+    let (lines, cursor) = super::parse_xread_reply(Nil, "500-0", "2026-05-14").unwrap();
+    assert!(lines.is_empty());
+    assert_eq!(cursor, "500-0");
+    assert!(super::parse_xread_reply(SimpleString("OK".into()), "500-0", "2026-05-14").is_err());
+}
+
+fn runs_sources(dir: &str) -> (std::path::PathBuf, Option<std::path::PathBuf>) {
+    (std::path::PathBuf::from(dir), None)
+}
+
+fn built_runs(
+    sources: &(std::path::PathBuf, Option<std::path::PathBuf>),
+    inputs: u64,
+    at: std::time::SystemTime,
+) -> super::BuiltRuns {
+    super::BuiltRuns {
+        sources: sources.clone(),
+        inputs,
+        at,
+        built_at_ms: 0,
+        rows: Vec::new(),
+        off_rows: Default::default(),
+        fleet_state: super::source_state::SourceState::Ok,
     }
+}
 
-    /// A `redis.maxlen` of `0` (unbounded): the stream is never trimmed.
-    const UNTRIMMED: usize = 0;
+/// (#3428) A `/runs` build is served again only for the same sources and
+/// inputs, and only inside [`RUNS_CACHE_TTL`] of when it was built.
+#[test]
+fn a_runs_build_is_reused_only_for_its_sources_and_inputs_inside_the_ttl() {
+    let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let (a, b) = (runs_sources("/a"), runs_sources("/b"));
+    let mut cache = super::RunsCache::default();
+    assert!(cache.fresh(&a, 1, at).is_none(), "nothing built yet");
+    cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
+    let just_inside = at + super::RUNS_CACHE_TTL - Duration::from_millis(1);
+    assert!(cache.fresh(&a, 1, just_inside).is_some());
+    assert!(cache.fresh(&a, 2, at).is_none(), "new inputs");
+    assert!(cache.fresh(&b, 1, at).is_none(), "other sources");
+    assert!(
+        cache.fresh(&a, 1, at + super::RUNS_CACHE_TTL).is_none(),
+        "past the TTL"
+    );
+}
 
-    /// 2026-05-14T00:00:00Z in epoch milliseconds.
-    const DAY_START_MS: u64 = 1_778_716_800_000;
+/// (#3428) A failed `/runs` build is not retried by every waiting request:
+/// those for the same sources back off for [`RUNS_CACHE_TTL`] from when it
+/// failed, and a later good build ends the backoff.
+#[test]
+fn a_failed_runs_build_backs_off_its_sources_for_the_ttl() {
+    let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let (a, b) = (runs_sources("/a"), runs_sources("/b"));
+    let mut cache = super::RunsCache::default();
+    assert!(!cache.backing_off(&a, at));
+    assert!(cache
+        .record(a.clone(), Err("a panicked build".into()), at)
+        .is_none());
+    assert!(cache.backing_off(&a, at + super::RUNS_CACHE_TTL - Duration::from_millis(1)));
+    assert!(
+        !cache.backing_off(&a, at + super::RUNS_CACHE_TTL),
+        "past the TTL"
+    );
+    assert!(!cache.backing_off(&b, at), "other sources");
+    let later = at + Duration::from_millis(1);
+    assert!(cache
+        .record(a.clone(), Ok(built_runs(&a, 1, later)), later)
+        .is_some());
+    assert!(
+        !cache.backing_off(&a, later),
+        "a good build ends the backoff"
+    );
+    assert!(cache.fresh(&a, 1, later).is_some());
+}
 
-    #[test]
-    fn day_start_ms_is_the_utc_midnight() {
-        assert_eq!(super::day_start_ms("2026-05-14"), Some(DAY_START_MS));
-        assert_eq!(super::day_start_ms("1970-01-02"), Some(86_400_000));
-        assert_eq!(super::day_start_ms("nope"), None);
-    }
+/// (#3428) A build past [`RUNS_CACHE_TTL`] whose inputs are unchanged is
+/// served at once instead of making the request wait on a rebuild, while
+/// it is younger than [`RUNS_STALE_BOUND`], and only the first such
+/// request starts the rebuild. New inputs, other sources, or a build past
+/// the bound (the first poll after an idle hour) still wait for a build:
+/// the fingerprint misses missions, lab runs and elapsed-time statuses.
+#[test]
+fn an_unchanged_runs_build_is_served_while_one_rebuild_runs_inside_the_bound() {
+    let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let past_ttl = at + super::RUNS_CACHE_TTL;
+    let (a, b) = (runs_sources("/a"), runs_sources("/b"));
+    let mut cache = super::RunsCache::default();
+    assert!(cache.stale(&a, 1, past_ttl).is_none(), "nothing built yet");
+    cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
+    let (built, ticket) = cache
+        .stale(&a, 1, past_ttl)
+        .expect("an unchanged build is served");
+    assert_eq!(built.inputs, 1);
+    assert!(ticket.is_some(), "the first request starts the rebuild");
+    let (_, second) = cache
+        .stale(&a, 1, past_ttl)
+        .expect("served while it rebuilds");
+    assert!(second.is_none(), "a second rebuild started while one runs");
+    assert!(
+        cache.stale(&a, 2, past_ttl).is_none(),
+        "new inputs were served an old build"
+    );
+    assert!(
+        cache.stale(&b, 1, past_ttl).is_none(),
+        "other sources were served this build"
+    );
+    let just_inside = at + super::RUNS_STALE_BOUND - Duration::from_millis(1);
+    assert!(cache.stale(&a, 1, just_inside).is_some());
+    assert!(
+        cache.stale(&a, 1, at + super::RUNS_STALE_BOUND).is_none(),
+        "a build past the bound was served instead of waiting for a new one"
+    );
+}
 
-    /// (D5 review) A Redis read that returned a full COUNT whose oldest entry is
-    /// still inside the date was cut; one that reached back before the date was not.
-    #[test]
-    fn redis_day_read_is_cut_when_a_full_read_ends_inside_the_date() {
-        let full = |oldest_ms: u64| {
-            let mut v: Vec<redis::Value> =
-                (0..super::MAX_FLOW_FILE_RECORDS as u64).map(|i| xentry(oldest_ms + (super::MAX_FLOW_FILE_RECORDS as u64 - i), "2026-05-14T09:00:00Z")).collect();
-            v.pop();
-            v.push(xentry(oldest_ms, "2026-05-14T09:00:00Z"));
-            redis::Value::Array(v)
-        };
-        let inside = super::records_from_xrevrange(full(DAY_START_MS + 1000), Some("2026-05-14"), UNTRIMMED).unwrap();
-        assert!(inside.cut, "a full COUNT whose oldest entry is inside the date is cut");
-        let before = super::records_from_xrevrange(full(DAY_START_MS - 1000), Some("2026-05-14"), UNTRIMMED).unwrap();
-        assert!(!before.cut, "a full COUNT that reached back before the date holds all of it");
-    }
+/// (#3428) A background rebuild is kept only while it is the current one:
+/// a foreground build (new inputs, or past the bound) supersedes it and
+/// its result is dropped. A superseded rebuild still running holds off
+/// the next until it returns, so at most one runs at a time.
+#[test]
+fn a_background_runs_rebuild_is_kept_only_while_it_is_the_current_one() {
+    let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let a = runs_sources("/a");
+    let past_ttl = at + super::RUNS_CACHE_TTL;
+    let mut cache = super::RunsCache::default();
+    cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
+    let first = cache
+        .stale(&a, 1, past_ttl)
+        .expect("served")
+        .1
+        .expect("starts");
+    cache.install_rebuild(&first, a.clone(), Ok(built_runs(&a, 1, past_ttl)), past_ttl);
+    drop(first);
+    assert!(
+        cache.fresh(&a, 1, past_ttl).is_some(),
+        "the rebuild was not kept"
+    );
 
-    /// A short read is the whole stream: it is cut only when the stream is known to have been
-    /// trimmed (its length reached `redis.maxlen`) and its first entry is newer than the date's
-    /// start. A young or never-trimmed stream has lost nothing, so is NOT cut.
-    #[test]
-    fn redis_day_read_is_cut_only_when_the_stream_was_trimmed_past_the_date() {
-        let one = |ms| redis::Value::Array(vec![xentry(ms, "2026-05-14T09:00:00Z")]);
-        let cut = |raw, maxlen| super::records_from_xrevrange(raw, Some("2026-05-14"), maxlen).unwrap().cut;
-        assert!(!cut(one(DAY_START_MS + 5000), UNTRIMMED), "a young stream (no trim) is not cut");
-        assert!(!cut(one(DAY_START_MS + 5000), 100), "a stream shorter than maxlen was never trimmed");
-        assert!(cut(one(DAY_START_MS + 5000), 1), "a stream at maxlen, starting inside the date, was trimmed");
-        assert!(!cut(one(DAY_START_MS - 5000), 1), "a trimmed stream that still reaches back before the date holds it all");
-        assert!(!cut(redis::Value::Array(vec![]), UNTRIMMED));
-    }
+    // A rebuild runs; a foreground build supersedes it.
+    let later = past_ttl + super::RUNS_CACHE_TTL;
+    let r1 = cache
+        .stale(&a, 1, later)
+        .expect("served")
+        .1
+        .expect("starts");
+    cache.record(a.clone(), Ok(built_runs(&a, 1, later)), later);
+    let r2_at = later + super::RUNS_CACHE_TTL;
+    assert!(
+        cache.stale(&a, 1, r2_at).expect("served").1.is_none(),
+        "a rebuild started beside a superseded one still running"
+    );
+    cache.install_rebuild(&r1, a.clone(), Ok(built_runs(&a, 1, r2_at)), r2_at);
+    drop(r1);
+    assert!(
+        cache.fresh(&a, 1, later).is_some(),
+        "a superseded rebuild replaced the foreground build"
+    );
+    assert!(
+        cache.fresh(&a, 1, r2_at).is_none(),
+        "a superseded rebuild was kept"
+    );
+    let r2 = cache
+        .stale(&a, 1, r2_at)
+        .expect("served")
+        .1
+        .expect("r1 returned, so r2 starts");
+    cache.install_rebuild(&r2, a.clone(), Ok(built_runs(&a, 1, r2_at)), r2_at);
+    assert!(
+        cache.fresh(&a, 1, r2_at).is_some(),
+        "the current rebuild was not kept"
+    );
+}
 
-    /// The reverse lie: bookends kept outside the ring, and a union of two
-    /// sources, do not make an uncut day read truncated.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn flow_date_is_not_truncated_for_an_uncut_day_with_many_bookends() {
-        unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
-        let tmp = TempDir::new().unwrap();
-        // A full ring (exactly the cap, nothing evicted) plus 40 bookends kept
-        // outside it: more records than the cap, yet nothing was cut.
-        let mut body = "{\"ts\":\"2026-05-14T08:00:00Z\",\"action\":\"operator.note\"}\n".repeat(super::MAX_FLOW_FILE_RECORDS);
-        for i in 0..40 {
-            body.push_str(&format!("{{\"ts\":\"2026-05-14T09:00:{:02}Z\",\"action\":\"dispatch.start\",\"session_id\":\"S{i}\"}}\n", i % 60));
-        }
-        fs::write(tmp.path().join("2026-05-14.jsonl"), body).unwrap();
-        let json = get_json(&tmp, "/flow/2026-05-14").await;
-        assert_eq!(json["count"], super::MAX_FLOW_FILE_RECORDS + 40);
-        assert_eq!(json["truncated"], false, "{json}");
-        assert_eq!(json["meta"]["cut"], serde_json::json!({"local": false, "fleet": false}));
-    }
+/// (#3428) A background rebuild that lands after a newer build failed
+/// does not end that failure's backoff.
+#[test]
+fn a_background_runs_rebuild_does_not_end_a_newer_failures_backoff() {
+    let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let a = runs_sources("/a");
+    let past_ttl = at + super::RUNS_CACHE_TTL;
+    let mut cache = super::RunsCache::default();
+    cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
+    let rebuild = cache
+        .stale(&a, 1, past_ttl)
+        .expect("served")
+        .1
+        .expect("starts");
+    assert!(cache
+        .record(
+            a.clone(),
+            Err("a panicked build of new inputs".into()),
+            past_ttl
+        )
+        .is_none());
+    cache.install_rebuild(
+        &rebuild,
+        a.clone(),
+        Ok(built_runs(&a, 1, past_ttl)),
+        past_ttl,
+    );
+    assert!(
+        cache.backing_off(&a, past_ttl),
+        "the newer failure's backoff was ended"
+    );
+}
 
-    /// A local day read that hit its cap says so, in `truncated` and in `meta.cut.local`.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn flow_date_is_truncated_when_the_local_read_hit_its_cap() {
-        unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
-        let tmp = TempDir::new().unwrap();
-        let line = "{\"ts\":\"2026-05-14T09:00:00Z\",\"action\":\"operator.note\"}\n";
-        fs::write(tmp.path().join("2026-05-14.jsonl"), line.repeat(super::MAX_FLOW_FILE_RECORDS + 5)).unwrap();
-        let json = get_json(&tmp, "/flow/2026-05-14").await;
-        assert_eq!(json["truncated"], true, "truncated must be true when a source was cut");
-        assert_eq!(json["meta"]["cut"], serde_json::json!({"local": true, "fleet": false}));
-    }
+/// (#3428) A rebuild that never lands (its task dropped with a runtime
+/// that shut down mid-build, as a test's does) cannot stop later
+/// rebuilds: dropping its ticket ends its claim.
+#[test]
+fn a_lost_runs_rebuild_does_not_stop_later_rebuilds() {
+    let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let (a, b) = (runs_sources("/a"), runs_sources("/b"));
+    let past_ttl = at + super::RUNS_CACHE_TTL;
+    let mut cache = super::RunsCache::default();
+    cache.record(a.clone(), Ok(built_runs(&a, 1, at)), at);
+    drop(
+        cache
+            .stale(&a, 1, past_ttl)
+            .expect("served")
+            .1
+            .expect("starts, then is lost"),
+    );
+    assert!(
+        cache.stale(&a, 1, past_ttl).expect("served").1.is_some(),
+        "a lost rebuild stopped a's"
+    );
+    cache.record(b.clone(), Ok(built_runs(&b, 1, at)), at);
+    assert!(
+        cache.stale(&b, 1, past_ttl).expect("served").1.is_some(),
+        "a lost rebuild stopped b's"
+    );
+}
 
-    #[tokio::test]
-    async fn tail_stream_starts_from_current_eof_not_replay() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("test.jsonl");
-        std::fs::write(&path, "{\"old\":1}\n{\"old\":2}\n{\"old\":3}\n").unwrap();
+fn xentry(ms: u64, ts: &str) -> redis::Value {
+    redis::Value::Array(vec![
+        redis::Value::BulkString(format!("{ms}-0").into_bytes()),
+        redis::Value::Array(vec![
+            redis::Value::BulkString(b"record".to_vec()),
+            redis::Value::BulkString(
+                format!(r#"{{"ts":"{ts}","action":"operator.note"}}"#).into_bytes(),
+            ),
+        ]),
+    ])
+}
 
-        let start = std::fs::metadata(&path).unwrap().len();
-        let stream = tail_lines(path.clone(), start);
-        tokio::pin!(stream);
+/// A `redis.maxlen` of `0` (unbounded): the stream is never trimmed.
+const UNTRIMMED: usize = 0;
 
-        // 600ms of polling should yield nothing — old lines are below start_offset.
-        let got = next_line(&mut stream, Duration::from_millis(600)).await;
-        assert!(got.is_none(), "tail-from-current must not replay history; got {got:?}");
+/// 2026-05-14T00:00:00Z in epoch milliseconds.
+const DAY_START_MS: u64 = 1_778_716_800_000;
 
-        // Append a new line — only the new line should be emitted.
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
+#[test]
+fn day_start_ms_is_the_utc_midnight() {
+    assert_eq!(super::day_start_ms("2026-05-14"), Some(DAY_START_MS));
+    assert_eq!(super::day_start_ms("1970-01-02"), Some(86_400_000));
+    assert_eq!(super::day_start_ms("nope"), None);
+}
+
+/// (D5 review) A Redis read that returned a full COUNT whose oldest entry is
+/// still inside the date was cut; one that reached back before the date was not.
+#[test]
+fn redis_day_read_is_cut_when_a_full_read_ends_inside_the_date() {
+    let full = |oldest_ms: u64| {
+        let mut v: Vec<redis::Value> = (0..super::MAX_FLOW_FILE_RECORDS as u64)
+            .map(|i| {
+                xentry(
+                    oldest_ms + (super::MAX_FLOW_FILE_RECORDS as u64 - i),
+                    "2026-05-14T09:00:00Z",
+                )
+            })
+            .collect();
+        v.pop();
+        v.push(xentry(oldest_ms, "2026-05-14T09:00:00Z"));
+        redis::Value::Array(v)
+    };
+    let inside =
+        super::records_from_xrevrange(full(DAY_START_MS + 1000), Some("2026-05-14"), UNTRIMMED)
             .unwrap();
+    assert!(
+        inside.cut,
+        "a full COUNT whose oldest entry is inside the date is cut"
+    );
+    let before =
+        super::records_from_xrevrange(full(DAY_START_MS - 1000), Some("2026-05-14"), UNTRIMMED)
+            .unwrap();
+    assert!(
+        !before.cut,
+        "a full COUNT that reached back before the date holds all of it"
+    );
+}
+
+/// A short read is the whole stream: it is cut only when the stream is known to have been
+/// trimmed (its length reached `redis.maxlen`) and its first entry is newer than the date's
+/// start. A young or never-trimmed stream has lost nothing, so is NOT cut.
+#[test]
+fn redis_day_read_is_cut_only_when_the_stream_was_trimmed_past_the_date() {
+    let one = |ms| redis::Value::Array(vec![xentry(ms, "2026-05-14T09:00:00Z")]);
+    let cut = |raw, maxlen| {
+        super::records_from_xrevrange(raw, Some("2026-05-14"), maxlen)
+            .unwrap()
+            .cut
+    };
+    assert!(
+        !cut(one(DAY_START_MS + 5000), UNTRIMMED),
+        "a young stream (no trim) is not cut"
+    );
+    assert!(
+        !cut(one(DAY_START_MS + 5000), 100),
+        "a stream shorter than maxlen was never trimmed"
+    );
+    assert!(
+        cut(one(DAY_START_MS + 5000), 1),
+        "a stream at maxlen, starting inside the date, was trimmed"
+    );
+    assert!(
+        !cut(one(DAY_START_MS - 5000), 1),
+        "a trimmed stream that still reaches back before the date holds it all"
+    );
+    assert!(!cut(redis::Value::Array(vec![]), UNTRIMMED));
+}
+
+/// The reverse lie: bookends kept outside the ring, and a union of two
+/// sources, do not make an uncut day read truncated.
+#[tokio::test]
+#[serial_test::serial]
+async fn flow_date_is_not_truncated_for_an_uncut_day_with_many_bookends() {
+    unsafe {
+        std::env::remove_var("DARKMUX_REDIS_URL");
+    }
+    let tmp = TempDir::new().unwrap();
+    // A full ring (exactly the cap, nothing evicted) plus 40 bookends kept
+    // outside it: more records than the cap, yet nothing was cut.
+    let mut body = "{\"ts\":\"2026-05-14T08:00:00Z\",\"action\":\"operator.note\"}\n"
+        .repeat(super::MAX_FLOW_FILE_RECORDS);
+    for i in 0..40 {
+        body.push_str(&format!("{{\"ts\":\"2026-05-14T09:00:{:02}Z\",\"action\":\"dispatch.start\",\"session_id\":\"S{i}\"}}\n", i % 60));
+    }
+    fs::write(tmp.path().join("2026-05-14.jsonl"), body).unwrap();
+    let json = get_json(&tmp, "/flow/2026-05-14").await;
+    assert_eq!(json["count"], super::MAX_FLOW_FILE_RECORDS + 40);
+    assert_eq!(json["truncated"], false, "{json}");
+    assert_eq!(
+        json["meta"]["cut"],
+        serde_json::json!({"local": false, "fleet": false})
+    );
+}
+
+/// A local day read that hit its cap says so, in `truncated` and in `meta.cut.local`.
+#[tokio::test]
+#[serial_test::serial]
+async fn flow_date_is_truncated_when_the_local_read_hit_its_cap() {
+    unsafe {
+        std::env::remove_var("DARKMUX_REDIS_URL");
+    }
+    let tmp = TempDir::new().unwrap();
+    let line = "{\"ts\":\"2026-05-14T09:00:00Z\",\"action\":\"operator.note\"}\n";
+    fs::write(
+        tmp.path().join("2026-05-14.jsonl"),
+        line.repeat(super::MAX_FLOW_FILE_RECORDS + 5),
+    )
+    .unwrap();
+    let json = get_json(&tmp, "/flow/2026-05-14").await;
+    assert_eq!(
+        json["truncated"], true,
+        "truncated must be true when a source was cut"
+    );
+    assert_eq!(
+        json["meta"]["cut"],
+        serde_json::json!({"local": true, "fleet": false})
+    );
+}
+
+#[tokio::test]
+async fn tail_stream_starts_from_current_eof_not_replay() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("test.jsonl");
+    std::fs::write(&path, "{\"old\":1}\n{\"old\":2}\n{\"old\":3}\n").unwrap();
+
+    let start = std::fs::metadata(&path).unwrap().len();
+    let stream = tail_lines(path.clone(), start);
+    tokio::pin!(stream);
+
+    // 600ms of polling should yield nothing — old lines are below start_offset.
+    let got = next_line(&mut stream, Duration::from_millis(600)).await;
+    assert!(
+        got.is_none(),
+        "tail-from-current must not replay history; got {got:?}"
+    );
+
+    // Append a new line — only the new line should be emitted.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    use std::io::Write;
+    writeln!(file, "{{\"new\":1}}").unwrap();
+    drop(file);
+
+    let got2 = next_line(&mut stream, Duration::from_millis(1500)).await;
+    assert_eq!(got2.as_deref(), Some(r#"{"new":1}"#));
+}
+
+#[tokio::test]
+async fn tail_stream_handles_missing_file_gracefully() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("not-yet.jsonl");
+    assert!(!path.exists());
+
+    let stream = tail_lines(path.clone(), 0);
+    tokio::pin!(stream);
+
+    // Create the file with content after the stream starts polling.
+    let path2 = path.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::write(&path2, "{\"late\":1}\n").unwrap();
+    });
+
+    let got = next_line(&mut stream, Duration::from_millis(2000)).await;
+    assert_eq!(got.as_deref(), Some(r#"{"late":1}"#));
+}
+
+/// A writer that appends between the tail's stat and its read: the read
+/// takes the new bytes too, so the offset must move past them, not to
+/// the length it stat'd, or the next poll delivers them a second time.
+#[tokio::test]
+async fn a_line_appended_between_the_stat_and_the_read_is_delivered_once() {
+    use std::io::Write;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("race.jsonl");
+    std::fs::write(&path, "a\n").unwrap();
+    let stale = std::fs::metadata(&path).unwrap().len();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"b\n")
+        .unwrap();
+    let mut tail = super::TailState {
+        path: path.clone(),
+        offset: 0,
+        partial: Vec::new(),
+        pending: VecDeque::new(),
+    };
+    tail.read_new(stale).await;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"c\n")
+        .unwrap();
+    tail.read_new(std::fs::metadata(&path).unwrap().len()).await;
+    assert_eq!(
+        Vec::from(tail.pending),
+        ["a", "b", "c"],
+        "every line once, in order"
+    );
+}
+
+/// The same promise under a real writer: lines appended steadily through
+/// several of the tail's polls, so appends land between a poll's stat and
+/// its read, arrive exactly once each.
+#[tokio::test]
+async fn the_tail_delivers_each_line_once_under_concurrent_appends() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("busy.jsonl");
+    std::fs::File::create(&path).unwrap();
+    let stream = tail_lines(path.clone(), 0);
+    tokio::pin!(stream);
+    let writer_path = path.clone();
+    let writer = std::thread::spawn(move || {
         use std::io::Write;
-        writeln!(file, "{{\"new\":1}}").unwrap();
-        drop(file);
-
-        let got2 = next_line(&mut stream, Duration::from_millis(1500)).await;
-        assert_eq!(got2.as_deref(), Some(r#"{"new":1}"#));
-    }
-
-    #[tokio::test]
-    async fn tail_stream_handles_missing_file_gracefully() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("not-yet.jsonl");
-        assert!(!path.exists());
-
-        let stream = tail_lines(path.clone(), 0);
-        tokio::pin!(stream);
-
-        // Create the file with content after the stream starts polling.
-        let path2 = path.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            std::fs::write(&path2, "{\"late\":1}\n").unwrap();
-        });
-
-        let got = next_line(&mut stream, Duration::from_millis(2000)).await;
-        assert_eq!(got.as_deref(), Some(r#"{"late":1}"#));
-    }
-
-    /// A writer that appends between the tail's stat and its read: the read
-    /// takes the new bytes too, so the offset must move past them, not to
-    /// the length it stat'd, or the next poll delivers them a second time.
-    #[tokio::test]
-    async fn a_line_appended_between_the_stat_and_the_read_is_delivered_once() {
-        use std::io::Write;
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("race.jsonl");
-        std::fs::write(&path, "a\n").unwrap();
-        let stale = std::fs::metadata(&path).unwrap().len();
-        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"b\n").unwrap();
-        let mut tail = super::TailState { path: path.clone(), offset: 0, partial: Vec::new(), pending: VecDeque::new() };
-        tail.read_new(stale).await;
-        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"c\n").unwrap();
-        tail.read_new(std::fs::metadata(&path).unwrap().len()).await;
-        assert_eq!(Vec::from(tail.pending), ["a", "b", "c"], "every line once, in order");
-    }
-
-    /// The same promise under a real writer: lines appended steadily through
-    /// several of the tail's polls, so appends land between a poll's stat and
-    /// its read, arrive exactly once each.
-    #[tokio::test]
-    async fn the_tail_delivers_each_line_once_under_concurrent_appends() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("busy.jsonl");
-        std::fs::File::create(&path).unwrap();
-        let stream = tail_lines(path.clone(), 0);
-        tokio::pin!(stream);
-        let writer_path = path.clone();
-        let writer = std::thread::spawn(move || {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(&writer_path).unwrap();
-            let started = std::time::Instant::now();
-            let mut n = 0usize;
-            while started.elapsed() < Duration::from_millis(1200) {
-                writeln!(f, "{{\"n\":{n},\"pad\":\"{}\"}}", "x".repeat(64)).unwrap();
-                n += 1;
-                if n.is_multiple_of(4) {
-                    std::thread::sleep(Duration::from_micros(200));
-                }
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&writer_path)
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut n = 0usize;
+        while started.elapsed() < Duration::from_millis(1200) {
+            writeln!(f, "{{\"n\":{n},\"pad\":\"{}\"}}", "x".repeat(64)).unwrap();
+            n += 1;
+            if n.is_multiple_of(4) {
+                std::thread::sleep(Duration::from_micros(200));
             }
-            n
-        });
-        let mut got = Vec::new();
-        while !writer.is_finished() {
-            match next_line(&mut stream, Duration::from_secs(3)).await {
-                Some(line) => got.push(line),
+        }
+        n
+    });
+    let mut got = Vec::new();
+    while !writer.is_finished() {
+        match next_line(&mut stream, Duration::from_secs(3)).await {
+            Some(line) => got.push(line),
+            None => break,
+        }
+    }
+    let n = writer.join().unwrap();
+    while got.len() < n {
+        match next_line(&mut stream, Duration::from_secs(3)).await {
+            Some(line) => got.push(line),
+            None => break,
+        }
+    }
+    // Anything delivered twice would arrive after the n-th line.
+    let extra = next_line(&mut stream, Duration::from_millis(800)).await;
+    assert_eq!(
+        extra,
+        None,
+        "a line was delivered twice ({} of {n} read first)",
+        got.len()
+    );
+    let want: Vec<String> = (0..n)
+        .map(|i| format!("{{\"n\":{i},\"pad\":\"{}\"}}", "x".repeat(64)))
+        .collect();
+    assert_eq!(got.len(), n, "every line once");
+    assert!(got == want, "every line once, in order");
+}
+
+/// A multi-byte character split across two reads is decoded whole.
+#[tokio::test]
+async fn a_character_split_across_two_reads_is_kept_whole() {
+    use std::io::Write;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("utf8.jsonl");
+    let line = "{\"s\":\"caf\u{e9}\"}\n".as_bytes().to_vec();
+    let cut = line.len() - 4; // between the two bytes of the e-acute
+    std::fs::write(&path, &line[..cut]).unwrap();
+    let mut tail = super::TailState {
+        path: path.clone(),
+        offset: 0,
+        partial: Vec::new(),
+        pending: VecDeque::new(),
+    };
+    tail.read_new(std::fs::metadata(&path).unwrap().len()).await;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&line[cut..])
+        .unwrap();
+    tail.read_new(std::fs::metadata(&path).unwrap().len()).await;
+    assert_eq!(Vec::from(tail.pending), ["{\"s\":\"caf\u{e9}\"}"]);
+}
+
+#[tokio::test]
+async fn tail_stream_emits_multiple_lines_from_single_append() {
+    // Regression: ensure pending VecDeque drains across multiple
+    // unfold iterations — three lines in one write should produce
+    // three sequential events.
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("test.jsonl");
+    std::fs::File::create(&path).unwrap();
+
+    let stream = tail_lines(path.clone(), 0);
+    tokio::pin!(stream);
+
+    std::fs::write(&path, "a\nb\nc\n").unwrap();
+
+    assert_eq!(
+        next_line(&mut stream, Duration::from_millis(1500))
+            .await
+            .as_deref(),
+        Some("a")
+    );
+    assert_eq!(
+        next_line(&mut stream, Duration::from_millis(1500))
+            .await
+            .as_deref(),
+        Some("b")
+    );
+    assert_eq!(
+        next_line(&mut stream, Duration::from_millis(1500))
+            .await
+            .as_deref(),
+        Some("c")
+    );
+}
+
+#[tokio::test]
+async fn stream_returns_400_for_malformed_date() {
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/flow/not-a-date/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// The is_addr_reachable / nudge probe tests moved with the helpers to
+// `darkmux_flow::daemon_probe` (#463 cycle-break).
+
+fn sample_addr() -> std::net::SocketAddr {
+    "127.0.0.1:8765".parse().expect("addr parses")
+}
+
+#[test]
+fn startup_banner_contains_core_info() {
+    let flows = PathBuf::from("/tmp/darkmux-flows-banner-test");
+    let missions = PathBuf::from("/tmp/darkmux-missions-banner-test");
+    let phases = PathBuf::from("/tmp/darkmux-phases-banner-test");
+    let lines = build_startup_banner(
+        &sample_addr(),
+        &flows,
+        true,
+        &missions,
+        true,
+        &phases,
+        true,
+        3,
+        9,
+        None,
+    );
+
+    // Title carries the binary version that operators bump via cargo install.
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("darkmux serve · v"),
+        "title line present: {joined}"
+    );
+    assert!(joined.contains("viewer:"), "viewer line present");
+    assert!(
+        joined.contains("http://127.0.0.1:8765/"),
+        "viewer shows the addr with trailing slash"
+    );
+    assert!(joined.contains("flow schema:"), "schema line present");
+    assert!(
+        joined.contains(darkmux_flow::FLOW_SCHEMA_VERSION),
+        "schema version shown"
+    );
+    assert!(
+        joined.contains("/tmp/darkmux-flows-banner-test"),
+        "flows dir shown"
+    );
+    assert!(
+        joined.contains("missions:       3 loaded"),
+        "mission count rendered"
+    );
+    assert!(
+        joined.contains("phases:        9 loaded"),
+        "phase count rendered"
+    );
+    assert!(joined.contains("ready"), "ready line present");
+    assert!(joined.contains("Ctrl-C"), "Ctrl-C hint present");
+}
+
+#[test]
+fn startup_banner_warns_on_missing_flows_dir() {
+    let flows = PathBuf::from("/tmp/darkmux-banner-missing-flows");
+    let missions = PathBuf::from("/tmp/darkmux-banner-present-missions");
+    let phases = PathBuf::from("/tmp/darkmux-banner-present-phases");
+    let lines = build_startup_banner(
+        &sample_addr(),
+        &flows,
+        false,
+        &missions,
+        true,
+        &phases,
+        true,
+        0,
+        0,
+        None,
+    );
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("flows dir doesn't exist yet"),
+        "expected flows-dir warning; got: {joined}"
+    );
+    assert!(
+        !joined.contains("missions dir not found"),
+        "should not warn about missions when missions dir exists"
+    );
+    assert!(
+        !joined.contains("phases dir not found"),
+        "should not warn about phases when phases dir exists"
+    );
+}
+
+#[test]
+fn startup_banner_warns_on_missing_missions_dir() {
+    let flows = PathBuf::from("/tmp/darkmux-banner-present-flows");
+    let missions = PathBuf::from("/tmp/darkmux-banner-missing-missions");
+    let phases = PathBuf::from("/tmp/darkmux-banner-present-phases");
+    let lines = build_startup_banner(
+        &sample_addr(),
+        &flows,
+        true,
+        &missions,
+        false,
+        &phases,
+        true,
+        0,
+        0,
+        None,
+    );
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("missions dir not found"),
+        "expected missions warning; got: {joined}"
+    );
+    assert!(
+        joined.contains("/tmp/darkmux-banner-missing-missions"),
+        "missions warning should include the path"
+    );
+    assert!(
+        !joined.contains("phases dir not found"),
+        "should not warn about phases when phases dir exists"
+    );
+}
+
+#[test]
+fn startup_banner_warns_on_missing_phases_dir() {
+    let flows = PathBuf::from("/tmp/darkmux-banner-present-flows");
+    let missions = PathBuf::from("/tmp/darkmux-banner-present-missions");
+    let phases = PathBuf::from("/tmp/darkmux-banner-missing-phases");
+    let lines = build_startup_banner(
+        &sample_addr(),
+        &flows,
+        true,
+        &missions,
+        true,
+        &phases,
+        false,
+        0,
+        0,
+        None,
+    );
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("phases dir not found"),
+        "expected phases warning; got: {joined}"
+    );
+    assert!(
+        joined.contains("/tmp/darkmux-banner-missing-phases"),
+        "phases warning should include the path"
+    );
+}
+
+#[test]
+fn startup_banner_no_warnings_when_state_is_clean() {
+    let flows = PathBuf::from("/some/flows");
+    let missions = PathBuf::from("/some/missions");
+    let phases = PathBuf::from("/some/phases");
+    let lines = build_startup_banner(
+        &sample_addr(),
+        &flows,
+        true,
+        &missions,
+        true,
+        &phases,
+        true,
+        1,
+        4,
+        None,
+    );
+    let joined = lines.join("\n");
+    assert!(!joined.contains("doesn't exist yet"), "no flows warning");
+    assert!(
+        !joined.contains("missions dir not found"),
+        "no missions warning"
+    );
+    assert!(
+        !joined.contains("phases dir not found"),
+        "no phases warning"
+    );
+}
+
+/// (#1247 Part 3) The banner names whichever lab-dir state is true —
+/// configured (shows the path) or unconfigured (shows the enable hint) —
+/// so the operator never has to wonder why the lab lens is empty.
+#[test]
+fn startup_banner_reports_lab_dir_state() {
+    let flows = PathBuf::from("/some/flows");
+    let missions = PathBuf::from("/some/missions");
+    let phases = PathBuf::from("/some/phases");
+    let unconfigured = build_startup_banner(
+        &sample_addr(),
+        &flows,
+        true,
+        &missions,
+        true,
+        &phases,
+        true,
+        0,
+        0,
+        None,
+    )
+    .join("\n");
+    assert!(
+        unconfigured.contains("lab dir:") && unconfigured.contains("--lab-dir"),
+        "expected the enable hint when unconfigured: {unconfigured}"
+    );
+
+    let lab = PathBuf::from("/some/lab-runs");
+    let configured = build_startup_banner(
+        &sample_addr(),
+        &flows,
+        true,
+        &missions,
+        true,
+        &phases,
+        true,
+        0,
+        0,
+        Some(&lab),
+    )
+    .join("\n");
+    assert!(
+        configured.contains("/some/lab-runs"),
+        "expected the configured lab dir path: {configured}"
+    );
+}
+
+// ─── #270 Redis aggregation tests ─────────────────────────────────
+//
+// Verify `GET /flow/<date>` (no `.jsonl`) returns a JSON array,
+// aggregating from Redis when `DARKMUX_REDIS_URL` is set + reachable
+// and falling back to the local file otherwise. POSIX-only because
+// the tests spawn a real `redis-server`. Tagged `#[serial]` because
+// they mutate `DARKMUX_REDIS_URL`.
+
+#[cfg(unix)]
+mod redis_aggregation {
+    use super::*;
+    use serial_test::serial;
+    use std::process::{Child, Command, Stdio};
+
+    use darkmux_flow::test_redis::REDIS_READY_TIMEOUT;
+
+    fn redis_server_available() -> bool {
+        let ok = Command::new("redis-server")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        // A job that opted in must never silently skip (#1662): a test that
+        // cannot run is a probe that passes without executing.
+        assert!(
+            ok || std::env::var("DARKMUX_E2E_REQUIRED").is_err(),
+            "redis-server is not on PATH, but DARKMUX_E2E_REQUIRED is set"
+        );
+        ok
+    }
+
+    struct RedisFixture {
+        child: Child,
+        url: String,
+    }
+
+    impl Drop for RedisFixture {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn spawn_redis() -> RedisFixture {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        // clippy's zombie-processes lint can't see through the
+        // `Drop` impl below that kill+waits the child. Suppress at
+        // the spawn site; the Drop guarantees no leaks.
+        #[allow(clippy::zombie_processes)]
+        let child = Command::new("redis-server")
+            .args([
+                "--port",
+                &port.to_string(),
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+                "--bind",
+                "127.0.0.1",
+                "--protected-mode",
+                "no",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("redis-server spawn");
+
+        // The fixture owns the child before the wait, so a failed wait
+        // still kills it on unwind. The wait is bounded and says why it
+        // failed: a `get_connection` poll could block forever on a port
+        // another process took (redis-rs reads with no timeout).
+        let mut fixture = RedisFixture {
+            child,
+            url: format!("redis://127.0.0.1:{port}"),
+        };
+        if let Err(why) = darkmux_flow::test_redis::wait_until_redis_answers(
+            &mut fixture.child,
+            port,
+            REDIS_READY_TIMEOUT,
+        ) {
+            panic!("{why}");
+        }
+        fixture
+    }
+
+    fn xadd_flow_record(url: &str, record_json: &str) {
+        let client = redis::Client::open(url).expect("redis client");
+        let mut conn = client.get_connection().expect("conn");
+        let _: String = redis::cmd("XADD")
+            .arg("darkmux:flow")
+            .arg("*")
+            .arg("schema")
+            .arg("1.8.0")
+            .arg("record")
+            .arg(record_json)
+            .query(&mut conn)
+            .expect("XADD");
+    }
+
+    fn today_utc_date() -> String {
+        darkmux_flow::day_utc_now()
+    }
+
+    const WORK_STREAM: &str = "darkmux:flow";
+    const TELEMETRY_STREAM: &str = "darkmux:flow:telemetry";
+
+    fn xlen(url: &str, stream: &str) -> u64 {
+        let client = redis::Client::open(url).expect("redis client");
+        let mut conn = client.get_connection().expect("conn");
+        redis::cmd("XLEN")
+            .arg(stream)
+            .query(&mut conn)
+            .expect("XLEN")
+    }
+
+    /// A sink writing through the production path (`RedisSink`), the two
+    /// streams capped at 100 entries each.
+    fn capped_sink(url: &str) -> darkmux_flow::RedisSink {
+        darkmux_flow::RedisSink::new(url, WORK_STREAM, Some(100))
+            .unwrap()
+            .with_telemetry(TELEMETRY_STREAM, Some(100))
+    }
+
+    fn flow_record(
+        action: darkmux_flow::FlowAction,
+        handle: &str,
+        execution: Option<&darkmux_types::execution_id::ExecutionId>,
+    ) -> darkmux_flow::FlowRecord {
+        use darkmux_types::session_id::{RunId, SessionId};
+        let session = SessionId::adhoc(
+            RunId::mission("telemetry-split").unwrap(),
+            "coder",
+            "sess-2101",
+        );
+        let mut r = darkmux_flow::FlowRecord::for_session(
+            &session,
+            darkmux_flow::Level::Info,
+            darkmux_flow::Category::Work,
+            darkmux_flow::Stage::Dispatch,
+            action,
+            handle,
+        );
+        r.execution_id = execution.cloned();
+        r
+    }
+
+    /// (#2101) THE regression: machine samples are most of the hub's
+    /// records by volume, and on one capped stream they flushed a relayed
+    /// run's usage out of the hub within two days. A flood of samples
+    /// must trim only the telemetry stream, and the day read must still
+    /// hand back the usage record, merged in hub order with the samples.
+    #[test]
+    #[serial]
+    fn a_telemetry_flood_does_not_evict_a_usage_record() {
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        use darkmux_flow::FlowSinkWrite as _;
+        let redis = spawn_redis();
+        let sink = capped_sink(&redis.url);
+        let execution = darkmux_types::execution_id::ExecutionId::mint();
+
+        sink.write(&flow_record(
+            darkmux_flow::FlowAction::TelemetryTokens,
+            "usage-first",
+            Some(&execution),
+        ))
+        .unwrap();
+        for i in 0..1_000 {
+            sink.write(&flow_record(
+                darkmux_flow::FlowAction::MachineTelemetry,
+                &format!("sample-{i}"),
+                None,
+            ))
+            .unwrap();
+        }
+
+        assert_eq!(
+            xlen(&redis.url, WORK_STREAM),
+            1,
+            "the usage record stays on the work stream"
+        );
+        let sampled = xlen(&redis.url, TELEMETRY_STREAM);
+        assert!(
+            sampled < 1_000,
+            "the telemetry stream must be the one that is trimmed, holds {sampled}"
+        );
+
+        let read =
+            super::read_flow_records_from_redis(&redis.url, None, super::FleetScope::WithSamples)
+                .unwrap();
+        let actions: Vec<&str> = read
+            .records
+            .iter()
+            .filter_map(|r| r["action"].as_str())
+            .collect();
+        assert_eq!(
+            actions.first(),
+            Some(&"telemetry.tokens"),
+            "the usage record is read, first in hub order"
+        );
+        // The run and mission listings read the work stream alone: samples
+        // double the parse cost of every cache refresh and they use none.
+        let listing =
+            super::read_flow_records_from_redis(&redis.url, None, super::FleetScope::Work).unwrap();
+        assert!(
+            listing
+                .records
+                .iter()
+                .all(|r| r["action"] != "machine.telemetry"),
+            "a work-scope read must not pull the telemetry stream"
+        );
+        assert_eq!(listing.records.len(), 1);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| **a == "machine.telemetry")
+                .count() as u64,
+            sampled,
+            "every sample the telemetry stream still holds is read back too"
+        );
+    }
+
+    /// (#2101) The live tail follows BOTH hub streams: the machine samples
+    /// that feed the fleet's live readings arrive beside the work records.
+    #[tokio::test]
+    #[serial]
+    async fn the_live_tail_carries_work_records_and_machine_samples() {
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        use darkmux_flow::FlowSinkWrite as _;
+        let redis = spawn_redis();
+        let today = today_utc_date();
+        let stream = redis_tail_lines(
+            redis.url.clone(),
+            vec![WORK_STREAM.to_string(), TELEMETRY_STREAM.to_string()],
+            today,
+        );
+        tokio::pin!(stream);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let sink = capped_sink(&redis.url);
+        sink.write(&flow_record(
+            darkmux_flow::FlowAction::OperatorNote,
+            "work-note",
+            None,
+        ))
+        .unwrap();
+        sink.write(&flow_record(
+            darkmux_flow::FlowAction::MachineTelemetry,
+            "sample",
+            None,
+        ))
+        .unwrap();
+
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            match next_line(&mut stream, Duration::from_millis(3000)).await {
+                Some(line) => seen.push(line),
                 None => break,
             }
         }
-        let n = writer.join().unwrap();
-        while got.len() < n {
-            match next_line(&mut stream, Duration::from_secs(3)).await {
-                Some(line) => got.push(line),
-                None => break,
-            }
+        assert!(
+            seen.iter().any(|l| l.contains("work-note")),
+            "work record missing from the tail: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|l| l.contains("machine.telemetry")),
+            "machine sample missing from the tail: {seen:?}"
+        );
+    }
+
+    async fn body_as_array(response: axum::response::Response) -> Vec<serde_json::Value> {
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("body parses as JSON");
+        body["records"]
+            .as_array()
+            .expect("the envelope's records array")
+            .clone()
+    }
+
+    /// New behavior: GET /flow/<date> (no `.jsonl`) returns a JSON
+    /// array sourced from Redis when DARKMUX_REDIS_URL is reachable.
+    /// Records from other dates are filtered out.
+    #[tokio::test]
+    #[serial]
+    async fn flow_endpoint_reads_from_redis_when_url_set() {
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
         }
-        // Anything delivered twice would arrive after the n-th line.
-        let extra = next_line(&mut stream, Duration::from_millis(800)).await;
-        assert_eq!(extra, None, "a line was delivered twice ({} of {n} read first)", got.len());
-        let want: Vec<String> = (0..n).map(|i| format!("{{\"n\":{i},\"pad\":\"{}\"}}", "x".repeat(64))).collect();
-        assert_eq!(got.len(), n, "every line once");
-        assert!(got == want, "every line once, in order");
-    }
+        let redis = spawn_redis();
+        let today = today_utc_date();
 
-    /// A multi-byte character split across two reads is decoded whole.
-    #[tokio::test]
-    async fn a_character_split_across_two_reads_is_kept_whole() {
-        use std::io::Write;
+        let today_record =
+            format!(r#"{{"ts":"{today}T12:00:00Z","action":"redis-today","machine_id":"laptop"}}"#);
+        let other_record =
+            r#"{"ts":"2020-01-01T12:00:00Z","action":"redis-other","machine_id":"laptop"}"#;
+        xadd_flow_record(&redis.url, &today_record);
+        xadd_flow_record(&redis.url, other_record);
+
+        // SAFETY: serial-tagged test owns the env mutation window.
+        unsafe {
+            std::env::set_var("DARKMUX_REDIS_URL", &redis.url);
+        }
+
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("utf8.jsonl");
-        let line = "{\"s\":\"caf\u{e9}\"}\n".as_bytes().to_vec();
-        let cut = line.len() - 4; // between the two bytes of the e-acute
-        std::fs::write(&path, &line[..cut]).unwrap();
-        let mut tail = super::TailState { path: path.clone(), offset: 0, partial: Vec::new(), pending: VecDeque::new() };
-        tail.read_new(std::fs::metadata(&path).unwrap().len()).await;
-        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&line[cut..]).unwrap();
-        tail.read_new(std::fs::metadata(&path).unwrap().len()).await;
-        assert_eq!(Vec::from(tail.pending), ["{\"s\":\"caf\u{e9}\"}"]);
-    }
-
-    #[tokio::test]
-    async fn tail_stream_emits_multiple_lines_from_single_append() {
-        // Regression: ensure pending VecDeque drains across multiple
-        // unfold iterations — three lines in one write should produce
-        // three sequential events.
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("test.jsonl");
-        std::fs::File::create(&path).unwrap();
-
-        let stream = tail_lines(path.clone(), 0);
-        tokio::pin!(stream);
-
-        std::fs::write(&path, "a\nb\nc\n").unwrap();
-
-        assert_eq!(
-            next_line(&mut stream, Duration::from_millis(1500)).await.as_deref(),
-            Some("a")
-        );
-        assert_eq!(
-            next_line(&mut stream, Duration::from_millis(1500)).await.as_deref(),
-            Some("b")
-        );
-        assert_eq!(
-            next_line(&mut stream, Duration::from_millis(1500)).await.as_deref(),
-            Some("c")
-        );
-    }
-
-    #[tokio::test]
-    async fn stream_returns_400_for_malformed_date() {
-        let app = build_router_local(PathBuf::new());
+        let app = build_router_local(tmp.path().to_path_buf());
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/flow/not-a-date/stream")
+                    .uri(format!("/flow/{today}"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+        }
+
+        assert_eq!(response.status(), StatusCode::OK, "expected 200");
+        let arr = body_as_array(response).await;
+        assert!(
+            arr.iter()
+                .any(|r| r.get("action").and_then(|v| v.as_str()) == Some("redis-today")),
+            "expected `redis-today` record in response: {arr:?}"
+        );
+        assert!(
+            arr.iter()
+                .all(|r| r.get("action").and_then(|v| v.as_str()) != Some("redis-other")),
+            "expected `redis-other` (other date) filtered out: {arr:?}"
+        );
     }
 
-    // The is_addr_reachable / nudge probe tests moved with the helpers to
-    // `darkmux_flow::daemon_probe` (#463 cycle-break).
-
-    fn sample_addr() -> std::net::SocketAddr {
-        "127.0.0.1:8765".parse().expect("addr parses")
-    }
-
+    /// (#1570) `REDIS_RESPONSE_TIMEOUT` bounds a peer that answers the
+    /// handshake but then stops answering COMMANDS — the pathology the hub
+    /// exhibited on 2026-07-29 (measured: `/flow/:date` 30s+408 -> 1.4s+200).
+    ///
+    /// SCOPE, stated honestly: this does NOT cover a total black hole that
+    /// accepts TCP and answers nothing at all, including the handshake.
+    /// There the block lands inside `get_connection_with_timeout` — before
+    /// `bound_redis_response` can run — so the socket deadline is never
+    /// applied. Verified the hard way: an earlier version of this test used
+    /// a black-hole listener and hung past 60s WITH the fix in place.
+    /// Widening to cover that is tracked separately; do not read this fix
+    /// as bounding every unreachable-Redis shape.
+    ///
+    /// The bound here is a WALL CLOCK the test enforces itself: the call
+    /// runs on its own thread and the test fails on deadline rather than
+    /// hanging. No test may ever wedge the suite — two did today.
     #[test]
-    fn startup_banner_contains_core_info() {
-        let flows = PathBuf::from("/tmp/darkmux-flows-banner-test");
-        let missions = PathBuf::from("/tmp/darkmux-missions-banner-test");
-        let phases = PathBuf::from("/tmp/darkmux-phases-banner-test");
-        let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &phases, true, 3, 9, None,
-        );
-
-        // Title carries the binary version that operators bump via cargo install.
-        let joined = lines.join("\n");
-        assert!(joined.contains("darkmux serve · v"), "title line present: {joined}");
-        assert!(joined.contains("viewer:"), "viewer line present");
-        assert!(
-            joined.contains("http://127.0.0.1:8765/"),
-            "viewer shows the addr with trailing slash"
-        );
-        assert!(joined.contains("flow schema:"), "schema line present");
-        assert!(joined.contains(darkmux_flow::FLOW_SCHEMA_VERSION), "schema version shown");
-        assert!(joined.contains("/tmp/darkmux-flows-banner-test"), "flows dir shown");
-        assert!(joined.contains("missions:       3 loaded"), "mission count rendered");
-        assert!(joined.contains("phases:        9 loaded"), "phase count rendered");
-        assert!(joined.contains("ready"), "ready line present");
-        assert!(joined.contains("Ctrl-C"), "Ctrl-C hint present");
-    }
-
-    #[test]
-    fn startup_banner_warns_on_missing_flows_dir() {
-        let flows = PathBuf::from("/tmp/darkmux-banner-missing-flows");
-        let missions = PathBuf::from("/tmp/darkmux-banner-present-missions");
-        let phases = PathBuf::from("/tmp/darkmux-banner-present-phases");
-        let lines = build_startup_banner(
-            &sample_addr(), &flows, false, &missions, true, &phases, true, 0, 0, None,
-        );
-        let joined = lines.join("\n");
-        assert!(
-            joined.contains("flows dir doesn't exist yet"),
-            "expected flows-dir warning; got: {joined}"
-        );
-        assert!(
-            !joined.contains("missions dir not found"),
-            "should not warn about missions when missions dir exists"
-        );
-        assert!(
-            !joined.contains("phases dir not found"),
-            "should not warn about phases when phases dir exists"
-        );
-    }
-
-    #[test]
-    fn startup_banner_warns_on_missing_missions_dir() {
-        let flows = PathBuf::from("/tmp/darkmux-banner-present-flows");
-        let missions = PathBuf::from("/tmp/darkmux-banner-missing-missions");
-        let phases = PathBuf::from("/tmp/darkmux-banner-present-phases");
-        let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, false, &phases, true, 0, 0, None,
-        );
-        let joined = lines.join("\n");
-        assert!(
-            joined.contains("missions dir not found"),
-            "expected missions warning; got: {joined}"
-        );
-        assert!(
-            joined.contains("/tmp/darkmux-banner-missing-missions"),
-            "missions warning should include the path"
-        );
-        assert!(
-            !joined.contains("phases dir not found"),
-            "should not warn about phases when phases dir exists"
-        );
-    }
-
-    #[test]
-    fn startup_banner_warns_on_missing_phases_dir() {
-        let flows = PathBuf::from("/tmp/darkmux-banner-present-flows");
-        let missions = PathBuf::from("/tmp/darkmux-banner-present-missions");
-        let phases = PathBuf::from("/tmp/darkmux-banner-missing-phases");
-        let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &phases, false, 0, 0, None,
-        );
-        let joined = lines.join("\n");
-        assert!(
-            joined.contains("phases dir not found"),
-            "expected phases warning; got: {joined}"
-        );
-        assert!(
-            joined.contains("/tmp/darkmux-banner-missing-phases"),
-            "phases warning should include the path"
-        );
-    }
-
-    #[test]
-    fn startup_banner_no_warnings_when_state_is_clean() {
-        let flows = PathBuf::from("/some/flows");
-        let missions = PathBuf::from("/some/missions");
-        let phases = PathBuf::from("/some/phases");
-        let lines = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &phases, true, 1, 4, None,
-        );
-        let joined = lines.join("\n");
-        assert!(!joined.contains("doesn't exist yet"), "no flows warning");
-        assert!(!joined.contains("missions dir not found"), "no missions warning");
-        assert!(!joined.contains("phases dir not found"), "no phases warning");
-    }
-
-    /// (#1247 Part 3) The banner names whichever lab-dir state is true —
-    /// configured (shows the path) or unconfigured (shows the enable hint) —
-    /// so the operator never has to wonder why the lab lens is empty.
-    #[test]
-    fn startup_banner_reports_lab_dir_state() {
-        let flows = PathBuf::from("/some/flows");
-        let missions = PathBuf::from("/some/missions");
-        let phases = PathBuf::from("/some/phases");
-        let unconfigured = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &phases, true, 0, 0, None,
-        )
-        .join("\n");
-        assert!(
-            unconfigured.contains("lab dir:") && unconfigured.contains("--lab-dir"),
-            "expected the enable hint when unconfigured: {unconfigured}"
-        );
-
-        let lab = PathBuf::from("/some/lab-runs");
-        let configured = build_startup_banner(
-            &sample_addr(), &flows, true, &missions, true, &phases, true, 0, 0, Some(&lab),
-        )
-        .join("\n");
-        assert!(
-            configured.contains("/some/lab-runs"),
-            "expected the configured lab dir path: {configured}"
-        );
-    }
-
-    // ─── #270 Redis aggregation tests ─────────────────────────────────
-    //
-    // Verify `GET /flow/<date>` (no `.jsonl`) returns a JSON array,
-    // aggregating from Redis when `DARKMUX_REDIS_URL` is set + reachable
-    // and falling back to the local file otherwise. POSIX-only because
-    // the tests spawn a real `redis-server`. Tagged `#[serial]` because
-    // they mutate `DARKMUX_REDIS_URL`.
-
-    #[cfg(unix)]
-    mod redis_aggregation {
-        use super::*;
-        use serial_test::serial;
-        use std::process::{Child, Command, Stdio};
-
-        use darkmux_flow::test_redis::REDIS_READY_TIMEOUT;
-
-        fn redis_server_available() -> bool {
-            let ok = Command::new("redis-server")
-                .arg("--version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            // A job that opted in must never silently skip (#1662): a test that
-            // cannot run is a probe that passes without executing.
-            assert!(
-                ok || std::env::var("DARKMUX_E2E_REQUIRED").is_err(),
-                "redis-server is not on PATH, but DARKMUX_E2E_REQUIRED is set"
+    fn read_flow_records_from_redis_is_deadline_bounded_not_open_ended() {
+        // Refused port: connect fails fast, the caller gets an Err, and the
+        // local-file fallback above it becomes reachable. This is the
+        // property that matters to the caller — bounded, not indefinite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let r = super::read_flow_records_from_redis(
+                "redis://127.0.0.1:1",
+                Some("2026-08-15"),
+                super::FleetScope::WithSamples,
             );
-            ok
-        }
+            let _ = tx.send((r.is_err(), started.elapsed()));
+        });
 
-        struct RedisFixture {
-            child: Child,
-            url: String,
-        }
-
-        impl Drop for RedisFixture {
-            fn drop(&mut self) {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+        match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok((is_err, elapsed)) => {
+                assert!(is_err, "an unreachable peer must yield Err, not Ok");
+                assert!(
+                    elapsed < std::time::Duration::from_secs(10),
+                    "took {elapsed:?} — the Redis attempt is not bounded"
+                );
             }
-        }
-
-        fn spawn_redis() -> RedisFixture {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0")
-                .expect("bind ephemeral port");
-            let port = listener.local_addr().unwrap().port();
-            drop(listener);
-
-            // clippy's zombie-processes lint can't see through the
-            // `Drop` impl below that kill+waits the child. Suppress at
-            // the spawn site; the Drop guarantees no leaks.
-            #[allow(clippy::zombie_processes)]
-            let child = Command::new("redis-server")
-                .args([
-                    "--port", &port.to_string(),
-                    "--save", "",
-                    "--appendonly", "no",
-                    "--bind", "127.0.0.1",
-                    "--protected-mode", "no",
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("redis-server spawn");
-
-            // The fixture owns the child before the wait, so a failed wait
-            // still kills it on unwind. The wait is bounded and says why it
-            // failed: a `get_connection` poll could block forever on a port
-            // another process took (redis-rs reads with no timeout).
-            let mut fixture = RedisFixture { child, url: format!("redis://127.0.0.1:{port}") };
-            if let Err(why) = darkmux_flow::test_redis::wait_until_redis_answers(&mut fixture.child, port, REDIS_READY_TIMEOUT) {
-                panic!("{why}");
-            }
-            fixture
-        }
-
-        fn xadd_flow_record(url: &str, record_json: &str) {
-            let client = redis::Client::open(url).expect("redis client");
-            let mut conn = client.get_connection().expect("conn");
-            let _: String = redis::cmd("XADD")
-                .arg("darkmux:flow")
-                .arg("*")
-                .arg("schema")
-                .arg("1.8.0")
-                .arg("record")
-                .arg(record_json)
-                .query(&mut conn)
-                .expect("XADD");
-        }
-
-        fn today_utc_date() -> String {
-            darkmux_flow::day_utc_now()
-        }
-
-        const WORK_STREAM: &str = "darkmux:flow";
-        const TELEMETRY_STREAM: &str = "darkmux:flow:telemetry";
-
-        fn xlen(url: &str, stream: &str) -> u64 {
-            let client = redis::Client::open(url).expect("redis client");
-            let mut conn = client.get_connection().expect("conn");
-            redis::cmd("XLEN").arg(stream).query(&mut conn).expect("XLEN")
-        }
-
-        /// A sink writing through the production path (`RedisSink`), the two
-        /// streams capped at 100 entries each.
-        fn capped_sink(url: &str) -> darkmux_flow::RedisSink {
-            darkmux_flow::RedisSink::new(url, WORK_STREAM, Some(100))
-                .unwrap()
-                .with_telemetry(TELEMETRY_STREAM, Some(100))
-        }
-
-        fn flow_record(
-            action: darkmux_flow::FlowAction,
-            handle: &str,
-            execution: Option<&darkmux_types::execution_id::ExecutionId>,
-        ) -> darkmux_flow::FlowRecord {
-            use darkmux_types::session_id::{RunId, SessionId};
-            let session = SessionId::adhoc(RunId::mission("telemetry-split").unwrap(), "coder", "sess-2101");
-            let mut r = darkmux_flow::FlowRecord::for_session(
-                &session,
-                darkmux_flow::Level::Info,
-                darkmux_flow::Category::Work,
-                darkmux_flow::Stage::Dispatch,
-                action,
-                handle,
-            );
-            r.execution_id = execution.cloned();
-            r
-        }
-
-        /// (#2101) THE regression: machine samples are most of the hub's
-        /// records by volume, and on one capped stream they flushed a relayed
-        /// run's usage out of the hub within two days. A flood of samples
-        /// must trim only the telemetry stream, and the day read must still
-        /// hand back the usage record, merged in hub order with the samples.
-        #[test]
-        #[serial]
-        fn a_telemetry_flood_does_not_evict_a_usage_record() {
-            if !redis_server_available() {
-                eprintln!("skipping: redis-server not on PATH");
-                return;
-            }
-            use darkmux_flow::FlowSinkWrite as _;
-            let redis = spawn_redis();
-            let sink = capped_sink(&redis.url);
-            let execution = darkmux_types::execution_id::ExecutionId::mint();
-
-            sink.write(&flow_record(darkmux_flow::FlowAction::TelemetryTokens, "usage-first", Some(&execution))).unwrap();
-            for i in 0..1_000 {
-                sink.write(&flow_record(darkmux_flow::FlowAction::MachineTelemetry, &format!("sample-{i}"), None)).unwrap();
-            }
-
-            assert_eq!(xlen(&redis.url, WORK_STREAM), 1, "the usage record stays on the work stream");
-            let sampled = xlen(&redis.url, TELEMETRY_STREAM);
-            assert!(sampled < 1_000, "the telemetry stream must be the one that is trimmed, holds {sampled}");
-
-            let read = super::read_flow_records_from_redis(&redis.url, None, super::FleetScope::WithSamples).unwrap();
-            let actions: Vec<&str> = read.records.iter().filter_map(|r| r["action"].as_str()).collect();
-            assert_eq!(actions.first(), Some(&"telemetry.tokens"), "the usage record is read, first in hub order");
-            // The run and mission listings read the work stream alone: samples
-            // double the parse cost of every cache refresh and they use none.
-            let listing = super::read_flow_records_from_redis(&redis.url, None, super::FleetScope::Work).unwrap();
-            assert!(
-                listing.records.iter().all(|r| r["action"] != "machine.telemetry"),
-                "a work-scope read must not pull the telemetry stream"
-            );
-            assert_eq!(listing.records.len(), 1);
-            assert_eq!(
-                actions.iter().filter(|a| **a == "machine.telemetry").count() as u64,
-                sampled,
-                "every sample the telemetry stream still holds is read back too"
-            );
-        }
-
-        /// (#2101) The live tail follows BOTH hub streams: the machine samples
-        /// that feed the fleet's live readings arrive beside the work records.
-        #[tokio::test]
-        #[serial]
-        async fn the_live_tail_carries_work_records_and_machine_samples() {
-            if !redis_server_available() {
-                eprintln!("skipping: redis-server not on PATH");
-                return;
-            }
-            use darkmux_flow::FlowSinkWrite as _;
-            let redis = spawn_redis();
-            let today = today_utc_date();
-            let stream = redis_tail_lines(
-                redis.url.clone(),
-                vec![WORK_STREAM.to_string(), TELEMETRY_STREAM.to_string()],
-                today,
-            );
-            tokio::pin!(stream);
-            tokio::time::sleep(Duration::from_millis(150)).await;
-
-            let sink = capped_sink(&redis.url);
-            sink.write(&flow_record(darkmux_flow::FlowAction::OperatorNote, "work-note", None)).unwrap();
-            sink.write(&flow_record(darkmux_flow::FlowAction::MachineTelemetry, "sample", None)).unwrap();
-
-            let mut seen = Vec::new();
-            while seen.len() < 2 {
-                match next_line(&mut stream, Duration::from_millis(3000)).await {
-                    Some(line) => seen.push(line),
-                    None => break,
-                }
-            }
-            assert!(seen.iter().any(|l| l.contains("work-note")), "work record missing from the tail: {seen:?}");
-            assert!(seen.iter().any(|l| l.contains("machine.telemetry")), "machine sample missing from the tail: {seen:?}");
-        }
-
-
-        async fn body_as_array(
-            response: axum::response::Response,
-        ) -> Vec<serde_json::Value> {
-            let bytes = to_bytes(response.into_body(), 1024 * 1024)
-                .await
-                .expect("body bytes");
-            let body: serde_json::Value = serde_json::from_slice(&bytes)
-                .expect("body parses as JSON");
-            body["records"].as_array().expect("the envelope's records array").clone()
-        }
-
-        /// New behavior: GET /flow/<date> (no `.jsonl`) returns a JSON
-        /// array sourced from Redis when DARKMUX_REDIS_URL is reachable.
-        /// Records from other dates are filtered out.
-        #[tokio::test]
-        #[serial]
-        async fn flow_endpoint_reads_from_redis_when_url_set() {
-            if !redis_server_available() {
-                eprintln!("skipping: redis-server not on PATH");
-                return;
-            }
-            let redis = spawn_redis();
-            let today = today_utc_date();
-
-            let today_record = format!(
-                r#"{{"ts":"{today}T12:00:00Z","action":"redis-today","machine_id":"laptop"}}"#
-            );
-            let other_record = r#"{"ts":"2020-01-01T12:00:00Z","action":"redis-other","machine_id":"laptop"}"#;
-            xadd_flow_record(&redis.url, &today_record);
-            xadd_flow_record(&redis.url, other_record);
-
-            // SAFETY: serial-tagged test owns the env mutation window.
-            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url); }
-
-            let tmp = TempDir::new().unwrap();
-            let app = build_router_local(tmp.path().to_path_buf());
-            let response = app
-                .oneshot(
-                    Request::builder()
-                        .uri(format!("/flow/{today}"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-
-            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
-
-            assert_eq!(response.status(), StatusCode::OK, "expected 200");
-            let arr = body_as_array(response).await;
-            assert!(
-                arr.iter().any(|r| r.get("action").and_then(|v| v.as_str()) == Some("redis-today")),
-                "expected `redis-today` record in response: {arr:?}"
-            );
-            assert!(
-                arr.iter().all(|r| r.get("action").and_then(|v| v.as_str()) != Some("redis-other")),
-                "expected `redis-other` (other date) filtered out: {arr:?}"
-            );
-        }
-
-        /// (#1570) `REDIS_RESPONSE_TIMEOUT` bounds a peer that answers the
-        /// handshake but then stops answering COMMANDS — the pathology the hub
-        /// exhibited on 2026-07-29 (measured: `/flow/:date` 30s+408 -> 1.4s+200).
-        ///
-        /// SCOPE, stated honestly: this does NOT cover a total black hole that
-        /// accepts TCP and answers nothing at all, including the handshake.
-        /// There the block lands inside `get_connection_with_timeout` — before
-        /// `bound_redis_response` can run — so the socket deadline is never
-        /// applied. Verified the hard way: an earlier version of this test used
-        /// a black-hole listener and hung past 60s WITH the fix in place.
-        /// Widening to cover that is tracked separately; do not read this fix
-        /// as bounding every unreachable-Redis shape.
-        ///
-        /// The bound here is a WALL CLOCK the test enforces itself: the call
-        /// runs on its own thread and the test fails on deadline rather than
-        /// hanging. No test may ever wedge the suite — two did today.
-        #[test]
-        fn read_flow_records_from_redis_is_deadline_bounded_not_open_ended() {
-            // Refused port: connect fails fast, the caller gets an Err, and the
-            // local-file fallback above it becomes reachable. This is the
-            // property that matters to the caller — bounded, not indefinite.
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let started = std::time::Instant::now();
-                let r = super::read_flow_records_from_redis("redis://127.0.0.1:1", Some("2026-08-15"), super::FleetScope::WithSamples);
-                let _ = tx.send((r.is_err(), started.elapsed()));
-            });
-
-            match rx.recv_timeout(std::time::Duration::from_secs(15)) {
-                Ok((is_err, elapsed)) => {
-                    assert!(is_err, "an unreachable peer must yield Err, not Ok");
-                    assert!(
-                        elapsed < std::time::Duration::from_secs(10),
-                        "took {elapsed:?} — the Redis attempt is not bounded"
-                    );
-                }
-                Err(_) => panic!(
-                    "read_flow_records_from_redis did not return within 15s — it is \
+            Err(_) => panic!(
+                "read_flow_records_from_redis did not return within 15s — it is \
                      blocking indefinitely, which is exactly the wedge #1570 exists \
                      to prevent"
-                ),
-            }
+            ),
+        }
+    }
+
+    /// (#1570) Redis must UNION with the local file, never replace it.
+    ///
+    /// The erase-on-recovery half of the bug: Redis is fleet-merged but is
+    /// NOT a superset — it rides a MAXLEN cap and, critically, is missing
+    /// everything written while it was unreachable. Preferring it wholesale
+    /// erased the outage window from the view the moment Redis returned.
+    ///
+    /// Measured live 2026-07-29 after a peer woke from an unplanned sleep:
+    /// `/flow/<today>` served 4 records against 4 on disk, with 2 present
+    /// only locally — including the `machine.online` record emitted DURING
+    /// the outage. The store was intact; only the read path lost it.
+    #[test]
+    fn union_output_is_chronological_when_local_only_records_predate_redis() {
+        // (#2410 follow-up, measured live 2026-09-06) With Redis on, the
+        // route returned Redis's newest-10k FIRST and appended the 236
+        // local-only bookends the ring had pinned — so a 00:08 `dispatch
+        // start` sat at index 10000 behind 16:21 telemetry. The set was
+        // right; the order broke the "chronological" promise the route
+        // documents. The union sorts by `ts` (stable, so same-instant
+        // records keep write order).
+        let rec = |ts: &str, action: &str| serde_json::json!({ "ts": ts, "action": action, "handle": "h" });
+        let redis = vec![
+            rec("2026-09-05T13:49:59Z", "machine.telemetry"),
+            rec("2026-09-05T16:21:49Z", "machine.telemetry"),
+        ];
+        let local = vec![
+            rec("2026-09-05T00:08:17Z", "dispatch.start"),
+            rec("2026-09-05T13:01:32Z", "dispatch.start"),
+        ];
+        let out = super::union_flow_records(redis, local);
+        let ts: Vec<&str> = out
+            .iter()
+            .filter_map(|r| r.get("ts").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            ts,
+            vec![
+                "2026-09-05T00:08:17Z",
+                "2026-09-05T13:01:32Z",
+                "2026-09-05T13:49:59Z",
+                "2026-09-05T16:21:49Z"
+            ],
+            "the union must be chronological, not redis-then-local"
+        );
+    }
+
+    #[test]
+    fn redis_records_union_with_local_rather_than_replacing_them() {
+        let rec = |ts: &str, action: &str| serde_json::json!({ "ts": ts, "action": action, "handle": "h" });
+        // Overlapping record + one each only-Redis / only-local.
+        let shared = rec("2026-07-29T01:00:00Z", "shared");
+        let redis = vec![shared.clone(), rec("2026-07-29T03:00:00Z", "redis-only")];
+        let local = vec![
+            shared.clone(),
+            // written while Redis was unreachable — the record that vanished
+            rec("2026-07-29T02:51:56Z", "machine.online"),
+        ];
+
+        let out = super::union_flow_records(redis, local);
+
+        let actions: Vec<&str> = out
+            .iter()
+            .filter_map(|r| r.get("action").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(out.len(), 3, "expected union, got {actions:?}");
+        assert!(actions.contains(&"redis-only"), "lost a Redis-only record");
+        assert!(
+            actions.contains(&"machine.online"),
+            "LOST THE OUTAGE-WINDOW RECORD — this is the reported bug"
+        );
+        assert_eq!(
+            actions.iter().filter(|a| **a == "shared").count(),
+            1,
+            "the overlapping record must not be duplicated"
+        );
+    }
+
+    /// (#1570) A date with NO local file and an unusable Redis must return
+    /// `200 []` promptly — never hang until the route's 30s timeout and 408.
+    ///
+    /// This is the operator-visible shape of the reported bug. The viewer's
+    /// `loadLiveWindow()` fetches TWO days (yesterday + today), so the first
+    /// request of a fresh UTC day hits exactly this path; measured live at
+    /// 30.00s + 408 before the fix, which read as "the viewer won't load."
+    ///
+    /// The bound that makes this pass is a socket-level response deadline
+    /// (`REDIS_RESPONSE_TIMEOUT`) — `get_connection_with_timeout` covers
+    /// only the connect. Note this test uses a REFUSED port, which fails
+    /// fast at connect; the pathological case in the field was a port that
+    /// ACCEPTS and then never answers, which no reachability probe catches
+    /// and which only the response deadline bounds.
+    #[tokio::test]
+    #[serial]
+    async fn flow_endpoint_returns_empty_not_408_for_a_date_with_no_records() {
+        let tmp = TempDir::new().unwrap();
+        // No file written for this date at all.
+        unsafe {
+            std::env::set_var("DARKMUX_REDIS_URL", "redis://127.0.0.1:1");
         }
 
-        /// (#1570) Redis must UNION with the local file, never replace it.
-        ///
-        /// The erase-on-recovery half of the bug: Redis is fleet-merged but is
-        /// NOT a superset — it rides a MAXLEN cap and, critically, is missing
-        /// everything written while it was unreachable. Preferring it wholesale
-        /// erased the outage window from the view the moment Redis returned.
-        ///
-        /// Measured live 2026-07-29 after a peer woke from an unplanned sleep:
-        /// `/flow/<today>` served 4 records against 4 on disk, with 2 present
-        /// only locally — including the `machine.online` record emitted DURING
-        /// the outage. The store was intact; only the read path lost it.
-        #[test]
-        fn union_output_is_chronological_when_local_only_records_predate_redis() {
-            // (#2410 follow-up, measured live 2026-09-06) With Redis on, the
-            // route returned Redis's newest-10k FIRST and appended the 236
-            // local-only bookends the ring had pinned — so a 00:08 `dispatch
-            // start` sat at index 10000 behind 16:21 telemetry. The set was
-            // right; the order broke the "chronological" promise the route
-            // documents. The union sorts by `ts` (stable, so same-instant
-            // records keep write order).
-            let rec = |ts: &str, action: &str| serde_json::json!({ "ts": ts, "action": action, "handle": "h" });
-            let redis = vec![rec("2026-09-05T13:49:59Z", "machine.telemetry"), rec("2026-09-05T16:21:49Z", "machine.telemetry")];
-            let local = vec![rec("2026-09-05T00:08:17Z", "dispatch.start"), rec("2026-09-05T13:01:32Z", "dispatch.start")];
-            let out = super::union_flow_records(redis, local);
-            let ts: Vec<&str> = out.iter().filter_map(|r| r.get("ts").and_then(|v| v.as_str())).collect();
-            assert_eq!(
-                ts,
-                vec!["2026-09-05T00:08:17Z", "2026-09-05T13:01:32Z", "2026-09-05T13:49:59Z", "2026-09-05T16:21:49Z"],
-                "the union must be chronological, not redis-then-local"
-            );
-        }
-
-        #[test]
-        fn redis_records_union_with_local_rather_than_replacing_them() {
-            let rec = |ts: &str, action: &str| {
-                serde_json::json!({ "ts": ts, "action": action, "handle": "h" })
-            };
-            // Overlapping record + one each only-Redis / only-local.
-            let shared = rec("2026-07-29T01:00:00Z", "shared");
-            let redis = vec![shared.clone(), rec("2026-07-29T03:00:00Z", "redis-only")];
-            let local = vec![
-                shared.clone(),
-                // written while Redis was unreachable — the record that vanished
-                rec("2026-07-29T02:51:56Z", "machine.online"),
-            ];
-
-            let out = super::union_flow_records(redis, local);
-
-            let actions: Vec<&str> = out
-                .iter()
-                .filter_map(|r| r.get("action").and_then(|v| v.as_str()))
-                .collect();
-            assert_eq!(out.len(), 3, "expected union, got {actions:?}");
-            assert!(actions.contains(&"redis-only"), "lost a Redis-only record");
-            assert!(
-                actions.contains(&"machine.online"),
-                "LOST THE OUTAGE-WINDOW RECORD — this is the reported bug"
-            );
-            assert_eq!(
-                actions.iter().filter(|a| **a == "shared").count(),
-                1,
-                "the overlapping record must not be duplicated"
-            );
-        }
-
-        /// (#1570) A date with NO local file and an unusable Redis must return
-        /// `200 []` promptly — never hang until the route's 30s timeout and 408.
-        ///
-        /// This is the operator-visible shape of the reported bug. The viewer's
-        /// `loadLiveWindow()` fetches TWO days (yesterday + today), so the first
-        /// request of a fresh UTC day hits exactly this path; measured live at
-        /// 30.00s + 408 before the fix, which read as "the viewer won't load."
-        ///
-        /// The bound that makes this pass is a socket-level response deadline
-        /// (`REDIS_RESPONSE_TIMEOUT`) — `get_connection_with_timeout` covers
-        /// only the connect. Note this test uses a REFUSED port, which fails
-        /// fast at connect; the pathological case in the field was a port that
-        /// ACCEPTS and then never answers, which no reachability probe catches
-        /// and which only the response deadline bounds.
-        #[tokio::test]
-        #[serial]
-        async fn flow_endpoint_returns_empty_not_408_for_a_date_with_no_records() {
-            let tmp = TempDir::new().unwrap();
-            // No file written for this date at all.
-            unsafe { std::env::set_var("DARKMUX_REDIS_URL", "redis://127.0.0.1:1"); }
-
-            let started = std::time::Instant::now();
-            let app = build_router_local(tmp.path().to_path_buf());
-            let response = app
-                .oneshot(
-                    Request::builder()
-                        .uri("/flow/2026-08-15")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let elapsed = started.elapsed();
-
-            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
-
-            assert_eq!(response.status(), StatusCode::OK, "a recordless date must not error");
-            let arr = body_as_array(response).await;
-            assert!(arr.is_empty(), "expected an empty array, got {} records", arr.len());
-            // Generous, but far below the 30s route timeout the bug hit — the
-            // point is that the request COMPLETES rather than being killed.
-            assert!(
-                elapsed < std::time::Duration::from_secs(10),
-                "took {elapsed:?} — the Redis attempt is not bounded"
-            );
-        }
-
-        /// Fallback path: DARKMUX_REDIS_URL set but pointing at an
-        /// unreachable endpoint → daemon serves the local file's records
-        /// as a JSON array.
-        #[tokio::test]
-        #[serial]
-        async fn flow_endpoint_falls_back_to_file_when_redis_unreachable() {
-            let today = today_utc_date();
-            let tmp = TempDir::new().unwrap();
-            let local_record = format!(
-                r#"{{"ts":"{today}T12:00:00Z","action":"local-fallback","machine_id":"local"}}"#
-            );
-            fs::write(
-                tmp.path().join(format!("{today}.jsonl")),
-                format!("{local_record}\n"),
+        let started = std::time::Instant::now();
+        let app = build_router_local(tmp.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/flow/2026-08-15")
+                    .body(Body::empty())
+                    .unwrap(),
             )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+        }
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a recordless date must not error"
+        );
+        let arr = body_as_array(response).await;
+        assert!(
+            arr.is_empty(),
+            "expected an empty array, got {} records",
+            arr.len()
+        );
+        // Generous, but far below the 30s route timeout the bug hit — the
+        // point is that the request COMPLETES rather than being killed.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "took {elapsed:?} — the Redis attempt is not bounded"
+        );
+    }
+
+    /// Fallback path: DARKMUX_REDIS_URL set but pointing at an
+    /// unreachable endpoint → daemon serves the local file's records
+    /// as a JSON array.
+    #[tokio::test]
+    #[serial]
+    async fn flow_endpoint_falls_back_to_file_when_redis_unreachable() {
+        let today = today_utc_date();
+        let tmp = TempDir::new().unwrap();
+        let local_record = format!(
+            r#"{{"ts":"{today}T12:00:00Z","action":"local-fallback","machine_id":"local"}}"#
+        );
+        fs::write(
+            tmp.path().join(format!("{today}.jsonl")),
+            format!("{local_record}\n"),
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("DARKMUX_REDIS_URL", "redis://127.0.0.1:1");
+        }
+
+        let app = build_router_local(tmp.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/flow/{today}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
             .unwrap();
 
-            unsafe { std::env::set_var("DARKMUX_REDIS_URL", "redis://127.0.0.1:1"); }
-
-            let app = build_router_local(tmp.path().to_path_buf());
-            let response = app
-                .oneshot(
-                    Request::builder()
-                        .uri(format!("/flow/{today}"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-
-            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
-
-            assert_eq!(response.status(), StatusCode::OK);
-            let arr = body_as_array(response).await;
-            assert!(
-                arr.iter().any(|r| r.get("action").and_then(|v| v.as_str()) == Some("local-fallback")),
-                "expected fallback to local file when Redis unreachable: {arr:?}"
-            );
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
         }
 
-        /// Regression: DARKMUX_REDIS_URL unset → local file as JSON array.
-        /// (Today this URL shape returns 400 because the handler only
-        /// accepts `<date>.jsonl`. Post-fix it returns the array.)
-        #[tokio::test]
-        #[serial]
-        async fn flow_endpoint_reads_local_file_when_redis_url_unset() {
-            // (#811) The config tier is empty by construction in this test build
-            // (the test-support dev-dep), so an unset DARKMUX_REDIS_URL means
-            // Redis off — not the operator's config.json-assembled URL.
-            let today = today_utc_date();
-            let tmp = TempDir::new().unwrap();
-            let local_record = format!(
-                r#"{{"ts":"{today}T12:00:00Z","action":"local-only","machine_id":"local"}}"#
-            );
-            fs::write(
-                tmp.path().join(format!("{today}.jsonl")),
-                format!("{local_record}\n"),
+        assert_eq!(response.status(), StatusCode::OK);
+        let arr = body_as_array(response).await;
+        assert!(
+            arr.iter()
+                .any(|r| r.get("action").and_then(|v| v.as_str()) == Some("local-fallback")),
+            "expected fallback to local file when Redis unreachable: {arr:?}"
+        );
+    }
+
+    /// Regression: DARKMUX_REDIS_URL unset → local file as JSON array.
+    /// (Today this URL shape returns 400 because the handler only
+    /// accepts `<date>.jsonl`. Post-fix it returns the array.)
+    #[tokio::test]
+    #[serial]
+    async fn flow_endpoint_reads_local_file_when_redis_url_unset() {
+        // (#811) The config tier is empty by construction in this test build
+        // (the test-support dev-dep), so an unset DARKMUX_REDIS_URL means
+        // Redis off — not the operator's config.json-assembled URL.
+        let today = today_utc_date();
+        let tmp = TempDir::new().unwrap();
+        let local_record =
+            format!(r#"{{"ts":"{today}T12:00:00Z","action":"local-only","machine_id":"local"}}"#);
+        fs::write(
+            tmp.path().join(format!("{today}.jsonl")),
+            format!("{local_record}\n"),
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+        }
+
+        let app = build_router_local(tmp.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/flow/{today}"))
+                    .body(Body::empty())
+                    .unwrap(),
             )
+            .await
             .unwrap();
 
-            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
+        assert_eq!(response.status(), StatusCode::OK);
+        let arr = body_as_array(response).await;
+        assert!(
+            arr.iter()
+                .any(|r| r.get("action").and_then(|v| v.as_str()) == Some("local-only")),
+            "expected local-only record: {arr:?}"
+        );
+    }
 
-            let app = build_router_local(tmp.path().to_path_buf());
-            let response = app
-                .oneshot(
-                    Request::builder()
-                        .uri(format!("/flow/{today}"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-
-            assert_eq!(response.status(), StatusCode::OK);
-            let arr = body_as_array(response).await;
-            assert!(
-                arr.iter().any(|r| r.get("action").and_then(|v| v.as_str()) == Some("local-only")),
-                "expected local-only record: {arr:?}"
-            );
+    #[tokio::test]
+    async fn flow_file_read_caps_at_max_records_keeping_newest() {
+        // (#900) A day-file larger than the cap must yield only the newest
+        // MAX_FLOW_FILE_RECORDS (chronological), bounding the daemon's
+        // memory — pre-fix the whole file was read + every line parsed.
+        let today = today_utc_date();
+        let tmp = TempDir::new().unwrap();
+        let total = MAX_FLOW_FILE_RECORDS + 5;
+        let mut buf = String::with_capacity(total * 40);
+        for i in 0..total {
+            buf.push_str(&format!(r#"{{"ts":"{today}T00:00:00Z","n":{i}}}"#));
+            buf.push('\n');
         }
+        fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
 
-        #[tokio::test]
-        async fn flow_file_read_caps_at_max_records_keeping_newest() {
-            // (#900) A day-file larger than the cap must yield only the newest
-            // MAX_FLOW_FILE_RECORDS (chronological), bounding the daemon's
-            // memory — pre-fix the whole file was read + every line parsed.
-            let today = today_utc_date();
-            let tmp = TempDir::new().unwrap();
-            let total = MAX_FLOW_FILE_RECORDS + 5;
-            let mut buf = String::with_capacity(total * 40);
-            for i in 0..total {
-                buf.push_str(&format!(r#"{{"ts":"{today}T00:00:00Z","n":{i}}}"#));
-                buf.push('\n');
-            }
-            fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
+        let records = read_flow_records_from_file(&today, tmp.path())
+            .await
+            .records;
+        assert_eq!(records.len(), MAX_FLOW_FILE_RECORDS, "must cap at the max");
+        // Oldest dropped, newest kept, chronological order preserved.
+        assert_eq!(
+            records.first().unwrap()["n"].as_u64().unwrap(),
+            (total - MAX_FLOW_FILE_RECORDS) as u64
+        );
+        assert_eq!(
+            records.last().unwrap()["n"].as_u64().unwrap(),
+            (total - 1) as u64
+        );
+    }
 
-            let records = read_flow_records_from_file(&today, tmp.path()).await.records;
-            assert_eq!(records.len(), MAX_FLOW_FILE_RECORDS, "must cap at the max");
-            // Oldest dropped, newest kept, chronological order preserved.
-            assert_eq!(
-                records.first().unwrap()["n"].as_u64().unwrap(),
-                (total - MAX_FLOW_FILE_RECORDS) as u64
-            );
-            assert_eq!(records.last().unwrap()["n"].as_u64().unwrap(), (total - 1) as u64);
-        }
-
-        /// (found live 2026-09-06) A day file's own `{"_type":"schema",…}`
-        /// header line is not a flow record — `for_each_record_in_day_file`
-        /// already skipped it, but `push_flow_line` (the reader behind
-        /// `GET /flow/<date>`) did not, so it surfaced as a headerless
-        /// "record 0" with no `ts`/`action`.
-        #[tokio::test]
-        async fn flow_file_read_skips_the_schema_header_line() {
-            let today = today_utc_date();
-            let tmp = TempDir::new().unwrap();
-            fs::write(
+    /// (found live 2026-09-06) A day file's own `{"_type":"schema",…}`
+    /// header line is not a flow record — `for_each_record_in_day_file`
+    /// already skipped it, but `push_flow_line` (the reader behind
+    /// `GET /flow/<date>`) did not, so it surfaced as a headerless
+    /// "record 0" with no `ts`/`action`.
+    #[tokio::test]
+    async fn flow_file_read_skips_the_schema_header_line() {
+        let today = today_utc_date();
+        let tmp = TempDir::new().unwrap();
+        fs::write(
                 tmp.path().join(format!("{today}.jsonl")),
                 format!(
                     "{{\"_type\":\"schema\",\"version\":\"1.0.0\"}}\n\
@@ -4810,2257 +6020,2854 @@
             )
             .unwrap();
 
-            let records = read_flow_records_from_file(&today, tmp.path()).await.records;
-            assert_eq!(records.len(), 1, "the schema header must not count as a record: {records:?}");
-            assert_eq!(records[0]["action"], "dispatch.start");
-        }
+        let records = read_flow_records_from_file(&today, tmp.path())
+            .await
+            .records;
+        assert_eq!(
+            records.len(),
+            1,
+            "the schema header must not count as a record: {records:?}"
+        );
+        assert_eq!(records[0]["action"], "dispatch.start");
+    }
 
-        /// (#2409) Cross-system contract 2 (dispatch liveness): the
-        /// `dispatch.start`/`dispatch.complete`/`dispatch.error` bookends
-        /// must never be evicted by the newest-N ring, no matter how far
-        /// back in the file they sit. This is the exact shape that went
-        /// blank live: a `dispatch.start` above the cap, a wall of
-        /// `telemetry.process` filling the newest 10k window, and the
-        /// matching `dispatch.complete` at the very end.
-        #[tokio::test]
-        async fn flow_file_read_caps_the_bookend_ring_too() {
-            // (#2410 review) The bookend keep-list is a ring under the same
-            // cap, not an unbounded Vec — a crash-looping producer that fires
-            // a bookend per second must not scale this read with the file.
-            let today = today_utc_date();
-            let tmp = TempDir::new().unwrap();
-            let total = MAX_FLOW_FILE_RECORDS + 50;
-            let mut buf = String::with_capacity(total * 70);
-            for i in 0..total {
-                buf.push_str(&format!(
+    /// (#2409) Cross-system contract 2 (dispatch liveness): the
+    /// `dispatch.start`/`dispatch.complete`/`dispatch.error` bookends
+    /// must never be evicted by the newest-N ring, no matter how far
+    /// back in the file they sit. This is the exact shape that went
+    /// blank live: a `dispatch.start` above the cap, a wall of
+    /// `telemetry.process` filling the newest 10k window, and the
+    /// matching `dispatch.complete` at the very end.
+    #[tokio::test]
+    async fn flow_file_read_caps_the_bookend_ring_too() {
+        // (#2410 review) The bookend keep-list is a ring under the same
+        // cap, not an unbounded Vec — a crash-looping producer that fires
+        // a bookend per second must not scale this read with the file.
+        let today = today_utc_date();
+        let tmp = TempDir::new().unwrap();
+        let total = MAX_FLOW_FILE_RECORDS + 50;
+        let mut buf = String::with_capacity(total * 70);
+        for i in 0..total {
+            buf.push_str(&format!(
                     r#"{{"ts":"{today}T00:00:00Z","action":"dispatch.start","session_id":"s{i}","n":{i}}}"#
                 ));
-                buf.push('\n');
-            }
-            fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
-
-            let records = read_flow_records_from_file(&today, tmp.path()).await.records;
-
-            assert_eq!(records.len(), MAX_FLOW_FILE_RECORDS, "bookends alone must respect the cap");
-            assert_eq!(
-                records.first().unwrap()["n"].as_u64(),
-                Some(50),
-                "the NEWEST bookends are the ones kept: {:?}",
-                records.first()
-            );
-            assert_eq!(records.last().unwrap()["n"].as_u64(), Some((total - 1) as u64));
+            buf.push('\n');
         }
+        fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
 
-        #[tokio::test]
-        async fn flow_file_read_keeps_dispatch_start_above_the_cap() {
-            let today = today_utc_date();
-            let tmp = TempDir::new().unwrap();
-            let telemetry_count = MAX_FLOW_FILE_RECORDS;
-            let total = telemetry_count + 2; // start + N telemetry + complete
-            let mut buf = String::with_capacity(total * 60);
+        let records = read_flow_records_from_file(&today, tmp.path())
+            .await
+            .records;
+
+        assert_eq!(
+            records.len(),
+            MAX_FLOW_FILE_RECORDS,
+            "bookends alone must respect the cap"
+        );
+        assert_eq!(
+            records.first().unwrap()["n"].as_u64(),
+            Some(50),
+            "the NEWEST bookends are the ones kept: {:?}",
+            records.first()
+        );
+        assert_eq!(
+            records.last().unwrap()["n"].as_u64(),
+            Some((total - 1) as u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn flow_file_read_keeps_dispatch_start_above_the_cap() {
+        let today = today_utc_date();
+        let tmp = TempDir::new().unwrap();
+        let telemetry_count = MAX_FLOW_FILE_RECORDS;
+        let total = telemetry_count + 2; // start + N telemetry + complete
+        let mut buf = String::with_capacity(total * 60);
+        buf.push_str(&format!(
+            r#"{{"ts":"{today}T00:00:00Z","action":"dispatch.start","session_id":"s1"}}"#
+        ));
+        buf.push('\n');
+        for i in 0..telemetry_count {
             buf.push_str(&format!(
-                r#"{{"ts":"{today}T00:00:00Z","action":"dispatch.start","session_id":"s1"}}"#
+                r#"{{"ts":"{today}T00:00:01Z","action":"machine.telemetry","n":{i}}}"#
             ));
             buf.push('\n');
-            for i in 0..telemetry_count {
-                buf.push_str(&format!(
-                    r#"{{"ts":"{today}T00:00:01Z","action":"machine.telemetry","n":{i}}}"#
-                ));
-                buf.push('\n');
-            }
-            buf.push_str(&format!(
-                r#"{{"ts":"{today}T23:59:59Z","action":"dispatch.complete","session_id":"s1"}}"#
-            ));
-            buf.push('\n');
-            fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
+        }
+        buf.push_str(&format!(
+            r#"{{"ts":"{today}T23:59:59Z","action":"dispatch.complete","session_id":"s1"}}"#
+        ));
+        buf.push('\n');
+        fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
 
-            let records = read_flow_records_from_file(&today, tmp.path()).await.records;
+        let records = read_flow_records_from_file(&today, tmp.path())
+            .await
+            .records;
 
+        assert_eq!(
+            records.len(),
+            telemetry_count + 2,
+            "both bookends plus every telemetry record must survive"
+        );
+        assert_eq!(
+            records.first().unwrap()["action"].as_str(),
+            Some("dispatch.start"),
+            "the start bookend, pinned above the cap, must still be first: {:?}",
+            records.first()
+        );
+        assert_eq!(
+            records.last().unwrap()["action"].as_str(),
+            Some("dispatch.complete"),
+            "the complete bookend must still be last: {:?}",
+            records.last()
+        );
+        let telemetry_between = &records[1..records.len() - 1];
+        assert_eq!(telemetry_between.len(), telemetry_count);
+        assert!(
+            telemetry_between
+                .iter()
+                .all(|r| r["action"].as_str() == Some("machine.telemetry")),
+            "everything between the bookends must be the telemetry ring, in file order"
+        );
+        for (i, r) in telemetry_between.iter().enumerate() {
             assert_eq!(
-                records.len(),
-                telemetry_count + 2,
-                "both bookends plus every telemetry record must survive"
+                r["n"].as_u64().unwrap(),
+                i as u64,
+                "telemetry ring must stay in file (chronological) order"
             );
-            assert_eq!(
-                records.first().unwrap()["action"].as_str(),
-                Some("dispatch.start"),
-                "the start bookend, pinned above the cap, must still be first: {:?}",
-                records.first()
-            );
-            assert_eq!(
-                records.last().unwrap()["action"].as_str(),
-                Some("dispatch.complete"),
-                "the complete bookend must still be last: {:?}",
-                records.last()
-            );
-            let telemetry_between = &records[1..records.len() - 1];
-            assert_eq!(telemetry_between.len(), telemetry_count);
-            assert!(
-                telemetry_between
-                    .iter()
-                    .all(|r| r["action"].as_str() == Some("machine.telemetry")),
-                "everything between the bookends must be the telemetry ring, in file order"
-            );
-            for (i, r) in telemetry_between.iter().enumerate() {
-                assert_eq!(
-                    r["n"].as_u64().unwrap(),
-                    i as u64,
-                    "telemetry ring must stay in file (chronological) order"
-                );
-            }
         }
+    }
 
-        /// (#2409) A file under the cap is unaffected — no regression to the
-        /// common case (the vast majority of days never approach 10k lines).
-        #[tokio::test]
-        async fn flow_file_read_under_cap_returns_everything_unchanged() {
-            let today = today_utc_date();
-            let tmp = TempDir::new().unwrap();
-            let mut buf = String::new();
+    /// (#2409) A file under the cap is unaffected — no regression to the
+    /// common case (the vast majority of days never approach 10k lines).
+    #[tokio::test]
+    async fn flow_file_read_under_cap_returns_everything_unchanged() {
+        let today = today_utc_date();
+        let tmp = TempDir::new().unwrap();
+        let mut buf = String::new();
+        buf.push_str(&format!(
+            r#"{{"ts":"{today}T00:00:00Z","action":"dispatch.start","session_id":"s1"}}"#
+        ));
+        buf.push('\n');
+        for i in 0..50 {
             buf.push_str(&format!(
-                r#"{{"ts":"{today}T00:00:00Z","action":"dispatch.start","session_id":"s1"}}"#
+                r#"{{"ts":"{today}T00:00:01Z","action":"machine.telemetry","n":{i}}}"#
             ));
             buf.push('\n');
-            for i in 0..50 {
-                buf.push_str(&format!(
-                    r#"{{"ts":"{today}T00:00:01Z","action":"machine.telemetry","n":{i}}}"#
-                ));
-                buf.push('\n');
-            }
-            buf.push_str(&format!(
-                r#"{{"ts":"{today}T00:01:00Z","action":"dispatch.complete","session_id":"s1"}}"#
-            ));
-            buf.push('\n');
-            fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
-
-            let records = read_flow_records_from_file(&today, tmp.path()).await.records;
-
-            assert_eq!(records.len(), 52, "under the cap: nothing dropped, nothing duplicated");
-            assert_eq!(records.first().unwrap()["action"].as_str(), Some("dispatch.start"));
-            assert_eq!(records.last().unwrap()["action"].as_str(), Some("dispatch.complete"));
-            for (i, r) in records[1..51].iter().enumerate() {
-                assert_eq!(r["n"].as_u64().unwrap(), i as u64);
-            }
         }
+        buf.push_str(&format!(
+            r#"{{"ts":"{today}T00:01:00Z","action":"dispatch.complete","session_id":"s1"}}"#
+        ));
+        buf.push('\n');
+        fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
 
-        #[tokio::test]
-        async fn flow_file_read_skips_a_pathological_oversize_line() {
-            // (#925) A single line larger than MAX_FLOW_LINE_BYTES (a corrupt
-            // or adversarial flows file with no newline) is skipped — drained
-            // to its next newline — not read into one ballooning allocation.
-            // The surrounding valid records are still returned, and empty /
-            // non-JSON lines are tolerated (push_flow_line drops them).
-            let today = today_utc_date();
-            let tmp = TempDir::new().unwrap();
-            let mut buf = String::new();
-            buf.push_str(&format!(r#"{{"ts":"{today}T00:00:00Z","n":1}}"#));
-            buf.push('\n');
-            buf.push('\n'); // empty line — skipped
-            buf.push_str("not valid json\n"); // non-JSON — skipped
-            buf.push_str(&"x".repeat(MAX_FLOW_LINE_BYTES + 100)); // over-cap — skipped
-            buf.push('\n');
-            buf.push_str(&format!(r#"{{"ts":"{today}T00:00:00Z","n":2}}"#));
-            buf.push('\n');
-            fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
+        let records = read_flow_records_from_file(&today, tmp.path())
+            .await
+            .records;
 
-            let records = read_flow_records_from_file(&today, tmp.path()).await.records;
-            assert_eq!(records.len(), 2, "oversize/empty/non-JSON lines skipped, valid kept");
-            assert_eq!(records[0]["n"].as_u64().unwrap(), 1);
-            assert_eq!(records[1]["n"].as_u64().unwrap(), 2);
+        assert_eq!(
+            records.len(),
+            52,
+            "under the cap: nothing dropped, nothing duplicated"
+        );
+        assert_eq!(
+            records.first().unwrap()["action"].as_str(),
+            Some("dispatch.start")
+        );
+        assert_eq!(
+            records.last().unwrap()["action"].as_str(),
+            Some("dispatch.complete")
+        );
+        for (i, r) in records[1..51].iter().enumerate() {
+            assert_eq!(r["n"].as_u64().unwrap(), i as u64);
         }
+    }
 
-        // ─── #270 PR-B: redis_tail_lines (SSE Redis tail) ────────────────
+    #[tokio::test]
+    async fn flow_file_read_skips_a_pathological_oversize_line() {
+        // (#925) A single line larger than MAX_FLOW_LINE_BYTES (a corrupt
+        // or adversarial flows file with no newline) is skipped — drained
+        // to its next newline — not read into one ballooning allocation.
+        // The surrounding valid records are still returned, and empty /
+        // non-JSON lines are tolerated (push_flow_line drops them).
+        let today = today_utc_date();
+        let tmp = TempDir::new().unwrap();
+        let mut buf = String::new();
+        buf.push_str(&format!(r#"{{"ts":"{today}T00:00:00Z","n":1}}"#));
+        buf.push('\n');
+        buf.push('\n'); // empty line — skipped
+        buf.push_str("not valid json\n"); // non-JSON — skipped
+        buf.push_str(&"x".repeat(MAX_FLOW_LINE_BYTES + 100)); // over-cap — skipped
+        buf.push('\n');
+        buf.push_str(&format!(r#"{{"ts":"{today}T00:00:00Z","n":2}}"#));
+        buf.push('\n');
+        fs::write(tmp.path().join(format!("{today}.jsonl")), buf).unwrap();
 
-        /// XADD'd records after the stream opens are emitted as lines.
-        /// Parallel to `tail_stream_emits_appended_lines` for the file-tail
-        /// path. Tail-from-now: existing entries in the stream are not
-        /// replayed (semantics matches the file-tail handler).
-        #[tokio::test]
-        #[serial]
-        async fn redis_tail_lines_emits_xadded_records_for_today() {
-            if !redis_server_available() {
-                eprintln!("skipping: redis-server not on PATH");
-                return;
-            }
-            let redis = spawn_redis();
-            let today = today_utc_date();
+        let records = read_flow_records_from_file(&today, tmp.path())
+            .await
+            .records;
+        assert_eq!(
+            records.len(),
+            2,
+            "oversize/empty/non-JSON lines skipped, valid kept"
+        );
+        assert_eq!(records[0]["n"].as_u64().unwrap(), 1);
+        assert_eq!(records[1]["n"].as_u64().unwrap(), 2);
+    }
 
-            // Pre-existing entry — must NOT be emitted (tail-from-now).
-            let pre = format!(
-                r#"{{"ts":"{today}T08:00:00Z","action":"pre-existing"}}"#
-            );
-            xadd_flow_record(&redis.url, &pre);
+    // ─── #270 PR-B: redis_tail_lines (SSE Redis tail) ────────────────
 
-            let stream = redis_tail_lines(
-                redis.url.clone(),
-                vec!["darkmux:flow".to_string()],
-                today.clone(),
-            );
-            tokio::pin!(stream);
-
-            // Give the stream a moment to read the current last-id before
-            // we XADD the next one.
-            tokio::time::sleep(Duration::from_millis(150)).await;
-
-            let post = format!(
-                r#"{{"ts":"{today}T12:00:00Z","action":"post-open"}}"#
-            );
-            xadd_flow_record(&redis.url, &post);
-
-            let got = next_line(&mut stream, Duration::from_millis(3000)).await;
-            assert!(
-                got.as_ref().is_some_and(|s| s.contains("post-open")),
-                "expected post-open record to arrive over the tail; got {got:?}"
-            );
-            assert!(
-                !got.as_ref().unwrap().contains("pre-existing"),
-                "tail-from-now must NOT replay history; got {got:?}"
-            );
+    /// XADD'd records after the stream opens are emitted as lines.
+    /// Parallel to `tail_stream_emits_appended_lines` for the file-tail
+    /// path. Tail-from-now: existing entries in the stream are not
+    /// replayed (semantics matches the file-tail handler).
+    #[tokio::test]
+    #[serial]
+    async fn redis_tail_lines_emits_xadded_records_for_today() {
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
         }
+        let redis = spawn_redis();
+        let today = today_utc_date();
 
-        /// The Redis tail reaches a remote reader through the handler with host
-        /// facts redacted, and this machine reads it unchanged. (The file tail
-        /// has the same test in `redaction.rs`; both meet `redacted_events`.)
-        #[tokio::test]
-        #[serial]
-        async fn the_redis_flow_stream_redacts_for_a_remote_reader_through_the_handler() {
-            use futures::StreamExt;
-            if !redis_server_available() {
-                eprintln!("skipping: redis-server not on PATH");
-                return;
-            }
-            let redis = spawn_redis();
-            let today = today_utc_date();
-            let prev = std::env::var_os("DARKMUX_REDIS_URL");
-            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url) };
-            let mut outcomes = Vec::new();
-            for from in ["10.0.0.9:5555", "127.0.0.1:5555"] {
-                let app = build_router_local(PathBuf::new());
-                let mut req = Request::builder().uri(format!("/flow/{today}/stream")).header("host", "localhost").body(Body::empty()).unwrap();
-                req.extensions_mut().insert(ConnectInfo(from.parse::<SocketAddr>().unwrap()));
-                let mut body = app.oneshot(req).await.unwrap().into_body().into_data_stream();
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                let record = format!(
-                    r#"{{"ts":"{today}T12:00:00Z","action":"x.y","cwd":"/Users/someone/w","endpoint":"http://[fd7a:115c:a1e0::53]:1234/v1","peer":"100.64.7.7","marker":"redis-marker"}}"#
-                );
-                xadd_flow_record(&redis.url, &record);
-                let mut seen = String::new();
-                let _ = tokio::time::timeout(Duration::from_secs(5), async {
-                    while let Some(Ok(chunk)) = body.next().await {
-                        seen.push_str(&String::from_utf8_lossy(&chunk));
-                        if seen.contains("redis-marker") {
-                            break;
-                        }
-                    }
-                })
-                .await;
-                outcomes.push(seen);
-            }
-            match prev {
-                Some(v) => unsafe { std::env::set_var("DARKMUX_REDIS_URL", v) },
-                None => unsafe { std::env::remove_var("DARKMUX_REDIS_URL") },
-            }
-            let (remote, local) = (&outcomes[0], &outcomes[1]);
-            assert!(remote.contains("redis-marker"), "the record reached the remote reader: {remote}");
-            for secret in ["someone", "fd7a", "100.64.7.7"] {
-                assert!(!remote.contains(secret), "remote saw `{secret}`: {remote}");
-                assert!(local.contains(secret), "this machine reads `{secret}` unchanged: {local}");
-            }
+        // Pre-existing entry — must NOT be emitted (tail-from-now).
+        let pre = format!(r#"{{"ts":"{today}T08:00:00Z","action":"pre-existing"}}"#);
+        xadd_flow_record(&redis.url, &pre);
+
+        let stream = redis_tail_lines(
+            redis.url.clone(),
+            vec!["darkmux:flow".to_string()],
+            today.clone(),
+        );
+        tokio::pin!(stream);
+
+        // Give the stream a moment to read the current last-id before
+        // we XADD the next one.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let post = format!(r#"{{"ts":"{today}T12:00:00Z","action":"post-open"}}"#);
+        xadd_flow_record(&redis.url, &post);
+
+        let got = next_line(&mut stream, Duration::from_millis(3000)).await;
+        assert!(
+            got.as_ref().is_some_and(|s| s.contains("post-open")),
+            "expected post-open record to arrive over the tail; got {got:?}"
+        );
+        assert!(
+            !got.as_ref().unwrap().contains("pre-existing"),
+            "tail-from-now must NOT replay history; got {got:?}"
+        );
+    }
+
+    /// The Redis tail reaches a remote reader through the handler with host
+    /// facts redacted, and this machine reads it unchanged. (The file tail
+    /// has the same test in `redaction.rs`; both meet `redacted_events`.)
+    #[tokio::test]
+    #[serial]
+    async fn the_redis_flow_stream_redacts_for_a_remote_reader_through_the_handler() {
+        use futures::StreamExt;
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
         }
-
-        /// (#1596) A consumer that disconnects during a QUIET period must
-        /// still terminate the producer task. `SendOutcome::Closed` — the
-        /// only other disconnect exit — is observable solely while
-        /// producing, so before the `tx.is_closed()` guard a closed tab on
-        /// an idle stream left the task looping `XREAD BLOCK 500` and
-        /// opening a fresh Redis connection every ~500ms for the daemon's
-        /// lifetime: one zombie per ordinary open-then-close of the
-        /// dashboard. The task is spawned HERE (not via `redis_tail_lines`)
-        /// exactly so its exit is assertable — the production wrapper
-        /// discards the JoinHandle.
-        #[tokio::test]
-        #[serial]
-        async fn redis_tail_task_exits_when_consumer_drops_while_quiet() {
-            if !redis_server_available() {
-                eprintln!("skipping: redis-server not on PATH");
-                return;
-            }
-            let redis = spawn_redis();
-            let (tx, rx) = tokio::sync::mpsc::channel::<String>(8);
-            let task = tokio::spawn(redis_tail_task(
-                tx,
-                redis.url.clone(),
-                "darkmux:flow".to_string(),
-                today_utc_date(),
-            ));
-            // Let it reach the XREAD loop, then disconnect with NOTHING
-            // having been produced — the quiet-stream shape.
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            drop(rx);
-            tokio::time::timeout(Duration::from_millis(3000), task)
-                .await
-                .expect("producer task must exit after the consumer drops — not loop forever")
-                .expect("task must not panic");
-        }
-
-        /// (#3432) A tail keeps its connection across `XREAD BLOCK` polls:
-        /// it opened a new one for every 500ms poll, per stream, per open
-        /// viewer (3.2 hub connects/s measured). Records still arrive on the
-        /// kept connection.
-        #[tokio::test]
-        #[serial]
-        async fn a_tail_keeps_one_connection_across_its_polls() {
-            if !redis_server_available() {
-                eprintln!("skipping: redis-server not on PATH");
-                return;
-            }
-            let redis = spawn_redis();
-            let today = today_utc_date();
-            let mut conn = redis::Client::open(redis.url.as_str()).unwrap().get_connection().unwrap();
-            let connects = |conn: &mut redis::Connection| -> u64 {
-                let info: String = redis::cmd("INFO").arg("stats").query(conn).unwrap();
-                info.lines()
-                    .find_map(|l| l.strip_prefix("total_connections_received:"))
-                    .and_then(|n| n.trim().parse().ok())
-                    .unwrap()
-            };
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
-            let task = tokio::spawn(redis_tail_task(tx, redis.url.clone(), "darkmux:flow".to_string(), today.clone()));
-            // Past the first poll's XINFO and connect.
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            let before = connects(&mut conn);
-            // Five or so quiet polls.
-            tokio::time::sleep(Duration::from_millis(2600)).await;
-            let after = connects(&mut conn);
-            xadd_flow_record(&redis.url, &format!(r#"{{"ts":"{today}T12:00:00Z","action":"kept"}}"#));
-            let got = tokio::time::timeout(Duration::from_millis(3000), rx.recv()).await.expect("a record within 3s");
-            assert_eq!(after - before, 0, "no new connection across quiet polls");
-            assert!(got.is_some_and(|s| s.contains("kept")));
-
-            // The hub drops the tail's connection: the next poll fails, the
-            // one after reopens once, and records arrive on the new one.
-            let before_kill = connects(&mut conn);
-            let _: u64 = redis::cmd("CLIENT").arg("KILL").arg("TYPE").arg("normal").arg("SKIPME").arg("yes").query(&mut conn).unwrap();
-            tokio::time::sleep(Duration::from_millis(2000)).await;
-            xadd_flow_record(&redis.url, &format!(r#"{{"ts":"{today}T12:00:01Z","action":"reopened"}}"#));
-            let got = tokio::time::timeout(Duration::from_millis(3000), rx.recv()).await.expect("a record after the reopen");
-            let reopens = connects(&mut conn) - before_kill - 1; // less the xadd helper's own connection
-            drop(rx);
-            let _ = tokio::time::timeout(Duration::from_millis(3000), task).await;
-            assert!(got.is_some_and(|s| s.contains("reopened")));
-            assert_eq!(reopens, 1, "one reopen after the connection was dropped");
-        }
-
-        /// Records for OTHER dates are filtered out by the tail.
-        #[tokio::test]
-        #[serial]
-        async fn redis_tail_lines_filters_records_for_other_dates() {
-            if !redis_server_available() {
-                eprintln!("skipping: redis-server not on PATH");
-                return;
-            }
-            let redis = spawn_redis();
-            let today = today_utc_date();
-
-            let stream = redis_tail_lines(
-                redis.url.clone(),
-                vec!["darkmux:flow".to_string()],
-                today.clone(),
-            );
-            tokio::pin!(stream);
-
-            tokio::time::sleep(Duration::from_millis(150)).await;
-
-            // First XADD: other date — should be filtered out.
-            xadd_flow_record(
-                &redis.url,
-                r#"{"ts":"2020-01-01T12:00:00Z","action":"other-date"}"#,
-            );
-            // Second XADD: today — should be emitted.
-            let today_record = format!(
-                r#"{{"ts":"{today}T12:00:00Z","action":"matching-date"}}"#
-            );
-            xadd_flow_record(&redis.url, &today_record);
-
-            // First emit must be the matching-date one — other-date was
-            // dropped on the way through.
-            let got = next_line(&mut stream, Duration::from_millis(3000)).await;
-            assert!(
-                got.as_ref().is_some_and(|s| s.contains("matching-date")),
-                "expected matching-date record; got {got:?}"
-            );
-            assert!(
-                !got.as_ref().unwrap().contains("other-date"),
-                "other-date record must be filtered: {got:?}"
-            );
-        }
-
-        /// #293 — `redis_tail_lines` against a permanently-unreachable
-        /// Redis MUST eventually emit a synthetic `stream.error` record
-        /// and exit the spawned task. Pre-fix it retried forever (log
-        /// spam + leaked spawned tasks per open SSE connection); the
-        /// receiver-drop check only fired on a successful produce,
-        /// which never happens on permanent failure.
-        ///
-        /// Contract: after MAX_CONSECUTIVE_XREAD_FAILURES (10) failures
-        /// at 500ms backoff (≈5s wall-clock), the stream sends a
-        /// synthetic record with `action: "stream.error"` and the
-        /// receiver sees the channel close on its next `.next()`
-        /// after that record.
-        ///
-        /// **Coverage caveat**: this exercises the TCP-refuses-fast
-        /// path (127.0.0.1:1). The operator's actual Studio-offline
-        /// path is structurally similar (Tailscale-routed peer,
-        /// REDIS_CONNECT_TIMEOUT=500ms per connect → also ≈10s total
-        /// budget) but takes 2× longer per iteration. Both are
-        /// bounded by the 10s test budget, but only the
-        /// refused-connect case is DIRECTLY verified here — would
-        /// need a netem/tarpit fixture for the silent-timeout case.
-        #[tokio::test]
-        async fn redis_tail_lines_exits_after_persistent_xread_failures() {
-            use futures::StreamExt;
-            // 127.0.0.1:1 — privileged port; nothing listens. TCP
-            // refuses fast → XREAD errors fast → ~10 failures × 500ms
-            // ≈ 5s before the synthetic record + exit.
-            let stream = redis_tail_lines(
-                "redis://127.0.0.1:1".to_string(),
-                vec!["darkmux:flow".to_string()],
-                "2026-05-23".to_string(),
-            );
-            tokio::pin!(stream);
-
-            let read_synthetic = async {
-                while let Some(line) = stream.next().await {
-                    if line.contains("\"stream.error\"") {
-                        return Some(line);
-                    }
-                }
-                None
-            };
-            // Budget: MAX × 500ms backoff + slack = 10s wall.
-            let synthetic = tokio::time::timeout(Duration::from_secs(10), read_synthetic)
-                .await
-                .expect("redis_tail_lines should emit synthetic + exit within 10s");
-            assert!(
-                synthetic.is_some(),
-                "expected a stream.error synthetic record before the channel closed"
-            );
-            let line = synthetic.unwrap();
-            assert!(
-                line.contains("redis_tail_lines"),
-                "synthetic record's handle should name the source; got: {line}"
-            );
-            assert!(
-                line.contains("darkmux:flow"),
-                "synthetic record's reasoning should name the stream; got: {line}"
-            );
-
-            // The next pull should yield None (channel closed because
-            // the spawned task returned after emitting the synthetic).
-            let post = tokio::time::timeout(Duration::from_secs(2), stream.next())
-                .await
-                .expect("channel close should be observable within 2s of synthetic");
-            assert!(
-                post.is_none(),
-                "channel must close after the synthetic; got: {post:?}"
-            );
-        }
-
-        /// Handler-level smoke: GET /flow/<date>/stream with Redis URL set
-        /// returns 200 + content-type `text/event-stream` and surfaces an
-        /// XADD'd record as an SSE `data: ...` line. End-to-end coverage
-        /// for the integration path.
-        #[tokio::test]
-        #[serial]
-        async fn flow_stream_handler_uses_redis_when_url_set() {
-            if !redis_server_available() {
-                eprintln!("skipping: redis-server not on PATH");
-                return;
-            }
-            let redis = spawn_redis();
-            let today = today_utc_date();
-            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url); }
-
-            let tmp = TempDir::new().unwrap();
-            let app = build_router_local(tmp.path().to_path_buf());
-            let response = app
-                .oneshot(
-                    Request::builder()
-                        .uri(format!("/flow/{today}/stream"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
+        let redis = spawn_redis();
+        let today = today_utc_date();
+        let prev = std::env::var_os("DARKMUX_REDIS_URL");
+        unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url) };
+        let mut outcomes = Vec::new();
+        for from in ["10.0.0.9:5555", "127.0.0.1:5555"] {
+            let app = build_router_local(PathBuf::new());
+            let mut req = Request::builder()
+                .uri(format!("/flow/{today}/stream"))
+                .header("host", "localhost")
+                .body(Body::empty())
                 .unwrap();
-
-            assert_eq!(response.status(), StatusCode::OK);
-            let content_type = response
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            assert!(
-                content_type.starts_with("text/event-stream"),
-                "expected SSE content-type; got {content_type}"
-            );
-
-            // Pull the SSE body as a stream; XADD; look for the line.
-            use futures::StreamExt;
-            let mut body = response.into_body().into_data_stream();
-
-            // Give the handler a beat to probe Redis + start XREAD.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-
+            req.extensions_mut()
+                .insert(ConnectInfo(from.parse::<SocketAddr>().unwrap()));
+            let mut body = app
+                .oneshot(req)
+                .await
+                .unwrap()
+                .into_body()
+                .into_data_stream();
+            tokio::time::sleep(Duration::from_millis(300)).await;
             let record = format!(
-                r#"{{"ts":"{today}T12:00:00Z","action":"sse-redis-end-to-end"}}"#
+                r#"{{"ts":"{today}T12:00:00Z","action":"x.y","cwd":"/Users/someone/w","endpoint":"http://[fd7a:115c:a1e0::53]:1234/v1","peer":"100.64.7.7","marker":"redis-marker"}}"#
             );
             xadd_flow_record(&redis.url, &record);
-
-            // Read up to 3s waiting for the SSE chunk that includes the line.
-            let read_fut = async {
-                let mut acc = Vec::new();
+            let mut seen = String::new();
+            let _ = tokio::time::timeout(Duration::from_secs(5), async {
                 while let Some(Ok(chunk)) = body.next().await {
-                    acc.extend_from_slice(&chunk);
-                    let s = String::from_utf8_lossy(&acc);
-                    if s.contains("sse-redis-end-to-end") {
-                        return s.into_owned();
+                    seen.push_str(&String::from_utf8_lossy(&chunk));
+                    if seen.contains("redis-marker") {
+                        break;
                     }
                 }
-                String::from_utf8_lossy(&acc).into_owned()
-            };
-            let got = tokio::time::timeout(Duration::from_secs(3), read_fut)
-                .await
-                .unwrap_or_default();
-
-            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
-
+            })
+            .await;
+            outcomes.push(seen);
+        }
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DARKMUX_REDIS_URL", v) },
+            None => unsafe { std::env::remove_var("DARKMUX_REDIS_URL") },
+        }
+        let (remote, local) = (&outcomes[0], &outcomes[1]);
+        assert!(
+            remote.contains("redis-marker"),
+            "the record reached the remote reader: {remote}"
+        );
+        for secret in ["someone", "fd7a", "100.64.7.7"] {
+            assert!(!remote.contains(secret), "remote saw `{secret}`: {remote}");
             assert!(
-                got.contains("sse-redis-end-to-end"),
-                "expected XADD'd record to surface as SSE event; got: {got:?}"
+                local.contains(secret),
+                "this machine reads `{secret}` unchanged: {local}"
             );
         }
+    }
 
-        /// (#2101) The live view the handler serves includes the telemetry
-        /// stream: a machine sample XADDed to `<stream>:telemetry` surfaces as
-        /// an SSE event. Dropping the stream from the handler's list left every
-        /// other test green.
-        #[tokio::test]
-        #[serial]
-        async fn flow_stream_handler_carries_the_telemetry_stream() {
-            if !redis_server_available() {
-                eprintln!("skipping: redis-server not on PATH");
-                return;
-            }
-            let redis = spawn_redis();
-            let today = today_utc_date();
-            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url); }
-            let tmp = TempDir::new().unwrap();
-            let app = build_router_local(tmp.path().to_path_buf());
-            let response = app
-                .oneshot(Request::builder().uri(format!("/flow/{today}/stream")).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            use futures::StreamExt;
-            let mut body = response.into_body().into_data_stream();
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            let client = redis::Client::open(redis.url.as_str()).unwrap();
-            let mut conn = client.get_connection().unwrap();
-            let record = format!(r#"{{"ts":"{today}T12:00:00Z","action":"sse-telemetry-sample"}}"#);
-            let _: String = redis::cmd("XADD")
-                .arg(TELEMETRY_STREAM).arg("*").arg("schema").arg("2.0.0").arg("record").arg(&record)
-                .query(&mut conn).unwrap();
-            let read_fut = async {
-                let mut acc = Vec::new();
-                while let Some(Ok(chunk)) = body.next().await {
-                    acc.extend_from_slice(&chunk);
-                    if String::from_utf8_lossy(&acc).contains("sse-telemetry-sample") {
-                        break;
-                    }
+    /// (#1596) A consumer that disconnects during a QUIET period must
+    /// still terminate the producer task. `SendOutcome::Closed` — the
+    /// only other disconnect exit — is observable solely while
+    /// producing, so before the `tx.is_closed()` guard a closed tab on
+    /// an idle stream left the task looping `XREAD BLOCK 500` and
+    /// opening a fresh Redis connection every ~500ms for the daemon's
+    /// lifetime: one zombie per ordinary open-then-close of the
+    /// dashboard. The task is spawned HERE (not via `redis_tail_lines`)
+    /// exactly so its exit is assertable — the production wrapper
+    /// discards the JoinHandle.
+    #[tokio::test]
+    #[serial]
+    async fn redis_tail_task_exits_when_consumer_drops_while_quiet() {
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        let redis = spawn_redis();
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(8);
+        let task = tokio::spawn(redis_tail_task(
+            tx,
+            redis.url.clone(),
+            "darkmux:flow".to_string(),
+            today_utc_date(),
+        ));
+        // Let it reach the XREAD loop, then disconnect with NOTHING
+        // having been produced — the quiet-stream shape.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(rx);
+        tokio::time::timeout(Duration::from_millis(3000), task)
+            .await
+            .expect("producer task must exit after the consumer drops — not loop forever")
+            .expect("task must not panic");
+    }
+
+    /// (#3432) A tail keeps its connection across `XREAD BLOCK` polls:
+    /// it opened a new one for every 500ms poll, per stream, per open
+    /// viewer (3.2 hub connects/s measured). Records still arrive on the
+    /// kept connection.
+    #[tokio::test]
+    #[serial]
+    async fn a_tail_keeps_one_connection_across_its_polls() {
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        let redis = spawn_redis();
+        let today = today_utc_date();
+        let mut conn = redis::Client::open(redis.url.as_str())
+            .unwrap()
+            .get_connection()
+            .unwrap();
+        let connects = |conn: &mut redis::Connection| -> u64 {
+            let info: String = redis::cmd("INFO").arg("stats").query(conn).unwrap();
+            info.lines()
+                .find_map(|l| l.strip_prefix("total_connections_received:"))
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+        let task = tokio::spawn(redis_tail_task(
+            tx,
+            redis.url.clone(),
+            "darkmux:flow".to_string(),
+            today.clone(),
+        ));
+        // Past the first poll's XINFO and connect.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let before = connects(&mut conn);
+        // Five or so quiet polls.
+        tokio::time::sleep(Duration::from_millis(2600)).await;
+        let after = connects(&mut conn);
+        xadd_flow_record(
+            &redis.url,
+            &format!(r#"{{"ts":"{today}T12:00:00Z","action":"kept"}}"#),
+        );
+        let got = tokio::time::timeout(Duration::from_millis(3000), rx.recv())
+            .await
+            .expect("a record within 3s");
+        assert_eq!(after - before, 0, "no new connection across quiet polls");
+        assert!(got.is_some_and(|s| s.contains("kept")));
+
+        // The hub drops the tail's connection: the next poll fails, the
+        // one after reopens once, and records arrive on the new one.
+        let before_kill = connects(&mut conn);
+        let _: u64 = redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("TYPE")
+            .arg("normal")
+            .arg("SKIPME")
+            .arg("yes")
+            .query(&mut conn)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        xadd_flow_record(
+            &redis.url,
+            &format!(r#"{{"ts":"{today}T12:00:01Z","action":"reopened"}}"#),
+        );
+        let got = tokio::time::timeout(Duration::from_millis(3000), rx.recv())
+            .await
+            .expect("a record after the reopen");
+        let reopens = connects(&mut conn) - before_kill - 1; // less the xadd helper's own connection
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_millis(3000), task).await;
+        assert!(got.is_some_and(|s| s.contains("reopened")));
+        assert_eq!(reopens, 1, "one reopen after the connection was dropped");
+    }
+
+    /// Records for OTHER dates are filtered out by the tail.
+    #[tokio::test]
+    #[serial]
+    async fn redis_tail_lines_filters_records_for_other_dates() {
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        let redis = spawn_redis();
+        let today = today_utc_date();
+
+        let stream = redis_tail_lines(
+            redis.url.clone(),
+            vec!["darkmux:flow".to_string()],
+            today.clone(),
+        );
+        tokio::pin!(stream);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // First XADD: other date — should be filtered out.
+        xadd_flow_record(
+            &redis.url,
+            r#"{"ts":"2020-01-01T12:00:00Z","action":"other-date"}"#,
+        );
+        // Second XADD: today — should be emitted.
+        let today_record = format!(r#"{{"ts":"{today}T12:00:00Z","action":"matching-date"}}"#);
+        xadd_flow_record(&redis.url, &today_record);
+
+        // First emit must be the matching-date one — other-date was
+        // dropped on the way through.
+        let got = next_line(&mut stream, Duration::from_millis(3000)).await;
+        assert!(
+            got.as_ref().is_some_and(|s| s.contains("matching-date")),
+            "expected matching-date record; got {got:?}"
+        );
+        assert!(
+            !got.as_ref().unwrap().contains("other-date"),
+            "other-date record must be filtered: {got:?}"
+        );
+    }
+
+    /// #293 — `redis_tail_lines` against a permanently-unreachable
+    /// Redis MUST eventually emit a synthetic `stream.error` record
+    /// and exit the spawned task. Pre-fix it retried forever (log
+    /// spam + leaked spawned tasks per open SSE connection); the
+    /// receiver-drop check only fired on a successful produce,
+    /// which never happens on permanent failure.
+    ///
+    /// Contract: after MAX_CONSECUTIVE_XREAD_FAILURES (10) failures
+    /// at 500ms backoff (≈5s wall-clock), the stream sends a
+    /// synthetic record with `action: "stream.error"` and the
+    /// receiver sees the channel close on its next `.next()`
+    /// after that record.
+    ///
+    /// **Coverage caveat**: this exercises the TCP-refuses-fast
+    /// path (127.0.0.1:1). The operator's actual Studio-offline
+    /// path is structurally similar (Tailscale-routed peer,
+    /// REDIS_CONNECT_TIMEOUT=500ms per connect → also ≈10s total
+    /// budget) but takes 2× longer per iteration. Both are
+    /// bounded by the 10s test budget, but only the
+    /// refused-connect case is DIRECTLY verified here — would
+    /// need a netem/tarpit fixture for the silent-timeout case.
+    #[tokio::test]
+    async fn redis_tail_lines_exits_after_persistent_xread_failures() {
+        use futures::StreamExt;
+        // 127.0.0.1:1 — privileged port; nothing listens. TCP
+        // refuses fast → XREAD errors fast → ~10 failures × 500ms
+        // ≈ 5s before the synthetic record + exit.
+        let stream = redis_tail_lines(
+            "redis://127.0.0.1:1".to_string(),
+            vec!["darkmux:flow".to_string()],
+            "2026-05-23".to_string(),
+        );
+        tokio::pin!(stream);
+
+        let read_synthetic = async {
+            while let Some(line) = stream.next().await {
+                if line.contains("\"stream.error\"") {
+                    return Some(line);
                 }
-                String::from_utf8_lossy(&acc).into_owned()
-            };
-            let got = tokio::time::timeout(Duration::from_secs(3), read_fut).await.unwrap_or_default();
-            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
-            assert!(got.contains("sse-telemetry-sample"), "the telemetry stream is not in the live view: {got:?}");
+            }
+            None
+        };
+        // Budget: MAX × 500ms backoff + slack = 10s wall.
+        let synthetic = tokio::time::timeout(Duration::from_secs(10), read_synthetic)
+            .await
+            .expect("redis_tail_lines should emit synthetic + exit within 10s");
+        assert!(
+            synthetic.is_some(),
+            "expected a stream.error synthetic record before the channel closed"
+        );
+        let line = synthetic.unwrap();
+        assert!(
+            line.contains("redis_tail_lines"),
+            "synthetic record's handle should name the source; got: {line}"
+        );
+        assert!(
+            line.contains("darkmux:flow"),
+            "synthetic record's reasoning should name the stream; got: {line}"
+        );
+
+        // The next pull should yield None (channel closed because
+        // the spawned task returned after emitting the synthetic).
+        let post = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("channel close should be observable within 2s of synthetic");
+        assert!(
+            post.is_none(),
+            "channel must close after the synthetic; got: {post:?}"
+        );
+    }
+
+    /// Handler-level smoke: GET /flow/<date>/stream with Redis URL set
+    /// returns 200 + content-type `text/event-stream` and surfaces an
+    /// XADD'd record as an SSE `data: ...` line. End-to-end coverage
+    /// for the integration path.
+    #[tokio::test]
+    #[serial]
+    async fn flow_stream_handler_uses_redis_when_url_set() {
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        let redis = spawn_redis();
+        let today = today_utc_date();
+        unsafe {
+            std::env::set_var("DARKMUX_REDIS_URL", &redis.url);
         }
 
-        /// On the Redis path, this machine's viewers still get what the hub
-        /// never carries, from the local day file: a lab run's records
-        /// (contract 3) and the 2 s generation heartbeats the hub rule keeps
-        /// local (#2101, #3210). A lab dispatch has no live channel either, so
-        /// before this its card moved only on the viewer's 20 s reconcile, and
-        /// a snapshot taken on turn 1's stream-open chunk read "— think tok/s"
-        /// for the whole 20 s. A record the hub does carry (work, a
-        /// prompt-phase heartbeat, a relayed generation beat) is written to the
-        /// file too, and reaches the viewer once, from Redis.
-        #[tokio::test]
-        #[serial]
-        async fn the_redis_flow_stream_also_sends_what_stays_off_the_hub_from_the_local_file() {
-            use futures::StreamExt;
-            use std::io::Write;
-            if !redis_server_available() {
-                eprintln!("skipping: redis-server not on PATH");
-                return;
-            }
-            let redis = spawn_redis();
-            let today = today_utc_date();
-            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url); }
-            let tmp = TempDir::new().unwrap();
-            let day_file = tmp.path().join(format!("{today}.jsonl"));
-            fs::write(&day_file, "").unwrap();
-            let app = build_router_local(tmp.path().to_path_buf());
-            let response = app
-                .oneshot(Request::builder().uri(format!("/flow/{today}/stream")).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let mut body = response.into_body().into_data_stream();
-            tokio::time::sleep(Duration::from_millis(300)).await;
+        let tmp = TempDir::new().unwrap();
+        let app = build_router_local(tmp.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/flow/{today}/stream"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-            let lab = "pepper-grinder-deep-1792325841-1.lab.adhoc.coder.pepper-grinder";
-            let work = "dispatch-coder-1792326044-38a8-0.adhoc.coder.thinkcap";
-            // The writers' real heartbeat shapes; `handle` marks each line.
-            let opener = r#"{"turn_seq":1,"cumulative_chars":0,"sampled_at_ms":1,"generated_chars":0,"prompt_chars":9000}"#;
-            let beat = r#"{"turn_seq":1,"partial_index":9,"cumulative_chars":0,"sampled_at_ms":2,"generated_chars":120}"#;
-            let relayed = r#"{"turn_seq":1,"partial_index":12,"cumulative_chars":0,"sampled_at_ms":3,"generated_chars":200,"hub_relay":true}"#;
-            let line = |action: &str, session: &str, marker: &str, payload: &str| {
-                format!(r#"{{"ts":"{today}T12:00:00Z","action":"{action}","session_id":"{session}","handle":"{marker}","payload":{payload}}}"#)
-            };
-            let hb = "dispatch.turn.heartbeat";
-            let on_hub = [
-                line("dispatch.turn", work, "work-turn", r#"{"turn_seq":1}"#),
-                line(hb, work, "work-opener", opener),
-                line(hb, work, "work-relayed", relayed),
-            ];
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "expected SSE content-type; got {content_type}"
+        );
+
+        // Pull the SSE body as a stream; XADD; look for the line.
+        use futures::StreamExt;
+        let mut body = response.into_body().into_data_stream();
+
+        // Give the handler a beat to probe Redis + start XREAD.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let record = format!(r#"{{"ts":"{today}T12:00:00Z","action":"sse-redis-end-to-end"}}"#);
+        xadd_flow_record(&redis.url, &record);
+
+        // Read up to 3s waiting for the SSE chunk that includes the line.
+        let read_fut = async {
+            let mut acc = Vec::new();
+            while let Some(Ok(chunk)) = body.next().await {
+                acc.extend_from_slice(&chunk);
+                let s = String::from_utf8_lossy(&acc);
+                if s.contains("sse-redis-end-to-end") {
+                    return s.into_owned();
+                }
+            }
+            String::from_utf8_lossy(&acc).into_owned()
+        };
+        let got = tokio::time::timeout(Duration::from_secs(3), read_fut)
+            .await
+            .unwrap_or_default();
+
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+        }
+
+        assert!(
+            got.contains("sse-redis-end-to-end"),
+            "expected XADD'd record to surface as SSE event; got: {got:?}"
+        );
+    }
+
+    /// (#2101) The live view the handler serves includes the telemetry
+    /// stream: a machine sample XADDed to `<stream>:telemetry` surfaces as
+    /// an SSE event. Dropping the stream from the handler's list left every
+    /// other test green.
+    #[tokio::test]
+    #[serial]
+    async fn flow_stream_handler_carries_the_telemetry_stream() {
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        let redis = spawn_redis();
+        let today = today_utc_date();
+        unsafe {
+            std::env::set_var("DARKMUX_REDIS_URL", &redis.url);
+        }
+        let tmp = TempDir::new().unwrap();
+        let app = build_router_local(tmp.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/flow/{today}/stream"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        use futures::StreamExt;
+        let mut body = response.into_body().into_data_stream();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let client = redis::Client::open(redis.url.as_str()).unwrap();
+        let mut conn = client.get_connection().unwrap();
+        let record = format!(r#"{{"ts":"{today}T12:00:00Z","action":"sse-telemetry-sample"}}"#);
+        let _: String = redis::cmd("XADD")
+            .arg(TELEMETRY_STREAM)
+            .arg("*")
+            .arg("schema")
+            .arg("2.0.0")
+            .arg("record")
+            .arg(&record)
+            .query(&mut conn)
+            .unwrap();
+        let read_fut = async {
+            let mut acc = Vec::new();
+            while let Some(Ok(chunk)) = body.next().await {
+                acc.extend_from_slice(&chunk);
+                if String::from_utf8_lossy(&acc).contains("sse-telemetry-sample") {
+                    break;
+                }
+            }
+            String::from_utf8_lossy(&acc).into_owned()
+        };
+        let got = tokio::time::timeout(Duration::from_secs(3), read_fut)
+            .await
+            .unwrap_or_default();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+        }
+        assert!(
+            got.contains("sse-telemetry-sample"),
+            "the telemetry stream is not in the live view: {got:?}"
+        );
+    }
+
+    /// On the Redis path, this machine's viewers still get what the hub
+    /// never carries, from the local day file: a lab run's records
+    /// (contract 3) and the 2 s generation heartbeats the hub rule keeps
+    /// local (#2101, #3210). A lab dispatch has no live channel either, so
+    /// before this its card moved only on the viewer's 20 s reconcile, and
+    /// a snapshot taken on turn 1's stream-open chunk read "— think tok/s"
+    /// for the whole 20 s. A record the hub does carry (work, a
+    /// prompt-phase heartbeat, a relayed generation beat) is written to the
+    /// file too, and reaches the viewer once, from Redis.
+    #[tokio::test]
+    #[serial]
+    async fn the_redis_flow_stream_also_sends_what_stays_off_the_hub_from_the_local_file() {
+        use futures::StreamExt;
+        use std::io::Write;
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        let redis = spawn_redis();
+        let today = today_utc_date();
+        unsafe {
+            std::env::set_var("DARKMUX_REDIS_URL", &redis.url);
+        }
+        let tmp = TempDir::new().unwrap();
+        let day_file = tmp.path().join(format!("{today}.jsonl"));
+        fs::write(&day_file, "").unwrap();
+        let app = build_router_local(tmp.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/flow/{today}/stream"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let lab = "pepper-grinder-deep-1792325841-1.lab.adhoc.coder.pepper-grinder";
+        let work = "dispatch-coder-1792326044-38a8-0.adhoc.coder.thinkcap";
+        // The writers' real heartbeat shapes; `handle` marks each line.
+        let opener = r#"{"turn_seq":1,"cumulative_chars":0,"sampled_at_ms":1,"generated_chars":0,"prompt_chars":9000}"#;
+        let beat = r#"{"turn_seq":1,"partial_index":9,"cumulative_chars":0,"sampled_at_ms":2,"generated_chars":120}"#;
+        let relayed = r#"{"turn_seq":1,"partial_index":12,"cumulative_chars":0,"sampled_at_ms":3,"generated_chars":200,"hub_relay":true}"#;
+        let line = |action: &str, session: &str, marker: &str, payload: &str| {
+            format!(
+                r#"{{"ts":"{today}T12:00:00Z","action":"{action}","session_id":"{session}","handle":"{marker}","payload":{payload}}}"#
+            )
+        };
+        let hb = "dispatch.turn.heartbeat";
+        let on_hub = [
+            line("dispatch.turn", work, "work-turn", r#"{"turn_seq":1}"#),
+            line(hb, work, "work-opener", opener),
+            line(hb, work, "work-relayed", relayed),
+        ];
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&day_file).unwrap();
+            for l in [
+                line(hb, lab, "lab-beat", beat),
+                line(hb, lab, "lab-opener", opener),
+                line("dispatch.turn", lab, "lab-turn", r#"{"turn_seq":1}"#),
+                line(hb, work, "work-beat", beat),
+            ]
+            .iter()
+            .chain(on_hub.iter())
             {
-                let mut f = fs::OpenOptions::new().append(true).open(&day_file).unwrap();
-                for l in [
-                    line(hb, lab, "lab-beat", beat),
-                    line(hb, lab, "lab-opener", opener),
-                    line("dispatch.turn", lab, "lab-turn", r#"{"turn_seq":1}"#),
-                    line(hb, work, "work-beat", beat),
-                ]
-                .iter()
-                .chain(on_hub.iter())
-                {
-                    writeln!(f, "{l}").unwrap();
-                }
-            }
-            for l in &on_hub {
-                xadd_flow_record(&redis.url, l);
-            }
-
-            let wanted = ["lab-beat", "lab-opener", "lab-turn", "work-beat", "work-turn", "work-opener", "work-relayed"];
-            let mut seen = String::new();
-            let _ = tokio::time::timeout(Duration::from_secs(4), async {
-                while let Some(Ok(chunk)) = body.next().await {
-                    seen.push_str(&String::from_utf8_lossy(&chunk));
-                    if wanted.iter().all(|m| seen.contains(&format!("\"{m}\""))) {
-                        break;
-                    }
-                }
-            })
-            .await;
-            // Long enough for another file poll: a duplicate would land by now.
-            let _ = tokio::time::timeout(Duration::from_millis(700), async {
-                while let Some(Ok(chunk)) = body.next().await {
-                    seen.push_str(&String::from_utf8_lossy(&chunk));
-                }
-            })
-            .await;
-            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
-
-            for m in wanted {
-                assert_eq!(seen.matches(&format!("\"{m}\"")).count(), 1, "`{m}` reaches the viewer exactly once: {seen:?}");
+                writeln!(f, "{l}").unwrap();
             }
         }
+        for l in &on_hub {
+            xadd_flow_record(&redis.url, l);
+        }
 
-        /// (#3122, through the real route) When the hub tail gives up (Redis
-        /// gone: `MAX_CONSECUTIVE_XREAD_FAILURES` failures, 500 ms apart), the
-        /// response ends, so the browser reconnects onto the file tail. The
-        /// local-file fill on the Redis path never ends on its own and must
-        /// not hold the response open.
-        #[tokio::test]
-        #[serial]
-        async fn the_redis_flow_stream_ends_when_redis_goes_away() {
-            use futures::StreamExt;
-            if !redis_server_available() {
-                eprintln!("skipping: redis-server not on PATH");
-                return;
-            }
-            let mut redis = spawn_redis();
-            let today = today_utc_date();
-            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url); }
-            let tmp = TempDir::new().unwrap();
-            fs::write(tmp.path().join(format!("{today}.jsonl")), "").unwrap();
-            let app = build_router_local(tmp.path().to_path_buf());
-            let response = app
-                .oneshot(Request::builder().uri(format!("/flow/{today}/stream")).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let mut body = response.into_body().into_data_stream();
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            redis.child.kill().unwrap();
-            let _ = redis.child.wait();
-            let mut seen = String::new();
-            let ended = tokio::time::timeout(Duration::from_secs(15), async {
-                while let Some(chunk) = body.next().await {
-                    if let Ok(c) = chunk {
-                        seen.push_str(&String::from_utf8_lossy(&c));
-                    }
+        let wanted = [
+            "lab-beat",
+            "lab-opener",
+            "lab-turn",
+            "work-beat",
+            "work-turn",
+            "work-opener",
+            "work-relayed",
+        ];
+        let mut seen = String::new();
+        let _ = tokio::time::timeout(Duration::from_secs(4), async {
+            while let Some(Ok(chunk)) = body.next().await {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+                if wanted.iter().all(|m| seen.contains(&format!("\"{m}\""))) {
+                    break;
                 }
-            })
-            .await;
-            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
-            assert!(ended.is_ok(), "the response stayed open after the hub tail gave up: {seen:?}");
+            }
+        })
+        .await;
+        // Long enough for another file poll: a duplicate would land by now.
+        let _ = tokio::time::timeout(Duration::from_millis(700), async {
+            while let Some(Ok(chunk)) = body.next().await {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        })
+        .await;
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
         }
 
-        /// (#2101) The session replay (`/flow-dispatch/:id`) reads the
-        /// telemetry stream: a peer's host sample on the hub lands in the run's
-        /// record set, which is what its SYSTEM pane draws. Reading the work
-        /// stream alone blanks that pane with no error.
-        #[tokio::test]
-        #[serial]
-        async fn a_dispatch_replay_carries_the_peers_host_samples_from_the_hub() {
-            if !redis_server_available() {
-                eprintln!("skipping: redis-server not on PATH");
-                return;
-            }
-            let redis = spawn_redis();
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-            let ts = |ago: i64| darkmux_flow::ts_utc_at(now - ago);
-            let add = |stream: &str, json: String| {
-                let client = redis::Client::open(redis.url.as_str()).unwrap();
-                let mut conn = client.get_connection().unwrap();
-                let _: String = redis::cmd("XADD").arg(stream).arg("*").arg("schema").arg("2.0.0").arg("record").arg(json).query(&mut conn).unwrap();
-            };
-            let rec = |action: &str, ago: i64| {
-                format!(r#"{{"ts":"{}","action":"{action}","session_id":"sess-peer","machine_uid":"UID-PEER","handle":"h"}}"#, ts(ago))
-            };
-            add(WORK_STREAM, rec("dispatch.start", 60));
-            add(WORK_STREAM, rec("dispatch.complete", 20));
-            add(TELEMETRY_STREAM, format!(r#"{{"ts":"{}","action":"machine.telemetry","machine_uid":"UID-PEER","handle":"sample"}}"#, ts(40)));
-            unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url); }
-            let tmp = TempDir::new().unwrap();
-            let app = build_router_local(tmp.path().to_path_buf());
-            let response = app
-                .oneshot(Request::builder().uri("/flow-dispatch/sess-peer").body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            unsafe { std::env::remove_var("DARKMUX_REDIS_URL"); }
-            let arr = body_as_array(response).await;
-            let actions: Vec<&str> = arr.iter().filter_map(|r| r["action"].as_str()).collect();
-            assert!(actions.contains(&"machine.telemetry"), "the peer's host sample is missing from its run's records: {actions:?}");
-            assert!(actions.contains(&"dispatch.start"), "{actions:?}");
+        for m in wanted {
+            assert_eq!(
+                seen.matches(&format!("\"{m}\"")).count(),
+                1,
+                "`{m}` reaches the viewer exactly once: {seen:?}"
+            );
         }
+    }
 
-        /// (#2101) The call site of the tail supervisor: a stream whose task
-        /// spends its failure budget (a key of the wrong type errors every
-        /// XREAD) must close the whole tail, though the other stream is
-        /// healthy, so the client reconnects. A detached task would leave the
-        /// SSE open on one stream only.
-        #[tokio::test]
-        #[serial]
-        async fn a_tail_that_loses_one_stream_closes_instead_of_staying_half_alive() {
-            if !redis_server_available() {
-                eprintln!("skipping: redis-server not on PATH");
-                return;
+    /// (#3122, through the real route) When the hub tail gives up (Redis
+    /// gone: `MAX_CONSECUTIVE_XREAD_FAILURES` failures, 500 ms apart), the
+    /// response ends, so the browser reconnects onto the file tail. The
+    /// local-file fill on the Redis path never ends on its own and must
+    /// not hold the response open.
+    #[tokio::test]
+    #[serial]
+    async fn the_redis_flow_stream_ends_when_redis_goes_away() {
+        use futures::StreamExt;
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        let mut redis = spawn_redis();
+        let today = today_utc_date();
+        unsafe {
+            std::env::set_var("DARKMUX_REDIS_URL", &redis.url);
+        }
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(format!("{today}.jsonl")), "").unwrap();
+        let app = build_router_local(tmp.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/flow/{today}/stream"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        redis.child.kill().unwrap();
+        let _ = redis.child.wait();
+        let mut seen = String::new();
+        let ended = tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(chunk) = body.next().await {
+                if let Ok(c) = chunk {
+                    seen.push_str(&String::from_utf8_lossy(&c));
+                }
             }
-            use futures::StreamExt;
-            let redis = spawn_redis();
+        })
+        .await;
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+        }
+        assert!(
+            ended.is_ok(),
+            "the response stayed open after the hub tail gave up: {seen:?}"
+        );
+    }
+
+    /// (#2101) The session replay (`/flow-dispatch/:id`) reads the
+    /// telemetry stream: a peer's host sample on the hub lands in the run's
+    /// record set, which is what its SYSTEM pane draws. Reading the work
+    /// stream alone blanks that pane with no error.
+    #[tokio::test]
+    #[serial]
+    async fn a_dispatch_replay_carries_the_peers_host_samples_from_the_hub() {
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        let redis = spawn_redis();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ts = |ago: i64| darkmux_flow::ts_utc_at(now - ago);
+        let add = |stream: &str, json: String| {
             let client = redis::Client::open(redis.url.as_str()).unwrap();
             let mut conn = client.get_connection().unwrap();
-            let _: () = redis::cmd("SET").arg("not-a-stream").arg("x").query(&mut conn).unwrap();
-            let stream = redis_tail_lines(
-                redis.url.clone(),
-                vec![WORK_STREAM.to_string(), "not-a-stream".to_string()],
-                today_utc_date(),
-            );
-            tokio::pin!(stream);
-            // 10 failures x 500ms of backoff, then the synthetic record, then close.
-            let drained = tokio::time::timeout(Duration::from_secs(20), async { while stream.next().await.is_some() {} }).await;
-            assert!(drained.is_ok(), "the tail stayed open on the healthy stream after the other stream's task ended");
+            let _: String = redis::cmd("XADD")
+                .arg(stream)
+                .arg("*")
+                .arg("schema")
+                .arg("2.0.0")
+                .arg("record")
+                .arg(json)
+                .query(&mut conn)
+                .unwrap();
+        };
+        let rec = |action: &str, ago: i64| {
+            format!(
+                r#"{{"ts":"{}","action":"{action}","session_id":"sess-peer","machine_uid":"UID-PEER","handle":"h"}}"#,
+                ts(ago)
+            )
+        };
+        add(WORK_STREAM, rec("dispatch.start", 60));
+        add(WORK_STREAM, rec("dispatch.complete", 20));
+        add(
+            TELEMETRY_STREAM,
+            format!(
+                r#"{{"ts":"{}","action":"machine.telemetry","machine_uid":"UID-PEER","handle":"sample"}}"#,
+                ts(40)
+            ),
+        );
+        unsafe {
+            std::env::set_var("DARKMUX_REDIS_URL", &redis.url);
+        }
+        let tmp = TempDir::new().unwrap();
+        let app = build_router_local(tmp.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/flow-dispatch/sess-peer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+        }
+        let arr = body_as_array(response).await;
+        let actions: Vec<&str> = arr.iter().filter_map(|r| r["action"].as_str()).collect();
+        assert!(
+            actions.contains(&"machine.telemetry"),
+            "the peer's host sample is missing from its run's records: {actions:?}"
+        );
+        assert!(actions.contains(&"dispatch.start"), "{actions:?}");
+    }
+
+    /// (#2101) The call site of the tail supervisor: a stream whose task
+    /// spends its failure budget (a key of the wrong type errors every
+    /// XREAD) must close the whole tail, though the other stream is
+    /// healthy, so the client reconnects. A detached task would leave the
+    /// SSE open on one stream only.
+    #[tokio::test]
+    #[serial]
+    async fn a_tail_that_loses_one_stream_closes_instead_of_staying_half_alive() {
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        use futures::StreamExt;
+        let redis = spawn_redis();
+        let client = redis::Client::open(redis.url.as_str()).unwrap();
+        let mut conn = client.get_connection().unwrap();
+        let _: () = redis::cmd("SET")
+            .arg("not-a-stream")
+            .arg("x")
+            .query(&mut conn)
+            .unwrap();
+        let stream = redis_tail_lines(
+            redis.url.clone(),
+            vec![WORK_STREAM.to_string(), "not-a-stream".to_string()],
+            today_utc_date(),
+        );
+        tokio::pin!(stream);
+        // 10 failures x 500ms of backoff, then the synthetic record, then close.
+        let drained = tokio::time::timeout(Duration::from_secs(20), async {
+            while stream.next().await.is_some() {}
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "the tail stayed open on the healthy stream after the other stream's task ended"
+        );
+    }
+
+    /// (#2101) When one stream's tail task ends, the others are stopped
+    /// and the channel closes, so the client reconnects instead of sitting
+    /// on a tail that silently lost a whole stream.
+    #[tokio::test]
+    async fn one_tail_task_ending_closes_the_channel() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
+        let mut tasks = tokio::task::JoinSet::new();
+        let forever = tx.clone();
+        tasks.spawn(async move {
+            let _held = forever;
+            std::future::pending::<()>().await;
+        });
+        tasks.spawn(async {});
+        drop(tx);
+        tokio::spawn(super::end_tail_when_any_task_ends(tasks));
+        let closed = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await;
+        assert!(
+            matches!(closed, Ok(None)),
+            "the channel must close once any task ends: {closed:?}"
+        );
+    }
+
+    // ─── #1466 gate MUST FIX 4: `mission_graph_json_handler` proxying
+    // a live peer's graph end-to-end — RELOCATED, not deleted ───────
+    //
+    // This in-process test used to live here (`mission_graph_json_
+    // handler_proxies_a_live_peers_graph`), gated on the SAME
+    // `redis_server_available()` this file's other Redis-needing
+    // tests use. That guard is exactly the problem: the only workflow
+    // job that runs this crate's tests is `build-test-lint` (macOS,
+    // `cargo test --workspace`), and that job installs no redis-server
+    // — so on every CI run since this test landed, it reported `ok`
+    // without ever executing a single assertion (the same defect
+    // class `ci.yml`'s own header memorializes for the `fleet-e2e`
+    // job, #1662, and the same SHAPE as #975 — a broken path riding
+    // four releases of green CI because nothing ever ran the real
+    // thing).
+    //
+    // Moved to `tests/e2e_mission_graph_peer_proxy.rs` — a binary
+    // under `tests/e2e_*.rs`, which the `fleet-e2e` job (ubuntu-latest,
+    // apt-installed redis, `DARKMUX_E2E_REQUIRED=1`) runs with the
+    // skip converted into a HARD FAILURE. `peer_graph`'s own unit
+    // tests (`crates/darkmux-serve/src/peer_graph.rs`) still
+    // exhaustively cover the decision logic with no Redis needed; the
+    // e2e binary is the ONE proof that the real, non-injected
+    // production wiring — two real daemon PROCESSES, real Redis, a
+    // real roster file, a real loopback HTTP call between them —
+    // actually composes end to end, at a gate that cannot silently
+    // skip.
+
+    /// (#3432) The daemon's presence readers share one read of each key
+    /// space per [`PRESENCE_CACHE_TTL`]: `/fleet/machines/live`,
+    /// `/fleet/dispatches/live` and `/runs`' live-session read each opened
+    /// a connection and ran a `SCAN` plus a `GET` per beat, on every
+    /// request (5.85 hub connects/s measured, about 2/s of them presence).
+    /// Each read is one connection, one `SCAN` and one `MGET`.
+    #[tokio::test]
+    #[serial]
+    async fn the_presence_readers_share_one_read_per_key_space() {
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        let redis = spawn_redis();
+        let mut conn = redis::Client::open(redis.url.as_str())
+            .unwrap()
+            .get_connection()
+            .unwrap();
+        let now = darkmux_flow::presence::now_ms();
+        for uid in ["UID-A", "UID-B"] {
+            let beat = serde_json::json!({ "machine_uid": uid, "display_name": uid, "schema_version": "1", "beat_ts_ms": now });
+            let _: () = redis::cmd("SET")
+                .arg(darkmux_flow::presence::presence_key(uid))
+                .arg(beat.to_string())
+                .arg("EX")
+                .arg(60)
+                .query(&mut conn)
+                .unwrap();
+        }
+        for sid in ["S-1", "S-2", "S-3"] {
+            let beat = serde_json::json!({ "session_id": sid, "display_name": "laptop", "beat_ts_ms": now, "mission_id": "M-1" });
+            let _: () = redis::cmd("SET")
+                .arg(darkmux_flow::session_presence::session_key(sid))
+                .arg(beat.to_string())
+                .arg("EX")
+                .arg(60)
+                .query(&mut conn)
+                .unwrap();
+        }
+        let stat = |conn: &mut redis::Connection, name: &str| -> u64 {
+            let info: String = redis::cmd("INFO").arg("all").query(conn).unwrap();
+            info.lines()
+                .find_map(|l| l.strip_prefix(name))
+                .and_then(|rest| rest.trim_start_matches(':').split([',', '\r']).next())
+                .map(|v| v.trim_start_matches("calls="))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0)
+        };
+        let (connects0, gets0) = (
+            stat(&mut conn, "total_connections_received"),
+            stat(&mut conn, "cmdstat_get:"),
+        );
+        unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url) };
+        let tmp = TempDir::new().unwrap();
+        let get = |uri: &'static str| {
+            let app = build_router_local(tmp.path().to_path_buf());
+            async move {
+                let response = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+        let machines = get("/fleet/machines/live").await;
+        let dispatches = get("/fleet/dispatches/live").await;
+        let again = (
+            get("/fleet/machines/live").await,
+            get("/fleet/dispatches/live").await,
+        );
+        let live = tokio::task::spawn_blocking(super::super::live_session_ids)
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+        let (connects, gets) = (
+            stat(&mut conn, "total_connections_received") - connects0,
+            stat(&mut conn, "cmdstat_get:") - gets0,
+        );
+        assert_eq!(
+            machines["machines"].as_array().map(Vec::len),
+            Some(2),
+            "{machines}"
+        );
+        assert_eq!(
+            dispatches["dispatches"].as_array().map(Vec::len),
+            Some(3),
+            "{dispatches}"
+        );
+        assert_eq!(
+            (&again.0, &again.1),
+            (&machines, &dispatches),
+            "served from the same reads"
+        );
+        assert_eq!(
+            live.map(|s| s.len()),
+            Some(4),
+            "three sessions and their mission"
+        );
+        assert_eq!(connects, 2, "one connection per key space for five reads");
+        assert_eq!(gets, 0, "beats come back in one MGET, not a GET each");
+    }
+
+    /// (#3432 review) The shared presence read is the last one from THIS
+    /// hub: another hub URL reads afresh, and so does a `FRESH` read (it
+    /// sees a beat written after the snapshot, which a shared read inside
+    /// the TTL does not).
+    #[test]
+    #[serial]
+    fn a_shared_presence_read_is_this_hubs_and_a_fresh_one_reads_anew() {
+        if !redis_server_available() {
+            eprintln!("skipping: redis-server not on PATH");
+            return;
+        }
+        use super::super::{session_beats, PresenceRead};
+        let (a, b) = (spawn_redis(), spawn_redis());
+        let beat = |url: &str, sid: &str| {
+            let mut conn = redis::Client::open(url).unwrap().get_connection().unwrap();
+            let json = serde_json::json!({ "session_id": sid, "display_name": "laptop", "beat_ts_ms": darkmux_flow::presence::now_ms() });
+            let _: () = redis::cmd("SET")
+                .arg(darkmux_flow::session_presence::session_key(sid))
+                .arg(json.to_string())
+                .arg("EX")
+                .arg(60)
+                .query(&mut conn)
+                .unwrap();
+        };
+        let ids = |r: (Vec<darkmux_flow::session_presence::SessionBeat>, _)| {
+            let mut v: Vec<String> = r.0.into_iter().map(|b| b.session_id).collect();
+            v.sort();
+            v
+        };
+        let url = |s: &str| darkmux_flow::RawRedisUrl::new(s.to_string());
+        beat(&a.url, "S-a");
+        beat(&b.url, "S-b");
+        assert_eq!(
+            ids(session_beats(&url(&a.url), PresenceRead::QUIET)),
+            ["S-a"]
+        );
+        assert_eq!(
+            ids(session_beats(&url(&b.url), PresenceRead::QUIET)),
+            ["S-b"],
+            "another hub is another read"
+        );
+        beat(&b.url, "S-b2");
+        assert_eq!(
+            ids(session_beats(&url(&b.url), PresenceRead::QUIET)),
+            ["S-b"],
+            "inside the TTL: the shared read"
+        );
+        assert_eq!(
+            ids(session_beats(&url(&b.url), PresenceRead::FRESH)),
+            ["S-b", "S-b2"],
+            "a fresh read sees the new beat"
+        );
+    }
+
+    /// (#3432) A failed presence read is kept for the TTL too, so a hub
+    /// that accepts and drops costs one attempt per TTL, not one per
+    /// request.
+    #[test]
+    #[serial]
+    fn a_failed_presence_read_is_kept_for_the_ttl() {
+        use super::super::{machine_beats, PresenceRead};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted = accepts.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                drop(stream);
+            }
+        });
+        let url = darkmux_flow::RawRedisUrl::new(format!("redis://127.0.0.1:{port}"));
+        let first = machine_beats(&url, PresenceRead::QUIET);
+        let second = machine_beats(&url, PresenceRead::QUIET);
+        assert!(matches!(
+            first.1,
+            crate::source_state::SourceState::Unavailable { .. }
+        ));
+        assert_eq!(first.1, second.1);
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one attempt for both reads"
+        );
+    }
+
+    // ─── #3217 the fleet window is read incrementally ───────────────
+    //
+    // `/runs`, `/flow-missions` and the catalog routes share one cached
+    // read of the hub's streams. These drive that read through
+    // `read_fleet_cached` with their own cache, an explicit clock (no
+    // sleeps, no fixed timestamps against the scan window) and this
+    // test's own `redis-server`, and count entry parses with
+    // `STREAM_ENTRY_PARSES` rather than timing anything.
+    mod fleet_window_reads {
+        use super::*;
+        use crate::fleet_fixture;
+        use std::time::{Duration, SystemTime};
+
+        fn now_secs() -> u64 {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
         }
 
-        /// (#2101) When one stream's tail task ends, the others are stopped
-        /// and the channel closes, so the client reconnects instead of sitting
-        /// on a tail that silently lost a whole stream.
-        #[tokio::test]
-        async fn one_tail_task_ending_closes_the_channel() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
-            let mut tasks = tokio::task::JoinSet::new();
-            let forever = tx.clone();
-            tasks.spawn(async move {
-                let _held = forever;
-                std::future::pending::<()>().await;
-            });
-            tasks.spawn(async {});
-            drop(tx);
-            tokio::spawn(super::end_tail_when_any_task_ends(tasks));
-            let closed = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await;
-            assert!(matches!(closed, Ok(None)), "the channel must close once any task ends: {closed:?}");
+        fn parses() -> u64 {
+            crate::fleet_window::STREAM_ENTRY_PARSES.load(std::sync::atomic::Ordering::Relaxed)
         }
 
-        // ─── #1466 gate MUST FIX 4: `mission_graph_json_handler` proxying
-        // a live peer's graph end-to-end — RELOCATED, not deleted ───────
-        //
-        // This in-process test used to live here (`mission_graph_json_
-        // handler_proxies_a_live_peers_graph`), gated on the SAME
-        // `redis_server_available()` this file's other Redis-needing
-        // tests use. That guard is exactly the problem: the only workflow
-        // job that runs this crate's tests is `build-test-lint` (macOS,
-        // `cargo test --workspace`), and that job installs no redis-server
-        // — so on every CI run since this test landed, it reported `ok`
-        // without ever executing a single assertion (the same defect
-        // class `ci.yml`'s own header memorializes for the `fleet-e2e`
-        // job, #1662, and the same SHAPE as #975 — a broken path riding
-        // four releases of green CI because nothing ever ran the real
-        // thing).
-        //
-        // Moved to `tests/e2e_mission_graph_peer_proxy.rs` — a binary
-        // under `tests/e2e_*.rs`, which the `fleet-e2e` job (ubuntu-latest,
-        // apt-installed redis, `DARKMUX_E2E_REQUIRED=1`) runs with the
-        // skip converted into a HARD FAILURE. `peer_graph`'s own unit
-        // tests (`crates/darkmux-serve/src/peer_graph.rs`) still
-        // exhaustively cover the decision logic with no Redis needed; the
-        // e2e binary is the ONE proof that the real, non-injected
-        // production wiring — two real daemon PROCESSES, real Redis, a
-        // real roster file, a real loopback HTTP call between them —
-        // actually composes end to end, at a gate that cannot silently
-        // skip.
+        fn conn(url: &str) -> redis::Connection {
+            redis::Client::open(url)
+                .expect("client")
+                .get_connection()
+                .expect("conn")
+        }
 
-        /// (#3432) The daemon's presence readers share one read of each key
-        /// space per [`PRESENCE_CACHE_TTL`]: `/fleet/machines/live`,
-        /// `/fleet/dispatches/live` and `/runs`' live-session read each opened
-        /// a connection and ran a `SCAN` plus a `GET` per beat, on every
-        /// request (5.85 hub connects/s measured, about 2/s of them presence).
-        /// Each read is one connection, one `SCAN` and one `MGET`.
-        #[tokio::test]
+        fn xadd_all(url: &str, stream: &str, records: &[serde_json::Value]) {
+            let mut pipe = redis::pipe();
+            for r in records {
+                pipe.cmd("XADD")
+                    .arg(stream)
+                    .arg("*")
+                    .arg("schema")
+                    .arg("1.8.0")
+                    .arg("record")
+                    .arg(r.to_string())
+                    .ignore();
+            }
+            let () = pipe.query(&mut conn(url)).expect("XADD pipeline");
+        }
+
+        fn xadd_with_id(url: &str, stream: &str, id: &str, record: &serde_json::Value) {
+            let _: String = redis::cmd("XADD")
+                .arg(stream)
+                .arg(id)
+                .arg("record")
+                .arg(record.to_string())
+                .query(&mut conn(url))
+                .expect("XADD with id");
+        }
+
+        /// The records a read holds, in the full form the catalog routes
+        /// serve.
+        fn values(read: &FleetRead) -> Vec<serde_json::Value> {
+            read.records.iter().map(|r| r.full()).collect()
+        }
+
+        /// What a cold, uncached read of the hub returns now: the truth an
+        /// incremental read must equal.
+        fn fresh(url: &str, scope: FleetScope) -> Vec<serde_json::Value> {
+            super::super::read_flow_records_from_redis(url, None, scope)
+                .expect("fresh read")
+                .records
+        }
+
+        fn read_at(
+            caches: &FleetCaches,
+            url: &str,
+            scope: FleetScope,
+            at: SystemTime,
+        ) -> FleetRead {
+            let url = url.to_string();
+            read_fleet_cached(caches, scope, at, move || {
+                Some(darkmux_flow::RawRedisUrl::new(url))
+            })
+        }
+
+        /// (a) A second read inside the cache window, and another after it
+        /// with nothing new on the stream, parse nothing: the window is
+        /// already held.
+        #[test]
         #[serial]
-        async fn the_presence_readers_share_one_read_per_key_space() {
+        fn a_repeated_read_does_not_parse_entries_it_already_holds() {
             if !redis_server_available() {
                 eprintln!("skipping: redis-server not on PATH");
                 return;
             }
             let redis = spawn_redis();
-            let mut conn = redis::Client::open(redis.url.as_str()).unwrap().get_connection().unwrap();
-            let now = darkmux_flow::presence::now_ms();
-            for uid in ["UID-A", "UID-B"] {
-                let beat = serde_json::json!({ "machine_uid": uid, "display_name": uid, "schema_version": "1", "beat_ts_ms": now });
-                let _: () = redis::cmd("SET").arg(darkmux_flow::presence::presence_key(uid)).arg(beat.to_string()).arg("EX").arg(60).query(&mut conn).unwrap();
+            xadd_all(
+                &redis.url,
+                WORK_STREAM,
+                &fleet_fixture::realistic_records(50, now_secs()),
+            );
+            let caches = FleetCaches::default();
+            let t0 = SystemTime::now();
+            let first = read_at(&caches, &redis.url, FleetScope::Work, t0);
+            assert_eq!(first.records.len(), 50);
+            // Inside the cache window the hub is not asked at all: an
+            // entry added meanwhile is not seen until the window expires.
+            xadd_all(
+                &redis.url,
+                WORK_STREAM,
+                &fleet_fixture::realistic_records(1, now_secs()),
+            );
+            let before = parses();
+            let within = read_at(
+                &caches,
+                &redis.url,
+                FleetScope::Work,
+                t0 + Duration::from_millis(500),
+            );
+            assert_eq!(
+                values(&within),
+                values(&first),
+                "a read inside the cache window went to the hub"
+            );
+            let after = read_at(
+                &caches,
+                &redis.url,
+                FleetScope::Work,
+                t0 + Duration::from_secs(10),
+            );
+            assert_eq!(
+                parses() - before,
+                1,
+                "a repeated read re-parsed entries it already held"
+            );
+            assert_eq!(values(&after), fresh(&redis.url, FleetScope::Work));
+            assert_eq!(after.state, source_state::SourceState::Ok);
+        }
+
+        /// (b) Entries appended since the last read are picked up, and only
+        /// they are parsed.
+        #[test]
+        #[serial]
+        fn new_entries_are_read_and_only_they_are_parsed() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
             }
-            for sid in ["S-1", "S-2", "S-3"] {
-                let beat = serde_json::json!({ "session_id": sid, "display_name": "laptop", "beat_ts_ms": now, "mission_id": "M-1" });
-                let _: () = redis::cmd("SET").arg(darkmux_flow::session_presence::session_key(sid)).arg(beat.to_string()).arg("EX").arg(60).query(&mut conn).unwrap();
+            let redis = spawn_redis();
+            let records = fleet_fixture::realistic_records(53, now_secs());
+            xadd_all(&redis.url, WORK_STREAM, &records[..50]);
+            let caches = FleetCaches::default();
+            let t0 = SystemTime::now();
+            read_at(&caches, &redis.url, FleetScope::Work, t0);
+            xadd_all(&redis.url, WORK_STREAM, &records[50..]);
+            let before = parses();
+            let next = read_at(
+                &caches,
+                &redis.url,
+                FleetScope::Work,
+                t0 + Duration::from_secs(10),
+            );
+            assert_eq!(
+                parses() - before,
+                3,
+                "only the three new entries are parsed"
+            );
+            assert_eq!(next.records.len(), 53);
+            assert_eq!(values(&next), fresh(&redis.url, FleetScope::Work));
+        }
+
+        /// (#3431) A day served from the window is what a fresh day read
+        /// of the hub returns: the same records in the same order, the
+        /// samples merged in, the other day's records left out, and the
+        /// same cut, bounded or not. The fixture straddles a midnight at a
+        /// fixed time; nothing here reads the clock but the cache's `at`.
+        #[test]
+        #[serial]
+        fn a_day_from_the_window_equals_a_fresh_day_read_of_the_hub() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
             }
-            let stat = |conn: &mut redis::Connection, name: &str| -> u64 {
-                let info: String = redis::cmd("INFO").arg("all").query(conn).unwrap();
+            let redis = spawn_redis();
+            // 2026-10-28T00:05:00Z: forty records 15s apart span 23:55 to 00:05.
+            let base = 1_793_145_900;
+            let work = fleet_fixture::realistic_records(40, base);
+            let sample = |i: u64| serde_json::json!({ "ts": fleet_fixture::iso(base - 600 + i * 60), "action": "machine.telemetry", "machine_uid": "UID-STUDIO", "payload": { "cpu_pct": i } });
+            // Hub ids at each record's own time, so the cut is decided by
+            // the fixture, not by when the test runs.
+            let id_of = |r: &serde_json::Value, seq: usize| {
+                let ts = r["ts"].as_str().unwrap();
+                let secs = darkmux_flow::parse_ts_utc(ts).unwrap();
+                format!("{}-{seq}", secs * 1000)
+            };
+            // A stream id only grows, so a record stamped earlier than the
+            // one before it takes that one's millisecond.
+            let mut last_ms = 0u64;
+            for (i, r) in work.iter().enumerate() {
+                let ms: u64 = id_of(r, 0).trim_end_matches("-0").parse().unwrap();
+                last_ms = last_ms.max(ms);
+                xadd_with_id(&redis.url, WORK_STREAM, &format!("{last_ms}-{i}"), r);
+            }
+            for i in 0..10 {
+                let s = sample(i);
+                xadd_with_id(&redis.url, TELEMETRY_STREAM, &id_of(&s, 0), &s);
+            }
+            let caches = FleetCaches::default();
+            let t0 = SystemTime::now();
+            let both = read_at(&caches, &redis.url, FleetScope::WithSamples, t0);
+            let work_only = read_at(&caches, &redis.url, FleetScope::Work, t0);
+            for maxlen in ["0", "5"] {
+                unsafe { std::env::set_var("DARKMUX_REDIS_MAXLEN", maxlen) };
+                for date in ["2026-10-27", "2026-10-28", "2026-10-29"] {
+                    let want = super::super::read_flow_records_from_redis(
+                        &redis.url,
+                        Some(date),
+                        FleetScope::WithSamples,
+                    )
+                    .expect("fresh day read");
+                    let got =
+                        super::super::fleet_day_records(date, &both.records, &work_only.records);
+                    assert_eq!(got.records, want.records, "{date}, maxlen {maxlen}");
+                    assert_eq!(got.cut, want.cut, "{date}, maxlen {maxlen}");
+                }
+            }
+            unsafe { std::env::remove_var("DARKMUX_REDIS_MAXLEN") };
+            // Under the 5-entry bound the stream starts inside 10-27, so
+            // 10-27 may be cut and 10-28 (which it holds from midnight) is not.
+            unsafe { std::env::set_var("DARKMUX_REDIS_MAXLEN", "5") };
+            let cut =
+                |date| super::super::fleet_day_records(date, &both.records, &work_only.records).cut;
+            assert_eq!((cut("2026-10-27"), cut("2026-10-28")), (true, false));
+            unsafe { std::env::remove_var("DARKMUX_REDIS_MAXLEN") };
+            let day =
+                super::super::fleet_day_records("2026-10-28", &both.records, &work_only.records);
+            assert!(
+                day.records
+                    .iter()
+                    .any(|r| r["action"] == "machine.telemetry"),
+                "the day's samples are in it"
+            );
+            assert!(day.records.len() < 50, "the other day's records are not");
+        }
+
+        /// (#3431) `GET /flow/<date>` reads the hub through the shared
+        /// window: a second request inside the cache window asks the hub
+        /// for nothing, where each request used to `XREVRANGE` the whole
+        /// of both streams (~20 MB a call on the operator's hub).
+        #[tokio::test]
+        #[serial]
+        async fn a_repeated_day_request_does_not_read_the_hubs_window_again() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let redis = spawn_redis();
+            let now = now_secs();
+            xadd_all(
+                &redis.url,
+                WORK_STREAM,
+                &fleet_fixture::realistic_records(20, now),
+            );
+            let xrevranges = || -> u64 {
+                let info: String = redis::cmd("INFO")
+                    .arg("commandstats")
+                    .query(&mut conn(&redis.url))
+                    .unwrap();
                 info.lines()
-                    .find_map(|l| l.strip_prefix(name))
-                    .and_then(|rest| rest.trim_start_matches(':').split([',', '\r']).next())
-                    .map(|v| v.trim_start_matches("calls="))
+                    .find_map(|l| l.strip_prefix("cmdstat_xrevrange:calls="))
+                    .and_then(|rest| rest.split(',').next())
                     .and_then(|n| n.parse().ok())
                     .unwrap_or(0)
             };
-            let (connects0, gets0) = (stat(&mut conn, "total_connections_received"), stat(&mut conn, "cmdstat_get:"));
+            let date = &fleet_fixture::iso(now)[..10];
             unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url) };
             let tmp = TempDir::new().unwrap();
-            let get = |uri: &'static str| {
-                let app = build_router_local(tmp.path().to_path_buf());
-                async move {
-                    let response = app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
-                    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-                }
+            let get = || async {
+                let response = build_router_local(tmp.path().to_path_buf())
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/flow/{date}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let bytes = to_bytes(response.into_body(), 16 * 1024 * 1024)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
             };
-            let machines = get("/fleet/machines/live").await;
-            let dispatches = get("/fleet/dispatches/live").await;
-            let again = (get("/fleet/machines/live").await, get("/fleet/dispatches/live").await);
-            let live = tokio::task::spawn_blocking(super::super::live_session_ids).await.unwrap();
+            let first = get().await;
+            let before = xrevranges();
+            let second = get().await;
+            let after = xrevranges();
             unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
-            let (connects, gets) = (stat(&mut conn, "total_connections_received") - connects0, stat(&mut conn, "cmdstat_get:") - gets0);
-            assert_eq!(machines["machines"].as_array().map(Vec::len), Some(2), "{machines}");
-            assert_eq!(dispatches["dispatches"].as_array().map(Vec::len), Some(3), "{dispatches}");
-            assert_eq!((&again.0, &again.1), (&machines, &dispatches), "served from the same reads");
-            assert_eq!(live.map(|s| s.len()), Some(4), "three sessions and their mission");
-            assert_eq!(connects, 2, "one connection per key space for five reads");
-            assert_eq!(gets, 0, "beats come back in one MGET, not a GET each");
+            assert_eq!(
+                after - before,
+                0,
+                "the second request asked the hub for its whole window"
+            );
+            assert_eq!(first["meta"]["coverage"], second["meta"]["coverage"]);
+            assert_eq!(first["records"], second["records"]);
+            assert!(first["count"].as_u64().is_some_and(|n| n > 0), "{first}");
         }
 
-        /// (#3432 review) The shared presence read is the last one from THIS
-        /// hub: another hub URL reads afresh, and so does a `FRESH` read (it
-        /// sees a beat written after the snapshot, which a shared read inside
-        /// the TTL does not).
+        /// (#3431 review) A day whose window has nothing to serve (never
+        /// read, or a cold read still going past another request's wait)
+        /// is read from the hub directly, as before, so a request made
+        /// beside another on a cold window is never served local-only. A
+        /// window with records, fresh or stale, never reads the hub.
+        #[test]
+        fn a_day_reads_the_hub_directly_only_when_the_window_has_nothing() {
+            use crate::source_state::SourceState;
+            let day = |records: Vec<serde_json::Value>| super::super::SourceRead {
+                records,
+                cut: false,
+            };
+            let window = |state: SourceState| {
+                move |_: FleetScope| FleetRead {
+                    records: FleetRecords::default(),
+                    state: state.clone(),
+                }
+            };
+            let hub_record =
+                serde_json::json!({ "ts": "2026-10-28T00:00:01Z", "action": "dispatch.start" });
+
+            let unavailable = SourceState::Unavailable { detail: "x" };
+            let (got, state) =
+                super::super::hub_day("2026-10-28", window(unavailable.clone()), || {
+                    Ok(day(vec![hub_record.clone()]))
+                });
+            assert_eq!(
+                got.map(|d| d.records),
+                Some(vec![hub_record.clone()]),
+                "the direct read's records"
+            );
+            assert_eq!(state, SourceState::Ok);
+
+            let (got, state) =
+                super::super::hub_day("2026-10-28", window(unavailable.clone()), || {
+                    Err(anyhow::anyhow!("down"))
+                });
+            assert!(got.is_none());
+            assert_eq!(state, unavailable, "both failed: local only, unavailable");
+
+            for state in [
+                SourceState::Ok,
+                SourceState::Stale {
+                    age_ms: 5,
+                    detail: "x",
+                },
+            ] {
+                let (got, served) =
+                    super::super::hub_day("2026-10-28", window(state.clone()), || {
+                        panic!("read the hub with a window to serve")
+                    });
+                assert!(got.is_some());
+                assert_eq!(served, state);
+            }
+            let (got, state) =
+                super::super::hub_day("2026-10-28", window(SourceState::Off), || {
+                    panic!("read the hub with none configured")
+                });
+            assert!(got.is_none());
+            assert_eq!(state, SourceState::Off);
+        }
+
+        /// (b) The same for the telemetry stream a dispatch replay reads
+        /// beside the work stream, merged in hub order.
         #[test]
         #[serial]
-        fn a_shared_presence_read_is_this_hubs_and_a_fresh_one_reads_anew() {
+        fn a_samples_read_is_incremental_on_both_streams() {
             if !redis_server_available() {
                 eprintln!("skipping: redis-server not on PATH");
                 return;
             }
-            use super::super::{session_beats, PresenceRead};
-            let (a, b) = (spawn_redis(), spawn_redis());
-            let beat = |url: &str, sid: &str| {
-                let mut conn = redis::Client::open(url).unwrap().get_connection().unwrap();
-                let json = serde_json::json!({ "session_id": sid, "display_name": "laptop", "beat_ts_ms": darkmux_flow::presence::now_ms() });
-                let _: () = redis::cmd("SET").arg(darkmux_flow::session_presence::session_key(sid)).arg(json.to_string()).arg("EX").arg(60).query(&mut conn).unwrap();
-            };
-            let ids = |r: (Vec<darkmux_flow::session_presence::SessionBeat>, _)| {
-                let mut v: Vec<String> = r.0.into_iter().map(|b| b.session_id).collect();
-                v.sort();
-                v
-            };
-            let url = |s: &str| darkmux_flow::RawRedisUrl::new(s.to_string());
-            beat(&a.url, "S-a");
-            beat(&b.url, "S-b");
-            assert_eq!(ids(session_beats(&url(&a.url), PresenceRead::QUIET)), ["S-a"]);
-            assert_eq!(ids(session_beats(&url(&b.url), PresenceRead::QUIET)), ["S-b"], "another hub is another read");
-            beat(&b.url, "S-b2");
-            assert_eq!(ids(session_beats(&url(&b.url), PresenceRead::QUIET)), ["S-b"], "inside the TTL: the shared read");
-            assert_eq!(ids(session_beats(&url(&b.url), PresenceRead::FRESH)), ["S-b", "S-b2"], "a fresh read sees the new beat");
+            let redis = spawn_redis();
+            let work = fleet_fixture::realistic_records(20, now_secs());
+            let sample = |i: usize| serde_json::json!({ "ts": fleet_fixture::iso(now_secs() - 5), "action": "machine.telemetry", "machine_uid": "UID-STUDIO", "payload": { "cpu_pct": i } });
+            xadd_all(&redis.url, WORK_STREAM, &work[..10]);
+            xadd_all(
+                &redis.url,
+                TELEMETRY_STREAM,
+                &(0..10).map(sample).collect::<Vec<_>>(),
+            );
+            let caches = FleetCaches::default();
+            let t0 = SystemTime::now();
+            read_at(&caches, &redis.url, FleetScope::WithSamples, t0);
+            xadd_all(&redis.url, TELEMETRY_STREAM, &[sample(10), sample(11)]);
+            xadd_all(&redis.url, WORK_STREAM, &work[10..]);
+            let before = parses();
+            let next = read_at(
+                &caches,
+                &redis.url,
+                FleetScope::WithSamples,
+                t0 + Duration::from_secs(10),
+            );
+            assert_eq!(
+                parses() - before,
+                12,
+                "two new samples and ten new work records"
+            );
+            assert_eq!(values(&next), fresh(&redis.url, FleetScope::WithSamples));
+            // The work-scope read shares the work stream's window: nothing to parse.
+            let before = parses();
+            let work_only = read_at(
+                &caches,
+                &redis.url,
+                FleetScope::Work,
+                t0 + Duration::from_secs(10),
+            );
+            assert_eq!(parses() - before, 0);
+            assert_eq!(values(&work_only), fresh(&redis.url, FleetScope::Work));
         }
 
-        /// (#3432) A failed presence read is kept for the TTL too, so a hub
-        /// that accepts and drops costs one attempt per TTL, not one per
-        /// request.
+        /// (c) Records trimmed off the head of the stream age out of the
+        /// window, as they would from a fresh read.
         #[test]
         #[serial]
-        fn a_failed_presence_read_is_kept_for_the_ttl() {
-            use super::super::{machine_beats, PresenceRead};
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let accepts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let counted = accepts.clone();
-            std::thread::spawn(move || {
-                for stream in listener.incoming() {
-                    counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    drop(stream);
-                }
-            });
-            let url = darkmux_flow::RawRedisUrl::new(format!("redis://127.0.0.1:{port}"));
-            let first = machine_beats(&url, PresenceRead::QUIET);
-            let second = machine_beats(&url, PresenceRead::QUIET);
-            assert!(matches!(first.1, crate::source_state::SourceState::Unavailable { .. }));
-            assert_eq!(first.1, second.1);
-            assert_eq!(accepts.load(std::sync::atomic::Ordering::Relaxed), 1, "one attempt for both reads");
+        fn entries_trimmed_off_the_stream_leave_the_window() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let redis = spawn_redis();
+            let records = fleet_fixture::realistic_records(42, now_secs());
+            xadd_all(&redis.url, WORK_STREAM, &records[..40]);
+            let caches = FleetCaches::default();
+            let t0 = SystemTime::now();
+            read_at(&caches, &redis.url, FleetScope::Work, t0);
+            let _: u64 = redis::cmd("XTRIM")
+                .arg(WORK_STREAM)
+                .arg("MAXLEN")
+                .arg(15)
+                .query(&mut conn(&redis.url))
+                .unwrap();
+            xadd_all(&redis.url, WORK_STREAM, &records[40..]);
+            let next = read_at(
+                &caches,
+                &redis.url,
+                FleetScope::Work,
+                t0 + Duration::from_secs(10),
+            );
+            assert_eq!(next.records.len(), 17);
+            assert_eq!(values(&next), fresh(&redis.url, FleetScope::Work));
         }
 
-        // ─── #3217 the fleet window is read incrementally ───────────────
-        //
-        // `/runs`, `/flow-missions` and the catalog routes share one cached
-        // read of the hub's streams. These drive that read through
-        // `read_fleet_cached` with their own cache, an explicit clock (no
-        // sleeps, no fixed timestamps against the scan window) and this
-        // test's own `redis-server`, and count entry parses with
-        // `STREAM_ENTRY_PARSES` rather than timing anything.
-        mod fleet_window_reads {
-            use super::*;
-            use std::time::{Duration, SystemTime};
-            use crate::fleet_fixture;
-
-            fn now_secs() -> u64 {
-                SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()
+        /// (c) A stream that no longer holds the last entry read (deleted
+        /// and rewritten, a hub restarted empty, ids gone backwards, or
+        /// trimmed past it) is read afresh: nothing stale or duplicated.
+        #[test]
+        #[serial]
+        fn a_stream_that_lost_the_last_entry_read_is_read_afresh() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
             }
+            let redis = spawn_redis();
+            let records = fleet_fixture::realistic_records(60, now_secs());
+            let caches = FleetCaches::default();
+            let mut at = SystemTime::now();
+            let mut step = |caches: &FleetCaches| {
+                at += Duration::from_secs(10);
+                read_at(caches, &redis.url, FleetScope::Work, at)
+            };
+            xadd_all(&redis.url, WORK_STREAM, &records[..20]);
+            step(&caches);
 
-            fn parses() -> u64 {
-                crate::fleet_window::STREAM_ENTRY_PARSES.load(std::sync::atomic::Ordering::Relaxed)
+            // Deleted and rewritten with new entries.
+            let _: u64 = redis::cmd("DEL")
+                .arg(WORK_STREAM)
+                .query(&mut conn(&redis.url))
+                .unwrap();
+            xadd_all(&redis.url, WORK_STREAM, &records[20..25]);
+            let next = step(&caches);
+            assert_eq!(
+                values(&next),
+                fresh(&redis.url, FleetScope::Work),
+                "after a delete and rewrite"
+            );
+            assert_eq!(next.records.len(), 5);
+
+            // Ids gone backwards: a hub restarted with a lower id sequence.
+            let _: u64 = redis::cmd("DEL")
+                .arg(WORK_STREAM)
+                .query(&mut conn(&redis.url))
+                .unwrap();
+            for (i, r) in records[25..28].iter().enumerate() {
+                xadd_with_id(&redis.url, WORK_STREAM, &format!("1-{}", i + 1), r);
             }
+            let next = step(&caches);
+            assert_eq!(
+                values(&next),
+                fresh(&redis.url, FleetScope::Work),
+                "after ids went backwards"
+            );
+            assert_eq!(next.records.len(), 3);
 
-            fn conn(url: &str) -> redis::Connection {
-                redis::Client::open(url).expect("client").get_connection().expect("conn")
+            // Trimmed past the last entry read, then written to.
+            xadd_all(&redis.url, WORK_STREAM, &records[28..30]);
+            step(&caches);
+            let _: u64 = redis::cmd("XTRIM")
+                .arg(WORK_STREAM)
+                .arg("MAXLEN")
+                .arg(0)
+                .query(&mut conn(&redis.url))
+                .unwrap();
+            xadd_all(&redis.url, WORK_STREAM, &records[30..34]);
+            let next = step(&caches);
+            assert_eq!(
+                values(&next),
+                fresh(&redis.url, FleetScope::Work),
+                "after a trim past the cursor"
+            );
+            assert_eq!(next.records.len(), 4);
+
+            // Emptied entirely.
+            let _: u64 = redis::cmd("DEL")
+                .arg(WORK_STREAM)
+                .query(&mut conn(&redis.url))
+                .unwrap();
+            assert!(
+                step(&caches).records.is_empty(),
+                "an emptied stream serves nothing"
+            );
+        }
+
+        /// A window read from one hub is never continued against another
+        /// (a changed `redis.host`), even when the new hub happens to hold
+        /// an entry with the same id as the last one read.
+        #[test]
+        #[serial]
+        fn a_window_read_from_another_hub_starts_over() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
             }
-
-            fn xadd_all(url: &str, stream: &str, records: &[serde_json::Value]) {
-                let mut pipe = redis::pipe();
-                for r in records {
-                    pipe.cmd("XADD").arg(stream).arg("*").arg("schema").arg("1.8.0").arg("record").arg(r.to_string()).ignore();
-                }
-                let () = pipe.query(&mut conn(url)).expect("XADD pipeline");
+            let (a, b) = (spawn_redis(), spawn_redis());
+            let records = fleet_fixture::realistic_records(6, now_secs());
+            for (i, r) in records[..3].iter().enumerate() {
+                xadd_with_id(&a.url, WORK_STREAM, &format!("5-{i}"), r);
             }
-
-            fn xadd_with_id(url: &str, stream: &str, id: &str, record: &serde_json::Value) {
-                let _: String = redis::cmd("XADD")
-                    .arg(stream)
-                    .arg(id)
-                    .arg("record")
-                    .arg(record.to_string())
-                    .query(&mut conn(url))
-                    .expect("XADD with id");
+            for (i, r) in records[3..].iter().enumerate() {
+                xadd_with_id(&b.url, WORK_STREAM, &format!("5-{}", i + 2), r);
             }
+            let caches = FleetCaches::default();
+            let t0 = SystemTime::now();
+            read_at(&caches, &a.url, FleetScope::Work, t0);
+            let next = read_at(
+                &caches,
+                &b.url,
+                FleetScope::Work,
+                t0 + Duration::from_secs(10),
+            );
+            assert_eq!(values(&next), fresh(&b.url, FleetScope::Work));
+        }
 
-            /// The records a read holds, in the full form the catalog routes
-            /// serve.
-            fn values(read: &FleetRead) -> Vec<serde_json::Value> {
-                read.records.iter().map(|r| r.full()).collect()
+        /// (#3217) The connect sends `AUTH` and `SELECT` itself, after the
+        /// response bound is on the socket: a password, a named user and a
+        /// database still connect to the right place, and a wrong password
+        /// is refused.
+        #[test]
+        #[serial]
+        fn a_url_with_credentials_and_a_database_still_connects() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
             }
-
-            /// What a cold, uncached read of the hub returns now: the truth an
-            /// incremental read must equal.
-            fn fresh(url: &str, scope: FleetScope) -> Vec<serde_json::Value> {
-                super::super::read_flow_records_from_redis(url, None, scope).expect("fresh read").records
+            let redis = spawn_redis();
+            let mut admin = conn(&redis.url);
+            let _: () = redis::cmd("SELECT").arg(2).query(&mut admin).unwrap();
+            let _: () = redis::cmd("SET")
+                .arg("which-db")
+                .arg("two")
+                .query(&mut admin)
+                .unwrap();
+            let _: () = redis::cmd("CONFIG")
+                .arg("SET")
+                .arg("requirepass")
+                .arg("s3cret")
+                .query(&mut admin)
+                .unwrap();
+            let hostport = redis.url.trim_start_matches("redis://").to_string();
+            for userinfo in [":s3cret@", "default:s3cret@"] {
+                let url = format!("redis://{userinfo}{hostport}/2");
+                let mut c = super::super::bounded_redis_connection(&url, "a probe")
+                    .unwrap_or_else(|e| panic!("{userinfo}: {e:#}"));
+                let got: String = redis::cmd("GET").arg("which-db").query(&mut c).unwrap();
+                assert_eq!(got, "two", "{userinfo} reached database 2");
             }
+            assert!(super::super::bounded_redis_connection(
+                &format!("redis://:wrong@{hostport}/2"),
+                "a probe"
+            )
+            .is_err());
+            assert!(
+                super::super::bounded_redis_connection(&format!("redis://{hostport}"), "a probe")
+                    .and_then(|mut c| Ok(redis::cmd("GET")
+                        .arg("which-db")
+                        .query::<Option<String>>(&mut c)?))
+                    .is_err(),
+                "no password, no read"
+            );
+        }
 
-            fn read_at(caches: &FleetCaches, url: &str, scope: FleetScope, at: SystemTime) -> FleetRead {
-                let url = url.to_string();
-                read_fleet_cached(caches, scope, at, move || Some(darkmux_flow::RawRedisUrl::new(url)))
+        /// A hub that stops answering: the last window read is served as
+        /// `Stale` with its age; with none read yet, nothing, `Unavailable`.
+        #[test]
+        #[serial]
+        fn an_unreachable_hub_serves_the_last_window_as_stale() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
             }
-
-            /// (a) A second read inside the cache window, and another after it
-            /// with nothing new on the stream, parse nothing: the window is
-            /// already held.
-            #[test]
-            #[serial]
-            fn a_repeated_read_does_not_parse_entries_it_already_holds() {
-                if !redis_server_available() {
-                    eprintln!("skipping: redis-server not on PATH");
-                    return;
+            let redis = spawn_redis();
+            let url = redis.url.clone();
+            xadd_all(
+                &url,
+                WORK_STREAM,
+                &fleet_fixture::realistic_records(10, now_secs()),
+            );
+            let caches = FleetCaches::default();
+            let t0 = SystemTime::now();
+            let first = read_at(&caches, &url, FleetScope::Work, t0);
+            drop(redis);
+            let later = read_at(
+                &caches,
+                &url,
+                FleetScope::Work,
+                t0 + Duration::from_secs(10),
+            );
+            assert_eq!(
+                later.state,
+                source_state::SourceState::Stale {
+                    age_ms: 10_000,
+                    detail: FLEET_READ_ERROR_DETAIL
                 }
-                let redis = spawn_redis();
-                xadd_all(&redis.url, WORK_STREAM, &fleet_fixture::realistic_records(50, now_secs()));
-                let caches = FleetCaches::default();
-                let t0 = SystemTime::now();
-                let first = read_at(&caches, &redis.url, FleetScope::Work, t0);
-                assert_eq!(first.records.len(), 50);
-                // Inside the cache window the hub is not asked at all: an
-                // entry added meanwhile is not seen until the window expires.
-                xadd_all(&redis.url, WORK_STREAM, &fleet_fixture::realistic_records(1, now_secs()));
-                let before = parses();
-                let within = read_at(&caches, &redis.url, FleetScope::Work, t0 + Duration::from_millis(500));
-                assert_eq!(values(&within), values(&first), "a read inside the cache window went to the hub");
-                let after = read_at(&caches, &redis.url, FleetScope::Work, t0 + Duration::from_secs(10));
-                assert_eq!(parses() - before, 1, "a repeated read re-parsed entries it already held");
-                assert_eq!(values(&after), fresh(&redis.url, FleetScope::Work));
-                assert_eq!(after.state, source_state::SourceState::Ok);
+            );
+            assert_eq!(values(&later), values(&first));
+            // The samples scope has no telemetry window yet: nothing to serve.
+            let samples = read_at(
+                &caches,
+                &url,
+                FleetScope::WithSamples,
+                t0 + Duration::from_secs(10),
+            );
+            assert_eq!(
+                samples.state,
+                source_state::SourceState::Unavailable {
+                    detail: FLEET_READ_ERROR_DETAIL
+                }
+            );
+            assert!(samples.records.is_empty());
+        }
+
+        /// (d) `/runs` built from the incremental, compact window equals
+        /// `/runs` built from a fresh full read of the same stream, on a
+        /// realistic fixture: the rows, the usage and the off-row counts.
+        #[test]
+        #[serial]
+        fn runs_from_the_compact_window_equal_runs_from_a_full_read() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
             }
-
-            /// (b) Entries appended since the last read are picked up, and only
-            /// they are parsed.
-            #[test]
-            #[serial]
-            fn new_entries_are_read_and_only_they_are_parsed() {
-                if !redis_server_available() {
-                    eprintln!("skipping: redis-server not on PATH");
-                    return;
-                }
-                let redis = spawn_redis();
-                let records = fleet_fixture::realistic_records(53, now_secs());
-                xadd_all(&redis.url, WORK_STREAM, &records[..50]);
-                let caches = FleetCaches::default();
-                let t0 = SystemTime::now();
-                read_at(&caches, &redis.url, FleetScope::Work, t0);
-                xadd_all(&redis.url, WORK_STREAM, &records[50..]);
-                let before = parses();
-                let next = read_at(&caches, &redis.url, FleetScope::Work, t0 + Duration::from_secs(10));
-                assert_eq!(parses() - before, 3, "only the three new entries are parsed");
-                assert_eq!(next.records.len(), 53);
-                assert_eq!(values(&next), fresh(&redis.url, FleetScope::Work));
-            }
-
-            /// (#3431) A day served from the window is what a fresh day read
-            /// of the hub returns: the same records in the same order, the
-            /// samples merged in, the other day's records left out, and the
-            /// same cut, bounded or not. The fixture straddles a midnight at a
-            /// fixed time; nothing here reads the clock but the cache's `at`.
-            #[test]
-            #[serial]
-            fn a_day_from_the_window_equals_a_fresh_day_read_of_the_hub() {
-                if !redis_server_available() {
-                    eprintln!("skipping: redis-server not on PATH");
-                    return;
-                }
-                let redis = spawn_redis();
-                // 2026-10-28T00:05:00Z: forty records 15s apart span 23:55 to 00:05.
-                let base = 1_793_145_900;
-                let work = fleet_fixture::realistic_records(40, base);
-                let sample = |i: u64| serde_json::json!({ "ts": fleet_fixture::iso(base - 600 + i * 60), "action": "machine.telemetry", "machine_uid": "UID-STUDIO", "payload": { "cpu_pct": i } });
-                // Hub ids at each record's own time, so the cut is decided by
-                // the fixture, not by when the test runs.
-                let id_of = |r: &serde_json::Value, seq: usize| {
-                    let ts = r["ts"].as_str().unwrap();
-                    let secs = darkmux_flow::parse_ts_utc(ts).unwrap();
-                    format!("{}-{seq}", secs * 1000)
-                };
-                // A stream id only grows, so a record stamped earlier than the
-                // one before it takes that one's millisecond.
-                let mut last_ms = 0u64;
-                for (i, r) in work.iter().enumerate() {
-                    let ms: u64 = id_of(r, 0).trim_end_matches("-0").parse().unwrap();
-                    last_ms = last_ms.max(ms);
-                    xadd_with_id(&redis.url, WORK_STREAM, &format!("{last_ms}-{i}"), r);
-                }
-                for i in 0..10 {
-                    let s = sample(i);
-                    xadd_with_id(&redis.url, TELEMETRY_STREAM, &id_of(&s, 0), &s);
-                }
-                let caches = FleetCaches::default();
-                let t0 = SystemTime::now();
-                let both = read_at(&caches, &redis.url, FleetScope::WithSamples, t0);
-                let work_only = read_at(&caches, &redis.url, FleetScope::Work, t0);
-                for maxlen in ["0", "5"] {
-                    unsafe { std::env::set_var("DARKMUX_REDIS_MAXLEN", maxlen) };
-                    for date in ["2026-10-27", "2026-10-28", "2026-10-29"] {
-                        let want = super::super::read_flow_records_from_redis(&redis.url, Some(date), FleetScope::WithSamples)
-                            .expect("fresh day read");
-                        let got = super::super::fleet_day_records(date, &both.records, &work_only.records);
-                        assert_eq!(got.records, want.records, "{date}, maxlen {maxlen}");
-                        assert_eq!(got.cut, want.cut, "{date}, maxlen {maxlen}");
-                    }
-                }
-                unsafe { std::env::remove_var("DARKMUX_REDIS_MAXLEN") };
-                // Under the 5-entry bound the stream starts inside 10-27, so
-                // 10-27 may be cut and 10-28 (which it holds from midnight) is not.
-                unsafe { std::env::set_var("DARKMUX_REDIS_MAXLEN", "5") };
-                let cut = |date| super::super::fleet_day_records(date, &both.records, &work_only.records).cut;
-                assert_eq!((cut("2026-10-27"), cut("2026-10-28")), (true, false));
-                unsafe { std::env::remove_var("DARKMUX_REDIS_MAXLEN") };
-                let day = super::super::fleet_day_records("2026-10-28", &both.records, &work_only.records);
-                assert!(day.records.iter().any(|r| r["action"] == "machine.telemetry"), "the day's samples are in it");
-                assert!(day.records.len() < 50, "the other day's records are not");
-            }
-
-            /// (#3431) `GET /flow/<date>` reads the hub through the shared
-            /// window: a second request inside the cache window asks the hub
-            /// for nothing, where each request used to `XREVRANGE` the whole
-            /// of both streams (~20 MB a call on the operator's hub).
-            #[tokio::test]
-            #[serial]
-            async fn a_repeated_day_request_does_not_read_the_hubs_window_again() {
-                if !redis_server_available() {
-                    eprintln!("skipping: redis-server not on PATH");
-                    return;
-                }
-                let redis = spawn_redis();
-                let now = now_secs();
-                xadd_all(&redis.url, WORK_STREAM, &fleet_fixture::realistic_records(20, now));
-                let xrevranges = || -> u64 {
-                    let info: String = redis::cmd("INFO").arg("commandstats").query(&mut conn(&redis.url)).unwrap();
-                    info.lines()
-                        .find_map(|l| l.strip_prefix("cmdstat_xrevrange:calls="))
-                        .and_then(|rest| rest.split(',').next())
-                        .and_then(|n| n.parse().ok())
-                        .unwrap_or(0)
-                };
-                let date = &fleet_fixture::iso(now)[..10];
-                unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url) };
-                let tmp = TempDir::new().unwrap();
-                let get = || async {
-                    let response = build_router_local(tmp.path().to_path_buf())
-                        .oneshot(Request::builder().uri(format!("/flow/{date}")).body(Body::empty()).unwrap())
-                        .await
-                        .unwrap();
-                    let bytes = to_bytes(response.into_body(), 16 * 1024 * 1024).await.unwrap();
-                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-                };
-                let first = get().await;
-                let before = xrevranges();
-                let second = get().await;
-                let after = xrevranges();
-                unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
-                assert_eq!(after - before, 0, "the second request asked the hub for its whole window");
-                assert_eq!(first["meta"]["coverage"], second["meta"]["coverage"]);
-                assert_eq!(first["records"], second["records"]);
-                assert!(first["count"].as_u64().is_some_and(|n| n > 0), "{first}");
-            }
-
-            /// (#3431 review) A day whose window has nothing to serve (never
-            /// read, or a cold read still going past another request's wait)
-            /// is read from the hub directly, as before, so a request made
-            /// beside another on a cold window is never served local-only. A
-            /// window with records, fresh or stale, never reads the hub.
-            #[test]
-            fn a_day_reads_the_hub_directly_only_when_the_window_has_nothing() {
-                use crate::source_state::SourceState;
-                let day = |records: Vec<serde_json::Value>| super::super::SourceRead { records, cut: false };
-                let window = |state: SourceState| move |_: FleetScope| FleetRead { records: FleetRecords::default(), state: state.clone() };
-                let hub_record = serde_json::json!({ "ts": "2026-10-28T00:00:01Z", "action": "dispatch.start" });
-
-                let unavailable = SourceState::Unavailable { detail: "x" };
-                let (got, state) = super::super::hub_day("2026-10-28", window(unavailable.clone()), || Ok(day(vec![hub_record.clone()])));
-                assert_eq!(got.map(|d| d.records), Some(vec![hub_record.clone()]), "the direct read's records");
-                assert_eq!(state, SourceState::Ok);
-
-                let (got, state) = super::super::hub_day("2026-10-28", window(unavailable.clone()), || Err(anyhow::anyhow!("down")));
-                assert!(got.is_none());
-                assert_eq!(state, unavailable, "both failed: local only, unavailable");
-
-                for state in [SourceState::Ok, SourceState::Stale { age_ms: 5, detail: "x" }] {
-                    let (got, served) = super::super::hub_day("2026-10-28", window(state.clone()), || panic!("read the hub with a window to serve"));
-                    assert!(got.is_some());
-                    assert_eq!(served, state);
-                }
-                let (got, state) = super::super::hub_day("2026-10-28", window(SourceState::Off), || panic!("read the hub with none configured"));
-                assert!(got.is_none());
-                assert_eq!(state, SourceState::Off);
-            }
-
-            /// (b) The same for the telemetry stream a dispatch replay reads
-            /// beside the work stream, merged in hub order.
-            #[test]
-            #[serial]
-            fn a_samples_read_is_incremental_on_both_streams() {
-                if !redis_server_available() {
-                    eprintln!("skipping: redis-server not on PATH");
-                    return;
-                }
-                let redis = spawn_redis();
-                let work = fleet_fixture::realistic_records(20, now_secs());
-                let sample = |i: usize| serde_json::json!({ "ts": fleet_fixture::iso(now_secs() - 5), "action": "machine.telemetry", "machine_uid": "UID-STUDIO", "payload": { "cpu_pct": i } });
-                xadd_all(&redis.url, WORK_STREAM, &work[..10]);
-                xadd_all(&redis.url, TELEMETRY_STREAM, &(0..10).map(sample).collect::<Vec<_>>());
-                let caches = FleetCaches::default();
-                let t0 = SystemTime::now();
-                read_at(&caches, &redis.url, FleetScope::WithSamples, t0);
-                xadd_all(&redis.url, TELEMETRY_STREAM, &[sample(10), sample(11)]);
-                xadd_all(&redis.url, WORK_STREAM, &work[10..]);
-                let before = parses();
-                let next = read_at(&caches, &redis.url, FleetScope::WithSamples, t0 + Duration::from_secs(10));
-                assert_eq!(parses() - before, 12, "two new samples and ten new work records");
-                assert_eq!(values(&next), fresh(&redis.url, FleetScope::WithSamples));
-                // The work-scope read shares the work stream's window: nothing to parse.
-                let before = parses();
-                let work_only = read_at(&caches, &redis.url, FleetScope::Work, t0 + Duration::from_secs(10));
-                assert_eq!(parses() - before, 0);
-                assert_eq!(values(&work_only), fresh(&redis.url, FleetScope::Work));
-            }
-
-            /// (c) Records trimmed off the head of the stream age out of the
-            /// window, as they would from a fresh read.
-            #[test]
-            #[serial]
-            fn entries_trimmed_off_the_stream_leave_the_window() {
-                if !redis_server_available() {
-                    eprintln!("skipping: redis-server not on PATH");
-                    return;
-                }
-                let redis = spawn_redis();
-                let records = fleet_fixture::realistic_records(42, now_secs());
-                xadd_all(&redis.url, WORK_STREAM, &records[..40]);
-                let caches = FleetCaches::default();
-                let t0 = SystemTime::now();
-                read_at(&caches, &redis.url, FleetScope::Work, t0);
-                let _: u64 = redis::cmd("XTRIM").arg(WORK_STREAM).arg("MAXLEN").arg(15).query(&mut conn(&redis.url)).unwrap();
-                xadd_all(&redis.url, WORK_STREAM, &records[40..]);
-                let next = read_at(&caches, &redis.url, FleetScope::Work, t0 + Duration::from_secs(10));
-                assert_eq!(next.records.len(), 17);
-                assert_eq!(values(&next), fresh(&redis.url, FleetScope::Work));
-            }
-
-            /// (c) A stream that no longer holds the last entry read (deleted
-            /// and rewritten, a hub restarted empty, ids gone backwards, or
-            /// trimmed past it) is read afresh: nothing stale or duplicated.
-            #[test]
-            #[serial]
-            fn a_stream_that_lost_the_last_entry_read_is_read_afresh() {
-                if !redis_server_available() {
-                    eprintln!("skipping: redis-server not on PATH");
-                    return;
-                }
-                let redis = spawn_redis();
-                let records = fleet_fixture::realistic_records(60, now_secs());
-                let caches = FleetCaches::default();
-                let mut at = SystemTime::now();
-                let mut step = |caches: &FleetCaches| {
-                    at += Duration::from_secs(10);
-                    read_at(caches, &redis.url, FleetScope::Work, at)
-                };
-                xadd_all(&redis.url, WORK_STREAM, &records[..20]);
-                step(&caches);
-
-                // Deleted and rewritten with new entries.
-                let _: u64 = redis::cmd("DEL").arg(WORK_STREAM).query(&mut conn(&redis.url)).unwrap();
-                xadd_all(&redis.url, WORK_STREAM, &records[20..25]);
-                let next = step(&caches);
-                assert_eq!(values(&next), fresh(&redis.url, FleetScope::Work), "after a delete and rewrite");
-                assert_eq!(next.records.len(), 5);
-
-                // Ids gone backwards: a hub restarted with a lower id sequence.
-                let _: u64 = redis::cmd("DEL").arg(WORK_STREAM).query(&mut conn(&redis.url)).unwrap();
-                for (i, r) in records[25..28].iter().enumerate() {
-                    xadd_with_id(&redis.url, WORK_STREAM, &format!("1-{}", i + 1), r);
-                }
-                let next = step(&caches);
-                assert_eq!(values(&next), fresh(&redis.url, FleetScope::Work), "after ids went backwards");
-                assert_eq!(next.records.len(), 3);
-
-                // Trimmed past the last entry read, then written to.
-                xadd_all(&redis.url, WORK_STREAM, &records[28..30]);
-                step(&caches);
-                let _: u64 = redis::cmd("XTRIM").arg(WORK_STREAM).arg("MAXLEN").arg(0).query(&mut conn(&redis.url)).unwrap();
-                xadd_all(&redis.url, WORK_STREAM, &records[30..34]);
-                let next = step(&caches);
-                assert_eq!(values(&next), fresh(&redis.url, FleetScope::Work), "after a trim past the cursor");
-                assert_eq!(next.records.len(), 4);
-
-                // Emptied entirely.
-                let _: u64 = redis::cmd("DEL").arg(WORK_STREAM).query(&mut conn(&redis.url)).unwrap();
-                assert!(step(&caches).records.is_empty(), "an emptied stream serves nothing");
-            }
-
-            /// A window read from one hub is never continued against another
-            /// (a changed `redis.host`), even when the new hub happens to hold
-            /// an entry with the same id as the last one read.
-            #[test]
-            #[serial]
-            fn a_window_read_from_another_hub_starts_over() {
-                if !redis_server_available() {
-                    eprintln!("skipping: redis-server not on PATH");
-                    return;
-                }
-                let (a, b) = (spawn_redis(), spawn_redis());
-                let records = fleet_fixture::realistic_records(6, now_secs());
-                for (i, r) in records[..3].iter().enumerate() {
-                    xadd_with_id(&a.url, WORK_STREAM, &format!("5-{i}"), r);
-                }
-                for (i, r) in records[3..].iter().enumerate() {
-                    xadd_with_id(&b.url, WORK_STREAM, &format!("5-{}", i + 2), r);
-                }
-                let caches = FleetCaches::default();
-                let t0 = SystemTime::now();
-                read_at(&caches, &a.url, FleetScope::Work, t0);
-                let next = read_at(&caches, &b.url, FleetScope::Work, t0 + Duration::from_secs(10));
-                assert_eq!(values(&next), fresh(&b.url, FleetScope::Work));
-            }
-
-            /// (#3217) The connect sends `AUTH` and `SELECT` itself, after the
-            /// response bound is on the socket: a password, a named user and a
-            /// database still connect to the right place, and a wrong password
-            /// is refused.
-            #[test]
-            #[serial]
-            fn a_url_with_credentials_and_a_database_still_connects() {
-                if !redis_server_available() {
-                    eprintln!("skipping: redis-server not on PATH");
-                    return;
-                }
-                let redis = spawn_redis();
-                let mut admin = conn(&redis.url);
-                let _: () = redis::cmd("SELECT").arg(2).query(&mut admin).unwrap();
-                let _: () = redis::cmd("SET").arg("which-db").arg("two").query(&mut admin).unwrap();
-                let _: () = redis::cmd("CONFIG").arg("SET").arg("requirepass").arg("s3cret").query(&mut admin).unwrap();
-                let hostport = redis.url.trim_start_matches("redis://").to_string();
-                for userinfo in [":s3cret@", "default:s3cret@"] {
-                    let url = format!("redis://{userinfo}{hostport}/2");
-                    let mut c = super::super::bounded_redis_connection(&url, "a probe").unwrap_or_else(|e| panic!("{userinfo}: {e:#}"));
-                    let got: String = redis::cmd("GET").arg("which-db").query(&mut c).unwrap();
-                    assert_eq!(got, "two", "{userinfo} reached database 2");
-                }
-                assert!(super::super::bounded_redis_connection(&format!("redis://:wrong@{hostport}/2"), "a probe").is_err());
-                assert!(super::super::bounded_redis_connection(&format!("redis://{hostport}"), "a probe")
-                    .and_then(|mut c| Ok(redis::cmd("GET").arg("which-db").query::<Option<String>>(&mut c)?))
-                    .is_err(), "no password, no read");
-            }
-
-            /// A hub that stops answering: the last window read is served as
-            /// `Stale` with its age; with none read yet, nothing, `Unavailable`.
-            #[test]
-            #[serial]
-            fn an_unreachable_hub_serves_the_last_window_as_stale() {
-                if !redis_server_available() {
-                    eprintln!("skipping: redis-server not on PATH");
-                    return;
-                }
-                let redis = spawn_redis();
-                let url = redis.url.clone();
-                xadd_all(&url, WORK_STREAM, &fleet_fixture::realistic_records(10, now_secs()));
-                let caches = FleetCaches::default();
-                let t0 = SystemTime::now();
-                let first = read_at(&caches, &url, FleetScope::Work, t0);
-                drop(redis);
-                let later = read_at(&caches, &url, FleetScope::Work, t0 + Duration::from_secs(10));
-                assert_eq!(later.state, source_state::SourceState::Stale { age_ms: 10_000, detail: FLEET_READ_ERROR_DETAIL });
-                assert_eq!(values(&later), values(&first));
-                // The samples scope has no telemetry window yet: nothing to serve.
-                let samples = read_at(&caches, &url, FleetScope::WithSamples, t0 + Duration::from_secs(10));
-                assert_eq!(samples.state, source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL });
-                assert!(samples.records.is_empty());
-            }
-
-            /// (d) `/runs` built from the incremental, compact window equals
-            /// `/runs` built from a fresh full read of the same stream, on a
-            /// realistic fixture: the rows, the usage and the off-row counts.
-            #[test]
-            #[serial]
-            fn runs_from_the_compact_window_equal_runs_from_a_full_read() {
-                if !redis_server_available() {
-                    eprintln!("skipping: redis-server not on PATH");
-                    return;
-                }
-                let _isolated = darkmux_types::test_isolation::IsolatedState::new();
-                let redis = spawn_redis();
-                let records = fleet_fixture::realistic_records(1_200, now_secs());
-                xadd_all(&redis.url, WORK_STREAM, &records[..1_000]);
-                let caches = FleetCaches::default();
-                let t0 = SystemTime::now();
-                read_at(&caches, &redis.url, FleetScope::Work, t0);
-                xadd_all(&redis.url, WORK_STREAM, &records[1_000..]);
-                let window = read_at(&caches, &redis.url, FleetScope::Work, t0 + Duration::from_secs(10));
-                let full = fresh(&redis.url, FleetScope::Work);
-                let flows = tempfile::tempdir().unwrap();
-                let a = runs::build_runs_with_usage(flows.path(), None, &window.records, None);
-                let b = runs::build_runs_with_usage(flows.path(), None, &full[..], None);
-                assert!(a.runs.len() >= 10, "the fixture must build real rows: {}", a.runs.len());
-                // Row order is not part of the comparison: `build_runs` folds
-                // through hash maps, so two builds over one input already list
-                // rows in different orders (the viewer and `run list` sort).
-                let sorted = |runs: &[runs::Run]| {
-                    let mut rows: Vec<serde_json::Value> = runs.iter().map(|r| serde_json::to_value(r).unwrap()).collect();
-                    rows.sort_by_key(|r| r["id"].to_string());
-                    rows
-                };
-                assert_eq!(sorted(&a.runs), sorted(&b.runs));
-                assert_eq!(serde_json::to_value(&a.usage).unwrap(), serde_json::to_value(&b.usage).unwrap());
-                let missions_a = serde_json::to_value(super::super::scan_flow_missions(flows.path(), &window.records)).unwrap();
-                let missions_b = serde_json::to_value(super::super::scan_flow_missions(flows.path(), &full[..])).unwrap();
-                assert_eq!(missions_a, missions_b);
-            }
+            let _isolated = darkmux_types::test_isolation::IsolatedState::new();
+            let redis = spawn_redis();
+            let records = fleet_fixture::realistic_records(1_200, now_secs());
+            xadd_all(&redis.url, WORK_STREAM, &records[..1_000]);
+            let caches = FleetCaches::default();
+            let t0 = SystemTime::now();
+            read_at(&caches, &redis.url, FleetScope::Work, t0);
+            xadd_all(&redis.url, WORK_STREAM, &records[1_000..]);
+            let window = read_at(
+                &caches,
+                &redis.url,
+                FleetScope::Work,
+                t0 + Duration::from_secs(10),
+            );
+            let full = fresh(&redis.url, FleetScope::Work);
+            let flows = tempfile::tempdir().unwrap();
+            let a = runs::build_runs_with_usage(flows.path(), None, &window.records, None);
+            let b = runs::build_runs_with_usage(flows.path(), None, &full[..], None);
+            assert!(
+                a.runs.len() >= 10,
+                "the fixture must build real rows: {}",
+                a.runs.len()
+            );
+            // Row order is not part of the comparison: `build_runs` folds
+            // through hash maps, so two builds over one input already list
+            // rows in different orders (the viewer and `run list` sort).
+            let sorted = |runs: &[runs::Run]| {
+                let mut rows: Vec<serde_json::Value> = runs
+                    .iter()
+                    .map(|r| serde_json::to_value(r).unwrap())
+                    .collect();
+                rows.sort_by_key(|r| r["id"].to_string());
+                rows
+            };
+            assert_eq!(sorted(&a.runs), sorted(&b.runs));
+            assert_eq!(
+                serde_json::to_value(&a.usage).unwrap(),
+                serde_json::to_value(&b.usage).unwrap()
+            );
+            let missions_a = serde_json::to_value(super::super::scan_flow_missions(
+                flows.path(),
+                &window.records,
+            ))
+            .unwrap();
+            let missions_b =
+                serde_json::to_value(super::super::scan_flow_missions(flows.path(), &full[..]))
+                    .unwrap();
+            assert_eq!(missions_a, missions_b);
         }
     }
+}
 
-    // ─── path_is_within (the lab-run path guard) ───────────────────────────
+// ─── path_is_within (the lab-run path guard) ───────────────────────────
 
-    #[test]
-    fn path_is_within_accepts_path_under_base() {
-        let tmp = TempDir::new().unwrap();
-        // Create a real directory structure.
-        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
-        assert!(path_is_within(
-            &tmp.path().join("sub"),
-            tmp.path(),
-        ));
-    }
+#[test]
+fn path_is_within_accepts_path_under_base() {
+    let tmp = TempDir::new().unwrap();
+    // Create a real directory structure.
+    std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+    assert!(path_is_within(&tmp.path().join("sub"), tmp.path(),));
+}
 
-    #[test]
-    fn path_is_within_rejects_path_outside_base() {
-        let tmp = TempDir::new().unwrap();
-        // A path outside the base dir.
-        assert!(
-            !path_is_within(
-                StdPath::new("/tmp"),
-                tmp.path(),
-            )
-        );
-    }
+#[test]
+fn path_is_within_rejects_path_outside_base() {
+    let tmp = TempDir::new().unwrap();
+    // A path outside the base dir.
+    assert!(!path_is_within(StdPath::new("/tmp"), tmp.path(),));
+}
 
-    #[test]
-    fn path_is_within_rejects_missing_worktree() {
-        let tmp = TempDir::new().unwrap();
-        // Non-existent worktree path.
-        assert!(
-            !path_is_within(
-                &tmp.path().join("does_not_exist"),
-                tmp.path(),
-            )
-        );
-    }
+#[test]
+fn path_is_within_rejects_missing_worktree() {
+    let tmp = TempDir::new().unwrap();
+    // Non-existent worktree path.
+    assert!(!path_is_within(
+        &tmp.path().join("does_not_exist"),
+        tmp.path(),
+    ));
+}
 
-    // ─── #1247 Part 3: lab observer lens ───────────────────────────────────
-    //
-    // Every fixture below is SYNTHETIC — fabricated field-for-field to match
-    // the real `ReviewEnvelope` / `FlowRecord` / `ScoresDoc` shapes (verified
-    // against the actual types via `darkmux_lab::lab::{funnel,scores}`), but
-    // with invented model names / case ids / crew names. No content from any
-    // private corpus.
+// ─── #1247 Part 3: lab observer lens ───────────────────────────────────
+//
+// Every fixture below is SYNTHETIC — fabricated field-for-field to match
+// the real `ReviewEnvelope` / `FlowRecord` / `ScoresDoc` shapes (verified
+// against the actual types via `darkmux_lab::lab::{funnel,scores}`), but
+// with invented model names / case ids / crew names. No content from any
+// private corpus.
 
-    /// Write a "finished" synthetic funnel run at `dir`: `funnels.json` (one
-    /// envelope), `funnel-events.jsonl` (a couple of records), and
-    /// `scores.json` (minimal valid doc). `mtime_offset_secs` lets a test
-    /// stagger two runs' mtimes deterministically (rather than racing on
-    /// filesystem timestamp resolution) — 0 for "now", a larger value for
-    /// "older" by touching the file's mtime backward via `filetime`-free
-    /// manual `set_file_mtime` (std has no stable API pre-1.75 filetime
-    /// crate; sidestepped by writing older runs FIRST in test bodies instead
-    /// — see the callers).
-    fn write_synthetic_funnel_run(dir: &StdPath, case_id: &str, crew: &str) {
-        fs::create_dir_all(dir).unwrap();
-        let funnels = serde_json::json!([{
-            "case_id": case_id,
-            "crew": crew,
-            "mode": "sequential",
-            "members": [],
-            "steps": [],
-            "bundles": 5,
-            "raw_flags": 8,
-            "deduped_flags": 6,
-            "flags": [],
-            "judged": [],
-            "confirmed": 2,
-            "needs_check": 1,
-            "archived": 3,
-            "fingerprint": {},
-            "staffing": {
-                "probes": [
-                    {"name": "demo-probe", "model": "darkmux:demo-probe-model", "k": 1, "n_ctx": 32768, "max_tokens": 3000}
-                ],
-                "judge": {"name": "demo-judge", "model": "darkmux:demo-judge-model", "k": 3, "n_ctx": 65536, "max_tokens": 20000, "role_id": "judge", "unmanaged": true, "endpoint": "provider.example", "passes": 2}
-            }
-        }]);
-        fs::write(dir.join("funnels.json"), serde_json::to_vec_pretty(&funnels).unwrap()).unwrap();
+/// Write a "finished" synthetic funnel run at `dir`: `funnels.json` (one
+/// envelope), `funnel-events.jsonl` (a couple of records), and
+/// `scores.json` (minimal valid doc). `mtime_offset_secs` lets a test
+/// stagger two runs' mtimes deterministically (rather than racing on
+/// filesystem timestamp resolution) — 0 for "now", a larger value for
+/// "older" by touching the file's mtime backward via `filetime`-free
+/// manual `set_file_mtime` (std has no stable API pre-1.75 filetime
+/// crate; sidestepped by writing older runs FIRST in test bodies instead
+/// — see the callers).
+fn write_synthetic_funnel_run(dir: &StdPath, case_id: &str, crew: &str) {
+    fs::create_dir_all(dir).unwrap();
+    let funnels = serde_json::json!([{
+        "case_id": case_id,
+        "crew": crew,
+        "mode": "sequential",
+        "members": [],
+        "steps": [],
+        "bundles": 5,
+        "raw_flags": 8,
+        "deduped_flags": 6,
+        "flags": [],
+        "judged": [],
+        "confirmed": 2,
+        "needs_check": 1,
+        "archived": 3,
+        "fingerprint": {},
+        "staffing": {
+            "probes": [
+                {"name": "demo-probe", "model": "darkmux:demo-probe-model", "k": 1, "n_ctx": 32768, "max_tokens": 3000}
+            ],
+            "judge": {"name": "demo-judge", "model": "darkmux:demo-judge-model", "k": 3, "n_ctx": 65536, "max_tokens": 20000, "role_id": "judge", "unmanaged": true, "endpoint": "provider.example", "passes": 2}
+        }
+    }]);
+    fs::write(
+        dir.join("funnels.json"),
+        serde_json::to_vec_pretty(&funnels).unwrap(),
+    )
+    .unwrap();
 
-        // (#1434) The review path emits only the generic `step result`
-        // companion vocabulary now — these filler events mirror it. A
-        // finished run's headline meta comes from `funnels.json`/`scores.json`
-        // below, not from these records.
-        let events = format!(
-            "{}\n{}\n",
-            serde_json::json!({
-                "ts": "2026-01-01T00:00:00Z", "level": "info", "category": "work",
-                "tier": "local", "stage": "dispatch", "action": "step.result",
-                "handle": "bundle", "session_id": case_id, "source": "review",
-                "payload": {"step_id": "bundle", "kind": "review.bundle", "items_out": 5}
-            }),
-            serde_json::json!({
-                "ts": "2026-01-01T00:05:00Z", "level": "info", "category": "work",
-                "tier": "local", "stage": "dispatch", "action": "step.result",
-                "handle": "judge", "session_id": case_id, "source": "review",
-                "payload": {"step_id": "judge", "kind": "dispatch.map", "items_in": 6, "items_out": 6}
-            }),
-        );
-        fs::write(dir.join("funnel-events.jsonl"), events).unwrap();
-
-        let scores = serde_json::json!({
-            "schema_version": "1.0.0",
-            "provenance": {
-                "run_id": format!("demo-run-{case_id}"),
-                "ts": "2026-01-01T00:05:00Z",
-                "machine": {"machine_id": "test-machine"},
-                "profile": "demo-profile",
-                "loaded_drift": false
-            },
-            "rows": [],
-            "crew": crew,
-            "exec_mode": "sequential",
-            "mode": "funnel",
-            "k": "(one per probe role)"
-        });
-        fs::write(dir.join("scores.json"), serde_json::to_vec_pretty(&scores).unwrap()).unwrap();
-    }
-
-    /// Write a LIVE synthetic run at `dir`: only `funnel-events.jsonl` with a
-    /// single `step result` record — no `funnels.json`/`scores.json` yet,
-    /// matching a run whose first case hasn't completed. (#1434 — the review
-    /// path emits the generic `step result` companion vocabulary; `crew` is
-    /// retained in the signature for call-site parity but no longer carried in
-    /// the record, since the retired per-run task bookend was the only record
-    /// that carried case/crew-on-start meta.)
-    fn write_synthetic_live_run(dir: &StdPath, case_id: &str, _crew: &str) {
-        fs::create_dir_all(dir).unwrap();
-        let record = serde_json::json!({
+    // (#1434) The review path emits only the generic `step result`
+    // companion vocabulary now — these filler events mirror it. A
+    // finished run's headline meta comes from `funnels.json`/`scores.json`
+    // below, not from these records.
+    let events = format!(
+        "{}\n{}\n",
+        serde_json::json!({
             "ts": "2026-01-01T00:00:00Z", "level": "info", "category": "work",
             "tier": "local", "stage": "dispatch", "action": "step.result",
             "handle": "bundle", "session_id": case_id, "source": "review",
-            "payload": {"step_id": "bundle", "kind": "review.bundle", "items_out": 12}
-        });
-        fs::write(dir.join("funnel-events.jsonl"), format!("{record}\n")).unwrap();
-    }
+            "payload": {"step_id": "bundle", "kind": "review.bundle", "items_out": 5}
+        }),
+        serde_json::json!({
+            "ts": "2026-01-01T00:05:00Z", "level": "info", "category": "work",
+            "tier": "local", "stage": "dispatch", "action": "step.result",
+            "handle": "judge", "session_id": case_id, "source": "review",
+            "payload": {"step_id": "judge", "kind": "dispatch.map", "items_in": 6, "items_out": 6}
+        }),
+    );
+    fs::write(dir.join("funnel-events.jsonl"), events).unwrap();
 
-    #[test]
-    fn resolve_lab_run_dir_accepts_valid_relative_subdir() {
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir_all(tmp.path().join("case-a/run1")).unwrap();
-        let resolved = resolve_lab_run_dir(tmp.path(), "case-a/run1");
-        assert_eq!(resolved, Some(tmp.path().join("case-a/run1")));
-    }
+    let scores = serde_json::json!({
+        "schema_version": "1.0.0",
+        "provenance": {
+            "run_id": format!("demo-run-{case_id}"),
+            "ts": "2026-01-01T00:05:00Z",
+            "machine": {"machine_id": "test-machine"},
+            "profile": "demo-profile",
+            "loaded_drift": false
+        },
+        "rows": [],
+        "crew": crew,
+        "exec_mode": "sequential",
+        "mode": "funnel",
+        "k": "(one per probe role)"
+    });
+    fs::write(
+        dir.join("scores.json"),
+        serde_json::to_vec_pretty(&scores).unwrap(),
+    )
+    .unwrap();
+}
 
-    #[test]
-    fn resolve_lab_run_dir_rejects_absolute_path() {
-        let tmp = TempDir::new().unwrap();
-        assert_eq!(resolve_lab_run_dir(tmp.path(), "/etc/passwd"), None);
-    }
+/// Write a LIVE synthetic run at `dir`: only `funnel-events.jsonl` with a
+/// single `step result` record — no `funnels.json`/`scores.json` yet,
+/// matching a run whose first case hasn't completed. (#1434 — the review
+/// path emits the generic `step result` companion vocabulary; `crew` is
+/// retained in the signature for call-site parity but no longer carried in
+/// the record, since the retired per-run task bookend was the only record
+/// that carried case/crew-on-start meta.)
+fn write_synthetic_live_run(dir: &StdPath, case_id: &str, _crew: &str) {
+    fs::create_dir_all(dir).unwrap();
+    let record = serde_json::json!({
+        "ts": "2026-01-01T00:00:00Z", "level": "info", "category": "work",
+        "tier": "local", "stage": "dispatch", "action": "step.result",
+        "handle": "bundle", "session_id": case_id, "source": "review",
+        "payload": {"step_id": "bundle", "kind": "review.bundle", "items_out": 12}
+    });
+    fs::write(dir.join("funnel-events.jsonl"), format!("{record}\n")).unwrap();
+}
 
-    #[test]
-    fn resolve_lab_run_dir_rejects_parent_dir_traversal() {
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir_all(tmp.path().join("case-a")).unwrap();
-        assert_eq!(resolve_lab_run_dir(tmp.path(), "case-a/../../etc"), None);
-        assert_eq!(resolve_lab_run_dir(tmp.path(), "../outside"), None);
-    }
+#[test]
+fn resolve_lab_run_dir_accepts_valid_relative_subdir() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("case-a/run1")).unwrap();
+    let resolved = resolve_lab_run_dir(tmp.path(), "case-a/run1");
+    assert_eq!(resolved, Some(tmp.path().join("case-a/run1")));
+}
 
-    #[test]
-    fn resolve_lab_run_dir_empty_resolves_to_lab_dir_itself() {
-        // QA finding (#1247 PR review round): a run matched AT `lab_dir`'s
-        // own root gets `""` as its `dir` — that identifier must round-trip
-        // back to `lab_dir`, or such a run is listed but permanently
-        // un-drillable (a 400 on every detail/events request).
-        let tmp = TempDir::new().unwrap();
-        assert_eq!(resolve_lab_run_dir(tmp.path(), ""), Some(tmp.path().to_path_buf()));
-    }
+#[test]
+fn resolve_lab_run_dir_rejects_absolute_path() {
+    let tmp = TempDir::new().unwrap();
+    assert_eq!(resolve_lab_run_dir(tmp.path(), "/etc/passwd"), None);
+}
 
-    #[test]
-    fn resolve_lab_run_dir_rejects_nonexistent_subdir() {
-        // path_is_within canonicalizes both sides; a dir that was never
-        // created can't resolve — the endpoint would 400 rather than 500 on
-        // a typo'd `dir` param.
-        let tmp = TempDir::new().unwrap();
-        assert_eq!(resolve_lab_run_dir(tmp.path(), "does-not-exist"), None);
-    }
+#[test]
+fn resolve_lab_run_dir_rejects_parent_dir_traversal() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("case-a")).unwrap();
+    assert_eq!(resolve_lab_run_dir(tmp.path(), "case-a/../../etc"), None);
+    assert_eq!(resolve_lab_run_dir(tmp.path(), "../outside"), None);
+}
 
-    #[cfg(unix)]
-    #[test]
-    fn resolve_lab_run_dir_rejects_symlink_escape() {
-        // A symlink INSIDE lab_dir pointing OUTSIDE it must be rejected —
-        // the string-shape checks (`..`, absolute) can't catch this; only
-        // the canonicalize + prefix check in `path_is_within` can, since
-        // canonicalize resolves the link to its real (outside) target before
-        // the prefix comparison runs.
-        let lab = TempDir::new().unwrap();
-        let outside = TempDir::new().unwrap();
-        fs::create_dir_all(outside.path().join("secret")).unwrap();
-        std::os::unix::fs::symlink(outside.path().join("secret"), lab.path().join("escape")).unwrap();
-        assert_eq!(resolve_lab_run_dir(lab.path(), "escape"), None);
-    }
+#[test]
+fn resolve_lab_run_dir_empty_resolves_to_lab_dir_itself() {
+    // QA finding (#1247 PR review round): a run matched AT `lab_dir`'s
+    // own root gets `""` as its `dir` — that identifier must round-trip
+    // back to `lab_dir`, or such a run is listed but permanently
+    // un-drillable (a 400 on every detail/events request).
+    let tmp = TempDir::new().unwrap();
+    assert_eq!(
+        resolve_lab_run_dir(tmp.path(), ""),
+        Some(tmp.path().to_path_buf())
+    );
+}
 
-    #[test]
-    fn scan_lab_runs_finds_a_finished_run_and_computes_headline_counts() {
-        let tmp = TempDir::new().unwrap();
-        write_synthetic_funnel_run(&tmp.path().join("case-a/run1"), "demo-case-a", "demo-crew");
-        let runs = scan_lab_runs(tmp.path());
-        assert_eq!(runs.len(), 1, "expected exactly one run cluster: {runs:?}");
-        let r = &runs[0];
-        assert_eq!(r.dir, "case-a/run1");
-        assert_eq!(r.case_ids, vec!["demo-case-a".to_string()]);
-        assert_eq!(r.crew.as_deref(), Some("demo-crew"));
-        assert_eq!(r.exec_mode.as_deref(), Some("sequential"));
-        assert_eq!(r.bundles, 5);
-        assert_eq!(r.raw_flags, 8);
-        assert_eq!(r.deduped_flags, 6);
-        assert_eq!(r.confirmed, 2);
-        assert_eq!(r.needs_check, 1);
-        assert_eq!(r.archived, 3);
-        assert!(!r.degenerate);
-        assert!(r.finished, "scores.json present => finished");
-        assert!(r.has_reviews);
-        assert!(r.has_events);
-        let staffing = r.staffing.as_ref().expect("staffing snapshot present");
-        assert_eq!(staffing.probes.len(), 1);
-        assert_eq!(staffing.probes[0].model, "darkmux:demo-probe-model");
-        assert_eq!(staffing.judge.as_ref().unwrap().model, "darkmux:demo-judge-model");
-    }
+#[test]
+fn resolve_lab_run_dir_rejects_nonexistent_subdir() {
+    // path_is_within canonicalizes both sides; a dir that was never
+    // created can't resolve — the endpoint would 400 rather than 500 on
+    // a typo'd `dir` param.
+    let tmp = TempDir::new().unwrap();
+    assert_eq!(resolve_lab_run_dir(tmp.path(), "does-not-exist"), None);
+}
 
-    /// (#1434 — successor of `scan_lab_runs_finds_a_live_run_via_events_
-    /// prefix_scan`.) A live run (events-only, no case completed yet) is
-    /// still DISCOVERED — `has_events` true, not finished, no envelope
-    /// snapshot yet. The former best-effort case_id/crew/exec_mode prefix
-    /// scan keyed on the retired per-run task-started record; that record no
-    /// longer exists, so those headline fields are now empty until the first
-    /// case completes and `funnels.json`/`scores.json` land (the deliberate,
-    /// named behavior change — the scan matched nothing in current output and
-    /// was removed rather than ported).
-    #[test]
-    fn scan_lab_runs_discovers_a_live_events_only_run_without_headline_meta() {
-        let tmp = TempDir::new().unwrap();
-        write_synthetic_live_run(&tmp.path().join("case-b/gate-1"), "demo-case-b", "demo-gate-crew");
-        let runs = scan_lab_runs(tmp.path());
-        assert_eq!(runs.len(), 1);
-        let r = &runs[0];
-        assert_eq!(r.dir, "case-b/gate-1");
-        assert!(r.case_ids.is_empty(), "no case has completed, so no case ids yet: {:?}", r.case_ids);
-        assert!(r.crew.is_none(), "crew meta lands only once a case completes");
-        assert!(r.exec_mode.is_none(), "exec_mode meta lands only once a case completes");
-        assert!(!r.finished, "no scores.json yet => not finished");
-        assert!(!r.has_reviews, "no case has completed yet");
-        assert!(r.has_events);
-        assert!(r.staffing.is_none(), "no envelope snapshot exists yet");
-    }
+#[cfg(unix)]
+#[test]
+fn resolve_lab_run_dir_rejects_symlink_escape() {
+    // A symlink INSIDE lab_dir pointing OUTSIDE it must be rejected —
+    // the string-shape checks (`..`, absolute) can't catch this; only
+    // the canonicalize + prefix check in `path_is_within` can, since
+    // canonicalize resolves the link to its real (outside) target before
+    // the prefix comparison runs.
+    let lab = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    fs::create_dir_all(outside.path().join("secret")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("secret"), lab.path().join("escape")).unwrap();
+    assert_eq!(resolve_lab_run_dir(lab.path(), "escape"), None);
+}
 
-    #[test]
-    fn scan_lab_runs_does_not_descend_into_a_matched_runs_worktrees() {
-        // A matched run dir's own `worktrees/<case>` subtree is a full repo
-        // checkout that could itself contain marker-file-shaped noise (e.g.
-        // a nested fixture) — `LAB_SCAN_SKIP_DIRS` must keep the scan from
-        // ever walking into it looking for more runs, unconditionally
-        // (independent of whether the parent itself matched — see the next
-        // test for why "stop entirely on match" is NOT the mechanism this
-        // relies on).
-        let tmp = TempDir::new().unwrap();
-        let run_dir = tmp.path().join("probe-27b-527");
-        write_synthetic_funnel_run(&run_dir, "demo-case-c", "demo-crew");
-        // Plant a decoy inside the run's own worktrees/ subtree that WOULD
-        // match the run-cluster criterion if the scanner ever walked there.
-        let decoy = run_dir.join("worktrees/demo-case-c/nested");
-        fs::create_dir_all(&decoy).unwrap();
-        fs::write(decoy.join("scores.json"), "{}").unwrap();
+#[test]
+fn scan_lab_runs_finds_a_finished_run_and_computes_headline_counts() {
+    let tmp = TempDir::new().unwrap();
+    write_synthetic_funnel_run(&tmp.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+    let runs = scan_lab_runs(tmp.path());
+    assert_eq!(runs.len(), 1, "expected exactly one run cluster: {runs:?}");
+    let r = &runs[0];
+    assert_eq!(r.dir, "case-a/run1");
+    assert_eq!(r.case_ids, vec!["demo-case-a".to_string()]);
+    assert_eq!(r.crew.as_deref(), Some("demo-crew"));
+    assert_eq!(r.exec_mode.as_deref(), Some("sequential"));
+    assert_eq!(r.bundles, 5);
+    assert_eq!(r.raw_flags, 8);
+    assert_eq!(r.deduped_flags, 6);
+    assert_eq!(r.confirmed, 2);
+    assert_eq!(r.needs_check, 1);
+    assert_eq!(r.archived, 3);
+    assert!(!r.degenerate);
+    assert!(r.finished, "scores.json present => finished");
+    assert!(r.has_reviews);
+    assert!(r.has_events);
+    let staffing = r.staffing.as_ref().expect("staffing snapshot present");
+    assert_eq!(staffing.probes.len(), 1);
+    assert_eq!(staffing.probes[0].model, "darkmux:demo-probe-model");
+    assert_eq!(
+        staffing.judge.as_ref().unwrap().model,
+        "darkmux:demo-judge-model"
+    );
+}
 
-        let runs = scan_lab_runs(tmp.path());
-        assert_eq!(runs.len(), 1, "the decoy under worktrees/ must not surface as a second run: {runs:?}");
-        assert_eq!(runs[0].dir, "probe-27b-527");
-    }
+/// (#1434 — successor of `scan_lab_runs_finds_a_live_run_via_events_
+/// prefix_scan`.) A live run (events-only, no case completed yet) is
+/// still DISCOVERED — `has_events` true, not finished, no envelope
+/// snapshot yet. The former best-effort case_id/crew/exec_mode prefix
+/// scan keyed on the retired per-run task-started record; that record no
+/// longer exists, so those headline fields are now empty until the first
+/// case completes and `funnels.json`/`scores.json` land (the deliberate,
+/// named behavior change — the scan matched nothing in current output and
+/// was removed rather than ported).
+#[test]
+fn scan_lab_runs_discovers_a_live_events_only_run_without_headline_meta() {
+    let tmp = TempDir::new().unwrap();
+    write_synthetic_live_run(
+        &tmp.path().join("case-b/gate-1"),
+        "demo-case-b",
+        "demo-gate-crew",
+    );
+    let runs = scan_lab_runs(tmp.path());
+    assert_eq!(runs.len(), 1);
+    let r = &runs[0];
+    assert_eq!(r.dir, "case-b/gate-1");
+    assert!(
+        r.case_ids.is_empty(),
+        "no case has completed, so no case ids yet: {:?}",
+        r.case_ids
+    );
+    assert!(
+        r.crew.is_none(),
+        "crew meta lands only once a case completes"
+    );
+    assert!(
+        r.exec_mode.is_none(),
+        "exec_mode meta lands only once a case completes"
+    );
+    assert!(!r.finished, "no scores.json yet => not finished");
+    assert!(!r.has_reviews, "no case has completed yet");
+    assert!(r.has_events);
+    assert!(r.staffing.is_none(), "no envelope snapshot exists yet");
+}
 
-    /// Regression (caught live against a real corpus during #1247 manual
-    /// verification, NOT in unit tests originally): a stray marker file
-    /// left directly at `lab_dir` — e.g. a leftover `funnels.json` from an
-    /// earlier ad-hoc `--scores-out` pointed at the corpus root — must not
-    /// swallow every run nested beneath it. An earlier version of this scan
-    /// returned early the instant ANY directory matched, which made
-    /// `lab_dir` itself matching hide the entire tree below it.
-    #[test]
-    fn scan_lab_runs_a_stray_marker_at_lab_dir_root_does_not_hide_nested_runs() {
-        let tmp = TempDir::new().unwrap();
-        // A stray funnels.json sitting directly at the scan root — matches
-        // the run-cluster criterion on its own, with no sibling scores.json
-        // or funnel-events.jsonl (exactly the leftover-artifact shape).
-        fs::write(tmp.path().join("funnels.json"), "[]").unwrap();
-        write_synthetic_funnel_run(&tmp.path().join("case-a/run1"), "demo-case-a", "demo-crew");
-        write_synthetic_funnel_run(&tmp.path().join("case-b/run1"), "demo-case-b", "demo-crew");
+#[test]
+fn scan_lab_runs_does_not_descend_into_a_matched_runs_worktrees() {
+    // A matched run dir's own `worktrees/<case>` subtree is a full repo
+    // checkout that could itself contain marker-file-shaped noise (e.g.
+    // a nested fixture) — `LAB_SCAN_SKIP_DIRS` must keep the scan from
+    // ever walking into it looking for more runs, unconditionally
+    // (independent of whether the parent itself matched — see the next
+    // test for why "stop entirely on match" is NOT the mechanism this
+    // relies on).
+    let tmp = TempDir::new().unwrap();
+    let run_dir = tmp.path().join("probe-27b-527");
+    write_synthetic_funnel_run(&run_dir, "demo-case-c", "demo-crew");
+    // Plant a decoy inside the run's own worktrees/ subtree that WOULD
+    // match the run-cluster criterion if the scanner ever walked there.
+    let decoy = run_dir.join("worktrees/demo-case-c/nested");
+    fs::create_dir_all(&decoy).unwrap();
+    fs::write(decoy.join("scores.json"), "{}").unwrap();
 
-        let runs = scan_lab_runs(tmp.path());
-        let dirs: Vec<&str> = runs.iter().map(|r| r.dir.as_str()).collect();
-        assert!(dirs.contains(&""), "the root's own stray marker still surfaces as a run: {dirs:?}");
-        assert!(dirs.contains(&"case-a/run1"), "nested runs must survive a matching root: {dirs:?}");
-        assert!(dirs.contains(&"case-b/run1"), "nested runs must survive a matching root: {dirs:?}");
-        assert_eq!(runs.len(), 3, "{runs:?}");
-    }
+    let runs = scan_lab_runs(tmp.path());
+    assert_eq!(
+        runs.len(),
+        1,
+        "the decoy under worktrees/ must not surface as a second run: {runs:?}"
+    );
+    assert_eq!(runs[0].dir, "probe-27b-527");
+}
 
-    #[test]
-    fn scan_lab_runs_respects_max_depth() {
-        let tmp = TempDir::new().unwrap();
-        // 6 levels deep — past LAB_SCAN_MAX_DEPTH (4) from lab_dir.
-        let deep = tmp
-            .path()
-            .join("a/b/c/d/e/f");
-        write_synthetic_funnel_run(&deep, "too-deep", "demo-crew");
-        let runs = scan_lab_runs(tmp.path());
-        assert!(runs.is_empty(), "a run past the depth cap must not surface: {runs:?}");
-    }
+/// Regression (caught live against a real corpus during #1247 manual
+/// verification, NOT in unit tests originally): a stray marker file
+/// left directly at `lab_dir` — e.g. a leftover `funnels.json` from an
+/// earlier ad-hoc `--scores-out` pointed at the corpus root — must not
+/// swallow every run nested beneath it. An earlier version of this scan
+/// returned early the instant ANY directory matched, which made
+/// `lab_dir` itself matching hide the entire tree below it.
+#[test]
+fn scan_lab_runs_a_stray_marker_at_lab_dir_root_does_not_hide_nested_runs() {
+    let tmp = TempDir::new().unwrap();
+    // A stray funnels.json sitting directly at the scan root — matches
+    // the run-cluster criterion on its own, with no sibling scores.json
+    // or funnel-events.jsonl (exactly the leftover-artifact shape).
+    fs::write(tmp.path().join("funnels.json"), "[]").unwrap();
+    write_synthetic_funnel_run(&tmp.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+    write_synthetic_funnel_run(&tmp.path().join("case-b/run1"), "demo-case-b", "demo-crew");
 
-    #[test]
-    fn scan_lab_runs_multiple_case_dirs_sorted_newest_first() {
-        let tmp = TempDir::new().unwrap();
-        write_synthetic_funnel_run(&tmp.path().join("older/run1"), "case-older", "crew-x");
-        // Force a deterministic newer mtime on the second run's marker files
-        // rather than racing filesystem timestamp resolution.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        write_synthetic_funnel_run(&tmp.path().join("newer/run1"), "case-newer", "crew-x");
+    let runs = scan_lab_runs(tmp.path());
+    let dirs: Vec<&str> = runs.iter().map(|r| r.dir.as_str()).collect();
+    assert!(
+        dirs.contains(&""),
+        "the root's own stray marker still surfaces as a run: {dirs:?}"
+    );
+    assert!(
+        dirs.contains(&"case-a/run1"),
+        "nested runs must survive a matching root: {dirs:?}"
+    );
+    assert!(
+        dirs.contains(&"case-b/run1"),
+        "nested runs must survive a matching root: {dirs:?}"
+    );
+    assert_eq!(runs.len(), 3, "{runs:?}");
+}
 
-        let runs = scan_lab_runs(tmp.path());
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].dir, "newer/run1", "newest run sorts first: {runs:?}");
-        assert_eq!(runs[1].dir, "older/run1");
-    }
+#[test]
+fn scan_lab_runs_respects_max_depth() {
+    let tmp = TempDir::new().unwrap();
+    // 6 levels deep — past LAB_SCAN_MAX_DEPTH (4) from lab_dir.
+    let deep = tmp.path().join("a/b/c/d/e/f");
+    write_synthetic_funnel_run(&deep, "too-deep", "demo-crew");
+    let runs = scan_lab_runs(tmp.path());
+    assert!(
+        runs.is_empty(),
+        "a run past the depth cap must not surface: {runs:?}"
+    );
+}
 
-    /// (#1982) A minimal live-shaped run dir: `lifecycle.json` (written at
-    /// run START, the only marker a running lab run has) plus whatever
-    /// `manifest.json` bytes the caller wants — `None` writes no manifest at
-    /// all, which is the real shape of a run that is still executing.
-    fn write_lab_run_with_manifest_bytes(dir: &StdPath, run_id: &str, manifest: Option<&str>) {
-        fs::create_dir_all(dir).unwrap();
-        fs::write(
-            dir.join(darkmux_lab::lab::lifecycle::LIFECYCLE_FILE),
-            serde_json::to_string(&serde_json::json!({
-                "schema_version": "1.0",
-                "run_id": run_id,
-                "kind": "lab",
-                "workload": "demo-workload",
-                "profile": "default",
-                "started_at_ms": 1_700_000_000_000u64,
-                "status": "running",
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        if let Some(bytes) = manifest {
-            fs::write(dir.join("manifest.json"), bytes).unwrap();
-        }
-    }
+#[test]
+fn scan_lab_runs_multiple_case_dirs_sorted_newest_first() {
+    let tmp = TempDir::new().unwrap();
+    write_synthetic_funnel_run(&tmp.path().join("older/run1"), "case-older", "crew-x");
+    // Force a deterministic newer mtime on the second run's marker files
+    // rather than racing filesystem timestamp resolution.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    write_synthetic_funnel_run(&tmp.path().join("newer/run1"), "case-newer", "crew-x");
 
-    /// (#1982) The POSITIVE control for the three degradation tests below —
-    /// without it, "resolves to `None`" proves nothing, because an
-    /// extraction that ALWAYS returned `None` would satisfy all three.
-    #[test]
-    fn scan_lab_runs_session_id_is_read_from_a_well_formed_manifest() {
-        let tmp = TempDir::new().unwrap();
-        write_lab_run_with_manifest_bytes(
-            &tmp.path().join("run1"),
-            "run1",
-            Some(r#"{"schema_version":3,"run_id":"run1","session_id":"darkmux-coding-demo-1787676109556"}"#),
-        );
-        let runs = scan_lab_runs(tmp.path());
-        assert_eq!(runs.len(), 1, "{runs:?}");
-        assert_eq!(
-            runs[0].session_id.as_deref(),
-            Some("darkmux-coding-demo-1787676109556"),
-            "a well-formed manifest's session_id must be read back verbatim"
-        );
-    }
+    let runs = scan_lab_runs(tmp.path());
+    assert_eq!(runs.len(), 2);
+    assert_eq!(
+        runs[0].dir, "newer/run1",
+        "newest run sorts first: {runs:?}"
+    );
+    assert_eq!(runs[1].dir, "older/run1");
+}
 
-    /// (#1982, narrowed by #2511) `manifest.json` is written at run END, so
-    /// for a run's whole DURATION the dir holds a `lifecycle.json` and no
-    /// manifest — but that no longer means nothing is claimable: #2511
-    /// added a lifecycle-record fallback (`RunLifecycle::set_session_id`,
-    /// read in `session_id` resolution in `crates/darkmux-serve/src/
-    /// lib.rs`) for exactly this window. This test still resolves `None`
-    /// because `write_lab_run_with_manifest_bytes`'s fixture `lifecycle.json`
-    /// deliberately carries no `session_id` field either (the shape of the
-    /// pre-dispatch instant, or a `tool-bench` run, which never mints one —
-    /// see `lifecycle_tests.rs`'s own `a_run_that_never_mints_a_session_id_
-    /// never_gains_one`). What still holds regardless of source: the
-    /// extraction must never fall back to the run id (or any other
-    /// guessable string), which would claim a session this run never
-    /// dispatched under and could swallow an unrelated row.
-    #[test]
-    fn scan_lab_runs_session_id_is_none_when_the_manifest_has_not_been_written_yet() {
-        let tmp = TempDir::new().unwrap();
-        write_lab_run_with_manifest_bytes(&tmp.path().join("run1"), "run1", None);
-        let runs = scan_lab_runs(tmp.path());
-        assert_eq!(runs.len(), 1, "the run is still DISCOVERED via lifecycle.json: {runs:?}");
-        assert_eq!(
-            runs[0].session_id, None,
-            "neither the manifest nor this fixture's lifecycle record carries a session_id — \
-             never a fallback to the run id: {runs:?}"
-        );
-    }
-
-    /// (#1982) A manifest caught mid-write (truncated JSON) is unparseable.
-    /// Lenient-on-read: the run still surfaces, it just claims no session.
-    #[test]
-    fn scan_lab_runs_session_id_is_none_for_a_malformed_manifest() {
-        let tmp = TempDir::new().unwrap();
-        write_lab_run_with_manifest_bytes(
-            &tmp.path().join("run1"),
-            "run1",
-            Some(r#"{"schema_version":3,"run_id":"run1","session_id":"darkmux-coding-de"#),
-        );
-        let runs = scan_lab_runs(tmp.path());
-        assert_eq!(runs.len(), 1, "a malformed manifest must not hide the run: {runs:?}");
-        assert_eq!(runs[0].session_id, None, "{runs:?}");
-    }
-
-    /// (#1982) A `session_id` of the wrong TYPE claims nothing either — the
-    /// claim key is a string and a number/object/null is not one. Guards a
-    /// future "be helpful" coercion (`Value::to_string()`, which would
-    /// produce the literal `123` and claim a session nothing ever
-    /// dispatched under).
-    #[test]
-    fn scan_lab_runs_session_id_is_none_when_the_manifest_value_is_not_a_string() {
-        let tmp = TempDir::new().unwrap();
-        write_lab_run_with_manifest_bytes(
-            &tmp.path().join("run1"),
-            "run1",
-            Some(r#"{"schema_version":3,"run_id":"run1","session_id":123}"#),
-        );
-        let runs = scan_lab_runs(tmp.path());
-        assert_eq!(runs.len(), 1, "{runs:?}");
-        assert_eq!(runs[0].session_id, None, "{runs:?}");
-    }
-
-    /// (#2511) A live-shaped run dir: `lifecycle.json` optionally carrying
-    /// its own `session_id` (the field `RunLifecycle::set_session_id`
-    /// writes mid-run), plus whatever `manifest.json` bytes the caller
-    /// wants (`None` = still executing, matching the real shape).
-    fn write_lab_run_with_lifecycle_session_id(
-        dir: &StdPath,
-        run_id: &str,
-        lifecycle_session_id: Option<&str>,
-        manifest: Option<&str>,
-    ) {
-        fs::create_dir_all(dir).unwrap();
-        let mut lifecycle = serde_json::json!({
-            "schema_version": "1.1",
+/// (#1982) A minimal live-shaped run dir: `lifecycle.json` (written at
+/// run START, the only marker a running lab run has) plus whatever
+/// `manifest.json` bytes the caller wants — `None` writes no manifest at
+/// all, which is the real shape of a run that is still executing.
+fn write_lab_run_with_manifest_bytes(dir: &StdPath, run_id: &str, manifest: Option<&str>) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join(darkmux_lab::lab::lifecycle::LIFECYCLE_FILE),
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": "1.0",
             "run_id": run_id,
             "kind": "lab",
             "workload": "demo-workload",
             "profile": "default",
             "started_at_ms": 1_700_000_000_000u64,
             "status": "running",
-        });
-        if let Some(sid) = lifecycle_session_id {
-            lifecycle["session_id"] = serde_json::Value::String(sid.to_string());
-        }
-        fs::write(
-            dir.join(darkmux_lab::lab::lifecycle::LIFECYCLE_FILE),
-            serde_json::to_string(&lifecycle).unwrap(),
-        )
-        .unwrap();
-        if let Some(bytes) = manifest {
-            fs::write(dir.join("manifest.json"), bytes).unwrap();
-        }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    if let Some(bytes) = manifest {
+        fs::write(dir.join("manifest.json"), bytes).unwrap();
     }
+}
 
-    /// (#2860 review F3) The manifest's `ok` is read off disk into
-    /// `run_ok`. The status decision built on it is tested in `runs.rs`
-    /// with a hand-built summary, which cannot catch the READ going wrong:
-    /// a wrong key or a dropped field passed the whole suite.
-    #[test]
-    fn scan_lab_runs_reads_the_manifests_ok_into_run_ok() {
-        for (manifest, want) in [
-            (r#"{"session_id":"s","ok":false}"#, Some(false)),
-            (r#"{"session_id":"s","ok":true}"#, Some(true)),
-            (r#"{"session_id":"s"}"#, None),
-        ] {
-            let tmp = TempDir::new().unwrap();
-            write_lab_run_with_lifecycle_session_id(&tmp.path().join("run1"), "run1", None, Some(manifest));
-            let runs = scan_lab_runs(tmp.path());
-            assert_eq!(runs.len(), 1, "{runs:?}");
-            assert_eq!(runs[0].run_ok, want, "manifest {manifest}");
-        }
+/// (#1982) The POSITIVE control for the three degradation tests below —
+/// without it, "resolves to `None`" proves nothing, because an
+/// extraction that ALWAYS returned `None` would satisfy all three.
+#[test]
+fn scan_lab_runs_session_id_is_read_from_a_well_formed_manifest() {
+    let tmp = TempDir::new().unwrap();
+    write_lab_run_with_manifest_bytes(
+        &tmp.path().join("run1"),
+        "run1",
+        Some(
+            r#"{"schema_version":3,"run_id":"run1","session_id":"darkmux-coding-demo-1787676109556"}"#,
+        ),
+    );
+    let runs = scan_lab_runs(tmp.path());
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(
+        runs[0].session_id.as_deref(),
+        Some("darkmux-coding-demo-1787676109556"),
+        "a well-formed manifest's session_id must be read back verbatim"
+    );
+}
+
+/// (#1982, narrowed by #2511) `manifest.json` is written at run END, so
+/// for a run's whole DURATION the dir holds a `lifecycle.json` and no
+/// manifest — but that no longer means nothing is claimable: #2511
+/// added a lifecycle-record fallback (`RunLifecycle::set_session_id`,
+/// read in `session_id` resolution in `crates/darkmux-serve/src/
+/// lib.rs`) for exactly this window. This test still resolves `None`
+/// because `write_lab_run_with_manifest_bytes`'s fixture `lifecycle.json`
+/// deliberately carries no `session_id` field either (the shape of the
+/// pre-dispatch instant, or a `tool-bench` run, which never mints one —
+/// see `lifecycle_tests.rs`'s own `a_run_that_never_mints_a_session_id_
+/// never_gains_one`). What still holds regardless of source: the
+/// extraction must never fall back to the run id (or any other
+/// guessable string), which would claim a session this run never
+/// dispatched under and could swallow an unrelated row.
+#[test]
+fn scan_lab_runs_session_id_is_none_when_the_manifest_has_not_been_written_yet() {
+    let tmp = TempDir::new().unwrap();
+    write_lab_run_with_manifest_bytes(&tmp.path().join("run1"), "run1", None);
+    let runs = scan_lab_runs(tmp.path());
+    assert_eq!(
+        runs.len(),
+        1,
+        "the run is still DISCOVERED via lifecycle.json: {runs:?}"
+    );
+    assert_eq!(
+        runs[0].session_id, None,
+        "neither the manifest nor this fixture's lifecycle record carries a session_id — \
+             never a fallback to the run id: {runs:?}"
+    );
+}
+
+/// (#1982) A manifest caught mid-write (truncated JSON) is unparseable.
+/// Lenient-on-read: the run still surfaces, it just claims no session.
+#[test]
+fn scan_lab_runs_session_id_is_none_for_a_malformed_manifest() {
+    let tmp = TempDir::new().unwrap();
+    write_lab_run_with_manifest_bytes(
+        &tmp.path().join("run1"),
+        "run1",
+        Some(r#"{"schema_version":3,"run_id":"run1","session_id":"darkmux-coding-de"#),
+    );
+    let runs = scan_lab_runs(tmp.path());
+    assert_eq!(
+        runs.len(),
+        1,
+        "a malformed manifest must not hide the run: {runs:?}"
+    );
+    assert_eq!(runs[0].session_id, None, "{runs:?}");
+}
+
+/// (#1982) A `session_id` of the wrong TYPE claims nothing either — the
+/// claim key is a string and a number/object/null is not one. Guards a
+/// future "be helpful" coercion (`Value::to_string()`, which would
+/// produce the literal `123` and claim a session nothing ever
+/// dispatched under).
+#[test]
+fn scan_lab_runs_session_id_is_none_when_the_manifest_value_is_not_a_string() {
+    let tmp = TempDir::new().unwrap();
+    write_lab_run_with_manifest_bytes(
+        &tmp.path().join("run1"),
+        "run1",
+        Some(r#"{"schema_version":3,"run_id":"run1","session_id":123}"#),
+    );
+    let runs = scan_lab_runs(tmp.path());
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].session_id, None, "{runs:?}");
+}
+
+/// (#2511) A live-shaped run dir: `lifecycle.json` optionally carrying
+/// its own `session_id` (the field `RunLifecycle::set_session_id`
+/// writes mid-run), plus whatever `manifest.json` bytes the caller
+/// wants (`None` = still executing, matching the real shape).
+fn write_lab_run_with_lifecycle_session_id(
+    dir: &StdPath,
+    run_id: &str,
+    lifecycle_session_id: Option<&str>,
+    manifest: Option<&str>,
+) {
+    fs::create_dir_all(dir).unwrap();
+    let mut lifecycle = serde_json::json!({
+        "schema_version": "1.1",
+        "run_id": run_id,
+        "kind": "lab",
+        "workload": "demo-workload",
+        "profile": "default",
+        "started_at_ms": 1_700_000_000_000u64,
+        "status": "running",
+    });
+    if let Some(sid) = lifecycle_session_id {
+        lifecycle["session_id"] = serde_json::Value::String(sid.to_string());
     }
-
-    /// (F2) The manifest's `escalation` (written by the lab provider) is read
-    /// into the summary: a wrong key or a dropped field would pass a status
-    /// test built on a hand-made summary.
-    #[test]
-    fn scan_lab_runs_reads_the_manifests_escalation() {
-        for (manifest, want) in [
-            (r#"{"session_id":"s","ok":false,"escalation":"escalation_compaction_reread_loop"}"#, Some("escalation_compaction_reread_loop")),
-            (r#"{"session_id":"s","ok":false}"#, None),
-        ] {
-            let tmp = TempDir::new().unwrap();
-            write_lab_run_with_lifecycle_session_id(&tmp.path().join("run1"), "run1", None, Some(manifest));
-            let runs = scan_lab_runs(tmp.path());
-            assert_eq!(runs.len(), 1, "{runs:?}");
-            assert_eq!(runs[0].escalation.as_deref(), want, "manifest {manifest}");
-        }
+    fs::write(
+        dir.join(darkmux_lab::lab::lifecycle::LIFECYCLE_FILE),
+        serde_json::to_string(&lifecycle).unwrap(),
+    )
+    .unwrap();
+    if let Some(bytes) = manifest {
+        fs::write(dir.join("manifest.json"), bytes).unwrap();
     }
+}
 
-    /// (#2494) A run that dispatched fine but failed its tests is only
-    /// visible if the scan carries `verify.passed` and the workload beside
-    /// `ok`. Three states: passed, failed, not checked (`verify: null` or
-    /// absent).
-    #[test]
-    fn scan_lab_runs_reads_workload_and_verify_passed_from_the_manifest() {
-        for (manifest, want_verify) in [
-            (r#"{"workload":"quick-coding","ok":true,"verify":{"passed":false,"details":"x"}}"#, Some(false)),
-            (r#"{"workload":"quick-coding","ok":true,"verify":{"passed":true,"details":"x"}}"#, Some(true)),
-            (r#"{"workload":"quick-coding","ok":true,"verify":null}"#, None),
-            (r#"{"workload":"quick-coding","ok":true}"#, None),
-        ] {
-            let tmp = TempDir::new().unwrap();
-            write_lab_run_with_lifecycle_session_id(&tmp.path().join("run1"), "run1", None, Some(manifest));
-            let runs = scan_lab_runs(tmp.path());
-            assert_eq!(runs.len(), 1, "{runs:?}");
-            assert_eq!(runs[0].verify_passed, want_verify, "manifest {manifest}");
-            assert_eq!(runs[0].workload.as_deref(), Some("quick-coding"), "manifest {manifest}");
-        }
-    }
-
-    /// (#2511) The actual join this issue exists to make possible: while a
-    /// run is still LIVE (no `manifest.json` yet), the session id a
-    /// single-dispatch provider already reported to `lifecycle.json`
-    /// mid-run must surface through `scan_lab_runs` — this is what lets a
-    /// live lab row be claimed by `runs::build_runs`'s dedup, not only a
-    /// finished one.
-    #[test]
-    fn scan_lab_runs_session_id_is_read_from_lifecycle_before_the_manifest_exists() {
+/// (#2860 review F3) The manifest's `ok` is read off disk into
+/// `run_ok`. The status decision built on it is tested in `runs.rs`
+/// with a hand-built summary, which cannot catch the READ going wrong:
+/// a wrong key or a dropped field passed the whole suite.
+#[test]
+fn scan_lab_runs_reads_the_manifests_ok_into_run_ok() {
+    for (manifest, want) in [
+        (r#"{"session_id":"s","ok":false}"#, Some(false)),
+        (r#"{"session_id":"s","ok":true}"#, Some(true)),
+        (r#"{"session_id":"s"}"#, None),
+    ] {
         let tmp = TempDir::new().unwrap();
         write_lab_run_with_lifecycle_session_id(
             &tmp.path().join("run1"),
             "run1",
-            Some("darkmux-coding-demo-1787676109556"),
             None,
+            Some(manifest),
         );
         let runs = scan_lab_runs(tmp.path());
         assert_eq!(runs.len(), 1, "{runs:?}");
-        assert_eq!(
-            runs[0].session_id.as_deref(),
-            Some("darkmux-coding-demo-1787676109556"),
-            "a live run's lifecycle-reported session id must surface before the run finishes"
-        );
+        assert_eq!(runs[0].run_ok, want, "manifest {manifest}");
     }
+}
 
-    /// The inverted case, required alongside the positive one: a run whose
-    /// provider has not (yet, or ever) minted a session id must NOT gain a
-    /// fabricated one — `lifecycle.json` with no `session_id` key is
-    /// exactly `tool-bench`'s real shape (and any run's shape before its
-    /// provider mints one), and must read back as `None`, never a guess.
-    #[test]
-    fn scan_lab_runs_session_id_is_none_when_lifecycle_never_minted_one() {
-        let tmp = TempDir::new().unwrap();
-        write_lab_run_with_lifecycle_session_id(&tmp.path().join("run1"), "run1", None, None);
-        let runs = scan_lab_runs(tmp.path());
-        assert_eq!(runs.len(), 1, "{runs:?}");
-        assert_eq!(
-            runs[0].session_id, None,
-            "no mint means nothing to claim — never a fallback to the run id: {runs:?}"
-        );
-    }
-
-    /// Once `manifest.json` lands at run end, it wins over the lifecycle
-    /// record. Scoped deliberately to `coding-task`/`prompt`, the only two
-    /// providers that ever populate BOTH: for them the two are
-    /// byte-identical (one mint, reported to the lifecycle record before
-    /// dispatching, then carried into the manifest verbatim at the end), so
-    /// "manifest wins" is a no-op in practice and the identity a consumer
-    /// sees never actually changes mid-run. This is NOT a general "the
-    /// manifest is always the authoritative session" rule — `tool-bench`'s
-    /// manifest carries a `session_id` too, but one minted FRESH at
-    /// manifest-write time (see its own `run()`), never reported to
-    /// `set_session_id` and never anything the run actually dispatched
-    /// under; the two never coexist for tool-bench today only because it
-    /// never calls `set_session_id` at all, not because this precedence
-    /// would resolve correctly if it did.
-    #[test]
-    fn scan_lab_runs_session_id_prefers_manifest_over_lifecycle_when_both_exist() {
+/// (F2) The manifest's `escalation` (written by the lab provider) is read
+/// into the summary: a wrong key or a dropped field would pass a status
+/// test built on a hand-made summary.
+#[test]
+fn scan_lab_runs_reads_the_manifests_escalation() {
+    for (manifest, want) in [
+        (
+            r#"{"session_id":"s","ok":false,"escalation":"escalation_compaction_reread_loop"}"#,
+            Some("escalation_compaction_reread_loop"),
+        ),
+        (r#"{"session_id":"s","ok":false}"#, None),
+    ] {
         let tmp = TempDir::new().unwrap();
         write_lab_run_with_lifecycle_session_id(
             &tmp.path().join("run1"),
             "run1",
-            Some("darkmux-coding-demo-mid-run"),
-            Some(r#"{"schema_version":3,"run_id":"run1","session_id":"darkmux-coding-demo-final"}"#),
+            None,
+            Some(manifest),
         );
         let runs = scan_lab_runs(tmp.path());
         assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].escalation.as_deref(), want, "manifest {manifest}");
+    }
+}
+
+/// (#2494) A run that dispatched fine but failed its tests is only
+/// visible if the scan carries `verify.passed` and the workload beside
+/// `ok`. Three states: passed, failed, not checked (`verify: null` or
+/// absent).
+#[test]
+fn scan_lab_runs_reads_workload_and_verify_passed_from_the_manifest() {
+    for (manifest, want_verify) in [
+        (
+            r#"{"workload":"quick-coding","ok":true,"verify":{"passed":false,"details":"x"}}"#,
+            Some(false),
+        ),
+        (
+            r#"{"workload":"quick-coding","ok":true,"verify":{"passed":true,"details":"x"}}"#,
+            Some(true),
+        ),
+        (
+            r#"{"workload":"quick-coding","ok":true,"verify":null}"#,
+            None,
+        ),
+        (r#"{"workload":"quick-coding","ok":true}"#, None),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        write_lab_run_with_lifecycle_session_id(
+            &tmp.path().join("run1"),
+            "run1",
+            None,
+            Some(manifest),
+        );
+        let runs = scan_lab_runs(tmp.path());
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].verify_passed, want_verify, "manifest {manifest}");
         assert_eq!(
-            runs[0].session_id.as_deref(),
-            Some("darkmux-coding-demo-final"),
-            "the finished-run manifest is authoritative once it exists"
+            runs[0].workload.as_deref(),
+            Some("quick-coding"),
+            "manifest {manifest}"
         );
     }
+}
 
-    #[test]
-    fn tail_lab_events_backfills_from_zero_then_returns_only_new_lines() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        fs::write(dir.join("funnel-events.jsonl"), "{\"a\":1}\n{\"a\":2}\n").unwrap();
+/// (#2511) The actual join this issue exists to make possible: while a
+/// run is still LIVE (no `manifest.json` yet), the session id a
+/// single-dispatch provider already reported to `lifecycle.json`
+/// mid-run must surface through `scan_lab_runs` — this is what lets a
+/// live lab row be claimed by `runs::build_runs`'s dedup, not only a
+/// finished one.
+#[test]
+fn scan_lab_runs_session_id_is_read_from_lifecycle_before_the_manifest_exists() {
+    let tmp = TempDir::new().unwrap();
+    write_lab_run_with_lifecycle_session_id(
+        &tmp.path().join("run1"),
+        "run1",
+        Some("darkmux-coding-demo-1787676109556"),
+        None,
+    );
+    let runs = scan_lab_runs(tmp.path());
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(
+        runs[0].session_id.as_deref(),
+        Some("darkmux-coding-demo-1787676109556"),
+        "a live run's lifecycle-reported session id must surface before the run finishes"
+    );
+}
 
-        let first = tail_lab_events(dir, 0);
-        assert_eq!(first.lines.len(), 2);
-        assert!(!first.finished);
-        assert!(first.next_offset > 0);
+/// The inverted case, required alongside the positive one: a run whose
+/// provider has not (yet, or ever) minted a session id must NOT gain a
+/// fabricated one — `lifecycle.json` with no `session_id` key is
+/// exactly `tool-bench`'s real shape (and any run's shape before its
+/// provider mints one), and must read back as `None`, never a guess.
+#[test]
+fn scan_lab_runs_session_id_is_none_when_lifecycle_never_minted_one() {
+    let tmp = TempDir::new().unwrap();
+    write_lab_run_with_lifecycle_session_id(&tmp.path().join("run1"), "run1", None, None);
+    let runs = scan_lab_runs(tmp.path());
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(
+        runs[0].session_id, None,
+        "no mint means nothing to claim — never a fallback to the run id: {runs:?}"
+    );
+}
 
-        // Nothing new yet — same offset, empty backfill.
-        let stale = tail_lab_events(dir, first.next_offset);
-        assert!(stale.lines.is_empty());
-        assert_eq!(stale.next_offset, first.next_offset);
+/// Once `manifest.json` lands at run end, it wins over the lifecycle
+/// record. Scoped deliberately to `coding-task`/`prompt`, the only two
+/// providers that ever populate BOTH: for them the two are
+/// byte-identical (one mint, reported to the lifecycle record before
+/// dispatching, then carried into the manifest verbatim at the end), so
+/// "manifest wins" is a no-op in practice and the identity a consumer
+/// sees never actually changes mid-run. This is NOT a general "the
+/// manifest is always the authoritative session" rule — `tool-bench`'s
+/// manifest carries a `session_id` too, but one minted FRESH at
+/// manifest-write time (see its own `run()`), never reported to
+/// `set_session_id` and never anything the run actually dispatched
+/// under; the two never coexist for tool-bench today only because it
+/// never calls `set_session_id` at all, not because this precedence
+/// would resolve correctly if it did.
+#[test]
+fn scan_lab_runs_session_id_prefers_manifest_over_lifecycle_when_both_exist() {
+    let tmp = TempDir::new().unwrap();
+    write_lab_run_with_lifecycle_session_id(
+        &tmp.path().join("run1"),
+        "run1",
+        Some("darkmux-coding-demo-mid-run"),
+        Some(r#"{"schema_version":3,"run_id":"run1","session_id":"darkmux-coding-demo-final"}"#),
+    );
+    let runs = scan_lab_runs(tmp.path());
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(
+        runs[0].session_id.as_deref(),
+        Some("darkmux-coding-demo-final"),
+        "the finished-run manifest is authoritative once it exists"
+    );
+}
 
-        // Append a third record and re-poll from the returned offset.
-        use std::io::Write;
-        let mut f = fs::OpenOptions::new().append(true).open(dir.join("funnel-events.jsonl")).unwrap();
-        writeln!(f, "{{\"a\":3}}").unwrap();
-        drop(f);
+#[test]
+fn tail_lab_events_backfills_from_zero_then_returns_only_new_lines() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(dir.join("funnel-events.jsonl"), "{\"a\":1}\n{\"a\":2}\n").unwrap();
 
-        let second = tail_lab_events(dir, first.next_offset);
-        assert_eq!(second.lines.len(), 1, "only the newly-appended line: {second:?}");
-        assert_eq!(second.lines[0]["a"], 3);
-    }
+    let first = tail_lab_events(dir, 0);
+    assert_eq!(first.lines.len(), 2);
+    assert!(!first.finished);
+    assert!(first.next_offset > 0);
 
-    #[test]
-    fn tail_lab_events_leaves_a_torn_trailing_line_for_the_next_poll() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        // A complete line followed by a partial one with NO trailing
-        // newline — simulates reading mid-flush.
-        fs::write(dir.join("funnel-events.jsonl"), "{\"a\":1}\n{\"a\":2").unwrap();
+    // Nothing new yet — same offset, empty backfill.
+    let stale = tail_lab_events(dir, first.next_offset);
+    assert!(stale.lines.is_empty());
+    assert_eq!(stale.next_offset, first.next_offset);
 
-        let resp = tail_lab_events(dir, 0);
-        assert_eq!(resp.lines.len(), 1, "the torn line must not be parsed yet: {resp:?}");
-        assert_eq!(resp.lines[0]["a"], 1);
-        // next_offset must land exactly after the complete line's newline,
-        // not past the torn trailing bytes.
-        assert_eq!(resp.next_offset, "{\"a\":1}\n".len() as u64);
-    }
+    // Append a third record and re-poll from the returned offset.
+    use std::io::Write;
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("funnel-events.jsonl"))
+        .unwrap();
+    writeln!(f, "{{\"a\":3}}").unwrap();
+    drop(f);
 
-    #[test]
-    fn tail_lab_events_reports_finished_once_scores_json_exists() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        fs::write(dir.join("funnel-events.jsonl"), "{\"a\":1}\n").unwrap();
-        assert!(!tail_lab_events(dir, 0).finished);
-        fs::write(dir.join("scores.json"), "{}").unwrap();
-        assert!(tail_lab_events(dir, 0).finished);
-    }
+    let second = tail_lab_events(dir, first.next_offset);
+    assert_eq!(
+        second.lines.len(),
+        1,
+        "only the newly-appended line: {second:?}"
+    );
+    assert_eq!(second.lines[0]["a"], 3);
+}
 
-    #[test]
-    fn tail_lab_events_missing_file_returns_empty_not_error() {
-        let tmp = TempDir::new().unwrap();
-        let resp = tail_lab_events(tmp.path(), 0);
-        assert!(resp.lines.is_empty());
-        assert_eq!(resp.next_offset, 0);
-        assert!(!resp.finished);
-    }
+#[test]
+fn tail_lab_events_leaves_a_torn_trailing_line_for_the_next_poll() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    // A complete line followed by a partial one with NO trailing
+    // newline — simulates reading mid-flush.
+    fs::write(dir.join("funnel-events.jsonl"), "{\"a\":1}\n{\"a\":2").unwrap();
 
-    #[tokio::test]
-    async fn lab_runs_handler_reports_unconfigured_when_no_lab_dir() {
-        let flows = TempDir::new().unwrap();
-        let app = build_router_full_local(flows.path().to_path_buf(), None);
-        let response = app
-            .oneshot(Request::builder().uri("/lab/runs").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["configured"], false);
-        assert_eq!(json["runs"].as_array().unwrap().len(), 0);
-    }
+    let resp = tail_lab_events(dir, 0);
+    assert_eq!(
+        resp.lines.len(),
+        1,
+        "the torn line must not be parsed yet: {resp:?}"
+    );
+    assert_eq!(resp.lines[0]["a"], 1);
+    // next_offset must land exactly after the complete line's newline,
+    // not past the torn trailing bytes.
+    assert_eq!(resp.next_offset, "{\"a\":1}\n".len() as u64);
+}
 
-    #[tokio::test]
-    async fn lab_runs_handler_lists_a_configured_runs_directory() {
-        let flows = TempDir::new().unwrap();
-        let lab = TempDir::new().unwrap();
-        write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
-        let app = build_router_full_local(
-            flows.path().to_path_buf(),
-            Some(lab.path().to_path_buf()),
-        );
-        let response = app
-            .oneshot(Request::builder().uri("/lab/runs").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["configured"], true);
-        let runs = json["runs"].as_array().unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0]["dir"], "case-a/run1");
-        assert_eq!(runs[0]["crew"], "demo-crew");
-    }
+#[test]
+fn tail_lab_events_reports_finished_once_scores_json_exists() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    fs::write(dir.join("funnel-events.jsonl"), "{\"a\":1}\n").unwrap();
+    assert!(!tail_lab_events(dir, 0).finished);
+    fs::write(dir.join("scores.json"), "{}").unwrap();
+    assert!(tail_lab_events(dir, 0).finished);
+}
 
-    /// `/lab/runs` serves each run's staffing as the seats it used (name, model,
-    /// k, window, budget), not the whole snapshot the `/runs` fold reads: the
-    /// wire type is `LabStaffing`, and the retired `has_funnels` spelling is gone.
-    #[tokio::test]
-    async fn lab_runs_serves_the_staffing_view_and_has_reviews() {
-        let flows = TempDir::new().unwrap();
-        let lab = TempDir::new().unwrap();
-        write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
-        let app = build_router_full_local(flows.path().to_path_buf(), Some(lab.path().to_path_buf()));
-        let response = app
-            .oneshot(Request::builder().uri("/lab/runs").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let run = &json["runs"][0];
-        let mut judge_keys: Vec<&str> =
-            run["staffing"]["judge"].as_object().unwrap().keys().map(String::as_str).collect();
-        judge_keys.sort_unstable();
-        assert_eq!(judge_keys, ["k", "max_tokens", "model", "n_ctx", "name"], "{run}");
-        assert_eq!(run["has_reviews"], true);
-        assert!(run.get("has_funnels").is_none(), "the retired field name must not be served: {run}");
-    }
+#[test]
+fn tail_lab_events_missing_file_returns_empty_not_error() {
+    let tmp = TempDir::new().unwrap();
+    let resp = tail_lab_events(tmp.path(), 0);
+    assert!(resp.lines.is_empty());
+    assert_eq!(resp.next_offset, 0);
+    assert!(!resp.finished);
+}
 
-    #[tokio::test]
-    async fn lab_run_detail_handler_returns_reviews_and_scores() {
-        let flows = TempDir::new().unwrap();
-        let lab = TempDir::new().unwrap();
-        write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
-        let app = build_router_full_local(
-            flows.path().to_path_buf(),
-            Some(lab.path().to_path_buf()),
-        );
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/lab/run/detail?dir=case-a%2Frun1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["dir"], "case-a/run1");
-        let reviews = json["reviews"].as_array().unwrap();
-        assert_eq!(reviews.len(), 1);
-        assert_eq!(reviews[0]["case_id"], "demo-case-a");
-        assert!(json["scores"].is_object(), "a readable scores.json is reported: {json}");
-        assert!(json.get("funnels").is_none(), "the retired field name must not be served: {json}");
-    }
+#[tokio::test]
+async fn lab_runs_handler_reports_unconfigured_when_no_lab_dir() {
+    let flows = TempDir::new().unwrap();
+    let app = build_router_full_local(flows.path().to_path_buf(), None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/lab/runs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["configured"], false);
+    assert_eq!(json["runs"].as_array().unwrap().len(), 0);
+}
 
-    #[tokio::test]
-    async fn lab_run_detail_handler_resolves_a_run_matched_at_lab_dir_root() {
-        // QA finding (#1247 PR review round): `lab_dir` ITSELF matching the
-        // run-cluster criteria (an operator pointing `--lab-dir` at one
-        // run's folder, or a stray marker left at the root) gets `dir: ""`
-        // from `/lab/runs` — that identifier must actually be drillable, not
-        // a permanent 400.
-        let flows = TempDir::new().unwrap();
-        let lab = TempDir::new().unwrap();
-        write_synthetic_funnel_run(lab.path(), "demo-case-root", "demo-crew");
-        let app = build_router_full_local(
-            flows.path().to_path_buf(),
-            Some(lab.path().to_path_buf()),
-        );
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/lab/run/detail?dir=")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["reviews"].as_array().unwrap()[0]["case_id"], "demo-case-root");
-    }
+#[tokio::test]
+async fn lab_runs_handler_lists_a_configured_runs_directory() {
+    let flows = TempDir::new().unwrap();
+    let lab = TempDir::new().unwrap();
+    write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+    let app = build_router_full_local(flows.path().to_path_buf(), Some(lab.path().to_path_buf()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/lab/runs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["configured"], true);
+    let runs = json["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["dir"], "case-a/run1");
+    assert_eq!(runs[0]["crew"], "demo-crew");
+}
 
-    #[tokio::test]
-    async fn lab_run_detail_handler_rejects_traversal_dir() {
-        let flows = TempDir::new().unwrap();
-        let lab = TempDir::new().unwrap();
-        write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
-        let app = build_router_full_local(
-            flows.path().to_path_buf(),
-            Some(lab.path().to_path_buf()),
-        );
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/lab/run/detail?dir=..%2F..%2Fetc")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
+/// `/lab/runs` serves each run's staffing as the seats it used (name, model,
+/// k, window, budget), not the whole snapshot the `/runs` fold reads: the
+/// wire type is `LabStaffing`, and the retired `has_funnels` spelling is gone.
+#[tokio::test]
+async fn lab_runs_serves_the_staffing_view_and_has_reviews() {
+    let flows = TempDir::new().unwrap();
+    let lab = TempDir::new().unwrap();
+    write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+    let app = build_router_full_local(flows.path().to_path_buf(), Some(lab.path().to_path_buf()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/lab/runs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let run = &json["runs"][0];
+    let mut judge_keys: Vec<&str> = run["staffing"]["judge"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    judge_keys.sort_unstable();
+    assert_eq!(
+        judge_keys,
+        ["k", "max_tokens", "model", "n_ctx", "name"],
+        "{run}"
+    );
+    assert_eq!(run["has_reviews"], true);
+    assert!(
+        run.get("has_funnels").is_none(),
+        "the retired field name must not be served: {run}"
+    );
+}
 
-    #[tokio::test]
-    async fn lab_run_detail_handler_404s_when_not_configured() {
-        let flows = TempDir::new().unwrap();
-        let app = build_router_full_local(flows.path().to_path_buf(), None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/lab/run/detail?dir=case-a%2Frun1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
+#[tokio::test]
+async fn lab_run_detail_handler_returns_reviews_and_scores() {
+    let flows = TempDir::new().unwrap();
+    let lab = TempDir::new().unwrap();
+    write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+    let app = build_router_full_local(flows.path().to_path_buf(), Some(lab.path().to_path_buf()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/lab/run/detail?dir=case-a%2Frun1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["dir"], "case-a/run1");
+    let reviews = json["reviews"].as_array().unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0]["case_id"], "demo-case-a");
+    assert!(
+        json["scores"].is_object(),
+        "a readable scores.json is reported: {json}"
+    );
+    assert!(
+        json.get("funnels").is_none(),
+        "the retired field name must not be served: {json}"
+    );
+}
 
-    #[tokio::test]
-    async fn lab_run_events_handler_backfills_then_deltas_across_two_polls() {
-        let flows = TempDir::new().unwrap();
-        let lab = TempDir::new().unwrap();
-        let run_dir = lab.path().join("live/gate-1");
-        write_synthetic_live_run(&run_dir, "demo-case-b", "demo-gate-crew");
-        let app = build_router_full_local(
-            flows.path().to_path_buf(),
-            Some(lab.path().to_path_buf()),
-        );
+#[tokio::test]
+async fn lab_run_detail_handler_resolves_a_run_matched_at_lab_dir_root() {
+    // QA finding (#1247 PR review round): `lab_dir` ITSELF matching the
+    // run-cluster criteria (an operator pointing `--lab-dir` at one
+    // run's folder, or a stray marker left at the root) gets `dir: ""`
+    // from `/lab/runs` — that identifier must actually be drillable, not
+    // a permanent 400.
+    let flows = TempDir::new().unwrap();
+    let lab = TempDir::new().unwrap();
+    write_synthetic_funnel_run(lab.path(), "demo-case-root", "demo-crew");
+    let app = build_router_full_local(flows.path().to_path_buf(), Some(lab.path().to_path_buf()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/lab/run/detail?dir=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        json["reviews"].as_array().unwrap()[0]["case_id"],
+        "demo-case-root"
+    );
+}
 
-        let first = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/lab/run/events?dir=live%2Fgate-1&offset=0")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
-        let bytes = to_bytes(first.into_body(), 65536).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["lines"].as_array().unwrap().len(), 1);
-        assert!(!json["finished"].as_bool().unwrap());
-        let next_offset = json["next_offset"].as_u64().unwrap();
-        assert!(next_offset > 0);
+#[tokio::test]
+async fn lab_run_detail_handler_rejects_traversal_dir() {
+    let flows = TempDir::new().unwrap();
+    let lab = TempDir::new().unwrap();
+    write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+    let app = build_router_full_local(flows.path().to_path_buf(), Some(lab.path().to_path_buf()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/lab/run/detail?dir=..%2F..%2Fetc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
 
-        // Append a second record directly (simulating the driver emitting
-        // another step) and re-poll from next_offset.
-        use std::io::Write;
-        let mut f = fs::OpenOptions::new()
-            .append(true)
-            .open(run_dir.join("funnel-events.jsonl"))
-            .unwrap();
-        writeln!(
+#[tokio::test]
+async fn lab_run_detail_handler_404s_when_not_configured() {
+    let flows = TempDir::new().unwrap();
+    let app = build_router_full_local(flows.path().to_path_buf(), None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/lab/run/detail?dir=case-a%2Frun1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn lab_run_events_handler_backfills_then_deltas_across_two_polls() {
+    let flows = TempDir::new().unwrap();
+    let lab = TempDir::new().unwrap();
+    let run_dir = lab.path().join("live/gate-1");
+    write_synthetic_live_run(&run_dir, "demo-case-b", "demo-gate-crew");
+    let app = build_router_full_local(flows.path().to_path_buf(), Some(lab.path().to_path_buf()));
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/lab/run/events?dir=live%2Fgate-1&offset=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let bytes = to_bytes(first.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["lines"].as_array().unwrap().len(), 1);
+    assert!(!json["finished"].as_bool().unwrap());
+    let next_offset = json["next_offset"].as_u64().unwrap();
+    assert!(next_offset > 0);
+
+    // Append a second record directly (simulating the driver emitting
+    // another step) and re-poll from next_offset.
+    use std::io::Write;
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(run_dir.join("funnel-events.jsonl"))
+        .unwrap();
+    writeln!(
             f,
             "{}",
             serde_json::json!({
@@ -7071,1344 +8878,1529 @@
             })
         )
         .unwrap();
-        drop(f);
+    drop(f);
 
-        let second = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/lab/run/events?dir=live%2Fgate-1&offset={next_offset}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(second.status(), StatusCode::OK);
-        let bytes = to_bytes(second.into_body(), 65536).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let lines = json["lines"].as_array().unwrap();
-        assert_eq!(lines.len(), 1, "only the newly-appended record: {lines:?}");
-        assert_eq!(lines[0]["action"], "step.result");
-    }
-
-    #[tokio::test]
-    async fn lab_run_events_handler_rejects_traversal_dir() {
-        let flows = TempDir::new().unwrap();
-        let lab = TempDir::new().unwrap();
-        write_synthetic_live_run(&lab.path().join("live/gate-1"), "demo-case-b", "demo-gate-crew");
-        let app = build_router_full_local(
-            flows.path().to_path_buf(),
-            Some(lab.path().to_path_buf()),
-        );
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/lab/run/events?dir=%2Fetc%2Fpasswd&offset=0")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn lab_run_events_handler_404s_when_not_configured() {
-        let flows = TempDir::new().unwrap();
-        let app = build_router_full_local(flows.path().to_path_buf(), None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/lab/run/events?dir=live%2Fgate-1&offset=0")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    // ─── Mission graph lens (#1284 Packet 5) ────────────────────────────
-
-    /// Redirects `darkmux-crew`'s mission/phase/task/step storage into a
-    /// fresh temp dir for the lifetime of the guard, mirroring the
-    /// `CrewDirGuard` pattern used throughout `darkmux-crew`'s own tests
-    /// (`cli.rs`, `index.rs`) — `DARKMUX_HOME` is the darkmux root, read
-    /// live per call, so no process restart is needed for the override to
-    /// take effect. Callers of anything backed by this guard MUST be
-    /// `#[serial_test::serial]` (env var mutation isn't thread-safe).
-    struct CrewDirGuard {
-        prev: Option<String>,
-        prev_home: Option<String>,
-        // Held only to keep the temp dir alive for the guard's lifetime
-        // (RAII) — never read after construction, hence the underscore.
-        _tmp: TempDir,
-    }
-    impl CrewDirGuard {
-        fn new() -> Self {
-            let tmp = TempDir::new().unwrap();
-            let prev = std::env::var("DARKMUX_HOME").ok();
-            let prev_home = std::env::var("HOME").ok();
-            // HOME too, not just the darkmux root: a path resolved from the
-            // home directory must not reach the operator's own state.
-            unsafe {
-                std::env::set_var("DARKMUX_HOME", tmp.path());
-                std::env::set_var("HOME", tmp.path());
-            }
-            Self { prev, prev_home, _tmp: tmp }
-        }
-    }
-    impl Drop for CrewDirGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
-                    None => std::env::remove_var("DARKMUX_HOME"),
-                }
-                match &self.prev_home {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-
-    fn now_unix() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    }
-
-    fn save_test_mission(mission: &darkmux_crew::types::Mission) {
-        darkmux_crew::lifecycle::save_mission(mission).expect("save mission");
-    }
-    fn save_test_phase(phase: &darkmux_crew::types::Phase) {
-        darkmux_crew::lifecycle::save_phase(phase).expect("save phase");
-    }
-
-    fn minimal_mission(id: &str, phase_ids: Vec<String>) -> darkmux_crew::types::Mission {
-        darkmux_crew::types::Mission {
-            id: id.to_string(),
-            description: format!("test mission {id}"),
-            status: darkmux_crew::types::MissionStatus::Active,
-            phase_ids,
-            created_ts: now_unix(),
-            started_ts: None,
-            finalized_ts: None,
-            source_input: None,
-            ticket: None,
-            spec: None,
-            machine: None,
-        }
-    }
-
-    fn minimal_phase(id: &str, mission_id: &str) -> darkmux_crew::types::Phase {
-        darkmux_crew::types::Phase {
-            id: id.to_string(),
-            mission_id: mission_id.to_string(),
-            description: format!("phase {id}"),
-            display_name: None,
-            status: darkmux_crew::types::PhaseStatus::Running,
-            created_ts: now_unix(),
-            started_ts: Some(now_unix()),
-            completed_ts: None,
-            abandoned_ts: None,
-            task_ids: Vec::new(),
-        }
-    }
-
-    // ─── /runs aggregator (#1508 step 3) ────────────────────────────────
-    //
-    // The normalization/dedup logic itself is unit-tested in `runs.rs`'s
-    // own `mod tests` (kind derivation, status mapping, the mission_id-gap
-    // dedup, ghost synthesis). These are wiring-level tests only: does the
-    // route exist, does it read the SAME `AppState` sources every other
-    // handler reads, does the envelope shape match `/missions`'s own.
-
-    /// (#3428) `/runs` requests inside [`RUNS_CACHE_TTL`] share one build of
-    /// the run list: it costs seconds on a busy machine (a 14-day fold of the
-    /// flow records, every mission and lab run), and every open viewer polls
-    /// it. `generated_at_ms` is when that build ran, so a served copy says
-    /// how old it is.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn runs_requests_inside_the_ttl_share_one_build() {
-        let _guard = CrewDirGuard::new();
-        let flows = TempDir::new().unwrap();
-        let builds = || super::RUNS_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
-        let get = || async {
-            let response = build_router_full_local(flows.path().to_path_buf(), None)
-                .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-        };
-        let before = builds();
-        let first = get().await;
-        save_test_mission(&minimal_mission("runs-cache-later", vec![]));
-        let second = get().await;
-        assert_eq!(builds() - before, 1, "one build for both requests");
-        assert_eq!(first["runs"], second["runs"]);
-        assert_eq!(first["generated_at_ms"], second["generated_at_ms"], "the build's own time");
-
-        // A new flow record (a run's terminal, which the replay's catch-up
-        // refetch waits on) changes what a build reads: the next request
-        // builds again inside the TTL.
-        let today = darkmux_flow::ts_utc_at(now_unix() as i64);
-        fs::write(
-            flows.path().join(format!("{}.jsonl", &today[..10])),
-            format!("{{\"action\":\"dispatch.start\",\"session_id\":\"S-new\",\"execution_id\":\"exec-00000001-0000-0001\",\"ts\":\"{today}\"}}\n"),
+    let second = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/lab/run/events?dir=live%2Fgate-1&offset={next_offset}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
         )
+        .await
         .unwrap();
-        let third = get().await;
-        assert_eq!(builds() - before, 2, "a new record means a new build");
-        assert_ne!(third["runs"], first["runs"], "{third}");
+    assert_eq!(second.status(), StatusCode::OK);
+    let bytes = to_bytes(second.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let lines = json["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), 1, "only the newly-appended record: {lines:?}");
+    assert_eq!(lines[0]["action"], "step.result");
+}
 
-        // Another flows dir is another build (a test's router, or a
-        // reconfigured daemon), never this one's copy.
-        let other = TempDir::new().unwrap();
-        let response = build_router_full_local(other.path().to_path_buf(), None)
+#[tokio::test]
+async fn lab_run_events_handler_rejects_traversal_dir() {
+    let flows = TempDir::new().unwrap();
+    let lab = TempDir::new().unwrap();
+    write_synthetic_live_run(
+        &lab.path().join("live/gate-1"),
+        "demo-case-b",
+        "demo-gate-crew",
+    );
+    let app = build_router_full_local(flows.path().to_path_buf(), Some(lab.path().to_path_buf()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/lab/run/events?dir=%2Fetc%2Fpasswd&offset=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn lab_run_events_handler_404s_when_not_configured() {
+    let flows = TempDir::new().unwrap();
+    let app = build_router_full_local(flows.path().to_path_buf(), None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/lab/run/events?dir=live%2Fgate-1&offset=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ─── Mission graph lens (#1284 Packet 5) ────────────────────────────
+
+/// Redirects `darkmux-crew`'s mission/phase/task/step storage into a
+/// fresh temp dir for the lifetime of the guard, mirroring the
+/// `CrewDirGuard` pattern used throughout `darkmux-crew`'s own tests
+/// (`cli.rs`, `index.rs`) — `DARKMUX_HOME` is the darkmux root, read
+/// live per call, so no process restart is needed for the override to
+/// take effect. Callers of anything backed by this guard MUST be
+/// `#[serial_test::serial]` (env var mutation isn't thread-safe).
+struct CrewDirGuard {
+    prev: Option<String>,
+    prev_home: Option<String>,
+    // Held only to keep the temp dir alive for the guard's lifetime
+    // (RAII) — never read after construction, hence the underscore.
+    _tmp: TempDir,
+}
+impl CrewDirGuard {
+    fn new() -> Self {
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        let prev_home = std::env::var("HOME").ok();
+        // HOME too, not just the darkmux root: a path resolved from the
+        // home directory must not reach the operator's own state.
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+            std::env::set_var("HOME", tmp.path());
+        }
+        Self {
+            prev,
+            prev_home,
+            _tmp: tmp,
+        }
+    }
+}
+impl Drop for CrewDirGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+            match &self.prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn save_test_mission(mission: &darkmux_crew::types::Mission) {
+    darkmux_crew::lifecycle::save_mission(mission).expect("save mission");
+}
+fn save_test_phase(phase: &darkmux_crew::types::Phase) {
+    darkmux_crew::lifecycle::save_phase(phase).expect("save phase");
+}
+
+fn minimal_mission(id: &str, phase_ids: Vec<String>) -> darkmux_crew::types::Mission {
+    darkmux_crew::types::Mission {
+        id: id.to_string(),
+        description: format!("test mission {id}"),
+        status: darkmux_crew::types::MissionStatus::Active,
+        phase_ids,
+        created_ts: now_unix(),
+        started_ts: None,
+        finalized_ts: None,
+        source_input: None,
+        ticket: None,
+        spec: None,
+        machine: None,
+    }
+}
+
+fn minimal_phase(id: &str, mission_id: &str) -> darkmux_crew::types::Phase {
+    darkmux_crew::types::Phase {
+        id: id.to_string(),
+        mission_id: mission_id.to_string(),
+        description: format!("phase {id}"),
+        display_name: None,
+        status: darkmux_crew::types::PhaseStatus::Running,
+        created_ts: now_unix(),
+        started_ts: Some(now_unix()),
+        completed_ts: None,
+        abandoned_ts: None,
+        task_ids: Vec::new(),
+    }
+}
+
+// ─── /runs aggregator (#1508 step 3) ────────────────────────────────
+//
+// The normalization/dedup logic itself is unit-tested in `runs.rs`'s
+// own `mod tests` (kind derivation, status mapping, the mission_id-gap
+// dedup, ghost synthesis). These are wiring-level tests only: does the
+// route exist, does it read the SAME `AppState` sources every other
+// handler reads, does the envelope shape match `/missions`'s own.
+
+/// (#3428) `/runs` requests inside [`RUNS_CACHE_TTL`] share one build of
+/// the run list: it costs seconds on a busy machine (a 14-day fold of the
+/// flow records, every mission and lab run), and every open viewer polls
+/// it. `generated_at_ms` is when that build ran, so a served copy says
+/// how old it is.
+#[tokio::test]
+#[serial_test::serial]
+async fn runs_requests_inside_the_ttl_share_one_build() {
+    let _guard = CrewDirGuard::new();
+    let flows = TempDir::new().unwrap();
+    let builds = || super::RUNS_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+    let get = || async {
+        let response = build_router_full_local(flows.path().to_path_buf(), None)
             .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(builds() - before, 3);
-    }
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    let before = builds();
+    let first = get().await;
+    save_test_mission(&minimal_mission("runs-cache-later", vec![]));
+    let second = get().await;
+    assert_eq!(builds() - before, 1, "one build for both requests");
+    assert_eq!(first["runs"], second["runs"]);
+    assert_eq!(
+        first["generated_at_ms"], second["generated_at_ms"],
+        "the build's own time"
+    );
 
-    /// (#3428) A `/runs` poll past [`RUNS_CACHE_TTL`] with nothing new
-    /// recorded is answered from the last build at once, and that build is
-    /// replaced in the background: a status that turns on elapsed time is
-    /// still refreshed, but no request waits a build out for it.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_runs_poll_past_the_ttl_with_nothing_new_is_served_while_it_rebuilds() {
-        let _guard = CrewDirGuard::new();
-        let flows = TempDir::new().unwrap();
-        let builds = || super::RUNS_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
-        let get = || async {
-            let response = build_router_full_local(flows.path().to_path_buf(), None)
-                .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-        };
-        let before = builds();
-        get().await;
-        assert_eq!(builds() - before, 1);
-        // Age the build past the TTL (inside the stale bound), marked so a
-        // served copy is recognized.
-        {
-            let mut slot = super::runs_cache().lock().await;
-            let built = slot.built.as_mut().expect("the first request's build");
-            built.at -= super::RUNS_CACHE_TTL + Duration::from_secs(1);
-            built.built_at_ms = 1;
-        }
-        let served = get().await;
-        assert_eq!(served["generated_at_ms"], 1, "the poll waited on a rebuild: {served}");
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while builds() - before < 2 {
-            assert!(std::time::Instant::now() < deadline, "the background rebuild never ran");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let next = get().await;
-            if next["generated_at_ms"] != 1 {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "the background rebuild was never kept");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(builds() - before, 2, "one rebuild, kept, and served inside the TTL");
-    }
-
-    /// (#3428) The live rebuild path keeps a background rebuild only while
-    /// it is current: new work arriving while it runs (a foreground build)
-    /// supersedes it, so when it lands the foreground build stays, and while
-    /// it still runs no other rebuild starts beside it.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_live_runs_rebuild_superseded_by_new_work_is_dropped_and_runs_alone() {
-        let _guard = CrewDirGuard::new();
-        let flows = TempDir::new().unwrap();
-        let builds = || super::RUNS_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
-        let get = || async {
-            let response = build_router_full_local(flows.path().to_path_buf(), None)
-                .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-        };
-        let age = || async {
-            super::runs_cache().lock().await.built.as_mut().expect("a build").at -=
-                super::RUNS_CACHE_TTL + Duration::from_secs(1);
-        };
-        let deadline = || std::time::Instant::now() + Duration::from_secs(10);
-        get().await;
-        age().await;
-        let before = builds();
-        // The background rebuild this poll starts takes 1.5s.
-        super::RUNS_BUILD_DELAY_MS.store(1_500, std::sync::atomic::Ordering::SeqCst);
-        get().await;
-        let until = deadline();
-        while super::RUNS_BUILD_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst) != 0 {
-            assert!(std::time::Instant::now() < until, "the background rebuild never began");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        // New work arrives while it runs: the next poll builds in the foreground.
-        let today = darkmux_flow::ts_utc_at(now_unix() as i64);
-        fs::write(
+    // A new flow record (a run's terminal, which the replay's catch-up
+    // refetch waits on) changes what a build reads: the next request
+    // builds again inside the TTL.
+    let today = darkmux_flow::ts_utc_at(now_unix() as i64);
+    fs::write(
             flows.path().join(format!("{}.jsonl", &today[..10])),
             format!("{{\"action\":\"dispatch.start\",\"session_id\":\"S-new\",\"execution_id\":\"exec-00000001-0000-0001\",\"ts\":\"{today}\"}}\n"),
         )
         .unwrap();
-        get().await;
-        // Past the TTL again while the superseded rebuild still runs: served,
-        // and no second rebuild starts beside it.
-        age().await;
-        let kept = super::runs_cache().lock().await.built.as_ref().expect("the foreground build").at;
-        get().await;
-        let until = deadline();
-        while super::runs_cache().lock().await.rebuild_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
-            assert!(std::time::Instant::now() < until, "the background rebuild never returned");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(builds() - before, 2, "a rebuild ran beside the superseded one");
-        assert_eq!(
-            super::runs_cache().lock().await.built.as_ref().expect("a build").at,
-            kept,
-            "the superseded rebuild replaced the foreground build"
+    let third = get().await;
+    assert_eq!(builds() - before, 2, "a new record means a new build");
+    assert_ne!(third["runs"], first["runs"], "{third}");
+
+    // Another flows dir is another build (a test's router, or a
+    // reconfigured daemon), never this one's copy.
+    let other = TempDir::new().unwrap();
+    let response = build_router_full_local(other.path().to_path_buf(), None)
+        .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(builds() - before, 3);
+}
+
+/// (#3428) A `/runs` poll past [`RUNS_CACHE_TTL`] with nothing new
+/// recorded is answered from the last build at once, and that build is
+/// replaced in the background: a status that turns on elapsed time is
+/// still refreshed, but no request waits a build out for it.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_runs_poll_past_the_ttl_with_nothing_new_is_served_while_it_rebuilds() {
+    let _guard = CrewDirGuard::new();
+    let flows = TempDir::new().unwrap();
+    let builds = || super::RUNS_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+    let get = || async {
+        let response = build_router_full_local(flows.path().to_path_buf(), None)
+            .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    let before = builds();
+    get().await;
+    assert_eq!(builds() - before, 1);
+    // Age the build past the TTL (inside the stale bound), marked so a
+    // served copy is recognized.
+    {
+        let mut slot = super::runs_cache().lock().await;
+        let built = slot.built.as_mut().expect("the first request's build");
+        built.at -= super::RUNS_CACHE_TTL + Duration::from_secs(1);
+        built.built_at_ms = 1;
+    }
+    let served = get().await;
+    assert_eq!(
+        served["generated_at_ms"], 1,
+        "the poll waited on a rebuild: {served}"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while builds() - before < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the background rebuild never ran"
         );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-
-    /// `/runs` rebuilds when what it reads changes. The daemon appends its
-    /// own host telemetry to today's file all day, and `/runs` folds none of
-    /// it, so such a record must not count as new input (it used to: the key
-    /// was each day file's length and mtime, so the 14-day fold re-ran after
-    /// every telemetry write). A record the build folds still does.
-    #[test]
-    #[serial_test::serial]
-    fn runs_inputs_change_only_with_what_runs_folds() {
-        unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
-        let flows = TempDir::new().unwrap();
-        let now = darkmux_flow::ts_utc_at(now_unix() as i64);
-        let today = flows.path().join(format!("{}.jsonl", &now[..10]));
-        let append = |line: String| {
-            let mut f = fs::OpenOptions::new().create(true).append(true).open(&today).unwrap();
-            std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()).unwrap();
-        };
-        append(format!("{{\"action\":\"dispatch.start\",\"session_id\":\"S-1\",\"ts\":\"{now}\"}}"));
-        let before = super::runs_inputs(flows.path());
-        append(format!("{{\"action\":\"machine.telemetry\",\"machine_id\":\"laptop\",\"ts\":\"{now}\",\"payload\":{{\"cpu_pct\":3}}}}"));
-        assert_eq!(super::runs_inputs(flows.path()), before, "host telemetry is not an input to /runs");
-        append(format!("{{\"action\":\"dispatch.complete\",\"session_id\":\"S-1\",\"ts\":\"{now}\"}}"));
-        assert_ne!(super::runs_inputs(flows.path()), before, "a record /runs folds is");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let next = get().await;
+        if next["generated_at_ms"] != 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the background rebuild was never kept"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert_eq!(
+        builds() - before,
+        2,
+        "one rebuild, kept, and served inside the TTL"
+    );
+}
 
-    /// (#3428) The first `/runs` poll after an idle stretch waits for a new
-    /// build rather than being served the old one: the build's fingerprint
-    /// misses a mission recorded without a flow record, and only the bound
-    /// on a served build's age keeps it from hiding that mission.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn the_first_runs_poll_after_an_idle_hour_waits_for_a_new_build() {
-        let _guard = CrewDirGuard::new();
-        let flows = TempDir::new().unwrap();
-        let get = || async {
-            let response = build_router_full_local(flows.path().to_path_buf(), None)
+/// (#3428) The live rebuild path keeps a background rebuild only while
+/// it is current: new work arriving while it runs (a foreground build)
+/// supersedes it, so when it lands the foreground build stays, and while
+/// it still runs no other rebuild starts beside it.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_live_runs_rebuild_superseded_by_new_work_is_dropped_and_runs_alone() {
+    let _guard = CrewDirGuard::new();
+    let flows = TempDir::new().unwrap();
+    let builds = || super::RUNS_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+    let get = || async {
+        let response = build_router_full_local(flows.path().to_path_buf(), None)
+            .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    let age = || async {
+        super::runs_cache()
+            .lock()
+            .await
+            .built
+            .as_mut()
+            .expect("a build")
+            .at -= super::RUNS_CACHE_TTL + Duration::from_secs(1);
+    };
+    let deadline = || std::time::Instant::now() + Duration::from_secs(10);
+    get().await;
+    age().await;
+    let before = builds();
+    // The background rebuild this poll starts takes 1.5s.
+    super::RUNS_BUILD_DELAY_MS.store(1_500, std::sync::atomic::Ordering::SeqCst);
+    get().await;
+    let until = deadline();
+    while super::RUNS_BUILD_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        assert!(
+            std::time::Instant::now() < until,
+            "the background rebuild never began"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // New work arrives while it runs: the next poll builds in the foreground.
+    let today = darkmux_flow::ts_utc_at(now_unix() as i64);
+    fs::write(
+            flows.path().join(format!("{}.jsonl", &today[..10])),
+            format!("{{\"action\":\"dispatch.start\",\"session_id\":\"S-new\",\"execution_id\":\"exec-00000001-0000-0001\",\"ts\":\"{today}\"}}\n"),
+        )
+        .unwrap();
+    get().await;
+    // Past the TTL again while the superseded rebuild still runs: served,
+    // and no second rebuild starts beside it.
+    age().await;
+    let kept = super::runs_cache()
+        .lock()
+        .await
+        .built
+        .as_ref()
+        .expect("the foreground build")
+        .at;
+    get().await;
+    let until = deadline();
+    while super::runs_cache()
+        .lock()
+        .await
+        .rebuild_in_flight
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        assert!(
+            std::time::Instant::now() < until,
+            "the background rebuild never returned"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        builds() - before,
+        2,
+        "a rebuild ran beside the superseded one"
+    );
+    assert_eq!(
+        super::runs_cache()
+            .lock()
+            .await
+            .built
+            .as_ref()
+            .expect("a build")
+            .at,
+        kept,
+        "the superseded rebuild replaced the foreground build"
+    );
+}
+
+/// `/runs` rebuilds when what it reads changes. The daemon appends its
+/// own host telemetry to today's file all day, and `/runs` folds none of
+/// it, so such a record must not count as new input (it used to: the key
+/// was each day file's length and mtime, so the 14-day fold re-ran after
+/// every telemetry write). A record the build folds still does.
+#[test]
+#[serial_test::serial]
+fn runs_inputs_change_only_with_what_runs_folds() {
+    unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+    let flows = TempDir::new().unwrap();
+    let now = darkmux_flow::ts_utc_at(now_unix() as i64);
+    let today = flows.path().join(format!("{}.jsonl", &now[..10]));
+    let append = |line: String| {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&today)
+            .unwrap();
+        std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()).unwrap();
+    };
+    append(format!(
+        "{{\"action\":\"dispatch.start\",\"session_id\":\"S-1\",\"ts\":\"{now}\"}}"
+    ));
+    let before = super::runs_inputs(flows.path());
+    append(format!("{{\"action\":\"machine.telemetry\",\"machine_id\":\"laptop\",\"ts\":\"{now}\",\"payload\":{{\"cpu_pct\":3}}}}"));
+    assert_eq!(
+        super::runs_inputs(flows.path()),
+        before,
+        "host telemetry is not an input to /runs"
+    );
+    append(format!(
+        "{{\"action\":\"dispatch.complete\",\"session_id\":\"S-1\",\"ts\":\"{now}\"}}"
+    ));
+    assert_ne!(
+        super::runs_inputs(flows.path()),
+        before,
+        "a record /runs folds is"
+    );
+}
+
+/// (#3428) The first `/runs` poll after an idle stretch waits for a new
+/// build rather than being served the old one: the build's fingerprint
+/// misses a mission recorded without a flow record, and only the bound
+/// on a served build's age keeps it from hiding that mission.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_first_runs_poll_after_an_idle_hour_waits_for_a_new_build() {
+    let _guard = CrewDirGuard::new();
+    let flows = TempDir::new().unwrap();
+    let get = || async {
+        let response = build_router_full_local(flows.path().to_path_buf(), None)
+            .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    get().await;
+    save_test_mission(&minimal_mission("runs-idle-hour", vec![]));
+    super::runs_cache()
+        .lock()
+        .await
+        .built
+        .as_mut()
+        .expect("the first request's build")
+        .at -= Duration::from_secs(3_600);
+    let after = get().await;
+    assert!(
+        after.to_string().contains("runs-idle-hour"),
+        "an hour-old build was served: {after}"
+    );
+}
+
+/// (#3428) `/runs` reads the fleet view and the live beats only to mark
+/// running rows not reporting, so a board with no running row never waits
+/// on either: a gather (every peer's card over the tailnet, 1-3s each time
+/// its 5s cache lapsed) or a beat read (a bounded hub connect that, on the
+/// operator's tailnet, often failed after its 500ms cap), both measured on
+/// the operator's laptop.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_board_with_no_running_row_reads_no_view_and_no_beats() {
+    use std::sync::atomic::Ordering;
+    let _guard = CrewDirGuard::new();
+    let flows = TempDir::new().unwrap();
+    let sources = std::sync::Arc::new(crate::fleet_view::tests::Scripted::default());
+    let get = |sources: std::sync::Arc<crate::fleet_view::tests::Scripted>| {
+        let app = build_router_full(
+            flows.path().to_path_buf(),
+            None,
+            None,
+            crate::fleet_view::FleetContext::with_sources(sources),
+        )
+        .layer(from_fn(assume_loopback_peer));
+        async move {
+            let response = app
                 .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
                 .await
                 .unwrap();
-            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-        };
-        get().await;
-        save_test_mission(&minimal_mission("runs-idle-hour", vec![]));
-        super::runs_cache().lock().await.built.as_mut().expect("the first request's build").at -=
-            Duration::from_secs(3_600);
-        let after = get().await;
-        assert!(after.to_string().contains("runs-idle-hour"), "an hour-old build was served: {after}");
-    }
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    };
+    // A hub that is configured but down: a beat read would cost a bounded
+    // connect attempt on every request.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let hub = format!(
+        "redis://127.0.0.1:{}",
+        listener.local_addr().unwrap().port()
+    );
+    let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = accepts.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            counted.fetch_add(1, Ordering::Relaxed);
+            drop(stream);
+        }
+    });
+    unsafe { std::env::set_var("DARKMUX_REDIS_URL", &hub) };
+    get(sources.clone()).await; // builds (its own hub reads are the build's)
+    let built = accepts.load(Ordering::Relaxed);
+    get(sources.clone()).await; // served from the build
+    unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+    assert_eq!(
+        sources.local_cards.load(Ordering::Relaxed),
+        0,
+        "an idle board gathers no view"
+    );
+    let beat_reads = accepts.load(Ordering::Relaxed) - built;
 
-    /// (#3428) `/runs` reads the fleet view and the live beats only to mark
-    /// running rows not reporting, so a board with no running row never waits
-    /// on either: a gather (every peer's card over the tailnet, 1-3s each time
-    /// its 5s cache lapsed) or a beat read (a bounded hub connect that, on the
-    /// operator's tailnet, often failed after its 500ms cap), both measured on
-    /// the operator's laptop.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_board_with_no_running_row_reads_no_view_and_no_beats() {
-        use std::sync::atomic::Ordering;
-        let _guard = CrewDirGuard::new();
-        let flows = TempDir::new().unwrap();
-        let sources = std::sync::Arc::new(crate::fleet_view::tests::Scripted::default());
-        let get = |sources: std::sync::Arc<crate::fleet_view::tests::Scripted>| {
-            let app = build_router_full(flows.path().to_path_buf(), None, None, crate::fleet_view::FleetContext::with_sources(sources))
-                .layer(from_fn(assume_loopback_peer));
-            async move {
-                let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
-                assert_eq!(response.status(), StatusCode::OK);
-            }
-        };
-        // A hub that is configured but down: a beat read would cost a bounded
-        // connect attempt on every request.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let hub = format!("redis://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = accepts.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                counted.fetch_add(1, Ordering::Relaxed);
-                drop(stream);
-            }
-        });
-        unsafe { std::env::set_var("DARKMUX_REDIS_URL", &hub) };
-        get(sources.clone()).await; // builds (its own hub reads are the build's)
-        let built = accepts.load(Ordering::Relaxed);
-        get(sources.clone()).await; // served from the build
-        unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
-        assert_eq!(sources.local_cards.load(Ordering::Relaxed), 0, "an idle board gathers no view");
-        let beat_reads = accepts.load(Ordering::Relaxed) - built;
-
-        // A dispatch that started a moment ago with no terminal: a running row.
-        let other = TempDir::new().unwrap();
-        let now = darkmux_flow::ts_utc_at(now_unix() as i64);
-        fs::write(
+    // A dispatch that started a moment ago with no terminal: a running row.
+    let other = TempDir::new().unwrap();
+    let now = darkmux_flow::ts_utc_at(now_unix() as i64);
+    fs::write(
             other.path().join(format!("{}.jsonl", &now[..10])),
             format!("{{\"action\":\"dispatch.start\",\"session_id\":\"S-live\",\"execution_id\":\"exec-00000001-0000-0001\",\"ts\":\"{now}\"}}\n"),
         )
         .unwrap();
-        let app = build_router_full(other.path().to_path_buf(), None, None, crate::fleet_view::FleetContext::with_sources(sources.clone()))
-            .layer(from_fn(assume_loopback_peer));
-        let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
-        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(json["runs"].as_array().unwrap().iter().any(|r| r["status"] == "running"), "{json}");
-        assert_eq!(sources.local_cards.load(Ordering::Relaxed), 1, "a running row is judged against the view");
-        assert_eq!(beat_reads, 0, "a request served from the build reads no live beats");
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn runs_handler_lists_a_tracked_mission_run() {
-        let _guard = CrewDirGuard::new();
-        let mission = minimal_mission("runs-test-mission", vec![]);
-        save_test_mission(&mission);
-
-        let flows = TempDir::new().unwrap();
-        let app = build_router_full_local(flows.path().to_path_buf(), None);
-        let response = app
-            .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(json["generated_at_ms"].as_u64().unwrap() > 0);
-        let runs = json["runs"].as_array().unwrap();
-        let run = runs
+    let app = build_router_full(
+        other.path().to_path_buf(),
+        None,
+        None,
+        crate::fleet_view::FleetContext::with_sources(sources.clone()),
+    )
+    .layer(from_fn(assume_loopback_peer));
+    let response = app
+        .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        json["runs"]
+            .as_array()
+            .unwrap()
             .iter()
-            .find(|r| r["id"] == "runs-test-mission")
-            .expect("the saved mission appears in /runs");
-        // Zero phases -> not the crew-of-one shape -> kind "mission" (see
-        // `runs::classify_mission`'s doc).
-        assert_eq!(run["kind"], "mission");
-        // MissionStatus::Active is the default, but `minimal_mission` here
-        // leaves `started_ts: None` (never actually started) — `/runs`
-        // maps that to "planned", not "running" (#1523 gate CONSIDER 4:
-        // the dead `Planned` variant, made reachable — see
-        // `runs::mission_run_status`'s doc).
-        assert_eq!(run["status"], "planned");
-        assert_eq!(run["tracked"], true);
-    }
+            .any(|r| r["status"] == "running"),
+        "{json}"
+    );
+    assert_eq!(
+        sources.local_cards.load(Ordering::Relaxed),
+        1,
+        "a running row is judged against the view"
+    );
+    assert_eq!(
+        beat_reads, 0,
+        "a request served from the build reads no live beats"
+    );
+}
 
-    /// `/runs` publishes the lifecycle policy its rows were judged by, the
-    /// numbers the viewer judges flow sessions by (`ui/src/lib/lifecycle.ts`).
-    #[tokio::test]
-    #[serial_test::serial] // pins HOME and DARKMUX_HOME
-    async fn runs_handler_publishes_its_lifecycle_policy() {
-        let _home = CrewDirGuard::new();
-        let flows = TempDir::new().unwrap();
-        let app = build_router_full_local(flows.path().to_path_buf(), None);
-        let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
-        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let policy = crate::runs::runs_policy();
-        assert_eq!(json["policy"]["stale_after_ms"].as_u64(), Some(policy.stale_after_ms));
-        assert_eq!(json["policy"]["budget_wait_grace_ms"].as_u64(), Some(policy.budget_wait_grace_ms));
-    }
+#[tokio::test]
+#[serial_test::serial]
+async fn runs_handler_lists_a_tracked_mission_run() {
+    let _guard = CrewDirGuard::new();
+    let mission = minimal_mission("runs-test-mission", vec![]);
+    save_test_mission(&mission);
 
-    /// (#3067) `/runs` names the tokens that belong to no run (radio routing,
-    /// a probe), so a reader can reconcile the rows to the total: the rows'
-    /// `tokens` plus `no_run.tokens` are everything the usage fold counted,
-    /// from the same fold `run list` reads.
-    #[tokio::test]
-    #[serial_test::serial] // pins HOME and DARKMUX_HOME
-    async fn runs_handler_names_the_tokens_on_no_run_so_rows_plus_it_reconcile() {
-        let _home = CrewDirGuard::new();
-        let flows = TempDir::new().unwrap();
-        let ts = darkmux_flow::ts_utc_now();
-        let usage = |sid: Option<&str>, total: u64| {
-            let mut r = serde_json::json!({
-                "ts": ts, "category": "telemetry", "source": "tokens", "action": "telemetry.tokens",
-                "payload": { "call_kind": "single_shot", "token_source": "provider", "total_tokens": total },
-            });
-            if let Some(sid) = sid {
-                r["session_id"] = serde_json::json!(sid);
-            }
-            r.to_string()
-        };
-        let start = serde_json::json!({ "ts": ts, "action": "dispatch.start", "session_id": "s-run", "handle": "coder" }).to_string();
-        let lines = [start, usage(Some("s-run"), 100), usage(None, 9), usage(None, 4), usage(Some("s-orphan"), 50)].join("\n");
-        fs::write(flows.path().join(format!("{}.jsonl", &ts[..10])), lines + "\n").unwrap();
-        let app = build_router_full_local(flows.path().to_path_buf(), None);
-        let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
-        let bytes = to_bytes(response.into_body(), 262144).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["no_run"]["tokens"], 13, "{json}");
-        assert_eq!(json["no_run"]["calls"], 2);
-        let rows: u64 = json["runs"].as_array().unwrap().iter().filter_map(|r| r["tokens"].as_u64()).sum();
-        assert_eq!((json["unlisted"]["tokens"].as_u64(), json["unlisted"]["calls"].as_u64()), (Some(50), Some(1)), "a session with no start record has no row");
-        let off = json["no_run"]["tokens"].as_u64().unwrap() + json["unlisted"]["tokens"].as_u64().unwrap();
-        assert_eq!(rows + off, 163, "rows plus no_run plus unlisted are the total");
-    }
+    let flows = TempDir::new().unwrap();
+    let app = build_router_full_local(flows.path().to_path_buf(), None);
+    let response = app
+        .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(json["generated_at_ms"].as_u64().unwrap() > 0);
+    let runs = json["runs"].as_array().unwrap();
+    let run = runs
+        .iter()
+        .find(|r| r["id"] == "runs-test-mission")
+        .expect("the saved mission appears in /runs");
+    // Zero phases -> not the crew-of-one shape -> kind "mission" (see
+    // `runs::classify_mission`'s doc).
+    assert_eq!(run["kind"], "mission");
+    // MissionStatus::Active is the default, but `minimal_mission` here
+    // leaves `started_ts: None` (never actually started) — `/runs`
+    // maps that to "planned", not "running" (#1523 gate CONSIDER 4:
+    // the dead `Planned` variant, made reachable — see
+    // `runs::mission_run_status`'s doc).
+    assert_eq!(run["status"], "planned");
+    assert_eq!(run["tracked"], true);
+}
 
-    /// 5.0: `/runs` applies the not-reporting overlay. A dispatch running on a
-    /// peer the daemon's fleet view holds as down (no beat, card unreadable) is
-    /// marked on its row; the same dispatch on a machine the view holds as up is
-    /// not. Removing the overlay call from the handler turns this red.
-    #[tokio::test]
-    #[serial_test::serial] // pins HOME, DARKMUX_HOME and DARKMUX_REDIS_URL
-    async fn runs_handler_marks_a_running_row_on_a_down_peer_not_reporting() {
-        use crate::fleet_view::{tests as fv, CardOutcome, FleetContext, UnreachableReason};
-        let _home = CrewDirGuard::new();
-        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
-        unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
-        let flows = TempDir::new().unwrap();
-        let ts = darkmux_flow::ts_utc_now();
-        let record = |sid: &str, machine: &str| {
-            serde_json::json!({
-                "ts": ts, "level": "info", "category": "work", "stage": "dispatch",
-                "action": "dispatch.start", "handle": "coder", "session_id": sid,
-                "source": "crew_dispatch", "machine_id": machine,
-            })
-            .to_string()
-        };
-        let lines = [record("s-down", "far-peer"), record("s-up", "near-peer")].join("\n");
-        fs::write(flows.path().join(format!("{}.jsonl", &ts[..10])), lines + "\n").unwrap();
-        // Presence answered (this machine and near-peer beat), so far-peer reads `no_beat`.
-        let s = fv::Scripted {
-            local: fv::identity("laptop", None, Some("nLAPTOP")),
-            roster: vec![fv::entry("far-peer"), fv::entry("near-peer")],
-            beats: vec![fv::beat("laptop", "U1", None), fv::beat("near-peer", "U2", None)],
-            ..Default::default()
-        };
-        let unreadable = || CardOutcome::Unreachable { reason: UnreachableReason::ListenerOff, detail: None };
-        fv::peer_says(&s, "far-peer", 0, unreadable(), crate::fleet_view::AcceptsState::Unknown);
-        fv::peer_says(&s, "near-peer", 0, unreadable(), crate::fleet_view::AcceptsState::Unknown);
-        let app = build_router_full(flows.path().to_path_buf(), None, None, FleetContext::with_sources(std::sync::Arc::new(s)))
-            .layer(from_fn(assume_loopback_peer));
-        let response = app.oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap()).await.unwrap();
-        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        unsafe {
-            match prev_redis {
-                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
-                None => std::env::remove_var("DARKMUX_REDIS_URL"),
-            }
+/// `/runs` publishes the lifecycle policy its rows were judged by, the
+/// numbers the viewer judges flow sessions by (`ui/src/lib/lifecycle.ts`).
+#[tokio::test]
+#[serial_test::serial] // pins HOME and DARKMUX_HOME
+async fn runs_handler_publishes_its_lifecycle_policy() {
+    let _home = CrewDirGuard::new();
+    let flows = TempDir::new().unwrap();
+    let app = build_router_full_local(flows.path().to_path_buf(), None);
+    let response = app
+        .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let policy = crate::runs::runs_policy();
+    assert_eq!(
+        json["policy"]["stale_after_ms"].as_u64(),
+        Some(policy.stale_after_ms)
+    );
+    assert_eq!(
+        json["policy"]["budget_wait_grace_ms"].as_u64(),
+        Some(policy.budget_wait_grace_ms)
+    );
+}
+
+/// (#3067) `/runs` names the tokens that belong to no run (radio routing,
+/// a probe), so a reader can reconcile the rows to the total: the rows'
+/// `tokens` plus `no_run.tokens` are everything the usage fold counted,
+/// from the same fold `run list` reads.
+#[tokio::test]
+#[serial_test::serial] // pins HOME and DARKMUX_HOME
+async fn runs_handler_names_the_tokens_on_no_run_so_rows_plus_it_reconcile() {
+    let _home = CrewDirGuard::new();
+    let flows = TempDir::new().unwrap();
+    let ts = darkmux_flow::ts_utc_now();
+    let usage = |sid: Option<&str>, total: u64| {
+        let mut r = serde_json::json!({
+            "ts": ts, "category": "telemetry", "source": "tokens", "action": "telemetry.tokens",
+            "payload": { "call_kind": "single_shot", "token_source": "provider", "total_tokens": total },
+        });
+        if let Some(sid) = sid {
+            r["session_id"] = serde_json::json!(sid);
         }
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let flag = |id: &str| json["runs"].as_array().unwrap().iter().find(|r| r["id"] == id).map(|r| r["not_reporting"].as_bool().unwrap_or(false));
-        assert_eq!(flag("s-down"), Some(true), "{json}");
-        assert_eq!(flag("s-up"), Some(false), "a peer with a beat is up: {json}");
+        r.to_string()
+    };
+    let start = serde_json::json!({ "ts": ts, "action": "dispatch.start", "session_id": "s-run", "handle": "coder" }).to_string();
+    let lines = [
+        start,
+        usage(Some("s-run"), 100),
+        usage(None, 9),
+        usage(None, 4),
+        usage(Some("s-orphan"), 50),
+    ]
+    .join("\n");
+    fs::write(
+        flows.path().join(format!("{}.jsonl", &ts[..10])),
+        lines + "\n",
+    )
+    .unwrap();
+    let app = build_router_full_local(flows.path().to_path_buf(), None);
+    let response = app
+        .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let bytes = to_bytes(response.into_body(), 262144).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["no_run"]["tokens"], 13, "{json}");
+    assert_eq!(json["no_run"]["calls"], 2);
+    let rows: u64 = json["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["tokens"].as_u64())
+        .sum();
+    assert_eq!(
+        (
+            json["unlisted"]["tokens"].as_u64(),
+            json["unlisted"]["calls"].as_u64()
+        ),
+        (Some(50), Some(1)),
+        "a session with no start record has no row"
+    );
+    let off =
+        json["no_run"]["tokens"].as_u64().unwrap() + json["unlisted"]["tokens"].as_u64().unwrap();
+    assert_eq!(
+        rows + off,
+        163,
+        "rows plus no_run plus unlisted are the total"
+    );
+}
+
+/// 5.0: `/runs` applies the not-reporting overlay. A dispatch running on a
+/// peer the daemon's fleet view holds as down (no beat, card unreadable) is
+/// marked on its row; the same dispatch on a machine the view holds as up is
+/// not. Removing the overlay call from the handler turns this red.
+#[tokio::test]
+#[serial_test::serial] // pins HOME, DARKMUX_HOME and DARKMUX_REDIS_URL
+async fn runs_handler_marks_a_running_row_on_a_down_peer_not_reporting() {
+    use crate::fleet_view::{tests as fv, CardOutcome, FleetContext, UnreachableReason};
+    let _home = CrewDirGuard::new();
+    let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+    unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
+    let flows = TempDir::new().unwrap();
+    let ts = darkmux_flow::ts_utc_now();
+    let record = |sid: &str, machine: &str| {
+        serde_json::json!({
+            "ts": ts, "level": "info", "category": "work", "stage": "dispatch",
+            "action": "dispatch.start", "handle": "coder", "session_id": sid,
+            "source": "crew_dispatch", "machine_id": machine,
+        })
+        .to_string()
+    };
+    let lines = [record("s-down", "far-peer"), record("s-up", "near-peer")].join("\n");
+    fs::write(
+        flows.path().join(format!("{}.jsonl", &ts[..10])),
+        lines + "\n",
+    )
+    .unwrap();
+    // Presence answered (this machine and near-peer beat), so far-peer reads `no_beat`.
+    let s = fv::Scripted {
+        local: fv::identity("laptop", None, Some("nLAPTOP")),
+        roster: vec![fv::entry("far-peer"), fv::entry("near-peer")],
+        beats: vec![
+            fv::beat("laptop", "U1", None),
+            fv::beat("near-peer", "U2", None),
+        ],
+        ..Default::default()
+    };
+    let unreadable = || CardOutcome::Unreachable {
+        reason: UnreachableReason::ListenerOff,
+        detail: None,
+    };
+    fv::peer_says(
+        &s,
+        "far-peer",
+        0,
+        unreadable(),
+        crate::fleet_view::AcceptsState::Unknown,
+    );
+    fv::peer_says(
+        &s,
+        "near-peer",
+        0,
+        unreadable(),
+        crate::fleet_view::AcceptsState::Unknown,
+    );
+    let app = build_router_full(
+        flows.path().to_path_buf(),
+        None,
+        None,
+        FleetContext::with_sources(std::sync::Arc::new(s)),
+    )
+    .layer(from_fn(assume_loopback_peer));
+    let response = app
+        .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    unsafe {
+        match prev_redis {
+            Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+            None => std::env::remove_var("DARKMUX_REDIS_URL"),
+        }
     }
-
-    /// 5.0: the overlay marks nothing unless BOTH the view and the beats were
-    /// read (a failed beat read must not mark a beating run).
-    #[test]
-    fn apply_not_reporting_marks_nothing_without_both_the_view_and_the_beats() {
-        use crate::fleet_view::{gather_view, tests as fv, CardOutcome, Liveness, FLEET_VIEW_CACHE_TTL};
-        let s = fv::scripted(fv::identity("laptop", None, Some("nLAPTOP")), vec![]);
-        let mut view = gather_view(&s, FLEET_VIEW_CACHE_TTL);
-        let mut down = view.machines[0].clone();
-        down.is_this_machine = false;
-        down.entry = Some(crate::wire::RosterMachineEntry::from(&fv::entry("far-peer")));
-        down.liveness = Liveness::NoBeat;
-        down.card = CardOutcome::Unknown;
-        view.machines.push(down);
-        let row = || {
-            let mut r = crate::runs::tests_support_run("r");
-            r.machine = Some("far-peer".into());
-            r
-        };
-        let none = std::collections::HashSet::new();
-        let mut rows = vec![row()];
-        apply_not_reporting(&mut rows, Some(&view), Some(&none));
-        assert!(rows[0].not_reporting, "both reads succeeded: marked");
-        let mut rows = vec![row()];
-        apply_not_reporting(&mut rows, Some(&view), None);
-        assert!(!rows[0].not_reporting, "a failed beat read marks nothing");
-        let mut rows = vec![row()];
-        apply_not_reporting(&mut rows, None, Some(&none));
-        assert!(!rows[0].not_reporting, "no view marks nothing");
-    }
-
-    /// (#3432 re-review) A failed read never replaces a good shared one still
-    /// inside its TTL: a confirming read that failed left every other reader
-    /// `unavailable` for 5s though the snapshot was good. The failing caller
-    /// still sees its own failure.
-    #[test]
-    fn a_failed_read_never_replaces_a_good_shared_one() {
-        static SLOT: PresenceSlot<u32> = std::sync::Mutex::new(None);
-        let url = darkmux_flow::RawRedisUrl::new("redis://127.0.0.1:1".to_string());
-        let good = shared_presence(&SLOT, &url, "t", PresenceRead::QUIET, |_| Ok(vec![1]));
-        let failed = shared_presence(&SLOT, &url, "t", PresenceRead::FRESH, |_| Err(anyhow::anyhow!("down")));
-        let after = shared_presence(&SLOT, &url, "t", PresenceRead::QUIET, |_| panic!("read again inside the TTL"));
-        assert_eq!(good.0, vec![1]);
-        assert!(matches!(failed.1, source_state::SourceState::Unavailable { .. }));
-        assert_eq!(after, good, "the good read is still the shared one");
-    }
-
-    /// (#3432 re-review) `/runs`' confirming read takes a shared read under a
-    /// second old, so a row that stays not reporting (a peer that died with a
-    /// run open) does not cost a new read on every request: the steady state
-    /// is the shared read, taken fresh each TTL.
-    #[test]
-    fn a_confirming_read_takes_a_shared_read_under_a_second_old() {
-        static SLOT: PresenceSlot<u32> = std::sync::Mutex::new(None);
-        let url = darkmux_flow::RawRedisUrl::new("redis://127.0.0.1:1".to_string());
-        shared_presence(&SLOT, &url, "t", PresenceRead::QUIET, |_| Ok(vec![1]));
-        let confirmed = shared_presence(&SLOT, &url, "t", PresenceRead::CONFIRM, |_| panic!("read anew under a second"));
-        assert_eq!(confirmed.0, vec![1]);
-        let fresh = shared_presence(&SLOT, &url, "t", PresenceRead::FRESH, |_| Ok(vec![2]));
-        assert_eq!(fresh.0, vec![2], "FRESH always reads");
-    }
-
-    /// (#3432 review) `/runs` marks a run not reporting only on a fresh beat
-    /// read: the shared snapshot can be up to 5s old, and a session that began
-    /// after it is not in it. A run the snapshot would mark is judged again on
-    /// a fresh read; one it would not mark costs no read.
-    #[test]
-    fn a_snapshot_mark_is_confirmed_on_a_fresh_read() {
-        use crate::fleet_view::{gather_view, tests as fv, CardOutcome, Liveness, FLEET_VIEW_CACHE_TTL};
-        let s = fv::scripted(fv::identity("laptop", None, Some("nLAPTOP")), vec![]);
-        let mut view = gather_view(&s, FLEET_VIEW_CACHE_TTL);
-        let mut down = view.machines[0].clone();
-        down.is_this_machine = false;
-        down.entry = Some(crate::wire::RosterMachineEntry::from(&fv::entry("far-peer")));
-        down.liveness = Liveness::NoBeat;
-        down.card = CardOutcome::Unknown;
-        view.machines.push(down);
-        let row = || {
-            let mut r = crate::runs::tests_support_run("r");
-            r.machine = Some("far-peer".into());
-            r
-        };
-        let stale: std::collections::HashSet<String> = Default::default();
-        let fresh: std::collections::HashSet<String> = ["r".to_string()].into();
-
-        let mut rows = vec![row()];
-        mark_not_reporting_served(&mut rows, Some(&view), Some(stale.clone()), || Some(fresh.clone()));
-        assert!(!rows[0].not_reporting, "the fresh read holds its beat");
-
-        let mut rows = vec![row()];
-        mark_not_reporting_served(&mut rows, Some(&view), Some(stale.clone()), || Some(stale.clone()));
-        assert!(rows[0].not_reporting, "gone on the fresh read too: marked");
-
-        let mut rows = vec![row()];
-        mark_not_reporting_served(&mut rows, Some(&view), Some(fresh.clone()), || panic!("read again with nothing to mark"));
-        assert!(!rows[0].not_reporting);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial] // pins HOME and DARKMUX_HOME
-    async fn runs_handler_includes_lab_runs_with_kind_lab() {
-        let _home = CrewDirGuard::new();
-        let flows = TempDir::new().unwrap();
-        let lab = TempDir::new().unwrap();
-        write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
-        let app = build_router_full_local(
-            flows.path().to_path_buf(),
-            Some(lab.path().to_path_buf()),
-        );
-        let response = app
-            .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let runs = json["runs"].as_array().unwrap();
-        let run = runs
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let flag = |id: &str| {
+        json["runs"]
+            .as_array()
+            .unwrap()
             .iter()
-            .find(|r| r["id"] == "case-a/run1")
-            .expect("the lab run appears in /runs");
-        assert_eq!(run["kind"], "lab");
-        assert_eq!(run["tracked"], true);
-    }
+            .find(|r| r["id"] == id)
+            .map(|r| r["not_reporting"].as_bool().unwrap_or(false))
+    };
+    assert_eq!(flag("s-down"), Some(true), "{json}");
+    assert_eq!(
+        flag("s-up"),
+        Some(false),
+        "a peer with a beat is up: {json}"
+    );
+}
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn runs_handler_never_errors_with_no_sources_configured() {
-        let _guard = CrewDirGuard::new();
-        let flows = TempDir::new().unwrap();
-        let app = build_router_full_local(flows.path().to_path_buf(), None);
-        let response = app
-            .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["runs"].as_array().unwrap().len(), 0);
-    }
+/// 5.0: the overlay marks nothing unless BOTH the view and the beats were
+/// read (a failed beat read must not mark a beating run).
+#[test]
+fn apply_not_reporting_marks_nothing_without_both_the_view_and_the_beats() {
+    use crate::fleet_view::{
+        gather_view, tests as fv, CardOutcome, Liveness, FLEET_VIEW_CACHE_TTL,
+    };
+    let s = fv::scripted(fv::identity("laptop", None, Some("nLAPTOP")), vec![]);
+    let mut view = gather_view(&s, FLEET_VIEW_CACHE_TTL);
+    let mut down = view.machines[0].clone();
+    down.is_this_machine = false;
+    down.entry = Some(crate::wire::RosterMachineEntry::from(&fv::entry(
+        "far-peer",
+    )));
+    down.liveness = Liveness::NoBeat;
+    down.card = CardOutcome::Unknown;
+    view.machines.push(down);
+    let row = || {
+        let mut r = crate::runs::tests_support_run("r");
+        r.machine = Some("far-peer".into());
+        r
+    };
+    let none = std::collections::HashSet::new();
+    let mut rows = vec![row()];
+    apply_not_reporting(&mut rows, Some(&view), Some(&none));
+    assert!(rows[0].not_reporting, "both reads succeeded: marked");
+    let mut rows = vec![row()];
+    apply_not_reporting(&mut rows, Some(&view), None);
+    assert!(!rows[0].not_reporting, "a failed beat read marks nothing");
+    let mut rows = vec![row()];
+    apply_not_reporting(&mut rows, None, Some(&none));
+    assert!(!rows[0].not_reporting, "no view marks nothing");
+}
 
-    /// (#1905) Conformance test for `runs.rs`'s own "Two callers, one
-    /// union" contract: `darkmux run list` (`src/run_list.rs`, the root
-    /// binary crate) and this crate's `GET /runs` handler must agree on
-    /// the same on-disk state, because they call the exact same
-    /// `build_runs(flows_dir, lab_dir, fleet)`. There is no separate
-    /// Rust binding across the crate boundary to assert the CALL SITE
-    /// against mechanically (the verb genuinely lives in a different
-    /// crate) -- what this test proves instead, per this issue's own
-    /// fallback instruction, is that `runs_handler`'s HTTP path
-    /// (`spawn_blocking` + JSON envelope) reports EXACTLY what a direct
-    /// `build_runs` call produces: no dropped, reordered, relabeled, or
-    /// additionally-filtered rows on the way out. A future handler change
-    /// that added filtering/transformation before serializing would fail
-    /// THIS test even though `runs.rs`'s own `build_runs` unit tests
-    /// (which never touch the handler) would stay green -- that gap is
-    /// exactly what this test closes.
-    ///
-    /// NOT covered: this doesn't invoke the actual `darkmux run list`
-    /// binary (a root-crate CLI verb can't easily reach into this crate's
-    /// test-only tempdir fixtures) -- but `src/run_list.rs::run` has
-    /// exactly one call site for `build_runs`, with the same three
-    /// arguments shape asserted here, so proving the HANDLER's path
-    /// matches a direct `build_runs` call is the practical proxy for
-    /// proving the VERB's path does too.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn run_list_verb_and_runs_handler_agree_on_the_same_fixture() {
-        let _guard = CrewDirGuard::new();
-        let mission = minimal_mission("conformance-mission", vec![]);
-        save_test_mission(&mission);
+/// (#3432 re-review) A failed read never replaces a good shared one still
+/// inside its TTL: a confirming read that failed left every other reader
+/// `unavailable` for 5s though the snapshot was good. The failing caller
+/// still sees its own failure.
+#[test]
+fn a_failed_read_never_replaces_a_good_shared_one() {
+    static SLOT: PresenceSlot<u32> = std::sync::Mutex::new(None);
+    let url = darkmux_flow::RawRedisUrl::new("redis://127.0.0.1:1".to_string());
+    let good = shared_presence(&SLOT, &url, "t", PresenceRead::QUIET, |_| Ok(vec![1]));
+    let failed = shared_presence(&SLOT, &url, "t", PresenceRead::FRESH, |_| {
+        Err(anyhow::anyhow!("down"))
+    });
+    let after = shared_presence(&SLOT, &url, "t", PresenceRead::QUIET, |_| {
+        panic!("read again inside the TTL")
+    });
+    assert_eq!(good.0, vec![1]);
+    assert!(matches!(
+        failed.1,
+        source_state::SourceState::Unavailable { .. }
+    ));
+    assert_eq!(after, good, "the good read is still the shared one");
+}
 
-        let flows = TempDir::new().unwrap();
-        let lab = TempDir::new().unwrap();
-        write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+/// (#3432 re-review) `/runs`' confirming read takes a shared read under a
+/// second old, so a row that stays not reporting (a peer that died with a
+/// run open) does not cost a new read on every request: the steady state
+/// is the shared read, taken fresh each TTL.
+#[test]
+fn a_confirming_read_takes_a_shared_read_under_a_second_old() {
+    static SLOT: PresenceSlot<u32> = std::sync::Mutex::new(None);
+    let url = darkmux_flow::RawRedisUrl::new("redis://127.0.0.1:1".to_string());
+    shared_presence(&SLOT, &url, "t", PresenceRead::QUIET, |_| Ok(vec![1]));
+    let confirmed = shared_presence(&SLOT, &url, "t", PresenceRead::CONFIRM, |_| {
+        panic!("read anew under a second")
+    });
+    assert_eq!(confirmed.0, vec![1]);
+    let fresh = shared_presence(&SLOT, &url, "t", PresenceRead::FRESH, |_| Ok(vec![2]));
+    assert_eq!(fresh.0, vec![2], "FRESH always reads");
+}
 
-        // Path A: exactly what `darkmux run list` calls
-        // (`src/run_list.rs::run`) -- the SAME function, the SAME three
-        // inputs (an empty fleet slice here, matching a standalone,
-        // Redis-off install; `fleet_records_for_runs()` degrades to the
-        // same empty vec in that case).
-        let direct = build_runs(flows.path(), Some(lab.path()), &[]);
-        assert_eq!(direct.len(), 2, "fixture sanity: one mission + one lab run");
+/// (#3432 review) `/runs` marks a run not reporting only on a fresh beat
+/// read: the shared snapshot can be up to 5s old, and a session that began
+/// after it is not in it. A run the snapshot would mark is judged again on
+/// a fresh read; one it would not mark costs no read.
+#[test]
+fn a_snapshot_mark_is_confirmed_on_a_fresh_read() {
+    use crate::fleet_view::{
+        gather_view, tests as fv, CardOutcome, Liveness, FLEET_VIEW_CACHE_TTL,
+    };
+    let s = fv::scripted(fv::identity("laptop", None, Some("nLAPTOP")), vec![]);
+    let mut view = gather_view(&s, FLEET_VIEW_CACHE_TTL);
+    let mut down = view.machines[0].clone();
+    down.is_this_machine = false;
+    down.entry = Some(crate::wire::RosterMachineEntry::from(&fv::entry(
+        "far-peer",
+    )));
+    down.liveness = Liveness::NoBeat;
+    down.card = CardOutcome::Unknown;
+    view.machines.push(down);
+    let row = || {
+        let mut r = crate::runs::tests_support_run("r");
+        r.machine = Some("far-peer".into());
+        r
+    };
+    let stale: std::collections::HashSet<String> = Default::default();
+    let fresh: std::collections::HashSet<String> = ["r".to_string()].into();
 
-        // Path B: the daemon's `GET /runs`.
-        let app = build_router_full_local(
-            flows.path().to_path_buf(),
-            Some(lab.path().to_path_buf()),
-        );
-        let response = app
-            .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let handler_runs = json["runs"].as_array().expect("/runs always returns a runs array");
+    let mut rows = vec![row()];
+    mark_not_reporting_served(&mut rows, Some(&view), Some(stale.clone()), || {
+        Some(fresh.clone())
+    });
+    assert!(!rows[0].not_reporting, "the fresh read holds its beat");
 
-        let mut direct_triples: Vec<(String, String, String)> = direct
-            .iter()
-            .map(|r| {
-                (
-                    r.id.clone(),
-                    serde_json::to_value(r.kind).unwrap().as_str().unwrap().to_string(),
-                    serde_json::to_value(r.status).unwrap().as_str().unwrap().to_string(),
-                )
-            })
-            .collect();
-        direct_triples.sort();
+    let mut rows = vec![row()];
+    mark_not_reporting_served(&mut rows, Some(&view), Some(stale.clone()), || {
+        Some(stale.clone())
+    });
+    assert!(rows[0].not_reporting, "gone on the fresh read too: marked");
 
-        let mut handler_triples: Vec<(String, String, String)> = handler_runs
-            .iter()
-            .map(|r| {
-                (
-                    r["id"].as_str().unwrap().to_string(),
-                    r["kind"].as_str().unwrap().to_string(),
-                    r["status"].as_str().unwrap().to_string(),
-                )
-            })
-            .collect();
-        handler_triples.sort();
+    let mut rows = vec![row()];
+    mark_not_reporting_served(&mut rows, Some(&view), Some(fresh.clone()), || {
+        panic!("read again with nothing to mark")
+    });
+    assert!(!rows[0].not_reporting);
+}
 
-        assert_eq!(
-            direct_triples, handler_triples,
-            "darkmux run list (a direct build_runs call) and GET /runs disagree on the SAME \
+#[tokio::test]
+#[serial_test::serial] // pins HOME and DARKMUX_HOME
+async fn runs_handler_includes_lab_runs_with_kind_lab() {
+    let _home = CrewDirGuard::new();
+    let flows = TempDir::new().unwrap();
+    let lab = TempDir::new().unwrap();
+    write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+    let app = build_router_full_local(flows.path().to_path_buf(), Some(lab.path().to_path_buf()));
+    let response = app
+        .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let runs = json["runs"].as_array().unwrap();
+    let run = runs
+        .iter()
+        .find(|r| r["id"] == "case-a/run1")
+        .expect("the lab run appears in /runs");
+    assert_eq!(run["kind"], "lab");
+    assert_eq!(run["tracked"], true);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn runs_handler_never_errors_with_no_sources_configured() {
+    let _guard = CrewDirGuard::new();
+    let flows = TempDir::new().unwrap();
+    let app = build_router_full_local(flows.path().to_path_buf(), None);
+    let response = app
+        .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["runs"].as_array().unwrap().len(), 0);
+}
+
+/// (#1905) Conformance test for `runs.rs`'s own "Two callers, one
+/// union" contract: `darkmux run list` (`src/run_list.rs`, the root
+/// binary crate) and this crate's `GET /runs` handler must agree on
+/// the same on-disk state, because they call the exact same
+/// `build_runs(flows_dir, lab_dir, fleet)`. There is no separate
+/// Rust binding across the crate boundary to assert the CALL SITE
+/// against mechanically (the verb genuinely lives in a different
+/// crate) -- what this test proves instead, per this issue's own
+/// fallback instruction, is that `runs_handler`'s HTTP path
+/// (`spawn_blocking` + JSON envelope) reports EXACTLY what a direct
+/// `build_runs` call produces: no dropped, reordered, relabeled, or
+/// additionally-filtered rows on the way out. A future handler change
+/// that added filtering/transformation before serializing would fail
+/// THIS test even though `runs.rs`'s own `build_runs` unit tests
+/// (which never touch the handler) would stay green -- that gap is
+/// exactly what this test closes.
+///
+/// NOT covered: this doesn't invoke the actual `darkmux run list`
+/// binary (a root-crate CLI verb can't easily reach into this crate's
+/// test-only tempdir fixtures) -- but `src/run_list.rs::run` has
+/// exactly one call site for `build_runs`, with the same three
+/// arguments shape asserted here, so proving the HANDLER's path
+/// matches a direct `build_runs` call is the practical proxy for
+/// proving the VERB's path does too.
+#[tokio::test]
+#[serial_test::serial]
+async fn run_list_verb_and_runs_handler_agree_on_the_same_fixture() {
+    let _guard = CrewDirGuard::new();
+    let mission = minimal_mission("conformance-mission", vec![]);
+    save_test_mission(&mission);
+
+    let flows = TempDir::new().unwrap();
+    let lab = TempDir::new().unwrap();
+    write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+
+    // Path A: exactly what `darkmux run list` calls
+    // (`src/run_list.rs::run`) -- the SAME function, the SAME three
+    // inputs (an empty fleet slice here, matching a standalone,
+    // Redis-off install; `fleet_records_for_runs()` degrades to the
+    // same empty vec in that case).
+    let direct = build_runs(flows.path(), Some(lab.path()), &[]);
+    assert_eq!(direct.len(), 2, "fixture sanity: one mission + one lab run");
+
+    // Path B: the daemon's `GET /runs`.
+    let app = build_router_full_local(flows.path().to_path_buf(), Some(lab.path().to_path_buf()));
+    let response = app
+        .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let handler_runs = json["runs"]
+        .as_array()
+        .expect("/runs always returns a runs array");
+
+    let mut direct_triples: Vec<(String, String, String)> = direct
+        .iter()
+        .map(|r| {
+            (
+                r.id.clone(),
+                serde_json::to_value(r.kind)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                serde_json::to_value(r.status)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        })
+        .collect();
+    direct_triples.sort();
+
+    let mut handler_triples: Vec<(String, String, String)> = handler_runs
+        .iter()
+        .map(|r| {
+            (
+                r["id"].as_str().unwrap().to_string(),
+                r["kind"].as_str().unwrap().to_string(),
+                r["status"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    handler_triples.sort();
+
+    assert_eq!(
+        direct_triples, handler_triples,
+        "darkmux run list (a direct build_runs call) and GET /runs disagree on the SAME \
              fixture -- the \"one union\" contract (#1905) is broken: either the handler \
              transformed the rows on the way out, or one of the two call sites stopped passing \
              the same inputs"
-        );
-    }
+    );
+}
 
-    /// (#1403) The standalone-shell manifest serves at the well-known path with
-    /// the manifest content type and declares `display: standalone` (an
-    /// installed home-screen shortcut opens chromeless).
-    #[tokio::test]
-    async fn web_manifest_served_standalone() {
+/// (#1403) The standalone-shell manifest serves at the well-known path with
+/// the manifest content type and declares `display: standalone` (an
+/// installed home-screen shortcut opens chromeless).
+#[tokio::test]
+async fn web_manifest_served_standalone() {
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/manifest.webmanifest")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let ct = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        ct.starts_with("application/manifest+json"),
+        "content-type was `{ct}`"
+    );
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["display"], "standalone");
+    assert!(json["icons"]
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false));
+}
+
+/// (#1403) Each app-icon route serves real PNG bytes (magic header) as
+/// `image/png` — the iOS home-screen icon + the manifest icons.
+#[tokio::test]
+async fn app_icons_served_as_png() {
+    for path in [
+        "/apple-touch-icon.png",
+        "/icon-192.png",
+        "/icon-512.png",
+        "/favicon-32.png",
+        "/favicon-16.png",
+    ] {
         let app = build_router_local(PathBuf::new());
         let response = app
-            .oneshot(Request::builder().uri("/manifest.webmanifest").body(Body::empty()).unwrap())
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let ct = response.headers().get("content-type").unwrap().to_str().unwrap().to_string();
-        assert!(ct.starts_with("application/manifest+json"), "content-type was `{ct}`");
-        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["display"], "standalone");
-        assert!(json["icons"].as_array().map(|a| !a.is_empty()).unwrap_or(false));
-    }
-
-    /// (#1403) Each app-icon route serves real PNG bytes (magic header) as
-    /// `image/png` — the iOS home-screen icon + the manifest icons.
-    #[tokio::test]
-    async fn app_icons_served_as_png() {
-        for path in ["/apple-touch-icon.png", "/icon-192.png", "/icon-512.png", "/favicon-32.png", "/favicon-16.png"] {
-            let app = build_router_local(PathBuf::new());
-            let response = app
-                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{path} status");
-            assert_eq!(response.headers().get("content-type").unwrap(), "image/png", "{path} ct");
-            let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-            // PNG signature: 89 50 4E 47 0D 0A 1A 0A.
-            assert!(bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]), "{path} not a PNG");
-        }
-    }
-
-    /// (#1403) Every HTML shell the daemon SERVES declares the standalone-app
-    /// shell — manifest link + apple-touch-icon + the apple-mobile metas — so
-    /// a future edit that drops it fails a test rather than silently breaking
-    /// the home-screen-shortcut experience.
-    ///
-    /// (the flip, #1800) Repointed from `VIEWER_HTML` to `NEXT_HTML`, because
-    /// the served document changed hands. That repoint immediately went RED:
-    /// the port carried the manifest and the icon (#1763) but not
-    /// `apple-mobile-web-app-capable`, so an iOS home-screen shortcut would
-    /// have opened inside Safari's chrome instead of as an app. Invisible
-    /// while `/next` was a dev surface nobody had pinned; it would have
-    /// surfaced at the flip as "my home-screen darkmux suddenly has a URL
-    /// bar". Fixed in `ui/index.html`.
-    ///
-    /// The legacy `viewer.html` is no longer checked here because nothing
-    /// serves it, and it is now deleted entirely (#1806) —
-    /// `scripts/build-demo.sh` derives the demo from `NEXT_HTML` (the same
-    /// constant this test checks) rather than reading the legacy file.
-    ///
-    /// The standalone `mission-graph.html` shell dropped out of this check
-    /// the same way, for the same reason (#1868): it is deleted, and
-    /// `/mission/:id/graph` now redirects into `NEXT_HTML` rather than
-    /// serving a second document — see
-    /// `mission_graph_route_redirects_into_the_port`. `NEXT_HTML` is the
-    /// ONLY HTML shell the daemon serves as of #1868, so what was a loop
-    /// over two documents collapses to a direct check of the one that's
-    /// left rather than a loop of one.
-    #[test]
-    fn html_shell_declares_standalone_app() {
-        assert!(
-            NEXT_HTML.contains("rel=\"manifest\"") && NEXT_HTML.contains("/manifest.webmanifest"),
-            "next.html lost its web-manifest link (#1403 standalone shell)"
-        );
-        assert!(
-            NEXT_HTML.contains("apple-touch-icon"),
-            "next.html lost its apple-touch-icon link (#1403 standalone shell)"
-        );
-        assert!(
-            NEXT_HTML.contains("apple-mobile-web-app-capable"),
-            "next.html lost the apple-mobile-web-app-capable meta (#1403)"
-        );
-    }
-
-    /// (#1403) The graph.json StepRow wire contract now carries the raw `kind`
-    /// the page gates the per-step token/turn meter on. Pins it so a
-    /// rename/removal fails here rather than silently disabling every step
-    /// meter on the mission-graph page.
-    #[test]
-    fn step_row_serializes_raw_kind() {
-        let row = crate::mission_graph::StepRow {
-            id: "s1".to_string(),
-            label: "Dispatch".to_string(),
-            kind: "dispatch.internal".to_string(),
-            status: darkmux_crew::types::NodeStatus::Running,
-            started_ts: None,
-            completed_ts: None,
-            tokens_final: None,
-            tokens_utility: None,
-            turns_final: None,
-            model: None,
-            error: None,
-            abandoned_reason: None,
-        };
-        let v = serde_json::to_value(&row).unwrap();
-        assert_eq!(v["kind"], "dispatch.internal");
-        assert_eq!(v["label"], "Dispatch");
-        // (#1432 item 4) Backfill fields are absent when None (lenient wire).
-        assert!(v.get("tokensFinal").is_none());
-        assert!(v.get("turnsFinal").is_none());
-        // (#2902 step 2a) The endpoint-presence `cloud`/`localOk` fields
-        // are gone from the wire entirely.
-        assert!(v.get("cloud").is_none());
-        assert!(v.get("localOk").is_none());
-        // (#1481) `model` is absent when None so a modelless step (procedural
-        // / Tier 3) never renders an empty chip on the page.
-        assert!(v.get("model").is_none());
-    }
-
-    /// (#1481) A step row carrying a resolved model serializes it under the
-    /// `model` key (single word — camelCase is a no-op) so the page can render
-    /// the seat's model chip. Pins the wire name against a future rename that
-    /// would silently blank every seat card's model.
-    #[test]
-    fn step_row_serializes_resolved_model() {
-        let row = crate::mission_graph::StepRow {
-            id: "review-probe-0-step".to_string(),
-            label: "Probe".to_string(),
-            kind: "dispatch.map".to_string(),
-            status: darkmux_crew::types::NodeStatus::Running,
-            started_ts: None,
-            completed_ts: None,
-            tokens_final: None,
-            tokens_utility: None,
-            turns_final: None,
-            model: Some("darkmux:qwen/qwen3.6-27b".to_string()),
-            error: None,
-            abandoned_reason: None,
-        };
-        let v = serde_json::to_value(&row).unwrap();
-        assert_eq!(v["model"], "darkmux:qwen/qwen3.6-27b");
-    }
-
-    /// (#881 parity) The graph.json route must ride the SAME remote-only
-    /// bearer gate as `/missions`/`/phases`/`/lab/runs` — guards against a
-    /// future refactor special-casing the mission-graph surface out of
-    /// `auth_mw`. Mirrors `lab_runs_requires_token_from_remote_peer`
-    /// exactly.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn mission_graph_json_requires_token_from_remote_peer() {
-        set_read_auth_env();
-        let app = build_router_local(PathBuf::new());
-        let mut req = Request::builder()
-            .uri("/mission/some-mission/graph.json")
-            .body(Body::empty())
-            .unwrap();
-        req.extensions_mut().insert(remote_peer());
-        let resp = app.oneshot(req).await.unwrap();
-        clear_auth_env();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn mission_graph_json_returns_404_for_unknown_mission() {
-        let _guard = CrewDirGuard::new();
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/mission/does-not-exist/graph.json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn mission_graph_json_rejects_invalid_id() {
-        let _guard = CrewDirGuard::new();
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/mission/..%2F..%2Fetc/graph.json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    /// A mission with phase data but NO task/step graph underneath any
-    /// phase (a legacy pre-registry instance, or a freeform hand-authored
-    /// mission) renders phases-only with a note — never an error (item 6,
-    /// graceful degradation).
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn mission_graph_json_legacy_mission_is_phases_only_with_a_note() {
-        let _guard = CrewDirGuard::new();
-        let mission = minimal_mission("legacy-mission", vec!["only-phase".to_string()]);
-        save_test_mission(&mission);
-        save_test_phase(&minimal_phase("only-phase", "legacy-mission"));
-
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/mission/legacy-mission/graph.json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["legacy"], true);
-        assert!(json["note"].is_string(), "legacy mission must carry a note: {json}");
-        let nodes = json["nodes"].as_array().unwrap();
-        assert_eq!(nodes.len(), 1, "phases-only: exactly the one phase node, no tasks/steps: {nodes:?}");
-        assert_eq!(nodes[0]["kind"], "phase");
-        assert_eq!(nodes[0]["id"], "only-phase");
-        assert_eq!(json["edges"].as_array().unwrap().len(), 0);
-    }
-
-    /// Full shape test: a hand-built mission with a fan-in (two upstream
-    /// tasks feeding one downstream task) exercises phase→task containment
-    /// AND task-level `depends_on` edges (#1401: steps render as ROWS
-    /// inside their owning task node, not separate nodes — the derived
-    /// step-granularity fan-in edges retired along with the step nodes
-    /// they connected; the fan-in now shows as two edges converging
-    /// directly on the downstream TASK).
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn mission_graph_json_fan_in_shape() {
-        let _guard = CrewDirGuard::new();
-        let mission_id = "fanin-mission";
-        let mission = minimal_mission(mission_id, vec!["p1".to_string()]);
-        save_test_mission(&mission);
-        save_test_phase(&minimal_phase("p1", mission_id));
-
-        let task_a = darkmux_crew::types::Task {
-            repo_root: None,
-            branch: None,
-            run_on: darkmux_crew::types::default_run_on(),
-            id: "task-a".to_string(),
-            phase_id: "p1".to_string(),
-            description: "task a".to_string(),
-            display_name: None,
-            step_ids: vec!["task-a-step".to_string()],
-            depends_on: vec![],
-            reads: Vec::new(),
-            role_id: None,
-            profile_name: None,
-            workdir: None,
-            image: None,
-        };
-        let task_b = darkmux_crew::types::Task {
-            repo_root: None,
-            branch: None,
-            run_on: darkmux_crew::types::default_run_on(),
-            id: "task-b".to_string(),
-            phase_id: "p1".to_string(),
-            description: "task b".to_string(),
-            display_name: None,
-            step_ids: vec!["task-b-step".to_string()],
-            depends_on: vec![],
-            reads: Vec::new(),
-            role_id: None,
-            profile_name: None,
-            workdir: None,
-            image: None,
-        };
-        let task_c = darkmux_crew::types::Task {
-            repo_root: None,
-            branch: None,
-            run_on: darkmux_crew::types::default_run_on(),
-            id: "task-c".to_string(),
-            phase_id: "p1".to_string(),
-            description: "task c (dedup-like)".to_string(),
-            display_name: Some("Dedup".to_string()),
-            step_ids: vec!["task-c-step".to_string()],
-            depends_on: vec!["task-a".to_string(), "task-b".to_string()],
-            reads: Vec::new(),
-            role_id: None,
-            profile_name: None,
-            workdir: None,
-            image: None,
-        };
-        for t in [&task_a, &task_b, &task_c] {
-            darkmux_crew::lifecycle::save_task(mission_id, t).unwrap();
-        }
-        let step_a = darkmux_crew::types::Step {
-            id: "task-a-step".to_string(),
-            task_id: "task-a".to_string(),
-            gate: None,
-            kind: "procedural.noop".to_string(),
-            status: darkmux_crew::types::NodeStatus::Complete,
-            config: serde_json::Value::Null,
-            started_ts: Some(1),
-            completed_ts: Some(2),
-            output: None,
-            stop_reason: None,
-        };
-        let step_b = darkmux_crew::types::Step {
-            id: "task-b-step".to_string(),
-            task_id: "task-b".to_string(),
-            gate: None,
-            kind: "procedural.noop".to_string(),
-            status: darkmux_crew::types::NodeStatus::Running,
-            config: serde_json::Value::Null,
-            started_ts: Some(1),
-            completed_ts: None,
-            output: None,
-            stop_reason: None,
-        };
-        let step_c = darkmux_crew::types::Step {
-            id: "task-c-step".to_string(),
-            task_id: "task-c".to_string(),
-            gate: None,
-            kind: "procedural.noop".to_string(),
-            status: darkmux_crew::types::NodeStatus::Planned,
-            config: serde_json::Value::Null,
-            started_ts: None,
-            completed_ts: None,
-            output: None,
-            stop_reason: None,
-        };
-        for s in [&step_a, &step_b, &step_c] {
-            darkmux_crew::lifecycle::save_step(mission_id, "p1", s).unwrap();
-        }
-
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/mission/{mission_id}/graph.json"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["legacy"], false);
-
-        let nodes = json["nodes"].as_array().unwrap();
-        // (#1401) 1 phase + 3 tasks — NO separate step nodes anymore.
-        assert_eq!(nodes.len(), 4, "{nodes:?}");
-        let node = |id: &str| nodes.iter().find(|n| n["id"] == id).unwrap_or_else(|| panic!("missing node {id}: {nodes:?}"));
-        assert_eq!(node("task-a")["status"], "complete");
-        assert_eq!(node("task-b")["status"], "running");
-        assert_eq!(node("task-c")["status"], "planned");
-
-        // (#1398) label falls back to `id` when no display_name is set;
-        // task-c's explicit display_name wins over its id.
-        assert_eq!(node("task-a")["label"], "task-a");
-        assert_eq!(node("task-c")["label"], "Dedup");
-
-        // (#1401) The steps a task carries render as an array of rows on
-        // ITS OWN node — kind display name resolved via `resolve_step_label`
-        // ("procedural.noop" -> "No-op").
-        let task_a_steps = node("task-a")["steps"].as_array().unwrap();
-        assert_eq!(task_a_steps.len(), 1, "{task_a_steps:?}");
-        assert_eq!(task_a_steps[0]["id"], "task-a-step");
-        assert_eq!(task_a_steps[0]["label"], "No-op");
-        assert_eq!(task_a_steps[0]["status"], "complete");
-        assert_eq!(task_a_steps[0]["startedTs"], 1);
-        assert_eq!(task_a_steps[0]["completedTs"], 2);
-        let task_b_steps = node("task-b")["steps"].as_array().unwrap();
-        assert_eq!(task_b_steps[0]["status"], "running");
-
-        // ── Wire-casing CONTRACT (review-gate MF1). The page's JS reads
-        // `n.parentId` in computeLayout — the first cut serialized
-        // `parent_id` while the JS read `parentId`, so every task grouped
-        // under a missing parent and the whole layout collapsed to the
-        // origin. Pin the EXACT camelCase keys the JS reads on node
-        // objects, the ABSENCE of the snake_case forms, and the envelope's
-        // deliberate snake_case (the JS reads `g.mission_id`), so a rename
-        // on either side fails here instead of silently flattening the
-        // layout.
-        assert_eq!(node("task-a")["parentId"], "p1");
-        assert!(
-            node("task-a")["parent_id"].is_null(),
-            "snake_case parent_id must NOT be on the wire (JS reads parentId)"
-        );
-        assert!(
-            task_a_steps[0]["started_ts"].is_null(),
-            "snake_case started_ts must NOT be on a step row's wire form (camelCase contract)"
-        );
-        assert!(node("task-a")["depth"].is_number());
-        assert!(json["mission_id"].is_string(), "envelope stays snake_case (JS reads g.mission_id)");
-        assert!(json["mission_status"].is_string(), "envelope stays snake_case (JS reads g.mission_status)");
-
-        let edges = json["edges"].as_array().unwrap();
-        let has_edge = |source: &str, target: &str, kind: &str| {
-            edges.iter().any(|e| e["source"] == source && e["target"] == target && e["kind"] == kind)
-        };
-        assert!(has_edge("p1", "task-a", "contains"));
-        assert!(has_edge("p1", "task-b", "contains"));
-        assert!(has_edge("p1", "task-c", "contains"));
-        // The fan-in: BOTH upstream TASKS converge directly on the
-        // downstream task — no step-level detour (#1401).
-        assert!(has_edge("task-a", "task-c", "depends_on"));
-        assert!(has_edge("task-b", "task-c", "depends_on"));
-        // No "contains" edges into step ids — steps aren't nodes anymore.
-        assert!(!edges.iter().any(|e| e["target"] == "task-a-step"));
-
-        // (review-gate C7) No duplicate edge ids — React keys must be
-        // unique; a duplicate depends_on entry on a Task must not emit
-        // the same edge twice.
-        let mut ids: Vec<&str> = edges.iter().filter_map(|e| e["id"].as_str()).collect();
-        let before = ids.len();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), before, "duplicate edge ids in {edges:?}");
-    }
-
-    /// (#2406) The issue's own exact live scenario, through the REAL
-    /// `/mission/:id/graph.json` route: one phase, 12 tasks — 7 complete, 1
-    /// errored, 4 still running. Before this fix, the phase-level rollup
-    /// reused `derive_task_status`'s "any Error wins" one level too high,
-    /// so this exact shape would have rendered the phase `error` while
-    /// eleven other units were doing real work (or `abandoned` once the
-    /// mission finalized). The fix: `running` (the phase is not over) with
-    /// the breakdown named in `statusNote`.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn mission_graph_json_live_mixed_phase_renders_running_with_counts() {
-        let _guard = CrewDirGuard::new();
-        let mission_id = "mixed-2406";
-        let mission = minimal_mission(mission_id, vec!["p1".to_string()]);
-        save_test_mission(&mission);
-        save_test_phase(&minimal_phase("p1", mission_id));
-
-        // 7 complete, 1 errored, 4 running — the issue's own numbers.
-        let mut task_statuses: Vec<(String, darkmux_crew::types::NodeStatus)> = Vec::new();
-        for i in 0..7 {
-            task_statuses.push((format!("unit-{i}"), darkmux_crew::types::NodeStatus::Complete));
-        }
-        task_statuses.push(("unit-7".to_string(), darkmux_crew::types::NodeStatus::Error));
-        for i in 8..12 {
-            task_statuses.push((format!("unit-{i}"), darkmux_crew::types::NodeStatus::Running));
-        }
-        for (task_id, status) in &task_statuses {
-            let step_id = format!("{task_id}-step");
-            let task = darkmux_crew::types::Task {
-                repo_root: None,
-                branch: None,
-                run_on: darkmux_crew::types::default_run_on(),
-                id: task_id.clone(),
-                phase_id: "p1".to_string(),
-                description: task_id.clone(),
-                display_name: None,
-                step_ids: vec![step_id.clone()],
-                depends_on: vec![],
-                reads: Vec::new(),
-                role_id: None,
-                profile_name: None,
-                workdir: None,
-                image: None,
-            };
-            darkmux_crew::lifecycle::save_task(mission_id, &task).unwrap();
-            let step = darkmux_crew::types::Step {
-                id: step_id,
-                task_id: task_id.clone(),
-                gate: None,
-                kind: "procedural.noop".to_string(),
-                status: *status,
-                config: serde_json::Value::Null,
-                started_ts: Some(1),
-                completed_ts: if *status == darkmux_crew::types::NodeStatus::Complete { Some(2) } else { None },
-                output: None,
-                stop_reason: None,
-            };
-            darkmux_crew::lifecycle::save_step(mission_id, "p1", &step).unwrap();
-        }
-
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/mission/{mission_id}/graph.json"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-
-        let nodes = json["nodes"].as_array().unwrap();
-        let phase = nodes.iter().find(|n| n["id"] == "p1").unwrap_or_else(|| panic!("missing phase node p1: {nodes:?}"));
+        assert_eq!(response.status(), StatusCode::OK, "{path} status");
         assert_eq!(
-            phase["status"], "running",
-            "1 errored + 7 complete + 4 running must NOT read `error` or `abandoned` — the phase isn't over: {phase:?}"
+            response.headers().get("content-type").unwrap(),
+            "image/png",
+            "{path} ct"
         );
-        let note = phase["statusNote"].as_str().expect("statusNote present on a live mixed phase");
-        assert!(note.contains("7 complete"), "note: {note}");
-        assert!(note.contains("1 errored"), "note: {note}");
-        assert!(note.contains("4 running"), "note: {note}");
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        // PNG signature: 89 50 4E 47 0D 0A 1A 0A.
+        assert!(
+            bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]),
+            "{path} not a PNG"
+        );
+    }
+}
+
+/// (#1403) Every HTML shell the daemon SERVES declares the standalone-app
+/// shell — manifest link + apple-touch-icon + the apple-mobile metas — so
+/// a future edit that drops it fails a test rather than silently breaking
+/// the home-screen-shortcut experience.
+///
+/// (the flip, #1800) Repointed from `VIEWER_HTML` to `NEXT_HTML`, because
+/// the served document changed hands. That repoint immediately went RED:
+/// the port carried the manifest and the icon (#1763) but not
+/// `apple-mobile-web-app-capable`, so an iOS home-screen shortcut would
+/// have opened inside Safari's chrome instead of as an app. Invisible
+/// while `/next` was a dev surface nobody had pinned; it would have
+/// surfaced at the flip as "my home-screen darkmux suddenly has a URL
+/// bar". Fixed in `ui/index.html`.
+///
+/// The legacy `viewer.html` is no longer checked here because nothing
+/// serves it, and it is now deleted entirely (#1806) —
+/// `scripts/build-demo.sh` derives the demo from `NEXT_HTML` (the same
+/// constant this test checks) rather than reading the legacy file.
+///
+/// The standalone `mission-graph.html` shell dropped out of this check
+/// the same way, for the same reason (#1868): it is deleted, and
+/// `/mission/:id/graph` now redirects into `NEXT_HTML` rather than
+/// serving a second document — see
+/// `mission_graph_route_redirects_into_the_port`. `NEXT_HTML` is the
+/// ONLY HTML shell the daemon serves as of #1868, so what was a loop
+/// over two documents collapses to a direct check of the one that's
+/// left rather than a loop of one.
+#[test]
+fn html_shell_declares_standalone_app() {
+    assert!(
+        NEXT_HTML.contains("rel=\"manifest\"") && NEXT_HTML.contains("/manifest.webmanifest"),
+        "next.html lost its web-manifest link (#1403 standalone shell)"
+    );
+    assert!(
+        NEXT_HTML.contains("apple-touch-icon"),
+        "next.html lost its apple-touch-icon link (#1403 standalone shell)"
+    );
+    assert!(
+        NEXT_HTML.contains("apple-mobile-web-app-capable"),
+        "next.html lost the apple-mobile-web-app-capable meta (#1403)"
+    );
+}
+
+/// (#1403) The graph.json StepRow wire contract now carries the raw `kind`
+/// the page gates the per-step token/turn meter on. Pins it so a
+/// rename/removal fails here rather than silently disabling every step
+/// meter on the mission-graph page.
+#[test]
+fn step_row_serializes_raw_kind() {
+    let row = crate::mission_graph::StepRow {
+        id: "s1".to_string(),
+        label: "Dispatch".to_string(),
+        kind: "dispatch.internal".to_string(),
+        status: darkmux_crew::types::NodeStatus::Running,
+        started_ts: None,
+        completed_ts: None,
+        tokens_final: None,
+        tokens_utility: None,
+        turns_final: None,
+        model: None,
+        error: None,
+        abandoned_reason: None,
+    };
+    let v = serde_json::to_value(&row).unwrap();
+    assert_eq!(v["kind"], "dispatch.internal");
+    assert_eq!(v["label"], "Dispatch");
+    // (#1432 item 4) Backfill fields are absent when None (lenient wire).
+    assert!(v.get("tokensFinal").is_none());
+    assert!(v.get("turnsFinal").is_none());
+    // (#2902 step 2a) The endpoint-presence `cloud`/`localOk` fields
+    // are gone from the wire entirely.
+    assert!(v.get("cloud").is_none());
+    assert!(v.get("localOk").is_none());
+    // (#1481) `model` is absent when None so a modelless step (procedural
+    // / Tier 3) never renders an empty chip on the page.
+    assert!(v.get("model").is_none());
+}
+
+/// (#1481) A step row carrying a resolved model serializes it under the
+/// `model` key (single word — camelCase is a no-op) so the page can render
+/// the seat's model chip. Pins the wire name against a future rename that
+/// would silently blank every seat card's model.
+#[test]
+fn step_row_serializes_resolved_model() {
+    let row = crate::mission_graph::StepRow {
+        id: "review-probe-0-step".to_string(),
+        label: "Probe".to_string(),
+        kind: "dispatch.map".to_string(),
+        status: darkmux_crew::types::NodeStatus::Running,
+        started_ts: None,
+        completed_ts: None,
+        tokens_final: None,
+        tokens_utility: None,
+        turns_final: None,
+        model: Some("darkmux:qwen/qwen3.6-27b".to_string()),
+        error: None,
+        abandoned_reason: None,
+    };
+    let v = serde_json::to_value(&row).unwrap();
+    assert_eq!(v["model"], "darkmux:qwen/qwen3.6-27b");
+}
+
+/// (#881 parity) The graph.json route must ride the SAME remote-only
+/// bearer gate as `/missions`/`/phases`/`/lab/runs` — guards against a
+/// future refactor special-casing the mission-graph surface out of
+/// `auth_mw`. Mirrors `lab_runs_requires_token_from_remote_peer`
+/// exactly.
+#[tokio::test]
+#[serial_test::serial]
+async fn mission_graph_json_requires_token_from_remote_peer() {
+    set_read_auth_env();
+    let app = build_router_local(PathBuf::new());
+    let mut req = Request::builder()
+        .uri("/mission/some-mission/graph.json")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut().insert(remote_peer());
+    let resp = app.oneshot(req).await.unwrap();
+    clear_auth_env();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn mission_graph_json_returns_404_for_unknown_mission() {
+    let _guard = CrewDirGuard::new();
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/mission/does-not-exist/graph.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn mission_graph_json_rejects_invalid_id() {
+    let _guard = CrewDirGuard::new();
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/mission/..%2F..%2Fetc/graph.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A mission with phase data but NO task/step graph underneath any
+/// phase (a legacy pre-registry instance, or a freeform hand-authored
+/// mission) renders phases-only with a note — never an error (item 6,
+/// graceful degradation).
+#[tokio::test]
+#[serial_test::serial]
+async fn mission_graph_json_legacy_mission_is_phases_only_with_a_note() {
+    let _guard = CrewDirGuard::new();
+    let mission = minimal_mission("legacy-mission", vec!["only-phase".to_string()]);
+    save_test_mission(&mission);
+    save_test_phase(&minimal_phase("only-phase", "legacy-mission"));
+
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/mission/legacy-mission/graph.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["legacy"], true);
+    assert!(
+        json["note"].is_string(),
+        "legacy mission must carry a note: {json}"
+    );
+    let nodes = json["nodes"].as_array().unwrap();
+    assert_eq!(
+        nodes.len(),
+        1,
+        "phases-only: exactly the one phase node, no tasks/steps: {nodes:?}"
+    );
+    assert_eq!(nodes[0]["kind"], "phase");
+    assert_eq!(nodes[0]["id"], "only-phase");
+    assert_eq!(json["edges"].as_array().unwrap().len(), 0);
+}
+
+/// Full shape test: a hand-built mission with a fan-in (two upstream
+/// tasks feeding one downstream task) exercises phase→task containment
+/// AND task-level `depends_on` edges (#1401: steps render as ROWS
+/// inside their owning task node, not separate nodes — the derived
+/// step-granularity fan-in edges retired along with the step nodes
+/// they connected; the fan-in now shows as two edges converging
+/// directly on the downstream TASK).
+#[tokio::test]
+#[serial_test::serial]
+async fn mission_graph_json_fan_in_shape() {
+    let _guard = CrewDirGuard::new();
+    let mission_id = "fanin-mission";
+    let mission = minimal_mission(mission_id, vec!["p1".to_string()]);
+    save_test_mission(&mission);
+    save_test_phase(&minimal_phase("p1", mission_id));
+
+    let task_a = darkmux_crew::types::Task {
+        repo_root: None,
+        branch: None,
+        run_on: darkmux_crew::types::default_run_on(),
+        id: "task-a".to_string(),
+        phase_id: "p1".to_string(),
+        description: "task a".to_string(),
+        display_name: None,
+        step_ids: vec!["task-a-step".to_string()],
+        depends_on: vec![],
+        reads: Vec::new(),
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    };
+    let task_b = darkmux_crew::types::Task {
+        repo_root: None,
+        branch: None,
+        run_on: darkmux_crew::types::default_run_on(),
+        id: "task-b".to_string(),
+        phase_id: "p1".to_string(),
+        description: "task b".to_string(),
+        display_name: None,
+        step_ids: vec!["task-b-step".to_string()],
+        depends_on: vec![],
+        reads: Vec::new(),
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    };
+    let task_c = darkmux_crew::types::Task {
+        repo_root: None,
+        branch: None,
+        run_on: darkmux_crew::types::default_run_on(),
+        id: "task-c".to_string(),
+        phase_id: "p1".to_string(),
+        description: "task c (dedup-like)".to_string(),
+        display_name: Some("Dedup".to_string()),
+        step_ids: vec!["task-c-step".to_string()],
+        depends_on: vec!["task-a".to_string(), "task-b".to_string()],
+        reads: Vec::new(),
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    };
+    for t in [&task_a, &task_b, &task_c] {
+        darkmux_crew::lifecycle::save_task(mission_id, t).unwrap();
+    }
+    let step_a = darkmux_crew::types::Step {
+        id: "task-a-step".to_string(),
+        task_id: "task-a".to_string(),
+        gate: None,
+        kind: "procedural.noop".to_string(),
+        status: darkmux_crew::types::NodeStatus::Complete,
+        config: serde_json::Value::Null,
+        started_ts: Some(1),
+        completed_ts: Some(2),
+        output: None,
+        stop_reason: None,
+    };
+    let step_b = darkmux_crew::types::Step {
+        id: "task-b-step".to_string(),
+        task_id: "task-b".to_string(),
+        gate: None,
+        kind: "procedural.noop".to_string(),
+        status: darkmux_crew::types::NodeStatus::Running,
+        config: serde_json::Value::Null,
+        started_ts: Some(1),
+        completed_ts: None,
+        output: None,
+        stop_reason: None,
+    };
+    let step_c = darkmux_crew::types::Step {
+        id: "task-c-step".to_string(),
+        task_id: "task-c".to_string(),
+        gate: None,
+        kind: "procedural.noop".to_string(),
+        status: darkmux_crew::types::NodeStatus::Planned,
+        config: serde_json::Value::Null,
+        started_ts: None,
+        completed_ts: None,
+        output: None,
+        stop_reason: None,
+    };
+    for s in [&step_a, &step_b, &step_c] {
+        darkmux_crew::lifecycle::save_step(mission_id, "p1", s).unwrap();
     }
 
-    /// (#2343) THE end-to-end reproduction, at the wire boundary — not just
-    /// `derive_task_status`/`phase_task_rollup`/`phase_display_status`
-    /// returning the right enum in isolation, but the actual
-    /// `/mission/{id}/graph.json` JSON a client reads. Pins the CALL SITE
-    /// (`build_mission_graph`'s per-task rollup) that threads a step's
-    /// `started_ts` into the derivation, not just the helper.
-    ///
-    /// Fixture: a single task whose first step (`unit-0-map`) is
-    /// `Complete`, and whose second step (`unit-0-collect`) was ADMITTED
-    /// to a wave (`NodeStatus::Running`, per `run_step_graph`'s
-    /// admission-time flip) but never actually got a turn on its
-    /// concurrency-capped track — `started_ts: None`, exactly the shape
-    /// `run_step_graph`'s job closure leaves behind for a step still
-    /// queued behind an endpoint's concurrency/`dispatch_free_cap`. Before this fix the
-    /// task read `running` (any `NodeStatus::Running` step won,
-    /// unconditionally) for as long as that queueing lasted — the issue's
-    /// own "RUNNING for an hour with nothing running". It must now read
-    /// `waiting`, and — since this is the phase's ONLY task and the
-    /// persisted phase status is `Running` (`minimal_phase`'s default,
-    /// same shape the #2343 tie-break exception targets) — the phase node
-    /// must ALSO read `waiting`, not launder back to `running` on the
-    /// persisted-status tie.
-    #[tokio::test]
-    // (#2343, post-review) `CrewDirGuard` sets a PROCESS-GLOBAL env var, and
-    // `serial_test` only serializes tests that carry the attribute — every
-    // other `CrewDirGuard::new()` test in this file has it. Without it here,
-    // this test raced its own siblings' guards: measured 18/25 failures under
-    // `--test-threads=32` with load (some runs failing twice, poisoning a
-    // sibling), 0/25 with the attribute.
-    #[serial_test::serial]
-    async fn mission_graph_json_admitted_not_dispatched_task_reads_waiting_not_running() {
-        let _guard = CrewDirGuard::new();
-        let mission_id = "waiting-2343";
-        let mission = minimal_mission(mission_id, vec!["p1".to_string()]);
-        save_test_mission(&mission);
-        save_test_phase(&minimal_phase("p1", mission_id));
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/mission/{mission_id}/graph.json"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["legacy"], false);
 
+    let nodes = json["nodes"].as_array().unwrap();
+    // (#1401) 1 phase + 3 tasks — NO separate step nodes anymore.
+    assert_eq!(nodes.len(), 4, "{nodes:?}");
+    let node = |id: &str| {
+        nodes
+            .iter()
+            .find(|n| n["id"] == id)
+            .unwrap_or_else(|| panic!("missing node {id}: {nodes:?}"))
+    };
+    assert_eq!(node("task-a")["status"], "complete");
+    assert_eq!(node("task-b")["status"], "running");
+    assert_eq!(node("task-c")["status"], "planned");
+
+    // (#1398) label falls back to `id` when no display_name is set;
+    // task-c's explicit display_name wins over its id.
+    assert_eq!(node("task-a")["label"], "task-a");
+    assert_eq!(node("task-c")["label"], "Dedup");
+
+    // (#1401) The steps a task carries render as an array of rows on
+    // ITS OWN node — kind display name resolved via `resolve_step_label`
+    // ("procedural.noop" -> "No-op").
+    let task_a_steps = node("task-a")["steps"].as_array().unwrap();
+    assert_eq!(task_a_steps.len(), 1, "{task_a_steps:?}");
+    assert_eq!(task_a_steps[0]["id"], "task-a-step");
+    assert_eq!(task_a_steps[0]["label"], "No-op");
+    assert_eq!(task_a_steps[0]["status"], "complete");
+    assert_eq!(task_a_steps[0]["startedTs"], 1);
+    assert_eq!(task_a_steps[0]["completedTs"], 2);
+    let task_b_steps = node("task-b")["steps"].as_array().unwrap();
+    assert_eq!(task_b_steps[0]["status"], "running");
+
+    // ── Wire-casing CONTRACT (review-gate MF1). The page's JS reads
+    // `n.parentId` in computeLayout — the first cut serialized
+    // `parent_id` while the JS read `parentId`, so every task grouped
+    // under a missing parent and the whole layout collapsed to the
+    // origin. Pin the EXACT camelCase keys the JS reads on node
+    // objects, the ABSENCE of the snake_case forms, and the envelope's
+    // deliberate snake_case (the JS reads `g.mission_id`), so a rename
+    // on either side fails here instead of silently flattening the
+    // layout.
+    assert_eq!(node("task-a")["parentId"], "p1");
+    assert!(
+        node("task-a")["parent_id"].is_null(),
+        "snake_case parent_id must NOT be on the wire (JS reads parentId)"
+    );
+    assert!(
+        task_a_steps[0]["started_ts"].is_null(),
+        "snake_case started_ts must NOT be on a step row's wire form (camelCase contract)"
+    );
+    assert!(node("task-a")["depth"].is_number());
+    assert!(
+        json["mission_id"].is_string(),
+        "envelope stays snake_case (JS reads g.mission_id)"
+    );
+    assert!(
+        json["mission_status"].is_string(),
+        "envelope stays snake_case (JS reads g.mission_status)"
+    );
+
+    let edges = json["edges"].as_array().unwrap();
+    let has_edge = |source: &str, target: &str, kind: &str| {
+        edges
+            .iter()
+            .any(|e| e["source"] == source && e["target"] == target && e["kind"] == kind)
+    };
+    assert!(has_edge("p1", "task-a", "contains"));
+    assert!(has_edge("p1", "task-b", "contains"));
+    assert!(has_edge("p1", "task-c", "contains"));
+    // The fan-in: BOTH upstream TASKS converge directly on the
+    // downstream task — no step-level detour (#1401).
+    assert!(has_edge("task-a", "task-c", "depends_on"));
+    assert!(has_edge("task-b", "task-c", "depends_on"));
+    // No "contains" edges into step ids — steps aren't nodes anymore.
+    assert!(!edges.iter().any(|e| e["target"] == "task-a-step"));
+
+    // (review-gate C7) No duplicate edge ids — React keys must be
+    // unique; a duplicate depends_on entry on a Task must not emit
+    // the same edge twice.
+    let mut ids: Vec<&str> = edges.iter().filter_map(|e| e["id"].as_str()).collect();
+    let before = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), before, "duplicate edge ids in {edges:?}");
+}
+
+/// (#2406) The issue's own exact live scenario, through the REAL
+/// `/mission/:id/graph.json` route: one phase, 12 tasks — 7 complete, 1
+/// errored, 4 still running. Before this fix, the phase-level rollup
+/// reused `derive_task_status`'s "any Error wins" one level too high,
+/// so this exact shape would have rendered the phase `error` while
+/// eleven other units were doing real work (or `abandoned` once the
+/// mission finalized). The fix: `running` (the phase is not over) with
+/// the breakdown named in `statusNote`.
+#[tokio::test]
+#[serial_test::serial]
+async fn mission_graph_json_live_mixed_phase_renders_running_with_counts() {
+    let _guard = CrewDirGuard::new();
+    let mission_id = "mixed-2406";
+    let mission = minimal_mission(mission_id, vec!["p1".to_string()]);
+    save_test_mission(&mission);
+    save_test_phase(&minimal_phase("p1", mission_id));
+
+    // 7 complete, 1 errored, 4 running — the issue's own numbers.
+    let mut task_statuses: Vec<(String, darkmux_crew::types::NodeStatus)> = Vec::new();
+    for i in 0..7 {
+        task_statuses.push((
+            format!("unit-{i}"),
+            darkmux_crew::types::NodeStatus::Complete,
+        ));
+    }
+    task_statuses.push(("unit-7".to_string(), darkmux_crew::types::NodeStatus::Error));
+    for i in 8..12 {
+        task_statuses.push((
+            format!("unit-{i}"),
+            darkmux_crew::types::NodeStatus::Running,
+        ));
+    }
+    for (task_id, status) in &task_statuses {
+        let step_id = format!("{task_id}-step");
         let task = darkmux_crew::types::Task {
             repo_root: None,
             branch: None,
             run_on: darkmux_crew::types::default_run_on(),
-            id: "unit-0".to_string(),
+            id: task_id.clone(),
             phase_id: "p1".to_string(),
-            description: "unit-0".to_string(),
+            description: task_id.clone(),
             display_name: None,
-            step_ids: vec!["unit-0-map".to_string(), "unit-0-collect".to_string()],
+            step_ids: vec![step_id.clone()],
             depends_on: vec![],
             reads: Vec::new(),
             role_id: None,
@@ -8417,999 +10409,1189 @@
             image: None,
         };
         darkmux_crew::lifecycle::save_task(mission_id, &task).unwrap();
-
-        let map_step = darkmux_crew::types::Step {
-            id: "unit-0-map".to_string(),
-            task_id: "unit-0".to_string(),
+        let step = darkmux_crew::types::Step {
+            id: step_id,
+            task_id: task_id.clone(),
             gate: None,
-            kind: "dispatch.map".to_string(),
-            status: darkmux_crew::types::NodeStatus::Complete,
+            kind: "procedural.noop".to_string(),
+            status: *status,
             config: serde_json::Value::Null,
             started_ts: Some(1),
-            completed_ts: Some(2),
+            completed_ts: if *status == darkmux_crew::types::NodeStatus::Complete {
+                Some(2)
+            } else {
+                None
+            },
             output: None,
             stop_reason: None,
         };
-        darkmux_crew::lifecycle::save_step(mission_id, "p1", &map_step).unwrap();
+        darkmux_crew::lifecycle::save_step(mission_id, "p1", &step).unwrap();
+    }
 
-        // Admitted to a wave (`Running`) but never actually dispatched —
-        // `started_ts: None` is the whole point of this fixture.
-        let collect_step = darkmux_crew::types::Step {
-            id: "unit-0-collect".to_string(),
-            task_id: "unit-0".to_string(),
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/mission/{mission_id}/graph.json"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    let nodes = json["nodes"].as_array().unwrap();
+    let phase = nodes
+        .iter()
+        .find(|n| n["id"] == "p1")
+        .unwrap_or_else(|| panic!("missing phase node p1: {nodes:?}"));
+    assert_eq!(
+            phase["status"], "running",
+            "1 errored + 7 complete + 4 running must NOT read `error` or `abandoned` — the phase isn't over: {phase:?}"
+        );
+    let note = phase["statusNote"]
+        .as_str()
+        .expect("statusNote present on a live mixed phase");
+    assert!(note.contains("7 complete"), "note: {note}");
+    assert!(note.contains("1 errored"), "note: {note}");
+    assert!(note.contains("4 running"), "note: {note}");
+}
+
+/// (#2343) THE end-to-end reproduction, at the wire boundary — not just
+/// `derive_task_status`/`phase_task_rollup`/`phase_display_status`
+/// returning the right enum in isolation, but the actual
+/// `/mission/{id}/graph.json` JSON a client reads. Pins the CALL SITE
+/// (`build_mission_graph`'s per-task rollup) that threads a step's
+/// `started_ts` into the derivation, not just the helper.
+///
+/// Fixture: a single task whose first step (`unit-0-map`) is
+/// `Complete`, and whose second step (`unit-0-collect`) was ADMITTED
+/// to a wave (`NodeStatus::Running`, per `run_step_graph`'s
+/// admission-time flip) but never actually got a turn on its
+/// concurrency-capped track — `started_ts: None`, exactly the shape
+/// `run_step_graph`'s job closure leaves behind for a step still
+/// queued behind an endpoint's concurrency/`dispatch_free_cap`. Before this fix the
+/// task read `running` (any `NodeStatus::Running` step won,
+/// unconditionally) for as long as that queueing lasted — the issue's
+/// own "RUNNING for an hour with nothing running". It must now read
+/// `waiting`, and — since this is the phase's ONLY task and the
+/// persisted phase status is `Running` (`minimal_phase`'s default,
+/// same shape the #2343 tie-break exception targets) — the phase node
+/// must ALSO read `waiting`, not launder back to `running` on the
+/// persisted-status tie.
+#[tokio::test]
+// (#2343, post-review) `CrewDirGuard` sets a PROCESS-GLOBAL env var, and
+// `serial_test` only serializes tests that carry the attribute — every
+// other `CrewDirGuard::new()` test in this file has it. Without it here,
+// this test raced its own siblings' guards: measured 18/25 failures under
+// `--test-threads=32` with load (some runs failing twice, poisoning a
+// sibling), 0/25 with the attribute.
+#[serial_test::serial]
+async fn mission_graph_json_admitted_not_dispatched_task_reads_waiting_not_running() {
+    let _guard = CrewDirGuard::new();
+    let mission_id = "waiting-2343";
+    let mission = minimal_mission(mission_id, vec!["p1".to_string()]);
+    save_test_mission(&mission);
+    save_test_phase(&minimal_phase("p1", mission_id));
+
+    let task = darkmux_crew::types::Task {
+        repo_root: None,
+        branch: None,
+        run_on: darkmux_crew::types::default_run_on(),
+        id: "unit-0".to_string(),
+        phase_id: "p1".to_string(),
+        description: "unit-0".to_string(),
+        display_name: None,
+        step_ids: vec!["unit-0-map".to_string(), "unit-0-collect".to_string()],
+        depends_on: vec![],
+        reads: Vec::new(),
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    };
+    darkmux_crew::lifecycle::save_task(mission_id, &task).unwrap();
+
+    let map_step = darkmux_crew::types::Step {
+        id: "unit-0-map".to_string(),
+        task_id: "unit-0".to_string(),
+        gate: None,
+        kind: "dispatch.map".to_string(),
+        status: darkmux_crew::types::NodeStatus::Complete,
+        config: serde_json::Value::Null,
+        started_ts: Some(1),
+        completed_ts: Some(2),
+        output: None,
+        stop_reason: None,
+    };
+    darkmux_crew::lifecycle::save_step(mission_id, "p1", &map_step).unwrap();
+
+    // Admitted to a wave (`Running`) but never actually dispatched —
+    // `started_ts: None` is the whole point of this fixture.
+    let collect_step = darkmux_crew::types::Step {
+        id: "unit-0-collect".to_string(),
+        task_id: "unit-0".to_string(),
+        gate: None,
+        kind: "review.probe-collect".to_string(),
+        status: darkmux_crew::types::NodeStatus::Running,
+        config: serde_json::Value::Null,
+        started_ts: None,
+        completed_ts: None,
+        output: None,
+        stop_reason: None,
+    };
+    darkmux_crew::lifecycle::save_step(mission_id, "p1", &collect_step).unwrap();
+
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/mission/{mission_id}/graph.json"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    let nodes = json["nodes"].as_array().unwrap();
+    let task_node = nodes
+        .iter()
+        .find(|n| n["id"] == "unit-0")
+        .unwrap_or_else(|| panic!("missing task node unit-0: {nodes:?}"));
+    assert_eq!(
+        task_node["status"], "waiting",
+        "admitted-but-not-dispatched must read `waiting`, not `running`: {task_node:?}"
+    );
+
+    let phase_node = nodes
+        .iter()
+        .find(|n| n["id"] == "p1")
+        .unwrap_or_else(|| panic!("missing phase node p1: {nodes:?}"));
+    assert_eq!(
+        phase_node["status"], "waiting",
+        "the phase's ONLY task is waiting, nothing is genuinely running — the phase must not \
+             launder back to `running` on the persisted-status tie (#2343): {phase_node:?}"
+    );
+}
+
+/// (review-gate MF2a) The three production graph runners persist Step
+/// JSONs only AFTER `run_step_graph` returns — so a page opened DURING
+/// a run sees tasks whose `step_ids` name steps with no file on disk.
+/// The builder must synthesize `planned` step ROWS for those ids
+/// (#1401 — otherwise the SSE layer has nothing to flip when the
+/// scheduler's `step start` records arrive). This fixture is exactly
+/// that mid-run shape: tasks persisted with `step_ids` + `depends_on`,
+/// ZERO step files, and NO config-snapshot.json (a hand-built test
+/// fixture, not a config-launched mission) — so the kind-recovery path
+/// (#1402) has nothing to recover from, and the row's label falls back
+/// to the step id itself (the fallback chain's SECOND-to-last rung,
+/// not the deep "unknown" — see `resolve_step_label`'s doc).
+#[tokio::test]
+#[serial_test::serial]
+async fn mission_graph_json_synthesizes_planned_steps_for_unpersisted_step_files() {
+    let _guard = CrewDirGuard::new();
+    let mission_id = "midrun-mission";
+    save_test_mission(&minimal_mission(mission_id, vec!["p1".to_string()]));
+    save_test_phase(&minimal_phase("p1", mission_id));
+
+    let task_a = darkmux_crew::types::Task {
+        repo_root: None,
+        branch: None,
+        run_on: darkmux_crew::types::default_run_on(),
+        id: "task-a".to_string(),
+        phase_id: "p1".to_string(),
+        description: "task a".to_string(),
+        display_name: None,
+        step_ids: vec!["task-a-step".to_string()],
+        depends_on: vec![],
+        reads: Vec::new(),
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    };
+    let task_b = darkmux_crew::types::Task {
+        repo_root: None,
+        branch: None,
+        run_on: darkmux_crew::types::default_run_on(),
+        id: "task-b".to_string(),
+        phase_id: "p1".to_string(),
+        description: "task b".to_string(),
+        display_name: None,
+        // Two steps — both must synthesize a row, in order.
+        step_ids: vec!["task-b-step-1".to_string(), "task-b-step-2".to_string()],
+        depends_on: vec!["task-a".to_string()],
+        reads: Vec::new(),
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    };
+    for t in [&task_a, &task_b] {
+        darkmux_crew::lifecycle::save_task(mission_id, t).unwrap();
+    }
+    // Deliberately NO save_step calls — the mid-run disk state.
+
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/mission/{mission_id}/graph.json"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["legacy"], false);
+
+    let nodes = json["nodes"].as_array().unwrap();
+    // (#1401) 1 phase + 2 tasks — NO separate step nodes, synthesized
+    // or otherwise.
+    assert_eq!(nodes.len(), 3, "{nodes:?}");
+    let node = |id: &str| {
+        nodes
+            .iter()
+            .find(|n| n["id"] == id)
+            .unwrap_or_else(|| panic!("missing node {id}: {nodes:?}"))
+    };
+    assert_eq!(node("task-a")["status"], "planned");
+    assert_eq!(node("task-b")["status"], "planned");
+
+    let task_a_steps = node("task-a")["steps"].as_array().unwrap();
+    assert_eq!(task_a_steps.len(), 1);
+    assert_eq!(task_a_steps[0]["id"], "task-a-step");
+    assert_eq!(
+        task_a_steps[0]["status"], "planned",
+        "synthesized step must be planned: {task_a_steps:?}"
+    );
+    assert_eq!(
+        task_a_steps[0]["label"], "task-a-step",
+        "no config-snapshot to recover a kind from -> label falls back to the step id \
+             itself, not the deep 'unknown' (#1402): {task_a_steps:?}"
+    );
+
+    let task_b_steps = node("task-b")["steps"].as_array().unwrap();
+    assert_eq!(
+        task_b_steps.len(),
+        2,
+        "both synthesized rows present, in step_ids order"
+    );
+    assert_eq!(task_b_steps[0]["id"], "task-b-step-1");
+    assert_eq!(task_b_steps[1]["id"], "task-b-step-2");
+    for row in task_b_steps {
+        assert_eq!(row["status"], "planned");
+    }
+
+    // Every dependency edge's BOTH endpoints exist as (task) nodes.
+    let node_ids: std::collections::BTreeSet<&str> =
+        nodes.iter().filter_map(|n| n["id"].as_str()).collect();
+    let edges = json["edges"].as_array().unwrap();
+    for e in edges {
+        for end in ["source", "target"] {
+            let id = e[end].as_str().unwrap();
+            assert!(
+                node_ids.contains(id),
+                "edge {e} references missing node {id}"
+            );
+        }
+    }
+    // Cross-task dep edge connects the TASKS directly (#1401) — no
+    // step-level detour, synthesized or otherwise.
+    assert!(edges
+        .iter()
+        .any(|e| e["source"] == "task-a" && e["target"] == "task-b" && e["kind"] == "depends_on"));
+}
+
+/// Slice out just the `STATUS_ACTIONS` map body from `graph.ts`'s source
+/// (#1868 QA finding). The step-lifecycle actions this map holds ALSO
+/// appear, independently, in this same file's `applyRecordToMetrics`
+/// (`isStart`/`isTerminal`) — so a whole-file `contains()` scan can't
+/// actually prove the STATUS_ACTIONS entry exists; deleting the map's own
+/// step lines while leaving the metrics checks intact still passes.
+/// Scoping the scan to the map's own body (up to its closing `]);`)
+/// closes that gap; the `expect` turns "someone renamed/restructured the
+/// map" into a loud failure instead of a silently-vacuous pass.
+fn graph_ts_status_actions_map() -> &'static str {
+    let graph_ts = include_str!("../../../ui/src/lenses/mission/graph.ts");
+    let (_, after) = graph_ts.split_once("const STATUS_ACTIONS").expect(
+        "STATUS_ACTIONS map not found in ui/src/lenses/mission/graph.ts — the pin lost its subject",
+    );
+    let (body, _) = after
+            .split_once("]);")
+            .expect("STATUS_ACTIONS map has no closing `]);` in ui/src/lenses/mission/graph.ts: the pin lost its subject");
+    body
+}
+
+/// How the viewer names `action` in code: `ACTION.<Variant>`, the
+/// `ui/src/lib/ingest.ts` constant spelled with the Rust variant's own
+/// name, so a Rust rename breaks the pin rather than drifting past it.
+fn ts_action_key(action: &darkmux_flow::FlowAction) -> String {
+    let wire = action.as_str();
+    let k = darkmux_flow::FlowAction::KNOWN_WIRE
+        .iter()
+        .position(|w| *w == wire)
+        .unwrap_or_else(|| panic!("`{wire}` is not a current FlowAction"));
+    format!("ACTION.{}", darkmux_flow::FlowAction::VARIANT_NAMES[k])
+}
+
+/// (review-gate C2) Pin the SSE action contract: the lens's
+/// STATUS_ACTIONS map must hold every action the emitting side actually
+/// writes (`scheduler::step_lifecycle_record`'s step start/complete/
+/// error; `lifecycle::emit_phase_transition_record`'s phase start/
+/// complete/abandon; the mission transition verbs). A rename on either
+/// side must fail a test, not silently kill the live animation. The emit
+/// side is pinned by darkmux-crew's own
+/// `run_step_graph_emits_step_start_and_step_complete_records`; this
+/// pins the lens side against the same `FlowAction` variants.
+///
+/// Retargeted at `ui/src/lenses/mission/graph.ts`'s own `STATUS_ACTIONS`
+/// map (#1868) — the standalone `mission-graph.html` page this test
+/// used to scan is retired; the map itself moved verbatim into the
+/// React port. `include_str!` reaches outside this crate into `ui/` on
+/// purpose (test-only, `#[cfg(test)]`-gated via this module's own
+/// `#[path]` attribute, so it never ships in the release binary) —
+/// there is no Rust-side binding to pin against on the TS side of this
+/// contract, so a text scan is the only mechanical tie available. Scans
+/// [`graph_ts_status_actions_map`]'s SLICE, not the whole file — see
+/// that helper's own doc for why the whole-file scan this test used to
+/// run was provably vacuous for the three step-lifecycle literals.
+#[test]
+fn mission_graph_lens_pins_flow_action_strings() {
+    use darkmux_flow::FlowAction;
+    let map = graph_ts_status_actions_map();
+    for action in [
+        FlowAction::StepStart,
+        FlowAction::StepComplete,
+        FlowAction::StepError,
+        FlowAction::PhaseStart,
+        FlowAction::PhaseComplete,
+        FlowAction::PhaseAbandon,
+        FlowAction::MissionStart,
+        FlowAction::MissionClose,
+    ] {
+        let key = ts_action_key(&action);
+        assert!(
+            map.contains(&format!("[{key},")),
+            "ui/src/lenses/mission/graph.ts lost the {key} entry from its \
+                 STATUS_ACTIONS map: the SSE delta layer silently stops animating that transition"
+        );
+    }
+}
+
+/// (F3, #1397/#1399 gate remediation) The MECHANICAL tie between the
+/// emit-side vocabulary constant and the lens-side consumer: iterates
+/// `darkmux_crew::scheduler::STEP_LIFECYCLE_ACTIONS` itself (not a
+/// re-typed list) and asserts each action appears in the lens's own
+/// map. The test above pins the lens against a hand-written variant list
+/// (covering the phase/mission verbs too, which have no shared Rust
+/// constant yet);
+/// this one guarantees that if the SCHEDULER's canonical step vocabulary
+/// ever changes, this crate fails to build/pass until the lens's
+/// STATUS_ACTIONS map catches up — the two hand-maintained lists (Rust
+/// constant, TS map) can no longer drift silently.
+///
+/// Retargeted at `ui/src/lenses/mission/graph.ts` (#1868) — same
+/// retirement as the test above. Scans
+/// [`graph_ts_status_actions_map`]'s SLICE, not the whole file — see
+/// that helper's own doc; the naive whole-file scan cannot fail for any
+/// of these three actions, because the same three also appear,
+/// independently, in this file's `applyRecordToMetrics`.
+#[test]
+fn mission_graph_lens_contains_every_scheduler_step_lifecycle_action() {
+    let map = graph_ts_status_actions_map();
+    for action in darkmux_crew::scheduler::STEP_LIFECYCLE_ACTIONS {
+        let key = ts_action_key(&action);
+        assert!(
+            map.contains(&format!("[{key},")),
+            "ui/src/lenses/mission/graph.ts's STATUS_ACTIONS map is missing scheduler \
+                 STEP_LIFECYCLE_ACTIONS entry {key}: the graph lens would silently \
+                 stop animating that step transition"
+        );
+    }
+}
+
+/// (item 7, #1512; #2310 P4d) Shape test against a REAL
+/// review-config-interpreted graph: loads the embedded `review` mission
+/// config and interprets it, persists the resulting
+/// Mission/Phase/Task/Step graph, and asserts the graph.json node counts
+/// match `review.json`'s own declared shape. Post-P4d that shape is the
+/// crawl-blocks one: 5 phase nodes (plan, review, summarize, create-mods,
+/// deliver) and the tasks the DOCUMENT declares statically — seven
+/// `plan.sites` tasks, the summary task, and the deliver task. The
+/// `review` phase's `unit-<rule>` tasks and `create-mods`' `create-mod`
+/// are GROWN/pruned at run time from a plan step's output, so `interpret`
+/// alone never mints them; that is what makes 9 tasks the honest number
+/// here, not a regression.
+#[tokio::test]
+#[serial_test::serial]
+async fn mission_graph_json_review_config_interpreted_shape() {
+    let _guard = CrewDirGuard::new();
+    let loaded =
+        darkmux_crew::mission_config::load("review").expect("embedded review config loads");
+
+    // `interpret` needs nothing beyond the document itself: every task
+    // it mints here is statically declared (the grown `unit-<rule>`
+    // tasks come later, from a plan step's real output).
+    let params = darkmux_crew::mission_config::LaunchParams {
+        phase_ids: std::collections::BTreeMap::new(),
+        task_overrides: std::collections::BTreeMap::new(),
+        step_config_overrides: std::collections::BTreeMap::new(),
+        input_values: std::collections::BTreeMap::new(),
+    };
+    let (tasks, steps, _warnings) =
+        darkmux_crew::mission_config::interpret(&loaded.config, &params)
+            .expect("interpret succeeds against the embedded review config");
+
+    let mission_id = "review-shape-mission";
+    let phase_ids: Vec<String> = loaded.config.phases.iter().map(|p| p.id.clone()).collect();
+    save_test_mission(&minimal_mission(mission_id, phase_ids.clone()));
+    for phase_id in &phase_ids {
+        save_test_phase(&minimal_phase(phase_id, mission_id));
+    }
+    for task in &tasks {
+        darkmux_crew::lifecycle::save_task(mission_id, task).unwrap();
+    }
+    for step in steps.values() {
+        darkmux_crew::lifecycle::save_step(
+            mission_id,
+            &tasks
+                .iter()
+                .find(|t| t.id == step.task_id)
+                .unwrap()
+                .phase_id,
+            step,
+        )
+        .unwrap();
+    }
+
+    let app = build_router_local(PathBuf::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/mission/{mission_id}/graph.json"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["legacy"], false);
+
+    let nodes = json["nodes"].as_array().unwrap();
+    let count_kind = |kind: &str| nodes.iter().filter(|n| n["kind"] == kind).count();
+    assert_eq!(
+        count_kind("phase"),
+        5,
+        "plan/review/summarize/create-mods/deliver: {nodes:?}"
+    );
+    // Seven `plan.sites` tasks (one per rule the document declares) +
+    // the summary task + the deliver task.
+    assert_eq!(
+        count_kind("task"),
+        9,
+        "expected 7 plan tasks + summary + deliver: {nodes:?}"
+    );
+    // (#1401) No separate "step" node kind anymore — every task's
+    // steps render as rows on ITS OWN node instead.
+    assert_eq!(
+        count_kind("step"),
+        0,
+        "steps are rows now, not nodes (#1401): {nodes:?}"
+    );
+    let total_step_rows: usize = nodes
+        .iter()
+        .filter(|n| n["kind"] == "task")
+        .map(|n| n["steps"].as_array().map(|a| a.len()).unwrap_or(0))
+        .sum();
+    // The deliver task carries TWO rows (`records.gather` then
+    // `deliver.github_review`); every other task here carries ONE.
+    // 9 tasks: 7×plan(1) + summary(1) + deliver(2) = 10 step rows.
+    assert_eq!(
+        total_step_rows, 10,
+        "plan + summary carry one row each, deliver carries two: {nodes:?}"
+    );
+    assert_eq!(tasks.len(), 9);
+    assert_eq!(steps.len(), 10);
+
+    // (#1402) Every row's label resolves through the real StepKind
+    // display-name fallback chain. This crate sees the Tier-1 builtins
+    // plus its own `mission.*` table; the launch-owned crawl-family
+    // kinds are registered by the LAUNCHER, not here, so their rows fall
+    // back to the raw kind id — which is the honest label a daemon that
+    // cannot construct the kind can offer (#2310 P4d retired the
+    // `review.*` lookup that used to reach into `darkmux-lab`).
+    let all_labels: Vec<String> = nodes
+        .iter()
+        .filter(|n| n["kind"] == "task")
+        .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
+        .filter_map(|row| row["label"].as_str().map(String::from))
+        .collect();
+    for expected in [
+        "plan.sites",
+        "dispatch.summary",
+        "records.gather",
+        "deliver.github_review",
+    ] {
+        assert!(
+            all_labels.iter().any(|l| l == expected),
+            "expected a \"{expected}\" row label among {all_labels:?}"
+        );
+    }
+}
+
+/// (#1432 item 4) graph.json backfills a COMPLETED step's finalized
+/// token/turn totals from the daemon's flow records at page load — so a
+/// page opened after the dispatch ran shows the real total, not the idle
+/// "· tok" placeholder (the SSE stream being tail-from-now). A step with
+/// NO folded record stays absent (honest "no data", never a wrong zero).
+#[tokio::test]
+#[serial_test::serial]
+async fn mission_graph_json_backfills_completed_step_totals_from_flow_records() {
+    use darkmux_crew::types::{NodeStatus, Step, Task};
+    let _guard = CrewDirGuard::new();
+    let mission_id = "backfill-mission";
+    let phase_id = "p1";
+    save_test_mission(&minimal_mission(mission_id, vec![phase_id.to_string()]));
+    save_test_phase(&minimal_phase(phase_id, mission_id));
+
+    // Two steps: one that ran (has a flow record), one that never did.
+    let mk_task = |id: &str, step: &str| Task {
+        repo_root: None,
+        branch: None,
+        run_on: darkmux_crew::types::default_run_on(),
+        id: id.to_string(),
+        phase_id: phase_id.to_string(),
+        description: format!("task {id}"),
+        display_name: None,
+        step_ids: vec![step.to_string()],
+        depends_on: Vec::new(),
+        reads: Vec::new(),
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    };
+    let mk_step = |id: &str, status: NodeStatus| Step {
+        id: id.to_string(),
+        task_id: format!("{id}-task"),
+        gate: None,
+        kind: "dispatch.internal".to_string(),
+        status,
+        config: serde_json::Value::Null,
+        started_ts: Some(now_unix()),
+        completed_ts: if status == NodeStatus::Complete {
+            Some(now_unix())
+        } else {
+            None
+        },
+        output: None,
+        stop_reason: None,
+    };
+    darkmux_crew::lifecycle::save_task(mission_id, &mk_task("ran-task", "ran-step")).unwrap();
+    darkmux_crew::lifecycle::save_task(mission_id, &mk_task("idle-task", "idle-step")).unwrap();
+    darkmux_crew::lifecycle::save_step(
+        mission_id,
+        phase_id,
+        &mk_step("ran-step", NodeStatus::Complete),
+    )
+    .unwrap();
+    darkmux_crew::lifecycle::save_step(
+        mission_id,
+        phase_id,
+        &mk_step("idle-step", NodeStatus::Planned),
+    )
+    .unwrap();
+
+    // A flows_dir carrying a dispatch-complete record for the ran step
+    // only. Named for TODAY's day stem (#1445 gate): the backfill scans
+    // only day files inside the mission's lifetime window, and this
+    // mission was just minted with created_ts = now — a hardcoded date
+    // would silently fall out of the window when run later.
+    let flows = TempDir::new().unwrap();
+    let complete = serde_json::json!({
+        "action": "dispatch.complete",
+        "session_id": format!("{mission_id}.step.ran-step"),
+        "payload": { "total_tokens": 99999, "total_turns": 7 }
+    });
+    // The step's tokens are its usage records' sum: the terminal's own
+    // `total_tokens` (99999) is never read.
+    let usage = serde_json::json!({
+        "action": "telemetry.tokens", "category": "telemetry", "source": "tokens",
+        "session_id": format!("{mission_id}.step.ran-step"),
+        "payload": { "call_kind": "turn", "token_source": "provider", "total_tokens": 12345 }
+    });
+    let today = crate::mission_graph::epoch_days_to_stem((now_unix() / 86400) as i64);
+    std::fs::write(
+        flows.path().join(format!("{today}.jsonl")),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&complete).unwrap(),
+            serde_json::to_string(&usage).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let app = build_router_local(flows.path().to_path_buf());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/mission/{mission_id}/graph.json"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let rows: Vec<serde_json::Value> = json["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["kind"] == "task")
+        .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
+        .collect();
+    let ran = rows
+        .iter()
+        .find(|r| r["id"] == "ran-step")
+        .expect("ran-step row");
+    assert_eq!(
+        ran["tokensFinal"], 12345,
+        "completed step backfilled from flow records"
+    );
+    assert_eq!(ran["turnsFinal"], 7);
+    let idle = rows
+        .iter()
+        .find(|r| r["id"] == "idle-step")
+        .expect("idle-step row");
+    assert!(
+        idle.get("tokensFinal").is_none(),
+        "never-ran step has no backfill (honest absent)"
+    );
+    assert!(idle.get("turnsFinal").is_none());
+}
+
+/// (#1432 item 4) A mixed-era mission (steps ran, but the daemon has NO
+/// flow files on disk — e.g. rotated away, or a fresh checkout) backfills
+/// nothing rather than erroring or inventing zeros. Same code path, empty
+/// flows_dir.
+#[tokio::test]
+#[serial_test::serial]
+async fn mission_graph_json_backfill_absent_when_no_flow_records() {
+    use darkmux_crew::types::{NodeStatus, Step, Task};
+    let _guard = CrewDirGuard::new();
+    let mission_id = "no-records-mission";
+    let phase_id = "p1";
+    save_test_mission(&minimal_mission(mission_id, vec![phase_id.to_string()]));
+    save_test_phase(&minimal_phase(phase_id, mission_id));
+    let task = Task {
+        repo_root: None,
+        branch: None,
+        run_on: darkmux_crew::types::default_run_on(),
+        id: "t1".to_string(),
+        phase_id: phase_id.to_string(),
+        description: "t1".to_string(),
+        display_name: None,
+        step_ids: vec!["s1".to_string()],
+        depends_on: Vec::new(),
+        reads: Vec::new(),
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    };
+    darkmux_crew::lifecycle::save_task(mission_id, &task).unwrap();
+    darkmux_crew::lifecycle::save_step(
+        mission_id,
+        phase_id,
+        &Step {
+            id: "s1".to_string(),
+            task_id: "t1".to_string(),
             gate: None,
-            kind: "review.probe-collect".to_string(),
-            status: darkmux_crew::types::NodeStatus::Running,
+            kind: "dispatch.internal".to_string(),
+            status: NodeStatus::Complete,
+            config: serde_json::Value::Null,
+            started_ts: Some(now_unix()),
+            completed_ts: Some(now_unix()),
+            output: None,
+            stop_reason: None,
+        },
+    )
+    .unwrap();
+
+    // Empty flows_dir (like the test router's own PathBuf::new()).
+    let empty = TempDir::new().unwrap();
+    let app = build_router_local(empty.path().to_path_buf());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/mission/{mission_id}/graph.json"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let row = json["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["kind"] == "task")
+        .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
+        .find(|r| r["id"] == "s1")
+        .expect("s1 row");
+    assert!(
+        row.get("tokensFinal").is_none(),
+        "no flow records -> no backfill"
+    );
+}
+
+/// (#1488 follow-up — mission-graph phantom-tokens fix) The review
+/// pipeline's step ids ("review-verify-step", "review-judge-step", …)
+/// are literal constants reused by EVERY review mission instance, and
+/// the backfill's day-file window has no upper bound — so a flow
+/// record that genuinely correlates to this step's id can belong to a
+/// DIFFERENT, earlier mission's real dispatch on the same-named step.
+/// A step that has NOT started (`started_ts: None`, status planned)
+/// must render NO token count even when such a record is present —
+/// confirmed live against review-1e47c34023, whose planned verify step
+/// read a phantom 46832 tokens folded from an unrelated same-day
+/// mission's real verify run.
+#[tokio::test]
+#[serial_test::serial]
+async fn mission_graph_json_planned_step_shows_no_phantom_tokens_from_collided_record() {
+    use darkmux_crew::types::{NodeStatus, Step, Task};
+    let _guard = CrewDirGuard::new();
+    let mission_id = "phantom-tokens-mission";
+    let phase_id = "p1";
+    save_test_mission(&minimal_mission(mission_id, vec![phase_id.to_string()]));
+    save_test_phase(&minimal_phase(phase_id, mission_id));
+
+    let task = Task {
+        repo_root: None,
+        branch: None,
+        run_on: darkmux_crew::types::default_run_on(),
+        id: "verify-task".to_string(),
+        phase_id: phase_id.to_string(),
+        description: "verify-task".to_string(),
+        display_name: None,
+        step_ids: vec!["review-verify-step".to_string()],
+        depends_on: Vec::new(),
+        reads: Vec::new(),
+        role_id: None,
+        profile_name: None,
+        workdir: None,
+        image: None,
+    };
+    darkmux_crew::lifecycle::save_task(mission_id, &task).unwrap();
+    // The step exists on disk (already scheduled) but has NOT started:
+    // no started_ts, status Planned — exactly the graph shape a
+    // dispatch.map verify seat has before its own dispatch begins.
+    darkmux_crew::lifecycle::save_step(
+        mission_id,
+        phase_id,
+        &Step {
+            id: "review-verify-step".to_string(),
+            task_id: "verify-task".to_string(),
+            gate: None,
+            kind: "dispatch.map".to_string(),
+            status: NodeStatus::Planned,
             config: serde_json::Value::Null,
             started_ts: None,
             completed_ts: None,
             output: None,
             stop_reason: None,
-        };
-        darkmux_crew::lifecycle::save_step(mission_id, "p1", &collect_step).unwrap();
+        },
+    )
+    .unwrap();
 
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/mission/{mission_id}/graph.json"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // A flow record that DOES correlate to "review-verify-step" by
+    // session id — simulating an unrelated, earlier mission's real,
+    // completed verify dispatch that happens to share this mission
+    // template's literal step id (the confirmed collision mechanism).
+    let flows = TempDir::new().unwrap();
+    let rec = serde_json::json!({
+        "action": "dispatch.complete",
+        "session_id": "step-review-verify-step",
+        "payload": { "total_tokens": 46_832, "total_turns": 5 }
+    });
+    let today = crate::mission_graph::epoch_days_to_stem((now_unix() / 86400) as i64);
+    std::fs::write(
+        flows.path().join(format!("{today}.jsonl")),
+        format!("{}\n", serde_json::to_string(&rec).unwrap()),
+    )
+    .unwrap();
 
-        let nodes = json["nodes"].as_array().unwrap();
-        let task_node = nodes
-            .iter()
-            .find(|n| n["id"] == "unit-0")
-            .unwrap_or_else(|| panic!("missing task node unit-0: {nodes:?}"));
-        assert_eq!(
-            task_node["status"], "waiting",
-            "admitted-but-not-dispatched must read `waiting`, not `running`: {task_node:?}"
-        );
+    let app = build_router_local(flows.path().to_path_buf());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/mission/{mission_id}/graph.json"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let row = json["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["kind"] == "task")
+        .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
+        .find(|r| r["id"] == "review-verify-step")
+        .expect("review-verify-step row");
+    assert_eq!(row["status"], "planned");
+    assert!(
+        row["startedTs"].is_null(),
+        "planned step must have no startedTs"
+    );
+    assert!(
+        row.get("tokensFinal").is_none(),
+        "a planned step must show no tokens even when a same-named record exists: {row:?}"
+    );
+    assert!(row.get("turnsFinal").is_none());
+}
 
-        let phase_node = nodes
-            .iter()
-            .find(|n| n["id"] == "p1")
-            .unwrap_or_else(|| panic!("missing phase node p1: {nodes:?}"));
-        assert_eq!(
-            phase_node["status"], "waiting",
-            "the phase's ONLY task is waiting, nothing is genuinely running — the phase must not \
-             launder back to `running` on the persisted-status tie (#2343): {phase_node:?}"
-        );
+/// (#1914) The fleet-snapshot handoff a spawned `run-list` panel child
+/// reads INSTEAD of its own Redis round trip (`write_fleet_snapshot_file`
+/// / `read_fleet_snapshot_file` / `fleet_records_for_runs`'s env-var
+/// override). A subprocess cannot reach `fleet_flow_records()`'s
+/// in-process 2s cache no matter how warm it is — this is the plumbing
+/// that lets it free-ride the daemon's own already-paid read instead.
+mod fleet_snapshot_handoff {
+    use super::*;
+    use serial_test::serial;
+    use std::io::Write;
+
+    fn sample_records() -> Vec<serde_json::Value> {
+        vec![serde_json::json!({
+            "ts": "2026-08-20T00:00:00Z",
+            "action": "dispatch.turn",
+            "session_id": "snapshot-handoff-selftest-s1",
+        })]
     }
 
-    /// (review-gate MF2a) The three production graph runners persist Step
-    /// JSONs only AFTER `run_step_graph` returns — so a page opened DURING
-    /// a run sees tasks whose `step_ids` name steps with no file on disk.
-    /// The builder must synthesize `planned` step ROWS for those ids
-    /// (#1401 — otherwise the SSE layer has nothing to flip when the
-    /// scheduler's `step start` records arrive). This fixture is exactly
-    /// that mid-run shape: tasks persisted with `step_ids` + `depends_on`,
-    /// ZERO step files, and NO config-snapshot.json (a hand-built test
-    /// fixture, not a config-launched mission) — so the kind-recovery path
-    /// (#1402) has nothing to recover from, and the row's label falls back
-    /// to the step id itself (the fallback chain's SECOND-to-last rung,
-    /// not the deep "unknown" — see `resolve_step_label`'s doc).
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn mission_graph_json_synthesizes_planned_steps_for_unpersisted_step_files() {
-        let _guard = CrewDirGuard::new();
-        let mission_id = "midrun-mission";
-        save_test_mission(&minimal_mission(mission_id, vec!["p1".to_string()]));
-        save_test_phase(&minimal_phase("p1", mission_id));
-
-        let task_a = darkmux_crew::types::Task {
-            repo_root: None,
-            branch: None,
-            run_on: darkmux_crew::types::default_run_on(),
-            id: "task-a".to_string(),
-            phase_id: "p1".to_string(),
-            description: "task a".to_string(),
-            display_name: None,
-            step_ids: vec!["task-a-step".to_string()],
-            depends_on: vec![],
-            reads: Vec::new(),
-            role_id: None,
-            profile_name: None,
-            workdir: None,
-            image: None,
-        };
-        let task_b = darkmux_crew::types::Task {
-            repo_root: None,
-            branch: None,
-            run_on: darkmux_crew::types::default_run_on(),
-            id: "task-b".to_string(),
-            phase_id: "p1".to_string(),
-            description: "task b".to_string(),
-            display_name: None,
-            // Two steps — both must synthesize a row, in order.
-            step_ids: vec!["task-b-step-1".to_string(), "task-b-step-2".to_string()],
-            depends_on: vec!["task-a".to_string()],
-            reads: Vec::new(),
-            role_id: None,
-            profile_name: None,
-            workdir: None,
-            image: None,
-        };
-        for t in [&task_a, &task_b] {
-            darkmux_crew::lifecycle::save_task(mission_id, t).unwrap();
-        }
-        // Deliberately NO save_step calls — the mid-run disk state.
-
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/mission/{mission_id}/graph.json"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["legacy"], false);
-
-        let nodes = json["nodes"].as_array().unwrap();
-        // (#1401) 1 phase + 2 tasks — NO separate step nodes, synthesized
-        // or otherwise.
-        assert_eq!(nodes.len(), 3, "{nodes:?}");
-        let node = |id: &str| {
-            nodes
-                .iter()
-                .find(|n| n["id"] == id)
-                .unwrap_or_else(|| panic!("missing node {id}: {nodes:?}"))
-        };
-        assert_eq!(node("task-a")["status"], "planned");
-        assert_eq!(node("task-b")["status"], "planned");
-
-        let task_a_steps = node("task-a")["steps"].as_array().unwrap();
-        assert_eq!(task_a_steps.len(), 1);
-        assert_eq!(task_a_steps[0]["id"], "task-a-step");
-        assert_eq!(task_a_steps[0]["status"], "planned", "synthesized step must be planned: {task_a_steps:?}");
-        assert_eq!(
-            task_a_steps[0]["label"], "task-a-step",
-            "no config-snapshot to recover a kind from -> label falls back to the step id \
-             itself, not the deep 'unknown' (#1402): {task_a_steps:?}"
-        );
-
-        let task_b_steps = node("task-b")["steps"].as_array().unwrap();
-        assert_eq!(task_b_steps.len(), 2, "both synthesized rows present, in step_ids order");
-        assert_eq!(task_b_steps[0]["id"], "task-b-step-1");
-        assert_eq!(task_b_steps[1]["id"], "task-b-step-2");
-        for row in task_b_steps {
-            assert_eq!(row["status"], "planned");
-        }
-
-        // Every dependency edge's BOTH endpoints exist as (task) nodes.
-        let node_ids: std::collections::BTreeSet<&str> =
-            nodes.iter().filter_map(|n| n["id"].as_str()).collect();
-        let edges = json["edges"].as_array().unwrap();
-        for e in edges {
-            for end in ["source", "target"] {
-                let id = e[end].as_str().unwrap();
-                assert!(node_ids.contains(id), "edge {e} references missing node {id}");
-            }
-        }
-        // Cross-task dep edge connects the TASKS directly (#1401) — no
-        // step-level detour, synthesized or otherwise.
-        assert!(edges
-            .iter()
-            .any(|e| e["source"] == "task-a" && e["target"] == "task-b" && e["kind"] == "depends_on"));
-    }
-
-    /// Slice out just the `STATUS_ACTIONS` map body from `graph.ts`'s source
-    /// (#1868 QA finding). The step-lifecycle actions this map holds ALSO
-    /// appear, independently, in this same file's `applyRecordToMetrics`
-    /// (`isStart`/`isTerminal`) — so a whole-file `contains()` scan can't
-    /// actually prove the STATUS_ACTIONS entry exists; deleting the map's own
-    /// step lines while leaving the metrics checks intact still passes.
-    /// Scoping the scan to the map's own body (up to its closing `]);`)
-    /// closes that gap; the `expect` turns "someone renamed/restructured the
-    /// map" into a loud failure instead of a silently-vacuous pass.
-    fn graph_ts_status_actions_map() -> &'static str {
-        let graph_ts = include_str!("../../../ui/src/lenses/mission/graph.ts");
-        let (_, after) = graph_ts
-            .split_once("const STATUS_ACTIONS")
-            .expect("STATUS_ACTIONS map not found in ui/src/lenses/mission/graph.ts — the pin lost its subject");
-        let (body, _) = after
-            .split_once("]);")
-            .expect("STATUS_ACTIONS map has no closing `]);` in ui/src/lenses/mission/graph.ts: the pin lost its subject");
-        body
-    }
-
-    /// How the viewer names `action` in code: `ACTION.<Variant>`, the
-    /// `ui/src/lib/ingest.ts` constant spelled with the Rust variant's own
-    /// name, so a Rust rename breaks the pin rather than drifting past it.
-    fn ts_action_key(action: &darkmux_flow::FlowAction) -> String {
-        let wire = action.as_str();
-        let k = darkmux_flow::FlowAction::KNOWN_WIRE
-            .iter()
-            .position(|w| *w == wire)
-            .unwrap_or_else(|| panic!("`{wire}` is not a current FlowAction"));
-        format!("ACTION.{}", darkmux_flow::FlowAction::VARIANT_NAMES[k])
-    }
-
-    /// (review-gate C2) Pin the SSE action contract: the lens's
-    /// STATUS_ACTIONS map must hold every action the emitting side actually
-    /// writes (`scheduler::step_lifecycle_record`'s step start/complete/
-    /// error; `lifecycle::emit_phase_transition_record`'s phase start/
-    /// complete/abandon; the mission transition verbs). A rename on either
-    /// side must fail a test, not silently kill the live animation. The emit
-    /// side is pinned by darkmux-crew's own
-    /// `run_step_graph_emits_step_start_and_step_complete_records`; this
-    /// pins the lens side against the same `FlowAction` variants.
-    ///
-    /// Retargeted at `ui/src/lenses/mission/graph.ts`'s own `STATUS_ACTIONS`
-    /// map (#1868) — the standalone `mission-graph.html` page this test
-    /// used to scan is retired; the map itself moved verbatim into the
-    /// React port. `include_str!` reaches outside this crate into `ui/` on
-    /// purpose (test-only, `#[cfg(test)]`-gated via this module's own
-    /// `#[path]` attribute, so it never ships in the release binary) —
-    /// there is no Rust-side binding to pin against on the TS side of this
-    /// contract, so a text scan is the only mechanical tie available. Scans
-    /// [`graph_ts_status_actions_map`]'s SLICE, not the whole file — see
-    /// that helper's own doc for why the whole-file scan this test used to
-    /// run was provably vacuous for the three step-lifecycle literals.
+    /// Round-trip proof for every `SourceState` `fleet_flow_records`
+    /// ever actually constructs: what `write_fleet_snapshot_file`
+    /// writes, `read_fleet_snapshot_file` must read back identically —
+    /// same records, same state (age included for `Stale`). If this
+    /// drifts, a panel spawned while the daemon's OWN last read was
+    /// degraded would silently start reporting a healthier state than
+    /// the truth (or vice versa).
     #[test]
-    fn mission_graph_lens_pins_flow_action_strings() {
-        use darkmux_flow::FlowAction;
-        let map = graph_ts_status_actions_map();
-        for action in [
-            FlowAction::StepStart,
-            FlowAction::StepComplete,
-            FlowAction::StepError,
-            FlowAction::PhaseStart,
-            FlowAction::PhaseComplete,
-            FlowAction::PhaseAbandon,
-            FlowAction::MissionStart,
-            FlowAction::MissionClose,
-        ] {
-            let key = ts_action_key(&action);
-            assert!(
-                map.contains(&format!("[{key},")),
-                "ui/src/lenses/mission/graph.ts lost the {key} entry from its \
-                 STATUS_ACTIONS map: the SSE delta layer silently stops animating that transition"
+    fn snapshot_round_trips_every_source_state() {
+        let cases = vec![
+            FleetRead {
+                records: sample_records().into(),
+                state: source_state::SourceState::Ok,
+            },
+            FleetRead {
+                records: FleetRecords::default(),
+                state: source_state::SourceState::Off,
+            },
+            FleetRead {
+                records: sample_records().into(),
+                state: source_state::SourceState::Stale {
+                    age_ms: 4200,
+                    detail: FLEET_READ_ERROR_DETAIL,
+                },
+            },
+            FleetRead {
+                records: FleetRecords::default(),
+                state: source_state::SourceState::Unavailable {
+                    detail: FLEET_READ_ERROR_DETAIL,
+                },
+            },
+        ];
+        for read in cases {
+            let file = write_fleet_snapshot_file(&read).expect("write snapshot");
+            let back = read_fleet_snapshot_file(file.path()).expect("read snapshot back");
+            assert_eq!(
+                back.records, read.records,
+                "records must round-trip for state {:?}",
+                read.state
             );
+            assert_eq!(back.state, read.state, "state must round-trip exactly");
         }
     }
 
-    /// (F3, #1397/#1399 gate remediation) The MECHANICAL tie between the
-    /// emit-side vocabulary constant and the lens-side consumer: iterates
-    /// `darkmux_crew::scheduler::STEP_LIFECYCLE_ACTIONS` itself (not a
-    /// re-typed list) and asserts each action appears in the lens's own
-    /// map. The test above pins the lens against a hand-written variant list
-    /// (covering the phase/mission verbs too, which have no shared Rust
-    /// constant yet);
-    /// this one guarantees that if the SCHEDULER's canonical step vocabulary
-    /// ever changes, this crate fails to build/pass until the lens's
-    /// STATUS_ACTIONS map catches up — the two hand-maintained lists (Rust
-    /// constant, TS map) can no longer drift silently.
-    ///
-    /// Retargeted at `ui/src/lenses/mission/graph.ts` (#1868) — same
-    /// retirement as the test above. Scans
-    /// [`graph_ts_status_actions_map`]'s SLICE, not the whole file — see
-    /// that helper's own doc; the naive whole-file scan cannot fail for any
-    /// of these three actions, because the same three also appear,
-    /// independently, in this file's `applyRecordToMetrics`.
+    /// A missing file is a plumbing failure, not a data answer — the
+    /// reader must say "I couldn't read this" (`None`), never fabricate
+    /// an `Off` or an empty `Ok`.
     #[test]
-    fn mission_graph_lens_contains_every_scheduler_step_lifecycle_action() {
-        let map = graph_ts_status_actions_map();
-        for action in darkmux_crew::scheduler::STEP_LIFECYCLE_ACTIONS {
-            let key = ts_action_key(&action);
-            assert!(
-                map.contains(&format!("[{key},")),
-                "ui/src/lenses/mission/graph.ts's STATUS_ACTIONS map is missing scheduler \
-                 STEP_LIFECYCLE_ACTIONS entry {key}: the graph lens would silently \
-                 stop animating that step transition"
-            );
-        }
-    }
-
-    /// (item 7, #1512; #2310 P4d) Shape test against a REAL
-    /// review-config-interpreted graph: loads the embedded `review` mission
-    /// config and interprets it, persists the resulting
-    /// Mission/Phase/Task/Step graph, and asserts the graph.json node counts
-    /// match `review.json`'s own declared shape. Post-P4d that shape is the
-    /// crawl-blocks one: 5 phase nodes (plan, review, summarize, create-mods,
-    /// deliver) and the tasks the DOCUMENT declares statically — seven
-    /// `plan.sites` tasks, the summary task, and the deliver task. The
-    /// `review` phase's `unit-<rule>` tasks and `create-mods`' `create-mod`
-    /// are GROWN/pruned at run time from a plan step's output, so `interpret`
-    /// alone never mints them; that is what makes 9 tasks the honest number
-    /// here, not a regression.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn mission_graph_json_review_config_interpreted_shape() {
-        let _guard = CrewDirGuard::new();
-        let loaded = darkmux_crew::mission_config::load("review").expect("embedded review config loads");
-
-        // `interpret` needs nothing beyond the document itself: every task
-        // it mints here is statically declared (the grown `unit-<rule>`
-        // tasks come later, from a plan step's real output).
-        let params = darkmux_crew::mission_config::LaunchParams {
-            phase_ids: std::collections::BTreeMap::new(),
-            task_overrides: std::collections::BTreeMap::new(),
-            step_config_overrides: std::collections::BTreeMap::new(),
-            input_values: std::collections::BTreeMap::new(),
-        };
-        let (tasks, steps, _warnings) = darkmux_crew::mission_config::interpret(&loaded.config, &params)
-            .expect("interpret succeeds against the embedded review config");
-
-        let mission_id = "review-shape-mission";
-        let phase_ids: Vec<String> = loaded.config.phases.iter().map(|p| p.id.clone()).collect();
-        save_test_mission(&minimal_mission(mission_id, phase_ids.clone()));
-        for phase_id in &phase_ids {
-            save_test_phase(&minimal_phase(phase_id, mission_id));
-        }
-        for task in &tasks {
-            darkmux_crew::lifecycle::save_task(mission_id, task).unwrap();
-        }
-        for step in steps.values() {
-            darkmux_crew::lifecycle::save_step(mission_id, &tasks.iter().find(|t| t.id == step.task_id).unwrap().phase_id, step).unwrap();
-        }
-
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/mission/{mission_id}/graph.json"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["legacy"], false);
-
-        let nodes = json["nodes"].as_array().unwrap();
-        let count_kind = |kind: &str| nodes.iter().filter(|n| n["kind"] == kind).count();
-        assert_eq!(count_kind("phase"), 5, "plan/review/summarize/create-mods/deliver: {nodes:?}");
-        // Seven `plan.sites` tasks (one per rule the document declares) +
-        // the summary task + the deliver task.
-        assert_eq!(
-            count_kind("task"),
-            9,
-            "expected 7 plan tasks + summary + deliver: {nodes:?}"
+    fn missing_snapshot_file_reads_as_none() {
+        let path = std::path::Path::new(
+            "/nonexistent/darkmux-fleet-snapshot-handoff-selftest-missing.json",
         );
-        // (#1401) No separate "step" node kind anymore — every task's
-        // steps render as rows on ITS OWN node instead.
-        assert_eq!(count_kind("step"), 0, "steps are rows now, not nodes (#1401): {nodes:?}");
-        let total_step_rows: usize = nodes
-            .iter()
-            .filter(|n| n["kind"] == "task")
-            .map(|n| n["steps"].as_array().map(|a| a.len()).unwrap_or(0))
-            .sum();
-        // The deliver task carries TWO rows (`records.gather` then
-        // `deliver.github_review`); every other task here carries ONE.
-        // 9 tasks: 7×plan(1) + summary(1) + deliver(2) = 10 step rows.
-        assert_eq!(
-            total_step_rows,
-            10,
-            "plan + summary carry one row each, deliver carries two: {nodes:?}"
-        );
-        assert_eq!(tasks.len(), 9);
-        assert_eq!(steps.len(), 10);
+        assert!(read_fleet_snapshot_file(path).is_none());
+    }
 
-        // (#1402) Every row's label resolves through the real StepKind
-        // display-name fallback chain. This crate sees the Tier-1 builtins
-        // plus its own `mission.*` table; the launch-owned crawl-family
-        // kinds are registered by the LAUNCHER, not here, so their rows fall
-        // back to the raw kind id — which is the honest label a daemon that
-        // cannot construct the kind can offer (#2310 P4d retired the
-        // `review.*` lookup that used to reach into `darkmux-lab`).
-        let all_labels: Vec<String> = nodes
-            .iter()
-            .filter(|n| n["kind"] == "task")
-            .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
-            .filter_map(|row| row["label"].as_str().map(String::from))
-            .collect();
-        for expected in ["plan.sites", "dispatch.summary", "records.gather", "deliver.github_review"] {
-            assert!(
-                all_labels.iter().any(|l| l == expected),
-                "expected a \"{expected}\" row label among {all_labels:?}"
-            );
+    /// Malformed JSON: same contract — `None`, never a panic and never
+    /// a fabricated state.
+    #[test]
+    fn malformed_snapshot_file_reads_as_none() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"not json").unwrap();
+        assert!(read_fleet_snapshot_file(file.path()).is_none());
+    }
+
+    /// An unrecognized `kind` (a snapshot a FUTURE binary wrote, with a
+    /// state this one doesn't know about) must also fall back to
+    /// `None` rather than silently mapping onto the wrong
+    /// `SourceState` — lenient-on-read never means "guess".
+    #[test]
+    fn unknown_kind_reads_as_none() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(br#"{"kind":"from-the-future","age_ms":null,"records":[]}"#)
+            .unwrap();
+        assert!(read_fleet_snapshot_file(file.path()).is_none());
+    }
+
+    /// The end-to-end contract `fleet_records_for_runs` promises the
+    /// CLI: when the env var points at a valid snapshot, the live
+    /// Redis path is never taken. Proven with a records payload that
+    /// could NOT have come from the live path — `DARKMUX_REDIS_URL` is
+    /// unset and this crate's test build resolves an empty config tier
+    /// (see the crate's `Cargo.toml` dev-dependency comment on
+    /// `test-support`), so the live path always degrades to `Off` with
+    /// no records; seeing `Ok` with the planted record is only
+    /// possible via the snapshot.
+    #[test]
+    #[serial]
+    fn fleet_records_for_runs_prefers_a_valid_snapshot_over_a_live_read() {
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
         }
-    }
-
-    /// (#1432 item 4) graph.json backfills a COMPLETED step's finalized
-    /// token/turn totals from the daemon's flow records at page load — so a
-    /// page opened after the dispatch ran shows the real total, not the idle
-    /// "· tok" placeholder (the SSE stream being tail-from-now). A step with
-    /// NO folded record stays absent (honest "no data", never a wrong zero).
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn mission_graph_json_backfills_completed_step_totals_from_flow_records() {
-        use darkmux_crew::types::{NodeStatus, Step, Task};
-        let _guard = CrewDirGuard::new();
-        let mission_id = "backfill-mission";
-        let phase_id = "p1";
-        save_test_mission(&minimal_mission(mission_id, vec![phase_id.to_string()]));
-        save_test_phase(&minimal_phase(phase_id, mission_id));
-
-        // Two steps: one that ran (has a flow record), one that never did.
-        let mk_task = |id: &str, step: &str| Task {
-            repo_root: None,
-            branch: None,
-            run_on: darkmux_crew::types::default_run_on(),
-            id: id.to_string(),
-            phase_id: phase_id.to_string(),
-            description: format!("task {id}"),
-            display_name: None,
-            step_ids: vec![step.to_string()],
-            depends_on: Vec::new(),
-            reads: Vec::new(),
-            role_id: None,
-            profile_name: None,
-            workdir: None,
-            image: None,
+        let planted = FleetRead {
+            records: sample_records().into(),
+            state: source_state::SourceState::Ok,
         };
-        let mk_step = |id: &str, status: NodeStatus| Step {
-            id: id.to_string(),
-            task_id: format!("{id}-task"),
-            gate: None,
-            kind: "dispatch.internal".to_string(),
-            status,
-            config: serde_json::Value::Null,
-            started_ts: Some(now_unix()),
-            completed_ts: if status == NodeStatus::Complete { Some(now_unix()) } else { None },
-            output: None,
-            stop_reason: None,
-        };
-        darkmux_crew::lifecycle::save_task(mission_id, &mk_task("ran-task", "ran-step")).unwrap();
-        darkmux_crew::lifecycle::save_task(mission_id, &mk_task("idle-task", "idle-step")).unwrap();
-        darkmux_crew::lifecycle::save_step(mission_id, phase_id, &mk_step("ran-step", NodeStatus::Complete)).unwrap();
-        darkmux_crew::lifecycle::save_step(mission_id, phase_id, &mk_step("idle-step", NodeStatus::Planned)).unwrap();
-
-        // A flows_dir carrying a dispatch-complete record for the ran step
-        // only. Named for TODAY's day stem (#1445 gate): the backfill scans
-        // only day files inside the mission's lifetime window, and this
-        // mission was just minted with created_ts = now — a hardcoded date
-        // would silently fall out of the window when run later.
-        let flows = TempDir::new().unwrap();
-        let complete = serde_json::json!({
-            "action": "dispatch.complete",
-            "session_id": format!("{mission_id}.step.ran-step"),
-            "payload": { "total_tokens": 99999, "total_turns": 7 }
-        });
-        // The step's tokens are its usage records' sum: the terminal's own
-        // `total_tokens` (99999) is never read.
-        let usage = serde_json::json!({
-            "action": "telemetry.tokens", "category": "telemetry", "source": "tokens",
-            "session_id": format!("{mission_id}.step.ran-step"),
-            "payload": { "call_kind": "turn", "token_source": "provider", "total_tokens": 12345 }
-        });
-        let today = crate::mission_graph::epoch_days_to_stem((now_unix() / 86400) as i64);
-        std::fs::write(
-            flows.path().join(format!("{today}.jsonl")),
-            format!("{}\n{}\n", serde_json::to_string(&complete).unwrap(), serde_json::to_string(&usage).unwrap()),
-        )
-        .unwrap();
-
-        let app = build_router_local(flows.path().to_path_buf());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/mission/{mission_id}/graph.json"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let rows: Vec<serde_json::Value> = json["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|n| n["kind"] == "task")
-            .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
-            .collect();
-        let ran = rows.iter().find(|r| r["id"] == "ran-step").expect("ran-step row");
-        assert_eq!(ran["tokensFinal"], 12345, "completed step backfilled from flow records");
-        assert_eq!(ran["turnsFinal"], 7);
-        let idle = rows.iter().find(|r| r["id"] == "idle-step").expect("idle-step row");
-        assert!(idle.get("tokensFinal").is_none(), "never-ran step has no backfill (honest absent)");
-        assert!(idle.get("turnsFinal").is_none());
-    }
-
-    /// (#1432 item 4) A mixed-era mission (steps ran, but the daemon has NO
-    /// flow files on disk — e.g. rotated away, or a fresh checkout) backfills
-    /// nothing rather than erroring or inventing zeros. Same code path, empty
-    /// flows_dir.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn mission_graph_json_backfill_absent_when_no_flow_records() {
-        use darkmux_crew::types::{NodeStatus, Step, Task};
-        let _guard = CrewDirGuard::new();
-        let mission_id = "no-records-mission";
-        let phase_id = "p1";
-        save_test_mission(&minimal_mission(mission_id, vec![phase_id.to_string()]));
-        save_test_phase(&minimal_phase(phase_id, mission_id));
-        let task = Task {
-            repo_root: None,
-            branch: None,
-            run_on: darkmux_crew::types::default_run_on(),
-            id: "t1".to_string(),
-            phase_id: phase_id.to_string(),
-            description: "t1".to_string(),
-            display_name: None,
-            step_ids: vec!["s1".to_string()],
-            depends_on: Vec::new(),
-            reads: Vec::new(),
-            role_id: None,
-            profile_name: None,
-            workdir: None,
-            image: None,
-        };
-        darkmux_crew::lifecycle::save_task(mission_id, &task).unwrap();
-        darkmux_crew::lifecycle::save_step(
-            mission_id,
-            phase_id,
-            &Step {
-                id: "s1".to_string(),
-                task_id: "t1".to_string(),
-                gate: None,
-                kind: "dispatch.internal".to_string(),
-                status: NodeStatus::Complete,
-                config: serde_json::Value::Null,
-                started_ts: Some(now_unix()),
-                completed_ts: Some(now_unix()),
-                output: None,
-                stop_reason: None,
-            },
-        )
-        .unwrap();
-
-        // Empty flows_dir (like the test router's own PathBuf::new()).
-        let empty = TempDir::new().unwrap();
-        let app = build_router_local(empty.path().to_path_buf());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/mission/{mission_id}/graph.json"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let row = json["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|n| n["kind"] == "task")
-            .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
-            .find(|r| r["id"] == "s1")
-            .expect("s1 row");
-        assert!(row.get("tokensFinal").is_none(), "no flow records -> no backfill");
-    }
-
-    /// (#1488 follow-up — mission-graph phantom-tokens fix) The review
-    /// pipeline's step ids ("review-verify-step", "review-judge-step", …)
-    /// are literal constants reused by EVERY review mission instance, and
-    /// the backfill's day-file window has no upper bound — so a flow
-    /// record that genuinely correlates to this step's id can belong to a
-    /// DIFFERENT, earlier mission's real dispatch on the same-named step.
-    /// A step that has NOT started (`started_ts: None`, status planned)
-    /// must render NO token count even when such a record is present —
-    /// confirmed live against review-1e47c34023, whose planned verify step
-    /// read a phantom 46832 tokens folded from an unrelated same-day
-    /// mission's real verify run.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn mission_graph_json_planned_step_shows_no_phantom_tokens_from_collided_record() {
-        use darkmux_crew::types::{NodeStatus, Step, Task};
-        let _guard = CrewDirGuard::new();
-        let mission_id = "phantom-tokens-mission";
-        let phase_id = "p1";
-        save_test_mission(&minimal_mission(mission_id, vec![phase_id.to_string()]));
-        save_test_phase(&minimal_phase(phase_id, mission_id));
-
-        let task = Task {
-            repo_root: None,
-            branch: None,
-            run_on: darkmux_crew::types::default_run_on(),
-            id: "verify-task".to_string(),
-            phase_id: phase_id.to_string(),
-            description: "verify-task".to_string(),
-            display_name: None,
-            step_ids: vec!["review-verify-step".to_string()],
-            depends_on: Vec::new(),
-            reads: Vec::new(),
-            role_id: None,
-            profile_name: None,
-            workdir: None,
-            image: None,
-        };
-        darkmux_crew::lifecycle::save_task(mission_id, &task).unwrap();
-        // The step exists on disk (already scheduled) but has NOT started:
-        // no started_ts, status Planned — exactly the graph shape a
-        // dispatch.map verify seat has before its own dispatch begins.
-        darkmux_crew::lifecycle::save_step(
-            mission_id,
-            phase_id,
-            &Step {
-                id: "review-verify-step".to_string(),
-                task_id: "verify-task".to_string(),
-                gate: None,
-                kind: "dispatch.map".to_string(),
-                status: NodeStatus::Planned,
-                config: serde_json::Value::Null,
-                started_ts: None,
-                completed_ts: None,
-                output: None,
-                stop_reason: None,
-            },
-        )
-        .unwrap();
-
-        // A flow record that DOES correlate to "review-verify-step" by
-        // session id — simulating an unrelated, earlier mission's real,
-        // completed verify dispatch that happens to share this mission
-        // template's literal step id (the confirmed collision mechanism).
-        let flows = TempDir::new().unwrap();
-        let rec = serde_json::json!({
-            "action": "dispatch.complete",
-            "session_id": "step-review-verify-step",
-            "payload": { "total_tokens": 46_832, "total_turns": 5 }
-        });
-        let today = crate::mission_graph::epoch_days_to_stem((now_unix() / 86400) as i64);
-        std::fs::write(
-            flows.path().join(format!("{today}.jsonl")),
-            format!("{}\n", serde_json::to_string(&rec).unwrap()),
-        )
-        .unwrap();
-
-        let app = build_router_local(flows.path().to_path_buf());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/mission/{mission_id}/graph.json"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let row = json["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|n| n["kind"] == "task")
-            .flat_map(|n| n["steps"].as_array().cloned().unwrap_or_default())
-            .find(|r| r["id"] == "review-verify-step")
-            .expect("review-verify-step row");
-        assert_eq!(row["status"], "planned");
-        assert!(row["startedTs"].is_null(), "planned step must have no startedTs");
-        assert!(
-            row.get("tokensFinal").is_none(),
-            "a planned step must show no tokens even when a same-named record exists: {row:?}"
-        );
-        assert!(row.get("turnsFinal").is_none());
-    }
-
-    /// (#1914) The fleet-snapshot handoff a spawned `run-list` panel child
-    /// reads INSTEAD of its own Redis round trip (`write_fleet_snapshot_file`
-    /// / `read_fleet_snapshot_file` / `fleet_records_for_runs`'s env-var
-    /// override). A subprocess cannot reach `fleet_flow_records()`'s
-    /// in-process 2s cache no matter how warm it is — this is the plumbing
-    /// that lets it free-ride the daemon's own already-paid read instead.
-    mod fleet_snapshot_handoff {
-        use super::*;
-        use serial_test::serial;
-        use std::io::Write;
-
-        fn sample_records() -> Vec<serde_json::Value> {
-            vec![serde_json::json!({
-                "ts": "2026-08-20T00:00:00Z",
-                "action": "dispatch.turn",
-                "session_id": "snapshot-handoff-selftest-s1",
-            })]
+        let file = write_fleet_snapshot_file(&planted).expect("write snapshot");
+        unsafe {
+            std::env::set_var(FLEET_SNAPSHOT_ENV_VAR, file.path());
         }
 
-        /// Round-trip proof for every `SourceState` `fleet_flow_records`
-        /// ever actually constructs: what `write_fleet_snapshot_file`
-        /// writes, `read_fleet_snapshot_file` must read back identically —
-        /// same records, same state (age included for `Stale`). If this
-        /// drifts, a panel spawned while the daemon's OWN last read was
-        /// degraded would silently start reporting a healthier state than
-        /// the truth (or vice versa).
-        #[test]
-        fn snapshot_round_trips_every_source_state() {
-            let cases = vec![
-                FleetRead { records: sample_records().into(), state: source_state::SourceState::Ok },
-                FleetRead { records: FleetRecords::default(), state: source_state::SourceState::Off },
-                FleetRead {
-                    records: sample_records().into(),
-                    state: source_state::SourceState::Stale {
-                        age_ms: 4200,
-                        detail: FLEET_READ_ERROR_DETAIL,
-                    },
-                },
-                FleetRead {
-                    records: FleetRecords::default(),
-                    state: source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL },
-                },
-            ];
-            for read in cases {
-                let file = write_fleet_snapshot_file(&read).expect("write snapshot");
-                let back = read_fleet_snapshot_file(file.path()).expect("read snapshot back");
-                assert_eq!(
-                    back.records, read.records,
-                    "records must round-trip for state {:?}",
-                    read.state
-                );
-                assert_eq!(back.state, read.state, "state must round-trip exactly");
-            }
+        let read = fleet_records_for_runs();
+
+        unsafe {
+            std::env::remove_var(FLEET_SNAPSHOT_ENV_VAR);
         }
 
-        /// A missing file is a plumbing failure, not a data answer — the
-        /// reader must say "I couldn't read this" (`None`), never fabricate
-        /// an `Off` or an empty `Ok`.
-        #[test]
-        fn missing_snapshot_file_reads_as_none() {
-            let path = std::path::Path::new(
+        assert_eq!(read.state, source_state::SourceState::Ok);
+        assert_eq!(read.records, planted.records);
+    }
+
+    /// The fallback guard: the env var IS set, but the file it names
+    /// is gone (a stale or already-cleaned-up handoff). The CLI must
+    /// fall back to the normal live path — never fail the invocation,
+    /// and never silently claim `Ok` over nothing. With
+    /// `DARKMUX_REDIS_URL` unset, the live path's own honest answer is
+    /// `Off`/empty; seeing exactly that (not an error, not the
+    /// planted-elsewhere data) is the proof the fallback engaged.
+    #[test]
+    #[serial]
+    fn fleet_records_for_runs_falls_back_when_the_snapshot_file_is_missing() {
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+        }
+        unsafe {
+            std::env::set_var(
+                FLEET_SNAPSHOT_ENV_VAR,
                 "/nonexistent/darkmux-fleet-snapshot-handoff-selftest-missing.json",
             );
-            assert!(read_fleet_snapshot_file(path).is_none());
         }
 
-        /// Malformed JSON: same contract — `None`, never a panic and never
-        /// a fabricated state.
-        #[test]
-        fn malformed_snapshot_file_reads_as_none() {
-            let mut file = tempfile::NamedTempFile::new().unwrap();
-            file.write_all(b"not json").unwrap();
-            assert!(read_fleet_snapshot_file(file.path()).is_none());
+        let read = fleet_records_for_runs();
+
+        unsafe {
+            std::env::remove_var(FLEET_SNAPSHOT_ENV_VAR);
         }
 
-        /// An unrecognized `kind` (a snapshot a FUTURE binary wrote, with a
-        /// state this one doesn't know about) must also fall back to
-        /// `None` rather than silently mapping onto the wrong
-        /// `SourceState` — lenient-on-read never means "guess".
-        #[test]
-        fn unknown_kind_reads_as_none() {
-            let mut file = tempfile::NamedTempFile::new().unwrap();
-            file.write_all(br#"{"kind":"from-the-future","age_ms":null,"records":[]}"#).unwrap();
-            assert!(read_fleet_snapshot_file(file.path()).is_none());
-        }
-
-        /// The end-to-end contract `fleet_records_for_runs` promises the
-        /// CLI: when the env var points at a valid snapshot, the live
-        /// Redis path is never taken. Proven with a records payload that
-        /// could NOT have come from the live path — `DARKMUX_REDIS_URL` is
-        /// unset and this crate's test build resolves an empty config tier
-        /// (see the crate's `Cargo.toml` dev-dependency comment on
-        /// `test-support`), so the live path always degrades to `Off` with
-        /// no records; seeing `Ok` with the planted record is only
-        /// possible via the snapshot.
-        #[test]
-        #[serial]
-        fn fleet_records_for_runs_prefers_a_valid_snapshot_over_a_live_read() {
-            unsafe {
-                std::env::remove_var("DARKMUX_REDIS_URL");
-            }
-            let planted =
-                FleetRead { records: sample_records().into(), state: source_state::SourceState::Ok };
-            let file = write_fleet_snapshot_file(&planted).expect("write snapshot");
-            unsafe {
-                std::env::set_var(FLEET_SNAPSHOT_ENV_VAR, file.path());
-            }
-
-            let read = fleet_records_for_runs();
-
-            unsafe {
-                std::env::remove_var(FLEET_SNAPSHOT_ENV_VAR);
-            }
-
-            assert_eq!(read.state, source_state::SourceState::Ok);
-            assert_eq!(read.records, planted.records);
-        }
-
-        /// The fallback guard: the env var IS set, but the file it names
-        /// is gone (a stale or already-cleaned-up handoff). The CLI must
-        /// fall back to the normal live path — never fail the invocation,
-        /// and never silently claim `Ok` over nothing. With
-        /// `DARKMUX_REDIS_URL` unset, the live path's own honest answer is
-        /// `Off`/empty; seeing exactly that (not an error, not the
-        /// planted-elsewhere data) is the proof the fallback engaged.
-        #[test]
-        #[serial]
-        fn fleet_records_for_runs_falls_back_when_the_snapshot_file_is_missing() {
-            unsafe {
-                std::env::remove_var("DARKMUX_REDIS_URL");
-            }
-            unsafe {
-                std::env::set_var(
-                    FLEET_SNAPSHOT_ENV_VAR,
-                    "/nonexistent/darkmux-fleet-snapshot-handoff-selftest-missing.json",
-                );
-            }
-
-            let read = fleet_records_for_runs();
-
-            unsafe {
-                std::env::remove_var(FLEET_SNAPSHOT_ENV_VAR);
-            }
-
-            assert_eq!(
-                read.state,
-                source_state::SourceState::Off,
-                "must fall back to the live (Off) path, not fabricate a result"
-            );
-            assert!(read.records.is_empty());
-        }
-
-        /// (#1914) On-demand no-rows-lost proof against a LIVE fleet, in the
-        /// same spirit as `presence_roundtrip_against_live_redis`
-        /// (`darkmux-flow/src/presence.rs`): `#[ignore]` so CI without a
-        /// reachable Redis skips it; run with `cargo test -p darkmux-serve
-        /// --lib fleet_snapshot_matches_a_live_read -- --ignored --nocapture`
-        /// while `DARKMUX_REDIS_URL` points at a reachable Redis.
-        ///
-        /// Times a direct live read against the daemon's own path
-        /// (`fleet_flow_records`), snapshots it, then reads the snapshot
-        /// back through the EXACT path a spawned `run-list` child takes
-        /// (`fleet_records_for_runs`'s env-var override) — the same
-        /// function `src/run_list.rs` calls, so this is the real consumer
-        /// contract, not a proxy for it. Asserts byte-for-byte equal
-        /// `.records` and `.state`: not fewer, not more, not reordered —
-        /// the concrete "no row disappears" evidence for the handoff
-        /// mechanism itself.
-        #[test]
-        #[ignore]
-        fn fleet_snapshot_matches_a_live_read() {
-            let Some(_url) =
-                std::env::var("DARKMUX_REDIS_URL").ok().filter(|s| !s.trim().is_empty())
-            else {
-                eprintln!("DARKMUX_REDIS_URL unset — skipping live fleet snapshot proof");
-                return;
-            };
-            let started = std::time::Instant::now();
-            let live = super::fleet_flow_records();
-            let live_elapsed = started.elapsed();
-            eprintln!(
-                "live fleet_flow_records(): {} records, state={:?}, {live_elapsed:?}",
-                live.records.len(),
-                live.state
-            );
-
-            let file = write_fleet_snapshot_file(&live).expect("write snapshot");
-            unsafe {
-                std::env::set_var(FLEET_SNAPSHOT_ENV_VAR, file.path());
-            }
-            let started = std::time::Instant::now();
-            let via_snapshot = fleet_records_for_runs();
-            let snapshot_elapsed = started.elapsed();
-            unsafe {
-                std::env::remove_var(FLEET_SNAPSHOT_ENV_VAR);
-            }
-            eprintln!(
-                "fleet_records_for_runs() via snapshot: {} records, state={:?}, {snapshot_elapsed:?}",
-                via_snapshot.records.len(),
-                via_snapshot.state
-            );
-
-            assert_eq!(
-                via_snapshot.records.len(),
-                live.records.len(),
-                "row count must match exactly — the handoff must not drop or duplicate rows"
-            );
-            assert_eq!(via_snapshot.records, live.records, "records must match byte-for-byte");
-            assert_eq!(via_snapshot.state, live.state, "state must match exactly");
-        }
-
-        /// (#1914) The strongest available proof, run against the REAL
-        /// compiled `darkmux run list --json` binary rather than the
-        /// library function directly: spawns the release binary twice —
-        /// once exactly as a bare terminal invocation always has (no env
-        /// var, its own live Redis read: the ONLY code path a bare
-        /// terminal invocation can ever take, unaffected by this feature),
-        /// once exactly as the daemon's `run-list` panel spawn now does
-        /// (`FLEET_SNAPSHOT_ENV_VAR` pointing at an already-fetched
-        /// snapshot) — and asserts the two invocations' `runs` arrays are
-        /// IDENTICAL in id/kind/status (order too, since both feed the
-        /// same union off the same underlying fleet read). `#[ignore]`:
-        /// needs a live Redis AND a release build at `target/release/
-        /// darkmux` (`cargo build --release --bin darkmux` first). Run with
-        /// `cargo test -p darkmux-serve --lib
-        /// fleet_snapshot_cli_end_to_end -- --ignored --nocapture` while
-        /// `DARKMUX_REDIS_URL` points at a reachable Redis.
-        #[test]
-        #[ignore]
-        fn fleet_snapshot_cli_end_to_end_matches_a_bare_invocation() {
-            let Some(_url) =
-                std::env::var("DARKMUX_REDIS_URL").ok().filter(|s| !s.trim().is_empty())
-            else {
-                eprintln!("DARKMUX_REDIS_URL unset — skipping the CLI end-to-end proof");
-                return;
-            };
-            let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/darkmux");
-            if !bin.exists() {
-                eprintln!(
-                    "no release binary at {} — run `cargo build --release --bin darkmux` first; \
-                     skipping the CLI end-to-end proof",
-                    bin.display()
-                );
-                return;
-            }
-
-            fn run_list_json(
-                bin: &std::path::Path,
-                extra_env: Option<(&str, &std::path::Path)>,
-            ) -> (std::time::Duration, serde_json::Value) {
-                let mut cmd = std::process::Command::new(bin);
-                cmd.args(["run", "list", "--json", "--limit", "10"]);
-                if let Some((k, v)) = extra_env {
-                    cmd.env(k, v);
-                }
-                let started = std::time::Instant::now();
-                let out = cmd.output().expect("spawn darkmux run list --json");
-                let elapsed = started.elapsed();
-                assert!(
-                    out.status.success(),
-                    "darkmux run list --json exited {:?}; stderr: {}",
-                    out.status.code(),
-                    String::from_utf8_lossy(&out.stderr)
-                );
-                let json: serde_json::Value =
-                    serde_json::from_slice(&out.stdout).expect("run list --json must be valid JSON");
-                (elapsed, json)
-            }
-
-            // Bare invocation: no env var. Exactly what a terminal always
-            // does, and exactly what a panel spawn did BEFORE this feature.
-            let (bare_elapsed, bare_json) = run_list_json(&bin, None);
-            eprintln!("bare `run list --json`: {bare_elapsed:?}");
-
-            // Snapshot invocation: exactly what a panel spawn does NOW.
-            let read = super::fleet_flow_records();
-            let file = write_fleet_snapshot_file(&read).expect("write snapshot");
-            let (snapshot_elapsed, snapshot_json) =
-                run_list_json(&bin, Some((FLEET_SNAPSHOT_ENV_VAR, file.path())));
-            eprintln!("snapshot-backed `run list --json`: {snapshot_elapsed:?}");
-
-            let extract_triples = |json: &serde_json::Value| -> Vec<(String, String, String)> {
-                json["runs"]
-                    .as_array()
-                    .expect("run list --json always has a runs array")
-                    .iter()
-                    .map(|r| {
-                        (
-                            r["id"].as_str().unwrap_or_default().to_string(),
-                            r["kind"].as_str().unwrap_or_default().to_string(),
-                            r["status"].as_str().unwrap_or_default().to_string(),
-                        )
-                    })
-                    .collect()
-            };
-            let bare_triples = extract_triples(&bare_json);
-            let snapshot_triples = extract_triples(&snapshot_json);
-            assert_eq!(
-                snapshot_triples.len(),
-                bare_triples.len(),
-                "row count must match — the snapshot-backed invocation must not drop or add rows"
-            );
-            assert_eq!(
-                snapshot_triples, bare_triples,
-                "id/kind/status, in order, must match exactly between the two invocations"
-            );
-        }
+        assert_eq!(
+            read.state,
+            source_state::SourceState::Off,
+            "must fall back to the live (Off) path, not fabricate a result"
+        );
+        assert!(read.records.is_empty());
     }
+
+    /// (#1914) On-demand no-rows-lost proof against a LIVE fleet, in the
+    /// same spirit as `presence_roundtrip_against_live_redis`
+    /// (`darkmux-flow/src/presence.rs`): `#[ignore]` so CI without a
+    /// reachable Redis skips it; run with `cargo test -p darkmux-serve
+    /// --lib fleet_snapshot_matches_a_live_read -- --ignored --nocapture`
+    /// while `DARKMUX_REDIS_URL` points at a reachable Redis.
+    ///
+    /// Times a direct live read against the daemon's own path
+    /// (`fleet_flow_records`), snapshots it, then reads the snapshot
+    /// back through the EXACT path a spawned `run-list` child takes
+    /// (`fleet_records_for_runs`'s env-var override) — the same
+    /// function `src/run_list.rs` calls, so this is the real consumer
+    /// contract, not a proxy for it. Asserts byte-for-byte equal
+    /// `.records` and `.state`: not fewer, not more, not reordered —
+    /// the concrete "no row disappears" evidence for the handoff
+    /// mechanism itself.
+    #[test]
+    #[ignore]
+    fn fleet_snapshot_matches_a_live_read() {
+        let Some(_url) = std::env::var("DARKMUX_REDIS_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            eprintln!("DARKMUX_REDIS_URL unset — skipping live fleet snapshot proof");
+            return;
+        };
+        let started = std::time::Instant::now();
+        let live = super::fleet_flow_records();
+        let live_elapsed = started.elapsed();
+        eprintln!(
+            "live fleet_flow_records(): {} records, state={:?}, {live_elapsed:?}",
+            live.records.len(),
+            live.state
+        );
+
+        let file = write_fleet_snapshot_file(&live).expect("write snapshot");
+        unsafe {
+            std::env::set_var(FLEET_SNAPSHOT_ENV_VAR, file.path());
+        }
+        let started = std::time::Instant::now();
+        let via_snapshot = fleet_records_for_runs();
+        let snapshot_elapsed = started.elapsed();
+        unsafe {
+            std::env::remove_var(FLEET_SNAPSHOT_ENV_VAR);
+        }
+        eprintln!(
+            "fleet_records_for_runs() via snapshot: {} records, state={:?}, {snapshot_elapsed:?}",
+            via_snapshot.records.len(),
+            via_snapshot.state
+        );
+
+        assert_eq!(
+            via_snapshot.records.len(),
+            live.records.len(),
+            "row count must match exactly — the handoff must not drop or duplicate rows"
+        );
+        assert_eq!(
+            via_snapshot.records, live.records,
+            "records must match byte-for-byte"
+        );
+        assert_eq!(via_snapshot.state, live.state, "state must match exactly");
+    }
+
+    /// (#1914) The strongest available proof, run against the REAL
+    /// compiled `darkmux run list --json` binary rather than the
+    /// library function directly: spawns the release binary twice —
+    /// once exactly as a bare terminal invocation always has (no env
+    /// var, its own live Redis read: the ONLY code path a bare
+    /// terminal invocation can ever take, unaffected by this feature),
+    /// once exactly as the daemon's `run-list` panel spawn now does
+    /// (`FLEET_SNAPSHOT_ENV_VAR` pointing at an already-fetched
+    /// snapshot) — and asserts the two invocations' `runs` arrays are
+    /// IDENTICAL in id/kind/status (order too, since both feed the
+    /// same union off the same underlying fleet read). `#[ignore]`:
+    /// needs a live Redis AND a release build at `target/release/
+    /// darkmux` (`cargo build --release --bin darkmux` first). Run with
+    /// `cargo test -p darkmux-serve --lib
+    /// fleet_snapshot_cli_end_to_end -- --ignored --nocapture` while
+    /// `DARKMUX_REDIS_URL` points at a reachable Redis.
+    #[test]
+    #[ignore]
+    fn fleet_snapshot_cli_end_to_end_matches_a_bare_invocation() {
+        let Some(_url) = std::env::var("DARKMUX_REDIS_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            eprintln!("DARKMUX_REDIS_URL unset — skipping the CLI end-to-end proof");
+            return;
+        };
+        let bin =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/darkmux");
+        if !bin.exists() {
+            eprintln!(
+                "no release binary at {} — run `cargo build --release --bin darkmux` first; \
+                     skipping the CLI end-to-end proof",
+                bin.display()
+            );
+            return;
+        }
+
+        fn run_list_json(
+            bin: &std::path::Path,
+            extra_env: Option<(&str, &std::path::Path)>,
+        ) -> (std::time::Duration, serde_json::Value) {
+            let mut cmd = std::process::Command::new(bin);
+            cmd.args(["run", "list", "--json", "--limit", "10"]);
+            if let Some((k, v)) = extra_env {
+                cmd.env(k, v);
+            }
+            let started = std::time::Instant::now();
+            let out = cmd.output().expect("spawn darkmux run list --json");
+            let elapsed = started.elapsed();
+            assert!(
+                out.status.success(),
+                "darkmux run list --json exited {:?}; stderr: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let json: serde_json::Value =
+                serde_json::from_slice(&out.stdout).expect("run list --json must be valid JSON");
+            (elapsed, json)
+        }
+
+        // Bare invocation: no env var. Exactly what a terminal always
+        // does, and exactly what a panel spawn did BEFORE this feature.
+        let (bare_elapsed, bare_json) = run_list_json(&bin, None);
+        eprintln!("bare `run list --json`: {bare_elapsed:?}");
+
+        // Snapshot invocation: exactly what a panel spawn does NOW.
+        let read = super::fleet_flow_records();
+        let file = write_fleet_snapshot_file(&read).expect("write snapshot");
+        let (snapshot_elapsed, snapshot_json) =
+            run_list_json(&bin, Some((FLEET_SNAPSHOT_ENV_VAR, file.path())));
+        eprintln!("snapshot-backed `run list --json`: {snapshot_elapsed:?}");
+
+        let extract_triples = |json: &serde_json::Value| -> Vec<(String, String, String)> {
+            json["runs"]
+                .as_array()
+                .expect("run list --json always has a runs array")
+                .iter()
+                .map(|r| {
+                    (
+                        r["id"].as_str().unwrap_or_default().to_string(),
+                        r["kind"].as_str().unwrap_or_default().to_string(),
+                        r["status"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        };
+        let bare_triples = extract_triples(&bare_json);
+        let snapshot_triples = extract_triples(&snapshot_json);
+        assert_eq!(
+            snapshot_triples.len(),
+            bare_triples.len(),
+            "row count must match — the snapshot-backed invocation must not drop or add rows"
+        );
+        assert_eq!(
+            snapshot_triples, bare_triples,
+            "id/kind/status, in order, must match exactly between the two invocations"
+        );
+    }
+}
 
 /// (#2019) The SERVED viewer must never carry a static-source meta.
 ///
@@ -9493,7 +11675,9 @@ fn served_viewer_ships_no_static_source_meta() {
 fn every_manifest_icon_has_a_route() {
     let manifest: serde_json::Value =
         serde_json::from_str(WEB_MANIFEST).expect("manifest.webmanifest must be valid JSON");
-    let icons = manifest["icons"].as_array().expect("manifest declares an icons array");
+    let icons = manifest["icons"]
+        .as_array()
+        .expect("manifest declares an icons array");
     assert!(!icons.is_empty(), "a manifest with no icons is not a PWA");
 
     for icon in icons {
@@ -9524,15 +11708,28 @@ const ROUTED_ICON_PATHS: &[&str] = &[
 #[test]
 fn for_each_flow_record_in_day_range_bounds_to_the_window_days() {
     let tmp = TempDir::new().unwrap();
-    fs::write(tmp.path().join("2026-01-01.jsonl"), "{\"action\":\"a\",\"ts\":\"2026-01-01T00:00:00Z\"}\n").unwrap();
-    fs::write(tmp.path().join("2026-01-02.jsonl"), "{\"action\":\"b\",\"ts\":\"2026-01-02T00:00:00Z\"}\n").unwrap();
-    fs::write(tmp.path().join("2026-01-03.jsonl"), "{\"action\":\"c\",\"ts\":\"2026-01-03T00:00:00Z\"}\n").unwrap();
+    fs::write(
+        tmp.path().join("2026-01-01.jsonl"),
+        "{\"action\":\"a\",\"ts\":\"2026-01-01T00:00:00Z\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("2026-01-02.jsonl"),
+        "{\"action\":\"b\",\"ts\":\"2026-01-02T00:00:00Z\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("2026-01-03.jsonl"),
+        "{\"action\":\"c\",\"ts\":\"2026-01-03T00:00:00Z\"}\n",
+    )
+    .unwrap();
 
     let mut seen_dates: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let files_scanned = for_each_flow_record_in_day_range(tmp.path(), "2026-01-02", "2026-01-02", |date, _v| {
-        seen_dates.insert(date.to_string());
-        std::ops::ControlFlow::Continue(())
-    });
+    let files_scanned =
+        for_each_flow_record_in_day_range(tmp.path(), "2026-01-02", "2026-01-02", |date, _v| {
+            seen_dates.insert(date.to_string());
+            std::ops::ControlFlow::Continue(())
+        });
     assert_eq!(
         seen_dates,
         std::collections::HashSet::from(["2026-01-02".to_string()]),
@@ -9544,15 +11741,28 @@ fn for_each_flow_record_in_day_range_bounds_to_the_window_days() {
 #[test]
 fn for_each_flow_record_in_day_range_spans_a_midnight_boundary() {
     let tmp = TempDir::new().unwrap();
-    fs::write(tmp.path().join("2026-01-01.jsonl"), "{\"action\":\"a\",\"ts\":\"2026-01-01T23:59:00Z\"}\n").unwrap();
-    fs::write(tmp.path().join("2026-01-02.jsonl"), "{\"action\":\"b\",\"ts\":\"2026-01-02T00:01:00Z\"}\n").unwrap();
-    fs::write(tmp.path().join("2026-01-03.jsonl"), "{\"action\":\"c\",\"ts\":\"2026-01-03T00:00:00Z\"}\n").unwrap();
+    fs::write(
+        tmp.path().join("2026-01-01.jsonl"),
+        "{\"action\":\"a\",\"ts\":\"2026-01-01T23:59:00Z\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("2026-01-02.jsonl"),
+        "{\"action\":\"b\",\"ts\":\"2026-01-02T00:01:00Z\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("2026-01-03.jsonl"),
+        "{\"action\":\"c\",\"ts\":\"2026-01-03T00:00:00Z\"}\n",
+    )
+    .unwrap();
 
     let mut seen_dates: Vec<String> = Vec::new();
-    let files_scanned = for_each_flow_record_in_day_range(tmp.path(), "2026-01-01", "2026-01-02", |date, _v| {
-        seen_dates.push(date.to_string());
-        std::ops::ControlFlow::Continue(())
-    });
+    let files_scanned =
+        for_each_flow_record_in_day_range(tmp.path(), "2026-01-01", "2026-01-02", |date, _v| {
+            seen_dates.push(date.to_string());
+            std::ops::ControlFlow::Continue(())
+        });
     seen_dates.sort();
     assert_eq!(
         seen_dates,
@@ -9576,7 +11786,10 @@ fn for_each_flow_record_in_day_range_skips_the_schema_header_line() {
         count += 1;
         std::ops::ControlFlow::Continue(())
     });
-    assert_eq!(count, 1, "the schema header must not be visited as a record");
+    assert_eq!(
+        count, 1,
+        "the schema header must not be visited as a record"
+    );
 }
 
 // ─── (#2413 M4) join_host_samples_into_session_records ──────────────────
@@ -9622,11 +11835,20 @@ fn join_host_samples_pulls_in_window_machine_telemetry_and_drops_out_of_window()
     ];
     let stats = join_host_samples_into_session_records(tmp.path(), &[], &mut records, 0);
 
-    let telemetry: Vec<&serde_json::Value> =
-        records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
-    assert_eq!(telemetry.len(), 1, "exactly the in-window, same-machine sample joins: {records:#?}");
+    let telemetry: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["action"] == "machine.telemetry")
+        .collect();
+    assert_eq!(
+        telemetry.len(),
+        1,
+        "exactly the in-window, same-machine sample joins: {records:#?}"
+    );
     assert_eq!(telemetry[0]["payload"]["cpu"], serde_json::json!(42));
-    assert_eq!(stats.days_scanned, 1, "the run's whole window sits in one day file");
+    assert_eq!(
+        stats.days_scanned, 1,
+        "the run's whole window sits in one day file"
+    );
 }
 
 // (#2413 follow-up) A session's host samples are joined between its
@@ -9673,9 +11895,15 @@ fn join_host_samples_joins_between_a_sessions_dispatch_bookends() {
     ];
     join_host_samples_into_session_records(tmp.path(), &[], &mut records, 0);
 
-    let telemetry: Vec<&serde_json::Value> =
-        records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
-    assert_eq!(telemetry.len(), 1, "exactly the in-window, same-machine sample joins: {records:#?}");
+    let telemetry: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["action"] == "machine.telemetry")
+        .collect();
+    assert_eq!(
+        telemetry.len(),
+        1,
+        "exactly the in-window, same-machine sample joins: {records:#?}"
+    );
     assert_eq!(telemetry[0]["payload"]["cpu"], serde_json::json!(42));
 }
 
@@ -9689,7 +11917,10 @@ fn join_host_samples_is_a_noop_when_the_session_carries_no_machine_uid() {
     })];
     let before = records.clone();
     join_host_samples_into_session_records(tmp.path(), &[], &mut records, 0);
-    assert_eq!(records, before, "no machine_uid on any session record — nothing to join against");
+    assert_eq!(
+        records, before,
+        "no machine_uid on any session record — nothing to join against"
+    );
 }
 
 // (live finding, 2026-09-06) `machine_uid` must come from the dispatch-START
@@ -9740,9 +11971,15 @@ fn join_host_samples_windows_against_the_start_records_machine_not_just_the_firs
     ];
     join_host_samples_into_session_records(tmp.path(), &[], &mut records, 0);
 
-    let telemetry: Vec<&serde_json::Value> =
-        records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
-    assert_eq!(telemetry.len(), 1, "only the START record's own machine's sample joins: {records:#?}");
+    let telemetry: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["action"] == "machine.telemetry")
+        .collect();
+    assert_eq!(
+        telemetry.len(),
+        1,
+        "only the START record's own machine's sample joins: {records:#?}"
+    );
     assert_eq!(telemetry[0]["machine_uid"], "m-real");
 }
 
@@ -9808,9 +12045,15 @@ fn join_host_samples_grants_the_grace_window_when_the_run_is_still_recent_at_req
     let now_ms = last_own_ms + 5_000;
     join_host_samples_into_session_records(tmp.path(), &[], &mut records, now_ms);
 
-    let telemetry: Vec<&serde_json::Value> =
-        records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
-    assert_eq!(telemetry.len(), 1, "only the sample within the staleness allowance joins: {records:#?}");
+    let telemetry: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["action"] == "machine.telemetry")
+        .collect();
+    assert_eq!(
+        telemetry.len(),
+        1,
+        "only the sample within the staleness allowance joins: {records:#?}"
+    );
     assert_eq!(telemetry[0]["payload"]["cpu"], serde_json::json!(11));
 }
 
@@ -9862,8 +12105,10 @@ fn join_host_samples_hard_clamps_when_the_run_is_already_stale_at_request_time()
     let now_ms = last_own_ms + 24 * 60 * 60 * 1000;
     join_host_samples_into_session_records(tmp.path(), &[], &mut records, now_ms);
 
-    let telemetry: Vec<&serde_json::Value> =
-        records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
+    let telemetry: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["action"] == "machine.telemetry")
+        .collect();
     assert!(
         telemetry.is_empty(),
         "a run already stale at request time must not absorb ANY later sample: {records:#?}"
@@ -9922,11 +12167,20 @@ fn join_host_samples_bounds_the_local_scan_to_the_runs_own_day_range() {
     ];
     let stats = join_host_samples_into_session_records(tmp.path(), &[], &mut records, 0);
 
-    let telemetry: Vec<&serde_json::Value> =
-        records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
-    assert_eq!(telemetry.len(), 1, "only the middle day's in-window sample joins: {records:#?}");
+    let telemetry: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["action"] == "machine.telemetry")
+        .collect();
+    assert_eq!(
+        telemetry.len(),
+        1,
+        "only the middle day's in-window sample joins: {records:#?}"
+    );
     assert_eq!(telemetry[0]["payload"]["cpu"], serde_json::json!(2));
-    assert_eq!(stats.days_scanned, 1, "only the one day file the run's window falls in was opened");
+    assert_eq!(
+        stats.days_scanned, 1,
+        "only the one day file the run's window falls in was opened"
+    );
 }
 
 #[test]
@@ -9967,10 +12221,19 @@ fn join_host_samples_scans_both_days_when_the_run_spans_midnight() {
     ];
     let stats = join_host_samples_into_session_records(tmp.path(), &[], &mut records, 0);
 
-    let telemetry: Vec<&serde_json::Value> =
-        records.iter().filter(|r| r["action"] == "machine.telemetry").collect();
-    assert_eq!(telemetry.len(), 2, "a run spanning midnight joins samples from both days: {records:#?}");
-    assert_eq!(stats.days_scanned, 2, "the run's window spans exactly the two overlapping day files");
+    let telemetry: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["action"] == "machine.telemetry")
+        .collect();
+    assert_eq!(
+        telemetry.len(),
+        2,
+        "a run spanning midnight joins samples from both days: {records:#?}"
+    );
+    assert_eq!(
+        stats.days_scanned, 2,
+        "the run's window spans exactly the two overlapping day files"
+    );
 }
 
 /// (#2476) `reap_dispatch_children_on_shutdown` must kill a REAL,
@@ -10011,8 +12274,13 @@ fn reap_dispatch_children_on_shutdown_kills_a_real_registered_child() {
          `docker run` CLIENT pid, never the container itself"
     );
 
-    let status = child.wait().expect("reaping the (now-signaled) sleep child");
-    assert!(!status.success(), "a SIGKILLed child must not report success: {status:?}");
+    let status = child
+        .wait()
+        .expect("reaping the (now-signaled) sleep child");
+    assert!(
+        !status.success(),
+        "a SIGKILLed child must not report success: {status:?}"
+    );
 
     darkmux_types::child_registry::reset_for_test();
     darkmux_types::interrupt::reset_for_test();
@@ -10041,7 +12309,10 @@ mod serve_listen_addr {
         let prev = std::env::var(k).ok();
         unsafe { std::env::set_var(k, "8799") };
         let (port, _) = crate::resolve_listen_addr(Some(9000), None);
-        assert_eq!(port, 9000, "the flag the operator typed wins over every tier below it");
+        assert_eq!(
+            port, 9000,
+            "the flag the operator typed wins over every tier below it"
+        );
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),
@@ -10073,7 +12344,10 @@ mod serve_listen_addr {
         assert_eq!(bind, "0.0.0.0");
         // And the client-side locator resolves from the SAME place, which
         // is the whole point — a wildcard bind is probed on loopback.
-        assert_eq!(darkmux_types::config_access::serve_client_addr(), "127.0.0.1:8799");
+        assert_eq!(
+            darkmux_types::config_access::serve_client_addr(),
+            "127.0.0.1:8799"
+        );
         unsafe {
             match prev_p {
                 Some(v) => std::env::set_var(kp, v),
@@ -10099,7 +12373,10 @@ mod serve_listen_addr {
             std::env::remove_var(kp);
             std::env::remove_var(kb);
         }
-        assert_eq!(crate::resolve_listen_addr(None, None), (8765, "127.0.0.1".to_string()));
+        assert_eq!(
+            crate::resolve_listen_addr(None, None),
+            (8765, "127.0.0.1".to_string())
+        );
         unsafe {
             match prev_p {
                 Some(v) => std::env::set_var(kp, v),
@@ -10171,14 +12448,22 @@ mod fleet_cache_wall_clock {
     fn wall_clock_cache_is_fresh_within_ttl() {
         let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let now = captured + Duration::from_millis(500);
-        assert!(wall_clock_cache_is_fresh(captured, now, Duration::from_secs(2)));
+        assert!(wall_clock_cache_is_fresh(
+            captured,
+            now,
+            Duration::from_secs(2)
+        ));
     }
 
     #[test]
     fn fleet_cache_is_stale_after_ttl_of_pure_awake_time() {
         let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let now = captured + Duration::from_secs(3);
-        assert!(!wall_clock_cache_is_fresh(captured, now, Duration::from_secs(2)));
+        assert!(!wall_clock_cache_is_fresh(
+            captured,
+            now,
+            Duration::from_secs(2)
+        ));
     }
 
     /// The actual defect this audit fixed: a snapshot captured just before
@@ -10196,7 +12481,11 @@ mod fleet_cache_wall_clock {
     fn fleet_cache_is_stale_after_a_simulated_multi_hour_sleep_gap() {
         let captured = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let now = captured + Duration::from_secs(4 * 3600);
-        assert!(!wall_clock_cache_is_fresh(captured, now, Duration::from_secs(2)));
+        assert!(!wall_clock_cache_is_fresh(
+            captured,
+            now,
+            Duration::from_secs(2)
+        ));
     }
 
     #[test]
@@ -10347,7 +12636,10 @@ mod fleet_cache_wall_clock {
             machines[0].machine_uid.clone()
         };
         // flow-action-guard:allow-start — an old spelling is this test's input
-        assert_eq!(backfill("dispatch start"), Some("00000000-0000-4000-8000-000000000001".to_string()));
+        assert_eq!(
+            backfill("dispatch start"),
+            Some("00000000-0000-4000-8000-000000000001".to_string())
+        );
         assert_eq!(backfill("dispatch start"), backfill("dispatch.start"));
         // flow-action-guard:allow-end
     }
@@ -10365,7 +12657,9 @@ mod fleet_cache_wall_clock {
     fn a_uid_pairing_written_after_a_read_is_seen_on_the_next() {
         let tmp = TempDir::new().unwrap();
         let day = tmp.path().join("2026-09-30.jsonl");
-        let pair = |id: &str, uid: &str| format!("{{\"action\":\"dispatch.start\",\"machine_id\":\"{id}\",\"machine_uid\":\"{uid}\"}}\n");
+        let pair = |id: &str, uid: &str| {
+            format!("{{\"action\":\"dispatch.start\",\"machine_id\":\"{id}\",\"machine_uid\":\"{uid}\"}}\n")
+        };
         let entry = |id: &str| darkmux_fleet::MachineEntry {
             id: id.into(),
             address: format!("{id}:8765"),
@@ -10383,13 +12677,25 @@ mod fleet_cache_wall_clock {
             (m[0].machine_uid.clone(), filled.contains(id))
         };
         fs::write(&day, pair("laptop", "UID-L")).unwrap();
-        assert_eq!(uid_of("laptop"), (Some("UID-L".into()), true), "a filled uid says so");
+        assert_eq!(
+            uid_of("laptop"),
+            (Some("UID-L".into()), true),
+            "a filled uid says so"
+        );
         assert_eq!(uid_of("studio"), (None, false));
         let mut f = fs::OpenOptions::new().append(true).open(&day).unwrap();
         std::io::Write::write_all(&mut f, pair("studio", "UID-S").as_bytes()).unwrap();
-        assert_eq!(uid_of("studio"), (Some("UID-S".into()), true), "the new pairing is read at once");
+        assert_eq!(
+            uid_of("studio"),
+            (Some("UID-S".into()), true),
+            "the new pairing is read at once"
+        );
         // The oldest day's pairing wins over a later one.
-        fs::write(tmp.path().join("2026-10-01.jsonl"), pair("laptop", "UID-LATER")).unwrap();
+        fs::write(
+            tmp.path().join("2026-10-01.jsonl"),
+            pair("laptop", "UID-LATER"),
+        )
+        .unwrap();
         assert_eq!(uid_of("laptop").0.as_deref(), Some("UID-L"));
     }
 }
@@ -10407,11 +12713,18 @@ mod flow_stream_ends_with_its_records {
 
     #[tokio::test]
     async fn the_response_ends_when_the_record_source_ends_though_the_live_channel_is_open() {
-        let records = stream::iter(vec![Ok(Event::default().data("a")), Ok(Event::default().data("stream.error"))]).boxed();
+        let records = stream::iter(vec![
+            Ok(Event::default().data("a")),
+            Ok(Event::default().data("stream.error")),
+        ])
+        .boxed();
         let live = stream::pending().boxed();
-        let all = tokio::time::timeout(std::time::Duration::from_secs(2), records_then_live(records, live).collect::<Vec<_>>())
-            .await
-            .expect("the response ends once its records do");
+        let all = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            records_then_live(records, live).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the response ends once its records do");
         assert_eq!(all.len(), 2, "every record is delivered before the end");
     }
 
@@ -10422,20 +12735,38 @@ mod flow_stream_ends_with_its_records {
     async fn the_redis_path_ends_when_the_hub_tail_ends_though_the_local_tail_is_open() {
         let hub = stream::iter(vec!["a".to_string(), "stream.error".to_string()]).boxed();
         let local = stream::pending().boxed();
-        let all = tokio::time::timeout(std::time::Duration::from_secs(2), super::super::hub_then_local(hub, local).collect::<Vec<_>>())
-            .await
-            .expect("the lines end once the hub's do");
+        let all = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::super::hub_then_local(hub, local).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the lines end once the hub's do");
         assert_eq!(all, ["a", "stream.error"]);
         let local = stream::iter(vec!["beat".to_string()]).boxed();
-        let first = tokio::time::timeout(std::time::Duration::from_secs(2), super::super::hub_then_local(stream::pending().boxed(), local).next()).await;
-        assert_eq!(first.ok().flatten().as_deref(), Some("beat"), "a local line arrives while the hub tail is open");
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::super::hub_then_local(stream::pending().boxed(), local).next(),
+        )
+        .await;
+        assert_eq!(
+            first.ok().flatten().as_deref(),
+            Some("beat"),
+            "a local line arrives while the hub tail is open"
+        );
     }
 
     #[tokio::test]
     async fn live_samples_still_flow_while_records_do() {
         let records = stream::pending().boxed();
         let live = stream::iter(vec![Ok(Event::default().event("live").data("s"))]).boxed();
-        let first = tokio::time::timeout(std::time::Duration::from_secs(2), records_then_live(records, live).next()).await;
-        assert!(matches!(first, Ok(Some(Ok(_)))), "a live sample arrives while the record source is open");
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            records_then_live(records, live).next(),
+        )
+        .await;
+        assert!(
+            matches!(first, Ok(Some(Ok(_)))),
+            "a live sample arrives while the record source is open"
+        );
     }
 }

@@ -1,15 +1,18 @@
 //! `darkmux serve` — minimal HTTP daemon for flow record retrieval.
 
 use anyhow::{Context, Result};
-use darkmux_profiles::engine;
 use axum::{
     extract::{ConnectInfo, Path, Query, Request, State},
     http::StatusCode,
     middleware::{from_fn, from_fn_with_state, Next},
-    response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::get,
     Router,
 };
+use darkmux_profiles::engine;
 use futures::stream::{self, Stream};
 use std::collections::VecDeque;
 use std::io::IsTerminal;
@@ -33,6 +36,7 @@ use std::time::Duration;
 /// way).
 pub mod mission_graph;
 
+mod client_changes;
 /// `GET /runs` — the flat, kind-tagged, normalized run view-model (#1508
 /// step 3: the read-side union over missions + lab + flow the Runs lens
 /// consumes). Own module (like `mission_graph`) rather than inlined here —
@@ -49,53 +53,53 @@ pub mod mission_graph;
 /// Client pairing: a loopback-only listener that pairs an app and runs its
 /// scoped work through `darkmux dispatch` (local prototype).
 pub mod client_edit;
+pub mod client_git;
 pub mod client_image;
 pub mod client_image_ref;
-pub mod client_git;
-mod client_changes;
 pub mod client_pairing;
 pub mod client_preview;
 pub mod client_profiles;
 pub mod client_trust;
 pub mod client_wire;
 pub mod client_workspace;
+/// (#3200) Reaps dispatch containers whose darkmux host died unhandled.
+mod dispatch_reaper;
 mod fleet_listener;
 /// The fleet view: one row per roster machine, each with its own card.
 pub mod fleet_view;
-/// (#3200) Reaps dispatch containers whose darkmux host died unhandled.
-mod dispatch_reaper;
 mod host_sampler;
 /// The machine card, served by the fleet listener at `GET /fleet/card` and read from each machine's own row of `GET /fleet/view`.
 pub mod machine_card;
 mod panel;
 mod redaction;
 pub use redaction::panel_withheld;
-mod redaction_stream;
+mod day_index;
+mod fleet_window;
+mod flow_window;
+mod host_gate;
 /// (#1466) Best-effort peer-mission-graph fetch — see the module's own doc
 /// for the full attribution → roster → presence → fetch decision chain.
 mod peer_graph;
-mod fleet_window;
-mod flow_window;
-mod day_index;
-mod host_gate;
-pub use fleet_window::{FleetRecord, FleetRecords, RecordIdentity};
+mod redaction_stream;
 pub(crate) use fleet_window::{read_fleet_cached, FleetCaches, FleetScope};
+pub use fleet_window::{FleetRecord, FleetRecords, RecordIdentity};
 mod routes;
-mod runs;
 mod run_lifecycle;
+mod runs;
 pub use runs::{
     build_runs, build_runs_with_usage, build_runs_within, local_dispatch_status, peer_mission_runs,
-    AbandonReason, DispatchSessionEvidence, Run, RunActivity, RunKind, RunRelay, RunStatus, RunsWithUsage,
+    AbandonReason, DispatchSessionEvidence, Run, RunActivity, RunKind, RunRelay, RunStatus,
+    RunsWithUsage,
 };
-pub mod source_state;
-/// The daemon's response bodies: one Rust type per JSON route, and the source
-/// of the TypeScript the viewer imports (see the module doc).
-pub mod wire;
 /// (#2928) The live channel's receive + SSE fan-out — see the module doc.
 mod live_hub;
+pub mod source_state;
 /// (#2902 step 2b) The one token sum, shared by `run list` and `/runs` —
 /// see the module's own doc.
 pub mod usage_sum;
+/// The daemon's response bodies: one Rust type per JSON route, and the source
+/// of the TypeScript the viewer imports (see the module doc).
+pub mod wire;
 // (#1637) Golden-file generation for the wire types the browser specs consume.
 // Test-only: it exists so a Playwright fixture cannot drift from the shape the
 // server actually emits.
@@ -242,8 +246,11 @@ const WEB_MANIFEST: &str = include_str!("../assets/manifest.webmanifest");
 fn inject_mode_meta(html: &str, mode: &str, date: Option<&str>) -> String {
     let mut meta = format!(r#"<meta name="darkmux-mode" content="{}">"#, mode);
     if let Some(d) = date {
-        meta.push_str(&format!(r#"
-<meta name="darkmux-date" content="{}">"#, d));
+        meta.push_str(&format!(
+            r#"
+<meta name="darkmux-date" content="{}">"#,
+            d
+        ));
     }
     meta.push_str(&format!(
         r#"
@@ -415,7 +422,10 @@ pub(crate) fn build_router_full(
     }
     // Outside the read gate and whatever the read posture: a `Host` that
     // names no address of this machine is a DNS-rebound page (`host_gate`).
-    router = router.layer(from_fn_with_state(state.fleet.hosts.clone(), host_gate::host_gate_mw));
+    router = router.layer(from_fn_with_state(
+        state.fleet.hosts.clone(),
+        host_gate::host_gate_mw,
+    ));
 
     router.layer(local_only_cors()).with_state(state)
 }
@@ -452,7 +462,10 @@ async fn assume_loopback_peer(mut req: Request, next: Next) -> Response {
             .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
     }
     if !req.headers().contains_key(axum::http::header::HOST) {
-        req.headers_mut().insert(axum::http::header::HOST, axum::http::HeaderValue::from_static("localhost"));
+        req.headers_mut().insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("localhost"),
+        );
     }
     next.run(req).await
 }
@@ -477,11 +490,14 @@ pub(crate) fn build_router_local(flows_dir: PathBuf) -> Router {
 
 /// (#1663) [`build_router_full`] plus the stated-loopback layer.
 #[cfg(test)]
-pub(crate) fn build_router_full_local(
-    flows_dir: PathBuf,
-    lab_dir: Option<PathBuf>,
-) -> Router {
-    build_router_full(flows_dir, lab_dir, None, fleet_view::FleetContext::hermetic()).layer(from_fn(assume_loopback_peer))
+pub(crate) fn build_router_full_local(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Router {
+    build_router_full(
+        flows_dir,
+        lab_dir,
+        None,
+        fleet_view::FleetContext::hermetic(),
+    )
+    .layer(from_fn(assume_loopback_peer))
 }
 
 /// (#881) Build a `401 Unauthorized` with a `WWW-Authenticate: Bearer` hint.
@@ -525,7 +541,10 @@ fn request_token_ok(headers: &axum::http::HeaderMap) -> bool {
     if !scheme.eq_ignore_ascii_case("bearer") {
         return false;
     }
-    tokens_match(presented.trim().as_bytes(), token.expose_for_compare().as_bytes())
+    tokens_match(
+        presented.trim().as_bytes(),
+        token.expose_for_compare().as_bytes(),
+    )
 }
 
 /// (#881) Remote-only token gate for the whole read surface. A request from
@@ -570,7 +589,10 @@ async fn auth_mw(req: Request, next: Next) -> Response {
     // Same instinct `serve_auth_preflight` applies: a bind
     // string that doesn't parse is treated as non-loopback, so a typo can't
     // sneak past the gate. Absence is not evidence of safety.
-    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0);
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0);
     if caller_is_local_or_holds_token(peer, req.headers()) {
         next.run(req).await
     } else {
@@ -607,7 +629,10 @@ const PROXY_HEADERS: &[&str] = &[
 
 /// Whether the caller is this machine ([`is_local_request`]) or presents the
 /// serve token: the audience of what only the operator's side may read.
-pub(crate) fn caller_is_local_or_holds_token(peer: Option<SocketAddr>, headers: &axum::http::HeaderMap) -> bool {
+pub(crate) fn caller_is_local_or_holds_token(
+    peer: Option<SocketAddr>,
+    headers: &axum::http::HeaderMap,
+) -> bool {
     is_local_request(peer, headers) || request_token_ok(headers)
 }
 
@@ -687,7 +712,10 @@ fn parse_host_header(raw: &str) -> Option<HostHeader> {
             t => Some(t.strip_prefix(':')?),
         };
         let ip = inner.parse::<std::net::Ipv6Addr>().ok()?;
-        return Some(HostHeader { host: RequestHost::Ip(ip.into()), port: parse_port(port)? });
+        return Some(HostHeader {
+            host: RequestHost::Ip(ip.into()),
+            port: parse_port(port)?,
+        });
     } else {
         match raw.split_once(':') {
             Some((n, p)) => (n.to_string(), Some(p)),
@@ -701,7 +729,10 @@ fn parse_host_header(raw: &str) -> Option<HostHeader> {
     } else {
         RequestHost::Other
     };
-    Some(HostHeader { host, port: parse_port(port)? })
+    Some(HostHeader {
+        host,
+        port: parse_port(port)?,
+    })
 }
 
 /// `Some(None)` for an absent port, `Some(Some(p))` for a numeric one,
@@ -733,7 +764,9 @@ fn host_names_this_daemon(headers: &axum::http::HeaderMap, bound: Option<SocketA
         RequestHost::Localhost => true,
         RequestHost::Ip(ip) => {
             ip.to_canonical().is_loopback()
-                || bound.is_some_and(|b| !b.ip().is_unspecified() && b.ip().to_canonical() == ip.to_canonical())
+                || bound.is_some_and(|b| {
+                    !b.ip().is_unspecified() && b.ip().to_canonical() == ip.to_canonical()
+                })
         }
         RequestHost::Other => false,
     }
@@ -749,11 +782,15 @@ fn auth_banner_lines(auth: ServeAuth, listener_enabled: bool) -> [String; 2] {
         "  reads:          open to whatever reaches this daemon (serve.read_auth off)"
     };
     let exec = if auth.token_present && listener_enabled {
-        "  fleet work:     token set; the fleet listener requires it plus a verified sender".to_string()
+        "  fleet work:     token set; the fleet listener requires it plus a verified sender"
+            .to_string()
     } else if auth.token_present {
         "  fleet work:     token set; the fleet listener is off (fleet.listener.enabled is false), so this machine takes no fleet work".to_string()
     } else {
-        format!("  fleet work:     {}", darkmux_types::style::dim("no serve token; this machine takes and sends no fleet work"))
+        format!(
+            "  fleet work:     {}",
+            darkmux_types::style::dim("no serve token; this machine takes and sends no fleet work")
+        )
     };
     [reads.to_string(), exec]
 }
@@ -776,7 +813,8 @@ impl ServeAuth {
     }
 }
 
-const TOKEN_REMEDY: &str = "store it: `security add-generic-password -U -a \"$USER\" -s darkmux-serve-token -w` \
+const TOKEN_REMEDY: &str =
+    "store it: `security add-generic-password -U -a \"$USER\" -s darkmux-serve-token -w` \
 (macOS) plus `darkmux config set serve.token_keychain true`, OR export DARKMUX_SERVE_TOKEN=…";
 
 /// (#881, #2988) Refuse to start `serve` in a posture whose reads could not
@@ -798,7 +836,9 @@ every read not from this machine would be refused with no way to pass.\n  Fix: {
 `darkmux config set serve.read_auth false`."
         ));
     }
-    let is_loopback = bind.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback());
+    let is_loopback = bind
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.to_canonical().is_loopback());
     if is_loopback || auth.read_auth {
         return Ok(());
     }
@@ -834,11 +874,19 @@ async fn fleet_machines_live_handler() -> axum::Json<wire::FleetMachinesLiveResp
             .await
             .unwrap_or_else(|e| {
                 eprintln!("darkmux serve: GET /fleet/machines/live task failed ({e})");
-                (Vec::new(), source_state::SourceState::Unavailable { detail: PRESENCE_READ_FAILED })
+                (
+                    Vec::new(),
+                    source_state::SourceState::Unavailable {
+                        detail: PRESENCE_READ_FAILED,
+                    },
+                )
             }),
         None => (Vec::new(), source_state::SourceState::Off),
     };
-    axum::Json(wire::FleetMachinesLiveResponse { machines: beats, meta: source_state::coverage_meta(&state) })
+    axum::Json(wire::FleetMachinesLiveResponse {
+        machines: beats,
+        meta: source_state::coverage_meta(&state),
+    })
 }
 
 /// The literal every presence failure reports on the wire. Never the
@@ -949,7 +997,10 @@ pub(crate) fn resolved_roster(flows_dir: &std::path::Path) -> Result<ResolvedRos
     // (#2796) Fill in uids the entry itself does not declare, so the viewer's
     // uid-based consolidation has something to consolidate on.
     let uid_from_history = backfill_roster_machine_uids(&mut machines, flows_dir);
-    Ok(ResolvedRoster { machines, uid_from_history })
+    Ok(ResolvedRoster {
+        machines,
+        uid_from_history,
+    })
 }
 
 /// GET /fleet/roster (#1855): the operator's DECLARED fleet topology
@@ -978,17 +1029,25 @@ pub(crate) fn resolved_roster(flows_dir: &std::path::Path) -> Result<ResolvedRos
 /// rather than silently discarding the roster and answering as if nothing
 /// were ever added.
 async fn fleet_roster_handler() -> axum::Json<wire::FleetRosterResponse> {
-    let result = tokio::task::spawn_blocking(|| resolved_roster(&darkmux_types::config_access::flows_dir())).await;
+    let result =
+        tokio::task::spawn_blocking(|| resolved_roster(&darkmux_types::config_access::flows_dir()))
+            .await;
     let (machines, error) = match result {
         Ok(Ok(roster)) => (roster.machines, None),
         Ok(Err(sentence)) => (Vec::new(), Some(sentence.to_string())),
         Err(e) => {
             eprintln!("darkmux serve: GET /fleet/roster task failed ({e})");
-            (Vec::new(), Some("internal error reading the fleet roster".to_string()))
+            (
+                Vec::new(),
+                Some("internal error reading the fleet roster".to_string()),
+            )
         }
     };
     axum::Json(wire::FleetRosterResponse {
-        machines: machines.iter().map(wire::RosterMachineEntry::from).collect(),
+        machines: machines
+            .iter()
+            .map(wire::RosterMachineEntry::from)
+            .collect(),
         error,
     })
 }
@@ -1015,9 +1074,16 @@ where
         Ok(c) => c,
         Err(e) => {
             if log {
-                eprintln!("darkmux serve: live-{kind} presence — opening the Redis client failed ({e})");
+                eprintln!(
+                    "darkmux serve: live-{kind} presence — opening the Redis client failed ({e})"
+                );
             }
-            return (Vec::new(), source_state::SourceState::Unavailable { detail: PRESENCE_READ_FAILED });
+            return (
+                Vec::new(),
+                source_state::SourceState::Unavailable {
+                    detail: PRESENCE_READ_FAILED,
+                },
+            );
         }
     };
     match read(&client) {
@@ -1026,7 +1092,12 @@ where
             if log {
                 eprintln!("darkmux serve: live-{kind} presence — reading the beats failed ({e})");
             }
-            (Vec::new(), source_state::SourceState::Unavailable { detail: PRESENCE_READ_FAILED })
+            (
+                Vec::new(),
+                source_state::SourceState::Unavailable {
+                    detail: PRESENCE_READ_FAILED,
+                },
+            )
         }
     }
 }
@@ -1042,7 +1113,13 @@ pub(crate) const PRESENCE_CACHE_TTL: Duration = Duration::from_secs(5);
 /// One presence key space's last read: which hub (a digest, as the URL can
 /// carry a password), when, and what it answered, failures included, so a hub
 /// that stalls costs one bounded read per TTL rather than one per request.
-type PresenceSlot<T> = std::sync::Mutex<Option<([u8; 32], std::time::SystemTime, (Vec<T>, source_state::SourceState))>>;
+type PresenceSlot<T> = std::sync::Mutex<
+    Option<(
+        [u8; 32],
+        std::time::SystemTime,
+        (Vec<T>, source_state::SourceState),
+    )>,
+>;
 
 /// How a reader takes a presence key space: how old a shared read it accepts,
 /// and whether a failed read is logged (the daemon's routes log it; the quiet
@@ -1055,15 +1132,27 @@ pub(crate) struct PresenceRead {
 
 impl PresenceRead {
     /// A route's read: shared, failures logged.
-    pub(crate) const ROUTE: Self = Self { max_age: PRESENCE_CACHE_TTL, log: true };
+    pub(crate) const ROUTE: Self = Self {
+        max_age: PRESENCE_CACHE_TTL,
+        log: true,
+    };
     /// Shared, quiet.
-    pub(crate) const QUIET: Self = Self { max_age: PRESENCE_CACHE_TTL, log: false };
+    pub(crate) const QUIET: Self = Self {
+        max_age: PRESENCE_CACHE_TTL,
+        log: false,
+    };
     /// `/runs`' confirming read before it marks a run not reporting: a shared
     /// read under a second old, else a new one. Quiet.
-    pub(crate) const CONFIRM: Self = Self { max_age: Duration::from_secs(1), log: false };
+    pub(crate) const CONFIRM: Self = Self {
+        max_age: Duration::from_secs(1),
+        log: false,
+    };
     /// Always a new read (shared from then on). Quiet.
     #[cfg(test)]
-    pub(crate) const FRESH: Self = Self { max_age: Duration::ZERO, log: false };
+    pub(crate) const FRESH: Self = Self {
+        max_age: Duration::ZERO,
+        log: false,
+    };
 }
 
 /// The read of a presence key space every reader in this process shares: the
@@ -1080,7 +1169,13 @@ fn shared_presence<T: Clone>(
     let hub = *blake3::hash(url.expose_for_probe().as_bytes()).as_bytes();
     let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((h, at, read)) = slot.as_ref() {
-        if *h == hub && wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), how.max_age.min(PRESENCE_CACHE_TTL)) {
+        if *h == hub
+            && wall_clock_cache_is_fresh(
+                *at,
+                std::time::SystemTime::now(),
+                how.max_age.min(PRESENCE_CACHE_TTL),
+            )
+        {
             return read.clone();
         }
     }
@@ -1100,15 +1195,40 @@ fn shared_presence<T: Clone>(
 }
 
 /// The live machines' beats, shared ([`shared_presence`]).
-pub(crate) fn machine_beats(url: &darkmux_flow::RawRedisUrl, how: PresenceRead) -> (Vec<darkmux_flow::presence::PresenceBeat>, source_state::SourceState) {
+pub(crate) fn machine_beats(
+    url: &darkmux_flow::RawRedisUrl,
+    how: PresenceRead,
+) -> (
+    Vec<darkmux_flow::presence::PresenceBeat>,
+    source_state::SourceState,
+) {
     static SLOT: PresenceSlot<darkmux_flow::presence::PresenceBeat> = std::sync::Mutex::new(None);
-    shared_presence(&SLOT, url, "machines", how, darkmux_flow::presence::read_live)
+    shared_presence(
+        &SLOT,
+        url,
+        "machines",
+        how,
+        darkmux_flow::presence::read_live,
+    )
 }
 
 /// The live sessions' beats, shared ([`shared_presence`]).
-pub(crate) fn session_beats(url: &darkmux_flow::RawRedisUrl, how: PresenceRead) -> (Vec<darkmux_flow::session_presence::SessionBeat>, source_state::SourceState) {
-    static SLOT: PresenceSlot<darkmux_flow::session_presence::SessionBeat> = std::sync::Mutex::new(None);
-    shared_presence(&SLOT, url, "sessions", how, darkmux_flow::session_presence::read_live_sessions)
+pub(crate) fn session_beats(
+    url: &darkmux_flow::RawRedisUrl,
+    how: PresenceRead,
+) -> (
+    Vec<darkmux_flow::session_presence::SessionBeat>,
+    source_state::SourceState,
+) {
+    static SLOT: PresenceSlot<darkmux_flow::session_presence::SessionBeat> =
+        std::sync::Mutex::new(None);
+    shared_presence(
+        &SLOT,
+        url,
+        "sessions",
+        how,
+        darkmux_flow::session_presence::read_live_sessions,
+    )
 }
 
 /// The session and mission ids with a live beat right now (a mission's own
@@ -1123,10 +1243,17 @@ pub fn live_session_ids() -> Option<std::collections::HashSet<String>> {
 
 /// [`live_session_ids`] from the shared read (`QUIET`) or a new one (`FRESH`).
 fn live_session_ids_read(how: PresenceRead) -> Option<std::collections::HashSet<String>> {
-    let Some(url) = darkmux_flow::redis_url() else { return Some(Default::default()) };
+    let Some(url) = darkmux_flow::redis_url() else {
+        return Some(Default::default());
+    };
     let (beats, state) = session_beats(&url, how);
-    matches!(state, source_state::SourceState::Ok)
-        .then(|| beats.into_iter().flat_map(|b| [Some(b.session_id), b.mission_id]).flatten().collect())
+    matches!(state, source_state::SourceState::Ok).then(|| {
+        beats
+            .into_iter()
+            .flat_map(|b| [Some(b.session_id), b.mission_id])
+            .flatten()
+            .collect()
+    })
 }
 
 /// (#3432 review) `/runs`' not-reporting marks: judged on the shared beat
@@ -1193,14 +1320,22 @@ async fn fleet_dispatches_live_handler() -> axum::Json<wire::FleetDispatchesLive
     let redis_url = darkmux_flow::redis_url();
     let (beats, state) = match redis_url {
         Some(url) => tokio::task::spawn_blocking(move || session_beats(&url, PresenceRead::ROUTE))
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("darkmux serve: GET /fleet/dispatches/live task failed ({e})");
-            (Vec::new(), source_state::SourceState::Unavailable { detail: PRESENCE_READ_FAILED })
-        }),
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("darkmux serve: GET /fleet/dispatches/live task failed ({e})");
+                (
+                    Vec::new(),
+                    source_state::SourceState::Unavailable {
+                        detail: PRESENCE_READ_FAILED,
+                    },
+                )
+            }),
         None => (Vec::new(), source_state::SourceState::Off),
     };
-    axum::Json(wire::FleetDispatchesLiveResponse { dispatches: beats, meta: source_state::coverage_meta(&state) })
+    axum::Json(wire::FleetDispatchesLiveResponse {
+        dispatches: beats,
+        meta: source_state::coverage_meta(&state),
+    })
 }
 
 /// CORS layer for the daemon's browser-facing endpoints. **Default**:
@@ -1382,7 +1517,10 @@ fn build_startup_banner(
         "  viewer:   {}",
         darkmux_types::style::accent(&format!("http://{addr}/"))
     ));
-    lines.push(format!("  flow schema:    {}", darkmux_types::style::dim(flow_schema)));
+    lines.push(format!(
+        "  flow schema:    {}",
+        darkmux_types::style::dim(flow_schema)
+    ));
     lines.push(format!(
         "  flows dir:      {}",
         darkmux_types::style::dim(&flows_dir.display().to_string())
@@ -1428,7 +1566,10 @@ fn build_startup_banner(
 
     // (#881, #2988) Both auth postures, so the operator sees at a glance
     // what reads need and what execution needs.
-    lines.extend(auth_banner_lines(ServeAuth::resolve(), darkmux_types::config_access::fleet_listener_enabled()));
+    lines.extend(auth_banner_lines(
+        ServeAuth::resolve(),
+        darkmux_types::config_access::fleet_listener_enabled(),
+    ));
 
     if !flows_dir_exists {
         lines.push(darkmux_types::style::warn(
@@ -1850,7 +1991,11 @@ async fn health(
     // (#3112) The sandbox this daemon runs isolated work in; `None` when the
     // setting is refused (every launch through the daemon refuses it too).
     let daemon_sandbox = darkmux_sandbox::selected().ok();
-    let configured = if loopback_caller { sandbox_configured_now() } else { None };
+    let configured = if loopback_caller {
+        sandbox_configured_now()
+    } else {
+        None
+    };
     axum::Json(wire::HealthResponse {
         darkmux_version: env!("CARGO_PKG_VERSION").to_string(),
         build: darkmux_types::build_version(),
@@ -1875,7 +2020,7 @@ async fn health(
         docker_on_path: (loopback_caller
             && !(daemon_sandbox.is_some_and(darkmux_sandbox::BackendKind::on_host)
                 && configured.is_some_and(darkmux_sandbox::BackendKind::on_host)))
-            .then(darkmux_sandbox::DockerBackend::on_path),
+        .then(darkmux_sandbox::DockerBackend::on_path),
         sandbox: daemon_sandbox
             .filter(|_| loopback_caller)
             .map(|kind| darkmux_sandbox::setting_value(kind).to_string()),
@@ -1883,10 +2028,18 @@ async fn health(
         // Whether this daemon can publish to the fleet hub's flow stream
         // (`null` when no hub is configured), for this machine only: an
         // outage's reason is operator detail, not something a peer needs.
-        hub_link: if loopback_caller { darkmux_flow::hub_link() } else { None },
+        hub_link: if loopback_caller {
+            darkmux_flow::hub_link()
+        } else {
+            None
+        },
         // (#2916 re-review C3) The open-file soft limit this daemon runs
         // with (raised at start), for this machine only.
-        open_file_limit: if loopback_caller { current_open_file_limit() } else { None },
+        open_file_limit: if loopback_caller {
+            current_open_file_limit()
+        } else {
+            None
+        },
         // The lifecycle policy every run is judged by (`/runs`' own rows,
         // and the viewer's surfaces): cheap to read, so a page learns two
         // numbers without building the run union.
@@ -1912,7 +2065,10 @@ async fn health(
 pub fn current_open_file_limit() -> Option<u64> {
     // SAFETY: plain getrlimit on a stack struct.
     unsafe {
-        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         (libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0).then_some(lim.rlim_cur as u64)
     }
 }
@@ -1926,7 +2082,10 @@ pub fn current_open_file_limit() -> Option<u64> {
 pub fn raise_open_file_limit(target: u64) -> Option<(u64, u64)> {
     // SAFETY: plain getrlimit/setrlimit on a stack struct.
     unsafe {
-        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
             return None;
         }
@@ -1947,7 +2106,9 @@ pub fn raise_open_file_limit(target: u64) -> Option<(u64, u64)> {
 /// Both paths are canonicalized first (so a symlink out of the base is caught);
 /// missing paths return false.
 pub fn path_is_within(path: &StdPath, base_dir: &StdPath) -> bool {
-    let (Ok(canon_base), Ok(canon_path)) = (std::fs::canonicalize(base_dir), std::fs::canonicalize(path)) else {
+    let (Ok(canon_base), Ok(canon_path)) =
+        (std::fs::canonicalize(base_dir), std::fs::canonicalize(path))
+    else {
         return false;
     };
     canon_path.starts_with(&canon_base)
@@ -1964,7 +2125,10 @@ async fn missions_handler() -> axum::Json<wire::MissionsResponse> {
         Ok(Ok(m)) => m,
         _ => Vec::new(),
     };
-    axum::Json(wire::MissionsResponse { missions, generated_at_ms: current_millis() })
+    axum::Json(wire::MissionsResponse {
+        missions,
+        generated_at_ms: current_millis(),
+    })
 }
 
 /// (#3428) How many times this process has built the `/runs` list: the
@@ -1975,7 +2139,8 @@ pub(crate) static RUNS_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// [`RUNS_BUILDS`], once: a test's slow build, to hold a background rebuild
 /// in flight while it drives the requests around it.
 #[cfg(test)]
-pub(crate) static RUNS_BUILD_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static RUNS_BUILD_DELAY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// (#3428) How long one build of the `/runs` list is served while what it
 /// reads is unchanged. A build costs seconds on a busy machine (a 14-day fold
@@ -2044,22 +2209,38 @@ struct RebuildTicket {
 
 impl Drop for RebuildTicket {
     fn drop(&mut self) {
-        self.in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.in_flight
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 impl RunsCache {
     /// Whether a build of `sources` failed inside [`RUNS_CACHE_TTL`] of `now`.
-    fn backing_off(&self, sources: &(PathBuf, Option<PathBuf>), now: std::time::SystemTime) -> bool {
-        self.failed.as_ref().is_some_and(|(s, at)| s == sources && wall_clock_cache_is_fresh(*at, now, RUNS_CACHE_TTL))
+    fn backing_off(
+        &self,
+        sources: &(PathBuf, Option<PathBuf>),
+        now: std::time::SystemTime,
+    ) -> bool {
+        self.failed.as_ref().is_some_and(|(s, at)| {
+            s == sources && wall_clock_cache_is_fresh(*at, now, RUNS_CACHE_TTL)
+        })
     }
 
     /// The last build, while it read these sources and `inputs` and is
     /// younger than [`RUNS_CACHE_TTL`] at `now`.
-    fn fresh(&self, sources: &(PathBuf, Option<PathBuf>), inputs: u64, now: std::time::SystemTime) -> Option<BuiltRuns> {
+    fn fresh(
+        &self,
+        sources: &(PathBuf, Option<PathBuf>),
+        inputs: u64,
+        now: std::time::SystemTime,
+    ) -> Option<BuiltRuns> {
         self.built
             .as_ref()
-            .filter(|b| b.sources == *sources && b.inputs == inputs && wall_clock_cache_is_fresh(b.at, now, RUNS_CACHE_TTL))
+            .filter(|b| {
+                b.sources == *sources
+                    && b.inputs == inputs
+                    && wall_clock_cache_is_fresh(b.at, now, RUNS_CACHE_TTL)
+            })
             .cloned()
     }
 
@@ -2077,14 +2258,22 @@ impl RunsCache {
         let built = self
             .built
             .as_ref()
-            .filter(|b| b.sources == *sources && b.inputs == inputs && wall_clock_cache_is_fresh(b.at, now, RUNS_STALE_BOUND))?
+            .filter(|b| {
+                b.sources == *sources
+                    && b.inputs == inputs
+                    && wall_clock_cache_is_fresh(b.at, now, RUNS_STALE_BOUND)
+            })?
             .clone();
-        if self.rebuild_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .rebuild_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Some((built, None));
         }
         self.generation += 1;
         self.rebuilding = Some(self.generation);
-        self.rebuild_in_flight.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.rebuild_in_flight
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let ticket = RebuildTicket {
             generation: self.generation,
             in_flight: std::sync::Arc::clone(&self.rebuild_in_flight),
@@ -2125,7 +2314,9 @@ impl RunsCache {
                 Some(built)
             }
             Err(e) => {
-                eprintln!("darkmux serve: GET /runs aggregation task failed ({e}); serving no rows");
+                eprintln!(
+                    "darkmux serve: GET /runs aggregation task failed ({e}); serving no rows"
+                );
                 self.failed = Some((sources, now));
                 None
             }
@@ -2150,7 +2341,13 @@ fn runs_inputs(flows_dir: &StdPath) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let fleet = fleet_flow_records();
     fleet.records.len().hash(&mut h);
-    fleet.records.values().last().and_then(|v| v.get("hub_id")).and_then(|v| v.as_str()).hash(&mut h);
+    fleet
+        .records
+        .values()
+        .last()
+        .and_then(|v| v.get("hub_id"))
+        .and_then(|v| v.as_str())
+        .hash(&mut h);
     runs::hash_daemon_runs_records(flows_dir, &mut h);
     h.finish()
 }
@@ -2161,10 +2358,15 @@ fn build_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>, inputs: u64) ->
     let (at, built_at_ms) = (std::time::SystemTime::now(), current_millis());
     let fleet = fleet_flow_records();
     #[cfg(test)]
-    std::thread::sleep(Duration::from_millis(RUNS_BUILD_DELAY_MS.swap(0, std::sync::atomic::Ordering::SeqCst)));
+    std::thread::sleep(Duration::from_millis(
+        RUNS_BUILD_DELAY_MS.swap(0, std::sync::atomic::Ordering::SeqCst),
+    ));
     RUNS_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let built = runs::build_runs_for_daemon(&flows_dir, lab_dir.as_deref(), &fleet.records);
-    let off = |s: &usage_sum::UsageSplit| wire::OffRowUsage { calls: s.calls, tokens: s.total };
+    let off = |s: &usage_sum::UsageSplit| wire::OffRowUsage {
+        calls: s.calls,
+        tokens: s.total,
+    };
     BuiltRuns {
         off_rows: (off(&built.usage.no_run), off(&built.usage.unlisted)),
         rows: built.runs,
@@ -2192,7 +2394,9 @@ async fn served_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Optio
         return None;
     }
     let dir = sources.0.clone();
-    let inputs = tokio::task::spawn_blocking(move || runs_inputs(&dir)).await.ok()?;
+    let inputs = tokio::task::spawn_blocking(move || runs_inputs(&dir))
+        .await
+        .ok()?;
     if let Some(built) = slot.fresh(&sources, inputs, std::time::SystemTime::now()) {
         return Some(built);
     }
@@ -2203,20 +2407,32 @@ async fn served_runs_list(flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Optio
         return Some(built);
     }
     let (flows_dir, lab_dir) = sources.clone();
-    let built = tokio::task::spawn_blocking(move || build_runs_list(flows_dir, lab_dir, inputs)).await;
-    slot.record(sources, built.map_err(|e| e.to_string()), std::time::SystemTime::now())
+    let built =
+        tokio::task::spawn_blocking(move || build_runs_list(flows_dir, lab_dir, inputs)).await;
+    slot.record(
+        sources,
+        built.map_err(|e| e.to_string()),
+        std::time::SystemTime::now(),
+    )
 }
 
 /// Rebuild the `/runs` list of unchanged inputs in the background under
 /// `ticket`, and keep it while it is current ([`RunsCache::install_rebuild`]).
 /// The ticket is dropped when the rebuild returns, ending its in-flight mark.
-async fn rebuild_runs_list(ticket: RebuildTicket, sources: (PathBuf, Option<PathBuf>), inputs: u64) {
+async fn rebuild_runs_list(
+    ticket: RebuildTicket,
+    sources: (PathBuf, Option<PathBuf>),
+    inputs: u64,
+) {
     let (flows_dir, lab_dir) = sources.clone();
-    let built = tokio::task::spawn_blocking(move || build_runs_list(flows_dir, lab_dir, inputs)).await;
-    runs_cache()
-        .lock()
-        .await
-        .install_rebuild(&ticket, sources, built.map_err(|e| e.to_string()), std::time::SystemTime::now());
+    let built =
+        tokio::task::spawn_blocking(move || build_runs_list(flows_dir, lab_dir, inputs)).await;
+    runs_cache().lock().await.install_rebuild(
+        &ticket,
+        sources,
+        built.map_err(|e| e.to_string()),
+        std::time::SystemTime::now(),
+    );
 }
 
 /// GET /runs — the flat, kind-tagged, normalized run view-model (#1508 step
@@ -2244,7 +2460,13 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsRes
     let Some(built) = built else {
         return failed_runs_response();
     };
-    let BuiltRuns { mut rows, off_rows: (no_run, unlisted), fleet_state, built_at_ms, .. } = built;
+    let BuiltRuns {
+        mut rows,
+        off_rows: (no_run, unlisted),
+        fleet_state,
+        built_at_ms,
+        ..
+    } = built;
     // (#3428) The view and the live beats only mark running rows not
     // reporting, so a board with none reads neither: a gather is every peer's
     // card over the tailnet, a beat read a bounded hub connect.
@@ -2253,7 +2475,9 @@ async fn runs_handler(State(state): State<AppState>) -> axum::Json<wire::RunsRes
         let marked = tokio::task::spawn_blocking(move || {
             let live = live_session_ids();
             log_beat_read_once(live.is_none());
-            mark_not_reporting_served(&mut rows, view.as_ref(), live, || live_session_ids_read(PresenceRead::CONFIRM));
+            mark_not_reporting_served(&mut rows, view.as_ref(), live, || {
+                live_session_ids_read(PresenceRead::CONFIRM)
+            });
             rows
         })
         .await;
@@ -2283,7 +2507,9 @@ fn failed_runs_response() -> axum::Json<wire::RunsResponse> {
         no_run: Default::default(),
         unlisted: Default::default(),
         generated_at_ms: current_millis(),
-        meta: source_state::coverage_meta(&source_state::SourceState::Unavailable { detail: "the run aggregation failed" }),
+        meta: source_state::coverage_meta(&source_state::SourceState::Unavailable {
+            detail: "the run aggregation failed",
+        }),
         policy: runs::runs_policy(),
     })
 }
@@ -2299,7 +2525,10 @@ async fn phases_handler() -> axum::Json<wire::PhasesResponse> {
         Ok(Ok(s)) => s,
         _ => Vec::new(),
     };
-    axum::Json(wire::PhasesResponse { phases, generated_at_ms: current_millis() })
+    axum::Json(wire::PhasesResponse {
+        phases,
+        generated_at_ms: current_millis(),
+    })
 }
 
 // ─── Mission graph lens (#1284 Packet 5; folded into the React port #1868) ──
@@ -2366,7 +2595,12 @@ async fn mission_graph_json_handler(
             // that's already being polled.
             None => {
                 let fleet = fleet_flow_records();
-                match peer_graph::try_peer_graph(&id_owned, &flows_dir, &fleet.records, already_relayed) {
+                match peer_graph::try_peer_graph(
+                    &id_owned,
+                    &flows_dir,
+                    &fleet.records,
+                    already_relayed,
+                ) {
                     Some(graph) => Ok(GraphSource::Peer(graph)),
                     None => Ok(GraphSource::NotFound),
                 }
@@ -2486,8 +2720,14 @@ const LAB_SCAN_MAX_DEPTH: usize = 4;
 /// plus common tooling noise that can sit beside a corpus directory. Belt
 /// and suspenders alongside the depth cap: a checked-out repo tree can be
 /// deep and wide even within 4 levels.
-const LAB_SCAN_SKIP_DIRS: &[&str] =
-    &["worktrees", "cases", ".git", "node_modules", "__pycache__", "target"];
+const LAB_SCAN_SKIP_DIRS: &[&str] = &[
+    "worktrees",
+    "cases",
+    ".git",
+    "node_modules",
+    "__pycache__",
+    "target",
+];
 
 /// Max bytes read from `funnel-events.jsonl` in one `/lab/run/events` poll —
 /// bounds a first-poll backfill against a huge historical run. The endpoint's
@@ -2564,7 +2804,10 @@ pub struct LabRunSummary {
     /// The resolved per-seat staffing (model/k/max_tokens/n_ctx) this run
     /// actually used — `None` only for a brand-new live run whose first case
     /// hasn't completed yet (no `funnels.json` snapshot exists).
-    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "serialize_staffing_view")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_staffing_view"
+    )]
     #[cfg_attr(test, ts(as = "Option<wire::LabStaffing>", optional))]
     pub(crate) staffing: Option<darkmux_lab::lab::review::StaffingSnapshot>,
     #[cfg_attr(test, ts(type = "number"))]
@@ -2680,7 +2923,10 @@ fn serialize_staffing_view<S: serde::Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     use serde::Serialize;
-    staffing.as_ref().map(wire::LabStaffing::from).serialize(serializer)
+    staffing
+        .as_ref()
+        .map(wire::LabStaffing::from)
+        .serialize(serializer)
 }
 
 /// GET /lab/runs — every run cluster under the lab observer's scan root,
@@ -2715,8 +2961,15 @@ async fn lab_runs_handler(State(state): State<AppState>) -> axum::Json<wire::Lab
     };
     let shown = lab_dir.display().to_string();
     let exists = lab_dir.is_dir();
-    let runs = tokio::task::spawn_blocking(move || scan_lab_runs(&lab_dir)).await.unwrap_or_default();
-    axum::Json(wire::LabRunsResponse { configured: true, dir: Some(shown), exists, runs })
+    let runs = tokio::task::spawn_blocking(move || scan_lab_runs(&lab_dir))
+        .await
+        .unwrap_or_default();
+    axum::Json(wire::LabRunsResponse {
+        configured: true,
+        dir: Some(shown),
+        exists,
+        runs,
+    })
 }
 
 /// `pub(crate)` (was private until #1508 step 3) — the `/runs` aggregator
@@ -2751,9 +3004,13 @@ fn scan_lab_dir_rec(dir: &StdPath, lab_dir: &StdPath, depth: usize, out: &mut Ve
     // artifacts. Without it the scan cannot see a running lab run at all, and
     // it falls through to flow synthesis, displaying as an `untracked`
     // DISPATCH for its entire duration.
-    let has_lifecycle = dir.join(darkmux_lab::lab::lifecycle::LIFECYCLE_FILE).is_file();
+    let has_lifecycle = dir
+        .join(darkmux_lab::lab::lifecycle::LIFECYCLE_FILE)
+        .is_file();
     if has_reviews || has_events || has_scores || has_lifecycle {
-        if let Some(summary) = build_lab_run_summary(dir, lab_dir, has_reviews, has_events, has_scores) {
+        if let Some(summary) =
+            build_lab_run_summary(dir, lab_dir, has_reviews, has_events, has_scores)
+        {
             out.push(summary);
         }
         // Deliberately DOES NOT `return` here — a match does not stop the
@@ -2912,11 +3169,18 @@ fn build_lab_run_summary(
                     }
                 }
                 if crew.is_none() {
-                    crew = doc.extras.get("crew").and_then(|v| v.as_str()).map(str::to_string);
+                    crew = doc
+                        .extras
+                        .get("crew")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
                 }
                 if exec_mode.is_none() {
-                    exec_mode =
-                        doc.extras.get("exec_mode").and_then(|v| v.as_str()).map(str::to_string);
+                    exec_mode = doc
+                        .extras
+                        .get("exec_mode")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
                 }
             }
         }
@@ -3011,7 +3275,9 @@ fn build_lab_run_summary(
         run_ok,
         escalation: manifest.as_ref().and_then(|m| m.escalation.clone()),
         workload: manifest.as_ref().and_then(|m| m.workload.clone()),
-        verify_passed: manifest.as_ref().and_then(darkmux_lab::lab::manifest::RunManifest::verify_passed),
+        verify_passed: manifest
+            .as_ref()
+            .and_then(darkmux_lab::lab::manifest::RunManifest::verify_passed),
     })
 }
 
@@ -3023,7 +3289,6 @@ fn mtime_ms_of(path: &StdPath) -> std::io::Result<u64> {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0))
 }
-
 
 #[derive(serde::Deserialize)]
 struct LabDirQuery {
@@ -3068,7 +3333,12 @@ async fn lab_run_detail_handler(
     })
     .await
     .unwrap_or_default();
-    axum::Json(wire::LabRunDetailResponse { dir: dir_label, reviews, scores }).into_response()
+    axum::Json(wire::LabRunDetailResponse {
+        dir: dir_label,
+        reviews,
+        scores,
+    })
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -3131,7 +3401,11 @@ fn lab_bad_dir() -> Response {
 fn tail_lab_events(dir: &StdPath, offset: u64) -> wire::LabRunEventsResponse {
     let path = dir.join("funnel-events.jsonl");
     let finished = dir.join("scores.json").is_file();
-    let empty = |next_offset: u64| wire::LabRunEventsResponse { lines: Vec::new(), next_offset, finished };
+    let empty = |next_offset: u64| wire::LabRunEventsResponse {
+        lines: Vec::new(),
+        next_offset,
+        finished,
+    };
 
     let Ok(mut file) = std::fs::File::open(&path) else {
         return empty(offset);
@@ -3170,11 +3444,18 @@ fn tail_lab_events(dir: &StdPath, offset: u64) -> wire::LabRunEventsResponse {
         if line.is_empty() || line.len() > MAX_FLOW_LINE_BYTES {
             continue;
         }
-        if let Some(v) = std::str::from_utf8(line).ok().and_then(darkmux_flow::reader::parse_value) {
+        if let Some(v) = std::str::from_utf8(line)
+            .ok()
+            .and_then(darkmux_flow::reader::parse_value)
+        {
             lines.push(v);
         }
     }
-    wire::LabRunEventsResponse { lines, next_offset: offset + last_nl as u64 + 1, finished }
+    wire::LabRunEventsResponse {
+        lines,
+        next_offset: offset + last_nl as u64 + 1,
+        finished,
+    }
 }
 
 /// GET /machine/status — returns currently-loaded models (per `lms ps
@@ -3201,7 +3482,10 @@ async fn machine_status_handler() -> axum::Json<wire::MachineStatusResponse> {
 }
 
 /// `/machine/status`'s body for one residents read.
-pub(crate) fn machine_status_body(r: EngineResidents, read_at_ms: u64) -> wire::MachineStatusResponse {
+pub(crate) fn machine_status_body(
+    r: EngineResidents,
+    read_at_ms: u64,
+) -> wire::MachineStatusResponse {
     wire::MachineStatusResponse {
         lms_unreachable: r.unknown.is_some(),
         models: r.models,
@@ -3228,7 +3512,11 @@ impl ResidentsRead {
     pub(crate) fn now() -> Self {
         let residents = local_engine_residents();
         let ram_free_for_ai_bytes = darkmux_doctor::ai_headroom_bytes_with(&residents.models);
-        Self { residents, ram_free_for_ai_bytes, read_at_ms: current_millis() }
+        Self {
+            residents,
+            ram_free_for_ai_bytes,
+            read_at_ms: current_millis(),
+        }
     }
 }
 
@@ -3257,7 +3545,9 @@ pub(crate) fn served_engine_residents() -> ResidentsRead {
     );
     let mut slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((k, at, read)) = slot.as_ref() {
-        if *k == key && wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), SERVED_RESIDENTS_TTL) {
+        if *k == key
+            && wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), SERVED_RESIDENTS_TTL)
+        {
             return read.clone();
         }
     }
@@ -3309,10 +3599,22 @@ pub fn local_engine_residents() -> EngineResidents {
         reports_residency: matches!(engine.capabilities().residency, engine::Residency::Reported),
         usable: engine.usable(),
     };
-    let servers = darkmux_profiles::engine::server::listed(&darkmux_profiles::engine::server::Dirs::under_home());
+    let servers = darkmux_profiles::engine::server::listed(
+        &darkmux_profiles::engine::server::Dirs::under_home(),
+    );
     match engine.loaded() {
-        Ok(models) => EngineResidents { engine: view, models, unknown: None, servers },
-        Err(e) => EngineResidents { engine: view, models: Vec::new(), unknown: Some(format!("{e:#}")), servers },
+        Ok(models) => EngineResidents {
+            engine: view,
+            models,
+            unknown: None,
+            servers,
+        },
+        Err(e) => EngineResidents {
+            engine: view,
+            models: Vec::new(),
+            unknown: Some(format!("{e:#}")),
+            servers,
+        },
     }
 }
 
@@ -3337,8 +3639,13 @@ const MACHINE_RESOURCES_CACHE_TTL: Duration = Duration::from_secs(10);
 /// the `lms` binary ([`machine_resources_key`]), so a ledger gathered with
 /// one is never served for another.
 #[allow(clippy::type_complexity)]
-static MACHINE_RESOURCES_CACHE: std::sync::Mutex<Option<(String, std::time::SystemTime, darkmux_profiles::model_ledger::ModelLedger)>> =
-    std::sync::Mutex::new(None);
+static MACHINE_RESOURCES_CACHE: std::sync::Mutex<
+    Option<(
+        String,
+        std::time::SystemTime,
+        darkmux_profiles::model_ledger::ModelLedger,
+    )>,
+> = std::sync::Mutex::new(None);
 
 /// What a machine-resources ledger is gathered with: the engine setting and
 /// the `lms` binary.
@@ -3366,7 +3673,13 @@ fn machine_resources_cached_fresh() -> Option<darkmux_profiles::model_ledger::Mo
     let key = machine_resources_key();
     let guard = MACHINE_RESOURCES_CACHE.lock().ok()?;
     let (k, at, v) = guard.as_ref()?;
-    (*k == key && wall_clock_cache_is_fresh(*at, std::time::SystemTime::now(), MACHINE_RESOURCES_CACHE_TTL)).then(|| v.clone())
+    (*k == key
+        && wall_clock_cache_is_fresh(
+            *at,
+            std::time::SystemTime::now(),
+            MACHINE_RESOURCES_CACHE_TTL,
+        ))
+    .then(|| v.clone())
 }
 
 /// GET /machine/resources (#1286) — the live machine-scope memory ledger:
@@ -3395,7 +3708,9 @@ fn machine_resources_cached_fresh() -> Option<darkmux_profiles::model_ledger::Mo
 /// `host` block uses.
 /// The route's body for one ledger: the recorded cache cadence, and the host
 /// sampler's `load` block.
-fn machine_resources_body(ledger: darkmux_profiles::model_ledger::ModelLedger) -> wire::MachineResourcesResponse {
+fn machine_resources_body(
+    ledger: darkmux_profiles::model_ledger::ModelLedger,
+) -> wire::MachineResourcesResponse {
     wire::MachineResourcesResponse {
         ledger,
         // Recorded cadence knob (#1286 observer constraint 4).
@@ -3424,7 +3739,12 @@ async fn machine_resources_handler(
     let key = machine_resources_key();
     let ledger = tokio::task::spawn_blocking(|| darkmux_profiles::engine::local().ledger())
         .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "darkmux serve: memory-ledger gather panicked\n"))?;
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "darkmux serve: memory-ledger gather panicked\n",
+            )
+        })?;
     if let Ok(mut guard) = MACHINE_RESOURCES_CACHE.lock() {
         *guard = Some((key, std::time::SystemTime::now(), ledger.clone()));
     }
@@ -3492,9 +3812,14 @@ pub(crate) fn gather_served_specs() -> wire::MachineSpecsResponse {
 /// rest of the sheet is static). Blocking (it shells out); each probe is
 /// independent, so one failure never cascades.
 pub(crate) fn gather_specs_from(read: ResidentsRead) -> wire::MachineSpecsResponse {
-    let ResidentsRead { residents, ram_free_for_ai_bytes: ram_free, read_at_ms } = read;
+    let ResidentsRead {
+        residents,
+        ram_free_for_ai_bytes: ram_free,
+        read_at_ms,
+    } = read;
     let lms_unreachable = residents.unknown.is_some();
-    let (engine, loaded_models, engine_servers) = (residents.engine, residents.models, residents.servers);
+    let (engine, loaded_models, engine_servers) =
+        (residents.engine, residents.models, residents.servers);
     let ram_total = darkmux_hardware::ram_installed_bytes();
     let cpu_brand = darkmux_hardware::cpu_brand().map(str::to_string);
     let machine_id = darkmux_flow::resolve_machine_id();
@@ -3555,15 +3880,31 @@ pub(crate) fn gather_specs_from(read: ResidentsRead) -> wire::MachineSpecsRespon
 /// one of `loaded_models` is it, the ONE derivation behind the machine card's
 /// `utility_model` and `darkmux machine status`'s utility line. `None` when no
 /// utility model is registered or the registry cannot be read.
-pub fn local_utility_model(loaded_models: &[darkmux_types::LoadedModel]) -> Option<wire::UtilityModel> {
+pub fn local_utility_model(
+    loaded_models: &[darkmux_types::LoadedModel],
+) -> Option<wire::UtilityModel> {
     let lr = darkmux_profiles::profiles::load_registry(None).ok()?;
     let id = lr.registry.utility_model_id()?;
-    Some(utility_model(id, lr.registry.utility_model_n_ctx(), loaded_models))
+    Some(utility_model(
+        id,
+        lr.registry.utility_model_n_ctx(),
+        loaded_models,
+    ))
 }
 
-fn utility_model(id: &str, n_ctx: Option<u32>, loaded_models: &[darkmux_types::LoadedModel]) -> wire::UtilityModel {
-    let loaded = loaded_models.iter().any(|m| m.identifier == id || m.model == id);
-    wire::UtilityModel { id: id.to_string(), loaded, n_ctx }
+fn utility_model(
+    id: &str,
+    n_ctx: Option<u32>,
+    loaded_models: &[darkmux_types::LoadedModel],
+) -> wire::UtilityModel {
+    let loaded = loaded_models
+        .iter()
+        .any(|m| m.identifier == id || m.model == id);
+    wire::UtilityModel {
+        id: id.to_string(),
+        loaded,
+        n_ctx,
+    }
 }
 
 /// GET /flow/:date/stream — SSE-tails new flow records for a UTC day.
@@ -3585,7 +3926,10 @@ async fn flow_stream_handler(
     Path(date_raw): Path<String>,
     peer: Option<ConnectInfo<SocketAddr>>,
     headers: axum::http::HeaderMap,
-) -> Result<Sse<futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>>>, (StatusCode, &'static str)> {
+) -> Result<
+    Sse<futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>>>,
+    (StatusCode, &'static str),
+> {
     let Some(date) = is_valid_date(&date_raw) else {
         return Err((StatusCode::BAD_REQUEST, "bad date format"));
     };
@@ -3593,7 +3937,8 @@ async fn flow_stream_handler(
     // A reader that is neither this machine nor a token holder gets each event
     // line with host facts redacted (`redaction.rs`).
     let redaction: Option<Arc<redaction::Redaction>> =
-        (!caller_is_local_or_holds_token(peer.map(|c| c.0), &headers)).then(|| Arc::new(redaction::Redaction::derive()));
+        (!caller_is_local_or_holds_token(peer.map(|c| c.0), &headers))
+            .then(|| Arc::new(redaction::Redaction::derive()));
 
     // (#925) Bound concurrent SSE streams so a client can't exhaust
     // connections. fetch_add-then-check; roll back + 503 if over the cap.
@@ -3649,14 +3994,21 @@ async fn flow_stream_handler(
         // use the URL only for Client::open and never log it (they
         // pre-date the RawRedisUrl wrapper and handle the raw string
         // safely), so the secret stays unlogged. (#661 Slice 5)
-        let hub = redis_tail_lines(url.expose_for_probe().to_string(), stream_names, date_owned.clone());
+        let hub = redis_tail_lines(
+            url.expose_for_probe().to_string(),
+            stream_names,
+            date_owned.clone(),
+        );
         // What the hub never carries (a lab run's records, the 2 s generation
         // heartbeats) comes from this machine's own day file, as the file-tail
         // path sends it: the live channel's durable fallback, and the only
         // push a lab run has (it opts out of the live channel). The hub's own
         // records (work, prompt-phase and `hub_relay` beats) come from the hub
         // alone, so none arrives twice (`stays_off_hub`).
-        hub_then_local(Box::pin(hub), Box::pin(local_only_lines(&state.flows_dir, &date_owned).await))
+        hub_then_local(
+            Box::pin(hub),
+            Box::pin(local_only_lines(&state.flows_dir, &date_owned).await),
+        )
     } else {
         if redis_url.is_some() {
             eprintln!(
@@ -3665,7 +4017,10 @@ async fn flow_stream_handler(
             );
         }
         let path = state.flows_dir.join(format!("{date_owned}.jsonl"));
-        let start_offset = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+        let start_offset = tokio::fs::metadata(&path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         Box::pin(tail_lines(path, start_offset))
     };
     let event_stream = redacted_events(lines, redaction.clone());
@@ -3719,7 +4074,11 @@ fn ending_with_first<T: Send + 'static>(
     // `first` arrives as `Some`, then one `None` marks its end; `second` is
     // always `Some`. The merged stream stops at that `None`.
     let first = first.map(Some).chain(futures::stream::once(async { None }));
-    Box::pin(futures::stream::select(first, second.map(Some)).take_while(|e| std::future::ready(e.is_some())).filter_map(std::future::ready))
+    Box::pin(
+        futures::stream::select(first, second.map(Some))
+            .take_while(|e| std::future::ready(e.is_some()))
+            .filter_map(std::future::ready),
+    )
 }
 
 /// GET /flow/:date — returns flow records for a UTC day.
@@ -3750,8 +4109,11 @@ async fn flow_handler(
         return (StatusCode::BAD_REQUEST, "bad date format").into_response();
     };
     let scan_start = std::time::Instant::now();
-    let DayRead { mut records, fleet_state, cut } =
-        aggregate_flow_records_for_date(date, &state.flows_dir).await;
+    let DayRead {
+        mut records,
+        fleet_state,
+        cut,
+    } = aggregate_flow_records_for_date(date, &state.flows_dir).await;
     let records_scanned = records.len();
     // Each source reports its own cut (the local file hit its cap, Redis's
     // newest-`COUNT` read ended inside the date or the stream starts after
@@ -3812,7 +4174,10 @@ async fn flow_days_handler(State(state): State<AppState>) -> axum::Json<wire::Fl
     let days = tokio::task::spawn_blocking(move || scan_flow_days(&dir))
         .await
         .unwrap_or_default();
-    axum::Json(wire::FlowDaysResponse { days, generated_at_ms: current_millis() })
+    axum::Json(wire::FlowDaysResponse {
+        days,
+        generated_at_ms: current_millis(),
+    })
 }
 
 /// Every `YYYY-MM-DD.jsonl` file in `flows_dir`, summarized, newest day
@@ -3888,7 +4253,10 @@ fn flow_day_files(flows_dir: &std::path::Path) -> Vec<(String, std::path::PathBu
 /// schema header skipped; an unreadable line ends the file. `false` when the
 /// file could not be opened or a line could not be read, so the records seen
 /// may not be all of it.
-fn for_each_record_in_day_file(path: &std::path::Path, mut visit: impl FnMut(&serde_json::Value)) -> bool {
+fn for_each_record_in_day_file(
+    path: &std::path::Path,
+    mut visit: impl FnMut(&serde_json::Value),
+) -> bool {
     use std::io::BufRead;
     let Ok(file) = std::fs::File::open(path) else {
         return false;
@@ -3977,7 +4345,9 @@ pub(crate) fn for_each_flow_record_in_day_range(
 /// across all day files, with a rollup (records, dispatch count, date span, ts
 /// span, machines), newest-activity first. The viewer lists these so you can
 /// "replay the mission" instead of hunting through days (#691). Disk-backed.
-async fn flow_missions_handler(State(state): State<AppState>) -> axum::Json<wire::FlowMissionsResponse> {
+async fn flow_missions_handler(
+    State(state): State<AppState>,
+) -> axum::Json<wire::FlowMissionsResponse> {
     let dir = state.flows_dir.clone();
     // (#1705) The fleet read happens INSIDE the same blocking task as the
     // day-file walk — one `spawn_blocking`, not two round trips.
@@ -3994,7 +4364,9 @@ async fn flow_missions_handler(State(state): State<AppState>) -> axum::Json<wire
         );
         (
             Vec::new(),
-            source_state::SourceState::Unavailable { detail: "the mission aggregation failed" },
+            source_state::SourceState::Unavailable {
+                detail: "the mission aggregation failed",
+            },
         )
     });
     axum::Json(wire::FlowMissionsResponse {
@@ -4006,7 +4378,8 @@ async fn flow_missions_handler(State(state): State<AppState>) -> axum::Json<wire
 
 /// (#3428) How many day files the missions catalog has read: the instrument
 /// a test reads to prove a repeated scan re-reads only what changed.
-pub(crate) static MISSION_DAY_FILE_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static MISSION_DAY_FILE_READS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// One record's part in the missions catalog: what [`scan_flow_missions`]
 /// folds, and its identity (computed from the whole record, so the fleet
@@ -4041,12 +4414,23 @@ impl MarkStrings {
 
 impl MissionMark {
     /// `None` for a record that names no mission.
-    fn of(v: &serde_json::Value, identity: RecordIdentity, strings: &mut MarkStrings) -> Option<Self> {
-        let mission_id = v.get("mission_id").and_then(|m| m.as_str()).filter(|m| !m.is_empty())?;
-        let dispatch = (darkmux_flow::reader::action_of(v) == Some(darkmux_flow::FlowAction::DispatchStart))
-            .then(|| darkmux_flow::reader::execution_id_of(v).map(|id| id.to_string().into_boxed_str()))
-            .flatten();
-        let machine = v.get("machine_id").and_then(|m| m.as_str()).filter(|m| !m.is_empty());
+    fn of(
+        v: &serde_json::Value,
+        identity: RecordIdentity,
+        strings: &mut MarkStrings,
+    ) -> Option<Self> {
+        let mission_id = v
+            .get("mission_id")
+            .and_then(|m| m.as_str())
+            .filter(|m| !m.is_empty())?;
+        let dispatch = (darkmux_flow::reader::action_of(v)
+            == Some(darkmux_flow::FlowAction::DispatchStart))
+        .then(|| darkmux_flow::reader::execution_id_of(v).map(|id| id.to_string().into_boxed_str()))
+        .flatten();
+        let machine = v
+            .get("machine_id")
+            .and_then(|m| m.as_str())
+            .filter(|m| !m.is_empty());
         Some(Self {
             identity,
             mission_id: strings.get(mission_id),
@@ -4064,9 +4448,12 @@ impl MissionMark {
 /// never kept, so the next scan tries again. Blocking.
 fn day_mission_records(path: &std::path::Path) -> std::sync::Arc<Vec<MissionMark>> {
     type Marks = std::sync::Arc<Vec<MissionMark>>;
-    type Cache = std::collections::HashMap<std::path::PathBuf, (u64, Option<std::time::SystemTime>, Marks)>;
+    type Cache =
+        std::collections::HashMap<std::path::PathBuf, (u64, Option<std::time::SystemTime>, Marks)>;
     static CACHE: std::sync::Mutex<Option<Cache>> = std::sync::Mutex::new(None);
-    let stamp = std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()));
+    let stamp = std::fs::metadata(path)
+        .ok()
+        .map(|m| (m.len(), m.modified().ok()));
     if let Some((len, modified)) = stamp {
         let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((l, m, marks)) = cache.as_ref().and_then(|c| c.get(path)) {
@@ -4085,7 +4472,9 @@ fn day_mission_records(path: &std::path::Path) -> std::sync::Arc<Vec<MissionMark
     // Stamped as read before the read, so a write during it reads again next time.
     if let (true, Some((len, modified))) = (whole, stamp) {
         let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-        cache.get_or_insert_with(Cache::new).insert(path.to_path_buf(), (len, modified, marks.clone()));
+        cache
+            .get_or_insert_with(Cache::new)
+            .insert(path.to_path_buf(), (len, modified, marks.clone()));
     }
     marks
 }
@@ -4124,15 +4513,17 @@ fn scan_flow_missions(
     // The per-record fold, shared by both sources so they cannot drift.
     let fold = |by_mission: &mut HashMap<String, Agg>, date: &str, mark: &MissionMark| {
         let ts = &*mark.ts;
-        let e = by_mission.entry(mark.mission_id.to_string()).or_insert_with(|| Agg {
-            records: 0,
-            dispatches: BTreeSet::new(),
-            machines: BTreeSet::new(),
-            first_ts: ts.to_string(),
-            last_ts: ts.to_string(),
-            first_date: date.to_string(),
-            last_date: date.to_string(),
-        });
+        let e = by_mission
+            .entry(mark.mission_id.to_string())
+            .or_insert_with(|| Agg {
+                records: 0,
+                dispatches: BTreeSet::new(),
+                machines: BTreeSet::new(),
+                first_ts: ts.to_string(),
+                last_ts: ts.to_string(),
+                first_date: date.to_string(),
+                last_date: date.to_string(),
+            });
         e.records += 1;
         if !ts.is_empty() {
             if e.first_ts.is_empty() || ts < e.first_ts.as_str() {
@@ -4148,8 +4539,10 @@ fn scan_flow_missions(
         if date > e.last_date.as_str() {
             e.last_date = date.to_string();
         }
-        e.dispatches.extend(mark.dispatch.as_deref().map(str::to_string));
-        e.machines.extend(mark.machine.as_deref().map(str::to_string));
+        e.dispatches
+            .extend(mark.dispatch.as_deref().map(str::to_string));
+        e.machines
+            .extend(mark.machine.as_deref().map(str::to_string));
     };
 
     // Fleet first — its records win the de-dup (see this function's doc).
@@ -4285,13 +4678,24 @@ async fn catalog_records_response(
             }
             let mut days_scanned = 0usize;
             if key == RecordKey::Dispatch {
-                let join_stats =
-                    join_host_samples_into_session_records(&dir, &fleet.records, &mut records, current_millis());
+                let join_stats = join_host_samples_into_session_records(
+                    &dir,
+                    &fleet.records,
+                    &mut records,
+                    current_millis(),
+                );
                 days_scanned = join_stats.days_scanned;
                 records_scanned += join_stats.records_scanned;
             }
             let scan_ms = scan_start.elapsed().as_millis() as u64;
-            (records, truncated, fleet.state, scan_ms, days_scanned, records_scanned)
+            (
+                records,
+                truncated,
+                fleet.state,
+                scan_ms,
+                days_scanned,
+                records_scanned,
+            )
         })
         .await
         .unwrap_or_else(|e| {
@@ -4301,7 +4705,9 @@ async fn catalog_records_response(
             (
                 Vec::new(),
                 false,
-                source_state::SourceState::Unavailable { detail: "the record collection failed" },
+                source_state::SourceState::Unavailable {
+                    detail: "the record collection failed",
+                },
                 0,
                 0,
                 0,
@@ -4333,7 +4739,8 @@ fn collect_records_by_field(
     let mut records: Vec<serde_json::Value> = Vec::new();
     let mut truncated = false;
     let mut records_scanned = 0usize;
-    let mut fleet_seen: std::collections::HashSet<RecordIdentity> = std::collections::HashSet::new();
+    let mut fleet_seen: std::collections::HashSet<RecordIdentity> =
+        std::collections::HashSet::new();
     for r in fleet.iter() {
         // `field` is a top-level id, held in the compact form; the route
         // serves the whole record (#3217).
@@ -4348,14 +4755,18 @@ fn collect_records_by_field(
         records.push(r.full());
     }
     if !truncated {
-        (truncated, records_scanned) = collect_local_records_by_field(flows_dir, field, id, &fleet_seen, &mut records);
+        (truncated, records_scanned) =
+            collect_local_records_by_field(flows_dir, field, id, &fleet_seen, &mut records);
     }
     // Two sources, one timeline: the local walk is chronological on its own
     // and so is the fleet slice, but concatenated they interleave. The
     // endpoint's contract (and its test) is chronological order.
     records.sort_by(|a, b| {
         let ts = |r: &serde_json::Value| {
-            r.get("ts").and_then(|t| t.as_str()).unwrap_or_default().to_string()
+            r.get("ts")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default()
+                .to_string()
         };
         ts(a).cmp(&ts(b))
     });
@@ -4376,7 +4787,10 @@ fn collect_local_records_by_field(
     records: &mut Vec<serde_json::Value>,
 ) -> (bool, usize) {
     let (mut truncated, mut scanned) = (false, 0usize);
-    let days = day_index::DAY_INDEX.days(flows_dir).into_iter().filter(|d| d.summary.holds(field, id) != Some(false));
+    let days = day_index::DAY_INDEX
+        .days(flows_dir)
+        .into_iter()
+        .filter(|d| d.summary.holds(field, id) != Some(false));
     for day in days {
         for_each_record_in_day_file(&day.path, |v| {
             scanned += 1;
@@ -4440,10 +4854,15 @@ fn join_host_samples_into_session_records(
 ) -> HostSampleJoinStats {
     use darkmux_flow::{Edge, FlowAction};
     let fleet: FleetRecords = fleet.into();
-    let edge = |r: &serde_json::Value| darkmux_flow::reader::action_of(r).and_then(|a| a.bookend()).map(|b| b.edge);
+    let edge = |r: &serde_json::Value| {
+        darkmux_flow::reader::action_of(r)
+            .and_then(|a| a.bookend())
+            .map(|b| b.edge)
+    };
     let is_start = |r: &serde_json::Value| edge(r) == Some(Edge::Start);
     let is_terminal = |r: &serde_json::Value| {
-        edge(r).is_some_and(Edge::is_terminal) || darkmux_flow::reader::action_of(r) == Some(FlowAction::SessionEnd)
+        edge(r).is_some_and(Edge::is_terminal)
+            || darkmux_flow::reader::action_of(r) == Some(FlowAction::SessionEnd)
     };
     // (live finding, 2026-09-06) `machine_uid` must come from the
     // dispatch-START record specifically, matching what the CLIENT gates
@@ -4461,15 +4880,27 @@ fn join_host_samples_into_session_records(
         .iter()
         .find(|r| is_start(r))
         .and_then(|r| r.get("machine_uid").and_then(|m| m.as_str()))
-        .or_else(|| records.iter().find_map(|r| r.get("machine_uid").and_then(|m| m.as_str())))
+        .or_else(|| {
+            records
+                .iter()
+                .find_map(|r| r.get("machine_uid").and_then(|m| m.as_str()))
+        })
         .map(str::to_string)
     else {
         return HostSampleJoinStats::default();
     };
     let ts_ms = |r: &serde_json::Value| -> Option<u64> {
-        r.get("ts").and_then(|t| t.as_str()).and_then(runs::parse_flow_ts).map(|secs| secs.saturating_mul(1000))
+        r.get("ts")
+            .and_then(|t| t.as_str())
+            .and_then(runs::parse_flow_ts)
+            .map(|secs| secs.saturating_mul(1000))
     };
-    let Some(start_ms) = records.iter().filter(|r| is_start(r)).filter_map(ts_ms).min() else {
+    let Some(start_ms) = records
+        .iter()
+        .filter(|r| is_start(r))
+        .filter_map(ts_ms)
+        .min()
+    else {
         return HostSampleJoinStats::default();
     };
     // (#2413 round 3 CONSIDER 1) An open/abandoned run (no terminal
@@ -4490,7 +4921,12 @@ fn join_host_samples_into_session_records(
     // dead), so extending its join window further into the future only
     // gives it a chance to absorb the NEXT run's host samples on the same
     // machine. A dead run's window ends where its own evidence ends.
-    let end_ms = match records.iter().filter(|r| is_terminal(r)).filter_map(ts_ms).max() {
+    let end_ms = match records
+        .iter()
+        .filter(|r| is_terminal(r))
+        .filter_map(ts_ms)
+        .max()
+    {
         Some(t) => t,
         None => {
             let last_own_ts = records.iter().filter_map(ts_ms).max().unwrap_or(start_ms);
@@ -4519,22 +4955,36 @@ fn join_host_samples_into_session_records(
     // live run pane polls every 5s.
     let from_day = runs::day_string_from_epoch_ms(start_ms);
     let to_day = runs::day_string_from_epoch_ms(end_ms);
-    let days_scanned = for_each_flow_record_in_day_range(flows_dir, &from_day, &to_day, |_date, v| {
-        records_scanned += 1;
-        if runs::is_host_sample_in_window(v, &machine_uid, start_ms, end_ms) && !seen.contains(&RecordIdentity::of(v)) {
-            joined.push(v.clone());
-        }
-        std::ops::ControlFlow::Continue(())
-    });
+    let days_scanned =
+        for_each_flow_record_in_day_range(flows_dir, &from_day, &to_day, |_date, v| {
+            records_scanned += 1;
+            if runs::is_host_sample_in_window(v, &machine_uid, start_ms, end_ms)
+                && !seen.contains(&RecordIdentity::of(v))
+            {
+                joined.push(v.clone());
+            }
+            std::ops::ControlFlow::Continue(())
+        });
     if joined.is_empty() {
-        return HostSampleJoinStats { days_scanned, records_scanned };
+        return HostSampleJoinStats {
+            days_scanned,
+            records_scanned,
+        };
     }
     records.extend(joined);
     records.sort_by(|a, b| {
-        let ts = |r: &serde_json::Value| r.get("ts").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+        let ts = |r: &serde_json::Value| {
+            r.get("ts")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
         ts(a).cmp(&ts(b))
     });
-    HostSampleJoinStats { days_scanned, records_scanned }
+    HostSampleJoinStats {
+        days_scanned,
+        records_scanned,
+    }
 }
 
 /// Aggregate the day's flow records — Redis-when-available, file-otherwise.
@@ -4567,17 +5017,17 @@ struct DayRead {
     cut: wire::CutSources,
 }
 
-async fn aggregate_flow_records_for_date(
-    date: &str,
-    flows_dir: &std::path::Path,
-) -> DayRead {
+async fn aggregate_flow_records_for_date(date: &str, flows_dir: &std::path::Path) -> DayRead {
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
     if darkmux_flow::redis_url().is_none() {
         let local = read_flow_records_from_file(date, flows_dir).await;
         return DayRead {
             records: local.records,
             fleet_state: source_state::SourceState::Off,
-            cut: wire::CutSources { local: local.cut, fleet: false },
+            cut: wire::CutSources {
+                local: local.cut,
+                fleet: false,
+            },
         };
     }
 
@@ -4598,22 +5048,34 @@ async fn aggregate_flow_records_for_date(
     let date_owned = date.to_string();
     let window_task = tokio::task::spawn_blocking(move || {
         hub_day(&date_owned, fleet_flow_records_in, || {
-            let url = darkmux_flow::redis_url().ok_or_else(|| anyhow::anyhow!("no hub configured"))?;
-            read_flow_records_from_redis(url.expose_for_probe(), Some(&date_owned), FleetScope::WithSamples)
+            let url =
+                darkmux_flow::redis_url().ok_or_else(|| anyhow::anyhow!("no hub configured"))?;
+            read_flow_records_from_redis(
+                url.expose_for_probe(),
+                Some(&date_owned),
+                FleetScope::WithSamples,
+            )
         })
     });
-    let (window, local_records) = tokio::join!(window_task, read_flow_records_from_file(date, flows_dir));
+    let (window, local_records) =
+        tokio::join!(window_task, read_flow_records_from_file(date, flows_dir));
 
     match window {
         Ok((Some(day), state)) => DayRead {
             records: union_flow_records(day.records, local_records.records),
             fleet_state: state,
-            cut: wire::CutSources { local: local_records.cut, fleet: day.cut },
+            cut: wire::CutSources {
+                local: local_records.cut,
+                fleet: day.cut,
+            },
         },
         Ok((None, state)) => DayRead {
             records: local_records.records,
             fleet_state: state,
-            cut: wire::CutSources { local: local_records.cut, fleet: false },
+            cut: wire::CutSources {
+                local: local_records.cut,
+                fleet: false,
+            },
         },
         Err(e) => {
             eprintln!(
@@ -4622,8 +5084,13 @@ async fn aggregate_flow_records_for_date(
             );
             DayRead {
                 records: local_records.records,
-                fleet_state: source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL },
-                cut: wire::CutSources { local: local_records.cut, fleet: false },
+                fleet_state: source_state::SourceState::Unavailable {
+                    detail: FLEET_READ_ERROR_DETAIL,
+                },
+                cut: wire::CutSources {
+                    local: local_records.cut,
+                    fleet: false,
+                },
             }
         }
     }
@@ -4654,7 +5121,10 @@ fn hub_day(
         },
         _ => {
             let work = window(FleetScope::Work);
-            (Some(fleet_day_records(date, &fleet.records, &work.records)), fleet.state)
+            (
+                Some(fleet_day_records(date, &fleet.records, &work.records)),
+                fleet.state,
+            )
         }
     }
 }
@@ -4693,9 +5163,18 @@ fn union_flow_records(
     let seen: std::collections::HashSet<String> =
         redis_records.iter().map(flow_record_identity).collect();
     let mut out = redis_records;
-    out.extend(local_records.into_iter().filter(|r| !seen.contains(&flow_record_identity(r))));
+    out.extend(
+        local_records
+            .into_iter()
+            .filter(|r| !seen.contains(&flow_record_identity(r))),
+    );
     out.sort_by(|a, b| {
-        let ts = |r: &serde_json::Value| r.get("ts").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+        let ts = |r: &serde_json::Value| {
+            r.get("ts")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned()
+        };
         ts(a).cmp(&ts(b))
     });
     out
@@ -4733,7 +5212,9 @@ fn wall_clock_cache_is_fresh(
     now: std::time::SystemTime,
     ttl: std::time::Duration,
 ) -> bool {
-    now.duration_since(captured).map(|age| age < ttl).unwrap_or(false)
+    now.duration_since(captured)
+        .map(|age| age < ttl)
+        .unwrap_or(false)
 }
 
 /// What one fleet read produced: the records, AND how completely they cover
@@ -4844,7 +5325,11 @@ impl<'a> FleetSnapshotOut<'a> {
             source_state::SourceState::Unavailable { .. } => ("unavailable", None),
             source_state::SourceState::Off => ("off", None),
         };
-        FleetSnapshotOut { kind, age_ms, compact_records: read.records.to_snapshot() }
+        FleetSnapshotOut {
+            kind,
+            age_ms,
+            compact_records: read.records.to_snapshot(),
+        }
     }
 }
 
@@ -4861,13 +5346,16 @@ impl FleetSnapshotFile {
                 age_ms: self.age_ms.unwrap_or(0),
                 detail: FLEET_READ_ERROR_DETAIL,
             },
-            "unavailable" => {
-                source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL }
-            }
+            "unavailable" => source_state::SourceState::Unavailable {
+                detail: FLEET_READ_ERROR_DETAIL,
+            },
             "off" => source_state::SourceState::Off,
             _ => return None,
         };
-        Some(FleetRead { records: FleetRecords::from_snapshot(self.compact_records)?, state })
+        Some(FleetRead {
+            records: FleetRecords::from_snapshot(self.compact_records)?,
+            state,
+        })
     }
 }
 
@@ -4877,13 +5365,18 @@ impl FleetSnapshotFile {
 /// dropping it deletes the file. These records are real operator flow
 /// data, so the file is scoped to one handoff and never left behind.
 /// Streamed to the file, never assembled in memory first (#3217).
-pub(crate) fn write_fleet_snapshot_file(read: &FleetRead) -> std::io::Result<tempfile::NamedTempFile> {
+pub(crate) fn write_fleet_snapshot_file(
+    read: &FleetRead,
+) -> std::io::Result<tempfile::NamedTempFile> {
     use std::io::Write;
-    let mut file = tempfile::Builder::new().prefix("darkmux-fleet-snapshot-").tempfile()?;
+    let mut file = tempfile::Builder::new()
+        .prefix("darkmux-fleet-snapshot-")
+        .tempfile()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     {
         let mut out = std::io::BufWriter::new(file.as_file_mut());
@@ -4932,7 +5425,12 @@ pub(crate) fn fleet_flow_records() -> FleetRead {
 /// age report reads as maximally stale ([`wall_clock_age_ms_at`]).
 fn fleet_flow_records_in(scope: FleetScope) -> FleetRead {
     static FLEET_CACHES: std::sync::OnceLock<FleetCaches> = std::sync::OnceLock::new();
-    read_fleet_cached(FLEET_CACHES.get_or_init(FleetCaches::default), scope, std::time::SystemTime::now(), darkmux_flow::redis_url)
+    read_fleet_cached(
+        FLEET_CACHES.get_or_init(FleetCaches::default),
+        scope,
+        std::time::SystemTime::now(),
+        darkmux_flow::redis_url,
+    )
 }
 
 /// A sync Redis connection with the connect AND every reply bounded (#278,
@@ -4947,11 +5445,13 @@ fn fleet_flow_records_in(scope: FleetScope) -> FleetRead {
 /// connect the flow sinks already use, bounds the whole of it.
 fn bounded_redis_connection(url: &str, what: &str) -> anyhow::Result<redis::Connection> {
     use anyhow::Context;
-    let client = redis::Client::open(url).with_context(|| format!("opening Redis client for {what}"))?;
+    let client =
+        redis::Client::open(url).with_context(|| format!("opening Redis client for {what}"))?;
     // Bounded by REDIS_CONNECT_TIMEOUT (#278), the setup included: twice it,
     // wall clock.
-    let conn = darkmux_flow::open_redis_connection_bounded(&client, darkmux_flow::REDIS_CONNECT_TIMEOUT)
-        .with_context(|| format!("connecting to Redis for {what}"))?;
+    let conn =
+        darkmux_flow::open_redis_connection_bounded(&client, darkmux_flow::REDIS_CONNECT_TIMEOUT)
+            .with_context(|| format!("connecting to Redis for {what}"))?;
     // (#1570) The connect above is bounded; the reads after it were not.
     // This is the exact read that took 30s and 408'd the viewer.
     bound_redis_response(&conn);
@@ -4990,39 +5490,43 @@ fn read_flow_records_from_redis(
     // NOTE: never interpolate `url` into a log/error — it may carry an inline
     // password (the env-URL tier). Use the non-secret `{date}` for context.
     // (#661 Slice 5 — sealing a pre-existing raw-URL log the audit flagged.)
-    let mut conn = bounded_redis_connection(url, &format!("/flow aggregation (date {date_label})"))?;
+    let mut conn =
+        bounded_redis_connection(url, &format!("/flow aggregation (date {date_label})"))?;
     let stream = darkmux_types::config_access::redis_stream(); // (#875)
     let telemetry_stream = darkmux_types::config_access::redis_telemetry_stream(); // (#2101)
-    // (#809) NEWEST-first read. The stream rides at its `MAXLEN ~` cap once
-    // the fleet has been busy long enough (XLEN floats a little above the
-    // cap — trimming is lazy), and an oldest-first `XRANGE - + COUNT N`
-    // then silently DROPS the newest entries — the live view loses exactly
-    // the most recent records at exactly the busiest moment (found live: a
-    // just-written record "not showing"). XREVRANGE makes
-    // cap-saturation cut the OLDEST entries instead, which the date filter
-    // below mostly discards anyway. Entries are reversed after parsing so
-    // callers still see chronological order.
-    //
-    // (#2409) This `COUNT 10000` has the SAME dispatch-liveness-bookend hole
-    // `read_flow_records_from_file` had — a busy stream can push a
-    // `dispatch.start` below this cap the same way a busy day file could,
-    // and cross-system contract 2 (dispatch liveness) applies here too. NOT
-    // fixed in this pass: unlike the local file (a plain sequential scan
-    // that can special-case `action`), a Redis stream has no server-side
-    // filter-by-field read, so keeping every bookend here means an
-    // unbounded or separately-capped second read of the stream — a real
-    // design decision, not a drop-in mirror of the file-path fix. Tracked as
-    // #2409's own follow-up (the local-file union in
-    // `aggregate_flow_records_for_date` already means a client hitting the
-    // Redis-configured path still gets the file path's bookend guarantee
-    // for records durable on THIS machine; only the Redis-only view of a
-    // remote peer's history is still exposed to this cap).
-    // (#2101) Both hub streams in ONE round trip (a tailnet read of this size
-    // costs ~344ms): the work records and the machine samples, which ride
-    // separate streams so samples cannot evict work records.
+                                                                                   // (#809) NEWEST-first read. The stream rides at its `MAXLEN ~` cap once
+                                                                                   // the fleet has been busy long enough (XLEN floats a little above the
+                                                                                   // cap — trimming is lazy), and an oldest-first `XRANGE - + COUNT N`
+                                                                                   // then silently DROPS the newest entries — the live view loses exactly
+                                                                                   // the most recent records at exactly the busiest moment (found live: a
+                                                                                   // just-written record "not showing"). XREVRANGE makes
+                                                                                   // cap-saturation cut the OLDEST entries instead, which the date filter
+                                                                                   // below mostly discards anyway. Entries are reversed after parsing so
+                                                                                   // callers still see chronological order.
+                                                                                   //
+                                                                                   // (#2409) This `COUNT 10000` has the SAME dispatch-liveness-bookend hole
+                                                                                   // `read_flow_records_from_file` had — a busy stream can push a
+                                                                                   // `dispatch.start` below this cap the same way a busy day file could,
+                                                                                   // and cross-system contract 2 (dispatch liveness) applies here too. NOT
+                                                                                   // fixed in this pass: unlike the local file (a plain sequential scan
+                                                                                   // that can special-case `action`), a Redis stream has no server-side
+                                                                                   // filter-by-field read, so keeping every bookend here means an
+                                                                                   // unbounded or separately-capped second read of the stream — a real
+                                                                                   // design decision, not a drop-in mirror of the file-path fix. Tracked as
+                                                                                   // #2409's own follow-up (the local-file union in
+                                                                                   // `aggregate_flow_records_for_date` already means a client hitting the
+                                                                                   // Redis-configured path still gets the file path's bookend guarantee
+                                                                                   // for records durable on THIS machine; only the Redis-only view of a
+                                                                                   // remote peer's history is still exposed to this cap).
+                                                                                   // (#2101) Both hub streams in ONE round trip (a tailnet read of this size
+                                                                                   // costs ~344ms): the work records and the machine samples, which ride
+                                                                                   // separate streams so samples cannot evict work records.
     let xrevrange = |stream: &str| {
         let mut cmd = redis::cmd("XREVRANGE");
-        cmd.arg(stream).arg("+").arg("-").arg("COUNT")
+        cmd.arg(stream)
+            .arg("+")
+            .arg("-")
+            .arg("COUNT")
             // (#1715) Was a bare `10000` literal, independent of the
             // `MAX_FLOW_FILE_RECORDS` const defined below in this file —
             // matched by convention, not enforced. Single-sourced now.
@@ -5041,12 +5545,22 @@ fn read_flow_records_from_redis(
     let raw = replies.remove(0);
     let work = records_from_xrevrange(raw, date, darkmux_types::config_access::redis_maxlen())?;
     let telemetry_records = match raw_telemetry {
-        Some(raw) => records_from_xrevrange(raw, date, darkmux_types::config_access::redis_telemetry_maxlen())?.records,
+        Some(raw) => {
+            records_from_xrevrange(
+                raw,
+                date,
+                darkmux_types::config_access::redis_telemetry_maxlen(),
+            )?
+            .records
+        }
         None => Vec::new(),
     };
     // `cut` is the work stream's alone: the telemetry stream is a live-state
     // window by design, so its trimming never means a day's work is missing.
-    Ok(SourceRead { records: merge_by_hub_id(work.records, telemetry_records), cut: work.cut })
+    Ok(SourceRead {
+        records: merge_by_hub_id(work.records, telemetry_records),
+        cut: work.cut,
+    })
 }
 
 /// A record's hub id (`<ms>-<seq>`, #3017) as a sort key.
@@ -5073,8 +5587,13 @@ fn merge_by_hub_id(a: Vec<serde_json::Value>, b: Vec<serde_json::Value>) -> Vec<
 /// Whether a newest-first read of `len` entries, the oldest at hub time
 /// `oldest_ms`, may not hold the whole of `date`: see [`records_from_xrevrange`].
 fn read_cuts_day(len: usize, oldest_ms: Option<u64>, date: &str, maxlen: usize) -> bool {
-    let bound = if maxlen == 0 { MAX_FLOW_FILE_RECORDS } else { maxlen.min(MAX_FLOW_FILE_RECORDS) };
-    len >= bound && day_start_ms(date).is_some_and(|start| oldest_ms.is_some_and(|oldest| oldest >= start))
+    let bound = if maxlen == 0 {
+        MAX_FLOW_FILE_RECORDS
+    } else {
+        maxlen.min(MAX_FLOW_FILE_RECORDS)
+    };
+    len >= bound
+        && day_start_ms(date).is_some_and(|start| oldest_ms.is_some_and(|oldest| oldest >= start))
 }
 
 /// (#3431) The hub's records for `date`, from the process's fleet window
@@ -5086,11 +5605,24 @@ fn read_cuts_day(len: usize, oldest_ms: Option<u64>, date: &str, maxlen: usize) 
 fn fleet_day_records(date: &str, fleet: &FleetRecords, work: &FleetRecords) -> SourceRead {
     let records = fleet
         .iter()
-        .filter(|r| r.value().get("ts").and_then(|t| t.as_str()).is_some_and(|ts| ts.starts_with(date)))
+        .filter(|r| {
+            r.value()
+                .get("ts")
+                .and_then(|t| t.as_str())
+                .is_some_and(|ts| ts.starts_with(date))
+        })
         .map(fleet_window::FleetRecord::full)
         .collect();
     let oldest_ms = work.values().next().and_then(hub_id_key).map(|(ms, _)| ms);
-    SourceRead { records, cut: read_cuts_day(work.len(), oldest_ms, date, darkmux_types::config_access::redis_maxlen()) }
+    SourceRead {
+        records,
+        cut: read_cuts_day(
+            work.len(),
+            oldest_ms,
+            date,
+            darkmux_types::config_access::redis_maxlen(),
+        ),
+    }
 }
 
 /// The records an `XREVRANGE` reply holds, read through the flow reader
@@ -5106,7 +5638,11 @@ fn fleet_day_records(date: &str, fleet: &FleetRecords, work: &FleetRecords) -> S
 /// trim length is this machine's own `redis.maxlen`, an approximation of what
 /// the hub's writers trim to. A read with no date asks for the whole stream
 /// and is never "cut" in this sense.
-fn records_from_xrevrange(raw: redis::Value, date: Option<&str>, maxlen: usize) -> Result<SourceRead> {
+fn records_from_xrevrange(
+    raw: redis::Value,
+    date: Option<&str>,
+    maxlen: usize,
+) -> Result<SourceRead> {
     let entries = match raw {
         redis::Value::Array(v) => v,
         other => {
@@ -5115,7 +5651,14 @@ fn records_from_xrevrange(raw: redis::Value, date: Option<&str>, maxlen: usize) 
             ));
         }
     };
-    let cut = date.is_some_and(|date| read_cuts_day(entries.len(), entries.last().and_then(entry_id_ms), date, maxlen));
+    let cut = date.is_some_and(|date| {
+        read_cuts_day(
+            entries.len(),
+            entries.last().and_then(entry_id_ms),
+            date,
+            maxlen,
+        )
+    });
     // (#1715 review) The last bare `10000` on this path — the same cap the
     // XREVRANGE above already single-sources, so it follows that constant
     // rather than sitting beside it as a third copy.
@@ -5130,7 +5673,9 @@ fn records_from_xrevrange(raw: redis::Value, date: Option<&str>, maxlen: usize) 
             redis::Value::Array(f) => f,
             _ => continue,
         };
-        let Some(json) = extract_record_field(fields) else { continue };
+        let Some(json) = extract_record_field(fields) else {
+            continue;
+        };
         if let Some(date) = date {
             if !record_ts_matches_date(json, date) {
                 continue;
@@ -5158,7 +5703,10 @@ fn records_from_xrevrange(raw: redis::Value, date: Option<&str>, maxlen: usize) 
 /// carries none, and a reader then has no hub order for it.
 fn stamp_hub_id(record: &mut serde_json::Value, id: &str) {
     if let Some(obj) = record.as_object_mut() {
-        obj.insert("hub_id".to_string(), serde_json::Value::String(id.to_string()));
+        obj.insert(
+            "hub_id".to_string(),
+            serde_json::Value::String(id.to_string()),
+        );
     }
 }
 
@@ -5166,7 +5714,9 @@ fn stamp_hub_id(record: &mut serde_json::Value, id: &str) {
 /// forwards lines). A line that is not a JSON object, or an entry with no
 /// id, passes through as is.
 fn stamp_hub_id_line(line: &str, id: Option<&str>) -> String {
-    let Some(id) = id else { return line.to_string() };
+    let Some(id) = id else {
+        return line.to_string();
+    };
     match serde_json::from_str::<serde_json::Value>(line) {
         Ok(mut v) if v.is_object() => {
             stamp_hub_id(&mut v, id);
@@ -5178,8 +5728,14 @@ fn stamp_hub_id_line(line: &str, id: Option<&str>) -> String {
 
 /// The millisecond part of a stream entry's `<ms>-<seq>` id.
 fn entry_id_ms(entry: &redis::Value) -> Option<u64> {
-    let redis::Value::Array(pair) = entry else { return None };
-    redis_value_as_str(pair.first()?)?.split('-').next()?.parse().ok()
+    let redis::Value::Array(pair) = entry else {
+        return None;
+    };
+    redis_value_as_str(pair.first()?)?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// The epoch milliseconds of 00:00:00 UTC on a `YYYY-MM-DD` date.
@@ -5254,15 +5810,17 @@ const MAX_FLOW_FILE_RECORDS: usize = darkmux_flow::FLOW_READ_CAP_RECORDS;
 /// 10000`) has the same hole and is NOT fixed here — a stream can't be
 /// filtered server-side by `action` the way a local file scan can; see
 /// #2409's own follow-up note on that function.
-async fn read_flow_records_from_file(
-    date: &str,
-    flows_dir: &std::path::Path,
-) -> SourceRead {
+async fn read_flow_records_from_file(date: &str, flows_dir: &std::path::Path) -> SourceRead {
     use tokio::io::AsyncReadExt;
     let path = flows_dir.join(format!("{date}.jsonl"));
     let file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
-        Err(_) => return SourceRead { records: Vec::new(), cut: false }, // missing file = empty (not an error)
+        Err(_) => {
+            return SourceRead {
+                records: Vec::new(),
+                cut: false,
+            }
+        } // missing file = empty (not an error)
     };
     let mut reader = tokio::io::BufReader::new(file);
     let mut ring: std::collections::VecDeque<(u64, serde_json::Value)> =
@@ -5324,7 +5882,10 @@ async fn read_flow_records_from_file(
     if !over_cap && !line.is_empty() {
         push_flow_line(&line, &mut ring, &mut bookends, &mut next_index, &mut cut);
     }
-    SourceRead { records: merge_ring_and_bookends(ring, bookends), cut }
+    SourceRead {
+        records: merge_ring_and_bookends(ring, bookends),
+        cut,
+    }
 }
 
 /// (#925, #2409) Parse one flow-record line and route it either into the
@@ -5365,7 +5926,10 @@ fn push_flow_line(
     let index = *next_index;
     *next_index += 1;
 
-    if darkmux_flow::reader::action_of(&v).and_then(|a| a.bookend()).is_some() {
+    if darkmux_flow::reader::action_of(&v)
+        .and_then(|a| a.bookend())
+        .is_some()
+    {
         if bookends.len() >= MAX_FLOW_FILE_RECORDS {
             bookends.pop_front();
             *cut = true;
@@ -5416,11 +5980,13 @@ fn merge_ring_and_bookends(
 ///
 /// Polls at 250ms. Each `.next()` yields exactly one line. The unfold
 /// inner loop continues until a real line is available (no empty ticks).
-fn tail_lines(
-    path: PathBuf,
-    start_offset: u64,
-) -> impl Stream<Item = String> {
-    let state = TailState { path, offset: start_offset, partial: Vec::new(), pending: VecDeque::new() };
+fn tail_lines(path: PathBuf, start_offset: u64) -> impl Stream<Item = String> {
+    let state = TailState {
+        path,
+        offset: start_offset,
+        partial: Vec::new(),
+        pending: VecDeque::new(),
+    };
     stream::unfold(state, move |mut s| async move {
         loop {
             // 1. If we have queued lines, emit the next one immediately.
@@ -5466,8 +6032,14 @@ impl TailState {
         if size <= self.offset {
             return;
         }
-        let Ok(mut file) = tokio::fs::File::open(&self.path).await else { return };
-        if file.seek(std::io::SeekFrom::Start(self.offset)).await.is_err() {
+        let Ok(mut file) = tokio::fs::File::open(&self.path).await else {
+            return;
+        };
+        if file
+            .seek(std::io::SeekFrom::Start(self.offset))
+            .await
+            .is_err()
+        {
             return;
         }
         let mut buf = Vec::new();
@@ -5479,12 +6051,15 @@ impl TailState {
         // Whole lines (ending in \n) are queued; the bytes after the last
         // newline wait for the rest of their line. Lines are split as bytes
         // and decoded whole, so a character split across two reads is kept.
-        let Some(end) = self.partial.iter().rposition(|b| *b == b'\n') else { return };
+        let Some(end) = self.partial.iter().rposition(|b| *b == b'\n') else {
+            return;
+        };
         let rest = self.partial.split_off(end + 1);
         let whole = std::mem::replace(&mut self.partial, rest);
         for line in whole[..end].split(|b| *b == b'\n') {
             if !line.is_empty() {
-                self.pending.push_back(String::from_utf8_lossy(line).into_owned());
+                self.pending
+                    .push_back(String::from_utf8_lossy(line).into_owned());
             }
         }
     }
@@ -5492,12 +6067,21 @@ impl TailState {
 
 /// The new lines of this machine's `<date>.jsonl` that the hub never carries
 /// (`darkmux_flow::stays_off_hub`), tailed from now like the file-tail path.
-async fn local_only_lines(flows_dir: &std::path::Path, date: &str) -> impl Stream<Item = String> + use<> {
+async fn local_only_lines(
+    flows_dir: &std::path::Path,
+    date: &str,
+) -> impl Stream<Item = String> + use<> {
     use futures::stream::StreamExt;
     let path = flows_dir.join(format!("{date}.jsonl"));
-    let start_offset = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+    let start_offset = tokio::fs::metadata(&path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
     tail_lines(path, start_offset).filter(|line| {
-        std::future::ready(darkmux_flow::reader::parse_value(line).is_some_and(|v| darkmux_flow::stays_off_hub(&v)))
+        std::future::ready(
+            darkmux_flow::reader::parse_value(line)
+                .is_some_and(|v| darkmux_flow::stays_off_hub(&v)),
+        )
     })
 }
 
@@ -5510,7 +6094,9 @@ fn redacted_events(
 ) -> futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> {
     use futures::stream::StreamExt;
     lines
-        .map(move |line| Ok(Event::default().data(redaction::Redaction::for_reader(redaction.as_deref(), line))))
+        .map(move |line| {
+            Ok(Event::default().data(redaction::Redaction::for_reader(redaction.as_deref(), line)))
+        })
         .boxed()
 }
 /// Long-poll Redis `XREAD BLOCK` and yield each matching record as a
@@ -5563,7 +6149,12 @@ fn redis_tail_lines(
     // their own failure budget.
     let mut tasks = tokio::task::JoinSet::new();
     for stream_name in stream_names {
-        tasks.spawn(redis_tail_task(tx.clone(), url.clone(), stream_name, date_filter.clone()));
+        tasks.spawn(redis_tail_task(
+            tx.clone(),
+            url.clone(),
+            stream_name,
+            date_filter.clone(),
+        ));
     }
     drop(tx);
     tokio::spawn(end_tail_when_any_task_ends(tasks));
@@ -5609,9 +6200,7 @@ pub(crate) async fn redis_tail_task(
                 "0-0".to_string()
             }
             Err(e) => {
-                eprintln!(
-                    "darkmux serve: XINFO blocking task join error ({e}); starting at 0-0"
-                );
+                eprintln!("darkmux serve: XINFO blocking task join error ({e}); starting at 0-0");
                 "0-0".to_string()
             }
         };
@@ -5664,7 +6253,13 @@ pub(crate) async fn redis_tail_task(
             let date_filter_call = date_filter.clone();
             let conn_call = kept.take();
             let result = tokio::task::spawn_blocking(move || {
-                poll_tail(conn_call, &url_call, &stream_call, &last_id_call, &date_filter_call)
+                poll_tail(
+                    conn_call,
+                    &url_call,
+                    &stream_call,
+                    &last_id_call,
+                    &date_filter_call,
+                )
             })
             .await
             .map(|(conn, read)| {
@@ -5831,10 +6426,7 @@ enum SendOutcome {
 /// Drop-newest is the chosen overflow strategy (see the comment
 /// near `SSE_MPSC_CAPACITY`). Extracted as a pure helper for
 /// unit-testability without spinning up a tokio runtime per test.
-fn try_send_or_drop_newest(
-    tx: &tokio::sync::mpsc::Sender<String>,
-    item: String,
-) -> SendOutcome {
+fn try_send_or_drop_newest(tx: &tokio::sync::mpsc::Sender<String>, item: String) -> SendOutcome {
     use tokio::sync::mpsc::error::TrySendError;
     match tx.try_send(item) {
         Ok(()) => SendOutcome::Sent,
@@ -5889,10 +6481,7 @@ fn synthetic_stream_error_record(stream_name: &str, attempts: u32, reason: &str)
 /// `"0-0"` when the stream doesn't exist yet (Redis errors with
 /// `ERR no such key`) — meaning "watch every future XADD" since auto-
 /// assigned ids will all be greater than `0-0`.
-fn resolve_current_last_id(
-    url: &str,
-    stream_name: &str,
-) -> Result<String, anyhow::Error> {
+fn resolve_current_last_id(url: &str, stream_name: &str) -> Result<String, anyhow::Error> {
     use anyhow::Context as _;
     let client = redis::Client::open(url)
         .with_context(|| format!("opening Redis for XINFO on {stream_name}"))?;
@@ -5930,7 +6519,10 @@ fn resolve_current_last_id(
 
 /// What one tail poll hands back: the connection to keep (only after a
 /// successful read) and the read.
-type TailPoll = (Option<redis::Connection>, Result<(Vec<String>, String), anyhow::Error>);
+type TailPoll = (
+    Option<redis::Connection>,
+    Result<(Vec<String>, String), anyhow::Error>,
+);
 
 /// One poll of a tail on its kept connection, or a new one when it has none
 /// (#3432). The connection comes back only when the read succeeded: after a
@@ -6002,7 +6594,11 @@ fn xread_block_once(
 /// stays), else `[[stream_name, [[id, [k, v, ...]], ...]]]`. Every entry
 /// advances the cursor, a filtered-out one included; only records of
 /// `date_filter`'s day are kept.
-fn parse_xread_reply(raw: redis::Value, last_id: &str, date_filter: &str) -> Result<(Vec<String>, String), anyhow::Error> {
+fn parse_xread_reply(
+    raw: redis::Value,
+    last_id: &str,
+    date_filter: &str,
+) -> Result<(Vec<String>, String), anyhow::Error> {
     let outer = match raw {
         redis::Value::Nil => return Ok((Vec::new(), last_id.to_string())),
         redis::Value::Array(v) => v,
@@ -6010,7 +6606,12 @@ fn parse_xread_reply(raw: redis::Value, last_id: &str, date_filter: &str) -> Res
     };
     let mut records = Vec::new();
     let mut new_last_id = last_id.to_string();
-    for (id, record) in outer.iter().filter_map(xread_stream_entries).flatten().filter_map(xread_entry) {
+    for (id, record) in outer
+        .iter()
+        .filter_map(xread_stream_entries)
+        .flatten()
+        .filter_map(xread_entry)
+    {
         if let Some(id) = id {
             new_last_id = id.to_string();
         }
@@ -6036,7 +6637,9 @@ fn xread_stream_entries(block: &redis::Value) -> Option<&[redis::Value]> {
 /// One `[id, [k, v, ...]]` stream entry: its id and its `record` field.
 /// `None` when it is not an entry at all.
 fn xread_entry(entry: &redis::Value) -> Option<(Option<&str>, Option<&str>)> {
-    let redis::Value::Array(parts) = entry else { return None };
+    let redis::Value::Array(parts) = entry else {
+        return None;
+    };
     if parts.len() < 2 {
         return None;
     }

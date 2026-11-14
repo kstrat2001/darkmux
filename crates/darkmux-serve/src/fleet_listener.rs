@@ -48,9 +48,9 @@ use axum::{
 };
 use darkmux_crew::dispatch::DispatchResult;
 use darkmux_fleet::{
-    Admitted, CheckReport, EndpointClass, IdentityProvider, NodeIdentity, Occupied, ProfileResolution, Refusal,
-    ReplyStatus, ScopedJob, SeatBook, SeatGuard, SeatOutlook, SubmissionMode, SubmissionReply, TokenCheck, Waited,
-    WorkJob, WorkSeat, WorkSubmission,
+    Admitted, CheckReport, EndpointClass, IdentityProvider, NodeIdentity, Occupied,
+    ProfileResolution, Refusal, ReplyStatus, ScopedJob, SeatBook, SeatGuard, SeatOutlook,
+    SubmissionMode, SubmissionReply, TokenCheck, Waited, WorkJob, WorkSeat, WorkSubmission,
 };
 use darkmux_types::config::{AcceptWorkEntry, BusyPolicy};
 use std::collections::BTreeMap;
@@ -120,7 +120,8 @@ pub(crate) struct FleetListenerState {
 
 /// (#2947) The production config preflight a submission runs.
 pub(crate) fn dispatch_config_preflight() -> Result<(), String> {
-    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::Dispatch).map_err(|e| e.to_string())
+    darkmux_crew::user_files::preflight(darkmux_types::config_enum::Scope::Dispatch)
+        .map_err(|e| e.to_string())
 }
 
 impl FleetListenerState {
@@ -151,7 +152,9 @@ impl FleetListenerState {
             receiver_uid: darkmux_hardware::machine_uid().map(str::to_string),
             provider,
             local_node_id,
-            token: Arc::new(|| darkmux_flow::serve_token().map(|t| t.expose_for_compare().to_string())),
+            token: Arc::new(|| {
+                darkmux_flow::serve_token().map(|t| t.expose_for_compare().to_string())
+            }),
             allow_list: Arc::new(darkmux_fleet::read_user_allow_list),
             resolve_profile: Arc::new(move |role, requested| {
                 darkmux_fleet::resolve_work_profile(role, requested, &resolve_receiver)
@@ -176,7 +179,10 @@ impl FleetListenerState {
 /// gate.
 pub(crate) fn router(state: FleetListenerState) -> Router {
     Router::new()
-        .route(darkmux_fleet::SUBMISSION_PATH, axum::routing::post(submit_route))
+        .route(
+            darkmux_fleet::SUBMISSION_PATH,
+            axum::routing::post(submit_route),
+        )
         .route(darkmux_fleet::CARD_PATH, axum::routing::get(card_handler))
         .layer(axum::middleware::from_fn_with_state(state.clone(), gate))
         .with_state(state)
@@ -220,9 +226,11 @@ impl RefusalLog {
     pub(crate) fn decide(&self, ip: std::net::IpAddr, now: std::time::Instant) -> LogDecision {
         let mut peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
         if peers.len() >= Self::MAX_PEERS && !peers.contains_key(&ip) {
-            peers.retain(|_, (start, _, sup)| now.duration_since(*start) < Self::WINDOW || *sup > 0);
+            peers
+                .retain(|_, (start, _, sup)| now.duration_since(*start) < Self::WINDOW || *sup > 0);
             if peers.len() >= Self::MAX_PEERS {
-                self.overflow.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.overflow
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 return LogDecision::Suppress;
             }
         }
@@ -283,7 +291,8 @@ impl RefusalLog {
                 eprintln!("darkmux serve: fleet listener: suppressed {k} refusal log line(s) from {ip} in the last minute");
             }
             eprintln!("{line}");
-            self.written.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.written
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -291,7 +300,13 @@ impl RefusalLog {
 fn refuse(state: &FleetListenerState, peer: Option<std::net::IpAddr>, r: &Refusal) -> Response {
     let receiver = &state.receiver;
     let code = StatusCode::from_u16(r.http_status()).unwrap_or(StatusCode::FORBIDDEN);
-    state.refusal_log.log(peer, &format!("darkmux serve: fleet listener: refused: {}", r.reason(receiver)));
+    state.refusal_log.log(
+        peer,
+        &format!(
+            "darkmux serve: fleet listener: refused: {}",
+            r.reason(receiver)
+        ),
+    );
     (code, Json(r.reply(receiver))).into_response()
 }
 
@@ -322,7 +337,11 @@ fn tokens_match(presented: &[u8], expected: &[u8]) -> bool {
     if presented.len() != expected.len() {
         return false;
     }
-    presented.iter().zip(expected).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0
+    presented
+        .iter()
+        .zip(expected)
+        .fold(0u8, |d, (a, b)| d | (a ^ b))
+        == 0
 }
 
 fn check_token(headers: &axum::http::HeaderMap, expected: Option<String>) -> TokenCheck {
@@ -365,12 +384,17 @@ impl IdentityCache {
     const MAX: usize = 256;
 
     pub(crate) fn new() -> Self {
-        Self { slots: Mutex::new(Default::default()) }
+        Self {
+            slots: Mutex::new(Default::default()),
+        }
     }
 
     fn get(&self, ip: std::net::IpAddr, now: std::time::Instant) -> Option<NodeIdentity> {
         let slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
-        slots.get(&ip).filter(|(at, _)| now.duration_since(*at) < Self::TTL).map(|(_, n)| n.clone())
+        slots
+            .get(&ip)
+            .filter(|(at, _)| now.duration_since(*at) < Self::TTL)
+            .map(|(_, n)| n.clone())
     }
 
     fn put(&self, ip: std::net::IpAddr, node: NodeIdentity, now: std::time::Instant) {
@@ -406,7 +430,11 @@ pub(crate) struct Admission {
 impl Admission {
     /// The identity lookup for `peer`: the provider's answer, or for a card
     /// read a recent one.
-    fn identify(&self, peer: std::net::IpAddr, purpose: Purpose) -> Result<Option<NodeIdentity>, String> {
+    fn identify(
+        &self,
+        peer: std::net::IpAddr,
+        purpose: Purpose,
+    ) -> Result<Option<NodeIdentity>, String> {
         let now = std::time::Instant::now();
         if purpose == Purpose::Card {
             if let Some(node) = self.identity_cache.get(peer, now) {
@@ -436,7 +464,9 @@ impl Admission {
         let fingerprint = match (token, expected.as_deref()) {
             (TokenCheck::Match, Some(t)) => TokenFingerprint::of(t),
             (TokenCheck::Mismatch, _) => return Err(Refusal::Token),
-            (TokenCheck::Match, None) | (TokenCheck::NotConfigured, _) => return Err(Refusal::NoTokenConfigured),
+            (TokenCheck::Match, None) | (TokenCheck::NotConfigured, _) => {
+                return Err(Refusal::NoTokenConfigured)
+            }
         };
         // The identity lookup is blocking (a subprocess) and runs only after
         // the token matched: `authenticate` calls this closure after its own
@@ -446,7 +476,13 @@ impl Admission {
         let decision = tokio::task::spawn_blocking(move || {
             let local_id = (this.local_node_id)();
             let name = this.provider.provider_name().to_string();
-            darkmux_fleet::authenticate(token, || this.identify(peer, purpose), &name, peer, local_id.as_deref())
+            darkmux_fleet::authenticate(
+                token,
+                || this.identify(peer, purpose),
+                &name,
+                peer,
+                local_id.as_deref(),
+            )
         })
         .await;
         match decision {
@@ -463,9 +499,12 @@ impl Admission {
     /// after the identity lookup, so an `untrust` during it is seen.
     pub(crate) async fn authorize(&self, node: NodeIdentity) -> Result<Admitted, Refusal> {
         let allow = self.allow_list.clone();
-        match tokio::task::spawn_blocking(move || darkmux_fleet::authorize(&node, || allow())).await {
+        match tokio::task::spawn_blocking(move || darkmux_fleet::authorize(&node, || allow())).await
+        {
             Ok(result) => result,
-            Err(e) => Err(Refusal::BadRequest(format!("the allow-list check did not finish: {e}"))),
+            Err(e) => Err(Refusal::BadRequest(format!(
+                "the allow-list check did not finish: {e}"
+            ))),
         }
     }
 }
@@ -492,7 +531,11 @@ fn slots_for<'a>(state: &'a FleetListenerState, req: &Request) -> &'a Arc<KeySlo
 /// peer address (no `ConnectInfo`) is refused: absence of evidence is not a
 /// peer.
 async fn gate(State(state): State<FleetListenerState>, mut req: Request, next: Next) -> Response {
-    let Some(peer) = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()) else {
+    let Some(peer) = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip())
+    else {
         return refuse(
             &state,
             None,
@@ -502,12 +545,27 @@ async fn gate(State(state): State<FleetListenerState>, mut req: Request, next: N
             },
         );
     };
-    let is_card = req.method() == axum::http::Method::GET && req.uri().path() == darkmux_fleet::CARD_PATH;
-    let purpose = if is_card { Purpose::Card } else { Purpose::Work };
-    match state.admission().authenticate(peer, req.headers(), purpose).await {
+    let is_card =
+        req.method() == axum::http::Method::GET && req.uri().path() == darkmux_fleet::CARD_PATH;
+    let purpose = if is_card {
+        Purpose::Card
+    } else {
+        Purpose::Work
+    };
+    match state
+        .admission()
+        .authenticate(peer, req.headers(), purpose)
+        .await
+    {
         Ok((node, fingerprint)) => {
             let Some(_node_slot) = slots_for(&state, &req).try_take(node.node_id.clone()) else {
-                return refuse(&state, Some(peer), &Refusal::TooManyAtOnce { peer: node.name.clone() });
+                return refuse(
+                    &state,
+                    Some(peer),
+                    &Refusal::TooManyAtOnce {
+                        peer: node.name.clone(),
+                    },
+                );
             };
             // (#2916 stage 2 review F1) Which token was in force, so a job
             // queued now can be checked against the token in force when its
@@ -527,7 +585,11 @@ enum Start {
     /// The seat is busy and this machine queues (`fleet.busy_policy =
     /// queue`): the job waits for it until `deadline`, holding one of its
     /// sender's queue slots while it waits.
-    Queued { what: String, queue_slot: KeySlot<String>, deadline: std::time::Instant },
+    Queued {
+        what: String,
+        queue_slot: KeySlot<String>,
+        deadline: std::time::Instant,
+    },
 }
 
 /// One line of a reply body. Every body is newline-delimited JSON: one line
@@ -577,13 +639,18 @@ fn finished_reply(
 
 /// `base` (machine, session, profile) with `status`.
 fn with_status(base: &SubmissionReply, status: ReplyStatus) -> SubmissionReply {
-    SubmissionReply { status, ..base.clone() }
+    SubmissionReply {
+        status,
+        ..base.clone()
+    }
 }
 
 /// The `queued` line a waiting sender reads.
 fn queued_reply(base: &SubmissionReply, receiver: &str, what: &str) -> SubmissionReply {
     SubmissionReply {
-        reason: Some(format!("{receiver} is busy ({what}); the job is queued and runs when its seat frees")),
+        reason: Some(format!(
+            "{receiver} is busy ({what}); the job is queued and runs when its seat frees"
+        )),
         ..with_status(base, ReplyStatus::Queued)
     }
 }
@@ -599,11 +666,17 @@ fn queued_reply(base: &SubmissionReply, receiver: &str, what: &str) -> Submissio
 /// instead and can outlast it. Such a run can outlive the connection: the
 /// job keeps running here, and the sender reports that the answer was lost
 /// and the job may still be running, naming the session to follow.
-fn queue_deadline(limits: &QueueLimits, wait: bool, job_timeout_seconds: u32) -> Option<std::time::Instant> {
+fn queue_deadline(
+    limits: &QueueLimits,
+    wait: bool,
+    job_timeout_seconds: u32,
+) -> Option<std::time::Instant> {
     let window = if wait {
         limits
             .connection_lifetime
-            .saturating_sub(std::time::Duration::from_secs(u64::from(job_timeout_seconds)))
+            .saturating_sub(std::time::Duration::from_secs(u64::from(
+                job_timeout_seconds,
+            )))
             .saturating_sub(QUEUE_SLACK)
     } else {
         limits.no_wait_max_age
@@ -620,15 +693,16 @@ fn wait_or_refuse(
     occupied: &Occupied,
 ) -> Result<std::time::Instant, Refusal> {
     match state.busy_policy {
-        BusyPolicy::Refuse => Err(Refusal::Busy { what: occupied.what.clone() }),
-        BusyPolicy::Queue => queue_deadline(&state.queue_limits, sub.wait, sub.job.timeout_seconds).ok_or_else(|| {
-            Refusal::Busy {
+        BusyPolicy::Refuse => Err(Refusal::Busy {
+            what: occupied.what.clone(),
+        }),
+        BusyPolicy::Queue => queue_deadline(&state.queue_limits, sub.wait, sub.job.timeout_seconds)
+            .ok_or_else(|| Refusal::Busy {
                 what: format!(
                     "{}; a job with a {}s timeout has no time left to wait inside one connection",
                     occupied.what, sub.job.timeout_seconds
                 ),
-            }
-        }),
+            }),
     }
 }
 
@@ -647,8 +721,15 @@ fn start_or_refuse(
     };
     let deadline = wait_or_refuse(state, sub, &occupied)?;
     match state.queue_slots.try_take(admitted.peer_name.clone()) {
-        Some(queue_slot) => Ok(Start::Queued { what: occupied.what, queue_slot, deadline }),
-        None => Err(Refusal::QueueFull { peer: admitted.peer_name.clone(), what: occupied.what }),
+        Some(queue_slot) => Ok(Start::Queued {
+            what: occupied.what,
+            queue_slot,
+            deadline,
+        }),
+        None => Err(Refusal::QueueFull {
+            peer: admitted.peer_name.clone(),
+            what: occupied.what,
+        }),
     }
 }
 
@@ -661,12 +742,17 @@ fn seat_outlook(
     scoped: &ScopedJob,
     sub: &WorkSubmission,
 ) -> Result<SeatOutlook, Refusal> {
-    let Some(occupied) = state.seats.peek(&scoped.seat) else { return Ok(SeatOutlook::Free) };
+    let Some(occupied) = state.seats.peek(&scoped.seat) else {
+        return Ok(SeatOutlook::Free);
+    };
     wait_or_refuse(state, sub, &occupied)?;
     if state.queue_slots.has_room(&admitted.peer_name) {
         Ok(SeatOutlook::WouldQueue)
     } else {
-        Err(Refusal::QueueFull { peer: admitted.peer_name.clone(), what: occupied.what })
+        Err(Refusal::QueueFull {
+            peer: admitted.peer_name.clone(),
+            what: occupied.what,
+        })
     }
 }
 
@@ -733,10 +819,17 @@ impl Worker {
         let receiver = &self.state.receiver;
         self.state.refusal_log.log(
             Some(self.peer),
-            &format!("darkmux serve: fleet listener: refused queued {}: {}", self.job.session_id, r.reason(receiver)),
+            &format!(
+                "darkmux serve: fleet listener: refused queued {}: {}",
+                self.job.session_id,
+                r.reason(receiver)
+            ),
         );
         if let Some(p) = &self.progress {
-            let reply = SubmissionReply { session_id: self.base.session_id.clone(), ..r.reply(receiver) };
+            let reply = SubmissionReply {
+                session_id: self.base.session_id.clone(),
+                ..r.reply(receiver)
+            };
             let _ = p.send(reply_line(&reply));
         }
     }
@@ -785,7 +878,9 @@ impl Worker {
         (state.config_preflight)().map_err(|detail| Refusal::BadConfig { detail })?;
         let now = scope_job(state, &admitted, &self.job)?;
         if now.seat != self.scoped.seat {
-            return Err(Refusal::SeatChanged { profile: now.profile });
+            return Err(Refusal::SeatChanged {
+                profile: now.profile,
+            });
         }
         Ok((admitted, now.profile))
     }
@@ -801,11 +896,18 @@ impl Worker {
         let state = &self.state;
         let receiver = &state.receiver;
         let sid = self.job.session_id.wire();
-        let waited = state.seats.claim_waiting(&self.scoped.seat, &sid, state.queue_heartbeat, deadline, &|| self.sender_gone(), |o| {
-            if let Some(p) = &self.progress {
-                let _ = p.send(reply_line(&queued_reply(&self.base, receiver, &o.what)));
-            }
-        });
+        let waited = state.seats.claim_waiting(
+            &self.scoped.seat,
+            &sid,
+            state.queue_heartbeat,
+            deadline,
+            &|| self.sender_gone(),
+            |o| {
+                if let Some(p) = &self.progress {
+                    let _ = p.send(reply_line(&queued_reply(&self.base, receiver, &o.what)));
+                }
+            },
+        );
         // Waiting is over, however it ended: the sender's queue slot frees.
         drop(queue_slot);
         match waited {
@@ -814,7 +916,9 @@ impl Worker {
                 None
             }
             Waited::TimedOut(o) => {
-                self.refuse_late(&Refusal::Busy { what: format!("{}; the job waited as long as it may", o.what) });
+                self.refuse_late(&Refusal::Busy {
+                    what: format!("{}; the job waited as long as it may", o.what),
+                });
                 None
             }
             Waited::Seat(guard) => match self.recheck() {
@@ -832,7 +936,11 @@ impl Worker {
     fn run(self, start: Start) {
         let (seat, admitted, profile) = match start {
             Start::Now(guard) => (guard, self.admitted.clone(), self.scoped.profile.clone()),
-            Start::Queued { queue_slot, deadline, .. } => match self.wait_for_seat(queue_slot, deadline) {
+            Start::Queued {
+                queue_slot,
+                deadline,
+                ..
+            } => match self.wait_for_seat(queue_slot, deadline) {
                 Some(got) => got,
                 None => return,
             },
@@ -863,12 +971,23 @@ impl Worker {
 /// listed", or "could not say". A caller with no entry still gets the card:
 /// visibility is not an execution grant. The card comes from the card cache;
 /// a gather runs off the async threads.
-async fn card_handler(State(state): State<FleetListenerState>, Extension(auth): Extension<Authenticated>) -> Response {
-    let grant = crate::machine_card::CardGrant::from_authorization(&state.admission().authorize(auth.node).await);
+async fn card_handler(
+    State(state): State<FleetListenerState>,
+    Extension(auth): Extension<Authenticated>,
+) -> Response {
+    let grant = crate::machine_card::CardGrant::from_authorization(
+        &state.admission().authorize(auth.node).await,
+    );
     let cache = state.card_cache.clone();
-    match tokio::task::spawn_blocking(move || cache.get(crate::machine_card::gather_local_card)).await {
+    match tokio::task::spawn_blocking(move || cache.get(crate::machine_card::gather_local_card))
+        .await
+    {
         Ok(card) => Json(crate::machine_card::ListenerCard { card, grant }).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "darkmux serve: machine card gather panicked\n").into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "darkmux serve: machine card gather panicked\n",
+        )
+            .into_response(),
     }
 }
 
@@ -890,14 +1009,24 @@ impl axum::extract::FromRequestParts<FleetListenerState> for Authorization {
         parts: &mut axum::http::request::Parts,
         state: &FleetListenerState,
     ) -> Result<Self, Self::Rejection> {
-        let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0.ip());
         let Some(auth) = parts.extensions.get::<Authenticated>().cloned() else {
             let detail = "the request did not pass the gate".to_string();
             let provider = state.provider.provider_name().to_string();
-            return Err(refuse(state, peer, &Refusal::IdentityUnavailable { provider, detail }));
+            return Err(refuse(
+                state,
+                peer,
+                &Refusal::IdentityUnavailable { provider, detail },
+            ));
         };
         let result = state.admission().authorize(auth.node.clone()).await;
-        Ok(Self { node: auth.node, result })
+        Ok(Self {
+            node: auth.node,
+            result,
+        })
     }
 }
 
@@ -909,7 +1038,9 @@ impl Authorization {
         self.result.map_err(|r| match r {
             Refusal::NotAllowed { .. } => {
                 let roster = darkmux_fleet::load_roster().unwrap_or_default();
-                r.with_trust_ask(darkmux_fleet::TrustAsk::for_sender(&self.node, &roster, body))
+                r.with_trust_ask(darkmux_fleet::TrustAsk::for_sender(
+                    &self.node, &roster, body,
+                ))
             }
             other => other,
         })
@@ -929,16 +1060,30 @@ async fn scope_submission(
     let (st, adm, job) = (state.clone(), admitted.clone(), sub.job.clone());
     let scoped = tokio::task::spawn_blocking(move || scope_job(&st, &adm, &job))
         .await
-        .unwrap_or_else(|e| Err(Refusal::ResolutionFailed { detail: format!("profile resolution did not finish: {e}") }))?;
+        .unwrap_or_else(|e| {
+            Err(Refusal::ResolutionFailed {
+                detail: format!("profile resolution did not finish: {e}"),
+            })
+        })?;
     Ok((sub, scoped))
 }
 
 /// The ONE owner of the scoped-job rule: resolve the job's profile as this
 /// machine does now, then check it against `admitted`'s scope and the
 /// boundary. A new submission and a queued job's recheck both go through it.
-fn scope_job(state: &FleetListenerState, admitted: &Admitted, job: &WorkJob) -> Result<ScopedJob, Refusal> {
+fn scope_job(
+    state: &FleetListenerState,
+    admitted: &Admitted,
+    job: &WorkJob,
+) -> Result<ScopedJob, Refusal> {
     let resolution = (state.resolve_profile)(&job.role_id, job.profile.as_deref());
-    darkmux_fleet::check_scope(&state.receiver, state.receiver_uid.as_deref(), admitted, job, resolution)
+    darkmux_fleet::check_scope(
+        &state.receiver,
+        state.receiver_uid.as_deref(),
+        admitted,
+        job,
+        resolution,
+    )
 }
 
 /// `POST` a job or a check: refuses a caller the allow-list does not list,
@@ -990,7 +1135,10 @@ async fn submit_handler(
     // sender's verbatim: a relay of it, in a standalone run, so a peer can
     // neither reuse one of this machine's sessions nor name one of its
     // missions.
-    sub.job.session_id = darkmux_types::session_id::SessionId::relay(sub.job.session_id.clone(), &admitted.peer_name);
+    sub.job.session_id = darkmux_types::session_id::SessionId::relay(
+        sub.job.session_id.clone(),
+        &admitted.peer_name,
+    );
     let session_id = sub.job.session_id.clone();
 
     // (#2916 stage 2, #3035) Busy is per seat: one job per local model, an
@@ -1006,7 +1154,11 @@ async fn submit_handler(
     };
     eprintln!(
         "darkmux serve: fleet listener: {} {session_id} from {} (role {}, profile {})",
-        if queued_what.is_some() { "queued" } else { "accepted" },
+        if queued_what.is_some() {
+            "queued"
+        } else {
+            "accepted"
+        },
         admitted.peer_name,
         sub.job.role_id,
         scoped.profile
@@ -1041,18 +1193,29 @@ async fn submit_handler(
     // minutes, and a queued job blocks until its seat frees. The seat guard
     // lives in the thread, so the seat frees when the work ends, even if
     // the sender stopped waiting.
-    let spawned = std::thread::Builder::new().name("darkmux-fleet-job".into()).spawn(move || worker.run(start));
+    let spawned = std::thread::Builder::new()
+        .name("darkmux-fleet-job".into())
+        .spawn(move || worker.run(start));
     if let Err(e) = spawned {
-        return refuse(&state, Some(peer_addr.ip()), &Refusal::BadRequest(format!("could not start the job: {e}")));
+        return refuse(
+            &state,
+            Some(peer_addr.ip()),
+            &Refusal::BadRequest(format!("could not start the job: {e}")),
+        );
     }
 
     if let Some(what) = queued_what {
         if let Some(rx) = progress_rx {
             use futures::StreamExt;
-            let lines = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(Ok::<_, std::convert::Infallible>);
+            let lines = tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+                .map(Ok::<_, std::convert::Infallible>);
             return (StatusCode::OK, axum::body::Body::from_stream(lines)).into_response();
         }
-        return (StatusCode::ACCEPTED, Json(queued_reply(&base, &receiver, &what))).into_response();
+        return (
+            StatusCode::ACCEPTED,
+            Json(queued_reply(&base, &receiver, &what)),
+        )
+            .into_response();
     }
     if !sub.wait {
         return (StatusCode::ACCEPTED, Json(base)).into_response();
@@ -1065,16 +1228,26 @@ async fn submit_handler(
 /// own overlay address (IPv4 preferred), on `port`. Refuses anything that is
 /// not a specific, non-loopback address — the listener must never answer on
 /// `0.0.0.0` or on loopback (where every caller looks like this machine).
-pub(crate) fn listen_addr(local: &darkmux_fleet::NodeIdentity, port: u16) -> Result<SocketAddr, String> {
+pub(crate) fn listen_addr(
+    local: &darkmux_fleet::NodeIdentity,
+    port: u16,
+) -> Result<SocketAddr, String> {
     let ip = local
         .addresses
         .iter()
         .find(|a| a.is_ipv4())
         .or_else(|| local.addresses.first())
         .copied()
-        .ok_or_else(|| "the identity provider reports no overlay address for this machine".to_string())?;
-    if ip.is_unspecified() || (ip.to_canonical().is_loopback() && !LOOPBACK_FOR_E2E) || ip.is_multicast() {
-        return Err(format!("refusing to bind the fleet listener to {ip}: not a specific overlay address"));
+        .ok_or_else(|| {
+            "the identity provider reports no overlay address for this machine".to_string()
+        })?;
+    if ip.is_unspecified()
+        || (ip.to_canonical().is_loopback() && !LOOPBACK_FOR_E2E)
+        || ip.is_multicast()
+    {
+        return Err(format!(
+            "refusing to bind the fleet listener to {ip}: not a specific overlay address"
+        ));
     }
     Ok(SocketAddr::new(ip, port))
 }
@@ -1100,7 +1273,8 @@ compile_error!("the `e2e-fleet-loopback` feature is for the debug-build two-daem
 /// (#2916 review C8): a daemon started by launchd can fail where a shell
 /// succeeds, and the reason used to live only in the daemon's log. Coarse
 /// phrases only: no provider output, no ids.
-pub(crate) static LISTENER_STATE: std::sync::Mutex<Option<(&'static str, String)>> = std::sync::Mutex::new(None);
+pub(crate) static LISTENER_STATE: std::sync::Mutex<Option<(&'static str, String)>> =
+    std::sync::Mutex::new(None);
 
 /// (#2916 stage 2 review C5) The busy policy the running listener was
 /// started with (it reads config once), so `darkmux doctor` can report what
@@ -1109,7 +1283,8 @@ pub(crate) static LISTENER_BUSY: std::sync::Mutex<Option<BusyPolicy>> = std::syn
 
 /// The running listener's seat book, for the machine card. `None` until the
 /// listener has started (this machine takes no fleet work).
-pub(crate) static LISTENER_SEATS: std::sync::Mutex<Option<Arc<SeatBook>>> = std::sync::Mutex::new(None);
+pub(crate) static LISTENER_SEATS: std::sync::Mutex<Option<Arc<SeatBook>>> =
+    std::sync::Mutex::new(None);
 
 /// The running listener's busy policy and seats, for the machine card;
 /// `None` when the listener has not started.
@@ -1144,7 +1319,11 @@ fn set_state(coarse: &'static str, detail: impl Into<String>) {
 pub(crate) fn listener_state(loopback_caller: bool) -> Option<String> {
     let g = LISTENER_STATE.lock().ok()?;
     let (coarse, detail) = g.as_ref()?;
-    Some(if loopback_caller { detail.clone() } else { (*coarse).to_string() })
+    Some(if loopback_caller {
+        detail.clone()
+    } else {
+        (*coarse).to_string()
+    })
 }
 
 /// Bounds on the listener's connections (#2916 review M1). A tokenless
@@ -1258,7 +1437,10 @@ impl<K: std::hash::Hash + Eq + Clone> Drop for KeySlot<K> {
 
 impl<K: std::hash::Hash + Eq + Clone> KeySlots<K> {
     pub(crate) fn new(max: usize) -> Self {
-        Self { max, counts: Mutex::new(Default::default()) }
+        Self {
+            max,
+            counts: Mutex::new(Default::default()),
+        }
     }
 
     /// Whether `key` could take a slot now (without taking one).
@@ -1274,7 +1456,10 @@ impl<K: std::hash::Hash + Eq + Clone> KeySlots<K> {
             return None;
         }
         *n += 1;
-        Some(KeySlot { owner: Arc::clone(self), key })
+        Some(KeySlot {
+            owner: Arc::clone(self),
+            key,
+        })
     }
 }
 
@@ -1340,7 +1525,11 @@ pub(crate) async fn serve_bounded(
 /// and discard until the sender hangs up, for at most `linger` and at most
 /// `max_bytes`; past either, the connection is dropped. The caller holds the
 /// connection's slots until this returns.
-async fn close_after_answer(mut stream: tokio::net::TcpStream, linger: std::time::Duration, max_bytes: usize) {
+async fn close_after_answer(
+    mut stream: tokio::net::TcpStream,
+    linger: std::time::Duration,
+    max_bytes: usize,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     if stream.shutdown().await.is_err() {
         return;
@@ -1349,7 +1538,9 @@ async fn close_after_answer(mut stream: tokio::net::TcpStream, linger: std::time
     let mut left = max_bytes;
     let drain = async {
         while let Ok(n @ 1..) = stream.read(&mut sink).await {
-            let Some(rest) = left.checked_sub(n) else { return };
+            let Some(rest) = left.checked_sub(n) else {
+                return;
+            };
             left = rest;
         }
     };
@@ -1369,7 +1560,12 @@ pub(crate) fn spawn_if_enabled(shutdown: tokio::sync::watch::Receiver<bool>) {
     tokio::spawn(async move {
         if let Err(e) = run(shutdown).await {
             set_state("not started", format!("not started: {e}"));
-            eprintln!("{}", darkmux_types::style::warn(&format!("darkmux serve: fleet listener: listener not started: {e}")));
+            eprintln!(
+                "{}",
+                darkmux_types::style::warn(&format!(
+                    "darkmux serve: fleet listener: listener not started: {e}"
+                ))
+            );
         }
     });
 }
@@ -1383,25 +1579,35 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<(), Str
     }
     let provider: Arc<dyn IdentityProvider> =
         Arc::from(darkmux_fleet::configured_provider().map_err(|e| format!("{e:#}"))?);
-    let receiver = darkmux_flow::resolve_machine_id()
-        .ok_or_else(|| "this machine has no machine_id, so it cannot tell a misaddressed job".to_string())?;
+    let receiver = darkmux_flow::resolve_machine_id().ok_or_else(|| {
+        "this machine has no machine_id, so it cannot tell a misaddressed job".to_string()
+    })?;
     // (#2916 stage 2) Read once at start, like the rest of the listener's
     // config. `configured_provider` above already ran the fleet-submission
     // preflight, which refuses a bad value; this is the typed read.
-    let busy_policy = darkmux_types::config_access::fleet_busy_policy().map_err(|e| e.to_string())?;
+    let busy_policy =
+        darkmux_types::config_access::fleet_busy_policy().map_err(|e| e.to_string())?;
     let port = darkmux_types::config_access::fleet_listener_port();
     let (addr, local_id) = loop {
         let p = provider.clone();
         match tokio::task::spawn_blocking(move || p.local_node()).await {
             Ok(Ok(local)) => break (listen_addr(&local, port)?, local.node_id.clone()),
             Ok(Err(e)) => {
-                set_state("waiting", format!("waiting for the {} network to answer (retrying every 30s)", provider.provider_name()));
+                set_state(
+                    "waiting",
+                    format!(
+                        "waiting for the {} network to answer (retrying every 30s)",
+                        provider.provider_name()
+                    ),
+                );
                 eprintln!(
                     "darkmux serve: fleet listener: the {} network is not answering ({e:#}); retrying in 30s",
                     provider.provider_name()
                 )
             }
-            Err(e) => eprintln!("darkmux serve: fleet listener: identity check failed ({e}); retrying in 30s"),
+            Err(e) => eprintln!(
+                "darkmux serve: fleet listener: identity check failed ({e}); retrying in 30s"
+            ),
         }
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
@@ -1421,7 +1627,10 @@ async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<(), Str
         );
     }
     set_state("listening", format!("listening on {addr}"));
-    println!("  fleet listener: {addr} (work submission; identity: {})", provider.provider_name());
+    println!(
+        "  fleet listener: {addr} (work submission; identity: {})",
+        provider.provider_name()
+    );
     let state = FleetListenerState::production(receiver, provider, Some(local_id), busy_policy);
     if let Ok(mut g) = LISTENER_BUSY.lock() {
         *g = Some(busy_policy);
@@ -1461,17 +1670,30 @@ mod tests {
         let base = SubmissionReply::of(ReplyStatus::Accepted);
         let refused = darkmux_crew::engine_dispatch::EngineRefusal {
             code: "busy",
-            message: "endpoint `tf` is serving `a` for a running dispatch; retry when it finishes".into(),
+            message: "endpoint `tf` is serving `a` for a running dispatch; retry when it finishes"
+                .into(),
             waiting_on: None,
         };
         let err = anyhow::Error::from(refused).context("step `s` dispatch.internal");
         let (status, reply) = finished_reply(&base, Some(Err(err)));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!((reply.status, reply.code.as_deref()), (ReplyStatus::Error, Some("busy")));
-        assert!(reply.reason.as_deref().is_some_and(|r| r.contains("retry when it finishes")), "{reply:?}");
+        assert_eq!(
+            (reply.status, reply.code.as_deref()),
+            (ReplyStatus::Error, Some("busy"))
+        );
+        assert!(
+            reply
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("retry when it finishes")),
+            "{reply:?}"
+        );
         let (_, plain) = finished_reply(&base, Some(Err(anyhow::anyhow!("docker exited 125"))));
         assert_eq!(plain.code, None);
-        assert!(!serde_json::to_string(&plain).unwrap().contains("\"code\""), "absent, not null");
+        assert!(
+            !serde_json::to_string(&plain).unwrap().contains("\"code\""),
+            "absent, not null"
+        );
     }
 
     const TOKEN: &str = "fleet-test-token";
@@ -1499,7 +1721,10 @@ mod tests {
     /// The fixed allow-list above already lets the laptop run these.
     fn allow_profiles(_h: &Harness, profiles: &[&str]) {
         let listed = allow()["macbook-pro"].profiles.clone().unwrap();
-        assert!(profiles.iter().all(|p| listed.iter().any(|l| l == p)), "{profiles:?} not in {listed:?}");
+        assert!(
+            profiles.iter().all(|p| listed.iter().any(|l| l == p)),
+            "{profiles:?} not in {listed:?}"
+        );
     }
 
     /// A real listener on 127.0.0.1 whose fake provider says the loopback
@@ -1577,7 +1802,10 @@ mod tests {
         fn provider_name(&self) -> &str {
             "static"
         }
-        fn identify(&self, peer: std::net::IpAddr) -> anyhow::Result<Option<darkmux_fleet::NodeIdentity>> {
+        fn identify(
+            &self,
+            peer: std::net::IpAddr,
+        ) -> anyhow::Result<Option<darkmux_fleet::NodeIdentity>> {
             let n = self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.3.lock().unwrap().is_some_and(|from| n >= from) {
                 while !self.4.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1612,24 +1840,55 @@ mod tests {
         job_ms: u64,
         config_preflight: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
     ) -> Harness {
-        start_full(peer, down, job_ms, config_preflight, BusyPolicy::Refuse, None, WIDE)
+        start_full(
+            peer,
+            down,
+            job_ms,
+            config_preflight,
+            BusyPolicy::Refuse,
+            None,
+            WIDE,
+        )
     }
 
     /// The test resolver: `utility` is utility-only, `cloud` is a hosted
     /// endpoint, `small` a second local model, anything else the local `big`.
     /// The test receiver's one unmanaged endpoint, declaring `concurrent_calls`.
     fn cloud_seat(concurrent_calls: Option<u32>) -> darkmux_fleet::WorkSeat {
-        darkmux_fleet::WorkSeat::Unmanaged { endpoint: "cloud-endpoint".into(), label: "cloud-endpoint".into(), model: "gpt-x".into(), concurrent_calls }
+        darkmux_fleet::WorkSeat::Unmanaged {
+            endpoint: "cloud-endpoint".into(),
+            label: "cloud-endpoint".into(),
+            model: "gpt-x".into(),
+            concurrent_calls,
+        }
     }
 
     fn test_resolution(requested: Option<&str>) -> ProfileResolution {
         use darkmux_fleet::WorkSeat;
         match requested {
             Some("utility") => ProfileResolution::UtilityOnly("utility".into()),
-            Some("cloud") => ProfileResolution::Work { profile: "cloud".into(), seat: cloud_seat(None) },
-            Some("small") => ProfileResolution::Work { profile: "small".into(), seat: WorkSeat::Local { model: "small".into() } },
-            Some(p) => ProfileResolution::Work { profile: p.to_string(), seat: WorkSeat::Local { model: "big".into() } },
-            None => ProfileResolution::Work { profile: "host".into(), seat: WorkSeat::Local { model: "big".into() } },
+            Some("cloud") => ProfileResolution::Work {
+                profile: "cloud".into(),
+                seat: cloud_seat(None),
+            },
+            Some("small") => ProfileResolution::Work {
+                profile: "small".into(),
+                seat: WorkSeat::Local {
+                    model: "small".into(),
+                },
+            },
+            Some(p) => ProfileResolution::Work {
+                profile: p.to_string(),
+                seat: WorkSeat::Local {
+                    model: "big".into(),
+                },
+            },
+            None => ProfileResolution::Work {
+                profile: "host".into(),
+                seat: WorkSeat::Local {
+                    model: "big".into(),
+                },
+            },
         }
     }
 
@@ -1642,7 +1901,16 @@ mod tests {
         cloud_calls: Option<u32>,
         queue_limits: QueueLimits,
     ) -> Harness {
-        start_full_as(peer, down, job_ms, config_preflight, busy_policy, cloud_calls, queue_limits, None)
+        start_full_as(
+            peer,
+            down,
+            job_ms,
+            config_preflight,
+            busy_policy,
+            cloud_calls,
+            queue_limits,
+            None,
+        )
     }
 
     /// [`start_full`] for a receiver that knows its own hardware uid.
@@ -1705,13 +1973,19 @@ mod tests {
                 if requested.is_none() && moved.load(std::sync::atomic::Ordering::SeqCst) {
                     return ProfileResolution::Work {
                         profile: "host".into(),
-                        seat: darkmux_fleet::WorkSeat::Local { model: "moved".into() },
+                        seat: darkmux_fleet::WorkSeat::Local {
+                            model: "moved".into(),
+                        },
                     };
                 }
                 match test_resolution(requested) {
-                    ProfileResolution::Work { profile, seat: darkmux_fleet::WorkSeat::Unmanaged { .. } } => {
-                        ProfileResolution::Work { profile, seat: cloud_seat(cloud_calls) }
-                    }
+                    ProfileResolution::Work {
+                        profile,
+                        seat: darkmux_fleet::WorkSeat::Unmanaged { .. },
+                    } => ProfileResolution::Work {
+                        profile,
+                        seat: cloud_seat(cloud_calls),
+                    },
                     other => other,
                 }
             }),
@@ -1719,9 +1993,16 @@ mod tests {
                 origins_c.lock().unwrap().push(origin);
                 // A job whose message is "slow" runs ten times as long, so a test
                 // can end one job while another still runs.
-                let ms = if job.message == "slow" { job_ms * 10 } else { job_ms };
+                let ms = if job.message == "slow" {
+                    job_ms * 10
+                } else {
+                    job_ms
+                };
                 std::thread::sleep(Duration::from_millis(ms));
-                ran_c.lock().unwrap().push((job.session_id.wire(), profile.clone()));
+                ran_c
+                    .lock()
+                    .unwrap()
+                    .push((job.session_id.wire(), profile.clone()));
                 Ok(DispatchResult {
                     exit_code: 0,
                     stdout: format!("ran {} on {profile}", job.role_id),
@@ -1748,14 +2029,29 @@ mod tests {
         std_listener.set_nonblocking(true).unwrap();
         let port = std_listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             rt.block_on(async move {
                 let l = tokio::net::TcpListener::from_std(std_listener).unwrap();
                 let (_tx, rx) = tokio::sync::watch::channel(false);
                 serve_bounded(l, router(state), ConnLimits::PRODUCTION, rx).await;
             });
         });
-        Harness { refusal_log, url: format!("http://127.0.0.1:{port}{}", darkmux_fleet::SUBMISSION_PATH), ran, seats, allow: allow_now, queue_slots, model_moved, went_hosted, token: token_now, network, origins }
+        Harness {
+            refusal_log,
+            url: format!("http://127.0.0.1:{port}{}", darkmux_fleet::SUBMISSION_PATH),
+            ran,
+            seats,
+            allow: allow_now,
+            queue_slots,
+            model_moved,
+            went_hosted,
+            token: token_now,
+            network,
+            origins,
+        }
     }
 
     fn laptop() -> darkmux_fleet::NodeIdentity {
@@ -1793,7 +2089,13 @@ mod tests {
     }
 
     fn post(h: &Harness, token: &str, j: WorkJob, wait: bool) -> (u16, SubmissionReply) {
-        darkmux_fleet::post_submission(&h.url, token, &WorkSubmission::new(j, wait), Duration::from_secs(10)).unwrap()
+        darkmux_fleet::post_submission(
+            &h.url,
+            token,
+            &WorkSubmission::new(j, wait),
+            Duration::from_secs(10),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1805,8 +2107,15 @@ mod tests {
         assert_eq!(reply.exit_code, Some(0));
         assert_eq!(reply.stdout.as_deref(), Some("ran radio-host on host"));
         assert_eq!(reply.profile.as_deref(), Some("host"));
-        assert_eq!(reply.session_id.map(|s| s.wire()), Some(relay("s-ok")), "the receiver's own session id");
-        assert_eq!(h.ran.lock().unwrap().as_slice(), &[(relay("s-ok"), "host".to_string())]);
+        assert_eq!(
+            reply.session_id.map(|s| s.wire()),
+            Some(relay("s-ok")),
+            "the receiver's own session id"
+        );
+        assert_eq!(
+            h.ran.lock().unwrap().as_slice(),
+            &[(relay("s-ok"), "host".to_string())]
+        );
     }
 
     /// Every refusal over real HTTP: immediate, with the reason, and nothing
@@ -1815,21 +2124,73 @@ mod tests {
     fn refusals_come_back_at_once_with_the_reason() {
         let h = start(Some(laptop()), false, 0);
         let cases: Vec<(&str, WorkJob, u16, &str)> = vec![
-            ("wrong-token", job("s1", None), 401, "fleet token is missing or does not match"),
-            (TOKEN, job("s2", Some("coder-big")), 403, "not in the allow-list scope: profile coder-big"),
+            (
+                "wrong-token",
+                job("s1", None),
+                401,
+                "fleet token is missing or does not match",
+            ),
+            (
+                TOKEN,
+                job("s2", Some("coder-big")),
+                403,
+                "not in the allow-list scope: profile coder-big",
+            ),
             (TOKEN, job("s3", Some("utility")), 403, "utility model"),
-            (TOKEN, { let mut j = job("s4", None); j.workdir = Some("/x".into()); j }, 403, "working directory"),
-            (TOKEN, { let mut j = job("s5", None); j.target_machine = "mini".into(); j }, 421, "this is studio, not mini"),
-            (TOKEN, { let mut j = job("s6", None); j.role_id = "coder".into(); j }, 403, "not in the allow-list scope: role coder"),
-            (TOKEN, { let mut j = job("s7", None); j.image = Some("evil.example/x".into()); j }, 403, "not in the allow-list scope: image"),
+            (
+                TOKEN,
+                {
+                    let mut j = job("s4", None);
+                    j.workdir = Some("/x".into());
+                    j
+                },
+                403,
+                "working directory",
+            ),
+            (
+                TOKEN,
+                {
+                    let mut j = job("s5", None);
+                    j.target_machine = "mini".into();
+                    j
+                },
+                421,
+                "this is studio, not mini",
+            ),
+            (
+                TOKEN,
+                {
+                    let mut j = job("s6", None);
+                    j.role_id = "coder".into();
+                    j
+                },
+                403,
+                "not in the allow-list scope: role coder",
+            ),
+            (
+                TOKEN,
+                {
+                    let mut j = job("s7", None);
+                    j.image = Some("evil.example/x".into());
+                    j
+                },
+                403,
+                "not in the allow-list scope: image",
+            ),
         ];
         for (token, j, want_code, want_reason) in cases {
             let (code, reply) = post(&h, token, j, true);
             assert_eq!(code, want_code, "{reply:?}");
             assert_eq!(reply.status, ReplyStatus::Refused);
-            assert!(reply.reason.as_deref().unwrap_or("").contains(want_reason), "{reply:?}");
+            assert!(
+                reply.reason.as_deref().unwrap_or("").contains(want_reason),
+                "{reply:?}"
+            );
         }
-        assert!(h.ran.lock().unwrap().is_empty(), "a refused request must never run");
+        assert!(
+            h.ran.lock().unwrap().is_empty(),
+            "a refused request must never run"
+        );
     }
 
     #[test]
@@ -1838,7 +2199,10 @@ mod tests {
         let (code, reply) = post(&h, TOKEN, job("s", None), true);
         assert_eq!(code, 403);
         let said = reply.reason.unwrap();
-        assert!(said.starts_with("studio does not accept work from phone"), "{said}");
+        assert!(
+            said.starts_with("studio does not accept work from phone"),
+            "{said}"
+        );
         // The remedy carries the role the job asked for, read from the body
         // the extractor could not see.
         assert!(said.contains("--roles radio-host"), "{said}");
@@ -1850,11 +2214,17 @@ mod tests {
         let h = start(None, false, 0);
         let (code, reply) = post(&h, TOKEN, job("s", None), true);
         assert_eq!(code, 403);
-        assert!(reply.reason.unwrap().contains("did not come from a node"), "not on the overlay");
+        assert!(
+            reply.reason.unwrap().contains("did not come from a node"),
+            "not on the overlay"
+        );
         let h = start(Some(laptop()), true, 0);
         let (code, reply) = post(&h, TOKEN, job("s", None), true);
         assert_eq!(code, 503);
-        assert!(reply.reason.unwrap().contains("cannot tell which machine sent this request"));
+        assert!(reply
+            .reason
+            .unwrap()
+            .contains("cannot tell which machine sent this request"));
         assert!(h.ran.lock().unwrap().is_empty());
     }
 
@@ -1867,7 +2237,10 @@ mod tests {
         // `start`'s allow-list does not list nSTUDIO; a hand-edited one
         // might, so check the refusal names self regardless of the list.
         assert_eq!(code, 403, "{reply:?}");
-        assert!(reply.reason.unwrap().contains("does not take fleet work from itself"));
+        assert!(reply
+            .reason
+            .unwrap()
+            .contains("does not take fleet work from itself"));
     }
 
     /// Every path on this listener is gated, not only the submission route.
@@ -1875,7 +2248,9 @@ mod tests {
     fn the_gate_covers_every_path() {
         let h = start(None, false, 0);
         let other = h.url.replace(darkmux_fleet::SUBMISSION_PATH, "/health");
-        let resp = ureq::get(&other).set("Authorization", &format!("Bearer {TOKEN}")).call();
+        let resp = ureq::get(&other)
+            .set("Authorization", &format!("Bearer {TOKEN}"))
+            .call();
         match resp {
             Err(ureq::Error::Status(code, _)) => assert_eq!(code, 403),
             other => panic!("an ungated path answered: {other:?}"),
@@ -1885,17 +2260,23 @@ mod tests {
     /// GET the card at `url` with `token`; the status and the body (a
     /// refusal's reply, or the card).
     fn get_card(url: &str, token: &str) -> (u16, serde_json::Value) {
-        let resp = ureq::get(url).set("Authorization", &format!("Bearer {token}")).call();
+        let resp = ureq::get(url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .call();
         let (code, resp) = match resp {
             Ok(r) => (r.status(), r),
             Err(ureq::Error::Status(code, r)) => (code, r),
             Err(e) => panic!("no answer: {e}"),
         };
-        (code, serde_json::from_reader(resp.into_reader()).unwrap_or(serde_json::Value::Null))
+        (
+            code,
+            serde_json::from_reader(resp.into_reader()).unwrap_or(serde_json::Value::Null),
+        )
     }
 
     fn card_url(h: &Harness) -> String {
-        h.url.replace(darkmux_fleet::SUBMISSION_PATH, darkmux_fleet::CARD_PATH)
+        h.url
+            .replace(darkmux_fleet::SUBMISSION_PATH, darkmux_fleet::CARD_PATH)
     }
 
     /// The promise: the listener's card read states the verified caller's own
@@ -1919,13 +2300,28 @@ mod tests {
         assert_eq!(code, 200, "{body}");
         assert_eq!(body["grant"]["state"], "listed");
         assert_eq!(body["grant"]["accepts"]["peer_name"], "macbook-pro");
-        assert_eq!(body["grant"]["accepts"]["profiles"], serde_json::json!(["host", "small", "cloud"]));
-        assert_eq!(body["grant"]["accepts"]["roles"], serde_json::json!(["radio-host"]));
+        assert_eq!(
+            body["grant"]["accepts"]["profiles"],
+            serde_json::json!(["host", "small", "cloud"])
+        );
+        assert_eq!(
+            body["grant"]["accepts"]["roles"],
+            serde_json::json!(["radio-host"])
+        );
         assert_eq!(body["grant"]["accepts"]["workspace"], false);
-        assert_eq!(body["card"]["card_schema_version"], crate::machine_card::CARD_SCHEMA_VERSION);
-        assert!(body["card"].get("grant").is_none() && body["card"].get("accepts").is_none(), "the card itself states no grant: {body}");
+        assert_eq!(
+            body["card"]["card_schema_version"],
+            crate::machine_card::CARD_SCHEMA_VERSION
+        );
+        assert!(
+            body["card"].get("grant").is_none() && body["card"].get("accepts").is_none(),
+            "the card itself states no grant: {body}"
+        );
         let text = body.to_string();
-        assert!(!text.contains("mini-1") && !text.contains("secret-profile"), "another sender's grant leaked: {text}");
+        assert!(
+            !text.contains("mini-1") && !text.contains("secret-profile"),
+            "another sender's grant leaked: {text}"
+        );
     }
 
     /// The promise of symmetric visibility: a card read is AUTHENTICATED, not
@@ -1933,16 +2329,32 @@ mod tests {
     /// machine's card whether or not the allow-list has an entry for it; the
     /// grant says which. A job from the same node is still refused by name.
     #[test]
-    fn a_verified_node_with_no_allow_list_entry_still_gets_the_card_and_the_grant_says_not_listed() {
+    fn a_verified_node_with_no_allow_list_entry_still_gets_the_card_and_the_grant_says_not_listed()
+    {
         let h = start(Some(test_node("nPHONE", "phone", "127.0.0.1")), false, 0);
         let (code, body) = get_card(&card_url(&h), TOKEN);
-        assert_eq!(code, 200, "a machine that grants nothing is still visible: {body}");
+        assert_eq!(
+            code, 200,
+            "a machine that grants nothing is still visible: {body}"
+        );
         assert_eq!(body["grant"], serde_json::json!({"state": "not_listed"}));
-        assert_eq!(body["card"]["card_schema_version"], crate::machine_card::CARD_SCHEMA_VERSION);
-        assert_eq!(h.refusal_log.written.load(std::sync::atomic::Ordering::SeqCst), 0, "a read is not a refusal");
+        assert_eq!(
+            body["card"]["card_schema_version"],
+            crate::machine_card::CARD_SCHEMA_VERSION
+        );
+        assert_eq!(
+            h.refusal_log
+                .written
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a read is not a refusal"
+        );
         let (code, reply) = post(&h, TOKEN, job("s-phone", None), true);
         assert_eq!(code, 403, "{reply:?}");
-        assert!(reply.reason.unwrap().starts_with("studio does not accept work from phone"));
+        assert!(reply
+            .reason
+            .unwrap()
+            .starts_with("studio does not accept work from phone"));
     }
 
     /// An allow-list this machine cannot read, or one that names the caller
@@ -1965,7 +2377,10 @@ mod tests {
         let (code, body) = get_card(&card_url(&h), TOKEN);
         assert_eq!(code, 200, "{body}");
         assert_eq!(body["grant"], serde_json::json!({"state": "unknown"}));
-        assert!(body["card"]["profiles"].is_array(), "the card is intact: {body}");
+        assert!(
+            body["card"]["profiles"].is_array(),
+            "the card is intact: {body}"
+        );
     }
 
     /// The gate on a card read is authentication: a wrong token, a node the
@@ -1977,16 +2392,34 @@ mod tests {
         let h = start(Some(laptop()), false, 0);
         let (code, body) = get_card(&card_url(&h), "wrong-token");
         assert_eq!(code, 401, "{body}");
-        assert!(body["reason"].as_str().unwrap().contains("fleet token is missing or does not match"), "{body}");
+        assert!(
+            body["reason"]
+                .as_str()
+                .unwrap()
+                .contains("fleet token is missing or does not match"),
+            "{body}"
+        );
         let h = start(None, false, 0);
         let (code, body) = get_card(&card_url(&h), TOKEN);
         assert_eq!(code, 403, "{body}");
-        assert!(body["reason"].as_str().unwrap().contains("did not come from a node"), "{body}");
+        assert!(
+            body["reason"]
+                .as_str()
+                .unwrap()
+                .contains("did not come from a node"),
+            "{body}"
+        );
         assert!(body.get("card").is_none() && body.get("grant").is_none());
         let h = start(Some(laptop()), true, 0);
         let (code, body) = get_card(&card_url(&h), TOKEN);
         assert_eq!(code, 503, "{body}");
-        assert!(body["reason"].as_str().unwrap().contains("cannot tell which machine sent this request"), "{body}");
+        assert!(
+            body["reason"]
+                .as_str()
+                .unwrap()
+                .contains("cannot tell which machine sent this request"),
+            "{body}"
+        );
     }
 
     /// A poller that cannot be placed asks every few seconds; its refusals
@@ -1997,7 +2430,12 @@ mod tests {
         for _ in 0..30 {
             assert_eq!(get_card(&card_url(&h), TOKEN).0, 403);
         }
-        assert_eq!(h.refusal_log.written.load(std::sync::atomic::Ordering::SeqCst), u64::from(RefusalLog::PER_WINDOW));
+        assert_eq!(
+            h.refusal_log
+                .written
+                .load(std::sync::atomic::Ordering::SeqCst),
+            u64::from(RefusalLog::PER_WINDOW)
+        );
     }
 
     /// The promise: a burst of card reads costs one gather. The second read
@@ -2009,7 +2447,10 @@ mod tests {
         let (_, first) = get_card(&card_url(&h), TOKEN);
         std::thread::sleep(Duration::from_millis(30));
         let (_, second) = get_card(&card_url(&h), TOKEN);
-        assert_eq!(first["card"]["generated_at_ms"], second["card"]["generated_at_ms"], "the second read gathered again");
+        assert_eq!(
+            first["card"]["generated_at_ms"], second["card"]["generated_at_ms"],
+            "the second read gathered again"
+        );
         assert_eq!(second["card"]["cache_ttl_ms"], CARD_TTL.as_millis() as u64);
     }
 
@@ -2022,7 +2463,11 @@ mod tests {
         let h = start(Some(laptop()), false, 0);
         assert_eq!(get_card(&card_url(&h), TOKEN).0, 200);
         assert_eq!(get_card(&card_url(&h), TOKEN).0, 200);
-        assert_eq!(lookups(&h), 1, "the second card read reused the first's lookup");
+        assert_eq!(
+            lookups(&h),
+            1,
+            "the second card read reused the first's lookup"
+        );
         let h = start(Some(laptop()), false, 0);
         assert_eq!(post(&h, TOKEN, job("s-a", None), true).0, 200);
         assert_eq!(post(&h, TOKEN, job("s-b", None), true).0, 200);
@@ -2037,16 +2482,26 @@ mod tests {
         use std::io::Write;
         const { assert!(PER_IP_CONNECTIONS >= NODE_CAP + CARD_NODE_CAP) };
         let h = start(Some(laptop()), false, 0);
-        let addr = h.url.trim_start_matches("http://").split('/').next().unwrap().to_string();
+        let addr = h
+            .url
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string();
         let mut held = Vec::new();
         for _ in 0..NODE_CAP {
             let mut s = std::net::TcpStream::connect(&addr).unwrap();
-            s.write_all(b"POST /fleet/work HTTP/1.1\r\nHost: x\r\n").unwrap();
+            s.write_all(b"POST /fleet/work HTTP/1.1\r\nHost: x\r\n")
+                .unwrap();
             held.push(s);
         }
         std::thread::sleep(Duration::from_millis(150));
         let (code, body) = get_card(&card_url(&h), TOKEN);
-        assert_eq!(code, 200, "{NODE_CAP} connections held for jobs starved the card read: {body}");
+        assert_eq!(
+            code, 200,
+            "{NODE_CAP} connections held for jobs starved the card read: {body}"
+        );
     }
 
     /// (#2947 review M1) A receiver whose own config would refuse the
@@ -2058,13 +2513,18 @@ mod tests {
             Some(laptop()),
             false,
             0,
-            Arc::new(|| Err("dispatch: refusing to start: bad config (#2947) `seroius`".to_string())),
+            Arc::new(|| {
+                Err("dispatch: refusing to start: bad config (#2947) `seroius`".to_string())
+            }),
         );
         let (code, reply) = post(&h, TOKEN, job("s-bad", None), false);
         assert_eq!(code, 503, "{reply:?}");
         assert_eq!(reply.status, ReplyStatus::Refused);
         let reason = reply.reason.unwrap_or_default();
-        assert!(reason.contains("`seroius`") && reason.contains("darkmux doctor"), "{reason}");
+        assert!(
+            reason.contains("`seroius`") && reason.contains("darkmux doctor"),
+            "{reason}"
+        );
         // (#2947 review C-e) The daemon reads config once at start.
         assert!(reason.contains("restart `darkmux serve`"), "{reason}");
         assert!(h.seats.running().is_empty(), "a seat was taken");
@@ -2080,7 +2540,11 @@ mod tests {
         unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "seroius") };
         let state = FleetListenerState::production(
             "studio".into(),
-            Arc::new(StaticIdentityProvider { local: test_node("nS", "studio", "100.64.0.2"), peers: vec![], down: None }),
+            Arc::new(StaticIdentityProvider {
+                local: test_node("nS", "studio", "100.64.0.2"),
+                peers: vec![],
+                down: None,
+            }),
             None,
             BusyPolicy::Refuse,
         );
@@ -2092,7 +2556,10 @@ mod tests {
             }
         }
         let err = r.unwrap_err();
-        assert!(err.contains("dispatch: refusing to start") && err.contains("`seroius`"), "{err}");
+        assert!(
+            err.contains("dispatch: refusing to start") && err.contains("`seroius`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2106,8 +2573,14 @@ mod tests {
         assert_eq!(code, 503);
         let reason = reply.reason.unwrap();
         assert!(reason.starts_with("busy: studio"), "{reason}");
-        assert!(reason.contains(&format!("{} is running on big", relay("s-long"))), "names what is running: {reason}");
-        assert!(started.elapsed() < Duration::from_millis(500), "busy is answered at once, not queued");
+        assert!(
+            reason.contains(&format!("{} is running on big", relay("s-long"))),
+            "names what is running: {reason}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "busy is answered at once, not queued"
+        );
         // The seat frees when the first job ends.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !h.seats.running().is_empty() {
@@ -2127,7 +2600,10 @@ mod tests {
         let (code, _) = post(&h, TOKEN, job("s-big", None), false);
         assert_eq!(code, 202);
         let (code, reply) = post(&h, TOKEN, job("s-small", Some("small")), true);
-        assert_eq!(code, 200, "a different local model is a different seat: {reply:?}");
+        assert_eq!(
+            code, 200,
+            "a different local model is a different seat: {reply:?}"
+        );
         assert_eq!(reply.status, ReplyStatus::Completed);
     }
 
@@ -2135,14 +2611,29 @@ mod tests {
     /// other up to its `limits.concurrent_calls`, and busy past it.
     #[test]
     fn jobs_on_an_endpoint_run_together_up_to_its_concurrent_calls() {
-        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Refuse, Some(2), WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            600,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Refuse,
+            Some(2),
+            WIDE,
+        );
         allow_profiles(&h, &["host", "small", "cloud"]);
         assert_eq!(post(&h, TOKEN, job("c1", Some("cloud")), false).0, 202);
-        assert_eq!(post(&h, TOKEN, job("c2", Some("cloud")), false).0, 202, "the second job fits a concurrency of 2");
+        assert_eq!(
+            post(&h, TOKEN, job("c2", Some("cloud")), false).0,
+            202,
+            "the second job fits a concurrency of 2"
+        );
         let (code, reply) = post(&h, TOKEN, job("c3", Some("cloud")), true);
         assert_eq!(code, 503, "{reply:?}");
         let reason = reply.reason.unwrap();
-        assert!(reason.contains("limits.concurrent_calls") && reason.contains("cloud-endpoint"), "{reason}");
+        assert!(
+            reason.contains("limits.concurrent_calls") && reason.contains("cloud-endpoint"),
+            "{reason}"
+        );
         // A local job is not held up by endpoint jobs.
         assert_eq!(post(&h, TOKEN, job("l1", None), false).0, 202);
     }
@@ -2152,7 +2643,15 @@ mod tests {
     /// id. Both hold a seat, and the cap still bounds them.
     #[test]
     fn a_repeated_sender_session_takes_two_seats_and_the_cap_holds() {
-        let h = start_full(Some(laptop()), false, 300, Arc::new(|| Ok(())), BusyPolicy::Refuse, Some(2), WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            300,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Refuse,
+            Some(2),
+            WIDE,
+        );
         allow_profiles(&h, &["host", "small", "cloud"]);
         let slow = |session: &str| {
             let mut j = job(session, Some("cloud"));
@@ -2160,18 +2659,32 @@ mod tests {
             j
         };
         assert_eq!(post(&h, TOKEN, job("dup", Some("cloud")), false).0, 202);
-        assert_eq!(post(&h, TOKEN, slow("dup"), false).0, 202, "same session id, second seat");
+        assert_eq!(
+            post(&h, TOKEN, slow("dup"), false).0,
+            202,
+            "same session id, second seat"
+        );
         assert_eq!(h.seats.running().len(), 2, "two claims, one session id");
         // The first dup finishes; the slow one still runs. Freeing by session
         // id would free both seats here.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while h.seats.running().len() > 1 {
-            assert!(std::time::Instant::now() < deadline, "the fast dup never finished");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fast dup never finished"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(post(&h, TOKEN, slow("o1"), false).0, 202, "one seat is free");
+        assert_eq!(
+            post(&h, TOKEN, slow("o1"), false).0,
+            202,
+            "one seat is free"
+        );
         let (code, reply) = post(&h, TOKEN, slow("o2"), true);
-        assert_eq!(code, 503, "the cap of 2 holds while the other dup runs: {reply:?}");
+        assert_eq!(
+            code, 503,
+            "the cap of 2 holds while the other dup runs: {reply:?}"
+        );
     }
 
     /// (5.0) A resolver that panics on a new submission is a 503 the sender
@@ -2182,18 +2695,33 @@ mod tests {
         let h = start(Some(laptop()), false, 0);
         let (code, reply) = post(&h, TOKEN, job("s-boom", Some("boom")), true);
         assert_eq!(code, 503, "{reply:?}");
-        assert_eq!(reply.refusal, Some(darkmux_fleet::RefusalCode::BadConfig), "{reply:?}");
+        assert_eq!(
+            reply.refusal,
+            Some(darkmux_fleet::RefusalCode::BadConfig),
+            "{reply:?}"
+        );
         let reason = reply.reason.unwrap();
         assert!(reason.contains("could not resolve a profile"), "{reason}");
         assert!(!reason.contains("config is fixed"), "{reason}");
-        assert!(h.seats.running().is_empty() && h.ran.lock().unwrap().is_empty(), "nothing ran");
+        assert!(
+            h.seats.running().is_empty() && h.ran.lock().unwrap().is_empty(),
+            "nothing ran"
+        );
     }
 
     /// (#2916 stage 2) `queue`: a waited-on job hears it is queued at once,
     /// then runs when the seat frees and gets its result.
     #[test]
     fn a_queued_job_is_told_it_waits_then_runs() {
-        let h = start_full(Some(laptop()), false, 500, Arc::new(|| Ok(())), BusyPolicy::Queue, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            500,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            WIDE,
+        );
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
         let mut progress = Vec::new();
         let (code, reply) = darkmux_fleet::post_submission_with_progress(
@@ -2209,25 +2737,45 @@ mod tests {
         assert_eq!(reply.stdout.as_deref(), Some("ran radio-host on host"));
         assert!(!progress.is_empty(), "the sender was never told it waits");
         let first = progress[0].reason.clone().unwrap();
-        assert!(first.contains("queued") && first.contains(&relay("s-first")), "{first}");
+        assert!(
+            first.contains("queued") && first.contains(&relay("s-first")),
+            "{first}"
+        );
         let ran = h.ran.lock().unwrap().clone();
-        assert_eq!(ran.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>(), vec![relay("s-first"), relay("s-second")]);
+        assert_eq!(
+            ran.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>(),
+            vec![relay("s-first"), relay("s-second")]
+        );
     }
 
     /// (#2916 stage 2) `queue` without `--wait`: the answer is `queued`,
     /// at once, and the job still runs.
     #[test]
     fn a_queued_job_without_wait_is_answered_queued_and_still_runs() {
-        let h = start_full(Some(laptop()), false, 300, Arc::new(|| Ok(())), BusyPolicy::Queue, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            300,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            WIDE,
+        );
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
         let started = std::time::Instant::now();
         let (code, reply) = post(&h, TOKEN, job("s-second", None), false);
         assert_eq!(code, 202, "{reply:?}");
         assert_eq!(reply.status, ReplyStatus::Queued);
-        assert!(started.elapsed() < Duration::from_millis(250), "answered at once");
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "answered at once"
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while h.ran.lock().unwrap().len() < 2 {
-            assert!(std::time::Instant::now() < deadline, "the queued job never ran");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the queued job never ran"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -2238,7 +2786,10 @@ mod tests {
     fn the_busy_settings_are_reported_to_this_machine_only() {
         *LISTENER_BUSY.lock().unwrap() = Some(BusyPolicy::Queue);
         let local = listener_busy(true).unwrap();
-        assert_eq!(serde_json::to_value(local).unwrap(), serde_json::json!({ "policy": "queue" }));
+        assert_eq!(
+            serde_json::to_value(local).unwrap(),
+            serde_json::json!({ "policy": "queue" })
+        );
         assert!(listener_busy(false).is_none(), "a peer sees nothing");
         // Process-global: leave it as the process started.
         *LISTENER_BUSY.lock().unwrap() = None;
@@ -2248,7 +2799,11 @@ mod tests {
     fn wait_ran(h: &Harness, n: usize) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while h.ran.lock().unwrap().len() < n {
-            assert!(std::time::Instant::now() < deadline, "only {:?} ran", h.ran.lock().unwrap());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {:?} ran",
+                h.ran.lock().unwrap()
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -2257,18 +2812,27 @@ mod tests {
     fn wait_idle(h: &Harness) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let slots_free = (0..NODE_CAP).map(|_| h.queue_slots.try_take("macbook-pro".into())).collect::<Vec<_>>();
+            let slots_free = (0..NODE_CAP)
+                .map(|_| h.queue_slots.try_take("macbook-pro".into()))
+                .collect::<Vec<_>>();
             if h.seats.running().is_empty() && slots_free.iter().all(Option::is_some) {
                 return;
             }
-            assert!(std::time::Instant::now() < deadline, "the listener never went idle: {:?}", h.seats.running());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the listener never went idle: {:?}",
+                h.seats.running()
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
 
     /// Post `j` with `wait` from a background thread; the reply and every
     /// `queued` line it heard come back on the handle.
-    fn post_in_background(h: &Harness, j: WorkJob) -> std::thread::JoinHandle<(u16, SubmissionReply, Vec<SubmissionReply>)> {
+    fn post_in_background(
+        h: &Harness,
+        j: WorkJob,
+    ) -> std::thread::JoinHandle<(u16, SubmissionReply, Vec<SubmissionReply>)> {
         let url = h.url.clone();
         std::thread::spawn(move || {
             let mut heard = Vec::new();
@@ -2289,7 +2853,15 @@ mod tests {
     /// it never runs.
     #[test]
     fn a_queued_job_is_refused_when_its_sender_was_untrusted_while_it_waited() {
-        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            600,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            WIDE,
+        );
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
         let waiting = post_in_background(&h, job("s-queued", None));
         std::thread::sleep(Duration::from_millis(200));
@@ -2297,7 +2869,10 @@ mod tests {
         let (_, reply, heard) = waiting.join().unwrap();
         assert!(!heard.is_empty(), "it was queued first");
         assert_eq!(reply.status, ReplyStatus::Refused, "{reply:?}");
-        assert!(reply.reason.unwrap().contains("does not accept work from macbook-pro"));
+        assert!(reply
+            .reason
+            .unwrap()
+            .contains("does not accept work from macbook-pro"));
         wait_idle(&h);
         assert_eq!(h.ran.lock().unwrap().len(), 1, "only the first job ran");
     }
@@ -2306,20 +2881,43 @@ mod tests {
     /// nobody is listening, and it still never runs.
     #[test]
     fn a_no_wait_queued_job_never_runs_after_untrust() {
-        let h = start_full(Some(laptop()), false, 400, Arc::new(|| Ok(())), BusyPolicy::Queue, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            400,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            WIDE,
+        );
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
-        assert_eq!(post(&h, TOKEN, job("s-queued", None), false).1.status, ReplyStatus::Queued);
+        assert_eq!(
+            post(&h, TOKEN, job("s-queued", None), false).1.status,
+            ReplyStatus::Queued
+        );
         h.allow.lock().unwrap().clear();
         wait_ran(&h, 1);
         wait_idle(&h);
-        assert_eq!(h.ran.lock().unwrap().len(), 1, "the queued job ran after untrust");
+        assert_eq!(
+            h.ran.lock().unwrap().len(),
+            1,
+            "the queued job ran after untrust"
+        );
     }
 
     /// Start a queuing listener with a job running and a second, waited-on
     /// job queued behind it; `revoke` runs while it waits. The queued job's
     /// reply comes back, and nothing but the first job may have run.
     fn queue_then(revoke: impl FnOnce(&Harness)) -> (Harness, SubmissionReply) {
-        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            600,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            WIDE,
+        );
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
         let waiting = post_in_background(&h, job("s-queued", None));
         std::thread::sleep(Duration::from_millis(200));
@@ -2328,7 +2926,11 @@ mod tests {
         assert!(!heard.is_empty(), "it was queued first");
         wait_ran(&h, 1);
         wait_idle(&h);
-        assert_eq!(h.ran.lock().unwrap().len(), 1, "the queued job ran after it was revoked: {reply:?}");
+        assert_eq!(
+            h.ran.lock().unwrap().len(),
+            1,
+            "the queued job ran after it was revoked: {reply:?}"
+        );
         (h, reply)
     }
 
@@ -2386,7 +2988,8 @@ mod tests {
                     extras: Default::default(),
                 },
             );
-            h.network.set(vec![test_node("nPHONE", "phone", "127.0.0.1")], None);
+            h.network
+                .set(vec![test_node("nPHONE", "phone", "127.0.0.1")], None);
         });
         refused_because(&reply, "did not come from a node");
     }
@@ -2396,7 +2999,15 @@ mod tests {
     /// lands while the provider is still answering is seen.
     #[test]
     fn an_untrust_during_the_rechecks_identity_lookup_is_seen() {
-        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            600,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            WIDE,
+        );
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
         let waiting = post_in_background(&h, job("s-queued", None));
         std::thread::sleep(Duration::from_millis(200));
@@ -2425,13 +3036,27 @@ mod tests {
     #[test]
     fn a_sender_that_hangs_up_during_the_recheck_never_runs() {
         use std::io::{Read, Write};
-        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            600,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            WIDE,
+        );
         // Lookups 0 and 1 are the gate's, for the first job and the waiter;
         // lookup 2 is the waiter's recheck once the first job frees the seat.
         h.network.hold_from(2);
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
         let body = serde_json::to_vec(&WorkSubmission::new(job("s-gone", None), true)).unwrap();
-        let addr = h.url.trim_start_matches("http://").split('/').next().unwrap().to_string();
+        let addr = h
+            .url
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string();
         let mut sock = std::net::TcpStream::connect(&addr).unwrap();
         write!(
             sock,
@@ -2453,18 +3078,32 @@ mod tests {
         // recheck's lookup begins and is held.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while h.network.lookups() < 3 {
-            assert!(std::time::Instant::now() < deadline, "the recheck never looked the sender up");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the recheck never looked the sender up"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(h.ran.lock().unwrap().len(), 1, "the first job ended before the recheck");
-        assert!(!h.seats.running().is_empty(), "the waiter should hold the seat, mid-recheck");
+        assert_eq!(
+            h.ran.lock().unwrap().len(),
+            1,
+            "the first job ended before the recheck"
+        );
+        assert!(
+            !h.seats.running().is_empty(),
+            "the waiter should hold the seat, mid-recheck"
+        );
         drop(sock);
         // The lookup answers 1.2 s after the hang-up.
         h.network.slow(Duration::from_millis(1_200));
         h.network.release();
         wait_idle(&h);
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(h.ran.lock().unwrap().len(), 1, "a job whose sender hung up during its recheck ran");
+        assert_eq!(
+            h.ran.lock().unwrap().len(),
+            1,
+            "a job whose sender hung up during its recheck ran"
+        );
     }
 
     /// (#2916 stage 2 review C3) The scope is checked again: an entry
@@ -2472,7 +3111,12 @@ mod tests {
     #[test]
     fn a_queued_job_is_refused_when_its_entry_is_narrowed_while_it_waits() {
         let (_, reply) = queue_then(|h| {
-            h.allow.lock().unwrap().get_mut("macbook-pro").unwrap().profiles = Some(vec!["small".into()]);
+            h.allow
+                .lock()
+                .unwrap()
+                .get_mut("macbook-pro")
+                .unwrap()
+                .profiles = Some(vec!["small".into()]);
         });
         refused_because(&reply, "not in the allow-list scope: profile host");
     }
@@ -2482,7 +3126,15 @@ mod tests {
     /// name the job is attributed to.
     #[test]
     fn a_queued_job_runs_under_its_entrys_current_name() {
-        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            600,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            WIDE,
+        );
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
         let waiting = post_in_background(&h, job("s-queued", None));
         std::thread::sleep(Duration::from_millis(200));
@@ -2493,7 +3145,10 @@ mod tests {
         }
         let (_, reply, _) = waiting.join().unwrap();
         assert_eq!(reply.status, ReplyStatus::Completed, "{reply:?}");
-        assert_eq!(h.origins(), vec!["macbook-pro".to_string(), "laptop".to_string()]);
+        assert_eq!(
+            h.origins(),
+            vec!["macbook-pro".to_string(), "laptop".to_string()]
+        );
     }
 
     /// (#2916 stage 2 review M1) The config preflight runs again when a
@@ -2510,7 +3165,15 @@ mod tests {
                 Ok(())
             }
         });
-        let h = start_full(Some(laptop()), false, 600, preflight, BusyPolicy::Queue, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            600,
+            preflight,
+            BusyPolicy::Queue,
+            None,
+            WIDE,
+        );
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
         let waiting = post_in_background(&h, job("s-queued", None));
         std::thread::sleep(Duration::from_millis(200));
@@ -2526,11 +3189,20 @@ mod tests {
     /// refused rather than run on a seat it does not hold.
     #[test]
     fn a_queued_job_is_refused_when_its_profile_moved_to_another_model() {
-        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            600,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            WIDE,
+        );
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
         let waiting = post_in_background(&h, job("s-queued", None));
         std::thread::sleep(Duration::from_millis(200));
-        h.model_moved.store(true, std::sync::atomic::Ordering::SeqCst);
+        h.model_moved
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let (_, reply, _) = waiting.join().unwrap();
         assert_eq!(reply.status, ReplyStatus::Refused, "{reply:?}");
         assert!(reply.reason.unwrap().contains("different model"));
@@ -2554,13 +3226,42 @@ mod tests {
     #[test]
     fn a_managed_only_job_is_refused_on_a_hosted_profile_and_runs_on_a_managed_one() {
         let h = start(Some(laptop()), false, 0);
-        let (code, reply) = post(&h, TOKEN, managed_only(job("s-managed", Some("host"))), true);
-        assert_eq!((code, reply.status), (200, ReplyStatus::Completed), "{reply:?}");
-        let (code, reply) = post(&h, TOKEN, managed_only(job("s-hosted", Some("cloud"))), true);
-        assert_eq!((code, reply.status, reply.refusal), (403, ReplyStatus::Refused, Some(darkmux_fleet::RefusalCode::Boundary)), "{reply:?}");
-        assert!(reply.reason.unwrap().contains("hosted endpoint"), "the sentence says why");
+        let (code, reply) = post(
+            &h,
+            TOKEN,
+            managed_only(job("s-managed", Some("host"))),
+            true,
+        );
+        assert_eq!(
+            (code, reply.status),
+            (200, ReplyStatus::Completed),
+            "{reply:?}"
+        );
+        let (code, reply) = post(
+            &h,
+            TOKEN,
+            managed_only(job("s-hosted", Some("cloud"))),
+            true,
+        );
+        assert_eq!(
+            (code, reply.status, reply.refusal),
+            (
+                403,
+                ReplyStatus::Refused,
+                Some(darkmux_fleet::RefusalCode::Boundary)
+            ),
+            "{reply:?}"
+        );
+        assert!(
+            reply.reason.unwrap().contains("hosted endpoint"),
+            "the sentence says why"
+        );
         let (code, reply) = post(&h, TOKEN, job("s-free", Some("cloud")), true);
-        assert_eq!((code, reply.status), (200, ReplyStatus::Completed), "no boundary, no restriction: {reply:?}");
+        assert_eq!(
+            (code, reply.status),
+            (200, ReplyStatus::Completed),
+            "no boundary, no restriction: {reply:?}"
+        );
         assert_eq!(h.ran.lock().unwrap().len(), 2, "the refused job never ran");
     }
 
@@ -2571,7 +3272,11 @@ mod tests {
         let mut j = job("s-future", Some("host"));
         j.boundary = Some(darkmux_fleet::Boundary::Unknown);
         let (code, reply) = post(&h, TOKEN, j, true);
-        assert_eq!((code, reply.refusal), (403, Some(darkmux_fleet::RefusalCode::Boundary)), "{reply:?}");
+        assert_eq!(
+            (code, reply.refusal),
+            (403, Some(darkmux_fleet::RefusalCode::Boundary)),
+            "{reply:?}"
+        );
         assert!(h.ran.lock().unwrap().is_empty());
     }
 
@@ -2581,12 +3286,25 @@ mod tests {
     /// same name with another machine's uid is `misaddressed`.
     #[test]
     fn a_job_for_the_former_name_with_the_receivers_uid_is_taken_over_http() {
-        let h = start_full_as(Some(laptop()), false, 0, Arc::new(|| Ok(())), BusyPolicy::Refuse, None, WIDE, Some("UID-STUDIO"));
+        let h = start_full_as(
+            Some(laptop()),
+            false,
+            0,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Refuse,
+            None,
+            WIDE,
+            Some("UID-STUDIO"),
+        );
         let mut former = job("s-old", None);
         former.target_machine = "m1-max-32gb-studio".into();
         former.target_machine_uid = Some("uid-studio".into());
         let (code, reply) = post(&h, TOKEN, former.clone(), true);
-        assert_eq!((code, reply.status), (200, ReplyStatus::Completed), "{reply:?}");
+        assert_eq!(
+            (code, reply.status),
+            (200, ReplyStatus::Completed),
+            "{reply:?}"
+        );
         let mut check = former;
         check.mode = darkmux_fleet::SubmissionMode::Check;
         check.session_id = sender("s-old-check");
@@ -2595,7 +3313,11 @@ mod tests {
         let mut other = job("s-other", None);
         other.target_machine_uid = Some("UID-ELSEWHERE".into());
         let (code, reply) = post(&h, TOKEN, other, true);
-        assert_eq!((code, reply.refusal), (421, Some(darkmux_fleet::RefusalCode::Misaddressed)), "{reply:?}");
+        assert_eq!(
+            (code, reply.refusal),
+            (421, Some(darkmux_fleet::RefusalCode::Misaddressed)),
+            "{reply:?}"
+        );
     }
 
     /// The typed code reaches the sender for each refusal, beside the
@@ -2608,10 +3330,42 @@ mod tests {
             ("wrong-token", job("c1", None), C::Token),
             (TOKEN, job("c2", Some("coder-big")), C::ProfileNotAllowed),
             (TOKEN, job("c3", Some("utility")), C::ProfileNotAllowed),
-            (TOKEN, { let mut j = job("c4", None); j.workdir = Some("/x".into()); j }, C::WorkspaceNotAllowed),
-            (TOKEN, { let mut j = job("c5", None); j.target_machine = "mini".into(); j }, C::Misaddressed),
-            (TOKEN, { let mut j = job("c6", None); j.role_id = "coder".into(); j }, C::RoleNotAllowed),
-            (TOKEN, { let mut j = job("c7", None); j.image = Some("evil.example/x".into()); j }, C::ImageNotAllowed),
+            (
+                TOKEN,
+                {
+                    let mut j = job("c4", None);
+                    j.workdir = Some("/x".into());
+                    j
+                },
+                C::WorkspaceNotAllowed,
+            ),
+            (
+                TOKEN,
+                {
+                    let mut j = job("c5", None);
+                    j.target_machine = "mini".into();
+                    j
+                },
+                C::Misaddressed,
+            ),
+            (
+                TOKEN,
+                {
+                    let mut j = job("c6", None);
+                    j.role_id = "coder".into();
+                    j
+                },
+                C::RoleNotAllowed,
+            ),
+            (
+                TOKEN,
+                {
+                    let mut j = job("c7", None);
+                    j.image = Some("evil.example/x".into());
+                    j
+                },
+                C::ImageNotAllowed,
+            ),
         ];
         for (token, j, want) in cases {
             let (_, reply) = post(&h, token, j, true);
@@ -2626,15 +3380,31 @@ mod tests {
     /// made, and the waiter is decided only after it frees.
     #[test]
     fn a_queued_managed_only_job_is_refused_when_its_profile_went_hosted_while_it_waited() {
-        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            600,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            WIDE,
+        );
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
         let waiting = post_in_background(&h, managed_only(job("s-queued", None)));
         std::thread::sleep(Duration::from_millis(200));
-        h.went_hosted.store(true, std::sync::atomic::Ordering::SeqCst);
+        h.went_hosted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let (_, reply, heard) = waiting.join().unwrap();
-        assert!(!heard.is_empty(), "it was queued first, on its managed seat");
+        assert!(
+            !heard.is_empty(),
+            "it was queued first, on its managed seat"
+        );
         assert_eq!(reply.status, ReplyStatus::Refused, "{reply:?}");
-        assert_eq!(reply.refusal, Some(darkmux_fleet::RefusalCode::Boundary), "{reply:?}");
+        assert_eq!(
+            reply.refusal,
+            Some(darkmux_fleet::RefusalCode::Boundary),
+            "{reply:?}"
+        );
         wait_idle(&h);
         assert_eq!(h.ran.lock().unwrap().len(), 1, "only the first job ran");
     }
@@ -2644,16 +3414,31 @@ mod tests {
     #[test]
     fn a_check_answers_what_a_run_would_meet_and_runs_nothing() {
         let h = start(Some(laptop()), false, 0);
-        let (code, reply) = post(&h, TOKEN, check(managed_only(job("k1", Some("host")))), true);
-        assert_eq!((code, reply.status), (200, ReplyStatus::Checked), "{reply:?}");
+        let (code, reply) = post(
+            &h,
+            TOKEN,
+            check(managed_only(job("k1", Some("host")))),
+            true,
+        );
+        assert_eq!(
+            (code, reply.status),
+            (200, ReplyStatus::Checked),
+            "{reply:?}"
+        );
         assert_eq!(reply.profile.as_deref(), Some("host"));
         assert_eq!(
             reply.check,
-            Some(darkmux_fleet::CheckReport { endpoint: darkmux_fleet::EndpointClass::Managed, seat: darkmux_fleet::SeatOutlook::Free })
+            Some(darkmux_fleet::CheckReport {
+                endpoint: darkmux_fleet::EndpointClass::Managed,
+                seat: darkmux_fleet::SeatOutlook::Free
+            })
         );
         assert_eq!(reply.session_id, None, "no session was minted for a check");
         let (_, hosted) = post(&h, TOKEN, check(job("k2", Some("cloud"))), true);
-        assert_eq!(hosted.check.unwrap().endpoint, darkmux_fleet::EndpointClass::Unmanaged);
+        assert_eq!(
+            hosted.check.unwrap().endpoint,
+            darkmux_fleet::EndpointClass::Unmanaged
+        );
         assert!(h.ran.lock().unwrap().is_empty(), "a check ran a job");
         assert!(h.seats.running().is_empty(), "a check held a seat");
     }
@@ -2664,12 +3449,36 @@ mod tests {
     #[test]
     fn a_check_is_refused_exactly_as_a_run_would_be() {
         use darkmux_fleet::RefusalCode as C;
-        let h = start_full(Some(laptop()), false, 800, Arc::new(|| Ok(())), BusyPolicy::Refuse, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            800,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Refuse,
+            None,
+            WIDE,
+        );
         let cases: Vec<(&str, WorkJob, C)> = vec![
             ("wrong-token", check(job("k1", None)), C::Token),
-            (TOKEN, check(job("k2", Some("coder-big"))), C::ProfileNotAllowed),
-            (TOKEN, check({ let mut j = job("k4", None); j.role_id = "coder".into(); j }), C::RoleNotAllowed),
-            (TOKEN, check(managed_only(job("k5", Some("cloud")))), C::Boundary),
+            (
+                TOKEN,
+                check(job("k2", Some("coder-big"))),
+                C::ProfileNotAllowed,
+            ),
+            (
+                TOKEN,
+                check({
+                    let mut j = job("k4", None);
+                    j.role_id = "coder".into();
+                    j
+                }),
+                C::RoleNotAllowed,
+            ),
+            (
+                TOKEN,
+                check(managed_only(job("k5", Some("cloud")))),
+                C::Boundary,
+            ),
         ];
         for (token, j, want) in cases {
             let mut run = j.clone();
@@ -2678,17 +3487,29 @@ mod tests {
             let (_, ran) = post(&h, token, run, false);
             assert_eq!(checked.status, ReplyStatus::Refused, "{checked:?}");
             assert_eq!(checked.refusal, Some(want), "{checked:?}");
-            assert_eq!(ran.refusal, Some(want), "the run is refused the same way: {ran:?}");
+            assert_eq!(
+                ran.refusal,
+                Some(want),
+                "the run is refused the same way: {ran:?}"
+            );
         }
         // Busy under `refuse`: the same code a run gets, and the check
         // itself never took the seat.
         assert_eq!(post(&h, TOKEN, job("k-first", None), false).0, 202);
         let (_, busy) = post(&h, TOKEN, check(job("k6", None)), true);
-        assert_eq!((busy.status, busy.refusal), (ReplyStatus::Refused, Some(C::Busy)), "{busy:?}");
+        assert_eq!(
+            (busy.status, busy.refusal),
+            (ReplyStatus::Refused, Some(C::Busy)),
+            "{busy:?}"
+        );
         wait_ran(&h, 1);
         wait_idle(&h);
         let (_, free) = post(&h, TOKEN, check(job("k7", None)), true);
-        assert_eq!(free.status, ReplyStatus::Checked, "the seat is free again: {free:?}");
+        assert_eq!(
+            free.status,
+            ReplyStatus::Checked,
+            "the seat is free again: {free:?}"
+        );
         assert_eq!(h.ran.lock().unwrap().len(), 1, "no check ran anything");
     }
 
@@ -2696,25 +3517,55 @@ mod tests {
     /// queue slot, and leaves the queue as it was.
     #[test]
     fn a_check_on_a_busy_seat_under_queue_says_would_queue_and_takes_no_slot() {
-        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            600,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            WIDE,
+        );
         assert_eq!(post(&h, TOKEN, job("q-first", None), false).0, 202);
         for i in 0..NODE_CAP + 2 {
             let (_, reply) = post(&h, TOKEN, check(job(&format!("q-check-{i}"), None)), true);
-            assert_eq!(reply.check.map(|c| c.seat), Some(darkmux_fleet::SeatOutlook::WouldQueue), "check {i}: {reply:?}");
+            assert_eq!(
+                reply.check.map(|c| c.seat),
+                Some(darkmux_fleet::SeatOutlook::WouldQueue),
+                "check {i}: {reply:?}"
+            );
         }
         wait_ran(&h, 1);
         wait_idle(&h);
-        assert_eq!(h.ran.lock().unwrap().len(), 1, "no check ran, and none was queued to run");
+        assert_eq!(
+            h.ran.lock().unwrap().len(),
+            1,
+            "no check ran, and none was queued to run"
+        );
     }
 
     /// A check answers a full queue as a run does: `busy`.
     #[test]
     fn a_check_when_the_peers_queue_is_full_is_refused_busy() {
-        let h = start_full(Some(laptop()), false, 1_500, Arc::new(|| Ok(())), BusyPolicy::Queue, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            1_500,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            WIDE,
+        );
         assert_eq!(post(&h, TOKEN, job("f-first", None), false).0, 202);
-        let _slots: Vec<_> = (0..NODE_CAP).map(|_| h.queue_slots.try_take("macbook-pro".into()).unwrap()).collect();
+        let _slots: Vec<_> = (0..NODE_CAP)
+            .map(|_| h.queue_slots.try_take("macbook-pro".into()).unwrap())
+            .collect();
         let (_, reply) = post(&h, TOKEN, check(job("f-check", None)), true);
-        assert_eq!((reply.status, reply.refusal), (ReplyStatus::Refused, Some(darkmux_fleet::RefusalCode::Busy)), "{reply:?}");
+        assert_eq!(
+            (reply.status, reply.refusal),
+            (ReplyStatus::Refused, Some(darkmux_fleet::RefusalCode::Busy)),
+            "{reply:?}"
+        );
     }
 
     /// A newer minor is refused naming both versions, over the wire, with the
@@ -2726,9 +3577,17 @@ mod tests {
         newer.schema = "8.9".into();
         let (code, reply) =
             darkmux_fleet::post_submission(&h.url, TOKEN, &newer, Duration::from_secs(10)).unwrap();
-        assert_eq!((code, reply.refusal), (400, Some(darkmux_fleet::RefusalCode::Version)), "{reply:?}");
+        assert_eq!(
+            (code, reply.refusal),
+            (400, Some(darkmux_fleet::RefusalCode::Version)),
+            "{reply:?}"
+        );
         let reason = reply.reason.unwrap();
-        assert!(reason.contains("v8.9") && reason.contains(&format!("v{}", darkmux_fleet::WORK_JOB_SCHEMA_VERSION)), "{reason}");
+        assert!(
+            reason.contains("v8.9")
+                && reason.contains(&format!("v{}", darkmux_fleet::WORK_JOB_SCHEMA_VERSION)),
+            "{reason}"
+        );
         assert!(h.ran.lock().unwrap().is_empty());
     }
 
@@ -2738,10 +3597,24 @@ mod tests {
     #[test]
     fn a_waiting_sender_that_hangs_up_frees_its_slot_and_its_job_never_runs() {
         use std::io::{Read, Write};
-        let h = start_full(Some(laptop()), false, 1_500, Arc::new(|| Ok(())), BusyPolicy::Queue, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            1_500,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            WIDE,
+        );
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
         let body = serde_json::to_vec(&WorkSubmission::new(job("s-gone", None), true)).unwrap();
-        let addr = h.url.trim_start_matches("http://").split('/').next().unwrap().to_string();
+        let addr = h
+            .url
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string();
         let mut sock = std::net::TcpStream::connect(&addr).unwrap();
         write!(
             sock,
@@ -2765,15 +3638,23 @@ mod tests {
         // slot would free only once the first job released the seat.
         let deadline = std::time::Instant::now() + Duration::from_millis(1_000);
         loop {
-            let slots: Vec<_> = (0..NODE_CAP).map(|_| h.queue_slots.try_take("macbook-pro".into())).collect();
+            let slots: Vec<_> = (0..NODE_CAP)
+                .map(|_| h.queue_slots.try_take("macbook-pro".into()))
+                .collect();
             if slots.iter().all(Option::is_some) {
                 break;
             }
             drop(slots);
-            assert!(std::time::Instant::now() < deadline, "the hung-up waiter still holds its queue slot");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the hung-up waiter still holds its queue slot"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(h.ran.lock().unwrap().is_empty(), "the first job was still running when the slot freed");
+        assert!(
+            h.ran.lock().unwrap().is_empty(),
+            "the first job was still running when the slot freed"
+        );
         wait_ran(&h, 1);
         wait_idle(&h);
         std::thread::sleep(Duration::from_millis(300));
@@ -2784,12 +3665,27 @@ mod tests {
     /// to wait inside one connection is answered busy at once, not queued.
     #[test]
     fn a_waited_job_with_no_room_in_its_connection_is_busy_not_queued() {
-        let tight = QueueLimits { connection_lifetime: Duration::from_secs(120), no_wait_max_age: Duration::from_secs(60) };
-        let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, None, tight);
+        let tight = QueueLimits {
+            connection_lifetime: Duration::from_secs(120),
+            no_wait_max_age: Duration::from_secs(60),
+        };
+        let h = start_full(
+            Some(laptop()),
+            false,
+            600,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            tight,
+        );
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
         // A 60 s job in a 120 s connection, less 60 s of slack: no time left.
         let (code, reply) = post(&h, TOKEN, job("s-second", None), true);
-        assert_eq!((code, reply.status), (503, ReplyStatus::Refused), "{reply:?}");
+        assert_eq!(
+            (code, reply.status),
+            (503, ReplyStatus::Refused),
+            "{reply:?}"
+        );
         assert!(reply.reason.unwrap().contains("no time left to wait"));
     }
 
@@ -2802,9 +3698,20 @@ mod tests {
             connection_lifetime: Duration::from_secs(60) + QUEUE_SLACK + Duration::from_millis(300),
             no_wait_max_age: Duration::from_millis(300),
         };
-        let h = start_full(Some(laptop()), false, 1_500, Arc::new(|| Ok(())), BusyPolicy::Queue, None, short);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            1_500,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            short,
+        );
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
-        assert_eq!(post(&h, TOKEN, job("s-nowait", None), false).1.status, ReplyStatus::Queued);
+        assert_eq!(
+            post(&h, TOKEN, job("s-nowait", None), false).1.status,
+            ReplyStatus::Queued
+        );
         let (_, reply, heard) = post_in_background(&h, job("s-wait", None)).join().unwrap();
         assert!(!heard.is_empty());
         assert_eq!(reply.status, ReplyStatus::Refused, "{reply:?}");
@@ -2817,7 +3724,15 @@ mod tests {
     /// (#2916 stage 2) A peer may queue at most `NODE_CAP` jobs.
     #[test]
     fn a_peer_cannot_queue_without_bound() {
-        let h = start_full(Some(laptop()), false, 2_000, Arc::new(|| Ok(())), BusyPolicy::Queue, None, WIDE);
+        let h = start_full(
+            Some(laptop()),
+            false,
+            2_000,
+            Arc::new(|| Ok(())),
+            BusyPolicy::Queue,
+            None,
+            WIDE,
+        );
         assert_eq!(post(&h, TOKEN, job("s-run", None), false).0, 202);
         for i in 0..NODE_CAP {
             let (code, r) = post(&h, TOKEN, job(&format!("s-q{i}"), None), false);
@@ -2866,7 +3781,10 @@ mod tests {
     fn submit_from_loopback(headers: &[(&str, &str)]) -> (StatusCode, usize) {
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let state = gate_only_state(reads.clone());
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let resp = rt.block_on(async {
             use tower::ServiceExt;
             let body = serde_json::to_vec(&WorkSubmission::new(job("s", None), true)).unwrap();
@@ -2875,10 +3793,14 @@ mod tests {
                 b = b.header(*k, *v);
             }
             let mut req = b.body(axum::body::Body::from(body)).unwrap();
-            req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5000))));
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5000))));
             router(state).oneshot(req).await.unwrap()
         });
-        (resp.status(), reads.load(std::sync::atomic::Ordering::SeqCst))
+        (
+            resp.status(),
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+        )
     }
 
     /// A caller without the token is answered before the allow-list is
@@ -2887,7 +3809,10 @@ mod tests {
     fn a_caller_without_the_token_reads_nothing() {
         let (status, reads) = submit_from_loopback(&[("Authorization", "Bearer wrong")]);
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(reads, 0, "the allow-list was read for a caller without the token");
+        assert_eq!(
+            reads, 0,
+            "the allow-list was read for a caller without the token"
+        );
     }
 
     /// (#2988 follow-up) Execution never inherits the read posture: a work
@@ -2936,7 +3861,10 @@ mod tests {
             identity_cache: Arc::new(IdentityCache::new()),
             config_preflight: Arc::new(|| Ok(())),
         };
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let resp = rt.block_on(async {
             use tower::ServiceExt;
             let body = serde_json::to_vec(&WorkSubmission::new(job("s", None), true)).unwrap();
@@ -2963,7 +3891,13 @@ mod tests {
         use std::io::{Read, Write};
         let h = start(Some(laptop()), false, 0);
         let body = serde_json::to_vec(&WorkSubmission::new(job("s-early", None), true)).unwrap();
-        let addr = h.url.trim_start_matches("http://").split('/').next().unwrap().to_string();
+        let addr = h
+            .url
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string();
         let mut sock = std::net::TcpStream::connect(&addr).unwrap();
         write!(
             sock,
@@ -2978,14 +3912,18 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         sock.write_all(&body).unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        sock.set_read_timeout(Some(Duration::from_secs(5))).expect("the connection was reset");
+        sock.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("the connection was reset");
         let mut got = String::new();
         let reading = std::time::Instant::now();
         sock.read_to_string(&mut got).expect("the answer broke off");
         // The listener sends FIN with the answer: the sender's read ends at
         // once, not when the listener stops lingering.
         let took = reading.elapsed();
-        assert!(took < ConnLimits::PRODUCTION.linger / 4, "the answer ended only after {took:?}: no FIN");
+        assert!(
+            took < ConnLimits::PRODUCTION.linger / 4,
+            "the answer ended only after {took:?}: no FIN"
+        );
         assert!(got.starts_with("HTTP/1.1 401"), "{got}");
         assert!(got.contains("\"refusal\":\"token\""), "{got}");
     }
@@ -3013,14 +3951,19 @@ mod tests {
         // Answers at once, without reading the body.
         let app = Router::new().route("/early", axum::routing::post(|| async { "no" }));
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             rt.block_on(async move {
                 let l = tokio::net::TcpListener::from_std(std_listener).unwrap();
                 let (_tx, rx) = tokio::sync::watch::channel(false);
                 serve_bounded(l, app, limits, rx).await;
             });
         });
-        let request = |len: usize| format!("POST /early HTTP/1.1\r\nHost: x\r\nContent-Length: {len}\r\n\r\n");
+        let request = |len: usize| {
+            format!("POST /early HTTP/1.1\r\nHost: x\r\nContent-Length: {len}\r\n\r\n")
+        };
         // Declares 64 MiB and sends 8 MiB of it, then keeps the socket open.
         let mut flood = std::net::TcpStream::connect(addr).unwrap();
         flood.write_all(request(64 << 20).as_bytes()).unwrap();
@@ -3040,7 +3983,10 @@ mod tests {
             if got.starts_with("HTTP/1.1 200") {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "the flooding connection still holds its slot");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the flooding connection still holds its slot"
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
         drop(flood);
@@ -3065,7 +4011,10 @@ mod tests {
         };
         let app = Router::new().route("/ok", axum::routing::get(|| async { "ok" }));
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             rt.block_on(async move {
                 let l = tokio::net::TcpListener::from_std(std_listener).unwrap();
                 let (_tx, rx) = tokio::sync::watch::channel(false);
@@ -3087,7 +4036,8 @@ mod tests {
         let mut held = Vec::new();
         for _ in 0..4 {
             let mut s = std::net::TcpStream::connect(addr).unwrap();
-            s.write_all(b"POST /fleet/work HTTP/1.1\r\nHost: x\r\n").unwrap();
+            s.write_all(b"POST /fleet/work HTTP/1.1\r\nHost: x\r\n")
+                .unwrap();
             held.push(s);
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -3096,14 +4046,24 @@ mod tests {
         // A half-sent request: served, it would be held until the 800 ms
         // header deadline; past the cap, it is closed at once.
         let _ = extra.write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n");
-        assert!(closed_within(&mut extra, Duration::from_millis(400)), "a connection past the cap must be closed on accept");
+        assert!(
+            closed_within(&mut extra, Duration::from_millis(400)),
+            "a connection past the cap must be closed on accept"
+        );
         // The half-sent ones are closed by the header deadline.
         for s in held.iter_mut() {
-            assert!(closed_within(s, Duration::from_secs(3)), "a half-sent request must be closed after the header deadline");
+            assert!(
+                closed_within(s, Duration::from_secs(3)),
+                "a half-sent request must be closed after the header deadline"
+            );
         }
         // Slots are free again: a real request is served.
         std::thread::sleep(Duration::from_millis(100));
-        let body = ureq::get(&format!("http://{addr}/ok")).call().unwrap().into_string().unwrap();
+        let body = ureq::get(&format!("http://{addr}/ok"))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap();
         assert_eq!(body, "ok");
     }
 
@@ -3112,7 +4072,9 @@ mod tests {
     #[test]
     fn one_address_at_its_cap_cannot_block_another() {
         use std::io::{Read, Write};
-        let Ok(std_listener) = std::net::TcpListener::bind("[::]:0") else { return };
+        let Ok(std_listener) = std::net::TcpListener::bind("[::]:0") else {
+            return;
+        };
         std_listener.set_nonblocking(true).unwrap();
         let port = std_listener.local_addr().unwrap().port();
         let limits = ConnLimits {
@@ -3125,7 +4087,10 @@ mod tests {
         };
         let app = Router::new().route("/ok", axum::routing::get(|| async { "ok" }));
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             rt.block_on(async move {
                 let l = tokio::net::TcpListener::from_std(std_listener).unwrap();
                 let (_tx, rx) = tokio::sync::watch::channel(false);
@@ -3154,11 +4119,20 @@ mod tests {
             Err(e) => e.kind() == std::io::ErrorKind::ConnectionReset,
             Ok(_) => false,
         };
-        assert!(closed, "a connection past the per-address cap is closed on accept");
+        assert!(
+            closed,
+            "a connection past the per-address cap is closed on accept"
+        );
         // Another address is served.
-        let Ok(other) = std::net::TcpStream::connect(v6) else { return };
+        let Ok(other) = std::net::TcpStream::connect(v6) else {
+            return;
+        };
         drop(other);
-        let body = ureq::get(&format!("http://[::1]:{port}/ok")).call().unwrap().into_string().unwrap();
+        let body = ureq::get(&format!("http://[::1]:{port}/ok"))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap();
         assert_eq!(body, "ok");
     }
 
@@ -3176,15 +4150,27 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(log.decide(a, t0), LogDecision::Suppress);
         }
-        assert_eq!(log.decide(b, t0), LogDecision::Write(None), "another address has its own budget");
-        assert_eq!(log.decide(a, t0 + RefusalLog::WINDOW), LogDecision::Write(Some(10)));
+        assert_eq!(
+            log.decide(b, t0),
+            LogDecision::Write(None),
+            "another address has its own budget"
+        );
+        assert_eq!(
+            log.decide(a, t0 + RefusalLog::WINDOW),
+            LogDecision::Write(Some(10))
+        );
         // Wired into the listener: 20 tokenless requests, 5 lines.
         let h = start(Some(laptop()), false, 0);
         for i in 0..20 {
             let (code, _) = post(&h, "wrong", job(&format!("s{i}"), None), true);
             assert_eq!(code, 401);
         }
-        assert_eq!(h.refusal_log.written.load(std::sync::atomic::Ordering::SeqCst), u64::from(RefusalLog::PER_WINDOW));
+        assert_eq!(
+            h.refusal_log
+                .written
+                .load(std::sync::atomic::Ordering::SeqCst),
+            u64::from(RefusalLog::PER_WINDOW)
+        );
     }
 
     /// (#2916 re-review C5) The per-address cap also bounds how many
@@ -3200,7 +4186,10 @@ mod tests {
             fn provider_name(&self) -> &str {
                 "slow"
             }
-            fn identify(&self, peer: std::net::IpAddr) -> anyhow::Result<Option<darkmux_fleet::NodeIdentity>> {
+            fn identify(
+                &self,
+                peer: std::net::IpAddr,
+            ) -> anyhow::Result<Option<darkmux_fleet::NodeIdentity>> {
                 use std::sync::atomic::Ordering::SeqCst;
                 let n = self.now.fetch_add(1, SeqCst) + 1;
                 self.max.fetch_max(n, SeqCst);
@@ -3216,7 +4205,11 @@ mod tests {
             }
         }
         let slow = Arc::new(Slow {
-            inner: StaticIdentityProvider { local: test_node("nSTUDIO", "studio", "100.64.0.2"), peers: vec![], down: None },
+            inner: StaticIdentityProvider {
+                local: test_node("nSTUDIO", "studio", "100.64.0.2"),
+                peers: vec![],
+                down: None,
+            },
             now: Default::default(),
             max: Default::default(),
         });
@@ -3245,7 +4238,10 @@ mod tests {
         std_listener.set_nonblocking(true).unwrap();
         let port = std_listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             rt.block_on(async move {
                 let l = tokio::net::TcpListener::from_std(std_listener).unwrap();
                 let (_tx, rx) = tokio::sync::watch::channel(false);
@@ -3257,7 +4253,12 @@ mod tests {
             .map(|i| {
                 let url = url.clone();
                 std::thread::spawn(move || {
-                    let _ = darkmux_fleet::post_submission(&url, TOKEN, &WorkSubmission::new(job(&format!("s{i}"), None), true), Duration::from_secs(10));
+                    let _ = darkmux_fleet::post_submission(
+                        &url,
+                        TOKEN,
+                        &WorkSubmission::new(job(&format!("s{i}"), None), true),
+                        Duration::from_secs(10),
+                    );
                 })
             })
             .collect();
@@ -3265,7 +4266,10 @@ mod tests {
             let _ = t.join();
         }
         let max = slow.max.load(std::sync::atomic::Ordering::SeqCst);
-        assert!((1..=ConnLimits::PRODUCTION.per_ip).contains(&max), "concurrent lookups from one address: {max}");
+        assert!(
+            (1..=ConnLimits::PRODUCTION.per_ip).contains(&max),
+            "concurrent lookups from one address: {max}"
+        );
     }
 
     /// A listener whose node cap is ONE request and whose profile resolution
@@ -3288,7 +4292,15 @@ mod tests {
                 test_resolution(None)
             }),
             execute: Arc::new(|j: WorkJob, _, _| {
-                Ok(DispatchResult { exit_code: 0, stdout: String::new(), stderr: String::new(), session_id: j.session_id, execution: None, out_dir: None, trajectory: None })
+                Ok(DispatchResult {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    session_id: j.session_id,
+                    execution: None,
+                    out_dir: None,
+                    trajectory: None,
+                })
             }),
             seats: Arc::new(SeatBook::new()),
             busy_policy: BusyPolicy::Refuse,
@@ -3306,7 +4318,10 @@ mod tests {
         std_listener.set_nonblocking(true).unwrap();
         let port = std_listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             rt.block_on(async move {
                 let l = tokio::net::TcpListener::from_std(std_listener).unwrap();
                 let (_tx, rx) = tokio::sync::watch::channel(false);
@@ -3320,16 +4335,34 @@ mod tests {
     /// requests in flight, whatever addresses they came from.
     #[test]
     fn one_node_has_at_most_its_cap_of_requests_in_flight() {
-        let url = format!("{}{}", spawn_one_slot_listener(600), darkmux_fleet::SUBMISSION_PATH);
+        let url = format!(
+            "{}{}",
+            spawn_one_slot_listener(600),
+            darkmux_fleet::SUBMISSION_PATH
+        );
         let u2 = url.clone();
         let first = std::thread::spawn(move || {
-            darkmux_fleet::post_submission(&u2, TOKEN, &WorkSubmission::new(job("s1", None), true), Duration::from_secs(10)).unwrap()
+            darkmux_fleet::post_submission(
+                &u2,
+                TOKEN,
+                &WorkSubmission::new(job("s1", None), true),
+                Duration::from_secs(10),
+            )
+            .unwrap()
         });
         std::thread::sleep(Duration::from_millis(200));
-        let (code, reply) =
-            darkmux_fleet::post_submission(&url, TOKEN, &WorkSubmission::new(job("s2", None), true), Duration::from_secs(10)).unwrap();
+        let (code, reply) = darkmux_fleet::post_submission(
+            &url,
+            TOKEN,
+            &WorkSubmission::new(job("s2", None), true),
+            Duration::from_secs(10),
+        )
+        .unwrap();
         assert_eq!(code, 503, "{reply:?}");
-        assert!(reply.reason.unwrap().contains("as many requests from macbook-pro as it takes at once"));
+        assert!(reply
+            .reason
+            .unwrap()
+            .contains("as many requests from macbook-pro as it takes at once"));
         assert_eq!(first.join().unwrap().0, 200);
     }
 
@@ -3341,11 +4374,20 @@ mod tests {
         let base = spawn_one_slot_listener(1_500);
         let work = format!("{base}{}", darkmux_fleet::SUBMISSION_PATH);
         let running = std::thread::spawn(move || {
-            darkmux_fleet::post_submission(&work, TOKEN, &WorkSubmission::new(job("s1", None), true), Duration::from_secs(10)).unwrap()
+            darkmux_fleet::post_submission(
+                &work,
+                TOKEN,
+                &WorkSubmission::new(job("s1", None), true),
+                Duration::from_secs(10),
+            )
+            .unwrap()
         });
         std::thread::sleep(Duration::from_millis(300));
         let (code, body) = get_card(&format!("{base}{}", darkmux_fleet::CARD_PATH), TOKEN);
-        assert_eq!(code, 200, "the job holds the node's only request slot: {body}");
+        assert_eq!(
+            code, 200,
+            "the job holds the node's only request slot: {body}"
+        );
         assert_eq!(body["grant"]["accepts"]["peer_name"], "macbook-pro");
         assert_eq!(running.join().unwrap().0, 200);
     }
@@ -3360,18 +4402,35 @@ mod tests {
         for _ in 0..(RefusalLog::PER_WINDOW + 3) {
             log.decide(a, t0);
         }
-        assert!(log.flush(t0).is_empty(), "nothing to report before the minute ends");
+        assert!(
+            log.flush(t0).is_empty(),
+            "nothing to report before the minute ends"
+        );
         let lines = log.flush(t0 + RefusalLog::WINDOW);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("suppressed 3"), "{lines:?}");
-        assert!(log.flush(t0 + RefusalLog::WINDOW * 2).is_empty(), "reported once");
+        assert!(
+            log.flush(t0 + RefusalLog::WINDOW * 2).is_empty(),
+            "reported once"
+        );
         let full = RefusalLog::new();
         for i in 0..RefusalLog::MAX_PEERS as u32 {
-            full.decide(std::net::IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i)), t0);
+            full.decide(
+                std::net::IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i)),
+                t0,
+            );
         }
-        assert_eq!(full.decide("100.64.9.9".parse().unwrap(), t0), LogDecision::Suppress);
+        assert_eq!(
+            full.decide("100.64.9.9".parse().unwrap(), t0),
+            LogDecision::Suppress
+        );
         let lines = full.flush(t0);
-        assert!(lines.iter().any(|l| l.contains("suppressed 1") && l.contains("beyond")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("suppressed 1") && l.contains("beyond")),
+            "{lines:?}"
+        );
     }
 
     /// A listener that is switched off says so on `/health`, to a peer and to
@@ -3385,7 +4444,10 @@ mod tests {
         spawn_if_enabled(rx);
         unsafe { std::env::remove_var("DARKMUX_FLEET_LISTENER_ENABLED") };
         assert_eq!(listener_state(false).as_deref(), Some("off"));
-        assert_eq!(listener_state(true).as_deref(), Some("off (fleet.listener.enabled is false)"));
+        assert_eq!(
+            listener_state(true).as_deref(),
+            Some("off (fleet.listener.enabled is false)")
+        );
         *LISTENER_STATE.lock().unwrap() = None;
     }
 
@@ -3400,10 +4462,19 @@ mod tests {
             check_token(&h, Some("s3cret".to_string()))
         };
         assert!(matches!(check("Bearer s3cret"), TokenCheck::Match));
-        assert!(matches!(check("bEaReR s3cret"), TokenCheck::Match), "the scheme is case-insensitive");
-        assert!(matches!(check("Basic s3cret"), TokenCheck::Mismatch), "the token under another scheme");
+        assert!(
+            matches!(check("bEaReR s3cret"), TokenCheck::Match),
+            "the scheme is case-insensitive"
+        );
+        assert!(
+            matches!(check("Basic s3cret"), TokenCheck::Mismatch),
+            "the token under another scheme"
+        );
         assert!(matches!(check("Token s3cret"), TokenCheck::Mismatch));
-        assert!(matches!(check("s3cret"), TokenCheck::Mismatch), "no scheme at all");
+        assert!(
+            matches!(check("s3cret"), TokenCheck::Mismatch),
+            "no scheme at all"
+        );
         assert!(matches!(check("Bearer wrong"), TokenCheck::Mismatch));
     }
 
@@ -3411,7 +4482,10 @@ mod tests {
     fn a_peer_sees_only_the_coarse_listener_state() {
         set_state("listening", "listening on 100.64.0.2:8766");
         assert_eq!(listener_state(false).as_deref(), Some("listening"));
-        assert_eq!(listener_state(true).as_deref(), Some("listening on 100.64.0.2:8766"));
+        assert_eq!(
+            listener_state(true).as_deref(),
+            Some("listening on 100.64.0.2:8766")
+        );
     }
 
     /// (#2988 review) The listener's no-token reason names the switch that
@@ -3429,7 +4503,10 @@ mod tests {
     #[test]
     fn the_open_file_limit_is_raised_never_lowered() {
         let (old, new) = crate::raise_open_file_limit(1).expect("getrlimit works");
-        assert_eq!(new, old, "a target below the current soft limit changes nothing");
+        assert_eq!(
+            new, old,
+            "a target below the current soft limit changes nothing"
+        );
     }
 
     #[test]
@@ -3438,7 +4515,10 @@ mod tests {
     #[cfg(not(feature = "e2e-fleet-loopback"))]
     fn the_listener_binds_only_a_specific_overlay_address() {
         let local = test_node("n", "studio", "100.64.0.2");
-        assert_eq!(listen_addr(&local, 8766).unwrap().to_string(), "100.64.0.2:8766");
+        assert_eq!(
+            listen_addr(&local, 8766).unwrap().to_string(),
+            "100.64.0.2:8766"
+        );
         for bad in ["0.0.0.0", "127.0.0.1", "::", "::ffff:127.0.0.1"] {
             let n = test_node("n", "studio", bad);
             assert!(listen_addr(&n, 8766).is_err(), "{bad}");

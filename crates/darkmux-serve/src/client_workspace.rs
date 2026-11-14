@@ -101,7 +101,9 @@ pub fn valid_ref(r: &str) -> bool {
 /// repo's name is taken by another checkout, each cut short enough that a
 /// numbered fallback still fits.
 pub fn name_for(normalized: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
-    name_candidates(normalized).into_iter().find(|n| valid_name(n) && !taken(n))
+    name_candidates(normalized)
+        .into_iter()
+        .find(|n| valid_name(n) && !taken(n))
 }
 
 /// Every name [`name_for`] may give a new workspace of `normalized`, in
@@ -112,7 +114,11 @@ pub fn name_candidates(normalized: &str) -> Vec<String> {
         return Vec::new();
     };
     let cut = |s: String| -> String { s.chars().take(MAX_NAME_LEN - NAME_SUFFIX_LEN).collect() };
-    let both = cut(format!("{}-{}", owner.to_ascii_lowercase(), repo.to_ascii_lowercase()));
+    let both = cut(format!(
+        "{}-{}",
+        owner.to_ascii_lowercase(),
+        repo.to_ascii_lowercase()
+    ));
     [cut(repo.to_ascii_lowercase()), both.clone()]
         .into_iter()
         .chain((2..100).map(|n| format!("{both}-{n}")))
@@ -133,7 +139,8 @@ fn git_out(wd: &Path, args: &[&str]) -> Option<String> {
 /// The normalized origin of a workspace, read from the repository darkmux
 /// holds for it, if it has one darkmux would accept.
 pub fn origin_of(wc: &crate::client_git::WorkCopy) -> Option<String> {
-    crate::client_git::line(wc, &["remote", "get-url", "origin"]).and_then(|u| normalize_repo_url(&u))
+    crate::client_git::line(wc, &["remote", "get-url", "origin"])
+        .and_then(|u| normalize_repo_url(&u))
 }
 
 /// The normalized origin of the user's own checkout (its own config, which
@@ -206,7 +213,8 @@ pub fn find_by_origin(base: &Path, normalized: &str, bot: BotName, client: &str)
 pub fn status_of(wc: &crate::client_git::WorkCopy) -> Option<(String, String)> {
     let head = crate::client_git::line(wc, &["rev-parse", "--short", "HEAD"]);
     let branch = crate::client_git::line(wc, &["branch", "--show-current"]);
-    (head.is_some() || branch.is_some()).then(|| (branch.unwrap_or_default(), head.unwrap_or_default()))
+    (head.is_some() || branch.is_some())
+        .then(|| (branch.unwrap_or_default(), head.unwrap_or_default()))
 }
 
 /// Runs git with no terminal (credential prompts fail instead of hanging),
@@ -257,8 +265,13 @@ fn git_bounded_with(
 
 /// The keys whose checkout-local values a network operation overrides with
 /// the operator's global ones (lowercase, as git lists them).
-const GLOBAL_ONLY_KEYS: [&str; 5] =
-    ["credential.helper", "core.sshcommand", "core.askpass", "core.hookspath", "core.fsmonitor"];
+const GLOBAL_ONLY_KEYS: [&str; 5] = [
+    "credential.helper",
+    "core.sshcommand",
+    "core.askpass",
+    "core.hookspath",
+    "core.fsmonitor",
+];
 
 /// `-c` settings for a network operation run for `dir` (where its config
 /// is read; `/` before a clone exists): hooks and fsmonitor off, the
@@ -272,13 +285,25 @@ fn global_network_config(dir: &Path) -> Vec<String> {
             .map(|o| o.lines().map(str::to_string).collect())
             .unwrap_or_default()
     };
-    let mut c: Vec<String> = ["core.hooksPath=/dev/null", "core.fsmonitor=false", "credential.helper="]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let mut c: Vec<String> = [
+        "core.hooksPath=/dev/null",
+        "core.fsmonitor=false",
+        "credential.helper=",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     c.extend(operator_credential_helpers(dir));
-    c.push(format!("core.sshCommand={}", global("core.sshCommand").pop().unwrap_or_else(|| "ssh".to_string())));
-    c.push(format!("core.askPass={}", global("core.askPass").pop().unwrap_or_default()));
+    c.push(format!(
+        "core.sshCommand={}",
+        global("core.sshCommand")
+            .pop()
+            .unwrap_or_else(|| "ssh".to_string())
+    ));
+    c.push(format!(
+        "core.askPass={}",
+        global("core.askPass").pop().unwrap_or_default()
+    ));
     c.into_iter().flat_map(|s| ["-c".to_string(), s]).collect()
 }
 
@@ -301,7 +326,13 @@ const OPERATOR_SCOPES: [&str; 3] = ["system", "global", "unknown"];
 /// left out.
 fn operator_credential_helpers(dir: &Path) -> Vec<String> {
     let out = darkmux_types::host_git::HostGit::trusted(dir)
-        .command(&["config", "-z", "--show-scope", "--get-regexp", r"^credential\.(.+\.)?helper$"])
+        .command(&[
+            "config",
+            "-z",
+            "--show-scope",
+            "--get-regexp",
+            r"^credential\.(.+\.)?helper$",
+        ])
         .env_remove("GIT_CONFIG_NOSYSTEM")
         .stdin(std::process::Stdio::null())
         .output();
@@ -335,7 +366,10 @@ fn repo_local_keys(dir: &Path) -> Vec<String> {
     fields
         .chunks_exact(2)
         .filter(|p| p[0] == b"local" || p[0] == b"worktree")
-        .map(|p| String::from_utf8_lossy(p[1].split(|b| *b == b'\n').next().unwrap_or_default()).to_lowercase())
+        .map(|p| {
+            String::from_utf8_lossy(p[1].split(|b| *b == b'\n').next().unwrap_or_default())
+                .to_lowercase()
+        })
         .collect()
 }
 
@@ -346,7 +380,10 @@ fn repo_local_keys(dir: &Path) -> Vec<String> {
 /// a remote runs to serve the fetch (over ssh, possibly this machine), and
 /// the command a fetch runs to list an alternate object store's refs.
 fn refused_network_keys(keys: &[String]) -> Vec<String> {
-    keys.iter().filter(|k| is_refused_network_key(k)).cloned().collect()
+    keys.iter()
+        .filter(|k| is_refused_network_key(k))
+        .cloned()
+        .collect()
 }
 
 /// (section prefix, key suffix) pairs [`refused_network_keys`] refuses; an
@@ -364,12 +401,17 @@ const REFUSED_NETWORK_KEYS: [(&str, &str); 9] = [
 ];
 
 fn is_refused_network_key(key: &str) -> bool {
-    let per_url_helper = key.starts_with("credential.") && key.ends_with(".helper") && key != "credential.helper";
-    per_url_helper || REFUSED_NETWORK_KEYS.iter().any(|(p, s)| key.starts_with(p) && key.ends_with(s))
+    let per_url_helper =
+        key.starts_with("credential.") && key.ends_with(".helper") && key != "credential.helper";
+    per_url_helper
+        || REFUSED_NETWORK_KEYS
+            .iter()
+            .any(|(p, s)| key.starts_with(p) && key.ends_with(s))
 }
 
 /// How a checkout's own network setting is moved where darkmux reads it.
-const NETWORK_FIX: &str = "darkmux reads network settings from your global git config only (a run that \
+const NETWORK_FIX: &str =
+    "darkmux reads network settings from your global git config only (a run that \
     had the checkout mounted could have written its own config): set it there, or for this one \
     repository in a `[includeIf \"gitdir:<checkout>/\"]` section of your global config";
 
@@ -408,11 +450,22 @@ fn last_stderr_line(child: &mut std::process::Child) -> String {
 /// Production clone: `git clone --separate-git-dir <git_dir> [--branch
 /// <ref>] -- <url> <dest>`: the repository lives in `git_dir`, outside the
 /// work tree a run is given.
-pub fn clone_with_git(url: &str, git_ref: Option<&str>, dest: &Path, git_dir: &Path) -> Result<(), String> {
+pub fn clone_with_git(
+    url: &str,
+    git_ref: Option<&str>,
+    dest: &Path,
+    git_dir: &Path,
+) -> Result<(), String> {
     clone_at(url, git_ref, dest, git_dir, &[])
 }
 
-fn clone_at(url: &str, git_ref: Option<&str>, dest: &Path, git_dir: &Path, extra: &[&str]) -> Result<(), String> {
+fn clone_at(
+    url: &str,
+    git_ref: Option<&str>,
+    dest: &Path,
+    git_dir: &Path,
+    extra: &[&str],
+) -> Result<(), String> {
     // A commit SHA (what a pinned template sends) is no branch: clone
     // without checking out, then check out that commit, detached.
     let sha = git_ref.filter(|r| is_commit_sha(r));
@@ -442,18 +495,37 @@ fn clone_at(url: &str, git_ref: Option<&str>, dest: &Path, git_dir: &Path, extra
     }
     let object = format!("{sha}^{{commit}}");
     // A commit off every branch the clone fetched: ask the remote for it.
-    if git_bounded_with(dest, extra, &in_dest(dest, &["cat-file", "-e", &object]), Duration::from_secs(30)).is_err() {
+    if git_bounded_with(
+        dest,
+        extra,
+        &in_dest(dest, &["cat-file", "-e", &object]),
+        Duration::from_secs(30),
+    )
+    .is_err()
+    {
         let fetch = ["fetch", "--quiet", "--no-recurse-submodules", "origin", sha];
-        git_bounded_with(dest, extra, &in_dest(dest, &fetch), Duration::from_secs(600))?;
+        git_bounded_with(
+            dest,
+            extra,
+            &in_dest(dest, &fetch),
+            Duration::from_secs(600),
+        )?;
     }
-    git_bounded_with(dest, extra, &in_dest(dest, &["checkout", "--quiet", "--detach", sha]), Duration::from_secs(120))
+    git_bounded_with(
+        dest,
+        extra,
+        &in_dest(dest, &["checkout", "--quiet", "--detach", sha]),
+        Duration::from_secs(120),
+    )
 }
 
 /// A full object name (SHA-1 or SHA-256, lowercase hex): a ref that names
 /// one commit, which `git clone --branch` cannot take. A short one is
 /// ambiguous and could be a branch, so it stays a branch or tag name.
 pub fn is_commit_sha(r: &str) -> bool {
-    matches!(r.len(), 40 | 64) && r.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    matches!(r.len(), 40 | 64)
+        && r.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
 /// (#3468) A refusal, with the code an app branches on beside the sentence
@@ -466,7 +538,10 @@ pub struct Coded {
 
 impl Coded {
     pub fn new(code: ClientCode, message: impl Into<String>) -> Self {
-        Coded { code, message: message.into() }
+        Coded {
+            code,
+            message: message.into(),
+        }
     }
     pub fn code(&self) -> ClientCode {
         self.code
@@ -498,10 +573,18 @@ fn fetch_at(dir: &Path, extra: &[&str]) -> Result<(), Coded> {
     if !refused.is_empty() {
         return Err(Coded::new(
             ClientCode::NetworkKeyInRepoConfig,
-            format!("not fetched: {}'s own git config sets {}. {NETWORK_FIX}.", dir.display(), refused.join(", ")),
+            format!(
+                "not fetched: {}'s own git config sets {}. {NETWORK_FIX}.",
+                dir.display(),
+                refused.join(", ")
+            ),
         ));
     }
-    let mut ignored: Vec<&str> = GLOBAL_ONLY_KEYS.iter().copied().filter(|k| local.iter().any(|l| l == k)).collect();
+    let mut ignored: Vec<&str> = GLOBAL_ONLY_KEYS
+        .iter()
+        .copied()
+        .filter(|k| local.iter().any(|l| l == k))
+        .collect();
     ignored.dedup();
     let args: Vec<&std::ffi::OsStr> = vec![
         "-C".as_ref(),
@@ -518,7 +601,11 @@ fn fetch_at(dir: &Path, extra: &[&str]) -> Result<(), Coded> {
                 true => e,
                 false => format!(
                     "{e} (darkmux ignored {} from {}'s own git config: {NETWORK_FIX})",
-                    ignored.iter().map(|k| spelled(k)).collect::<Vec<_>>().join(", "),
+                    ignored
+                        .iter()
+                        .map(|k| spelled(k))
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     dir.display()
                 ),
             },
@@ -656,7 +743,10 @@ pub fn bot_branch(bot: &str, suffix: &str) -> String {
 pub fn is_bot_branch(branch: &str, bot: &str) -> bool {
     branch
         .strip_prefix(&format!("mux/{bot}-"))
-        .is_some_and(|s| s.len() == BOT_BRANCH_SUFFIX_LEN && s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')))
+        .is_some_and(|s| {
+            s.len() == BOT_BRANCH_SUFFIX_LEN
+                && s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+        })
 }
 
 /// The remote default branch to start new work from, as a ref that
@@ -678,7 +768,13 @@ fn remote_default_with(git: impl Fn(&[&str]) -> Option<String>) -> Option<String
         }
     }
     ["origin/main", "origin/master"].into_iter().find_map(|r| {
-        git(&["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{r}")]).map(|_| r.to_string())
+        git(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/{r}"),
+        ])
+        .map(|_| r.to_string())
     })
 }
 
@@ -697,11 +793,17 @@ pub fn add_worktree(source: &Path, branch: &str, dest: &Path, commit: &str) -> R
             crate::client_git::repo_filter_refusal(&drivers, "adding a worktree"),
         ));
     }
-    add_worktree_unfiltered(source, branch, dest, commit).map_err(|e| Coded::new(ClientCode::Unprocessable, e))
+    add_worktree_unfiltered(source, branch, dest, commit)
+        .map_err(|e| Coded::new(ClientCode::Unprocessable, e))
 }
 
 /// [`add_worktree`] once the checkout's filters are known to be none.
-fn add_worktree_unfiltered(source: &Path, branch: &str, dest: &Path, commit: &str) -> Result<(), String> {
+fn add_worktree_unfiltered(
+    source: &Path,
+    branch: &str,
+    dest: &Path,
+    commit: &str,
+) -> Result<(), String> {
     let dest = dest.to_string_lossy();
     let child = darkmux_types::host_git::HostGit::trusted(source)
         .command(&["worktree", "add", "--quiet", "-b", branch, &dest, commit])
@@ -1001,10 +1103,13 @@ pub fn owner_of(base: &Path, name: &str) -> Option<String> {
 /// The workspaces under `base` darkmux holds a repository for (made for a
 /// paired app), by name, sorted, with the client id each is recorded for.
 pub fn held_owners(base: &Path) -> Vec<(String, Option<String>)> {
-    held_workspaces(base).into_iter().map(|(n, _)| {
-        let owner = owner_of(base, &n);
-        (n, owner)
-    }).collect()
+    held_workspaces(base)
+        .into_iter()
+        .map(|(n, _)| {
+            let owner = owner_of(base, &n);
+            (n, owner)
+        })
+        .collect()
 }
 
 /// The checkout recorded for workspace `name`, if any (a record that is a
@@ -1026,7 +1131,10 @@ fn recorded_source(base: &Path, name: &str) -> Option<PathBuf> {
 /// a preview recipe is read from: never the workspace, which a run writes.
 pub fn own_checkout_of(base: &Path, name: &str, dir: &Path) -> Result<PathBuf, Coded> {
     let held = crate::client_git::work_copy_of(base, name, dir);
-    let repo = held.as_ref().and_then(origin_of).unwrap_or_else(|| "this repo".to_string());
+    let repo = held
+        .as_ref()
+        .and_then(origin_of)
+        .unwrap_or_else(|| "this repo".to_string());
     let gone = |message: String| Coded::new(ClientCode::NoSourceCheckout, message);
     let Some(source) = recorded_source(base, name) else {
         return Err(gone(format!(
@@ -1036,8 +1144,12 @@ pub fn own_checkout_of(base: &Path, name: &str, dir: &Path) -> Result<PathBuf, C
              checkout of {repo}"
         )));
     };
-    let source = check_source(&source, base)
-        .map_err(|e| gone(format!("workspace {name}'s checkout {}: {e}; refusing its preview", source.display())))?;
+    let source = check_source(&source, base).map_err(|e| {
+        gone(format!(
+            "workspace {name}'s checkout {}: {e}; refusing its preview",
+            source.display()
+        ))
+    })?;
     let held_common = held.and_then(|wc| crate::client_git::common_of(&wc.git_dir));
     if held_common.is_none() || held_common != common_dir(&source) {
         return Err(gone(format!(
@@ -1108,10 +1220,17 @@ pub fn try_hold(base: &Path, name: &str, how: Hold) -> Result<Option<NameHold>, 
             return Ok(None);
         };
         if is_file_at(&file, &path)? {
-            return Ok(Some(NameHold { _file: file, path, how }));
+            return Ok(Some(NameHold {
+                _file: file,
+                path,
+                how,
+            }));
         }
     }
-    Err(format!("{} kept being replaced while darkmux locked it", path.display()))
+    Err(format!(
+        "{} kept being replaced while darkmux locked it",
+        path.display()
+    ))
 }
 
 /// Opens (making it, owner-only, never through a link) and locks the lock
@@ -1146,7 +1265,9 @@ fn lock_file(path: &Path, how: Hold) -> Result<Option<std::fs::File>, String> {
 /// since it was opened; a path with no file is not it either).
 fn is_file_at(file: &std::fs::File, path: &Path) -> Result<bool, String> {
     use std::os::unix::fs::MetadataExt;
-    let held = file.metadata().map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let held = file
+        .metadata()
+        .map_err(|e| format!("reading {}: {e}", path.display()))?;
     match std::fs::symlink_metadata(path) {
         Ok(there) => Ok((held.dev(), held.ino()) == (there.dev(), there.ino())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -1167,7 +1288,9 @@ pub fn hold_free_name(
         if !valid_name(&name) || taken(&name) {
             continue;
         }
-        let Some(held) = try_hold(base, &name, Hold::Sole)? else { continue };
+        let Some(held) = try_hold(base, &name, Hold::Sole)? else {
+            continue;
+        };
         if taken(&name) {
             continue;
         }
@@ -1207,7 +1330,11 @@ impl Asks {
 
 impl Drop for AskHold<'_> {
     fn drop(&mut self) {
-        self.asks.held.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.key);
+        self.asks
+            .held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
         self.asks.freed.notify_all();
     }
 }
@@ -1227,7 +1354,10 @@ pub fn sweep_partials(base: &Path) -> Vec<String> {
         .filter_map(Result::ok)
         .filter_map(|e| {
             let file = e.file_name().into_string().ok()?;
-            let name = file.strip_prefix('.')?.strip_suffix(".partial")?.to_string();
+            let name = file
+                .strip_prefix('.')?
+                .strip_suffix(".partial")?
+                .to_string();
             valid_name(&name).then_some(name)
         })
         .filter(|name| sweep_partial(base, name))
@@ -1311,7 +1441,12 @@ pub struct Removal {
 /// anything holds the name ([`Hold`]): a run, an Undo, a live preview, a
 /// workspace request; a hold let go within `wait` is waited for. Nothing
 /// is followed through a link. The caller checks who may remove it.
-pub fn remove_workspace_within(base: &Path, name: &str, force: bool, wait: Duration) -> Result<Removal, Coded> {
+pub fn remove_workspace_within(
+    base: &Path,
+    name: &str,
+    force: bool,
+    wait: Duration,
+) -> Result<Removal, Coded> {
     let dir = base.join(name);
     check_removable(base, name, force)?;
     let held = hold_alone_within(base, name, wait)?;
@@ -1324,10 +1459,19 @@ pub fn remove_workspace_within(base: &Path, name: &str, force: bool, wait: Durat
         }
         WorkspaceKind::Worktree => remove_worktree_of(&wc, &dir, branch.as_deref(), force),
     }
-    .map_err(|e| Coded::new(ClientCode::Internal, format!("removing workspace {name}: {e}")))?;
+    .map_err(|e| {
+        Coded::new(
+            ClientCode::Internal,
+            format!("removing workspace {name}: {e}"),
+        )
+    })?;
     forget_records(base, name);
     held.forget();
-    Ok(Removal { kind, branch, branch_removed })
+    Ok(Removal {
+        kind,
+        branch,
+        branch_removed,
+    })
 }
 
 /// Whether workspace `name` could be removed (with `force` or not), read
@@ -1340,7 +1484,11 @@ pub fn check_removable(base: &Path, name: &str, force: bool) -> Result<(), Coded
 }
 
 /// [`check_removable`], returning the workspace and what it is.
-fn checked_removable(base: &Path, name: &str, force: bool) -> Result<(crate::client_git::WorkCopy, WorkspaceKind), Coded> {
+fn checked_removable(
+    base: &Path,
+    name: &str,
+    force: bool,
+) -> Result<(crate::client_git::WorkCopy, WorkspaceKind), Coded> {
     let wc = removable(base, name, &base.join(name))?;
     let kind = kind_of(base, name, &wc)?;
     if kind != WorkspaceKind::Worktree {
@@ -1376,16 +1524,24 @@ fn hold_alone_within(base: &Path, name: &str, wait: Duration) -> Result<NameHold
 /// folder darkmux did not make.
 fn removable(base: &Path, name: &str, dir: &Path) -> Result<crate::client_git::WorkCopy, Coded> {
     if !valid_name(name) {
-        return Err(Coded::new(ClientCode::BadRequest, format!("{name:?} is not a workspace name")));
+        return Err(Coded::new(
+            ClientCode::BadRequest,
+            format!("{name:?} is not a workspace name"),
+        ));
     }
     let not_ours = || {
         Coded::new(
             ClientCode::Forbidden,
-            format!("{name} is not a workspace darkmux made for an app; darkmux removes only those"),
+            format!(
+                "{name} is not a workspace darkmux made for an app; darkmux removes only those"
+            ),
         )
     };
     match std::fs::symlink_metadata(dir) {
-        Err(_) => Err(Coded::new(ClientCode::NotFound, format!("no workspace named {name}"))),
+        Err(_) => Err(Coded::new(
+            ClientCode::NotFound,
+            format!("no workspace named {name}"),
+        )),
         Ok(m) if !m.is_dir() => Err(not_ours()),
         Ok(_) => crate::client_git::work_copy_of(base, name, dir).ok_or_else(not_ours),
     }
@@ -1395,9 +1551,15 @@ fn removable(base: &Path, name: &str, dir: &Path) -> Result<crate::client_git::W
 /// the clone directory beside it (a template project when its first commit
 /// is recorded), or an admin directory under a checkout's
 /// `.git/worktrees/`. Anything else is refused.
-fn kind_of(base: &Path, name: &str, wc: &crate::client_git::WorkCopy) -> Result<WorkspaceKind, Coded> {
+fn kind_of(
+    base: &Path,
+    name: &str,
+    wc: &crate::client_git::WorkCopy,
+) -> Result<WorkspaceKind, Coded> {
     let common = crate::client_git::common_of(&wc.git_dir);
-    let cloned = crate::client_git::clone_git_dir(base, name).canonicalize().ok();
+    let cloned = crate::client_git::clone_git_dir(base, name)
+        .canonicalize()
+        .ok();
     if common.as_ref() == Some(&wc.git_dir) && cloned.as_ref() == Some(&wc.git_dir) {
         return Ok(match template_commit_of(base, name) {
             Some(_) => WorkspaceKind::Template,
@@ -1432,9 +1594,21 @@ fn refuse_unsaved(
         return Ok(());
     };
     let saved = match kind {
-        WorkspaceKind::Template => template_commit_of(base, name).is_some_and(|first| first == head),
-        _ => line(wc, &["for-each-ref", "--count=1", "--contains", &head, "--format=%(refname)", "refs/remotes/"])
-            .is_some_and(|r| !r.is_empty()),
+        WorkspaceKind::Template => {
+            template_commit_of(base, name).is_some_and(|first| first == head)
+        }
+        _ => line(
+            wc,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--contains",
+                &head,
+                "--format=%(refname)",
+                "refs/remotes/",
+            ],
+        )
+        .is_some_and(|r| !r.is_empty()),
     };
     if saved {
         return Ok(());
@@ -1465,12 +1639,22 @@ fn remove_worktree_of(
     branch: Option<&str>,
     force: bool,
 ) -> std::io::Result<bool> {
-    let Some(common) = wc.git_dir.parent().and_then(Path::parent).map(Path::to_path_buf) else {
+    let Some(common) = wc
+        .git_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+    else {
         return Ok(false);
     };
     let git = darkmux_types::host_git::HostGit::held_git_dir(&common);
     let removed = git
-        .command(&["worktree".as_ref(), "remove".as_ref(), "--force".as_ref(), dir.as_os_str()])
+        .command(&[
+            "worktree".as_ref(),
+            "remove".as_ref(),
+            "--force".as_ref(),
+            dir.as_os_str(),
+        ])
         .stdin(std::process::Stdio::null())
         .output()
         .is_ok_and(|o| o.status.success());
@@ -1484,7 +1668,10 @@ fn remove_worktree_of(
     if !force && !held_elsewhere(&git, branch) {
         return Ok(false);
     }
-    let deleted = git.command(&["branch", "-D", "--", branch]).stdin(std::process::Stdio::null()).output();
+    let deleted = git
+        .command(&["branch", "-D", "--", branch])
+        .stdin(std::process::Stdio::null())
+        .output();
     Ok(deleted.is_ok_and(|o| o.status.success()))
 }
 
@@ -1493,8 +1680,15 @@ fn remove_worktree_of(
 /// one).
 fn held_elsewhere(git: &darkmux_types::host_git::HostGit, branch: &str) -> bool {
     let tip = format!("refs/heads/{branch}");
-    git.stdout(&["for-each-ref", "--contains", &tip, "--format=%(refname)", "refs/heads/", "refs/remotes/"])
-        .is_some_and(|refs| refs.lines().any(|r| !r.starts_with("refs/heads/mux/")))
+    git.stdout(&[
+        "for-each-ref",
+        "--contains",
+        &tip,
+        "--format=%(refname)",
+        "refs/heads/",
+        "refs/remotes/",
+    ])
+    .is_some_and(|refs| refs.lines().any(|r| !r.starts_with("refs/heads/mux/")))
 }
 
 /// Forgets every record darkmux keeps beside workspace `name`.
@@ -1674,7 +1868,8 @@ mod tests {
         let missing = dir.path().join("missing");
         let args: Vec<&std::ffi::OsStr> =
             vec!["-C".as_ref(), missing.as_os_str(), "status".as_ref()];
-        let err = git_bounded_with(Path::new("/"), &[], &args, Duration::from_secs(30)).unwrap_err();
+        let err =
+            git_bounded_with(Path::new("/"), &[], &args, Duration::from_secs(30)).unwrap_err();
         assert!(err.starts_with("git exited with "), "{err}");
         assert!(err.contains("cannot change to"), "{err}");
     }
@@ -1703,9 +1898,17 @@ mod tests {
         let (root, src, marker) = checkout_for_test(&tmp);
         let fx = darkmux_types::host_git::fixture::git;
         let hooks = src.join(".git").join("hooks");
-        std::fs::write(hooks.join("post-checkout"), format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::write(
+            hooks.join("post-checkout"),
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(hooks.join("post-checkout"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            hooks.join("post-checkout"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         fx(&src, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
 
         add_worktree(&src, "mux/t", &root.join("wt"), "HEAD").expect("the worktree is added");
@@ -1721,10 +1924,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (root, src, marker) = checkout_for_test(&tmp);
         let fx = darkmux_types::host_git::fixture::git;
-        fx(&src, &["config", "filter.x.smudge", &format!("touch '{}'; cat", marker.display())]);
+        fx(
+            &src,
+            &[
+                "config",
+                "filter.x.smudge",
+                &format!("touch '{}'; cat", marker.display()),
+            ],
+        );
 
         let coded = add_worktree(&src, "mux/t", &root.join("wt"), "HEAD").unwrap_err();
-        assert_eq!(coded.code, ClientCode::FilterInRepoConfig, "(#3468) its code");
+        assert_eq!(
+            coded.code,
+            ClientCode::FilterInRepoConfig,
+            "(#3468) its code"
+        );
         let err = coded.message;
         assert!(err.contains("filter.x"), "names the driver: {err}");
         assert!(err.contains("--global"), "names the fix: {err}");
@@ -1745,13 +1959,27 @@ mod tests {
         let (_root, src, marker) = checkout_for_test(&tmp);
         let fx = darkmux_types::host_git::fixture::git;
         fx(&src, &["remote", "add", "origin", DEAD_SSH_ORIGIN]);
-        fx(&src, &["config", "core.sshCommand", &format!("touch '{}'; false", marker.display())]);
+        fx(
+            &src,
+            &[
+                "config",
+                "core.sshCommand",
+                &format!("touch '{}'; false", marker.display()),
+            ],
+        );
 
         let coded = fetch_with_git(&src).unwrap_err();
-        assert_eq!(coded.code, ClientCode::FetchFailed, "(#3468) an ignored key leaves a plain failure");
+        assert_eq!(
+            coded.code,
+            ClientCode::FetchFailed,
+            "(#3468) an ignored key leaves a plain failure"
+        );
         let err = coded.message;
         assert!(!marker.exists(), "the checkout's own core.sshCommand ran");
-        assert!(err.contains("core.sshCommand") && err.contains("global"), "{err}");
+        assert!(
+            err.contains("core.sshCommand") && err.contains("global"),
+            "{err}"
+        );
     }
 
     /// (#3457) Network settings darkmux cannot switch off by override (a
@@ -1771,12 +1999,29 @@ mod tests {
             let fx = darkmux_types::host_git::fixture::git;
             fx(&src, &["remote", "add", "origin", DEAD_SSH_ORIGIN]);
             fx(&src, &["config", key, value]);
-            fx(&src, &["config", "core.sshCommand", &format!("touch '{}'; false", marker.display())]);
+            fx(
+                &src,
+                &[
+                    "config",
+                    "core.sshCommand",
+                    &format!("touch '{}'; false", marker.display()),
+                ],
+            );
             let coded = fetch_with_git(&src).unwrap_err();
-            assert_eq!(coded.code, ClientCode::NetworkKeyInRepoConfig, "(#3468) {key}: its code");
+            assert_eq!(
+                coded.code,
+                ClientCode::NetworkKeyInRepoConfig,
+                "(#3468) {key}: its code"
+            );
             let err = coded.message;
-            assert!(err.to_lowercase().contains(&key.to_lowercase()), "{key}: {err}");
-            assert!(err.contains("includeIf"), "{key}: names the per-repo fix: {err}");
+            assert!(
+                err.to_lowercase().contains(&key.to_lowercase()),
+                "{key}: {err}"
+            );
+            assert!(
+                err.contains("includeIf"),
+                "{key}: names the per-repo fix: {err}"
+            );
             assert!(!marker.exists(), "{key}: git ran");
         }
     }
@@ -1796,7 +2041,11 @@ mod tests {
             .args(["fetch", "-q", "origin"])
             .output()
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// A checkout that borrows objects from an alternate runs its
@@ -1810,22 +2059,55 @@ mod tests {
         let (remote, other, src) = (root.join("remote"), root.join("other"), root.join("src"));
         two_commit_repo(&remote);
         two_commit_repo(&other);
-        fx(&root, &["clone", "-q", remote.to_str().unwrap(), src.to_str().unwrap()]);
-        let alternates = src.join(".git").join("objects").join("info").join("alternates");
-        std::fs::write(&alternates, format!("{}\n", other.join(".git").join("objects").display())).unwrap();
+        fx(
+            &root,
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                src.to_str().unwrap(),
+            ],
+        );
+        let alternates = src
+            .join(".git")
+            .join("objects")
+            .join("info")
+            .join("alternates");
+        std::fs::write(
+            &alternates,
+            format!("{}\n", other.join(".git").join("objects").display()),
+        )
+        .unwrap();
         let marker = root.join("alternate-refs-ran");
-        fx(&src, &["config", "core.alternateRefsCommand", &format!("touch '{}'; true", marker.display())]);
+        fx(
+            &src,
+            &[
+                "config",
+                "core.alternateRefsCommand",
+                &format!("touch '{}'; true", marker.display()),
+            ],
+        );
         bump(&remote, "third");
         plain_fetch(&src);
-        assert!(marker.exists(), "the fixture must arm: plain git's fetch runs the command");
+        assert!(
+            marker.exists(),
+            "the fixture must arm: plain git's fetch runs the command"
+        );
         std::fs::remove_file(&marker).unwrap();
         bump(&remote, "fourth");
 
         let out = fetch_at(&src, ALLOW_FILE);
-        assert!(!marker.exists(), "the checkout's own core.alternateRefsCommand ran");
+        assert!(
+            !marker.exists(),
+            "the checkout's own core.alternateRefsCommand ran"
+        );
         let coded = out.unwrap_err();
         assert_eq!(coded.code, ClientCode::NetworkKeyInRepoConfig);
-        assert!(coded.message.contains("core.alternaterefscommand"), "{}", coded.message);
+        assert!(
+            coded.message.contains("core.alternaterefscommand"),
+            "{}",
+            coded.message
+        );
     }
 
     /// A fetch never recurses into the checkout's submodules: the child
@@ -1839,15 +2121,38 @@ mod tests {
         let (sub_src, remote, src) = (root.join("subsrc"), root.join("remote"), root.join("src"));
         two_commit_repo(&sub_src);
         two_commit_repo(&remote);
-        fx(&remote, &["submodule", "add", "-q", sub_src.to_str().unwrap(), "lib"]);
+        fx(
+            &remote,
+            &["submodule", "add", "-q", sub_src.to_str().unwrap(), "lib"],
+        );
         fx(&remote, &["commit", "-qm", "with lib"]);
-        fx(&root, &["clone", "-q", "--recurse-submodules", remote.to_str().unwrap(), src.to_str().unwrap()]);
+        fx(
+            &root,
+            &[
+                "clone",
+                "-q",
+                "--recurse-submodules",
+                remote.to_str().unwrap(),
+                src.to_str().unwrap(),
+            ],
+        );
         // The submodule's repository borrows objects and names a command.
         let sub_git = src.join(".git").join("modules").join("lib");
         let alternates = sub_git.join("objects").join("info").join("alternates");
-        std::fs::write(&alternates, format!("{}\n", sub_src.join(".git").join("objects").display())).unwrap();
+        std::fs::write(
+            &alternates,
+            format!("{}\n", sub_src.join(".git").join("objects").display()),
+        )
+        .unwrap();
         let marker = root.join("submodule-alternate-refs-ran");
-        fx(&sub_git, &["config", "core.alternateRefsCommand", &format!("touch '{}'; true", marker.display())]);
+        fx(
+            &sub_git,
+            &[
+                "config",
+                "core.alternateRefsCommand",
+                &format!("touch '{}'; true", marker.display()),
+            ],
+        );
         let move_lib = |what: &str| {
             bump(&sub_src, what);
             fx(&remote.join("lib"), &["pull", "-q"]);
@@ -1855,18 +2160,27 @@ mod tests {
         };
         move_lib("third");
         plain_fetch(&src);
-        assert!(marker.exists(), "the fixture must arm: plain git's fetch recurses and runs the command");
+        assert!(
+            marker.exists(),
+            "the fixture must arm: plain git's fetch recurses and runs the command"
+        );
         std::fs::remove_file(&marker).unwrap();
         move_lib("fourth");
 
         fetch_at(&src, ALLOW_FILE).expect("the fetch itself succeeds");
-        assert!(!marker.exists(), "the fetch recursed into the submodule and ran its config");
+        assert!(
+            !marker.exists(),
+            "the fetch recursed into the submodule and ran its config"
+        );
     }
 
     /// Sets `vars` (`None` removes one) for the duration of `f`, then puts
     /// back what was there. Callers are `#[serial]`.
     fn with_env<T>(vars: &[(&str, Option<&std::ffi::OsStr>)], f: impl FnOnce() -> T) -> T {
-        let prev: Vec<(&str, Option<std::ffi::OsString>)> = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
+        let prev: Vec<(&str, Option<std::ffi::OsString>)> = vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var_os(k)))
+            .collect();
         for (k, v) in vars {
             // SAFETY: #[serial] callers; restored below.
             match v {
@@ -1900,7 +2214,11 @@ mod tests {
         // Quoted in a config file, where `;` would start a comment.
         let quoted = |name: &str| format!("\"{}\"", helper(name));
         let system = root.join("system-config");
-        std::fs::write(&system, format!("[credential]\n\thelper = {}\n", quoted("system"))).unwrap();
+        std::fs::write(
+            &system,
+            format!("[credential]\n\thelper = {}\n", quoted("system")),
+        )
+        .unwrap();
         let global = root.join("global-config");
         std::fs::write(
             &global,
@@ -1913,7 +2231,10 @@ mod tests {
             ),
         )
         .unwrap();
-        darkmux_types::host_git::fixture::git(&src, &["config", "credential.helper", &helper("checkout")]);
+        darkmux_types::host_git::fixture::git(
+            &src,
+            &["config", "credential.helper", &helper("checkout")],
+        );
         let fill = |args: &[String], host: &str| -> Vec<String> {
             use std::io::Write;
             let _ = std::fs::remove_file(&log);
@@ -1928,9 +2249,18 @@ mod tests {
                 .stderr(std::process::Stdio::null())
                 .spawn()
                 .unwrap();
-            child.stdin.take().unwrap().write_all(format!("protocol=https\nhost={host}\n\n").as_bytes()).unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(format!("protocol=https\nhost={host}\n\n").as_bytes())
+                .unwrap();
             child.wait().unwrap();
-            std::fs::read_to_string(&log).unwrap_or_default().lines().map(str::to_string).collect()
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
         };
         let env = [
             ("GIT_CONFIG_GLOBAL", Some(global.as_os_str())),
@@ -1939,10 +2269,21 @@ mod tests {
         ];
         let (plain, gh) = with_env(&env, || {
             let args = global_network_config(&src);
-            (fill(&args, "plain.invalid"), fill(&args, "forge.example.invalid"))
+            (
+                fill(&args, "plain.invalid"),
+                fill(&args, "forge.example.invalid"),
+            )
         });
-        assert_eq!(plain, ["system", "global"], "the system and global helpers, never the checkout's");
-        assert_eq!(gh, ["gh"], "a per-URL reset and helper apply to their host as they do for the operator");
+        assert_eq!(
+            plain,
+            ["system", "global"],
+            "the system and global helpers, never the checkout's"
+        );
+        assert_eq!(
+            gh,
+            ["gh"],
+            "a per-URL reset and helper apply to their host as they do for the operator"
+        );
     }
 
     /// The operator's GLOBAL `core.sshCommand` is the one a fetch runs.
@@ -1958,7 +2299,14 @@ mod tests {
         // Quoted: in a config file an unquoted `;` starts a comment, which
         // left `touch '<marker>'` with git's ssh arguments after it, and GNU
         // touch reads the `-p` among them as an option and touches nothing.
-        std::fs::write(&global, format!("[core]\n\tsshCommand = \"touch '{}'; false\"\n", global_marker.display())).unwrap();
+        std::fs::write(
+            &global,
+            format!(
+                "[core]\n\tsshCommand = \"touch '{}'; false\"\n",
+                global_marker.display()
+            ),
+        )
+        .unwrap();
         let prev = std::env::var_os("GIT_CONFIG_GLOBAL");
         // SAFETY: #[serial]; restored below.
         unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &global) };
@@ -1970,7 +2318,10 @@ mod tests {
             }
         }
         assert!(out.is_err());
-        assert!(global_marker.exists(), "the global core.sshCommand must be the one used");
+        assert!(
+            global_marker.exists(),
+            "the global core.sshCommand must be the one used"
+        );
     }
 
     #[test]
@@ -2011,7 +2362,13 @@ mod tests {
     fn a_bots_branch_is_its_prefix_and_exactly_a_suffix() {
         assert!(is_bot_branch(&bot_branch("bot", "1f2e3d"), "bot"));
         assert!(is_bot_branch("mux/bot-a-1f2e3d", "bot-a"));
-        for (branch, bot) in [("mux/bot-a-1f2e3d", "bot"), ("mux/bot-cafe", "bot"), ("mux/bot-1f2e3d4", "bot"), ("mux/bot-1F2E3D", "bot"), ("main", "bot")] {
+        for (branch, bot) in [
+            ("mux/bot-a-1f2e3d", "bot"),
+            ("mux/bot-cafe", "bot"),
+            ("mux/bot-1f2e3d4", "bot"),
+            ("mux/bot-1F2E3D", "bot"),
+            ("main", "bot"),
+        ] {
             assert!(!is_bot_branch(branch, bot), "{branch} {bot}");
         }
     }
@@ -2039,11 +2396,22 @@ mod tests {
             let out = std::process::Command::new("git")
                 .arg("-C")
                 .arg(dir)
-                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         std::fs::create_dir_all(dir).unwrap();
@@ -2068,7 +2436,10 @@ mod tests {
         let dest = tmp.path().join("project");
         let git_dir = tmp.path().join("project.git");
         clone_at(&url, Some(&first), &dest, &git_dir, ALLOW_FILE).unwrap();
-        assert_eq!(std::fs::read_to_string(dest.join("page.txt")).unwrap(), "first");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("page.txt")).unwrap(),
+            "first"
+        );
     }
 
     #[test]
@@ -2079,18 +2450,41 @@ mod tests {
         // A commit kept only by a non-branch ref (like a pull request's),
         // which a clone does not fetch.
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git").arg("-C").arg(&src).args(args).output().unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&src)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         let tree = run(&["rev-parse", "HEAD^{tree}"]);
-        let lone = run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", &tree, "-m", "lone"]);
+        let lone = run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit-tree",
+            &tree,
+            "-m",
+            "lone",
+        ]);
         run(&["update-ref", "refs/pull/1/head", &lone]);
         let url = format!("file://{}", src.display());
         let dest = tmp.path().join("project");
         let git_dir = tmp.path().join("project.git");
         clone_at(&url, Some(&lone), &dest, &git_dir, ALLOW_FILE).unwrap();
-        let head = std::process::Command::new("git").arg("-C").arg(&dest).args(["rev-parse", "HEAD"]).output().unwrap();
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dest)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
         assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), lone);
     }
 
@@ -2103,7 +2497,10 @@ mod tests {
         let dest = tmp.path().join("project");
         let git_dir = tmp.path().join("project.git");
         clone_at(&url, Some("main"), &dest, &git_dir, ALLOW_FILE).unwrap();
-        assert_eq!(std::fs::read_to_string(dest.join("page.txt")).unwrap(), "second");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("page.txt")).unwrap(),
+            "second"
+        );
     }
 
     #[test]
@@ -2134,7 +2531,11 @@ mod tests {
         let elsewhere = base.path().join("elsewhere");
         std::fs::write(&elsewhere, format!("{sha}\n")).unwrap();
         std::os::unix::fs::symlink(&elsewhere, base.path().join(".q.template")).unwrap();
-        assert_eq!(template_commit_of(base.path(), "q"), None, "a link is no record");
+        assert_eq!(
+            template_commit_of(base.path(), "q"),
+            None,
+            "a link is no record"
+        );
         std::fs::write(base.path().join(".r.template"), "main\n").unwrap();
         assert_eq!(template_commit_of(base.path(), "r"), None, "not a SHA");
         record_source(base.path(), "p", Path::new("/tmp/mine")).unwrap();
@@ -2149,7 +2550,10 @@ mod tests {
     fn only_full_hex_object_names_count_as_commit_shas() {
         assert!(is_commit_sha("e044900cd94d086c841616b05ed63638aa402be4"));
         assert!(is_commit_sha(&"a".repeat(64)));
-        assert!(!is_commit_sha("e044900"), "a short SHA is ambiguous, and could be a branch");
+        assert!(
+            !is_commit_sha("e044900"),
+            "a short SHA is ambiguous, and could be a branch"
+        );
         assert!(!is_commit_sha("main"));
         assert!(!is_commit_sha("E044900CD94D086C841616B05ED63638AA402BE4"));
         assert!(!is_commit_sha(&"g".repeat(40)));
@@ -2165,13 +2569,22 @@ mod tests {
         let sole = try_hold(base, "site", Hold::Sole).unwrap().unwrap();
         assert!(try_hold(base, "site", Hold::Sole).unwrap().is_none());
         assert!(try_hold(base, "site", Hold::Shared).unwrap().is_none());
-        assert!(try_hold(base, "other", Hold::Sole).unwrap().is_some(), "another name is free");
+        assert!(
+            try_hold(base, "other", Hold::Sole).unwrap().is_some(),
+            "another name is free"
+        );
         drop(sole);
-        let (a, b) = (try_hold(base, "site", Hold::Shared).unwrap(), try_hold(base, "site", Hold::Shared).unwrap());
+        let (a, b) = (
+            try_hold(base, "site", Hold::Shared).unwrap(),
+            try_hold(base, "site", Hold::Shared).unwrap(),
+        );
         assert!(a.is_some() && b.is_some());
         assert!(try_hold(base, "site", Hold::Sole).unwrap().is_none());
         drop((a, b));
-        try_hold(base, "site", Hold::Sole).unwrap().unwrap().forget();
+        try_hold(base, "site", Hold::Sole)
+            .unwrap()
+            .unwrap()
+            .forget();
         assert!(!base.join(".site.lock").exists());
         assert!(try_hold(base, "../x", Hold::Sole).is_err());
         let target = base.join("elsewhere");
@@ -2200,8 +2613,14 @@ mod tests {
                     let mut i = 0u64;
                     while Instant::now() < until {
                         i += 1;
-                        let how = if (t + i).is_multiple_of(3) { Hold::Sole } else { Hold::Shared };
-                        let Ok(Some(held)) = try_hold(base, "site", how) else { continue };
+                        let how = if (t + i).is_multiple_of(3) {
+                            Hold::Sole
+                        } else {
+                            Hold::Shared
+                        };
+                        let Ok(Some(held)) = try_hold(base, "site", how) else {
+                            continue;
+                        };
                         let weight = if how == Hold::Sole { -1000 } else { 1 };
                         let now = inside.fetch_add(weight, Ordering::SeqCst) + weight;
                         if !(now == -1000 || now > 0) {
@@ -2209,12 +2628,20 @@ mod tests {
                         }
                         std::thread::yield_now();
                         inside.fetch_sub(weight, Ordering::SeqCst);
-                        if i.is_multiple_of(2) { held.forget() } else { drop(held) }
+                        if i.is_multiple_of(2) {
+                            held.forget()
+                        } else {
+                            drop(held)
+                        }
                     }
                 });
             }
         });
-        assert_eq!(violations.load(Ordering::SeqCst), 0, "a sole hold was taken beside another");
+        assert_eq!(
+            violations.load(Ordering::SeqCst),
+            0,
+            "a sole hold was taken beside another"
+        );
     }
 
     /// A lock file removed (or replaced) since it was opened is not the one

@@ -38,15 +38,17 @@
 //! negligible" and "the cadence is what it claims" are both verifiable
 //! facts in the response, not assumptions.
 
+use darkmux_crew::host_probe::wire::{
+    host_sample_now, BatteryHealthNow, PowerWindowWire, ThermalWindowWire,
+};
 use darkmux_crew::host_probe::{
     battery, reduce_host_extras, BatteryHealth, BatterySample, HostExtraAt, HostProbe,
     HostSampleFull,
 };
-use darkmux_crew::host_probe::wire::{host_sample_now, BatteryHealthNow, PowerWindowWire, ThermalWindowWire};
 use darkmux_crew::telemetry_sampler::{reduce_host_stats, HostSampleAt};
 use darkmux_flow::payload::{
-    BatteryCharge, BatteryTransition, LoadWindow, MachineBatteryHealthPayload, MachineBatteryPayload, MachineLoad,
-    MachineThermalPayload,
+    BatteryCharge, BatteryTransition, LoadWindow, MachineBatteryHealthPayload,
+    MachineBatteryPayload, MachineLoad, MachineThermalPayload,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -156,7 +158,8 @@ impl HostSamplerRing {
     /// Test-only: the snapshot as the JSON it serializes to.
     #[cfg(test)]
     pub(crate) fn snapshot_json(&self) -> Option<serde_json::Value> {
-        self.snapshot().map(|load| serde_json::to_value(load).unwrap_or_default())
+        self.snapshot()
+            .map(|load| serde_json::to_value(load).unwrap_or_default())
     }
 
     /// Test-only: set the cadence [`spawn`] would otherwise record, without
@@ -218,7 +221,11 @@ impl HostSamplerRing {
         let ex = reduce_host_extras(&extras, configured_interval_ms);
         // `unwrap`s below are safe: `raw` is non-empty because `latest`
         // (from `g.back()?` above) proved the ring holds at least one entry.
-        let span_ms = raw.last().unwrap().at_ms.saturating_sub(raw.first().unwrap().at_ms);
+        let span_ms = raw
+            .last()
+            .unwrap()
+            .at_ms
+            .saturating_sub(raw.first().unwrap().at_ms);
         drop(g);
 
         // (#2111) The "now" shape is the shared `host_sample_now` mapping —
@@ -281,7 +288,13 @@ fn build_thermal_transition_record(
     sample: &HostSampleFull,
     sampled_at_ms: u64,
 ) -> darkmux_flow::FlowRecord {
-    build_thermal_transition_record_with(from, to, sample, sampled_at_ms, darkmux_crew::host_source::provenance())
+    build_thermal_transition_record_with(
+        from,
+        to,
+        sample,
+        sampled_at_ms,
+        darkmux_crew::host_source::provenance(),
+    )
 }
 
 /// (#2779) [`build_thermal_transition_record`]'s body, with the host
@@ -301,8 +314,8 @@ fn build_thermal_transition_record_with(
     provenance: &darkmux_crew::host_source::Provenance,
 ) -> darkmux_flow::FlowRecord {
     use darkmux_crew::host_probe::thermal_severity;
-    let rising_into_elevated =
-        thermal_severity(to) > thermal_severity(from) && thermal_severity(to) >= thermal_severity("serious");
+    let rising_into_elevated = thermal_severity(to) > thermal_severity(from)
+        && thermal_severity(to) >= thermal_severity("serious");
     let level = if rising_into_elevated {
         darkmux_flow::Level::Warn
     } else {
@@ -502,7 +515,14 @@ fn battery_health_edge(
     if prev.is_some_and(|p| same_health(p, h)) {
         return (prev.cloned(), None);
     }
-    (Some(h.clone()), Some(build_battery_health_record(h, poll_interval_ms, sampled_at_ms)))
+    (
+        Some(h.clone()),
+        Some(build_battery_health_record(
+            h,
+            poll_interval_ms,
+            sampled_at_ms,
+        )),
+    )
 }
 
 /// Whether two readings describe the same HEALTH: cycles, capacity and
@@ -514,7 +534,11 @@ fn same_health(a: &BatteryHealth, b: &BatteryHealth) -> bool {
     // Capacity estimates wobble by a few mAh between polls (live: raw max
     // 5,702 then 5,700). Only a move of more than 1% of the original
     // capacity counts as wear.
-    let tol = a.design_capacity_mah.or(b.design_capacity_mah).map(|d| d / 100).unwrap_or(0);
+    let tol = a
+        .design_capacity_mah
+        .or(b.design_capacity_mah)
+        .map(|d| d / 100)
+        .unwrap_or(0);
     let close = |x: Option<u64>, y: Option<u64>| match (x, y) {
         (Some(x), Some(y)) => x.abs_diff(y) <= tol,
         (x, y) => x == y,
@@ -536,7 +560,11 @@ fn same_health(a: &BatteryHealth, b: &BatteryHealth) -> bool {
 /// `power.min_battery_pct` #2706's gate enforces, so "the stream said it
 /// crossed" and "the gate refused" can never disagree about where the line
 /// was.
-fn battery_transitions(prev: &BatterySample, now: &BatterySample, floor_pct: u8) -> Vec<BatteryTransition> {
+fn battery_transitions(
+    prev: &BatterySample,
+    now: &BatterySample,
+    floor_pct: u8,
+) -> Vec<BatteryTransition> {
     let mut out = Vec::new();
     match (prev.on_ac, now.on_ac) {
         (true, false) => out.push(BatteryTransition::ToBattery),
@@ -718,7 +746,8 @@ pub(crate) fn spawn(
     // `snapshot`'s sleep-gap cap (`reduce_host_extras`) reads this back —
     // recorded here, once, rather than re-resolved from config on every
     // request.
-    ring.configured_interval_ms.store(interval_ms, Ordering::Relaxed);
+    ring.configured_interval_ms
+        .store(interval_ms, Ordering::Relaxed);
     let interval = Duration::from_millis(interval_ms);
     Some(std::thread::spawn(move || {
         let mut probe = HostProbe::new();
@@ -787,7 +816,8 @@ pub(crate) fn spawn(
             let at_ms = darkmux_crew::host_probe::epoch_ms_now();
             // (#2111) Edge-detect BEFORE the sample moves into the ring —
             // `thermal_edge` only borrows it.
-            let (next_state, transition) = thermal_edge(known_thermal_state.as_deref(), &sample, at_ms);
+            let (next_state, transition) =
+                thermal_edge(known_thermal_state.as_deref(), &sample, at_ms);
             known_thermal_state = next_state;
             if let Some(rec) = transition {
                 let _ = darkmux_flow::record(rec);
@@ -850,7 +880,8 @@ pub(crate) fn spawn(
             // buys; the switch to live cadence now lands within one
             // interval instead of up to ten.
             let probe_start = Instant::now();
-            cached_live = crate::runs::any_dispatch_live_locally(at_ms, crate::runs::stale_after_ms());
+            cached_live =
+                crate::runs::any_dispatch_live_locally(at_ms, crate::runs::stale_after_ms());
             let liveness_probe_ms = probe_start.elapsed().as_millis() as u64;
 
             // (#2413, C2, and round 3 MF1) Opportunistically (re)acquire
@@ -888,20 +919,27 @@ pub(crate) fn spawn(
                         // thread) reports what actually happened, same
                         // rule `dispatch_internal.rs`'s dispatch-owned
                         // sampler already follows.
-                        let effective_interval_ms =
-                            machine_telemetry_effective_interval_ms(last_emit_at_ms, at_ms, interval_ms, emit_every_n_ticks);
-                        last_emit_at_ms = Some(at_ms);
-                        let mut rec = darkmux_crew::host_probe::build_machine_scoped_telemetry_record(
-                            &sample,
+                        let effective_interval_ms = machine_telemetry_effective_interval_ms(
+                            last_emit_at_ms,
                             at_ms,
-                            effective_interval_ms,
+                            interval_ms,
+                            emit_every_n_ticks,
                         );
+                        last_emit_at_ms = Some(at_ms);
+                        let mut rec =
+                            darkmux_crew::host_probe::build_machine_scoped_telemetry_record(
+                                &sample,
+                                at_ms,
+                                effective_interval_ms,
+                            );
                         // (CLAUDE.md "samplers stamp their own cost") The
                         // liveness probe this emission's cadence decision
                         // depended on is part of this record's own write
                         // cost — stamped so "the observer was negligible"
                         // stays a verifiable claim in the data.
-                        if let Some(darkmux_flow::Payload::MachineTelemetry(p)) = rec.payload.as_mut() {
+                        if let Some(darkmux_flow::Payload::MachineTelemetry(p)) =
+                            rec.payload.as_mut()
+                        {
                             p.liveness_probe_ms = Some(liveness_probe_ms);
                         }
                         let _ = darkmux_flow::record(rec);
@@ -963,13 +1001,20 @@ mod tests {
             charge_pct: pct,
             on_ac,
             charging: on_ac,
-            state: if on_ac { ChargeState::Charging } else { ChargeState::Discharging },
+            state: if on_ac {
+                ChargeState::Charging
+            } else {
+                ChargeState::Discharging
+            },
             minutes_to_empty: None,
         }
     }
 
     fn sample_with_battery(b: Option<BatterySample>) -> HostSampleFull {
-        HostSampleFull { battery: b, ..Default::default() }
+        HostSampleFull {
+            battery: b,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -979,7 +1024,8 @@ mod tests {
         // stream with battery records it has no battery for.
         let mut known: Option<BatterySample> = None;
         for tick in 0..50u64 {
-            let (next, rec) = battery_edge(known.as_ref(), &sample_with_battery(None), 50, tick * 5_000);
+            let (next, rec) =
+                battery_edge(known.as_ref(), &sample_with_battery(None), 50, tick * 5_000);
             known = next;
             assert!(rec.is_none(), "tick {tick}: no battery ⇒ no record, ever");
         }
@@ -988,9 +1034,18 @@ mod tests {
 
     #[test]
     fn the_first_battery_reading_seeds_silently_because_it_is_not_a_transition() {
-        let (known, rec) = battery_edge(None, &sample_with_battery(Some(battery_at(80, true))), 50, 1_000);
+        let (known, rec) = battery_edge(
+            None,
+            &sample_with_battery(Some(battery_at(80, true))),
+            50,
+            1_000,
+        );
         assert!(rec.is_none(), "there is nothing to have transitioned FROM");
-        assert_eq!(known.map(|b| b.charge_pct), Some(80), "but the baseline is now known");
+        assert_eq!(
+            known.map(|b| b.charge_pct),
+            Some(80),
+            "but the baseline is now known"
+        );
     }
 
     #[test]
@@ -998,7 +1053,12 @@ mod tests {
         let on_ac = battery_at(80, true);
         let unplugged = battery_at(80, false);
 
-        let (known, rec) = battery_edge(Some(&on_ac), &sample_with_battery(Some(unplugged)), 50, 1_000);
+        let (known, rec) = battery_edge(
+            Some(&on_ac),
+            &sample_with_battery(Some(unplugged)),
+            50,
+            1_000,
+        );
         let rec = rec.expect("unplugging is a transition");
         assert_eq!(rec.action, darkmux_flow::FlowAction::MachineBattery);
         assert!(
@@ -1011,7 +1071,12 @@ mod tests {
         assert_eq!(p["to"]["on_ac"], false);
 
         // Staying on battery emits nothing, however many ticks pass.
-        let (known, rec) = battery_edge(known.as_ref(), &sample_with_battery(Some(unplugged)), 50, 3_000);
+        let (known, rec) = battery_edge(
+            known.as_ref(),
+            &sample_with_battery(Some(unplugged)),
+            50,
+            3_000,
+        );
         assert!(rec.is_none(), "an unchanged state is not a transition");
 
         let (_, rec) = battery_edge(known.as_ref(), &sample_with_battery(Some(on_ac)), 50, 5_000);
@@ -1043,28 +1108,48 @@ mod tests {
         let above = battery_at(51, false);
         let at = battery_at(50, false);
         let (_, rec) = battery_edge(Some(&above), &sample_with_battery(Some(at)), 50, 1_000);
-        assert!(rec.is_none(), "50 with a floor of 50 has not crossed anything");
+        assert!(
+            rec.is_none(),
+            "50 with a floor of 50 has not crossed anything"
+        );
     }
 
     #[test]
     fn recovering_past_the_floor_emits_and_is_only_info() {
         let below = battery_at(20, false);
         let recovered = battery_at(50, true);
-        let (_, rec) = battery_edge(Some(&below), &sample_with_battery(Some(recovered)), 50, 1_000);
+        let (_, rec) = battery_edge(
+            Some(&below),
+            &sample_with_battery(Some(recovered)),
+            50,
+            1_000,
+        );
         let rec = rec.expect("recovery is a transition");
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
         let p = rec.payload_json();
         // Plugging in and crossing back up happen together and are both named.
-        assert_eq!(p["transitions"], serde_json::json!(["to-ac", "at-or-above-floor"]));
+        assert_eq!(
+            p["transitions"],
+            serde_json::json!(["to-ac", "at-or-above-floor"])
+        );
     }
 
     #[test]
     fn an_absent_reading_mid_series_holds_the_known_state_rather_than_resetting_it() {
         let below = battery_at(20, false);
-        let (known, _) = battery_edge(Some(&battery_at(60, false)), &sample_with_battery(Some(below)), 50, 1_000);
+        let (known, _) = battery_edge(
+            Some(&battery_at(60, false)),
+            &sample_with_battery(Some(below)),
+            50,
+            1_000,
+        );
         let (held, rec) = battery_edge(known.as_ref(), &sample_with_battery(None), 50, 3_000);
         assert!(rec.is_none());
-        assert_eq!(held.map(|b| b.charge_pct), Some(20), "a failed probe is not evidence anything moved");
+        assert_eq!(
+            held.map(|b| b.charge_pct),
+            Some(20),
+            "a failed probe is not evidence anything moved"
+        );
     }
 
     // ── The hourly health cadence, driven by an INJECTED clock ──
@@ -1076,9 +1161,15 @@ mod tests {
         // prove nothing.
         let hour = battery::HEALTH_POLL_INTERVAL_MS;
         assert!(!interval_due(0, hour));
-        assert!(!interval_due(hour - 1, hour), "one millisecond short is not due");
+        assert!(
+            !interval_due(hour - 1, hour),
+            "one millisecond short is not due"
+        );
         assert!(interval_due(hour, hour), "exactly at the interval is due");
-        assert!(interval_due(hour * 3, hour), "a long gap (a host sleep) is still just due");
+        assert!(
+            interval_due(hour * 3, hour),
+            "a long gap (a host sleep) is still just due"
+        );
     }
 
     #[test]
@@ -1131,7 +1222,8 @@ mod tests {
         let h = health_with(26);
         let (mut known, _) = battery_health_edge(None, Some(&h), 3_600_000, 0);
         for hour in 1..=24u64 {
-            let (next, rec) = battery_health_edge(known.as_ref(), Some(&h), 3_600_000, hour * 3_600_000);
+            let (next, rec) =
+                battery_health_edge(known.as_ref(), Some(&h), 3_600_000, hour * 3_600_000);
             known = next;
             assert!(
                 rec.is_none(),
@@ -1157,9 +1249,13 @@ mod tests {
             later.temperature_c = Some(30.0 + hour as f64 / 10.0);
             later.total_operating_ms = Some((5358 + hour) * HOUR_MS);
             later.time_at_soc_ms = Some(vec![0, 14 * HOUR_MS, (1938 + hour) * HOUR_MS]);
-            let (next, rec) = battery_health_edge(known.as_ref(), Some(&later), 3_600_000, hour * 3_600_000);
+            let (next, rec) =
+                battery_health_edge(known.as_ref(), Some(&later), 3_600_000, hour * 3_600_000);
             known = next;
-            assert!(rec.is_none(), "hour {hour}: only temperature/totals moved, which is not a health change");
+            assert!(
+                rec.is_none(),
+                "hour {hour}: only temperature/totals moved, which is not a health change"
+            );
         }
     }
 
@@ -1171,11 +1267,19 @@ mod tests {
         h.raw_max_capacity_mah = Some(5702);
         h.nominal_charge_capacity_mah = Some(5854);
         let (mut known, _) = battery_health_edge(None, Some(&h), 3_600_000, 0);
-        for (hour, (raw, nom)) in [(5700, 5852), (5703, 5855), (5698, 5850), (5701, 5853)].into_iter().enumerate() {
+        for (hour, (raw, nom)) in [(5700, 5852), (5703, 5855), (5698, 5850), (5701, 5853)]
+            .into_iter()
+            .enumerate()
+        {
             let mut j = h.clone();
             j.raw_max_capacity_mah = Some(raw);
             j.nominal_charge_capacity_mah = Some(nom);
-            let (next, rec) = battery_health_edge(known.as_ref(), Some(&j), 3_600_000, (hour as u64 + 1) * 3_600_000);
+            let (next, rec) = battery_health_edge(
+                known.as_ref(),
+                Some(&j),
+                3_600_000,
+                (hour as u64 + 1) * 3_600_000,
+            );
             known = next;
             assert!(rec.is_none(), "{raw}/{nom} mAh is jitter, not wear");
         }
@@ -1193,13 +1297,18 @@ mod tests {
         for hour in 1..=10u64 {
             let mut later = h.clone();
             later.raw_max_capacity_mah = Some(5700 - 10 * hour);
-            let (next, rec) = battery_health_edge(known.as_ref(), Some(&later), 3_600_000, hour * 3_600_000);
+            let (next, rec) =
+                battery_health_edge(known.as_ref(), Some(&later), 3_600_000, hour * 3_600_000);
             known = next;
             if rec.is_some() {
                 emitted.push(hour);
             }
         }
-        assert_eq!(emitted.len(), 1, "one record once the loss passes 1% of original, got {emitted:?}");
+        assert_eq!(
+            emitted.len(),
+            1,
+            "one record once the loss passes 1% of original, got {emitted:?}"
+        );
     }
 
     #[test]
@@ -1215,17 +1324,24 @@ mod tests {
     #[test]
     fn a_changed_health_value_emits_with_the_cadence_that_produced_it() {
         let (known, _) = battery_health_edge(None, Some(&health_with(26)), 3_600_000, 0);
-        let (_, rec) = battery_health_edge(known.as_ref(), Some(&health_with(27)), 3_600_000, 3_600_000);
+        let (_, rec) =
+            battery_health_edge(known.as_ref(), Some(&health_with(27)), 3_600_000, 3_600_000);
         let p = rec.expect("a real movement").payload_json();
         assert_eq!(p["cycle_count"], 27);
         assert_eq!(
             p["poll_interval_ms"], 3_600_000,
             "the cadence is a RECORDED knob — an artifact must say what produced it"
         );
-        assert_eq!(p["sampled_at_ms"], 3_600_000, "stamped with when it was observed, not when it was read back");
+        assert_eq!(
+            p["sampled_at_ms"], 3_600_000,
+            "stamped with when it was observed, not when it was read back"
+        );
         // Both capacity readings ride along, each labeled by its source.
         assert_eq!(p["raw_capacity_pct"], 90.4);
-        assert!(p.get("nominal_capacity_pct").is_some(), "the other reading is recorded too: {p}");
+        assert!(
+            p.get("nominal_capacity_pct").is_some(),
+            "the other reading is recorded too: {p}"
+        );
     }
 
     #[test]
@@ -1240,7 +1356,8 @@ mod tests {
     fn a_desktop_never_emits_a_health_record_at_all() {
         let mut known: Option<BatteryHealth> = None;
         for hour in 0..48u64 {
-            let (next, rec) = battery_health_edge(known.as_ref(), None, 3_600_000, hour * 3_600_000);
+            let (next, rec) =
+                battery_health_edge(known.as_ref(), None, 3_600_000, hour * 3_600_000);
             known = next;
             assert!(rec.is_none(), "hour {hour}");
         }
@@ -1252,7 +1369,10 @@ mod tests {
         let ring = HostSamplerRing::new();
         ring.push(entry(0, 50, 60, 70, 5));
         let v = ring.snapshot_json().expect("samples present");
-        assert!(v["battery_health"].is_null(), "no health polled yet ⇒ null, never a fabricated block");
+        assert!(
+            v["battery_health"].is_null(),
+            "no health polled yet ⇒ null, never a fabricated block"
+        );
         assert!(
             v["window"].get("battery_health").is_none(),
             "health is not a time series and must not sit inside the window reduction"
@@ -1267,9 +1387,15 @@ mod tests {
     #[test]
     fn the_now_block_carries_charge_and_reads_null_on_a_machine_with_no_battery() {
         let ring = HostSamplerRing::new();
-        ring.push(RingEntry { at_ms: 0, sample: sample_with_battery(None) });
+        ring.push(RingEntry {
+            at_ms: 0,
+            sample: sample_with_battery(None),
+        });
         let v = ring.snapshot_json().expect("samples present");
-        assert!(v["now"]["battery"].is_null(), "not measured must never serialize as a zero");
+        assert!(
+            v["now"]["battery"].is_null(),
+            "not measured must never serialize as a zero"
+        );
 
         let ring = HostSamplerRing::new();
         ring.push(RingEntry {
@@ -1294,7 +1420,10 @@ mod tests {
     #[test]
     fn empty_ring_snapshots_to_none() {
         let ring = HostSamplerRing::new();
-        assert!(ring.snapshot_json().is_none(), "no samples yet ⇒ no load block");
+        assert!(
+            ring.snapshot_json().is_none(),
+            "no samples yet ⇒ no load block"
+        );
     }
 
     #[test]
@@ -1315,7 +1444,10 @@ mod tests {
         assert_eq!(v["window"]["samples"], 3);
         assert_eq!(v["window"]["span_ms"], 4000);
         assert_eq!(v["window"]["interval_ms"], 2000, "measured mean gap");
-        assert_eq!(v["window"]["cpu_pct"]["max"], 90, "peak reused via reduce_host_stats");
+        assert_eq!(
+            v["window"]["cpu_pct"]["max"], 90,
+            "peak reused via reduce_host_stats"
+        );
         assert_eq!(v["window"]["cpu_pct"]["mean"], 60.0);
     }
 
@@ -1324,7 +1456,13 @@ mod tests {
         let ring = HostSamplerRing::new();
         ring.push(entry(0, 50, 60, 70, 5));
         let v = ring.snapshot_json().expect("samples present");
-        for key in ["cpu_clusters", "gpu_mhz", "gpu_mem_bytes", "thermal", "power_mw"] {
+        for key in [
+            "cpu_clusters",
+            "gpu_mhz",
+            "gpu_mem_bytes",
+            "thermal",
+            "power_mw",
+        ] {
             assert!(
                 v["now"][key].is_null(),
                 "`now.{key}` must be null when unmeasured, got {}",
@@ -1355,7 +1493,12 @@ mod tests {
                 cost_ms: 7,
                 cpu_pct: Some(19),
                 cpu_clusters: Some(vec![
-                    CpuCluster { name: "Super".into(), cores: 6, pct: Some(40), mhz: Some(4200) },
+                    CpuCluster {
+                        name: "Super".into(),
+                        cores: 6,
+                        pct: Some(40),
+                        mhz: Some(4200),
+                    },
                     CpuCluster {
                         name: "Performance".into(),
                         cores: 12,
@@ -1416,7 +1559,10 @@ mod tests {
         // throughout. Capped at 3x the 5000ms cadence (15000ms):
         // 1230 * 15000 / 3.6e6 = 5.125 mWh.
         let e = v["window"]["energy_mwh"].as_f64().expect("energy");
-        assert!((e - 5.125).abs() < 0.001, "got {e}, expected the capped 5.125 mWh, not 1230");
+        assert!(
+            (e - 5.125).abs() < 0.001,
+            "got {e}, expected the capped 5.125 mWh, not 1230"
+        );
     }
 
     #[test]
@@ -1426,7 +1572,10 @@ mod tests {
             ring.push(entry(i as u64 * 1000, 1, 1, 1, 1));
         }
         let v = ring.snapshot_json().expect("samples present");
-        assert_eq!(v["window"]["samples"], RING_CAPACITY as u64, "capped at RING_CAPACITY");
+        assert_eq!(
+            v["window"]["samples"], RING_CAPACITY as u64,
+            "capped at RING_CAPACITY"
+        );
         // The oldest 5 entries (at_ms 0..5000) must have been evicted — the
         // window's span should reflect only the newest RING_CAPACITY entries.
         let expected_span = (RING_CAPACITY as u64 - 1) * 1000;
@@ -1457,27 +1606,33 @@ mod tests {
     #[test]
     fn spawned_sampler_populates_the_ring_and_stops_promptly() {
         with_isolated_env(|_flows_dir| {
-        let ring = HostSamplerRing::new();
-        let stop = Arc::new(AtomicBool::new(false));
-        // A tight interval so the test doesn't wait long for a sample to land.
-        let handle = spawn(50, ring.clone(), Arc::clone(&stop));
-        assert!(handle.is_some(), "non-zero interval spawns a thread");
+            let ring = HostSamplerRing::new();
+            let stop = Arc::new(AtomicBool::new(false));
+            // A tight interval so the test doesn't wait long for a sample to land.
+            let handle = spawn(50, ring.clone(), Arc::clone(&stop));
+            assert!(handle.is_some(), "non-zero interval spawns a thread");
 
-        // Wait (bounded) for at least one sample. The bound allows for the
-        // probe's one-time construction cost (~100ms on macOS).
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while ring.snapshot_json().is_none() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(ring.snapshot_json().is_some(), "at least one sample landed within the deadline");
+            // Wait (bounded) for at least one sample. The bound allows for the
+            // probe's one-time construction cost (~100ms on macOS).
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while ring.snapshot_json().is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                ring.snapshot_json().is_some(),
+                "at least one sample landed within the deadline"
+            );
 
-        let t0 = Instant::now();
-        stop.store(true, Ordering::SeqCst);
-        handle.unwrap().join().expect("sampler thread joins cleanly");
-        assert!(
-            t0.elapsed() < Duration::from_secs(2),
-            "teardown must be prompt (bounded by STOP_POLL_INTERVAL), not a full interval wait"
-        );
+            let t0 = Instant::now();
+            stop.store(true, Ordering::SeqCst);
+            handle
+                .unwrap()
+                .join()
+                .expect("sampler thread joins cleanly");
+            assert!(
+                t0.elapsed() < Duration::from_secs(2),
+                "teardown must be prompt (bounded by STOP_POLL_INTERVAL), not a full interval wait"
+            );
         });
     }
 
@@ -1516,8 +1671,15 @@ mod tests {
 
     #[test]
     fn machine_telemetry_effective_interval_ms_first_emission_stamps_the_configured_cadence() {
-        assert_eq!(machine_telemetry_effective_interval_ms(None, 12345, 5000, 1), 5000);
-        assert_eq!(machine_telemetry_effective_interval_ms(None, 12345, 5000, 10), 50_000, "idle multiplier applies");
+        assert_eq!(
+            machine_telemetry_effective_interval_ms(None, 12345, 5000, 1),
+            5000
+        );
+        assert_eq!(
+            machine_telemetry_effective_interval_ms(None, 12345, 5000, 10),
+            50_000,
+            "idle multiplier applies"
+        );
     }
 
     #[test]
@@ -1525,11 +1687,21 @@ mod tests {
         // A tick that ran LATE (an 8s gap against a 500ms knob) must
         // report the real 8s, not the configured 500ms it would report if
         // this had regressed back to stamping the knob verbatim.
-        assert_eq!(machine_telemetry_effective_interval_ms(Some(1_000), 9_000, 500, 1), 8_000);
-        assert_eq!(machine_telemetry_effective_interval_ms(Some(1_000), 9_000, 500, 10), 8_000, "knob ignored once a prior emission exists");
+        assert_eq!(
+            machine_telemetry_effective_interval_ms(Some(1_000), 9_000, 500, 1),
+            8_000
+        );
+        assert_eq!(
+            machine_telemetry_effective_interval_ms(Some(1_000), 9_000, 500, 10),
+            8_000,
+            "knob ignored once a prior emission exists"
+        );
     }
 
-    fn wait_for_machine_telemetry_record(flows_dir: &std::path::Path, deadline: Duration) -> serde_json::Value {
+    fn wait_for_machine_telemetry_record(
+        flows_dir: &std::path::Path,
+        deadline: Duration,
+    ) -> serde_json::Value {
         let day_path = flows_dir.join(format!("{}.jsonl", darkmux_flow::day_utc_now()));
         let start = Instant::now();
         loop {
@@ -1543,7 +1715,10 @@ mod tests {
                 }
             }
             if start.elapsed() > deadline {
-                panic!("no machine.telemetry record landed in {} within {deadline:?}", day_path.display());
+                panic!(
+                    "no machine.telemetry record landed in {} within {deadline:?}",
+                    day_path.display()
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1599,19 +1774,35 @@ mod tests {
             handle.join().unwrap();
 
             assert_eq!(rec["source"], "host");
-            let absent_or_null = |v: Option<&serde_json::Value>| v.is_none() || v.unwrap().is_null();
-            assert!(absent_or_null(rec.get("session_id")), "no session_id: {rec}");
+            let absent_or_null =
+                |v: Option<&serde_json::Value>| v.is_none() || v.unwrap().is_null();
+            assert!(
+                absent_or_null(rec.get("session_id")),
+                "no session_id: {rec}"
+            );
             assert!(absent_or_null(rec.get("model")), "no model: {rec}");
-            assert!(absent_or_null(rec.get("mission_id")), "no mission_id: {rec}");
+            assert!(
+                absent_or_null(rec.get("mission_id")),
+                "no mission_id: {rec}"
+            );
             assert!(absent_or_null(rec.get("phase_id")), "no phase_id: {rec}");
             let payload = &rec["payload"];
-            assert!(payload["sampled_at_ms"].is_u64(), "carries sampled_at_ms: {payload}");
-            assert!(payload["interval_ms"].is_u64(), "carries the effective interval_ms: {payload}");
+            assert!(
+                payload["sampled_at_ms"].is_u64(),
+                "carries sampled_at_ms: {payload}"
+            );
+            assert!(
+                payload["interval_ms"].is_u64(),
+                "carries the effective interval_ms: {payload}"
+            );
             // (#2413 C3) The liveness probe this emission's cadence
             // decision depended on stamps its own cost — "the observer was
             // negligible" stays a verifiable claim in the data rather than
             // an assumption (CLAUDE.md's samplers-stamp-their-own-cost rule).
-            assert!(payload["liveness_probe_ms"].is_u64(), "carries liveness_probe_ms: {payload}");
+            assert!(
+                payload["liveness_probe_ms"].is_u64(),
+                "carries liveness_probe_ms: {payload}"
+            );
         });
     }
 
@@ -1635,8 +1826,13 @@ mod tests {
             let recs = wait_for_n_machine_telemetry_records(flows_dir, 2, Duration::from_secs(10));
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap();
-            assert_eq!(recs[0]["payload"]["interval_ms"], 500, "first emission stamps the configured 10x cadence");
-            let second = recs[1]["payload"]["interval_ms"].as_u64().expect("interval_ms is a number");
+            assert_eq!(
+                recs[0]["payload"]["interval_ms"], 500,
+                "first emission stamps the configured 10x cadence"
+            );
+            let second = recs[1]["payload"]["interval_ms"]
+                .as_u64()
+                .expect("interval_ms is a number");
             assert!(
                 (400..=2000).contains(&second),
                 "second emission must stamp the MEASURED gap, in the neighborhood of 500ms: got {second}"
@@ -1675,8 +1871,13 @@ mod tests {
             let recs = wait_for_n_machine_telemetry_records(flows_dir, 2, Duration::from_secs(10));
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap();
-            assert_eq!(recs[0]["payload"]["interval_ms"], 50, "first emission stamps the configured 1x cadence");
-            let second = recs[1]["payload"]["interval_ms"].as_u64().expect("interval_ms is a number");
+            assert_eq!(
+                recs[0]["payload"]["interval_ms"], 50,
+                "first emission stamps the configured 1x cadence"
+            );
+            let second = recs[1]["payload"]["interval_ms"]
+                .as_u64()
+                .expect("interval_ms is a number");
             assert!(
                 (20..=500).contains(&second),
                 "second emission must stamp the MEASURED gap, in the neighborhood of 50ms: got {second}"
@@ -1709,7 +1910,11 @@ mod tests {
             let appeared_at = Instant::now();
             {
                 use std::io::Write;
-                let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&day_path).unwrap();
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&day_path)
+                    .unwrap();
                 writeln!(
                     f,
                     "{}",
@@ -1735,7 +1940,9 @@ mod tests {
                         .filter(|l| {
                             serde_json::from_str::<serde_json::Value>(l)
                                 .ok()
-                                .and_then(|v| v.get("action").and_then(|a| a.as_str().map(str::to_string)))
+                                .and_then(|v| {
+                                    v.get("action").and_then(|a| a.as_str().map(str::to_string))
+                                })
                                 .as_deref()
                                 == Some("machine.telemetry")
                         })
@@ -1784,8 +1991,10 @@ mod tests {
             let other_pid = 1u32;
             // Held for the whole test body — `Drop` releases the lock, so
             // it must outlive the ownership check after the window.
-            let _guard = darkmux_crew::host_sampler_lock::try_acquire_as_for_test(other_pid, "dispatch", 60_000)
-                .expect("the lock is free at test start");
+            let _guard = darkmux_crew::host_sampler_lock::try_acquire_as_for_test(
+                other_pid, "dispatch", 60_000,
+            )
+            .expect("the lock is free at test start");
 
             let ring = HostSamplerRing::new();
             let stop = Arc::new(AtomicBool::new(false));
@@ -1853,9 +2062,10 @@ mod tests {
             // happens to point by now. Without it the no-emission assertion
             // below could pass vacuously: a sampler that never faced a
             // contended lock trivially emits nothing.
-            let held: Option<darkmux_crew::host_sampler_lock::LockState> = std::fs::read_to_string(&lock_path_at_acquire)
-                .ok()
-                .and_then(|t| serde_json::from_str(&t).ok());
+            let held: Option<darkmux_crew::host_sampler_lock::LockState> =
+                std::fs::read_to_string(&lock_path_at_acquire)
+                    .ok()
+                    .and_then(|t| serde_json::from_str(&t).ok());
             assert_eq!(
                 held.as_ref().map(|st| st.pid),
                 Some(other_pid),
@@ -1902,12 +2112,16 @@ mod tests {
                  sampler emitted while a fresh lock it could see was held, which is the real \
                  defect this test exists to catch.",
                 now_path = darkmux_types::config_access::host_sampler_lock_path(),
-                same_path = darkmux_types::config_access::host_sampler_lock_path() == lock_path_at_acquire,
+                same_path =
+                    darkmux_types::config_access::host_sampler_lock_path() == lock_path_at_acquire,
                 now_home = std::env::var("DARKMUX_HOME").ok(),
             );
             // Still samples its OWN ring regardless (the ring is
             // unconditional, per the issue's own rule).
-            assert!(ring.snapshot_json().is_some(), "the ring keeps sampling regardless of who holds the lock");
+            assert!(
+                ring.snapshot_json().is_some(),
+                "the ring keeps sampling regardless of who holds the lock"
+            );
         });
     }
 
@@ -1915,7 +2129,10 @@ mod tests {
 
     fn thermal_sample(state: &str) -> HostSampleFull {
         HostSampleFull {
-            thermal: Some(ThermalSample { state: state.to_string(), cpu_speed_limit_pct: 100 }),
+            thermal: Some(ThermalSample {
+                state: state.to_string(),
+                cpu_speed_limit_pct: 100,
+            }),
             ..Default::default()
         }
     }
@@ -1938,28 +2155,44 @@ mod tests {
                 records.push(r);
             }
         }
-        assert_eq!(records.len(), 3, "expected exactly 3 transitions, got {records:?}");
+        assert_eq!(
+            records.len(),
+            3,
+            "expected exactly 3 transitions, got {records:?}"
+        );
 
         let p0 = records[0].payload_json();
         assert_eq!(p0["from"], "nominal");
         assert_eq!(p0["to"], "fair");
-        assert!(matches!(records[0].level, darkmux_flow::Level::Info), "rising to fair is Info");
+        assert!(
+            matches!(records[0].level, darkmux_flow::Level::Info),
+            "rising to fair is Info"
+        );
 
         let p1 = records[1].payload_json();
         assert_eq!(p1["from"], "fair");
         assert_eq!(p1["to"], "serious");
-        assert!(matches!(records[1].level, darkmux_flow::Level::Warn), "rising INTO serious is Warn");
+        assert!(
+            matches!(records[1].level, darkmux_flow::Level::Warn),
+            "rising INTO serious is Warn"
+        );
 
         let p2 = records[2].payload_json();
         assert_eq!(p2["from"], "serious");
         assert_eq!(p2["to"], "nominal");
-        assert!(matches!(records[2].level, darkmux_flow::Level::Info), "falling back to nominal is Info");
+        assert!(
+            matches!(records[2].level, darkmux_flow::Level::Info),
+            "falling back to nominal is Info"
+        );
 
         for r in &records {
             assert!(matches!(r.category, darkmux_flow::Category::Machinery));
             assert!(matches!(r.tier, darkmux_flow::Tier::Darkmux));
             assert_eq!(r.action, darkmux_flow::FlowAction::MachineThermal);
-            assert!(r.mission_id.is_none(), "no mission context — the daemon runs independently of any dispatch");
+            assert!(
+                r.mission_id.is_none(),
+                "no mission context — the daemon runs independently of any dispatch"
+            );
             assert!(r.session_id.is_none());
         }
     }
@@ -1967,7 +2200,10 @@ mod tests {
     #[test]
     fn thermal_edge_first_reading_seeds_baseline_silently() {
         let (next, rec) = thermal_edge(None, &thermal_sample("critical"), 0);
-        assert!(rec.is_none(), "the very first reading is never a transition");
+        assert!(
+            rec.is_none(),
+            "the very first reading is never a transition"
+        );
         assert_eq!(next.as_deref(), Some("critical"));
     }
 
@@ -1982,7 +2218,10 @@ mod tests {
         // retrospective concern over the reduced window, not this
         // per-tick detector.
         let (_next, rec) = thermal_edge(prev.as_deref(), &thermal_sample("nominal"), 3_600_000);
-        assert!(rec.is_none(), "same state across any gap must not emit a transition");
+        assert!(
+            rec.is_none(),
+            "same state across any gap must not emit a transition"
+        );
     }
 
     #[test]
@@ -1991,7 +2230,10 @@ mod tests {
         assert_eq!(prev.as_deref(), Some("fair"));
         let missing = HostSampleFull::default(); // thermal: None — probe read failure
         let (prev2, rec) = thermal_edge(prev.as_deref(), &missing, 1000);
-        assert!(rec.is_none(), "an absent reading is not evidence of a transition");
+        assert!(
+            rec.is_none(),
+            "an absent reading is not evidence of a transition"
+        );
         assert_eq!(
             prev2.as_deref(),
             Some("fair"),
@@ -2003,7 +2245,10 @@ mod tests {
     fn thermal_edge_payload_carries_speed_limit_power_and_sampled_at() {
         let (prev, _) = thermal_edge(None, &thermal_sample("nominal"), 0);
         let sample = HostSampleFull {
-            thermal: Some(ThermalSample { state: "serious".into(), cpu_speed_limit_pct: 62 }),
+            thermal: Some(ThermalSample {
+                state: "serious".into(),
+                cpu_speed_limit_pct: 62,
+            }),
             power: Some(PowerSample::rails(1000.0, 200.0, 30.0)),
             ..Default::default()
         };
@@ -2036,7 +2281,10 @@ mod tests {
     #[test]
     fn a_scripted_thermal_transition_names_the_scenario_that_produced_it() {
         let sample = HostSampleFull {
-            thermal: Some(ThermalSample { state: "critical".into(), cpu_speed_limit_pct: 30 }),
+            thermal: Some(ThermalSample {
+                state: "critical".into(),
+                cpu_speed_limit_pct: 30,
+            }),
             ..Default::default()
         };
         let scripted = darkmux_crew::host_source::Provenance::Scripted {
@@ -2044,7 +2292,8 @@ mod tests {
             frames: 4,
             span_ms: 90_000,
         };
-        let rec = build_thermal_transition_record_with("nominal", "critical", &sample, 5000, &scripted);
+        let rec =
+            build_thermal_transition_record_with("nominal", "critical", &sample, 5000, &scripted);
         assert!(
             matches!(rec.level, darkmux_flow::Level::Warn),
             "a rise into critical is still an operator-actionable Warn — the stamp answers \
@@ -2071,7 +2320,10 @@ mod tests {
             },
         );
         assert!(
-            unavailable.payload_json().get("simulated_host_source").is_none(),
+            unavailable
+                .payload_json()
+                .get("simulated_host_source")
+                .is_none(),
             "nothing is simulated when the scenario failed to load, so nothing may be stamped"
         );
     }
@@ -2103,7 +2355,14 @@ mod tests {
             frames: 2,
             span_ms: 4_000,
         };
-        let rec = build_battery_transition_record_with(&[BatteryTransition::BelowFloor], &above, &below, 50, 1_000, &scripted);
+        let rec = build_battery_transition_record_with(
+            &[BatteryTransition::BelowFloor],
+            &above,
+            &below,
+            50,
+            1_000,
+            &scripted,
+        );
         assert!(
             matches!(rec.level, darkmux_flow::Level::Warn),
             "a floor crossing stays operator-actionable — the stamp answers WHOSE reading it was, \
@@ -2129,7 +2388,10 @@ mod tests {
             },
         );
         assert!(
-            unavailable.payload_json().get("simulated_host_source").is_none(),
+            unavailable
+                .payload_json()
+                .get("simulated_host_source")
+                .is_none(),
             "nothing is simulated when the scenario failed to load, so nothing may be stamped"
         );
     }
@@ -2157,9 +2419,12 @@ mod tests {
             "health is a real IOKit read on every source, so it carries no simulation marker: {payload}"
         );
         assert!(
-            darkmux_crew::host_source::HOST_READING_ACTIONS.iter().any(|(action, duty)| *action
-                == darkmux_flow::FlowAction::MachineBatteryHealth
-                && matches!(duty, darkmux_crew::host_source::StampDuty::Exempt(_))),
+            darkmux_crew::host_source::HOST_READING_ACTIONS
+                .iter()
+                .any(
+                    |(action, duty)| *action == darkmux_flow::FlowAction::MachineBatteryHealth
+                        && matches!(duty, darkmux_crew::host_source::StampDuty::Exempt(_))
+                ),
             "and the registry must say so, with the reason, so the next sweep reads the call \
              instead of re-deriving it"
         );
@@ -2172,7 +2437,10 @@ mod tests {
     fn a_zero_period_never_comes_due() {
         assert!(!interval_due(0, 0));
         assert!(!interval_due(60_000, 0));
-        assert!(!interval_due(u64::MAX, 0), "an unbounded wait on a 0 period is still off");
+        assert!(
+            !interval_due(u64::MAX, 0),
+            "an unbounded wait on a 0 period is still off"
+        );
         // …and a real period behaves normally.
         assert!(!interval_due(59_999, 60_000));
         assert!(interval_due(60_000, 60_000));
@@ -2198,7 +2466,10 @@ mod tests {
         }
         let load = ring.snapshot().expect("samples");
         let from_lens = serde_json::to_value(&load).unwrap()["window"]["thermal"].clone();
-        assert_eq!(from_lens["level_entries"]["fair"], 1, "one arrival, not two samples");
+        assert_eq!(
+            from_lens["level_entries"]["fair"], 1,
+            "one arrival, not two samples"
+        );
         assert_eq!(from_lens["level_ms"]["fair"], 10_000);
     }
 }

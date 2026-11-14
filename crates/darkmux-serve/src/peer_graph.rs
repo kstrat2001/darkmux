@@ -138,21 +138,35 @@ const MAX_PEER_GRAPH_BYTES: u64 = 2 * 1024 * 1024;
 /// See this module's own doc for what each variant means operationally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PeerLookup {
-    Unrostered { machine: String },
-    Silent { machine: String },
-    Live { machine: String, entry: Box<darkmux_fleet::MachineEntry> },
+    Unrostered {
+        machine: String,
+    },
+    Silent {
+        machine: String,
+    },
+    Live {
+        machine: String,
+        entry: Box<darkmux_fleet::MachineEntry>,
+    },
 }
 
 fn classify_peer(owner: &str, roster: &FleetRoster, live_machines: &HashSet<String>) -> PeerLookup {
     // (#3028) The one resolver every machine name goes through; a name two
     // entries answer to is not a peer to send a token to.
     let Ok(Some(entry)) = darkmux_fleet::find_machine(roster, owner) else {
-        return PeerLookup::Unrostered { machine: owner.to_string() };
+        return PeerLookup::Unrostered {
+            machine: owner.to_string(),
+        };
     };
     if !live_machines.contains(owner) {
-        return PeerLookup::Silent { machine: owner.to_string() };
+        return PeerLookup::Silent {
+            machine: owner.to_string(),
+        };
     }
-    PeerLookup::Live { machine: owner.to_string(), entry: Box::new(entry.clone()) }
+    PeerLookup::Live {
+        machine: owner.to_string(),
+        entry: Box::new(entry.clone()),
+    }
 }
 
 /// Best-effort: serve `mission_id`'s graph from the peer that flow records
@@ -190,7 +204,14 @@ pub(crate) fn try_peer_graph(
     // that verified address. A first-contact pin is saved in the roster before
     // the token is attached, exactly as a work submission does.
     let provider = darkmux_fleet::configured_provider_or_unavailable();
-    try_peer_graph_with(mission_id, &owner, self_machine.as_deref(), &roster, &live, provider.as_ref())
+    try_peer_graph_with(
+        mission_id,
+        &owner,
+        self_machine.as_deref(),
+        &roster,
+        &live,
+        provider.as_ref(),
+    )
 }
 
 /// The dependency-injected core of [`try_peer_graph`] — the attributed
@@ -239,7 +260,10 @@ fn settled_peer_target(
     provider: &dyn darkmux_fleet::IdentityProvider,
 ) -> Option<darkmux_fleet::SettledTarget> {
     let refused = |e: &dyn std::fmt::Display| {
-        eprintln!("peer_graph: peer `{machine}` not asked: {}", darkmux_fleet::sanitize_remote_line(&format!("{e}")));
+        eprintln!(
+            "peer_graph: peer `{machine}` not asked: {}",
+            darkmux_fleet::sanitize_remote_line(&format!("{e}"))
+        );
     };
     let target = darkmux_fleet::peer_target(
         machine,
@@ -251,7 +275,9 @@ fn settled_peer_target(
     )
     .inspect_err(|e| refused(e))
     .ok()?;
-    darkmux_fleet::pin_on_first_contact(target, entry, provider).inspect_err(|e| refused(&format!("{e:#}"))).ok()
+    darkmux_fleet::pin_on_first_contact(target, entry, provider)
+        .inspect_err(|e| refused(&format!("{e:#}")))
+        .ok()
 }
 
 /// Which machines currently hold a live presence beat, by the SAME
@@ -266,7 +292,11 @@ fn live_machine_names() -> HashSet<String> {
         return HashSet::new();
     };
     // (#3432) The daemon's shared read: a failed one is empty, as before.
-    crate::machine_beats(&url, crate::PresenceRead::QUIET).0.into_iter().map(|b| b.display_name).collect()
+    crate::machine_beats(&url, crate::PresenceRead::QUIET)
+        .0
+        .into_iter()
+        .map(|b| b.display_name)
+        .collect()
 }
 
 /// GET `<base>/mission/<mission_id>/graph.json` with the shared bearer
@@ -301,12 +331,21 @@ fn live_machine_names() -> HashSet<String> {
 /// naming the outcome (never a verdict about the peer or the operator's
 /// network) matches `fetch_peer_json`'s own precedent in
 /// `src/fleet_cli.rs` (#1466 gate CONSIDER 6).
-fn fetch_peer_graph_json(target: &darkmux_fleet::SettledTarget, mission_id: &str, peer_id: &str) -> Option<serde_json::Value> {
+fn fetch_peer_graph_json(
+    target: &darkmux_fleet::SettledTarget,
+    mission_id: &str,
+    peer_id: &str,
+) -> Option<serde_json::Value> {
     let path = format!("/mission/{mission_id}/graph.json");
     let url = format!("{}{path}", target.base());
     // (#2916 re-review MUST 3) Through the one token-attaching helper; it
     // never follows redirects either.
-    let resp = match darkmux_fleet::fleet_get(target, &path, PEER_GRAPH_TIMEOUT, &[(PEER_RELAY_HEADER, "1")]) {
+    let resp = match darkmux_fleet::fleet_get(
+        target,
+        &path,
+        PEER_GRAPH_TIMEOUT,
+        &[(PEER_RELAY_HEADER, "1")],
+    ) {
         Ok(resp) => resp,
         Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
             eprintln!(
@@ -315,7 +354,9 @@ fn fetch_peer_graph_json(target: &darkmux_fleet::SettledTarget, mission_id: &str
             return None;
         }
         Err(ureq::Error::Status(404, _)) => {
-            eprintln!("peer_graph: peer `{peer_id}` ({url}) answered 404 — no mission there either");
+            eprintln!(
+                "peer_graph: peer `{peer_id}` ({url}) answered 404 — no mission there either"
+            );
             return None;
         }
         Err(ureq::Error::Status(status, _)) => {
@@ -416,7 +457,9 @@ fn fetch_peer_graph_json(target: &darkmux_fleet::SettledTarget, mission_id: &str
 /// it was before this fix, only a WRONG shape or a WRONG mission id is
 /// now rejected).
 fn graph_shape_is_valid(value: &serde_json::Value, mission_id: &str) -> bool {
-    let Some(obj) = value.as_object() else { return false };
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
     let nodes_ok = matches!(obj.get("nodes"), Some(serde_json::Value::Array(_)));
     let edges_ok = matches!(obj.get("edges"), Some(serde_json::Value::Array(_)));
     let id_matches = obj.get("mission_id").and_then(|v| v.as_str()) == Some(mission_id);
@@ -441,7 +484,9 @@ fn graph_shape_is_valid(value: &serde_json::Value, mission_id: &str) -> bool {
 /// real but small richness regression against a forgery vector on a
 /// field the operator reads as this daemon's own attestation.
 fn stamp_provenance(graph: &mut serde_json::Value, machine: &str) {
-    let Some(obj) = graph.as_object_mut() else { return };
+    let Some(obj) = graph.as_object_mut() else {
+        return;
+    };
     obj.insert(
         "note".to_string(),
         serde_json::Value::String(format!("fetched live from peer `{machine}`")),
@@ -472,9 +517,22 @@ mod tests {
         // A non-loopback address of this machine (its outbound one).
         let ip = require_outbound_ip();
         let roster = roster_with("studio", &format!("{ip}:{port}"));
-        assert_eq!(try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider()), None);
+        assert_eq!(
+            try_peer_graph_with(
+                "m",
+                "studio",
+                None,
+                &roster,
+                &live(&["studio"]),
+                &no_provider()
+            ),
+            None
+        );
         std::thread::sleep(Duration::from_millis(100));
-        assert!(listener.accept().is_err(), "an unverified peer must never be dialed");
+        assert!(
+            listener.accept().is_err(),
+            "an unverified peer must never be dialed"
+        );
     }
 
     /// This machine's outbound non-loopback address, when it has one.
@@ -504,7 +562,11 @@ mod tests {
     fn provider_with_studio_at(ip: std::net::IpAddr) -> darkmux_fleet::StaticIdentityProvider {
         darkmux_fleet::StaticIdentityProvider {
             local: darkmux_fleet::test_node("nLAPTOP", "laptop", "100.64.0.7"),
-            peers: vec![darkmux_fleet::test_node("nSTUDIO", "studio", &ip.to_string())],
+            peers: vec![darkmux_fleet::test_node(
+                "nSTUDIO",
+                "studio",
+                &ip.to_string(),
+            )],
             down: None,
         }
     }
@@ -533,7 +595,8 @@ mod tests {
 
     /// A one-shot graph responder on all interfaces; the returned cell holds
     /// the request's Authorization line once a request arrived.
-    fn auth_recording_graph_server() -> (u16, Arc<std::sync::Mutex<Option<String>>>, Arc<AtomicBool>) {
+    fn auth_recording_graph_server() -> (u16, Arc<std::sync::Mutex<Option<String>>>, Arc<AtomicBool>)
+    {
         let listener = TcpListener::bind("0.0.0.0:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let auth = Arc::new(std::sync::Mutex::new(None));
@@ -545,8 +608,10 @@ mod tests {
                 let mut buf = [0u8; 4096];
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
-                *auth2.lock().unwrap() =
-                    req.lines().find(|l| l.to_ascii_lowercase().starts_with("authorization:")).map(str::to_string);
+                *auth2.lock().unwrap() = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .map(str::to_string);
                 let body = r#"{"mission_id":"m","nodes":[],"edges":[],"legacy":false,"generated_at_ms":0}"#;
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -575,8 +640,14 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-            let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &provider);
-            (out, darkmux_fleet::load_roster().unwrap().machines["studio"].node_id.clone())
+            let out =
+                try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &provider);
+            (
+                out,
+                darkmux_fleet::load_roster().unwrap().machines["studio"]
+                    .node_id
+                    .clone(),
+            )
         });
         assert!(out.is_some(), "the peer was asked");
         assert!(hit.load(Ordering::SeqCst));
@@ -604,7 +675,10 @@ mod tests {
         });
         assert_eq!(out, None);
         std::thread::sleep(Duration::from_millis(150));
-        assert!(!hit.load(Ordering::SeqCst), "nothing was sent to a peer whose pin was not saved");
+        assert!(
+            !hit.load(Ordering::SeqCst),
+            "nothing was sent to a peer whose pin was not saved"
+        );
         assert_eq!(auth.lock().unwrap().clone(), None);
     }
 
@@ -681,7 +755,9 @@ mod tests {
         let roster = FleetRoster::default();
         assert_eq!(
             classify_peer("studio", &roster, &live(&["studio"])),
-            PeerLookup::Unrostered { machine: "studio".into() }
+            PeerLookup::Unrostered {
+                machine: "studio".into()
+            }
         );
     }
 
@@ -690,7 +766,9 @@ mod tests {
         let roster = roster_with("studio", "127.0.0.1:9");
         assert_eq!(
             classify_peer("studio", &roster, &HashSet::new()),
-            PeerLookup::Silent { machine: "studio".into() }
+            PeerLookup::Silent {
+                machine: "studio".into()
+            }
         );
     }
 
@@ -699,7 +777,10 @@ mod tests {
         let roster = roster_with("studio", "127.0.0.1:9000");
         assert_eq!(
             classify_peer("studio", &roster, &live(&["studio"])),
-            PeerLookup::Live { machine: "studio".into(), entry: Box::new(roster.machines["studio"].clone()) }
+            PeerLookup::Live {
+                machine: "studio".into(),
+                entry: Box::new(roster.machines["studio"].clone())
+            }
         );
     }
 
@@ -712,7 +793,10 @@ mod tests {
         roster.machines.get_mut("old-studio").unwrap().current_name = Some("studio".into());
         assert_eq!(
             classify_peer("Studio", &roster, &live(&["Studio"])),
-            PeerLookup::Live { machine: "Studio".into(), entry: Box::new(roster.machines["old-studio"].clone()) }
+            PeerLookup::Live {
+                machine: "Studio".into(),
+                entry: Box::new(roster.machines["old-studio"].clone())
+            }
         );
     }
 
@@ -721,25 +805,51 @@ mod tests {
 
     #[test]
     fn unrostered_owner_never_attempts_the_network() {
-        let (addr, hit) = one_shot_http("200 OK", r#"{"mission_id":"m","nodes":[],"edges":[],"legacy":false,"generated_at_ms":0}"#);
+        let (addr, hit) = one_shot_http(
+            "200 OK",
+            r#"{"mission_id":"m","nodes":[],"edges":[],"legacy":false,"generated_at_ms":0}"#,
+        );
         // The roster names a DIFFERENT machine at this address — "studio"
         // (the mission's actual owner) is absent.
         let roster = roster_with("not-studio", &addr);
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         assert_eq!(out, None);
-        assert!(!hit.load(Ordering::SeqCst), "unrostered peer must never be dialed");
+        assert!(
+            !hit.load(Ordering::SeqCst),
+            "unrostered peer must never be dialed"
+        );
     }
 
     #[test]
     fn silent_peer_never_attempts_the_network() {
-        let (addr, hit) = one_shot_http("200 OK", r#"{"mission_id":"m","nodes":[],"edges":[],"legacy":false,"generated_at_ms":0}"#);
+        let (addr, hit) = one_shot_http(
+            "200 OK",
+            r#"{"mission_id":"m","nodes":[],"edges":[],"legacy":false,"generated_at_ms":0}"#,
+        );
         let roster = roster_with("studio", &addr);
         // "studio" is rostered but the live set is empty — rostered but
         // silent, the #1466-continuation degraded case (CLAUDE.md:
         // "presence is fleet-membership truth").
-        let out = try_peer_graph_with("m", "studio", None, &roster, &HashSet::new(), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &HashSet::new(),
+            &no_provider(),
+        );
         assert_eq!(out, None);
-        assert!(!hit.load(Ordering::SeqCst), "a silent peer must never be dialed — presence already answered");
+        assert!(
+            !hit.load(Ordering::SeqCst),
+            "a silent peer must never be dialed — presence already answered"
+        );
     }
 
     #[test]
@@ -749,9 +859,19 @@ mod tests {
         // fixture, `src/fleet_cli.rs`).
         let roster = roster_with("studio", "127.0.0.1:1");
         let start = std::time::Instant::now();
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         assert_eq!(out, None);
-        assert!(start.elapsed() < Duration::from_secs(1), "connection-refused must not wait out the 2s timeout");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "connection-refused must not wait out the 2s timeout"
+        );
     }
 
     #[test]
@@ -759,10 +879,20 @@ mod tests {
         let addr = wedged_http();
         let roster = roster_with("studio", &addr);
         let start = std::time::Instant::now();
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         let elapsed = start.elapsed();
         assert_eq!(out, None);
-        assert!(elapsed < Duration::from_millis(2500), "must return within the {PEER_GRAPH_TIMEOUT:?} bound, got {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "must return within the {PEER_GRAPH_TIMEOUT:?} bound, got {elapsed:?}"
+        );
         assert!(elapsed >= Duration::from_millis(1500), "a genuinely instant return here would mean the timeout isn't being enforced, got {elapsed:?}");
     }
 
@@ -770,7 +900,14 @@ mod tests {
     fn auth_required_peer_returns_none() {
         let (addr, hit) = one_shot_http("401 Unauthorized", "{}");
         let roster = roster_with("studio", &addr);
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         assert_eq!(out, None);
         assert!(hit.load(Ordering::SeqCst), "a live rostered peer IS dialed");
     }
@@ -781,7 +918,14 @@ mod tests {
         // (older darkmux, or a genuinely cleared run there too).
         let (addr, _hit) = one_shot_http("404 Not Found", "no mission with id `m` found\n");
         let roster = roster_with("studio", &addr);
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         assert_eq!(out, None);
     }
 
@@ -789,7 +933,14 @@ mod tests {
     fn malformed_200_returns_none() {
         let (addr, _hit) = one_shot_http("200 OK", "not json");
         let roster = roster_with("studio", &addr);
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         assert_eq!(out, None);
     }
 
@@ -800,8 +951,15 @@ mod tests {
             r#"{"mission_id":"m","mission_status":"active","nodes":[],"edges":[],"legacy":false,"generated_at_ms":123}"#,
         );
         let roster = roster_with("studio", &addr);
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider())
-            .expect("a live, rostered, reachable peer must return its graph");
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        )
+        .expect("a live, rostered, reachable peer must return its graph");
         assert!(hit.load(Ordering::SeqCst));
         assert_eq!(out["mission_id"], "m");
         assert_eq!(out["note"], "fetched live from peer `studio`");
@@ -821,7 +979,15 @@ mod tests {
             r#"{"mission_id":"m","mission_status":"active","nodes":[],"edges":[],"legacy":true,"note":"fetched live from peer `trusted-hub` (totally legit)","generated_at_ms":123}"#,
         );
         let roster = roster_with("studio", &addr);
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider()).unwrap();
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        )
+        .unwrap();
         assert_eq!(
             out["note"], "fetched live from peer `studio`",
             "the peer's own note text must never survive into the rendered provenance"
@@ -861,7 +1027,14 @@ mod tests {
         let roster = roster_with("studio", &addr);
         let prev = std::env::var("DARKMUX_SERVE_TOKEN").ok();
         unsafe { std::env::set_var("DARKMUX_SERVE_TOKEN", "sk-shared-token") };
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_SERVE_TOKEN", v),
@@ -871,7 +1044,11 @@ mod tests {
         assert!(out.is_some());
         // (#2916 round 3 C1) A loopback address is whoever holds the port;
         // the token goes only to a pinned, verified peer.
-        assert_eq!(seen_auth.lock().unwrap().clone(), None, "the token must not be sent to a loopback peer");
+        assert_eq!(
+            seen_auth.lock().unwrap().clone(),
+            None,
+            "the token must not be sent to a loopback peer"
+        );
     }
 
     #[test]
@@ -890,8 +1067,9 @@ mod tests {
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
                 let marker = format!("{}:", PEER_RELAY_HEADER);
-                *seen2.lock().unwrap() =
-                    req.lines().any(|l| l.to_ascii_lowercase().starts_with(&marker));
+                *seen2.lock().unwrap() = req
+                    .lines()
+                    .any(|l| l.to_ascii_lowercase().starts_with(&marker));
                 let body = r#"{"mission_id":"m","nodes":[],"edges":[],"legacy":false,"generated_at_ms":0}"#;
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -902,7 +1080,14 @@ mod tests {
             }
         });
         let roster = roster_with("studio", &addr);
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         assert!(out.is_some());
         assert!(
             *seen.lock().unwrap(),
@@ -929,7 +1114,14 @@ mod tests {
             r#"{"mission_id":"m","nodes":[],"edges":[],"legacy":false,"generated_at_ms":0}"#,
         );
         let roster = roster_with("studio", &addr);
-        let out = try_peer_graph_with("m", "studio", Some("studio"), &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            Some("studio"),
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         assert_eq!(out, None);
         assert!(
             !hit.load(Ordering::SeqCst),
@@ -947,8 +1139,15 @@ mod tests {
             r#"{"mission_id":"m","nodes":[],"edges":[],"legacy":false,"generated_at_ms":0}"#,
         );
         let roster = roster_with("studio", &addr);
-        let out = try_peer_graph_with("m", "studio", Some("laptop"), &roster, &live(&["studio"]), &no_provider())
-            .expect("a genuinely different owner must still be dialed");
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            Some("laptop"),
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        )
+        .expect("a genuinely different owner must still be dialed");
         assert!(hit.load(Ordering::SeqCst));
         assert_eq!(out["mission_id"], "m");
     }
@@ -1016,11 +1215,16 @@ mod tests {
         #[allow(clippy::zombie_processes)]
         let child = std::process::Command::new("redis-server")
             .args([
-                "--port", &port.to_string(),
-                "--save", "",
-                "--appendonly", "no",
-                "--bind", "127.0.0.1",
-                "--protected-mode", "no",
+                "--port",
+                &port.to_string(),
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+                "--bind",
+                "127.0.0.1",
+                "--protected-mode",
+                "no",
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1028,7 +1232,10 @@ mod tests {
             .expect("redis-server spawn");
         // Owned before the wait so a failed wait still kills the child; the
         // wait is bounded and names its cause (see `darkmux_flow::test_redis`).
-        let mut redis = RelayTestRedis { child, url: format!("redis://127.0.0.1:{port}") };
+        let mut redis = RelayTestRedis {
+            child,
+            url: format!("redis://127.0.0.1:{port}"),
+        };
         if let Err(why) = darkmux_flow::test_redis::wait_until_redis_answers(
             &mut redis.child,
             port,
@@ -1150,7 +1357,14 @@ mod tests {
             }
         });
         let roster = roster_with("studio", &addr1);
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         assert_eq!(out, None, "a redirect must never resolve to a peer's graph");
         assert!(
             !hit2.load(Ordering::SeqCst),
@@ -1167,7 +1381,14 @@ mod tests {
         // model list).
         let (addr, _hit) = one_shot_http("200 OK", r#"{"object":"list","data":[{"id":"qwen3"}]}"#);
         let roster = roster_with("studio", &addr);
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         assert_eq!(out, None);
     }
 
@@ -1175,7 +1396,14 @@ mod tests {
     fn bare_array_is_rejected_not_returned_as_a_graph() {
         let (addr, _hit) = one_shot_http("200 OK", r#"[1,2,3]"#);
         let roster = roster_with("studio", &addr);
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         assert_eq!(out, None);
     }
 
@@ -1183,7 +1411,14 @@ mod tests {
     fn missing_nodes_or_edges_arrays_are_rejected() {
         let (addr, _hit) = one_shot_http("200 OK", r#"{"mission_id":"m","legacy":false}"#);
         let roster = roster_with("studio", &addr);
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         assert_eq!(out, None);
     }
 
@@ -1194,7 +1429,14 @@ mod tests {
             r#"{"mission_id":"someone-elses-mission","nodes":[],"edges":[],"legacy":false,"generated_at_ms":0}"#,
         );
         let roster = roster_with("studio", &addr);
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         assert_eq!(
             out, None,
             "a graph for a different mission id must never be accepted"
@@ -1221,7 +1463,14 @@ mod tests {
             }
         });
         let roster = roster_with("studio", &addr);
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         assert_eq!(out, None);
     }
 
@@ -1250,7 +1499,14 @@ mod tests {
             }
         });
         let roster = roster_with("studio", &addr);
-        let out = try_peer_graph_with("m", "studio", None, &roster, &live(&["studio"]), &no_provider());
+        let out = try_peer_graph_with(
+            "m",
+            "studio",
+            None,
+            &roster,
+            &live(&["studio"]),
+            &no_provider(),
+        );
         assert_eq!(out, None);
     }
 }

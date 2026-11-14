@@ -72,7 +72,9 @@ use std::path::Path as StdPath;
 /// phase, whose one task has exactly one step — the same shape
 /// `build_graph` always produces — read as `Dispatch`; anything else reads
 /// as `Mission`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
@@ -85,7 +87,9 @@ pub enum RunKind {
 /// The run's flat lifecycle status. See each source's own mapping:
 /// [`mission_run_status`] (missions/dispatches), [`lab_run_status`] (lab
 /// runs), [`ghost_runs`] (untracked flow-only sessions).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
@@ -145,7 +149,9 @@ impl RunStatus {
 /// (`mission_to_run`/`flow_mission_to_run`/`lab_summary_to_run`/
 /// `ghost_runs`) for how each is decided. Only meaningful when `status ==
 /// RunStatus::Abandoned`; every other status leaves this `None`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
@@ -207,7 +213,9 @@ pub enum DispatchSessionEvidence {
 /// `dispatch --profile p@peer`, a fleet work job). Read from the relay
 /// session id (`SessionId::parse`), the only parser of that grammar. The
 /// row's own `machine` is the EXECUTOR; this names the asker.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 pub struct RunRelay {
@@ -442,7 +450,9 @@ pub struct Run {
 
 /// (#3467) What a running run is doing besides its turns. One wire spelling
 /// per value; a new one is additive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "snake_case")]
@@ -522,14 +532,26 @@ pub(crate) fn tests_support_run(id: &str) -> Run {
 /// and a machine whose card was read claim nothing: the run's own records
 /// stand. `no_beat` only says no daemon beat was found, so a peer running a
 /// bare dispatch still counts through its session beat.
-pub fn mark_not_reporting(runs: &mut [Run], view: &crate::fleet_view::FleetView, live: &HashSet<String>) {
+pub fn mark_not_reporting(
+    runs: &mut [Run],
+    view: &crate::fleet_view::FleetView,
+    live: &HashSet<String>,
+) {
     use crate::fleet_view::{CardOutcome, Liveness};
     for run in runs.iter_mut().filter(|r| r.status == RunStatus::Running) {
         if live.contains(&run.id) || run.dispatch_id.as_ref().is_some_and(|d| live.contains(d)) {
             continue;
         }
-        let Some(row) = view.machines.iter().find(|m| row_runs_machine(view, m, run)) else { continue };
-        let down = !row.is_this_machine && !matches!(row.card, CardOutcome::Available { .. }) && row.liveness == Liveness::NoBeat;
+        let Some(row) = view
+            .machines
+            .iter()
+            .find(|m| row_runs_machine(view, m, run))
+        else {
+            continue;
+        };
+        let down = !row.is_this_machine
+            && !matches!(row.card, CardOutcome::Available { .. })
+            && row.liveness == Liveness::NoBeat;
         run.not_reporting = down;
     }
 }
@@ -537,11 +559,17 @@ pub fn mark_not_reporting(runs: &mut [Run], view: &crate::fleet_view::FleetView,
 /// Whether a view row is the machine a run was recorded on: by hardware uid
 /// when both name one, else by a name the run may carry (the row's card name
 /// or roster id).
-fn row_runs_machine(view: &crate::fleet_view::FleetView, row: &crate::fleet_view::FleetMachine, run: &Run) -> bool {
+fn row_runs_machine(
+    view: &crate::fleet_view::FleetView,
+    row: &crate::fleet_view::FleetMachine,
+    run: &Run,
+) -> bool {
     if let (Some(a), Some(b)) = (&row.machine_uid, &run.machine_uid) {
         return a.eq_ignore_ascii_case(b);
     }
-    let Some(name) = &run.machine else { return false };
+    let Some(name) = &run.machine else {
+        return false;
+    };
     let card_name = match &row.card {
         crate::fleet_view::CardOutcome::Available { card, .. } => card.specs.machine_id.clone(),
         _ => None,
@@ -596,7 +624,14 @@ pub(crate) fn build_runs_for_daemon(
     fleet: impl Into<FleetRecords>,
 ) -> RunsWithUsage {
     let window = ScanWindow::default_window();
-    build_runs_judged_by(Some(&RUNS_FLOW_RECORDS), flows_dir, lab_dir, fleet, &window, &PeerClocks::cached())
+    build_runs_judged_by(
+        Some(&RUNS_FLOW_RECORDS),
+        flows_dir,
+        lab_dir,
+        fleet,
+        &window,
+        &PeerClocks::cached(),
+    )
 }
 
 /// Build the full run union — the SAME `Vec<Run>` both `runs_handler`
@@ -628,7 +663,13 @@ pub fn build_runs_within(
     fleet: impl Into<FleetRecords>,
     window_days: i64,
 ) -> Vec<Run> {
-    build_runs_in(flows_dir, lab_dir, fleet, &ScanWindow::within_days(window_days)).runs
+    build_runs_in(
+        flows_dir,
+        lab_dir,
+        fleet,
+        &ScanWindow::within_days(window_days),
+    )
+    .runs
 }
 
 fn build_runs_in(
@@ -637,7 +678,14 @@ fn build_runs_in(
     fleet: impl Into<FleetRecords>,
     window: &ScanWindow,
 ) -> RunsWithUsage {
-    build_runs_judged_by(None, flows_dir, lab_dir, fleet, window, &PeerClocks::cached())
+    build_runs_judged_by(
+        None,
+        flows_dir,
+        lab_dir,
+        fleet,
+        window,
+        &PeerClocks::cached(),
+    )
 }
 
 /// [`build_runs_in`] judged by an explicit presence reading, so a test can
@@ -658,7 +706,8 @@ fn build_runs_judged_by(
     // (#2891) The day files feed both indexes in one pass. Through the
     // daemon's store only the bytes appended since its last read come off disk.
     let local = LocalRecords::of(store, flows_dir, window);
-    let (flow_index, flow_missions) = build_flow_indexes_in(&local, &fleet, window, Some(&mut usage_fold), peers);
+    let (flow_index, flow_missions) =
+        build_flow_indexes_in(&local, &fleet, window, Some(&mut usage_fold), peers);
     let usage = usage_fold.finish();
     // (#1705) Mission-level rollup over the SAME merged record set. A
     // mission owned by another machine has no durable record here — its
@@ -702,11 +751,21 @@ fn build_runs_judged_by(
     for mission in &missions {
         known_mission_ids.insert(mission.id.clone());
         let (kind, shape) = classify_mission(mission, &phases_by_id);
-        let mut run = mission_to_run(mission, kind, shape.as_ref(), &mission_id_index, &flow_index, now_ms);
+        let mut run = mission_to_run(
+            mission,
+            kind,
+            shape.as_ref(),
+            &mission_id_index,
+            &flow_index,
+            now_ms,
+        );
         // (#2902 step 2b) Its records carry its `mission_id`.
         // Its flow sessions too, as a peer's row of the same mission claims them, so
         // which machine serves a mission never changes who reads a shared session.
-        let sessions = flow_missions.get(&mission.id).map(|a| a.session_ids.clone()).unwrap_or_default();
+        let sessions = flow_missions
+            .get(&mission.id)
+            .map(|a| a.session_ids.clone())
+            .unwrap_or_default();
         claims.push((runs.len(), Some(mission.id.clone()), sessions));
         // The same key a peer builds for this mission (`flow_mission_to_run`):
         // its newest record's receive key, so a mission sorts alike whichever
@@ -765,7 +824,10 @@ fn build_runs_judged_by(
     let (peer_runs, remote_mission_ids) =
         peer_runs_from_index(&flow_missions, &known_mission_ids, &flow_index, now_ms);
     for (i, run) in peer_runs.iter().enumerate() {
-        let sessions = flow_missions.get(&run.id).map(|a| a.session_ids.clone()).unwrap_or_default();
+        let sessions = flow_missions
+            .get(&run.id)
+            .map(|a| a.session_ids.clone())
+            .unwrap_or_default();
         claims.push((runs.len() + i, Some(run.id.clone()), sessions));
     }
     runs.extend(peer_runs);
@@ -880,7 +942,12 @@ pub fn peer_mission_runs(
     known_mission_ids: &HashSet<String>,
 ) -> Vec<Run> {
     let fleet: FleetRecords = fleet.into();
-    let flow_index = build_flow_session_index(flows_dir, &fleet, RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::cached());
+    let flow_index = build_flow_session_index(
+        flows_dir,
+        &fleet,
+        RUNS_FLOW_SCAN_WINDOW_DAYS,
+        &PeerClocks::cached(),
+    );
     let flow_missions = build_flow_mission_index(flows_dir, &fleet, RUNS_FLOW_SCAN_WINDOW_DAYS);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1009,10 +1076,13 @@ impl FlowMissionAgg {
     /// `mission.start` payload. Gated on the action so only that payload is
     /// cloned.
     fn fold_config_id(&mut self, v: &serde_json::Value) {
-        if self.config_id.is_some() || darkmux_flow::reader::action_of(v) != Some(FlowAction::MissionStart) {
+        if self.config_id.is_some()
+            || darkmux_flow::reader::action_of(v) != Some(FlowAction::MissionStart)
+        {
             return;
         }
-        if let Some(darkmux_flow::Payload::MissionStart(open)) = darkmux_flow::reader::payload_of(v) {
+        if let Some(darkmux_flow::Payload::MissionStart(open)) = darkmux_flow::reader::payload_of(v)
+        {
             self.config_id = open
                 .0
                 .get(darkmux_crew::lifecycle::MISSION_START_CONFIG_ID_KEY)
@@ -1024,14 +1094,21 @@ impl FlowMissionAgg {
     /// Only the mission grain closes a mission: an execution-grain
     /// `dispatch.*` bookend ends one role execution, never the run.
     fn fold_terminal(&mut self, v: &serde_json::Value, ts: &str) {
-        let Some(action) = darkmux_flow::reader::action_of(v) else { return };
+        let Some(action) = darkmux_flow::reader::action_of(v) else {
+            return;
+        };
         if !matches!(
             action,
-            FlowAction::MissionClose | FlowAction::MissionAbort | FlowAction::RunComplete | FlowAction::RunError
+            FlowAction::MissionClose
+                | FlowAction::MissionAbort
+                | FlowAction::RunComplete
+                | FlowAction::RunError
         ) {
             return;
         }
-        let Some(ending) = crate::run_lifecycle::ending_of_record(v) else { return };
+        let Some(ending) = crate::run_lifecycle::ending_of_record(v) else {
+            return;
+        };
         let bookend_terminal = matches!(action, FlowAction::RunComplete | FlowAction::RunError);
         self.close.fold(ts, ending, bookend_terminal);
         self.terminal_ts = self.close.close.as_ref().map(|(ts, _)| ts.clone());
@@ -1051,7 +1128,10 @@ fn build_flow_mission_index(
     window_days: i64,
 ) -> HashMap<String, FlowMissionAgg> {
     let window = ScanWindow::within_days(window_days);
-    let local = LocalRecords::Walk { dir: flows_dir, cutoff: &window.cutoff_date };
+    let local = LocalRecords::Walk {
+        dir: flows_dir,
+        cutoff: &window.cutoff_date,
+    };
     build_flow_indexes_in(&local, fleet, &window, None, &PeerClocks::default()).1
 }
 
@@ -1094,7 +1174,11 @@ fn flow_mission_to_run(
         .collect();
     let status_sessions = mission_status_sessions(mission_id, &sessions);
     let any_live = status_sessions.iter().any(|s| session_is_live(s, now_ms));
-    let status = match (&agg.terminal_ts, agg.terminal_was_abort, agg.terminal_status) {
+    let status = match (
+        &agg.terminal_ts,
+        agg.terminal_was_abort,
+        agg.terminal_status,
+    ) {
         // #1627 again: abort is teardown, not success.
         (Some(_), true, _) => RunStatus::Abandoned,
         (Some(_), false, Some(term_stat)) => term_stat,
@@ -1108,7 +1192,11 @@ fn flow_mission_to_run(
     // re-deriving it from `status` alone (which can't tell the two apart
     // after the match above has already collapsed them).
     let abandoned_reason = if status == RunStatus::Abandoned {
-        Some(if agg.terminal_was_abort { AbandonReason::Aborted } else { AbandonReason::NoTerminal })
+        Some(if agg.terminal_was_abort {
+            AbandonReason::Aborted
+        } else {
+            AbandonReason::NoTerminal
+        })
     } else {
         None
     };
@@ -1117,7 +1205,8 @@ fn flow_mission_to_run(
         .copied()
         .filter(|(_, s)| s.start_ts.is_some())
         .collect();
-    sessions_by_start.sort_by(|(ia, a), (ib, b)| a.start_ts.cmp(&b.start_ts).then_with(|| ia.cmp(ib)));
+    sessions_by_start
+        .sort_by(|(ia, a), (ib, b)| a.start_ts.cmp(&b.start_ts).then_with(|| ia.cmp(ib)));
 
     let mut sessions_fallback: Vec<(&str, &SessionAgg)> = sessions
         .iter()
@@ -1136,7 +1225,11 @@ fn flow_mission_to_run(
     let route = sessions_by_start
         .iter()
         .find_map(|(_, s)| s.endpoint.clone())
-        .or_else(|| sessions_fallback.iter().find_map(|(_, s)| s.endpoint.clone()))
+        .or_else(|| {
+            sessions_fallback
+                .iter()
+                .find_map(|(_, s)| s.endpoint.clone())
+        })
         .or_else(|| sessions.iter().find_map(|(_, s)| s.endpoint.clone()));
     let model = sessions_by_start
         .iter()
@@ -1148,7 +1241,12 @@ fn flow_mission_to_run(
         .filter(|(_, s)| !s.run_grain)
         .find_map(|(_, s)| s.role.clone())
         .or_else(|| sessions_by_start.iter().find_map(|(_, s)| s.role.clone()))
-        .or_else(|| sessions_fallback.iter().filter(|(_, s)| !s.run_grain).find_map(|(_, s)| s.role.clone()))
+        .or_else(|| {
+            sessions_fallback
+                .iter()
+                .filter(|(_, s)| !s.run_grain)
+                .find_map(|(_, s)| s.role.clone())
+        })
         .or_else(|| sessions_fallback.iter().find_map(|(_, s)| s.role.clone()));
     // (#1915) This IS the fix: a mission this daemon only sees via the
     // fleet stream is exactly the row #1915 diagnosed as inert — `tracked:
@@ -1165,7 +1263,8 @@ fn flow_mission_to_run(
     let session_id = earliest_by_start(&sessions)
         .filter(|(_, agg)| !agg.is_ambiguous())
         .map(|(sid, _)| sid.to_string());
-    let (activity, activity_elapsed_ms) = activity_of(status, status_sessions.iter().map(|s| s.as_ref()));
+    let (activity, activity_elapsed_ms) =
+        activity_of(status, status_sessions.iter().map(|s| s.as_ref()));
     Run {
         id: mission_id.to_string(),
         kind: mission_run_kind(agg.config_id.as_deref(), false),
@@ -1208,13 +1307,23 @@ fn flow_mission_to_run(
 /// structural `(Task, Step)` pair (source of `role_id` — see the module
 /// doc). See [`RunKind`]'s own doc for the marker-first, counts-as-fallback
 /// rule this implements.
-fn classify_mission(mission: &Mission, phases_by_id: &HashMap<String, Phase>) -> (RunKind, Option<(Task, Step)>) {
+fn classify_mission(
+    mission: &Mission,
+    phases_by_id: &HashMap<String, Phase>,
+) -> (RunKind, Option<(Task, Step)>) {
     let shape = crew_of_one_shape(mission, phases_by_id);
-    let kind = mission_run_kind(mission.spec.as_ref().map(|s| s.config_id.as_str()), shape.is_some());
+    let kind = mission_run_kind(
+        mission.spec.as_ref().map(|s| s.config_id.as_str()),
+        shape.is_some(),
+    );
     // Only surface the shape when the FINAL kind is Dispatch — a marker-
     // driven Mission with an (unlikely) accidental crew-of-one structural
     // shape must not borrow that shape's role/session for its Run.
-    let shape = if kind == RunKind::Dispatch { shape } else { None };
+    let shape = if kind == RunKind::Dispatch {
+        shape
+    } else {
+        None
+    };
     (kind, shape)
 }
 
@@ -1245,7 +1354,10 @@ fn mission_run_kind(config_id: Option<&str>, crew_of_one_shape: bool) -> RunKind
 /// single-phase mission pays the `load_tasks_for_phase`/`load_steps_for_phase`
 /// cost (bounded, same per-mission I/O shape `mission_graph::build_mission_graph`
 /// already pays for the graph lens).
-fn crew_of_one_shape(mission: &Mission, phases_by_id: &HashMap<String, Phase>) -> Option<(Task, Step)> {
+fn crew_of_one_shape(
+    mission: &Mission,
+    phases_by_id: &HashMap<String, Phase>,
+) -> Option<(Task, Step)> {
     if mission.phase_ids.len() != 1 {
         return None;
     }
@@ -1269,7 +1381,9 @@ fn crew_of_one_shape(mission: &Mission, phases_by_id: &HashMap<String, Phase>) -
 /// Pre-group the flow session index by `mission_id` (#1523 gate CONSIDER
 /// 2) — one O(sessions) pass, read back in O(1) per mission by
 /// [`mission_to_run`] instead of a linear `flow_index` scan per mission.
-fn build_mission_id_index(flow_index: &HashMap<String, SessionAgg>) -> HashMap<String, Vec<String>> {
+fn build_mission_id_index(
+    flow_index: &HashMap<String, SessionAgg>,
+) -> HashMap<String, Vec<String>> {
     let mut idx: HashMap<String, Vec<String>> = HashMap::new();
     for (session_id, agg) in flow_index {
         if let Some(mid) = &agg.mission_id {
@@ -1372,16 +1486,23 @@ fn mission_to_run(
     // tainted-endpoint, no start, no machine, no role" — internally
     // contradictory, where the pre-fix row was at least wrong-but-consistent
     // from one source. Add a new field here and it reads this pool too.
-    let unambiguous_sessions: Vec<(&str, &SessionAgg)> =
-        sessions.iter().copied().filter(|(_, s)| !s.is_ambiguous()).collect();
+    let unambiguous_sessions: Vec<(&str, &SessionAgg)> = sessions
+        .iter()
+        .copied()
+        .filter(|(_, s)| !s.is_ambiguous())
+        .collect();
     // (contract 8) The run's own session, the one its `run.start` opened,
     // represents the row: its machine, start and drill target are the
     // run's, whatever an execution's clock says. A mission with none (its
     // start outside the window, or no run bookend written) falls back to
     // the earliest session.
-    let run_sessions: Vec<(&str, &SessionAgg)> =
-        unambiguous_sessions.iter().copied().filter(|(_, s)| s.run_grain).collect();
-    let representative = earliest_by_start(&run_sessions).or_else(|| earliest_by_start(&unambiguous_sessions));
+    let run_sessions: Vec<(&str, &SessionAgg)> = unambiguous_sessions
+        .iter()
+        .copied()
+        .filter(|(_, s)| s.run_grain)
+        .collect();
+    let representative =
+        earliest_by_start(&run_sessions).or_else(|| earliest_by_start(&unambiguous_sessions));
     // A mission whose dispatches span MULTIPLE distinct endpoints (mixed
     // seats across phases) collapses to one representative endpoint here:
     // the row shows one route. Picking the earliest session that names an
@@ -1434,8 +1555,11 @@ fn mission_to_run(
     // that N missions shared, each record carrying its own mission: such a
     // bucket is ambiguous, stays a member (`sessions`) and never lends an
     // attribute or an order.
-    let mut sessions_by_start: Vec<&SessionAgg> =
-        unambiguous_sessions.iter().map(|(_, s)| *s).filter(|s| s.start_ts.is_some()).collect();
+    let mut sessions_by_start: Vec<&SessionAgg> = unambiguous_sessions
+        .iter()
+        .map(|(_, s)| *s)
+        .filter(|s| s.start_ts.is_some())
+        .collect();
     sessions_by_start.sort_by(|a, b| a.start_ts.cmp(&b.start_ts));
 
     let mut sessions_fallback: Vec<(&str, &SessionAgg)> = unambiguous_sessions
@@ -1468,9 +1592,19 @@ fn mission_to_run(
     //
     // (#3074) If dispatch.start has aged out, fall back to sessions that still have a role.
     let role = dispatch_role
-        .or_else(|| sessions_by_start.iter().filter(|s| !s.run_grain).find_map(|s| s.role.clone()))
+        .or_else(|| {
+            sessions_by_start
+                .iter()
+                .filter(|s| !s.run_grain)
+                .find_map(|s| s.role.clone())
+        })
         .or_else(|| sessions_by_start.iter().find_map(|s| s.role.clone()))
-        .or_else(|| sessions_fallback.iter().filter(|(_, s)| !s.run_grain).find_map(|(_, s)| s.role.clone()))
+        .or_else(|| {
+            sessions_fallback
+                .iter()
+                .filter(|(_, s)| !s.run_grain)
+                .find_map(|(_, s)| s.role.clone())
+        })
         .or_else(|| sessions_fallback.iter().find_map(|(_, s)| s.role.clone()));
 
     // `machine` deliberately stays representative-only, unlike role/model
@@ -1511,7 +1645,10 @@ fn mission_to_run(
     // where the pre-fix row was at least wrong-but-consistent from one
     // source. Same pool, same detector, so every time field on the row now
     // comes from the same trustworthy candidate set.
-    let terminal_ts_str = unambiguous_sessions.iter().filter_map(|(_, s)| s.terminal_ts.clone()).max();
+    let terminal_ts_str = unambiguous_sessions
+        .iter()
+        .filter_map(|(_, s)| s.terminal_ts.clone())
+        .max();
     // (#1915) The drill target — see `Run::session_id`'s own doc for why
     // this is populated for every mission row, tracked or not.
     //
@@ -1555,7 +1692,11 @@ fn mission_to_run(
     // reads it directly rather than re-deriving the same decision from
     // `status` (which can no longer tell the two apart once collapsed).
     let abandoned_reason = if status == RunStatus::Abandoned {
-        Some(if mission_stopped_by_operator(mission) { AbandonReason::Aborted } else { AbandonReason::NoTerminal })
+        Some(if mission_stopped_by_operator(mission) {
+            AbandonReason::Aborted
+        } else {
+            AbandonReason::NoTerminal
+        })
     } else {
         None
     };
@@ -1653,10 +1794,19 @@ fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg], now_ms: u64) 
 /// dropped only when the mission has none there. Its attributes (role,
 /// model, machine, endpoint) stay refused: those are the whole session's,
 /// not per attempt.
-fn mission_status_sessions<'a>(mission_id: &str, sessions: &[(&str, &'a SessionAgg)]) -> Vec<Cow<'a, SessionAgg>> {
+fn mission_status_sessions<'a>(
+    mission_id: &str,
+    sessions: &[(&str, &'a SessionAgg)],
+) -> Vec<Cow<'a, SessionAgg>> {
     sessions
         .iter()
-        .filter_map(|(_, s)| if s.is_ambiguous() { s.for_mission(mission_id).map(Cow::Owned) } else { Some(Cow::Borrowed(*s)) })
+        .filter_map(|(_, s)| {
+            if s.is_ambiguous() {
+                s.for_mission(mission_id).map(Cow::Owned)
+            } else {
+                Some(Cow::Borrowed(*s))
+            }
+        })
         .collect()
 }
 
@@ -1764,9 +1914,15 @@ fn mission_run_status_and_evidence(
                     // OBSERVED this session stop (see
                     // `run_lifecycle.rs`'s `ending_of`), never a guess from
                     // silence.
-                    return (RunStatus::Abandoned, Some(DispatchSessionEvidence::RecordedEnd));
+                    return (
+                        RunStatus::Abandoned,
+                        Some(DispatchSessionEvidence::RecordedEnd),
+                    );
                 }
-                if sessions.iter().any(|s| s.terminal_status == Some(RunStatus::Error)) {
+                if sessions
+                    .iter()
+                    .any(|s| s.terminal_status == Some(RunStatus::Error))
+                {
                     return (RunStatus::Error, None);
                 }
                 return (RunStatus::Running, None);
@@ -1795,7 +1951,10 @@ fn mission_run_status_and_evidence(
                 // a terminal record and none looks live — genuinely "went
                 // quiet without announcing it," the one case the old fixed
                 // wording actually described accurately.
-                (RunStatus::Abandoned, Some(DispatchSessionEvidence::StaleNoTerminal))
+                (
+                    RunStatus::Abandoned,
+                    Some(DispatchSessionEvidence::StaleNoTerminal),
+                )
             }
         }
         // (#1627) A torn-down mission is NOT a completed one, and must never
@@ -1827,69 +1986,69 @@ fn mission_stopped_by_operator(mission: &Mission) -> bool {
 /// `(_, None)` without repeating the inner match's own arms three times.
 fn mission_finalized_status(mission: &Mission) -> RunStatus {
     match darkmux_crew::lifecycle::load_envelope(&mission.id) {
-            // (#1881) `load_envelope` failed to deserialize `envelope.json`
-            // — a newer darkmux wrote a `status`/`outcome` shape this
-            // reader's `MissionEnvelope` doesn't recognize (the fleet's
-            // deliberately heterogeneous machines: laptop on a
-            // `cargo install`ed main, Studio on brew/stable — CLAUDE.md's
-            // "cross-system contracts" section). The PREVIOUS version of
-            // this match read the envelope with `.ok().flatten()`, which
-            // discarded this exact `Err` and fell through to the `_ =>
-            // Complete` arm below — silently rendering a record this
-            // binary could NOT read as a completed, green run. This arm is
-            // the fix: a genuine parse failure gets its own honest state
-            // instead of the happiest available guess.
-            //
-            // (#1881, QA-considered) The error itself is discarded here on
-            // purpose, not by oversight: `build_runs` calls this per
-            // mission on EVERY `/runs` poll, so an unconditional
-            // `eprintln!` here would spam the daemon's stderr once per
-            // request for as long as a broken envelope sits on disk — the
-            // exact kind of unbounded, unstructured noise this project's
-            // observability doctrine argues against. The breadcrumb lives
-            // in `darkmux doctor`'s "mission envelope readability" check
-            // instead (below in this crate's sibling
-            // `crates/darkmux-doctor/src/lib.rs`): on-demand, names the
-            // mission id AND the parse error, and is exactly where an
-            // operator investigating an amber dashboard row is already
-            // pointed. A future rate-limited or once-per-mission log line
-            // here would be a genuine improvement, not ruled out — it just
-            // isn't the cheap fix an unconditional `eprintln!` would be.
-            Err(_) => RunStatus::Unparseable,
-            // (#1564) No envelope at all — not a parse failure (that's the
-            // `Err` arm above), but no longer a SINGLE "genuinely no data"
-            // case either. Two genuinely different situations reach here
-            // with no `envelope.json` on disk:
-            //
-            // - `mission finalize` (`src/coder_phase.rs`'s whole-mission
-            //   success verb, and pre-#1284 records generally) drives EVERY
-            //   phase to `Complete` before the mission ever reaches
-            //   `Finalized`, and never writes an envelope — an intentional
-            //   gap, documented at `finalize_mission_if_complete`'s own doc.
-            // - A Finalized mission whose phases were all force-abandoned.
-            //   `reconcile_mint_failure` used to close that way; since #3074
-            //   it closes with an `Error` envelope, so this shape
-            //   now only appears in records an older binary wrote. Before
-            //   #1564 it collapsed onto the same `Complete` the happy path
-            //   above gets.
-            //
-            // Neither case has an envelope to consult, but both leave a
-            // real signal on disk: `reconcile_mission_phases_terminal`
-            // guarantees every phase is terminal (`Complete`/`Abandoned`)
-            // by the time a mission reaches `Finalized` through either
-            // path, so "did at least one phase actually complete" tells
-            // them apart without guessing. No phases at all stays
-            // `Complete`, unchanged — a genuinely dataless mint/dispatch-
-            // shape mission, the same "no data, don't invent a verdict"
-            // reasoning this arm has always applied.
-            Ok(None) => envelope_less_status(mission),
-            // The run ended on the operator's stop, recorded where it ended
-            // (`finalize_mission_with_payload`, from the one decider its
-            // `run.error` and `dispatch.error` name it from): the operator
-            // tore it down, so it reads as the flow's lifecycle rule reads
-            // those terminals, never as the error the envelope's status says.
-            Ok(Some(envelope)) => envelope_status(&envelope),
-        }
+        // (#1881) `load_envelope` failed to deserialize `envelope.json`
+        // — a newer darkmux wrote a `status`/`outcome` shape this
+        // reader's `MissionEnvelope` doesn't recognize (the fleet's
+        // deliberately heterogeneous machines: laptop on a
+        // `cargo install`ed main, Studio on brew/stable — CLAUDE.md's
+        // "cross-system contracts" section). The PREVIOUS version of
+        // this match read the envelope with `.ok().flatten()`, which
+        // discarded this exact `Err` and fell through to the `_ =>
+        // Complete` arm below — silently rendering a record this
+        // binary could NOT read as a completed, green run. This arm is
+        // the fix: a genuine parse failure gets its own honest state
+        // instead of the happiest available guess.
+        //
+        // (#1881, QA-considered) The error itself is discarded here on
+        // purpose, not by oversight: `build_runs` calls this per
+        // mission on EVERY `/runs` poll, so an unconditional
+        // `eprintln!` here would spam the daemon's stderr once per
+        // request for as long as a broken envelope sits on disk — the
+        // exact kind of unbounded, unstructured noise this project's
+        // observability doctrine argues against. The breadcrumb lives
+        // in `darkmux doctor`'s "mission envelope readability" check
+        // instead (below in this crate's sibling
+        // `crates/darkmux-doctor/src/lib.rs`): on-demand, names the
+        // mission id AND the parse error, and is exactly where an
+        // operator investigating an amber dashboard row is already
+        // pointed. A future rate-limited or once-per-mission log line
+        // here would be a genuine improvement, not ruled out — it just
+        // isn't the cheap fix an unconditional `eprintln!` would be.
+        Err(_) => RunStatus::Unparseable,
+        // (#1564) No envelope at all — not a parse failure (that's the
+        // `Err` arm above), but no longer a SINGLE "genuinely no data"
+        // case either. Two genuinely different situations reach here
+        // with no `envelope.json` on disk:
+        //
+        // - `mission finalize` (`src/coder_phase.rs`'s whole-mission
+        //   success verb, and pre-#1284 records generally) drives EVERY
+        //   phase to `Complete` before the mission ever reaches
+        //   `Finalized`, and never writes an envelope — an intentional
+        //   gap, documented at `finalize_mission_if_complete`'s own doc.
+        // - A Finalized mission whose phases were all force-abandoned.
+        //   `reconcile_mint_failure` used to close that way; since #3074
+        //   it closes with an `Error` envelope, so this shape
+        //   now only appears in records an older binary wrote. Before
+        //   #1564 it collapsed onto the same `Complete` the happy path
+        //   above gets.
+        //
+        // Neither case has an envelope to consult, but both leave a
+        // real signal on disk: `reconcile_mission_phases_terminal`
+        // guarantees every phase is terminal (`Complete`/`Abandoned`)
+        // by the time a mission reaches `Finalized` through either
+        // path, so "did at least one phase actually complete" tells
+        // them apart without guessing. No phases at all stays
+        // `Complete`, unchanged — a genuinely dataless mint/dispatch-
+        // shape mission, the same "no data, don't invent a verdict"
+        // reasoning this arm has always applied.
+        Ok(None) => envelope_less_status(mission),
+        // The run ended on the operator's stop, recorded where it ended
+        // (`finalize_mission_with_payload`, from the one decider its
+        // `run.error` and `dispatch.error` name it from): the operator
+        // tore it down, so it reads as the flow's lifecycle rule reads
+        // those terminals, never as the error the envelope's status says.
+        Ok(Some(envelope)) => envelope_status(&envelope),
+    }
 }
 
 /// A Finalized mission with no envelope (see the `Ok(None)` arm above):
@@ -1966,7 +2125,12 @@ pub fn local_dispatch_status(
     flows_dir: &StdPath,
     fleet: impl Into<FleetRecords>,
 ) -> HashMap<String, (RunStatus, Option<DispatchSessionEvidence>)> {
-    let flow_index = build_flow_session_index(flows_dir, fleet, RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::cached());
+    let flow_index = build_flow_session_index(
+        flows_dir,
+        fleet,
+        RUNS_FLOW_SCAN_WINDOW_DAYS,
+        &PeerClocks::cached(),
+    );
     let mission_id_index = build_mission_id_index(&flow_index);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1980,7 +2144,8 @@ pub fn local_dispatch_status(
             // The SAME pool `mission_to_run` judges its row by, so radio's
             // busy check and `/runs` never disagree about one mission.
             let status_sessions = mission_status_sessions(&mission.id, &candidates);
-            let sessions_bare: Vec<&SessionAgg> = status_sessions.iter().map(|s| s.as_ref()).collect();
+            let sessions_bare: Vec<&SessionAgg> =
+                status_sessions.iter().map(|s| s.as_ref()).collect();
             let verdict = mission_run_status_and_evidence(mission, &sessions_bare, now_ms);
             (mission.id.clone(), verdict)
         })
@@ -2037,8 +2202,11 @@ fn lab_summary_to_run(
     let interrupted_by_signal = summary.lifecycle_status
         == Some(darkmux_lab::lab::lifecycle::LifecycleStatus::Interrupted)
         && summary.lifecycle_error.is_some();
-    let abandoned_reason = (status == RunStatus::Abandoned)
-        .then_some(if interrupted_by_signal { AbandonReason::Aborted } else { AbandonReason::NoTerminal });
+    let abandoned_reason = (status == RunStatus::Abandoned).then_some(if interrupted_by_signal {
+        AbandonReason::Aborted
+    } else {
+        AbandonReason::NoTerminal
+    });
     Run {
         id: summary.dir.clone(),
         kind: RunKind::Lab,
@@ -2111,7 +2279,11 @@ fn lab_summary_to_run(
         // tool-bench's manifest names one that no dispatch ever used. Its own
         // record is what represents it, so it publishes none and keeps its
         // scores page; every other lab run opens the shared session view.
-        dispatch_id: if summary.finished { None } else { summary.session_id.clone() },
+        dispatch_id: if summary.finished {
+            None
+        } else {
+            summary.session_id.clone()
+        },
         abandoned_reason,
         tokens: None,
         workload: summary.workload.clone(),
@@ -2142,8 +2314,14 @@ enum LabSession {
 impl LabSession {
     fn of(agg: &SessionAgg, now_ms: u64) -> Self {
         if agg.terminal_status.is_some() {
-            let at_s = agg.terminal_ts.as_deref().or(agg.last_activity_ts.as_deref()).and_then(parse_flow_ts);
-            LabSession::Ended { at_ms: at_s.map_or(0, |s| s.saturating_mul(1000)) }
+            let at_s = agg
+                .terminal_ts
+                .as_deref()
+                .or(agg.last_activity_ts.as_deref())
+                .and_then(parse_flow_ts);
+            LabSession::Ended {
+                at_ms: at_s.map_or(0, |s| s.saturating_mul(1000)),
+            }
         } else if session_is_live(agg, now_ms) {
             LabSession::Live
         } else {
@@ -2255,7 +2433,11 @@ fn lab_own_verdict(summary: &LabRunSummary) -> Option<RunStatus> {
         None if summary.run_ok.is_some() => return Some(settled_lab_status(summary)),
         _ => {}
     }
-    summary.finished.then_some(if summary.degenerate { RunStatus::Error } else { RunStatus::Complete })
+    summary.finished.then_some(if summary.degenerate {
+        RunStatus::Error
+    } else {
+        RunStatus::Complete
+    })
 }
 
 /// (#2860, F2) The status of a lab run that ENDED and wrote a manifest: an
@@ -2304,7 +2486,8 @@ pub(crate) const BUDGET_WAIT_GRACE_MS: u64 = 60_000;
 /// TTLs: a dispatch writes `dispatch.start` just before its first beat, and the
 /// beats this build reads may be one [`PEER_CLOCKS_CACHE_TTL`] old, so one TTL
 /// of margin keeps a run that just started from reading dead.
-pub(crate) const BEAT_GONE_GRACE_MS: u64 = 2 * darkmux_flow::session_presence::DEFAULT_TTL_SECS * 1_000;
+pub(crate) const BEAT_GONE_GRACE_MS: u64 =
+    2 * darkmux_flow::session_presence::DEFAULT_TTL_SECS * 1_000;
 
 /// The lifecycle policy every `/runs` row is judged by, published on the
 /// response so the viewer judges flow sessions by the same numbers
@@ -2324,7 +2507,10 @@ pub struct RunsPolicy {
 /// The policy as the daemon resolves it now (`runtime.inactivity_timeout_seconds`
 /// follows config, like every other `/runs` staleness decision).
 pub fn runs_policy() -> RunsPolicy {
-    RunsPolicy { stale_after_ms: stale_after_ms(), budget_wait_grace_ms: BUDGET_WAIT_GRACE_MS }
+    RunsPolicy {
+        stale_after_ms: stale_after_ms(),
+        budget_wait_grace_ms: BUDGET_WAIT_GRACE_MS,
+    }
 }
 
 /// (#2413) Best-effort, LOCAL-ONLY: is at least one run or execution
@@ -2352,12 +2538,19 @@ pub fn runs_policy() -> RunsPolicy {
 /// records land ONLY in a non-local sink (theoretical: `LocalFileSink` is
 /// always-on regardless of what else is configured).
 pub(crate) fn any_dispatch_live_locally(now_ms: u64, max_age_ms: u64) -> bool {
-    any_dispatch_live_in(&darkmux_types::config_access::flows_dir(), &darkmux_flow::day_utc_now(), now_ms, max_age_ms)
+    any_dispatch_live_in(
+        &darkmux_types::config_access::flows_dir(),
+        &darkmux_flow::day_utc_now(),
+        now_ms,
+        max_age_ms,
+    )
 }
 
 fn any_dispatch_live_in(dir: &std::path::Path, day: &str, now_ms: u64, max_age_ms: u64) -> bool {
     let path = dir.join(format!("{day}.jsonl"));
-    let Ok(text) = std::fs::read_to_string(&path) else { return false };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
     let mut last_activity_ms: HashMap<String, u64> = HashMap::new();
     // (self-QA catch, #2413) A session is "open" ONLY from its OWN bookend
     // start through its OWN terminal, never inferred from mere PRESENCE in
@@ -2366,9 +2559,15 @@ fn any_dispatch_live_in(dir: &std::path::Path, day: &str, now_ms: u64, max_age_m
     // presence-based version returned `true`; this one returns `false`.
     let mut open: HashSet<String> = HashSet::new();
     for line in text.lines() {
-        let Some(rec) = darkmux_flow::reader::parse_record(line) else { continue };
-        let Some(sid) = rec.session_id.clone() else { continue };
-        let Some(ts_secs) = parse_flow_ts(&rec.ts) else { continue };
+        let Some(rec) = darkmux_flow::reader::parse_record(line) else {
+            continue;
+        };
+        let Some(sid) = rec.session_id.clone() else {
+            continue;
+        };
+        let Some(ts_secs) = parse_flow_ts(&rec.ts) else {
+            continue;
+        };
         let ts_ms = ts_secs.saturating_mul(1000);
         let edge = rec.action.bookend().map(|b| b.edge);
         if edge == Some(Edge::Start) {
@@ -2383,8 +2582,11 @@ fn any_dispatch_live_in(dir: &std::path::Path, day: &str, now_ms: u64, max_age_m
             last_activity_ms.insert(sid, ts_ms);
         }
     }
-    open.into_iter()
-        .any(|sid| last_activity_ms.get(&sid).is_some_and(|ts| now_ms.saturating_sub(*ts) <= max_age_ms))
+    open.into_iter().any(|sid| {
+        last_activity_ms
+            .get(&sid)
+            .is_some_and(|ts| now_ms.saturating_sub(*ts) <= max_age_ms)
+    })
 }
 
 /// (#1642, #1633) The ONE liveness decision every `/runs` source — lab,
@@ -2533,7 +2735,10 @@ impl ScanWindow {
     /// shape `build_runs_within` (#2917, radio's narrow busy check) and the
     /// per-caller `window_days` wrappers need.
     pub(crate) fn within_days(window_days: i64) -> Self {
-        Self { cutoff_date: cutoff_date_string(window_days), since_iso: None }
+        Self {
+            cutoff_date: cutoff_date_string(window_days),
+            since_iso: None,
+        }
     }
 
     /// The default window, widened to reach `since_secs` (a Unix epoch
@@ -2542,7 +2747,10 @@ impl ScanWindow {
         let since_iso = crate::usage_sum::iso_from_epoch(since_secs);
         let default_cutoff = cutoff_date_string(RUNS_FLOW_SCAN_WINDOW_DAYS);
         let since_day = since_iso[..10].to_string();
-        Self { cutoff_date: since_day.min(default_cutoff), since_iso: Some(since_iso) }
+        Self {
+            cutoff_date: since_day.min(default_cutoff),
+            since_iso: Some(since_iso),
+        }
     }
 
     /// Lexical compare on the `YYYY-MM-DD` prefix of a record `ts` — the
@@ -2551,7 +2759,9 @@ impl ScanWindow {
     /// the view (#1707 gate MUST FIX 2).
     /// The bound this window's usage fold covers, as an inclusive `ts`.
     fn since_label(&self) -> String {
-        self.since_iso.clone().unwrap_or_else(|| format!("{}T00:00:00Z", self.cutoff_date))
+        self.since_iso
+            .clone()
+            .unwrap_or_else(|| format!("{}T00:00:00Z", self.cutoff_date))
     }
 
     fn holds(&self, v: &serde_json::Value) -> bool {
@@ -2564,7 +2774,10 @@ impl ScanWindow {
 
 /// A record's `machine_uid`, when it carries a non-empty one.
 fn record_machine_uid(v: &serde_json::Value) -> Option<String> {
-    v.get("machine_uid").and_then(|u| u.as_str()).filter(|u| !u.is_empty()).map(str::to_string)
+    v.get("machine_uid")
+        .and_then(|u| u.as_str())
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
 }
 
 /// Per-session_id rollup built by ONE pass over the flow stream
@@ -2676,7 +2889,11 @@ impl SessionAgg {
     /// The attempt-scoped fields, from the current attempt.
     fn settle(&mut self) {
         self.lifecycle.seal();
-        let latest = self.lifecycle.latest().cloned().or_else(|| self.lifecycle.recorded_end(None));
+        let latest = self
+            .lifecycle
+            .latest()
+            .cloned()
+            .or_else(|| self.lifecycle.recorded_end(None));
         self.settle_from(latest.as_ref());
     }
 
@@ -2687,7 +2904,11 @@ impl SessionAgg {
     /// share (#1918), instead of refusing it: the attempts are per mission,
     /// so no other mission's activity or terminal reaches it.
     fn for_mission(&self, mission: &str) -> Option<SessionAgg> {
-        let attempt = self.lifecycle.latest_of(mission).cloned().or_else(|| self.lifecycle.recorded_end(Some(mission)))?;
+        let attempt = self
+            .lifecycle
+            .latest_of(mission)
+            .cloned()
+            .or_else(|| self.lifecycle.recorded_end(Some(mission)))?;
         let mut scoped = self.clone();
         scoped.settle_from(Some(&attempt));
         Some(scoped)
@@ -2734,7 +2955,10 @@ fn build_flow_session_index(
     peers: &PeerClocks,
 ) -> HashMap<String, SessionAgg> {
     let window = ScanWindow::within_days(window_days);
-    let local = LocalRecords::Walk { dir: flows_dir, cutoff: &window.cutoff_date };
+    let local = LocalRecords::Walk {
+        dir: flows_dir,
+        cutoff: &window.cutoff_date,
+    };
     build_flow_indexes_in(&local, fleet, &window, None, peers).0
 }
 
@@ -2770,8 +2994,11 @@ fn build_flow_indexes_in(
     let within_window = |v: &serde_json::Value| -> bool { window.holds(v) };
     let fleet: FleetRecords = fleet.into();
 
-    let fleet_seen: HashSet<RecordIdentity> =
-        fleet.iter().filter(|r| within_window(r.value())).map(FleetRecord::identity).collect();
+    let fleet_seen: HashSet<RecordIdentity> = fleet
+        .iter()
+        .filter(|r| within_window(r.value()))
+        .map(FleetRecord::identity)
+        .collect();
     let mut fold = |v: &serde_json::Value| {
         fold_session_record(&mut idx, v);
         fold_mission_record(&mut missions, v);
@@ -2804,7 +3031,8 @@ fn build_flow_indexes_in(
 /// interval (5 seconds), since a beat cannot change faster than it is written.
 /// A beat read up to this much older than the board's build shifts a peer's
 /// clock by that much, far inside the staleness budget it corrects.
-const PEER_CLOCKS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(darkmux_flow::presence::DEFAULT_BEAT_INTERVAL_SECS);
+const PEER_CLOCKS_CACHE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(darkmux_flow::presence::DEFAULT_BEAT_INTERVAL_SECS);
 
 #[derive(Default, Clone)]
 struct PeerClocks {
@@ -2820,21 +3048,27 @@ impl PeerClocks {
     /// The live peers' clocks, from the shared Redis (empty when it is off or
     /// unreadable: nothing is corrected then).
     fn read() -> Self {
-        let Some(url) = darkmux_flow::redis_url() else { return Self::default() };
+        let Some(url) = darkmux_flow::redis_url() else {
+            return Self::default();
+        };
         let (beats, _) = crate::machine_beats(&url, crate::PresenceRead::ROUTE);
         // (#3125) The live session beats, read the same way; a failed read
         // knows nothing (`None`), never "every beat is gone".
         let (sessions, state) = crate::session_beats(&url, crate::PresenceRead::ROUTE);
         let live_sessions = matches!(state, crate::source_state::SourceState::Ok)
             .then(|| sessions.into_iter().map(|b| b.session_id).collect());
-        Self { live_sessions, ..Self::from_beats(&beats) }
+        Self {
+            live_sessions,
+            ..Self::from_beats(&beats)
+        }
     }
 
     /// [`PeerClocks::read`], at most once per [`PEER_CLOCKS_CACHE_TTL`]: the
     /// board rebuilds on a few-second poll, and each read is a Redis SCAN plus
     /// a GET per machine (and a Keychain lookup for the URL).
     fn cached() -> Self {
-        static CACHE: std::sync::Mutex<Option<(std::time::Instant, PeerClocks)>> = std::sync::Mutex::new(None);
+        static CACHE: std::sync::Mutex<Option<(std::time::Instant, PeerClocks)>> =
+            std::sync::Mutex::new(None);
         Self::cached_in(&CACHE, std::time::Instant::now(), Self::read)
     }
 
@@ -2856,7 +3090,10 @@ impl PeerClocks {
 
     fn from_beats(beats: &[darkmux_flow::presence::PresenceBeat]) -> Self {
         Self {
-            now_ms: beats.iter().map(|b| (b.machine_uid.to_ascii_lowercase(), b.beat_ts_ms)).collect(),
+            now_ms: beats
+                .iter()
+                .map(|b| (b.machine_uid.to_ascii_lowercase(), b.beat_ts_ms))
+                .collect(),
             ..Self::default()
         }
     }
@@ -2874,13 +3111,19 @@ impl PeerClocks {
     fn apply(&self, idx: &mut HashMap<String, SessionAgg>) {
         let mine = darkmux_hardware::machine_uid().map(str::to_ascii_lowercase);
         for (session_id, agg) in idx.iter_mut() {
-            let Some(uid) = agg.machine_uid.as_deref().map(str::to_ascii_lowercase) else { continue };
+            let Some(uid) = agg.machine_uid.as_deref().map(str::to_ascii_lowercase) else {
+                continue;
+            };
             let own = mine.as_deref() == Some(uid.as_str());
             if !own {
                 agg.clock_now_ms = self.now_ms.get(&uid).copied();
             }
             let reporting = self.now_ms.contains_key(&uid);
-            agg.beat_lost = reporting && self.live_sessions.as_ref().is_some_and(|live| !live.contains(session_id));
+            agg.beat_lost = reporting
+                && self
+                    .live_sessions
+                    .as_ref()
+                    .is_some_and(|live| !live.contains(session_id));
         }
     }
 }
@@ -2941,7 +3184,10 @@ fn fold_session_record(idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Va
     }
     let action = darkmux_flow::reader::action_of(v);
     let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-    let grain = action.as_ref().and_then(FlowAction::bookend).map(|b| b.grain);
+    let grain = action
+        .as_ref()
+        .and_then(FlowAction::bookend)
+        .map(|b| b.grain);
     agg.run_grain |= grain == Some(Grain::Run);
 
     // Check EVERY execution bookend's payload for `endpoint`, not just the
@@ -2953,7 +3199,10 @@ fn fold_session_record(idx: &mut HashMap<String, SessionAgg>, v: &serde_json::Va
     }
 
     agg.beats_promised |= start_promises_beat(v);
-    let mission = v.get("mission_id").and_then(|m| m.as_str()).filter(|m| !m.is_empty());
+    let mission = v
+        .get("mission_id")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty());
     agg.lifecycle.fold(action.as_ref(), mission, ts, v);
 }
 
@@ -3001,7 +3250,9 @@ fn settle_session_index(idx: &mut HashMap<String, SessionAgg>) {
 /// map's key). The only fix that can't drift is deriving the id from the
 /// SAME comparison that picks the agg, rather than a second, separately
 /// written search for "which id maps to this agg" after the fact.
-fn earliest_by_start<'a>(sessions: &[(&'a str, &'a SessionAgg)]) -> Option<(&'a str, &'a SessionAgg)> {
+fn earliest_by_start<'a>(
+    sessions: &[(&'a str, &'a SessionAgg)],
+) -> Option<(&'a str, &'a SessionAgg)> {
     sessions
         .iter()
         .copied()
@@ -3066,11 +3317,12 @@ fn ghost_runs(
         // `ending_of`) — so an Abandoned ghost always means "no ending
         // recorded", whether it came from `session.end` or the staleness
         // gate above.
-        let abandoned_reason = (status == RunStatus::Abandoned).then_some(if agg.stopped_by_operator {
-            AbandonReason::Aborted
-        } else {
-            AbandonReason::NoTerminal
-        });
+        let abandoned_reason =
+            (status == RunStatus::Abandoned).then_some(if agg.stopped_by_operator {
+                AbandonReason::Aborted
+            } else {
+                AbandonReason::NoTerminal
+            });
         let (activity, activity_elapsed_ms) = activity_of(status, [agg]);
         out.push(Run {
             id: session_id.clone(),
@@ -3106,7 +3358,11 @@ fn ghost_runs(
             // is itself a finding (a session-id COLLISION between an
             // orphaned dispatch and a real mission), not a nuisance to
             // silence.
-            dispatch_id: if agg.is_ambiguous() { None } else { Some(session_id.clone()) },
+            dispatch_id: if agg.is_ambiguous() {
+                None
+            } else {
+                Some(session_id.clone())
+            },
             abandoned_reason,
             tokens: None,
             workload: None,
@@ -3131,9 +3387,10 @@ fn run_relay(session_id: &str) -> Option<RunRelay> {
         return None;
     }
     match SessionId::parse(session_id).ok()?.kind() {
-        SessionKind::Relay { sender, peer } => {
-            Some(RunRelay { asked_on_machine: peer.clone(), sender_run: sender.mission_id().map(str::to_string) })
-        }
+        SessionKind::Relay { sender, peer } => Some(RunRelay {
+            asked_on_machine: peer.clone(),
+            sender_run: sender.mission_id().map(str::to_string),
+        }),
         _ => None,
     }
 }
@@ -3145,7 +3402,11 @@ fn run_relay(session_id: &str) -> Option<RunRelay> {
 /// fold only usage records; every other record (host samples, machine
 /// telemetry) is skipped by all three, so the store does not keep it.
 fn feeds_runs_index(v: &serde_json::Value) -> bool {
-    let named = |key: &str| v.get(key).and_then(|x| x.as_str()).is_some_and(|s| !s.is_empty());
+    let named = |key: &str| {
+        v.get(key)
+            .and_then(|x| x.as_str())
+            .is_some_and(|s| !s.is_empty())
+    };
     named("session_id") || named("mission_id") || crate::usage_sum::is_usage_record(v)
 }
 
@@ -3155,7 +3416,9 @@ fn feeds_runs_index(v: &serde_json::Value) -> bool {
 /// so it does not make the next poll rebuild. Reads the store as the next
 /// build would, so that build then finds nothing new on disk. Blocking.
 pub(crate) fn hash_daemon_runs_records(flows_dir: &StdPath, h: &mut impl std::hash::Hasher) {
-    RUNS_FLOW_RECORDS.read(flows_dir, &ScanWindow::default_window().cutoff_date).hash_into(h);
+    RUNS_FLOW_RECORDS
+        .read(flows_dir, &ScanWindow::default_window().cutoff_date)
+        .hash_into(h);
 }
 
 /// (#2891) The day files the daemon's `GET /runs` reads: kept as line text
@@ -3177,7 +3440,10 @@ impl<'a> LocalRecords<'a> {
     fn of(store: Option<&FlowRecordStore>, dir: &'a StdPath, window: &'a ScanWindow) -> Self {
         match store {
             Some(store) => LocalRecords::Kept(store.read(dir, &window.cutoff_date)),
-            None => LocalRecords::Walk { dir, cutoff: &window.cutoff_date },
+            None => LocalRecords::Walk {
+                dir,
+                cutoff: &window.cutoff_date,
+            },
         }
     }
 
@@ -3211,7 +3477,9 @@ fn for_each_flow_record_from(
     let mut day_files: Vec<std::path::PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else { continue };
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
         let Some(date) = name.strip_suffix(".jsonl") else {
             continue;
         };
@@ -3281,7 +3549,10 @@ fn record_receive_key(v: &serde_json::Value) -> Option<u64> {
     if let Some(k) = v.get("hub_id").and_then(|h| h.as_str()).and_then(hub_key) {
         return Some(k);
     }
-    v.get("ts").and_then(|t| t.as_str()).and_then(parse_flow_ts).map(local_receive_key)
+    v.get("ts")
+        .and_then(|t| t.as_str())
+        .and_then(parse_flow_ts)
+        .map(local_receive_key)
 }
 
 /// This machine's own time, in seconds, on the receive-key scale.
@@ -3300,7 +3571,11 @@ pub(crate) fn parse_flow_ts(ts: &str) -> Option<u64> {
 /// below for the same purpose from an arbitrary record timestamp.
 pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
-    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
     let doe = z - era * 146_097; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
     let y = yoe + era * 400;
@@ -3333,7 +3608,12 @@ pub(crate) fn day_string_from_epoch_ms(ms: u64) -> String {
 /// consumer must join it in BY TIME instead. Pure over one record + the
 /// window bounds so it's testable without exercising the day-file walk
 /// `join_host_samples_into_session_records` (`lib.rs`) wraps this in.
-pub(crate) fn is_host_sample_in_window(v: &serde_json::Value, machine_uid: &str, start_ms: u64, end_ms: u64) -> bool {
+pub(crate) fn is_host_sample_in_window(
+    v: &serde_json::Value,
+    machine_uid: &str,
+    start_ms: u64,
+    end_ms: u64,
+) -> bool {
     if darkmux_flow::reader::action_of(v) != Some(FlowAction::MachineTelemetry) {
         return false;
     }
@@ -3372,7 +3652,10 @@ mod tests {
             RunStatus::Abandoned,
             RunStatus::Unparseable,
         ] {
-            assert_eq!(serde_json::to_value(st).unwrap(), serde_json::json!(st.as_str()));
+            assert_eq!(
+                serde_json::to_value(st).unwrap(),
+                serde_json::json!(st.as_str())
+            );
         }
     }
 
@@ -3431,7 +3714,10 @@ mod tests {
             .as_secs();
         // Second-precision ts + two calls a moment apart — allow a couple
         // seconds of drift rather than asserting exact equality.
-        assert!(actual.abs_diff(parsed) <= 3, "parsed={parsed} actual={actual}");
+        assert!(
+            actual.abs_diff(parsed) <= 3,
+            "parsed={parsed} actual={actual}"
+        );
     }
 
     #[test]
@@ -3461,7 +3747,11 @@ mod tests {
         for &(y, m, d) in cases {
             let days = darkmux_flow::days_from_civil(y, m, d);
             let (ry, rm, rd) = civil_from_days(days);
-            assert_eq!((ry, rm as i64, rd as i64), (y, m, d), "round-trip failed for {y:04}-{m:02}-{d:02}");
+            assert_eq!(
+                (ry, rm as i64, rd as i64),
+                (y, m, d),
+                "round-trip failed for {y:04}-{m:02}-{d:02}"
+            );
         }
     }
 
@@ -3539,10 +3829,17 @@ mod tests {
         write_day_file(
             tmp.path(),
             &today(),
-            &[serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch.start", "session_id": "s1"})],
+            &[
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch.start", "session_id": "s1"}),
+            ],
         );
         let start_ms = parse_flow_ts("2026-01-01T00:00:00Z").unwrap() * 1000;
-        assert!(any_dispatch_live_in(tmp.path(), &today(), start_ms + 5_000, 60_000));
+        assert!(any_dispatch_live_in(
+            tmp.path(),
+            &today(),
+            start_ms + 5_000,
+            60_000
+        ));
     }
 
     #[test]
@@ -3569,7 +3866,9 @@ mod tests {
         write_day_file(
             tmp.path(),
             &today(),
-            &[serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch.start", "session_id": "s1"})],
+            &[
+                serde_json::json!({"level": "info", "category": "work", "tier": "local", "stage": "dispatch", "handle": "h", "ts": "2026-01-01T00:00:00Z", "action": "dispatch.start", "session_id": "s1"}),
+            ],
         );
         let start_ms = parse_flow_ts("2026-01-01T00:00:00Z").unwrap() * 1000;
         assert!(
@@ -3659,7 +3958,12 @@ mod tests {
         }
     }
 
-    fn minimal_task(id: &str, phase_id: &str, step_ids: Vec<String>, role_id: Option<&str>) -> Task {
+    fn minimal_task(
+        id: &str,
+        phase_id: &str,
+        step_ids: Vec<String>,
+        role_id: Option<&str>,
+    ) -> Task {
         Task {
             repo_root: None,
             branch: None,
@@ -3708,12 +4012,19 @@ mod tests {
         let mission = minimal_mission(
             "m1",
             vec!["p1".to_string(), "p2".to_string()],
-            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "x".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "dispatch".to_string(),
+                inputs_fingerprint: "x".to_string(),
+                origin: None,
+            }),
         );
         let phases_by_id = HashMap::new();
         let (kind, shape) = classify_mission(&mission, &phases_by_id);
         assert_eq!(kind, RunKind::Dispatch);
-        assert!(shape.is_none(), "no crew-of-one shape available, so no (task, step) pair");
+        assert!(
+            shape.is_none(),
+            "no crew-of-one shape available, so no (task, step) pair"
+        );
     }
 
     #[test]
@@ -3723,7 +4034,11 @@ mod tests {
         let mission = minimal_mission(
             "m2",
             vec!["p1".to_string()],
-            Some(MissionSpec { config_id: "coder-phase".to_string(), inputs_fingerprint: "x".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "coder-phase".to_string(),
+                inputs_fingerprint: "x".to_string(),
+                origin: None,
+            }),
         );
         let phases_by_id = HashMap::new();
         let (kind, _) = classify_mission(&mission, &phases_by_id);
@@ -3782,7 +4097,10 @@ mod tests {
     fn mission_run_status_unknown_is_unparseable_not_a_verdict() {
         let mut m = minimal_mission("m-unk", vec![], None);
         m.status = MissionStatus::Unknown;
-        assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Unparseable);
+        assert_eq!(
+            mission_run_status(&m, &[], now_unix() * 1_000),
+            RunStatus::Unparseable
+        );
     }
 
     #[test]
@@ -3791,7 +4109,10 @@ mod tests {
         // dead `Planned` variant made reachable.
         let mut m = minimal_mission("m5b", vec![], None);
         m.started_ts = None;
-        assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Planned);
+        assert_eq!(
+            mission_run_status(&m, &[], now_unix() * 1_000),
+            RunStatus::Planned
+        );
     }
 
     #[test]
@@ -3801,11 +4122,23 @@ mod tests {
         // record itself never got finalized (the process died first).
         let m = minimal_mission("m5c", vec![], None);
         let now_ms = now_unix() * 1_000;
-        let abandoned = SessionAgg { terminal_status: Some(RunStatus::Abandoned), ..Default::default() };
-        assert_eq!(mission_run_status(&m, &[&abandoned], now_ms), RunStatus::Abandoned);
+        let abandoned = SessionAgg {
+            terminal_status: Some(RunStatus::Abandoned),
+            ..Default::default()
+        };
+        assert_eq!(
+            mission_run_status(&m, &[&abandoned], now_ms),
+            RunStatus::Abandoned
+        );
 
-        let errored = SessionAgg { terminal_status: Some(RunStatus::Error), ..Default::default() };
-        assert_eq!(mission_run_status(&m, &[&errored], now_ms), RunStatus::Error);
+        let errored = SessionAgg {
+            terminal_status: Some(RunStatus::Error),
+            ..Default::default()
+        };
+        assert_eq!(
+            mission_run_status(&m, &[&errored], now_ms),
+            RunStatus::Error
+        );
     }
 
     #[test]
@@ -3878,7 +4211,10 @@ mod tests {
         // must show GENUINE recent activity now that liveness is gated
         // (#1642), not just the absence of a terminal.
         let m = minimal_mission("m5d", vec![], None);
-        let done = SessionAgg { terminal_status: Some(RunStatus::Complete), ..Default::default() };
+        let done = SessionAgg {
+            terminal_status: Some(RunStatus::Complete),
+            ..Default::default()
+        };
         let still_running = SessionAgg {
             terminal_status: None,
             has_start: true,
@@ -3900,13 +4236,19 @@ mod tests {
         // fabricate a finalize that never happened; `Running` matches
         // `mission status`'s existing "drift" framing.
         let m = minimal_mission("m5e", vec![], None);
-        let done = SessionAgg { terminal_status: Some(RunStatus::Complete), ..Default::default() };
+        let done = SessionAgg {
+            terminal_status: Some(RunStatus::Complete),
+            ..Default::default()
+        };
         // (#1642) Terminal-Complete-not-Abandoned/Error must win over the
         // staleness gate outright — judged FAR in the future (no possible
         // reading of "recent activity") and still Running, because the
         // all-terminal branch returns before the gate is ever consulted.
         let far_future_ms = (now_unix() + 999_999_999) * 1_000;
-        assert_eq!(mission_run_status(&m, &[&done], far_future_ms), RunStatus::Running);
+        assert_eq!(
+            mission_run_status(&m, &[&done], far_future_ms),
+            RunStatus::Running
+        );
     }
 
     #[test]
@@ -3945,8 +4287,12 @@ mod tests {
     #[serial_test::serial]
     fn mission_run_status_finalized_no_envelope_all_phases_abandoned_reads_abandoned() {
         let _g = CrewGuard::new();
-        darkmux_crew::lifecycle::save_mission(&minimal_mission("m10", vec!["m10-p1".to_string()], None))
-            .unwrap();
+        darkmux_crew::lifecycle::save_mission(&minimal_mission(
+            "m10",
+            vec!["m10-p1".to_string()],
+            None,
+        ))
+        .unwrap();
         let mut phase = minimal_phase("m10-p1", "m10", vec![]);
         phase.status = PhaseStatus::Abandoned;
         darkmux_crew::lifecycle::save_phase(&phase).unwrap();
@@ -4008,14 +4354,17 @@ mod tests {
 
         let err_env = MissionEnvelope::new("m7", MissionOutcomeStatus::Error, &[]);
         darkmux_crew::envelope::finalize_mission(&err_env);
-        assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Error);
+        assert_eq!(
+            mission_run_status(&m, &[], now_unix() * 1_000),
+            RunStatus::Error
+        );
     }
 
     /// (#1877 item 4 — stated decision, pinned; F10/F11) A `RunOutcome::Partial`
     /// envelope collapses into `Degraded` and reads `RunStatus::Degraded`,
     /// never `Complete`: a cut-off or partial run is not a clean one, and this
     /// site deliberately does not read `envelope.outcome` to invent a finer state.
-        #[test]
+    #[test]
     #[serial_test::serial]
     fn mission_run_status_finalized_degraded_envelope_reads_degraded_never_complete() {
         let _g = CrewGuard::new();
@@ -4032,7 +4381,10 @@ mod tests {
         );
         assert_eq!(partial_env.status, MissionOutcomeStatus::Degraded);
         darkmux_crew::envelope::finalize_mission(&partial_env);
-        assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Degraded);
+        assert_eq!(
+            mission_run_status(&m, &[], now_unix() * 1_000),
+            RunStatus::Degraded
+        );
     }
 
     /// (#1892) `MissionStatus` has exactly five variants; no wildcard, so a
@@ -4088,10 +4440,14 @@ mod tests {
         // Finalized, no envelope on disk yet: genuinely no data, degrades
         // to Complete — the OTHER terminal variant, so the classifier
         // above and the match it mirrors both stay exercised end to end.
-        darkmux_crew::lifecycle::save_mission(&minimal_mission("m1892-finalized", vec![], None)).unwrap();
+        darkmux_crew::lifecycle::save_mission(&minimal_mission("m1892-finalized", vec![], None))
+            .unwrap();
         let mut finalized = minimal_mission("m1892-finalized", vec![], None);
         finalized.status = MissionStatus::Finalized;
-        assert_eq!(mission_run_status(&finalized, &[], now_ms), RunStatus::Complete);
+        assert_eq!(
+            mission_run_status(&finalized, &[], now_ms),
+            RunStatus::Complete
+        );
     }
 
     /// (#1881 RED proof) `envelope.json` exists but is not valid JSON at
@@ -4118,7 +4474,11 @@ mod tests {
         std::fs::write(&path, "{not valid json at all").unwrap();
 
         let status = mission_run_status(&m, &[], now_unix() * 1_000);
-        assert_ne!(status, RunStatus::Complete, "a genuinely unparseable envelope must never read as a completed, green run");
+        assert_ne!(
+            status,
+            RunStatus::Complete,
+            "a genuinely unparseable envelope must never read as a completed, green run"
+        );
         assert_eq!(status, RunStatus::Unparseable);
     }
 
@@ -4168,7 +4528,11 @@ mod tests {
         }
 
         let status = mission_run_status(&m, &[], now_unix() * 1_000);
-        assert_ne!(status, RunStatus::Complete, "an unrecognized status value must never read as a completed, green run");
+        assert_ne!(
+            status,
+            RunStatus::Complete,
+            "an unrecognized status value must never read as a completed, green run"
+        );
         assert_eq!(status, RunStatus::Unparseable);
     }
 
@@ -4189,7 +4553,8 @@ mod tests {
     /// intact when `outcome` alone is unrecognized.
     #[test]
     #[serial_test::serial]
-    fn mission_run_status_finalized_unknown_outcome_variant_with_known_status_still_reads_that_status() {
+    fn mission_run_status_finalized_unknown_outcome_variant_with_known_status_still_reads_that_status(
+    ) {
         let _g = CrewGuard::new();
         darkmux_crew::lifecycle::save_mission(&minimal_mission("m11", vec![], None)).unwrap();
         let mut m = minimal_mission("m11", vec![], None);
@@ -4234,7 +4599,10 @@ mod tests {
         let mut m = minimal_mission("m5g", vec![], None);
         m.started_ts = Some(946_684_800); // 2000-01-01T00:00:00Z
         let stale_now_ms = 946_684_800_000 + stale_after_ms() + 1_000;
-        assert_eq!(mission_run_status(&m, &[], stale_now_ms), RunStatus::Abandoned);
+        assert_eq!(
+            mission_run_status(&m, &[], stale_now_ms),
+            RunStatus::Abandoned
+        );
     }
 
     #[test]
@@ -4261,7 +4629,10 @@ mod tests {
         // Comfortably past the budget even accounting for `stale_b`'s
         // 1-second-newer activity — both must read as dead.
         let now_ms = 946_684_800_000 + stale_after_ms() + 5_000;
-        assert_eq!(mission_run_status(&m, &[&stale_a, &stale_b], now_ms), RunStatus::Abandoned);
+        assert_eq!(
+            mission_run_status(&m, &[&stale_a, &stale_b], now_ms),
+            RunStatus::Abandoned
+        );
     }
 
     // ── mission_run_status_and_evidence / DispatchSessionEvidence (#2682 fix-pass) ──
@@ -4273,7 +4644,10 @@ mod tests {
         let stale_now_ms = 946_684_800_000 + stale_after_ms() + 1_000;
         assert_eq!(
             mission_run_status_and_evidence(&m, &[], stale_now_ms),
-            (RunStatus::Abandoned, Some(DispatchSessionEvidence::NoAttributableSession)),
+            (
+                RunStatus::Abandoned,
+                Some(DispatchSessionEvidence::NoAttributableSession)
+            ),
             "an Abandoned verdict with NO sessions at all must name the mission's own age, not \
              invent an observed dispatch"
         );
@@ -4283,10 +4657,16 @@ mod tests {
     fn mission_run_status_and_evidence_session_end_terminal_is_recorded_end() {
         let mut m = minimal_mission("m-evidence-end", vec![], None);
         m.started_ts = Some(946_684_800);
-        let ended = SessionAgg { terminal_status: Some(RunStatus::Abandoned), ..Default::default() };
+        let ended = SessionAgg {
+            terminal_status: Some(RunStatus::Abandoned),
+            ..Default::default()
+        };
         assert_eq!(
             mission_run_status_and_evidence(&m, &[&ended], 946_684_800_000),
-            (RunStatus::Abandoned, Some(DispatchSessionEvidence::RecordedEnd)),
+            (
+                RunStatus::Abandoned,
+                Some(DispatchSessionEvidence::RecordedEnd)
+            ),
             "a session whose OWN terminal read Abandoned (a real `session.end` record) is a \
              POSITIVE observation, not the same fact as silence"
         );
@@ -4305,7 +4685,10 @@ mod tests {
         let now_ms = 946_684_800_000 + stale_after_ms() + 5_000;
         assert_eq!(
             mission_run_status_and_evidence(&m, &[&stale], now_ms),
-            (RunStatus::Abandoned, Some(DispatchSessionEvidence::StaleNoTerminal)),
+            (
+                RunStatus::Abandoned,
+                Some(DispatchSessionEvidence::StaleNoTerminal)
+            ),
             "a real session that went quiet without any terminal record is the genuinely \
              'no evidence of life' case"
         );
@@ -4329,7 +4712,10 @@ mod tests {
     /// activity, in `local_dispatch_status` (radio's busy check) and on its
     /// `/runs` row alike. `m_ago`/`other_ago`: how long ago each mission's
     /// `step start` landed. Returns both verdicts.
-    fn shared_session_verdicts(m_ago: u64, other_ago: u64) -> (RunStatus, Option<DispatchSessionEvidence>, RunStatus) {
+    fn shared_session_verdicts(
+        m_ago: u64,
+        other_ago: u64,
+    ) -> (RunStatus, Option<DispatchSessionEvidence>, RunStatus) {
         let flows = TempDir::new().unwrap();
         let mut m = minimal_mission("m-ambiguous-e2e", vec![], None);
         m.started_ts = Some(now_unix().saturating_sub(90 * 60));
@@ -4344,9 +4730,15 @@ mod tests {
             ],
         );
         let status = local_dispatch_status(std::slice::from_ref(&m), flows.path(), &[]);
-        let (verdict, evidence) = status.get(&m.id).copied().unwrap_or_else(|| panic!("no entry for {}", m.id));
+        let (verdict, evidence) = status
+            .get(&m.id)
+            .copied()
+            .unwrap_or_else(|| panic!("no entry for {}", m.id));
         let runs = build_runs(flows.path(), None, &[]);
-        let row = runs.iter().find(|r| r.id == m.id).unwrap_or_else(|| panic!("no row for {}: {runs:?}", m.id));
+        let row = runs
+            .iter()
+            .find(|r| r.id == m.id)
+            .unwrap_or_else(|| panic!("no row for {}: {runs:?}", m.id));
         (verdict, evidence, row.status)
     }
 
@@ -4360,8 +4752,15 @@ mod tests {
         // exports.
         let _budget = InactivityBudgetGuard::seconds(60);
         let (verdict, evidence, row) = shared_session_verdicts(0, 90 * 60);
-        assert_eq!(verdict, RunStatus::Running, "m's own step started this second on the shared session");
-        assert_eq!(evidence, None, "a live mission names no abandonment evidence");
+        assert_eq!(
+            verdict,
+            RunStatus::Running,
+            "m's own step started this second on the shared session"
+        );
+        assert_eq!(
+            evidence, None,
+            "a live mission names no abandonment evidence"
+        );
         assert_eq!(row, verdict, "/runs disagreed with local_dispatch_status");
     }
 
@@ -4374,9 +4773,17 @@ mod tests {
         let _g = CrewGuard::new();
         let _budget = InactivityBudgetGuard::seconds(60);
         let (verdict, evidence, row) = shared_session_verdicts(90 * 60, 0);
-        assert_eq!(verdict, RunStatus::Abandoned, "m went quiet; the other mission's fresh step is not its activity");
+        assert_eq!(
+            verdict,
+            RunStatus::Abandoned,
+            "m went quiet; the other mission's fresh step is not its activity"
+        );
         assert_eq!(evidence, Some(DispatchSessionEvidence::StaleNoTerminal));
-        assert_eq!(row, RunStatus::Abandoned, "/runs must not borrow the other mission's activity either");
+        assert_eq!(
+            row,
+            RunStatus::Abandoned,
+            "/runs must not borrow the other mission's activity either"
+        );
     }
 
     /// A fleet-only mission (no mission record here, `flow_mission_to_run`)
@@ -4399,8 +4806,15 @@ mod tests {
             ],
         );
         let runs = build_runs(flows.path(), None, &[]);
-        let row = runs.iter().find(|r| r.id == "fleet-only").unwrap_or_else(|| panic!("no row: {runs:?}"));
-        assert_eq!(row.status, RunStatus::Abandoned, "its session recorded its end a minute ago: {row:?}");
+        let row = runs
+            .iter()
+            .find(|r| r.id == "fleet-only")
+            .unwrap_or_else(|| panic!("no row: {runs:?}"));
+        assert_eq!(
+            row.status,
+            RunStatus::Abandoned,
+            "its session recorded its end a minute ago: {row:?}"
+        );
     }
 
     /// A session shared by two missions the mission store does not know
@@ -4423,8 +4837,17 @@ mod tests {
             ],
         );
         let runs = build_runs(flows.path(), None, &[]);
-        let row = |id: &str| runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("no row for {id}: {runs:?}")).clone();
-        assert_eq!(row("ghost-b").status, RunStatus::Running, "ghost-b is mid-turn on the shared session");
+        let row = |id: &str| {
+            runs.iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("no row for {id}: {runs:?}"))
+                .clone()
+        };
+        assert_eq!(
+            row("ghost-b").status,
+            RunStatus::Running,
+            "ghost-b is mid-turn on the shared session"
+        );
         assert_eq!(
             row("ghost-a").status,
             RunStatus::Abandoned,
@@ -4451,13 +4874,26 @@ mod tests {
             }),
         );
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
-        let phase = minimal_phase("p-crash", "dispatch-crashed-local-status", vec!["t-crash".to_string()]);
+        let phase = minimal_phase(
+            "p-crash",
+            "dispatch-crashed-local-status",
+            vec!["t-crash".to_string()],
+        );
         darkmux_crew::lifecycle::save_phase(&phase).unwrap();
-        let task =
-            minimal_task("t-crash", "p-crash", vec!["s-crash".to_string()], Some("coder"));
+        let task = minimal_task(
+            "t-crash",
+            "p-crash",
+            vec!["s-crash".to_string()],
+            Some("coder"),
+        );
         darkmux_crew::lifecycle::save_task("dispatch-crashed-local-status", &task).unwrap();
-        let step = minimal_step("s-crash", "t-crash", Some("crew-dispatch-coder-local-status"));
-        darkmux_crew::lifecycle::save_step("dispatch-crashed-local-status", "p-crash", &step).unwrap();
+        let step = minimal_step(
+            "s-crash",
+            "t-crash",
+            Some("crew-dispatch-coder-local-status"),
+        );
+        darkmux_crew::lifecycle::save_step("dispatch-crashed-local-status", "p-crash", &step)
+            .unwrap();
 
         write_day_file(
             flows.path(),
@@ -4482,7 +4918,10 @@ mod tests {
             .get(&mission.id)
             .copied()
             .unwrap_or_else(|| panic!("no local_dispatch_status entry for {}", mission.id));
-        assert_eq!(verdict, run.status, "local_dispatch_status disagreed with build_runs");
+        assert_eq!(
+            verdict, run.status,
+            "local_dispatch_status disagreed with build_runs"
+        );
         assert_eq!(evidence, Some(DispatchSessionEvidence::StaleNoTerminal));
     }
 
@@ -4496,20 +4935,30 @@ mod tests {
     fn build_runs_within_reads_only_its_own_window() {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
-        let record = |sid: &str| {
-            serde_json::json!({"ts": "2026-01-01T09:00:00Z", "action": "dispatch.start", "session_id": sid, "handle": "coder"})
-        };
+        let record = |sid: &str| serde_json::json!({"ts": "2026-01-01T09:00:00Z", "action": "dispatch.start", "session_id": sid, "handle": "coder"});
         write_day_file(flows.path(), &today(), &[record("s-today")]);
-        write_day_file(flows.path(), &cutoff_date_string(5), &[record("s-five-days-ago")]);
+        write_day_file(
+            flows.path(),
+            &cutoff_date_string(5),
+            &[record("s-five-days-ago")],
+        );
         let ids = |runs: Vec<Run>| -> Vec<String> {
-            runs.into_iter().filter_map(|r| r.dispatch_id.or(Some(r.id))).collect()
+            runs.into_iter()
+                .filter_map(|r| r.dispatch_id.or(Some(r.id)))
+                .collect()
         };
         let board = ids(build_runs(flows.path(), None, &[]));
         assert!(board.iter().any(|i| i.contains("s-today")), "{board:?}");
-        assert!(board.iter().any(|i| i.contains("s-five-days-ago")), "the board keeps its 14 days: {board:?}");
+        assert!(
+            board.iter().any(|i| i.contains("s-five-days-ago")),
+            "the board keeps its 14 days: {board:?}"
+        );
         let narrow = ids(build_runs_within(flows.path(), None, &[], 1));
         assert!(narrow.iter().any(|i| i.contains("s-today")), "{narrow:?}");
-        assert!(!narrow.iter().any(|i| i.contains("s-five-days-ago")), "outside the window is not read: {narrow:?}");
+        assert!(
+            !narrow.iter().any(|i| i.contains("s-five-days-ago")),
+            "outside the window is not read: {narrow:?}"
+        );
     }
 
     /// (#2917 re-review C-3) The premise radio's busy copy is worded
@@ -4527,7 +4976,11 @@ mod tests {
         let mission = minimal_mission(
             "long-mission",
             vec!["long-mission-phase".to_string()],
-            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fp".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "dispatch".to_string(),
+                inputs_fingerprint: "fp".to_string(),
+                origin: None,
+            }),
         );
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
         darkmux_crew::lifecycle::save_phase(&minimal_phase(
@@ -4538,19 +4991,33 @@ mod tests {
         .unwrap();
         darkmux_crew::lifecycle::save_task(
             "long-mission",
-            &minimal_task("long-mission-task", "long-mission-phase", vec!["long-mission-step".to_string()], Some("coder")),
+            &minimal_task(
+                "long-mission-task",
+                "long-mission-phase",
+                vec!["long-mission-step".to_string()],
+                Some("coder"),
+            ),
         )
         .unwrap();
         darkmux_crew::lifecycle::save_step(
             "long-mission",
             "long-mission-phase",
-            &minimal_step("long-mission-step", "long-mission-task", Some("crew-dispatch-coder-long")),
+            &minimal_step(
+                "long-mission-step",
+                "long-mission-task",
+                Some("crew-dispatch-coder-long"),
+            ),
         )
         .unwrap();
         let iso = |unix: u64| {
             let (y, m, d) = civil_from_days((unix / 86_400) as i64);
             let s = unix % 86_400;
-            format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", s / 3600, (s / 60) % 60, s % 60)
+            format!(
+                "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+                s / 3600,
+                (s / 60) % 60,
+                s % 60
+            )
         };
         let now = now_unix();
         write_day_file(
@@ -4573,12 +5040,23 @@ mod tests {
                 "session_id": "crew-dispatch-coder-long", "mission_id": "long-mission",
             })],
         );
-        let find = |runs: Vec<Run>| runs.into_iter().find(|r| r.id == "long-mission").expect("the mission is listed");
+        let find = |runs: Vec<Run>| {
+            runs.into_iter()
+                .find(|r| r.id == "long-mission")
+                .expect("the mission is listed")
+        };
         let board = find(build_runs(flows.path(), None, &[]));
-        assert_eq!(board.model.as_deref(), Some("qwen3.6-35b-a3b"), "the 14-day board names the model: {board:?}");
+        assert_eq!(
+            board.model.as_deref(),
+            Some("qwen3.6-35b-a3b"),
+            "the 14-day board names the model: {board:?}"
+        );
         let narrow = find(build_runs_within(flows.path(), None, &[], 1));
         assert_eq!(narrow.status, RunStatus::Running, "{narrow:?}");
-        assert_eq!(narrow.model, None, "the one-day read cannot see the record that names the model: {narrow:?}");
+        assert_eq!(
+            narrow.model, None,
+            "the one-day read cannot see the record that names the model: {narrow:?}"
+        );
     }
 
     // ── lab normalization ───────────────────────────────────────────────
@@ -4657,10 +5135,19 @@ mod tests {
             run_ok: ok,
             ..lab_summary_with_lifecycle("d", false, false, Some(Lc::Complete))
         };
-        assert_eq!(lab_run_status(&with_ok(Some(false)), now, None), RunStatus::Error);
-        assert_eq!(lab_run_status(&with_ok(Some(true)), now, None), RunStatus::Complete);
+        assert_eq!(
+            lab_run_status(&with_ok(Some(false)), now, None),
+            RunStatus::Error
+        );
+        assert_eq!(
+            lab_run_status(&with_ok(Some(true)), now, None),
+            RunStatus::Complete
+        );
         // No manifest (a provider that writes none) is not evidence of failure.
-        assert_eq!(lab_run_status(&with_ok(None), now, None), RunStatus::Complete);
+        assert_eq!(
+            lab_run_status(&with_ok(None), now, None),
+            RunStatus::Complete
+        );
     }
 
     /// (F2, 5.0 dogfood) A run whose dispatch escalated on purpose (the
@@ -4677,11 +5164,20 @@ mod tests {
             escalation: Some("escalation_compaction_reread_loop".into()),
             ..lab_summary_with_lifecycle("d", false, false, lc)
         };
-        assert_eq!(lab_run_status(&escalated(Some(Lc::Complete)), now, None), RunStatus::Escalated);
+        assert_eq!(
+            lab_run_status(&escalated(Some(Lc::Complete)), now, None),
+            RunStatus::Escalated
+        );
         // A run from before the lifecycle record existed still reads from its manifest.
-        assert_eq!(lab_run_status(&escalated(None), now, None), RunStatus::Escalated);
+        assert_eq!(
+            lab_run_status(&escalated(None), now, None),
+            RunStatus::Escalated
+        );
         // A harness error is still an error: only a COMPLETED harness can escalate.
-        assert_eq!(lab_run_status(&escalated(Some(Lc::Error)), now, None), RunStatus::Error);
+        assert_eq!(
+            lab_run_status(&escalated(Some(Lc::Error)), now, None),
+            RunStatus::Error
+        );
     }
 
     /// (F2) The whole chain for a REAL provider's manifest: each provider's own
@@ -4699,7 +5195,10 @@ mod tests {
             1,
             r#"{"result":"escalation_compaction_reread_loop","final_assistant":"x"}"#,
         );
-        let verify = VerifyReport { passed: false, details: "dispatch escalated".into() };
+        let verify = VerifyReport {
+            passed: false,
+            details: "dispatch escalated".into(),
+        };
         let session = darkmux_types::session_id::SessionId::adhoc(
             darkmux_types::session_id::RunId::lab("w-p-1-1").unwrap(),
             "coder",
@@ -4707,7 +5206,10 @@ mod tests {
         );
         let now = 1_700_000_000_000u64;
         for provider in ["prompt", "coding-task"] {
-            for (end, want) in [(&escalated, RunStatus::Escalated), (&DispatchEnd::Failed, RunStatus::Error)] {
+            for (end, want) in [
+                (&escalated, RunStatus::Escalated),
+                (&DispatchEnd::Failed, RunStatus::Error),
+            ] {
                 let tmp = TempDir::new().unwrap();
                 let run_dir = tmp.path().join("run1");
                 std::fs::create_dir_all(&run_dir).unwrap();
@@ -4779,7 +5281,11 @@ mod tests {
         let row = lab_summary_to_run(&summary, None, 1_700_000_000_000, None);
         assert_eq!(row.verify_passed, Some(false));
         assert_eq!(row.workload.as_deref(), Some("quick-coding"));
-        assert_eq!(row.status, RunStatus::Complete, "verify is not folded into status");
+        assert_eq!(
+            row.status,
+            RunStatus::Complete,
+            "verify is not folded into status"
+        );
     }
 
     /// (#2860 review F4) A run from before `lifecycle.json` existed still has
@@ -4790,15 +5296,33 @@ mod tests {
     #[test]
     fn a_manifest_is_a_terminal_record_when_there_is_no_lifecycle() {
         let now = 1_700_000_000_000u64 + 30 * 24 * 3600 * 1000; // long stale
-        let old = |ok: Option<bool>| LabRunSummary { run_ok: ok, ..minimal_lab_summary("d", false, false) };
-        assert_eq!(lab_run_status(&old(Some(true)), now, Some(LabSession::Silent)), RunStatus::Complete);
-        assert_eq!(lab_run_status(&old(Some(false)), now, Some(LabSession::Silent)), RunStatus::Error);
+        let old = |ok: Option<bool>| LabRunSummary {
+            run_ok: ok,
+            ..minimal_lab_summary("d", false, false)
+        };
+        assert_eq!(
+            lab_run_status(&old(Some(true)), now, Some(LabSession::Silent)),
+            RunStatus::Complete
+        );
+        assert_eq!(
+            lab_run_status(&old(Some(false)), now, Some(LabSession::Silent)),
+            RunStatus::Error
+        );
         // A degenerate run is an error even when its manifest says ok:
         // tool-bench always writes `ok: true`.
-        let degenerate = LabRunSummary { degenerate: true, ..old(Some(true)) };
-        assert_eq!(lab_run_status(&degenerate, now, Some(LabSession::Silent)), RunStatus::Error);
+        let degenerate = LabRunSummary {
+            degenerate: true,
+            ..old(Some(true))
+        };
+        assert_eq!(
+            lab_run_status(&degenerate, now, Some(LabSession::Silent)),
+            RunStatus::Error
+        );
         // CONTROL: no manifest outcome keeps the old inference.
-        assert_eq!(lab_run_status(&old(None), now, Some(LabSession::Silent)), RunStatus::Abandoned);
+        assert_eq!(
+            lab_run_status(&old(None), now, Some(LabSession::Silent)),
+            RunStatus::Abandoned
+        );
     }
 
     /// (#1930) The run's own terminal record outranks every inference.
@@ -4823,7 +5347,10 @@ mod tests {
         );
 
         let interrupted = lab_summary_with_lifecycle("d", false, false, Some(Lc::Interrupted));
-        assert_eq!(lab_run_status(&interrupted, now, None), RunStatus::Abandoned);
+        assert_eq!(
+            lab_run_status(&interrupted, now, None),
+            RunStatus::Abandoned
+        );
 
         // Complete without `scores.json` — a lab run that finished but whose
         // bench artifacts were never part of its shape.
@@ -4856,7 +5383,11 @@ mod tests {
 
         for st in [Lc::Running, Lc::Unknown] {
             let fresh = lab_summary_with_lifecycle("d", false, false, Some(st));
-            assert_eq!(lab_run_status(&fresh, now, None), RunStatus::Running, "{st:?} fresh");
+            assert_eq!(
+                lab_run_status(&fresh, now, None),
+                RunStatus::Running,
+                "{st:?} fresh"
+            );
 
             let old = lab_summary_with_lifecycle("d", false, false, Some(st));
             assert_eq!(
@@ -4870,9 +5401,18 @@ mod tests {
     #[test]
     fn lab_run_status_maps_finished_and_degenerate() {
         let now = FIXTURE_NOW_MS;
-        assert_eq!(lab_run_status(&minimal_lab_summary("d1", false, false), now, None), RunStatus::Running);
-        assert_eq!(lab_run_status(&minimal_lab_summary("d2", true, false), now, None), RunStatus::Complete);
-        assert_eq!(lab_run_status(&minimal_lab_summary("d3", true, true), now, None), RunStatus::Error);
+        assert_eq!(
+            lab_run_status(&minimal_lab_summary("d1", false, false), now, None),
+            RunStatus::Running
+        );
+        assert_eq!(
+            lab_run_status(&minimal_lab_summary("d2", true, false), now, None),
+            RunStatus::Complete
+        );
+        assert_eq!(
+            lab_run_status(&minimal_lab_summary("d3", true, true), now, None),
+            RunStatus::Error
+        );
     }
 
     #[test]
@@ -4921,7 +5461,10 @@ mod tests {
         let mut coding = minimal_lab_summary("refresh-rotation-1", false, false);
         coding.session_id = Some("darkmux-coding-refresh-rotation-1".to_string());
         let run = lab_summary_to_run(&coding, None, FIXTURE_NOW_MS, None);
-        assert_eq!(run.dispatch_id.as_deref(), Some("darkmux-coding-refresh-rotation-1"));
+        assert_eq!(
+            run.dispatch_id.as_deref(),
+            Some("darkmux-coding-refresh-rotation-1")
+        );
     }
 
     /// The inverted case — without it, the test above would pass even if
@@ -4994,8 +5537,13 @@ mod tests {
     #[test]
     fn lab_summary_to_run_drop_written_interrupted_stays_no_terminal() {
         use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
-        let summary =
-            lab_summary_with_lifecycle_error("dead/case-3", false, false, Some(Lc::Interrupted), None);
+        let summary = lab_summary_with_lifecycle_error(
+            "dead/case-3",
+            false,
+            false,
+            Some(Lc::Interrupted),
+            None,
+        );
         let run = lab_summary_to_run(&summary, None, summary.mtime_ms, None);
         assert_eq!(run.status, RunStatus::Abandoned);
         assert_eq!(
@@ -5018,19 +5566,30 @@ mod tests {
     /// happened would be a worse lie than having no ordering.
     #[test]
     fn lab_summary_to_run_always_carries_an_activity_ts() {
-        let unfinished =
-            lab_summary_to_run(&minimal_lab_summary("live/wip", false, false), None, FIXTURE_NOW_MS, None);
+        let unfinished = lab_summary_to_run(
+            &minimal_lab_summary("live/wip", false, false),
+            None,
+            FIXTURE_NOW_MS,
+            None,
+        );
         assert_eq!(unfinished.status, RunStatus::Running);
         assert_eq!(unfinished.started_ts, None);
-        assert_eq!(unfinished.completed_ts, None, "an unfinished run never completed");
+        assert_eq!(
+            unfinished.completed_ts, None,
+            "an unfinished run never completed"
+        );
         assert_eq!(
             unfinished.updated_ts,
             Some(1_700_000_000),
             "an unfinished lab run must still be orderable by its newest-artifact time"
         );
 
-        let finished =
-            lab_summary_to_run(&minimal_lab_summary("live/done", true, false), None, FIXTURE_NOW_MS, None);
+        let finished = lab_summary_to_run(
+            &minimal_lab_summary("live/done", true, false),
+            None,
+            FIXTURE_NOW_MS,
+            None,
+        );
         assert_eq!(finished.updated_ts, Some(1_700_000_000));
         assert_eq!(finished.completed_ts, Some(1_700_000_000));
     }
@@ -5085,7 +5644,10 @@ mod tests {
         // The operator's actual data: the FRESHEST of 49 stuck runs was 2.6h
         // old. Every one of them must fall out of `running`.
         let two_point_six_hours = FIXTURE_NOW_MS + (2.6 * 3_600_000.0) as u64;
-        assert_eq!(lab_run_status(&summary, two_point_six_hours, None), RunStatus::Abandoned);
+        assert_eq!(
+            lab_run_status(&summary, two_point_six_hours, None),
+            RunStatus::Abandoned
+        );
     }
 
     /// Staleness must never override a run's OWN terminal verdict — a finished
@@ -5148,7 +5710,11 @@ mod tests {
             600,
             "the shipped default inactivity budget"
         );
-        assert_eq!(stale_after_ms(), 600 * 2_000, "a 20-minute staleness window by default");
+        assert_eq!(
+            stale_after_ms(),
+            600 * 2_000,
+            "a 20-minute staleness window by default"
+        );
     }
 
     /// (#3074) `0` on the inactivity bound means UNBOUNDED, so no run is ever
@@ -5158,7 +5724,11 @@ mod tests {
     #[serial_test::serial]
     fn an_unbounded_inactivity_budget_never_reads_a_live_run_abandoned() {
         let _budget = InactivityBudgetGuard::seconds(0);
-        assert_eq!(stale_after_ms(), UNBOUNDED_STALE_AFTER_MS, "0 is the unbounded reading, not a 0ms window");
+        assert_eq!(
+            stale_after_ms(),
+            UNBOUNDED_STALE_AFTER_MS,
+            "0 is the unbounded reading, not a 0ms window"
+        );
         assert_eq!(runs_policy().stale_after_ms, UNBOUNDED_STALE_AFTER_MS);
         let summary = minimal_lab_summary("live/unbounded", false, false);
         assert_eq!(
@@ -5183,7 +5753,11 @@ mod tests {
         let _budget = InactivityBudgetGuard::seconds(0);
         let wire = serde_json::to_value(runs_policy()).unwrap();
         const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-        assert_eq!(wire["stale_after_ms"].as_u64(), Some(MAX_SAFE_INTEGER), "{wire}");
+        assert_eq!(
+            wire["stale_after_ms"].as_u64(),
+            Some(MAX_SAFE_INTEGER),
+            "{wire}"
+        );
     }
 
     // ── the lifecycle corpus: one spec, two executors ────────────────────
@@ -5193,10 +5767,17 @@ mod tests {
     /// read exactly as `/runs` reads it: the settled session's current
     /// attempt. The daemon has no `waiting` phase of its own (a held call is
     /// `Running`), so `open` and `waiting` both read `running` here.
-    fn daemon_judgement(agg: &SessionAgg, opened: bool, now_ms: u64) -> (&'static str, RunStatus, Option<AbandonReason>) {
+    fn daemon_judgement(
+        agg: &SessionAgg,
+        opened: bool,
+        now_ms: u64,
+    ) -> (&'static str, RunStatus, Option<AbandonReason>) {
         let ended = agg.terminal_status.map(|status| {
-            let reason = (status == RunStatus::Abandoned)
-                .then_some(if agg.stopped_by_operator { AbandonReason::Aborted } else { AbandonReason::NoTerminal });
+            let reason = (status == RunStatus::Abandoned).then_some(if agg.stopped_by_operator {
+                AbandonReason::Aborted
+            } else {
+                AbandonReason::NoTerminal
+            });
             (status, reason)
         });
         // Nothing opened: not a run, though its session may have recorded
@@ -5211,7 +5792,11 @@ mod tests {
         if session_is_live(agg, now_ms) {
             return ("running", RunStatus::Running, None);
         }
-        ("stale", RunStatus::Abandoned, Some(AbandonReason::NoTerminal))
+        (
+            "stale",
+            RunStatus::Abandoned,
+            Some(AbandonReason::NoTerminal),
+        )
     }
 
     /// `tests/lifecycle/cases.json`, asserted against the daemon's session
@@ -5228,18 +5813,33 @@ mod tests {
     #[serial_test::serial]
     fn lifecycle_corpus() {
         let _default = InactivityBudgetGuard::unset();
-        let doc: serde_json::Value = serde_json::from_str(include_str!("../../../tests/lifecycle/cases.json")).expect("the corpus parses");
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/lifecycle/cases.json"))
+                .expect("the corpus parses");
         let policy = runs_policy();
-        assert_eq!(doc["policy"]["stale_after_ms"].as_u64(), Some(policy.stale_after_ms), "the corpus is judged at the published policy");
-        assert_eq!(doc["policy"]["budget_wait_grace_ms"].as_u64(), Some(policy.budget_wait_grace_ms));
+        assert_eq!(
+            doc["policy"]["stale_after_ms"].as_u64(),
+            Some(policy.stale_after_ms),
+            "the corpus is judged at the published policy"
+        );
+        assert_eq!(
+            doc["policy"]["budget_wait_grace_ms"].as_u64(),
+            Some(policy.budget_wait_grace_ms)
+        );
         let mut judged = 0;
         for case in doc["cases"].as_array().expect("cases") {
             let name = case["name"].as_str().unwrap_or("?");
             if case.get("server").and_then(|v| v.as_bool()) == Some(false) {
-                assert!(case["server_skip_reason"].as_str().is_some_and(|r| !r.is_empty()), "{name}: a skipped case says why");
+                assert!(
+                    case["server_skip_reason"]
+                        .as_str()
+                        .is_some_and(|r| !r.is_empty()),
+                    "{name}: a skipped case says why"
+                );
                 continue;
             }
-            let now_s = parse_flow_ts(case["as_of"].as_str().expect("as_of")).expect("as_of parses");
+            let now_s =
+                parse_flow_ts(case["as_of"].as_str().expect("as_of")).expect("as_of parses");
             let mut idx: HashMap<String, SessionAgg> = HashMap::new();
             for r in case["records"].as_array().expect("records") {
                 let ts = r["ts"].as_str().and_then(parse_flow_ts);
@@ -5248,18 +5848,32 @@ mod tests {
                 }
             }
             settle_session_index(&mut idx);
-            let sid = case["run"]["session_id"].as_str().or(case["records"][0]["session_id"].as_str()).expect("session_id");
+            let sid = case["run"]["session_id"]
+                .as_str()
+                .or(case["records"][0]["session_id"].as_str())
+                .expect("session_id");
             let Some(agg) = idx.get(sid) else {
-                assert_eq!(case["phase"], "not_started", "{name}: no record of the session is in yet");
+                assert_eq!(
+                    case["phase"], "not_started",
+                    "{name}: no record of the session is in yet"
+                );
                 judged += 1;
                 continue;
             };
             // A case naming its run's mission is judged as `/runs` judges
             // that mission's row: by its own attempts on the session.
-            let scoped = case["run"]["mission_id"].as_str().map(|m| agg.for_mission(m));
+            let scoped = case["run"]["mission_id"]
+                .as_str()
+                .map(|m| agg.for_mission(m));
             let (phase, status, reason) = match &scoped {
                 Some(None) => ("not_started", RunStatus::Planned, None),
-                Some(Some(mine)) => daemon_judgement(mine, mine.lifecycle.latest_of(case["run"]["mission_id"].as_str().unwrap_or_default()).is_some(), now_s * 1_000),
+                Some(Some(mine)) => daemon_judgement(
+                    mine,
+                    mine.lifecycle
+                        .latest_of(case["run"]["mission_id"].as_str().unwrap_or_default())
+                        .is_some(),
+                    now_s * 1_000,
+                ),
                 None => daemon_judgement(agg, agg.lifecycle.latest().is_some(), now_s * 1_000),
             };
             let want_phase = match case["phase"].as_str().expect("phase") {
@@ -5267,11 +5881,22 @@ mod tests {
                 other => other,
             };
             assert_eq!(phase, want_phase, "{name}: phase");
-            assert_eq!(serde_json::to_value(status).unwrap(), case["status"], "{name}: status");
-            assert_eq!(reason.map(|r| serde_json::to_value(r).unwrap()), case.get("abandoned_reason").cloned(), "{name}: abandoned_reason");
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                case["status"],
+                "{name}: status"
+            );
+            assert_eq!(
+                reason.map(|r| serde_json::to_value(r).unwrap()),
+                case.get("abandoned_reason").cloned(),
+                "{name}: abandoned_reason"
+            );
             judged += 1;
         }
-        assert!(judged >= 30, "the daemon judges the corpus, not a token few ({judged})");
+        assert!(
+            judged >= 30,
+            "the daemon judges the corpus, not a token few ({judged})"
+        );
     }
 
     /// The policy `/runs` publishes follows the daemon's own config, the
@@ -5280,7 +5905,13 @@ mod tests {
     #[serial_test::serial]
     fn the_published_policy_follows_the_inactivity_budget() {
         let _budget = InactivityBudgetGuard::seconds(60);
-        assert_eq!(runs_policy(), RunsPolicy { stale_after_ms: 120_000, budget_wait_grace_ms: 60_000 });
+        assert_eq!(
+            runs_policy(),
+            RunsPolicy {
+                stale_after_ms: 120_000,
+                budget_wait_grace_ms: 60_000
+            }
+        );
     }
 
     // ── earliest_by_start: pairs, not bare aggs (#1915) ──────────────────
@@ -5292,8 +5923,14 @@ mod tests {
     /// pass a test built any other way and still drift.
     #[test]
     fn earliest_by_start_returns_the_id_paired_with_the_winning_agg() {
-        let later = SessionAgg { start_ts: Some("2026-01-01T09:00:00Z".to_string()), ..Default::default() };
-        let earlier = SessionAgg { start_ts: Some("2026-01-01T08:00:00Z".to_string()), ..Default::default() };
+        let later = SessionAgg {
+            start_ts: Some("2026-01-01T09:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let earlier = SessionAgg {
+            start_ts: Some("2026-01-01T08:00:00Z".to_string()),
+            ..Default::default()
+        };
         // Listed with the LATER session first, on purpose — a fallback to
         // "just take the first pair" would pass this test for the wrong
         // reason if it happened to also pick the earliest by luck.
@@ -5309,7 +5946,10 @@ mod tests {
     #[test]
     fn earliest_by_start_excludes_a_session_with_no_start_ts_even_when_listed_first() {
         let no_start = SessionAgg::default();
-        let has_start = SessionAgg { start_ts: Some("2026-01-01T08:00:00Z".to_string()), ..Default::default() };
+        let has_start = SessionAgg {
+            start_ts: Some("2026-01-01T08:00:00Z".to_string()),
+            ..Default::default()
+        };
         let pairs = [("no-start-sess", &no_start), ("has-start-sess", &has_start)];
         let (id, _) = earliest_by_start(&pairs).unwrap();
         assert_eq!(id, "has-start-sess");
@@ -5320,8 +5960,14 @@ mod tests {
     /// first pair's agg mismatched to a different id.
     #[test]
     fn earliest_by_start_falls_back_to_the_first_pair_when_nothing_has_a_start_ts() {
-        let a = SessionAgg { role: Some("coder".to_string()), ..Default::default() };
-        let b = SessionAgg { role: Some("reviewer".to_string()), ..Default::default() };
+        let a = SessionAgg {
+            role: Some("coder".to_string()),
+            ..Default::default()
+        };
+        let b = SessionAgg {
+            role: Some("reviewer".to_string()),
+            ..Default::default()
+        };
         let pairs = [("sess-a", &a), ("sess-b", &b)];
         let (id, agg) = earliest_by_start(&pairs).unwrap();
         assert_eq!(id, "sess-a");
@@ -5359,7 +6005,12 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
+        let idx = build_flow_session_index(
+            tmp.path(),
+            &[],
+            RUNS_FLOW_SCAN_WINDOW_DAYS,
+            &PeerClocks::default(),
+        );
         let agg = idx.get("task-__panel_args__").expect("session indexed");
         assert!(
             agg.is_ambiguous(),
@@ -5395,7 +6046,12 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
+        let idx = build_flow_session_index(
+            tmp.path(),
+            &[],
+            RUNS_FLOW_SCAN_WINDOW_DAYS,
+            &PeerClocks::default(),
+        );
         let agg = idx.get("crew-dispatch-coder-1").expect("session indexed");
         assert!(
             !agg.is_ambiguous(),
@@ -5428,7 +6084,12 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
+        let idx = build_flow_session_index(
+            tmp.path(),
+            &[],
+            RUNS_FLOW_SCAN_WINDOW_DAYS,
+            &PeerClocks::default(),
+        );
         let agg = idx.get("sess-1").expect("session indexed");
         assert_eq!(agg.endpoint.as_deref(), Some("azure:host/gpt-4o"));
         assert_eq!(agg.terminal_status, Some(RunStatus::Complete));
@@ -5455,7 +6116,12 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
+        let idx = build_flow_session_index(
+            tmp.path(),
+            &[],
+            RUNS_FLOW_SCAN_WINDOW_DAYS,
+            &PeerClocks::default(),
+        );
         assert_eq!(idx["sess-2"].terminal_status, Some(RunStatus::Abandoned));
     }
 
@@ -5501,7 +6167,12 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
+        let idx = build_flow_session_index(
+            tmp.path(),
+            &[],
+            RUNS_FLOW_SCAN_WINDOW_DAYS,
+            &PeerClocks::default(),
+        );
         assert_eq!(idx["sess-3"].terminal_status, Some(RunStatus::Error));
     }
 
@@ -5521,7 +6192,12 @@ mod tests {
                 "handle": "coder",
             })],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
+        let idx = build_flow_session_index(
+            tmp.path(),
+            &[],
+            RUNS_FLOW_SCAN_WINDOW_DAYS,
+            &PeerClocks::default(),
+        );
         assert!(
             !idx.contains_key("ancient-orphan-sess"),
             "a session older than the scan window must never be indexed at all"
@@ -5554,7 +6230,12 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
+        let idx = build_flow_session_index(
+            tmp.path(),
+            &[],
+            RUNS_FLOW_SCAN_WINDOW_DAYS,
+            &PeerClocks::default(),
+        );
         let agg = idx.get("ticking-sess").expect("session indexed");
         assert_eq!(
             agg.last_activity_ts.as_deref(),
@@ -5599,7 +6280,12 @@ mod tests {
                 }),
             ],
         );
-        let idx = build_flow_session_index(tmp.path(), &[], RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
+        let idx = build_flow_session_index(
+            tmp.path(),
+            &[],
+            RUNS_FLOW_SCAN_WINDOW_DAYS,
+            &PeerClocks::default(),
+        );
         let agg = idx.get("outoforder-sess").expect("session indexed");
         assert_eq!(
             agg.last_activity_ts.as_deref(),
@@ -5625,8 +6311,17 @@ mod tests {
         );
         let mut known_missions = HashSet::new();
         known_missions.insert("real-mission-1".to_string());
-        let ghosts = ghost_runs(&idx, &known_missions, &HashSet::new(), &HashSet::new(), now_unix() * 1_000);
-        assert!(ghosts.is_empty(), "a session covered by a loaded mission must not double-list");
+        let ghosts = ghost_runs(
+            &idx,
+            &known_missions,
+            &HashSet::new(),
+            &HashSet::new(),
+            now_unix() * 1_000,
+        );
+        assert!(
+            ghosts.is_empty(),
+            "a session covered by a loaded mission must not double-list"
+        );
     }
 
     #[test]
@@ -5636,11 +6331,21 @@ mod tests {
         let mut idx = HashMap::new();
         idx.insert(
             "crew-dispatch-coder-abc".to_string(),
-            SessionAgg { mission_id: None, has_start: true, ..Default::default() },
+            SessionAgg {
+                mission_id: None,
+                has_start: true,
+                ..Default::default()
+            },
         );
         let mut known_sessions = HashSet::new();
         known_sessions.insert("crew-dispatch-coder-abc".to_string());
-        let ghosts = ghost_runs(&idx, &HashSet::new(), &known_sessions, &HashSet::new(), now_unix() * 1_000);
+        let ghosts = ghost_runs(
+            &idx,
+            &HashSet::new(),
+            &known_sessions,
+            &HashSet::new(),
+            now_unix() * 1_000,
+        );
         assert!(ghosts.is_empty());
     }
 
@@ -5662,7 +6367,13 @@ mod tests {
         // Judged at exactly the session's own activity instant — idle 0,
         // unambiguously live.
         let now_ms = parse_flow_ts("2026-07-24T10:00:00Z").unwrap() * 1_000;
-        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_ms);
+        let ghosts = ghost_runs(
+            &idx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            now_ms,
+        );
         assert_eq!(ghosts.len(), 1);
         let g = &ghosts[0];
         assert_eq!(g.id, "orphan-sess");
@@ -5698,18 +6409,38 @@ mod tests {
     #[test]
     fn a_relayed_run_is_one_executor_row_naming_where_it_was_asked() {
         let sender = sender_session("radio");
-        let relayed = darkmux_types::session_id::SessionId::relay(sender.clone(), "MacBook-Pro").wire();
+        let relayed =
+            darkmux_types::session_id::SessionId::relay(sender.clone(), "MacBook-Pro").wire();
         let mut idx = HashMap::new();
-        idx.insert(sender.wire(), SessionAgg { machine: Some("MacBook-Pro".into()), ..Default::default() });
+        idx.insert(
+            sender.wire(),
+            SessionAgg {
+                machine: Some("MacBook-Pro".into()),
+                ..Default::default()
+            },
+        );
         idx.insert(relayed.clone(), live_ghost_agg("darkbook"));
         let now_ms = parse_flow_ts("2026-07-24T10:00:00Z").unwrap() * 1_000;
-        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_ms);
+        let ghosts = ghost_runs(
+            &idx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            now_ms,
+        );
         assert_eq!(ghosts.len(), 1, "one relayed run is one row: {ghosts:?}");
         assert_eq!(ghosts[0].id, relayed);
-        assert_eq!(ghosts[0].machine.as_deref(), Some("darkbook"), "the executor owns the row");
+        assert_eq!(
+            ghosts[0].machine.as_deref(),
+            Some("darkbook"),
+            "the executor owns the row"
+        );
         assert_eq!(
             ghosts[0].relay,
-            Some(RunRelay { asked_on_machine: "MacBook-Pro".into(), sender_run: None }),
+            Some(RunRelay {
+                asked_on_machine: "MacBook-Pro".into(),
+                sender_run: None
+            }),
             "a radio asker has no run row to point at, so none is named"
         );
     }
@@ -5721,18 +6452,33 @@ mod tests {
         let sender = SessionId::step(RunId::mission("review-17").unwrap(), "probe");
         let relay = run_relay(&SessionId::relay(sender, "MacBook-Pro").wire()).expect("a relay");
         assert_eq!(relay.sender_run.as_deref(), Some("review-17"));
-        assert_eq!(run_relay(&sender_session("radio").wire()), None, "a non-relay id has no origin");
+        assert_eq!(
+            run_relay(&sender_session("radio").wire()),
+            None,
+            "a non-relay id has no origin"
+        );
     }
 
     /// (#3016) Two sessions that merely look alike stay two rows.
     #[test]
     fn ghost_runs_keep_an_unrelated_pair_as_two_rows() {
-        let relayed = darkmux_types::session_id::SessionId::relay(sender_session("radio-1"), "MacBook-Pro").wire();
+        let relayed =
+            darkmux_types::session_id::SessionId::relay(sender_session("radio-1"), "MacBook-Pro")
+                .wire();
         let mut idx = HashMap::new();
-        idx.insert(sender_session("radio-2").wire(), live_ghost_agg("MacBook-Pro"));
+        idx.insert(
+            sender_session("radio-2").wire(),
+            live_ghost_agg("MacBook-Pro"),
+        );
         idx.insert(relayed, live_ghost_agg("darkbook"));
         let now_ms = parse_flow_ts("2026-07-24T10:00:00Z").unwrap() * 1_000;
-        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_ms);
+        let ghosts = ghost_runs(
+            &idx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            now_ms,
+        );
         assert_eq!(ghosts.len(), 2, "{ghosts:?}");
         assert_eq!(ghosts.iter().filter(|g| g.relay.is_some()).count(), 1);
     }
@@ -5763,8 +6509,18 @@ mod tests {
         collided.mission_ids_seen.insert("mission-b".to_string());
         idx.insert("colliding-sess".to_string(), collided);
         let now_ms = parse_flow_ts("2026-07-24T10:00:00Z").unwrap() * 1_000;
-        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_ms);
-        assert_eq!(ghosts.len(), 1, "the row itself is still real and still emitted: {ghosts:?}");
+        let ghosts = ghost_runs(
+            &idx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            now_ms,
+        );
+        assert_eq!(
+            ghosts.len(),
+            1,
+            "the row itself is still real and still emitted: {ghosts:?}"
+        );
         let g = &ghosts[0];
         assert_eq!(g.id, "colliding-sess");
         assert_eq!(
@@ -5778,9 +6534,18 @@ mod tests {
         let mut idx = HashMap::new();
         idx.insert(
             "no-start-sess".to_string(),
-            SessionAgg { has_start: false, ..Default::default() },
+            SessionAgg {
+                has_start: false,
+                ..Default::default()
+            },
         );
-        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_unix() * 1_000);
+        let ghosts = ghost_runs(
+            &idx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            now_unix() * 1_000,
+        );
         assert!(ghosts.is_empty());
     }
 
@@ -5796,14 +6561,34 @@ mod tests {
         let mut idx = HashMap::new();
         fold_session_record(&mut idx, &wait);
         settle_session_index(&mut idx);
-        let held = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), base_ms + 3 * 3_600_000);
-        assert_eq!(held.len(), 1, "a waiting session with no start yet is a run");
-        assert_eq!(held[0].status, RunStatus::Running, "running while it waits, hours past the staleness window");
+        let held = ghost_runs(
+            &idx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            base_ms + 3 * 3_600_000,
+        );
+        assert_eq!(
+            held.len(),
+            1,
+            "a waiting session with no start yet is a run"
+        );
+        assert_eq!(
+            held[0].status,
+            RunStatus::Running,
+            "running while it waits, hours past the staleness window"
+        );
 
         let stop = serde_json::json!({ "ts": "2000-01-01T04:00:00Z", "action": "budget.stop", "session_id": "held", "payload": { "scope": "endpoint", "message": "stopped", "reason": "mission `m` is aborted" } });
         fold_session_record(&mut idx, &stop);
         settle_session_index(&mut idx);
-        let stopped = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), base_ms + 5 * 3_600_000);
+        let stopped = ghost_runs(
+            &idx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            base_ms + 5 * 3_600_000,
+        );
         assert_eq!(stopped[0].status, RunStatus::Abandoned);
         assert_eq!(stopped[0].abandoned_reason, Some(AbandonReason::Aborted));
     }
@@ -5822,12 +6607,31 @@ mod tests {
             let mut idx = HashMap::new();
             idx.insert(
                 "peer-sess".to_string(),
-                SessionAgg { has_start: true, last_activity_ts: Some(base_ts.to_string()), clock_now_ms, ..Default::default() },
+                SessionAgg {
+                    has_start: true,
+                    last_activity_ts: Some(base_ts.to_string()),
+                    clock_now_ms,
+                    ..Default::default()
+                },
             );
-            ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), daemon_now)
+            ghost_runs(
+                &idx,
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashSet::new(),
+                daemon_now,
+            )
         };
-        assert_eq!(session(None)[0].status, RunStatus::Abandoned, "judged by this daemon's clock it is 30 minutes quiet");
-        assert_eq!(session(Some(base_ms + 1_000))[0].status, RunStatus::Running, "its own clock says it just wrote");
+        assert_eq!(
+            session(None)[0].status,
+            RunStatus::Abandoned,
+            "judged by this daemon's clock it is 30 minutes quiet"
+        );
+        assert_eq!(
+            session(Some(base_ms + 1_000))[0].status,
+            RunStatus::Running,
+            "its own clock says it just wrote"
+        );
         // And the other way: the peer's own clock moved on past the budget, so
         // a session that has been quiet that long on ITS clock has stopped.
         let quiet = session(Some(base_ms + stale_after_ms() + 1_000));
@@ -5844,22 +6648,38 @@ mod tests {
         let reads = std::cell::Cell::new(0);
         let read = || {
             reads.set(reads.get() + 1);
-            PeerClocks { now_ms: HashMap::from([("u".to_string(), 7)]), ..Default::default() }
+            PeerClocks {
+                now_ms: HashMap::from([("u".to_string(), 7)]),
+                ..Default::default()
+            }
         };
         assert_eq!(PeerClocks::cached_in(&cache, t0, read).now_ms["u"], 7);
-        assert_eq!(PeerClocks::cached_in(&cache, t0 + PEER_CLOCKS_CACHE_TTL / 2, read).now_ms["u"], 7);
-        assert_eq!(reads.get(), 1, "a second build inside the TTL reuses the read");
+        assert_eq!(
+            PeerClocks::cached_in(&cache, t0 + PEER_CLOCKS_CACHE_TTL / 2, read).now_ms["u"],
+            7
+        );
+        assert_eq!(
+            reads.get(),
+            1,
+            "a second build inside the TTL reuses the read"
+        );
         PeerClocks::cached_in(&cache, t0 + PEER_CLOCKS_CACHE_TTL * 2, read);
         assert_eq!(reads.get(), 2, "past the TTL it reads again");
     }
 
     #[test]
     fn a_reporting_peers_sessions_get_its_beat_clock() {
-        let sess = |uid: &str| SessionAgg { machine_uid: Some(uid.to_string()), ..Default::default() };
+        let sess = |uid: &str| SessionAgg {
+            machine_uid: Some(uid.to_string()),
+            ..Default::default()
+        };
         let mut idx = HashMap::new();
         idx.insert("slow".to_string(), sess("PEER-UID-0001"));
         idx.insert("silent".to_string(), sess("GONE-UID-0002"));
-        idx.insert("mine".to_string(), sess(darkmux_hardware::machine_uid().unwrap_or("local")));
+        idx.insert(
+            "mine".to_string(),
+            sess(darkmux_hardware::machine_uid().unwrap_or("local")),
+        );
         idx.insert("anon".to_string(), SessionAgg::default());
         let beat = |uid: &str, ts: u64| darkmux_flow::presence::PresenceBeat {
             machine_uid: uid.to_string(),
@@ -5875,9 +6695,19 @@ mod tests {
             beats.push(beat(me, 5_000_000));
         }
         PeerClocks::from_beats(&beats).apply(&mut idx);
-        assert_eq!(idx["slow"].clock_now_ms, Some(1_000_000), "uids compare case-insensitively");
-        assert_eq!(idx["silent"].clock_now_ms, None, "no live beat: not reporting, judged by this daemon's clock");
-        assert_eq!(idx["mine"].clock_now_ms, None, "this machine's own sessions keep this machine's clock");
+        assert_eq!(
+            idx["slow"].clock_now_ms,
+            Some(1_000_000),
+            "uids compare case-insensitively"
+        );
+        assert_eq!(
+            idx["silent"].clock_now_ms, None,
+            "no live beat: not reporting, judged by this daemon's clock"
+        );
+        assert_eq!(
+            idx["mine"].clock_now_ms, None,
+            "this machine's own sessions keep this machine's clock"
+        );
         assert_eq!(idx["anon"].clock_now_ms, None);
     }
 
@@ -5893,7 +6723,10 @@ mod tests {
         let start_ts = "2000-01-01T00:00:00Z";
         let start_ms = parse_flow_ts(start_ts).unwrap() * 1_000;
         let after = start_ms + 60_000;
-        assert!(stale_after_ms() > 60_000, "the case is a run quiet for less than the staleness budget");
+        assert!(
+            stale_after_ms() > 60_000,
+            "the case is a run quiet for less than the staleness budget"
+        );
         let peer = "STUDIO-UID-3125";
         let build = |action: &str, uid: &str, clocks: PeerClocks, now: u64| {
             let mut idx = HashMap::new();
@@ -5910,21 +6743,59 @@ mod tests {
             live_sessions: live,
         };
 
-        let killed = build("dispatch.start", peer, reporting(after, Some(HashSet::new())), after);
-        assert_eq!(killed[0].status, RunStatus::Abandoned, "machine up, beat gone, no terminal: nothing runs it");
+        let killed = build(
+            "dispatch.start",
+            peer,
+            reporting(after, Some(HashSet::new())),
+            after,
+        );
+        assert_eq!(
+            killed[0].status,
+            RunStatus::Abandoned,
+            "machine up, beat gone, no terminal: nothing runs it"
+        );
         assert_eq!(killed[0].abandoned_reason, Some(AbandonReason::NoTerminal));
 
         // The inverted cases, each of which must still read running.
-        let beating = build("dispatch.start", peer, reporting(after, Some(HashSet::from(["killed".to_string()]))), after);
-        assert_eq!(beating[0].status, RunStatus::Running, "a live beat is a live run");
+        let beating = build(
+            "dispatch.start",
+            peer,
+            reporting(after, Some(HashSet::from(["killed".to_string()]))),
+            after,
+        );
+        assert_eq!(
+            beating[0].status,
+            RunStatus::Running,
+            "a live beat is a live run"
+        );
         let unknown = build("dispatch.start", peer, reporting(after, None), after);
-        assert_eq!(unknown[0].status, RunStatus::Running, "presence off or unread: no beat is known to be missing");
-        let down = PeerClocks { live_sessions: Some(HashSet::new()), ..Default::default() };
+        assert_eq!(
+            unknown[0].status,
+            RunStatus::Running,
+            "presence off or unread: no beat is known to be missing"
+        );
+        let down = PeerClocks {
+            live_sessions: Some(HashSet::new()),
+            ..Default::default()
+        };
         let partitioned = build("dispatch.start", peer, down, after);
-        assert_eq!(partitioned[0].status, RunStatus::Running, "its machine is not reporting: that is `not reporting`, not an ending");
+        assert_eq!(
+            partitioned[0].status,
+            RunStatus::Running,
+            "its machine is not reporting: that is `not reporting`, not an ending"
+        );
         let just_started = start_ms + BEAT_GONE_GRACE_MS - 1_000;
-        let starting = build("dispatch.start", peer, reporting(just_started, Some(HashSet::new())), just_started);
-        assert_eq!(starting[0].status, RunStatus::Running, "inside the grace its first beat may not be read yet");
+        let starting = build(
+            "dispatch.start",
+            peer,
+            reporting(just_started, Some(HashSet::new())),
+            just_started,
+        );
+        assert_eq!(
+            starting[0].status,
+            RunStatus::Running,
+            "inside the grace its first beat may not be read yet"
+        );
         // A call its budget holds before any bookend: its wait's lapse judges
         // it, never its beat, whatever a record says.
         let mut held = HashMap::new();
@@ -5936,14 +6807,27 @@ mod tests {
         settle_session_index(&mut held);
         held.get_mut("held").unwrap().beats_promised = true;
         reporting(after, Some(HashSet::new())).apply(&mut held);
-        assert!(held["held"].beat_lost, "the case under test: no beat on a reporting machine");
-        assert!(session_is_live(&held["held"], after), "only a session a bookend opened is judged by its beat");
+        assert!(
+            held["held"].beat_lost,
+            "the case under test: no beat on a reporting machine"
+        );
+        assert!(
+            session_is_live(&held["held"], after),
+            "only a session a bookend opened is judged by its beat"
+        );
 
         // This machine's own run, while this machine's own beat is live.
         if let Some(mine) = darkmux_hardware::machine_uid() {
-            let own_clocks = PeerClocks { now_ms: HashMap::from([(mine.to_ascii_lowercase(), after)]), live_sessions: Some(HashSet::new()) };
+            let own_clocks = PeerClocks {
+                now_ms: HashMap::from([(mine.to_ascii_lowercase(), after)]),
+                live_sessions: Some(HashSet::new()),
+            };
             let own = build("dispatch.start", mine, own_clocks, after);
-            assert_eq!(own[0].status, RunStatus::Abandoned, "on its own machine too");
+            assert_eq!(
+                own[0].status,
+                RunStatus::Abandoned,
+                "on its own machine too"
+            );
         }
     }
 
@@ -5957,29 +6841,57 @@ mod tests {
         let after = parse_flow_ts(start_ts).unwrap() * 1_000 + 60_000;
         assert!(stale_after_ms() > 60_000);
         let peer = "STUDIO-UID-3125";
-        let run_session = darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission("m-killed").unwrap()).wire();
-        let task_session = darkmux_types::session_id::SessionId::task(darkmux_types::session_id::RunId::mission("m-killed").unwrap(), "coder").wire();
-        let rec = |action: &str, session: &str| serde_json::json!({
-            "ts": start_ts, "action": action, "handle": "coder", "mission_id": "m-killed",
-            "session_id": session, "machine_id": "studio", "machine_uid": peer, "payload": { "beats": true },
-        });
-        let records = [rec("run.start", &run_session), rec("dispatch.start", &task_session)];
+        let run_session = darkmux_types::session_id::SessionId::run(
+            darkmux_types::session_id::RunId::mission("m-killed").unwrap(),
+        )
+        .wire();
+        let task_session = darkmux_types::session_id::SessionId::task(
+            darkmux_types::session_id::RunId::mission("m-killed").unwrap(),
+            "coder",
+        )
+        .wire();
+        let rec = |action: &str, session: &str| {
+            serde_json::json!({
+                "ts": start_ts, "action": action, "handle": "coder", "mission_id": "m-killed",
+                "session_id": session, "machine_id": "studio", "machine_uid": peer, "payload": { "beats": true },
+            })
+        };
+        let records = [
+            rec("run.start", &run_session),
+            rec("dispatch.start", &task_session),
+        ];
         let row = |live: HashSet<String>| {
             let mut idx = HashMap::new();
             let mut missions: HashMap<String, FlowMissionAgg> = HashMap::new();
             for r in &records {
                 fold_session_record(&mut idx, r);
-                missions.entry("m-killed".to_string()).or_default().fold_record(r);
+                missions
+                    .entry("m-killed".to_string())
+                    .or_default()
+                    .fold_record(r);
             }
             settle_session_index(&mut idx);
-            PeerClocks { now_ms: HashMap::from([(peer.to_ascii_lowercase(), after)]), live_sessions: Some(live) }.apply(&mut idx);
-            peer_runs_from_index(&missions, &HashSet::new(), &idx, after).0.remove(0)
+            PeerClocks {
+                now_ms: HashMap::from([(peer.to_ascii_lowercase(), after)]),
+                live_sessions: Some(live),
+            }
+            .apply(&mut idx);
+            peer_runs_from_index(&missions, &HashSet::new(), &idx, after)
+                .0
+                .remove(0)
         };
         let killed = row(HashSet::new());
-        assert_eq!(killed.status, RunStatus::Abandoned, "every beat gone on a reporting machine: nothing runs it");
+        assert_eq!(
+            killed.status,
+            RunStatus::Abandoned,
+            "every beat gone on a reporting machine: nothing runs it"
+        );
         assert_eq!(killed.abandoned_reason, Some(AbandonReason::NoTerminal));
         // Between dispatches only the launcher beats, and that is enough.
-        assert_eq!(row(HashSet::from([run_session.clone()])).status, RunStatus::Running);
+        assert_eq!(
+            row(HashSet::from([run_session.clone()])).status,
+            RunStatus::Running
+        );
     }
 
     /// (#3125 review) A missing beat counts only for a session whose start
@@ -5990,10 +6902,15 @@ mod tests {
     /// refusing writes, or no Keychain access, beats nothing anywhere).
     #[test]
     fn a_session_with_no_beat_promised_or_on_a_silent_machine_is_not_abandoned() {
-        let Some(mine) = darkmux_hardware::machine_uid() else { return };
+        let Some(mine) = darkmux_hardware::machine_uid() else {
+            return;
+        };
         let start_ts = "2000-01-01T00:00:00Z";
         let after = parse_flow_ts(start_ts).unwrap() * 1_000 + 60_000;
-        let run_session = darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission("panel-1").unwrap()).wire();
+        let run_session = darkmux_types::session_id::SessionId::run(
+            darkmux_types::session_id::RunId::mission("panel-1").unwrap(),
+        )
+        .wire();
         let row = |payload: serde_json::Value, clocks: PeerClocks| {
             let r = serde_json::json!({
                 "ts": start_ts, "action": "run.start", "handle": "pr-merge", "mission_id": "panel-1",
@@ -6002,18 +6919,44 @@ mod tests {
             let mut idx = HashMap::new();
             let mut missions: HashMap<String, FlowMissionAgg> = HashMap::new();
             fold_session_record(&mut idx, &r);
-            missions.entry("panel-1".to_string()).or_default().fold_record(&r);
+            missions
+                .entry("panel-1".to_string())
+                .or_default()
+                .fold_record(&r);
             settle_session_index(&mut idx);
             clocks.apply(&mut idx);
-            peer_runs_from_index(&missions, &HashSet::new(), &idx, after).0.remove(0)
+            peer_runs_from_index(&missions, &HashSet::new(), &idx, after)
+                .0
+                .remove(0)
         };
-        let my_beat = || PeerClocks { now_ms: HashMap::from([(mine.to_ascii_lowercase(), after)]), live_sessions: Some(HashSet::new()) };
+        let my_beat = || PeerClocks {
+            now_ms: HashMap::from([(mine.to_ascii_lowercase(), after)]),
+            live_sessions: Some(HashSet::new()),
+        };
         let panel = row(serde_json::json!({}), my_beat());
-        assert_eq!(panel.status, RunStatus::Running, "a run that promised no beat lost nothing");
-        let silent = row(serde_json::json!({ "beats": true }), PeerClocks { now_ms: HashMap::new(), live_sessions: Some(HashSet::new()) });
-        assert_eq!(silent.status, RunStatus::Running, "this machine's own beat is absent: its beats prove nothing");
+        assert_eq!(
+            panel.status,
+            RunStatus::Running,
+            "a run that promised no beat lost nothing"
+        );
+        let silent = row(
+            serde_json::json!({ "beats": true }),
+            PeerClocks {
+                now_ms: HashMap::new(),
+                live_sessions: Some(HashSet::new()),
+            },
+        );
+        assert_eq!(
+            silent.status,
+            RunStatus::Running,
+            "this machine's own beat is absent: its beats prove nothing"
+        );
         let gone = row(serde_json::json!({ "beats": true }), my_beat());
-        assert_eq!(gone.status, RunStatus::Abandoned, "promised a beat, beat gone, on a machine that beats: it ended");
+        assert_eq!(
+            gone.status,
+            RunStatus::Abandoned,
+            "promised a beat, beat gone, on a machine that beats: it ended"
+        );
     }
 
     /// (#2891) `/runs` built through one long-lived record store (the
@@ -6026,7 +6969,10 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let dir = flows.path();
-        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         let (yesterday, today) = (day_string_from_epoch_ms(now_ms - 86_400_000), today());
         let at = |day: &str, s: u32| format!("{day}T00:00:{:02}Z", s % 60);
         let session = |day: &str, sid: &str, mid: Option<&str>, s: u32| {
@@ -6053,15 +6999,30 @@ mod tests {
             ]
         };
         let append = |day: &str, recs: &[serde_json::Value]| {
-            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{day}.jsonl"))).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(format!("{day}.jsonl")))
+                .unwrap();
             for r in recs {
                 writeln!(f, "{}", serde_json::to_string(r).unwrap()).unwrap();
             }
         };
         let store = FlowRecordStore::new(feeds_runs_index);
         let body = |store: Option<&FlowRecordStore>| {
-            let out = build_runs_judged_by(store, dir, None, &[], &ScanWindow::default_window(), &PeerClocks::default());
-            let mut runs: Vec<String> = out.runs.iter().map(|r| serde_json::to_string(r).unwrap()).collect();
+            let out = build_runs_judged_by(
+                store,
+                dir,
+                None,
+                &[],
+                &ScanWindow::default_window(),
+                &PeerClocks::default(),
+            );
+            let mut runs: Vec<String> = out
+                .runs
+                .iter()
+                .map(|r| serde_json::to_string(r).unwrap())
+                .collect();
             runs.sort();
             (runs, serde_json::to_string(&out.usage).unwrap())
         };
@@ -6070,7 +7031,11 @@ mod tests {
             // form lost, or a record `feeds_runs_index` wrongly drops, shows here.
             let fresh = body(None);
             assert!(!fresh.0.is_empty(), "{step}: the fixture builds rows");
-            assert_eq!(body(Some(&store)), fresh, "{step}: the incremental build differs from a scratch build");
+            assert_eq!(
+                body(Some(&store)),
+                fresh,
+                "{step}: the incremental build differs from a scratch build"
+            );
         };
         append(&yesterday, &session(&yesterday, "s-a", None, 0));
         append(&yesterday, &loose(&yesterday, 5));
@@ -6078,7 +7043,11 @@ mod tests {
         agree("first build");
         let parsed = store.lines_parsed();
         agree("repeat build");
-        assert_eq!(store.lines_parsed(), parsed, "a repeat build with nothing appended parses no line");
+        assert_eq!(
+            store.lines_parsed(),
+            parsed,
+            "a repeat build with nothing appended parses no line"
+        );
 
         append(&today, &session(&today, "s-c", Some("m-1"), 10));
         append(&today, &loose(&today, 20));
@@ -6118,15 +7087,36 @@ mod tests {
             })],
         );
         let process = || {
-            let clocks = PeerClocks { now_ms: HashMap::from([(peer.to_ascii_lowercase(), peer_now)]), live_sessions: Some(HashSet::new()) };
-            let out = build_runs_judged_by(None, flows.path(), None, &[], &ScanWindow::default_window(), &clocks);
-            let row = out.runs.iter().find(|r| r.id == "killed-sess").expect("the killed session's row").clone();
+            let clocks = PeerClocks {
+                now_ms: HashMap::from([(peer.to_ascii_lowercase(), peer_now)]),
+                live_sessions: Some(HashSet::new()),
+            };
+            let out = build_runs_judged_by(
+                None,
+                flows.path(),
+                None,
+                &[],
+                &ScanWindow::default_window(),
+                &clocks,
+            );
+            let row = out
+                .runs
+                .iter()
+                .find(|r| r.id == "killed-sess")
+                .expect("the killed session's row")
+                .clone();
             (row.status, row.abandoned_reason)
         };
         let daemon = process();
         let run_list = process();
-        assert_eq!(run_list, daemon, "a fresh process and a long-running one must agree");
-        assert_eq!(run_list, (RunStatus::Abandoned, Some(AbandonReason::NoTerminal)));
+        assert_eq!(
+            run_list, daemon,
+            "a fresh process and a long-running one must agree"
+        );
+        assert_eq!(
+            run_list,
+            (RunStatus::Abandoned, Some(AbandonReason::NoTerminal))
+        );
     }
 
     /// (#3467) `/runs` and `run list` read a dispatch starting its model as
@@ -6148,7 +7138,8 @@ mod tests {
             })
         };
         let model = |elapsed: Option<u64>| {
-            let mut p = serde_json::json!({"engine": "tensorfold", "endpoint": "tf", "model": "TF/m"});
+            let mut p =
+                serde_json::json!({"engine": "tensorfold", "endpoint": "tf", "model": "TF/m"});
             if let Some(ms) = elapsed {
                 p["elapsed_ms"] = ms.into();
             }
@@ -6160,7 +7151,11 @@ mod tests {
         darkmux_crew::lifecycle::save_mission(&minimal_mission(
             "disp-1",
             vec![],
-            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "x".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "dispatch".to_string(),
+                inputs_fingerprint: "x".to_string(),
+                origin: None,
+            }),
         ))
         .unwrap();
         let in_mission = |action: &str, back: i64, payload: serde_json::Value| {
@@ -6189,29 +7184,65 @@ mod tests {
         ];
         let rows = |lines: &[serde_json::Value]| {
             write_day_file(flows.path(), &today(), lines);
-            build_runs_judged_by(None, flows.path(), None, &[], &ScanWindow::default_window(), &PeerClocks::default()).runs
+            build_runs_judged_by(
+                None,
+                flows.path(),
+                None,
+                &[],
+                &ScanWindow::default_window(),
+                &PeerClocks::default(),
+            )
+            .runs
         };
-        let pick = |rows: &[Run], id: &str| rows.iter().find(|r| r.id == id).cloned().unwrap_or_else(|| panic!("no row {id}: {rows:?}"));
+        let pick = |rows: &[Run], id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("no row {id}: {rows:?}"))
+        };
         let row = |lines: &[serde_json::Value]| pick(&rows(lines), "tf-sess");
         let first = rows(&lines);
         let mission = pick(&first, "disp-1");
-        assert_eq!((mission.kind, mission.status), (RunKind::Dispatch, RunStatus::Running));
-        assert_eq!((mission.activity, mission.activity_elapsed_ms), (Some(RunActivity::StartingModel), Some(10_000)), "a tracked dispatch reads it too");
+        assert_eq!(
+            (mission.kind, mission.status),
+            (RunKind::Dispatch, RunStatus::Running)
+        );
+        assert_eq!(
+            (mission.activity, mission.activity_elapsed_ms),
+            (Some(RunActivity::StartingModel), Some(10_000)),
+            "a tracked dispatch reads it too"
+        );
         let gone = pick(&first, "stale-sess");
         assert_eq!(gone.status, RunStatus::Abandoned);
-        assert_eq!((gone.activity, gone.activity_elapsed_ms), (None, None), "only a running run is doing anything");
+        assert_eq!(
+            (gone.activity, gone.activity_elapsed_ms),
+            (None, None),
+            "only a running run is doing anything"
+        );
         let starting = row(&lines);
         assert_eq!(starting.status, RunStatus::Running);
-        assert_eq!((starting.activity, starting.activity_elapsed_ms), (Some(RunActivity::StartingModel), Some(20_000)));
+        assert_eq!(
+            (starting.activity, starting.activity_elapsed_ms),
+            (Some(RunActivity::StartingModel), Some(20_000))
+        );
         let wire = serde_json::to_value(&starting).unwrap();
-        assert_eq!((wire["activity"].as_str(), wire["activity_elapsed_ms"].as_u64()), (Some("starting_model"), Some(20_000)));
+        assert_eq!(
+            (
+                wire["activity"].as_str(),
+                wire["activity_elapsed_ms"].as_u64()
+            ),
+            (Some("starting_model"), Some(20_000))
+        );
 
         lines.push(rec("dispatch.model.ready", 15, model(Some(24_000))));
         let ready = row(&lines);
         assert_eq!(ready.status, RunStatus::Running);
         assert_eq!((ready.activity, ready.activity_elapsed_ms), (None, None));
         let wire = serde_json::to_value(&ready).unwrap();
-        assert!(wire.get("activity").is_none() && wire.get("activity_elapsed_ms").is_none(), "absent, not null: {wire}");
+        assert!(
+            wire.get("activity").is_none() && wire.get("activity_elapsed_ms").is_none(),
+            "absent, not null: {wire}"
+        );
     }
 
     /// (#3504) A dispatch queued for a busy endpoint or memory reads
@@ -6225,7 +7256,8 @@ mod tests {
         let flows = TempDir::new().unwrap();
         let now = now_unix() as i64;
         let rec = |action: &str, back: i64, elapsed: Option<u64>| {
-            let mut payload = serde_json::json!({"engine": "tensorfold", "endpoint": "tf", "model": "TF/m"});
+            let mut payload =
+                serde_json::json!({"engine": "tensorfold", "endpoint": "tf", "model": "TF/m"});
             if let Some(ms) = elapsed {
                 payload["elapsed_ms"] = ms.into();
             }
@@ -6236,8 +7268,18 @@ mod tests {
         };
         let row = |lines: &[serde_json::Value]| {
             write_day_file(flows.path(), &today(), lines);
-            let runs = build_runs_judged_by(None, flows.path(), None, &[], &ScanWindow::default_window(), &PeerClocks::default()).runs;
-            runs.into_iter().find(|r| r.id == "q-sess").expect("the run")
+            let runs = build_runs_judged_by(
+                None,
+                flows.path(),
+                None,
+                &[],
+                &ScanWindow::default_window(),
+                &PeerClocks::default(),
+            )
+            .runs;
+            runs.into_iter()
+                .find(|r| r.id == "q-sess")
+                .expect("the run")
         };
         let mut lines = vec![
             rec("dispatch.start", 50, None),
@@ -6246,17 +7288,28 @@ mod tests {
         ];
         let queued = row(&lines);
         assert_eq!(queued.status, RunStatus::Running);
-        assert_eq!((queued.activity, queued.activity_elapsed_ms), (Some(RunActivity::Queued), Some(20_000)));
+        assert_eq!(
+            (queued.activity, queued.activity_elapsed_ms),
+            (Some(RunActivity::Queued), Some(20_000))
+        );
         assert_eq!(serde_json::to_value(&queued).unwrap()["activity"], "queued");
         lines.push(rec("dispatch.queue.resume", 20, Some(29_000)));
         let resumed = row(&lines);
-        assert_eq!((resumed.activity, resumed.activity_elapsed_ms), (None, None), "resumed: no longer queued");
+        assert_eq!(
+            (resumed.activity, resumed.activity_elapsed_ms),
+            (None, None),
+            "resumed: no longer queued"
+        );
         lines.push(rec("dispatch.model.start", 19, None));
         assert_eq!(row(&lines).activity, Some(RunActivity::StartingModel));
         lines.truncate(3);
         lines.push(rec("dispatch.error", 10, None));
         let ended = row(&lines);
-        assert_eq!((ended.activity, ended.activity_elapsed_ms), (None, None), "a wait its dispatch.error closed");
+        assert_eq!(
+            (ended.activity, ended.activity_elapsed_ms),
+            (None, None),
+            "a wait its dispatch.error closed"
+        );
     }
 
     #[test]
@@ -6276,13 +7329,29 @@ mod tests {
 
         // Just inside the budget: still live.
         let inside_ms = base_ms + stale_after_ms() - 1_000;
-        let fresh = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), inside_ms);
-        assert_eq!(fresh[0].status, RunStatus::Running, "no terminal + recent activity must read live");
+        let fresh = ghost_runs(
+            &idx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            inside_ms,
+        );
+        assert_eq!(
+            fresh[0].status,
+            RunStatus::Running,
+            "no terminal + recent activity must read live"
+        );
 
         // Past the budget: the trail stops, and that is evidence of
         // abandonment — the #1642/#1633 defect this test guards.
         let outside_ms = base_ms + stale_after_ms() + 1_000;
-        let stale = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), outside_ms);
+        let stale = ghost_runs(
+            &idx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            outside_ms,
+        );
         assert_eq!(
             stale[0].status,
             RunStatus::Abandoned,
@@ -6309,8 +7378,18 @@ mod tests {
             },
         );
         let far_future_ms = (now_unix() + 999_999_999) * 1_000;
-        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), far_future_ms);
-        assert_eq!(ghosts[0].status, RunStatus::Complete, "a terminal verdict must never decay into Abandoned");
+        let ghosts = ghost_runs(
+            &idx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            far_future_ms,
+        );
+        assert_eq!(
+            ghosts[0].status,
+            RunStatus::Complete,
+            "a terminal verdict must never decay into Abandoned"
+        );
         // (#1907) `abandoned_reason` is ONLY ever set alongside `Abandoned` —
         // a Complete row must carry `None`, not a stale reason left over
         // from some other branch.
@@ -6349,19 +7428,45 @@ mod tests {
         ghost_idx.insert("agree-1-ghost".to_string(), session.clone());
 
         for (label, now_ms, want) in [
-            ("just inside the budget", ref_ms + stale_after_ms() - 1_000, RunStatus::Running),
-            ("just outside the budget", ref_ms + stale_after_ms() + 1_000, RunStatus::Abandoned),
+            (
+                "just inside the budget",
+                ref_ms + stale_after_ms() - 1_000,
+                RunStatus::Running,
+            ),
+            (
+                "just outside the budget",
+                ref_ms + stale_after_ms() + 1_000,
+                RunStatus::Abandoned,
+            ),
             // (#1642) EXACTLY at the budget. The ±1s cases above cannot
             // detect an inclusivity drift (`<` vs `<=`) between two kinds —
             // both sides agree at ±1s no matter which comparison each uses,
             // so the one boundary where the kinds can silently disagree is
             // the only one the other two rows structurally cannot see. That
             // drift is precisely the class this test exists to prevent.
-            ("exactly at the budget", ref_ms + stale_after_ms(), RunStatus::Running),
+            (
+                "exactly at the budget",
+                ref_ms + stale_after_ms(),
+                RunStatus::Running,
+            ),
         ] {
-            assert_eq!(lab_run_status(&lab_summary, now_ms, None), want, "lab disagreed {label}");
-            assert_eq!(mission_run_status(&mission, &[&session], now_ms), want, "mission disagreed {label}");
-            let ghosts = ghost_runs(&ghost_idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_ms);
+            assert_eq!(
+                lab_run_status(&lab_summary, now_ms, None),
+                want,
+                "lab disagreed {label}"
+            );
+            assert_eq!(
+                mission_run_status(&mission, &[&session], now_ms),
+                want,
+                "mission disagreed {label}"
+            );
+            let ghosts = ghost_runs(
+                &ghost_idx,
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashSet::new(),
+                now_ms,
+            );
             assert_eq!(ghosts[0].status, want, "ghost disagreed {label}");
         }
     }
@@ -6385,7 +7490,11 @@ mod tests {
         let mission = minimal_mission(
             "dispatch-coder-1",
             vec!["dispatch-coder-1-phase".to_string()],
-            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fp".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "dispatch".to_string(),
+                inputs_fingerprint: "fp".to_string(),
+                origin: None,
+            }),
         );
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
         let phase = minimal_phase(
@@ -6406,7 +7515,8 @@ mod tests {
             "dispatch-coder-1-task",
             Some("crew-dispatch-coder-xyz"),
         );
-        darkmux_crew::lifecycle::save_step("dispatch-coder-1", "dispatch-coder-1-phase", &step).unwrap();
+        darkmux_crew::lifecycle::save_step("dispatch-coder-1", "dispatch-coder-1-phase", &step)
+            .unwrap();
 
         // The dispatch's own flow records, carrying its mission.
         write_day_file(
@@ -6430,7 +7540,11 @@ mod tests {
         );
 
         let runs = build_runs(flows.path(), None, &[]);
-        assert_eq!(runs.len(), 1, "exactly one Run — the tracked mission, no ghost duplicate: {runs:?}");
+        assert_eq!(
+            runs.len(),
+            1,
+            "exactly one Run — the tracked mission, no ghost duplicate: {runs:?}"
+        );
         assert_eq!(runs[0].id, "dispatch-coder-1");
         assert_eq!(runs[0].kind, RunKind::Dispatch);
         assert!(runs[0].tracked);
@@ -6462,7 +7576,11 @@ mod tests {
         let mut mission = minimal_mission(
             "ancient-mission-1",
             vec!["ancient-mission-1-phase".to_string()],
-            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fp".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "dispatch".to_string(),
+                inputs_fingerprint: "fp".to_string(),
+                origin: None,
+            }),
         );
         mission.machine = Some("durable-studio".to_string());
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
@@ -6484,7 +7602,8 @@ mod tests {
             "ancient-mission-1-task",
             Some("crew-dispatch-ancient-xyz"),
         );
-        darkmux_crew::lifecycle::save_step("ancient-mission-1", "ancient-mission-1-phase", &step).unwrap();
+        darkmux_crew::lifecycle::save_step("ancient-mission-1", "ancient-mission-1-phase", &step)
+            .unwrap();
 
         // The dispatch's own flow records exist, with a REAL (different)
         // machine_id stamped on them — but they're filed under a date far
@@ -6514,7 +7633,11 @@ mod tests {
         );
 
         let runs = build_runs(flows.path(), None, &[]);
-        assert_eq!(runs.len(), 1, "exactly one Run — the tracked mission, no ghost duplicate: {runs:?}");
+        assert_eq!(
+            runs.len(),
+            1,
+            "exactly one Run — the tracked mission, no ghost duplicate: {runs:?}"
+        );
         assert_eq!(runs[0].id, "ancient-mission-1");
         assert!(runs[0].tracked);
         assert_eq!(
@@ -6549,7 +7672,11 @@ mod tests {
         let mut mission = minimal_mission(
             "disagree-mission-1",
             vec!["disagree-mission-1-phase".to_string()],
-            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fp".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "dispatch".to_string(),
+                inputs_fingerprint: "fp".to_string(),
+                origin: None,
+            }),
         );
         mission.machine = Some("orchestrator-mint-host".to_string());
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
@@ -6571,7 +7698,8 @@ mod tests {
             "disagree-mission-1-task",
             Some("crew-dispatch-disagree-xyz"),
         );
-        darkmux_crew::lifecycle::save_step("disagree-mission-1", "disagree-mission-1-phase", &step).unwrap();
+        darkmux_crew::lifecycle::save_step("disagree-mission-1", "disagree-mission-1-phase", &step)
+            .unwrap();
 
         // Entirely INSIDE the flow retention window (today's day-file),
         // stamped with a DIFFERENT machine — the peer that actually ran
@@ -6955,12 +8083,25 @@ mod tests {
         let mission = minimal_mission(
             "generic-config-1",
             vec!["p-generic".to_string()],
-            Some(MissionSpec { config_id: "some-custom-config".to_string(), inputs_fingerprint: "fpg".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "some-custom-config".to_string(),
+                inputs_fingerprint: "fpg".to_string(),
+                origin: None,
+            }),
         );
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
-        let phase = minimal_phase("p-generic", "generic-config-1", vec!["t-generic".to_string()]);
+        let phase = minimal_phase(
+            "p-generic",
+            "generic-config-1",
+            vec!["t-generic".to_string()],
+        );
         darkmux_crew::lifecycle::save_phase(&phase).unwrap();
-        let task = minimal_task("t-generic", "p-generic", vec!["s-generic".to_string()], Some("coder"));
+        let task = minimal_task(
+            "t-generic",
+            "p-generic",
+            vec!["s-generic".to_string()],
+            Some("coder"),
+        );
         darkmux_crew::lifecycle::save_task("generic-config-1", &task).unwrap();
         // NO explicit session_id — the real `interpret::push_step` gap.
         let step = minimal_step("s-generic", "t-generic", None);
@@ -6994,7 +8135,11 @@ mod tests {
         );
 
         let runs = build_runs(flows.path(), None, &[]);
-        assert_eq!(runs.len(), 1, "exactly one Run for the generic-config mission, no per-step ghost: {runs:?}");
+        assert_eq!(
+            runs.len(),
+            1,
+            "exactly one Run for the generic-config mission, no per-step ghost: {runs:?}"
+        );
         assert_eq!(runs[0].id, "generic-config-1");
         assert_eq!(runs[0].kind, RunKind::Mission);
         assert!(runs[0].tracked);
@@ -7018,11 +8163,17 @@ mod tests {
         let flows = TempDir::new().unwrap();
 
         let step_in = |m: &str| {
-            darkmux_types::session_id::SessionId::step(darkmux_types::session_id::RunId::mission(m).unwrap(), "s-shared")
-                .wire()
+            darkmux_types::session_id::SessionId::step(
+                darkmux_types::session_id::RunId::mission(m).unwrap(),
+                "s-shared",
+            )
+            .wire()
         };
         let (session_x, session_y) = (step_in("mission-x"), step_in("mission-y"));
-        assert_ne!(session_x, session_y, "the two missions' scoped session ids must differ");
+        assert_ne!(
+            session_x, session_y,
+            "the two missions' scoped session ids must differ"
+        );
 
         // `write_day_file` truncates the day file on every call — collect
         // BOTH missions' records and write the file exactly once, the way
@@ -7070,11 +8221,25 @@ mod tests {
         write_day_file(flows.path(), &today(), &all_records);
 
         let runs = build_runs(flows.path(), None, &[]);
-        let run_x = runs.iter().find(|r| r.id == "mission-x").expect("mission-x must produce a Run");
-        let run_y = runs.iter().find(|r| r.id == "mission-y").expect("mission-y must produce a Run");
+        let run_x = runs
+            .iter()
+            .find(|r| r.id == "mission-x")
+            .expect("mission-x must produce a Run");
+        let run_y = runs
+            .iter()
+            .find(|r| r.id == "mission-y")
+            .expect("mission-y must produce a Run");
 
-        assert_eq!(run_x.model.as_deref(), Some("model-x"), "mission-x must never read mission-y's model");
-        assert_eq!(run_y.model.as_deref(), Some("model-y"), "mission-y must never read mission-x's model");
+        assert_eq!(
+            run_x.model.as_deref(),
+            Some("model-x"),
+            "mission-x must never read mission-y's model"
+        );
+        assert_eq!(
+            run_y.model.as_deref(),
+            Some("model-y"),
+            "mission-y must never read mission-x's model"
+        );
         assert_ne!(
             run_x.model, run_y.model,
             "two missions running the SAME shared task/step id must attribute DISTINCT models — \
@@ -7116,18 +8281,31 @@ mod tests {
             }),
         );
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
-        darkmux_crew::lifecycle::save_phase(&minimal_phase("pn", "mission-new", vec!["tn".to_string()])).unwrap();
+        darkmux_crew::lifecycle::save_phase(&minimal_phase(
+            "pn",
+            "mission-new",
+            vec!["tn".to_string()],
+        ))
+        .unwrap();
         darkmux_crew::lifecycle::save_task(
             "mission-new",
             &minimal_task("tn", "pn", vec!["s-shared".to_string()], Some("coder")),
         )
         .unwrap();
-        darkmux_crew::lifecycle::save_step("mission-new", "pn", &minimal_step("s-shared", "tn", None)).unwrap();
+        darkmux_crew::lifecycle::save_step(
+            "mission-new",
+            "pn",
+            &minimal_step("s-shared", "tn", None),
+        )
+        .unwrap();
 
         let mut recs: Vec<serde_json::Value> = Vec::new();
         // LEGACY: two OLD missions folded into the ONE bare session id —
         // the 49-missions/1-session bucket #1918 measured live.
-        for (mid, model) in [("mission-old-a", "legacy-model-a"), ("mission-old-b", "legacy-model-b")] {
+        for (mid, model) in [
+            ("mission-old-a", "legacy-model-a"),
+            ("mission-old-b", "legacy-model-b"),
+        ] {
             recs.push(serde_json::json!({
                 "ts": "2026-07-20T09:00:00Z", "action": "dispatch.start",
                 "session_id": raw, "handle": "legacy-role", "mission_id": mid,
@@ -7151,7 +8329,10 @@ mod tests {
         write_day_file(flows.path(), &today(), &recs);
 
         let runs = build_runs(flows.path(), None, &[]);
-        let run = runs.iter().find(|r| r.id == "mission-new").expect("mission-new must produce a Run");
+        let run = runs
+            .iter()
+            .find(|r| r.id == "mission-new")
+            .expect("mission-new must produce a Run");
         assert_eq!(
             run.model.as_deref(),
             Some("correct-model"),
@@ -7173,18 +8354,27 @@ mod tests {
     fn build_runs_a_three_item_map_is_one_row_and_three_executions() {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
-        let session = darkmux_types::session_id::SessionId::task(darkmux_types::session_id::RunId::mission("m3").unwrap(), "probe").wire();
+        let session = darkmux_types::session_id::SessionId::task(
+            darkmux_types::session_id::RunId::mission("m3").unwrap(),
+            "probe",
+        )
+        .wire();
         let now = darkmux_flow::ts_utc_now();
         let mut records = vec![serde_json::json!({
             "ts": now, "action": "run.start", "handle": "review", "mission_id": "m3",
             "session_id": darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission("m3").unwrap()).wire(),
         })];
         for i in 1..=3u64 {
-            let (exec, endpoint) = (format!("exec-{i}"), format!("azure:seat-{i}.example.com/gpt-4o"));
-            let common = |action: &str| serde_json::json!({
-                "ts": now, "action": action, "handle": "probe-1", "mission_id": "m3",
-                "session_id": session, "execution_id": exec,
-            });
+            let (exec, endpoint) = (
+                format!("exec-{i}"),
+                format!("azure:seat-{i}.example.com/gpt-4o"),
+            );
+            let common = |action: &str| {
+                serde_json::json!({
+                    "ts": now, "action": action, "handle": "probe-1", "mission_id": "m3",
+                    "session_id": session, "execution_id": exec,
+                })
+            };
             let mut start = common("dispatch.start");
             start["payload"] = serde_json::json!({ "endpoint": endpoint, "item_index": i - 1 });
             let mut usage = common("telemetry.tokens");
@@ -7201,14 +8391,28 @@ mod tests {
         write_day_file(flows.path(), &today(), &records);
 
         let out = build_runs_with_usage(flows.path(), None, &[], None);
-        assert_eq!(out.runs.len(), 1, "one row for the whole map, not one per execution: {:?}", out.runs);
+        assert_eq!(
+            out.runs.len(),
+            1,
+            "one row for the whole map, not one per execution: {:?}",
+            out.runs
+        );
         assert_eq!(out.runs[0].id, "m3");
-        assert_eq!(out.runs[0].tokens, Some(60), "the run is the sum of its three executions");
+        assert_eq!(
+            out.runs[0].tokens,
+            Some(60),
+            "the run is the sum of its three executions"
+        );
         let mut seats: Vec<(String, u64)> = out
             .usage
             .groups
             .iter()
-            .map(|g| (g.endpoint.clone().expect("each execution's endpoint"), g.total()))
+            .map(|g| {
+                (
+                    g.endpoint.clone().expect("each execution's endpoint"),
+                    g.total(),
+                )
+            })
             .collect();
         seats.sort();
         assert_eq!(
@@ -7266,11 +8470,24 @@ mod tests {
         // accepted, orthogonal side effect of unmasking the field.
         mission.started_ts = None;
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
-        let phase = minimal_phase("p-bookend", "bookend-mission-1", vec!["t-bookend".to_string()]);
+        let phase = minimal_phase(
+            "p-bookend",
+            "bookend-mission-1",
+            vec!["t-bookend".to_string()],
+        );
         darkmux_crew::lifecycle::save_phase(&phase).unwrap();
-        let task = minimal_task("t-bookend", "p-bookend", vec!["s-bookend".to_string()], Some("coder"));
+        let task = minimal_task(
+            "t-bookend",
+            "p-bookend",
+            vec!["s-bookend".to_string()],
+            Some("coder"),
+        );
         darkmux_crew::lifecycle::save_task("bookend-mission-1", &task).unwrap();
-        let step = minimal_step("s-bookend", "t-bookend", Some("crew-dispatch-coder-bookend"));
+        let step = minimal_step(
+            "s-bookend",
+            "t-bookend",
+            Some("crew-dispatch-coder-bookend"),
+        );
         darkmux_crew::lifecycle::save_step("bookend-mission-1", "p-bookend", &step).unwrap();
 
         write_day_file(
@@ -7315,7 +8532,11 @@ mod tests {
         );
 
         let runs = build_runs(flows.path(), None, &[]);
-        assert_eq!(runs.len(), 1, "exactly one Run — the bookend session joins, it doesn't ghost: {runs:?}");
+        assert_eq!(
+            runs.len(),
+            1,
+            "exactly one Run — the bookend session joins, it doesn't ghost: {runs:?}"
+        );
         assert_eq!(runs[0].id, "bookend-mission-1");
         assert_eq!(runs[0].kind, RunKind::Mission);
         assert!(runs[0].tracked);
@@ -7337,7 +8558,11 @@ mod tests {
         // same string here by construction, the pre-4.0 bookend's own shape —
         // pinned as "the representative session's id" rather than "the
         // mission id" so the two don't get silently conflated).
-        assert_eq!(runs[0].dispatch_id.as_deref(), Some("bookend-mission-1"), "session_id must be the representative (earliest) session's own id: {runs:?}");
+        assert_eq!(
+            runs[0].dispatch_id.as_deref(),
+            Some("bookend-mission-1"),
+            "session_id must be the representative (earliest) session's own id: {runs:?}"
+        );
 
         // Ordering is untouched by this fix: start_ts still comes from the
         // EARLIEST session (the bookend), same as before.
@@ -7360,7 +8585,11 @@ mod tests {
         let mut mission = minimal_mission(
             "rep-mission",
             vec!["p-rep".to_string()],
-            Some(MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "fpr".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "review".to_string(),
+                inputs_fingerprint: "fpr".to_string(),
+                origin: None,
+            }),
         );
         mission.started_ts = None;
         mission.machine = None;
@@ -7380,12 +8609,31 @@ mod tests {
             ],
         );
         let runs = build_runs(flows.path(), None, &[]);
-        let row = runs.iter().find(|r| r.id == "rep-mission").expect("the mission's row");
-        assert_eq!(row.dispatch_id.as_deref(), Some("rep-mission.run"), "{row:?}");
+        let row = runs
+            .iter()
+            .find(|r| r.id == "rep-mission")
+            .expect("the mission's row");
+        assert_eq!(
+            row.dispatch_id.as_deref(),
+            Some("rep-mission.run"),
+            "{row:?}"
+        );
         assert_eq!(row.machine.as_deref(), Some("studio"), "{row:?}");
-        assert_eq!(row.started_ts, parse_flow_ts("2026-01-01T08:00:00Z"), "{row:?}");
-        assert_eq!(row.role.as_deref(), Some("reviewer"), "the role is an execution's, never the run's config id: {row:?}");
-        assert_eq!(runs.len(), 1, "one run row, the execution session is the mission's, not a ghost: {runs:?}");
+        assert_eq!(
+            row.started_ts,
+            parse_flow_ts("2026-01-01T08:00:00Z"),
+            "{row:?}"
+        );
+        assert_eq!(
+            row.role.as_deref(),
+            Some("reviewer"),
+            "the role is an execution's, never the run's config id: {row:?}"
+        );
+        assert_eq!(
+            runs.len(),
+            1,
+            "one run row, the execution session is the mission's, not a ghost: {runs:?}"
+        );
     }
 
     /// (#1918) The SAME uniform guard applied to the LOCAL tracked-mission
@@ -7417,9 +8665,18 @@ mod tests {
         mission.started_ts = None;
         let created_ts = mission.created_ts;
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
-        let phase = minimal_phase("p-collision", "collision-mission-1", vec!["t-collision".to_string()]);
+        let phase = minimal_phase(
+            "p-collision",
+            "collision-mission-1",
+            vec!["t-collision".to_string()],
+        );
         darkmux_crew::lifecycle::save_phase(&phase).unwrap();
-        let task = minimal_task("t-collision", "p-collision", vec!["s-collision".to_string()], Some("coder"));
+        let task = minimal_task(
+            "t-collision",
+            "p-collision",
+            vec!["s-collision".to_string()],
+            Some("coder"),
+        );
         darkmux_crew::lifecycle::save_task("collision-mission-1", &task).unwrap();
         let step = minimal_step("s-collision", "t-collision", Some("collision-mission-1"));
         darkmux_crew::lifecycle::save_step("collision-mission-1", "p-collision", &step).unwrap();
@@ -7467,8 +8724,14 @@ mod tests {
         );
 
         let runs = build_runs(flows.path(), None, &[]);
-        let row = runs.iter().find(|r| r.id == "collision-mission-1").expect("row for collision-mission-1");
-        assert!(row.tracked, "this test's own premise: a LOCAL durable mission, tracked: true");
+        let row = runs
+            .iter()
+            .find(|r| r.id == "collision-mission-1")
+            .expect("row for collision-mission-1");
+        assert!(
+            row.tracked,
+            "this test's own premise: a LOCAL durable mission, tracked: true"
+        );
         assert_eq!(
             row.dispatch_id, None,
             "a tracked mission's representative session must ALSO go None when it is ambiguous — the guard is uniform across every population site, not a fleet-only special case: {row:?}"
@@ -7554,9 +8817,18 @@ mod tests {
         // never actually be exercised.
         mission.started_ts = None;
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
-        let phase = minimal_phase("p-ambig", "ambig-bookend-mission", vec!["t-ambig".to_string()]);
+        let phase = minimal_phase(
+            "p-ambig",
+            "ambig-bookend-mission",
+            vec!["t-ambig".to_string()],
+        );
         darkmux_crew::lifecycle::save_phase(&phase).unwrap();
-        let task = minimal_task("t-ambig", "p-ambig", vec!["s-ambig".to_string()], Some("coder"));
+        let task = minimal_task(
+            "t-ambig",
+            "p-ambig",
+            vec!["s-ambig".to_string()],
+            Some("coder"),
+        );
         darkmux_crew::lifecycle::save_task("ambig-bookend-mission", &task).unwrap();
         let step = minimal_step("s-ambig", "t-ambig", Some("crew-dispatch-coder-ambig"));
         darkmux_crew::lifecycle::save_step("ambig-bookend-mission", "p-ambig", &step).unwrap();
@@ -7626,7 +8898,10 @@ mod tests {
         );
 
         let runs = build_runs(flows.path(), None, &[]);
-        let row = runs.iter().find(|r| r.id == "ambig-bookend-mission").expect("row for ambig-bookend-mission");
+        let row = runs
+            .iter()
+            .find(|r| r.id == "ambig-bookend-mission")
+            .expect("row for ambig-bookend-mission");
         assert!(row.tracked);
 
         // Already correct before this fix — pinned here so the fixture's
@@ -7716,11 +8991,24 @@ mod tests {
         );
         mission.started_ts = None;
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
-        let phase = minimal_phase("p-bookend2", "bookend-mission-2", vec!["t-bookend2".to_string()]);
+        let phase = minimal_phase(
+            "p-bookend2",
+            "bookend-mission-2",
+            vec!["t-bookend2".to_string()],
+        );
         darkmux_crew::lifecycle::save_phase(&phase).unwrap();
-        let task = minimal_task("t-bookend2", "p-bookend2", vec!["s-bookend2".to_string()], Some("coder"));
+        let task = minimal_task(
+            "t-bookend2",
+            "p-bookend2",
+            vec!["s-bookend2".to_string()],
+            Some("coder"),
+        );
         darkmux_crew::lifecycle::save_task("bookend-mission-2", &task).unwrap();
-        let step = minimal_step("s-bookend2", "t-bookend2", Some("crew-dispatch-coder-bookend2"));
+        let step = minimal_step(
+            "s-bookend2",
+            "t-bookend2",
+            Some("crew-dispatch-coder-bookend2"),
+        );
         darkmux_crew::lifecycle::save_step("bookend-mission-2", "p-bookend2", &step).unwrap();
 
         write_day_file(
@@ -7836,9 +9124,21 @@ mod tests {
         );
 
         let runs = build_runs(flows.path(), None, &[]);
-        assert_eq!(runs.len(), 1, "exactly one Run for the bookend-only mission: {runs:?}");
-        assert_eq!(runs[0].role.as_deref(), Some("cmd-gate-approve"), "with no other session, the bookend's own handle IS the best available role: {runs:?}");
-        assert_eq!(runs[0].model.as_deref(), None, "a procedural-only mission genuinely has no model to show: {runs:?}");
+        assert_eq!(
+            runs.len(),
+            1,
+            "exactly one Run for the bookend-only mission: {runs:?}"
+        );
+        assert_eq!(
+            runs[0].role.as_deref(),
+            Some("cmd-gate-approve"),
+            "with no other session, the bookend's own handle IS the best available role: {runs:?}"
+        );
+        assert_eq!(
+            runs[0].model.as_deref(),
+            None,
+            "a procedural-only mission genuinely has no model to show: {runs:?}"
+        );
     }
 
     /// Launch path 1/4 (the flagship path): a review-shaped mission whose
@@ -7855,7 +9155,11 @@ mod tests {
         let mission = minimal_mission(
             "review-1700000000-abcdef",
             vec!["p-investigate".to_string()],
-            Some(MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "fpr".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "review".to_string(),
+                inputs_fingerprint: "fpr".to_string(),
+                origin: None,
+            }),
         );
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
         let phase = minimal_phase("p-investigate", "review-1700000000-abcdef", vec![]);
@@ -7896,7 +9200,10 @@ mod tests {
         assert_eq!(runs[0].id, "review-1700000000-abcdef");
         assert_eq!(runs[0].kind, RunKind::Mission);
         assert!(runs[0].tracked);
-        assert_eq!(runs[0].route.as_deref(), Some("azure:myorg.cognitiveservices.azure.com/gpt-4o"));
+        assert_eq!(
+            runs[0].route.as_deref(),
+            Some("azure:myorg.cognitiveservices.azure.com/gpt-4o")
+        );
         assert_eq!(runs[0].model.as_deref(), Some("gpt-4o"));
     }
 
@@ -7913,12 +9220,21 @@ mod tests {
         let mission = minimal_mission(
             "dispatch-crashed-1",
             vec!["p-crash".to_string()],
-            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fpc".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "dispatch".to_string(),
+                inputs_fingerprint: "fpc".to_string(),
+                origin: None,
+            }),
         );
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
         let phase = minimal_phase("p-crash", "dispatch-crashed-1", vec!["t-crash".to_string()]);
         darkmux_crew::lifecycle::save_phase(&phase).unwrap();
-        let task = minimal_task("t-crash", "p-crash", vec!["s-crash".to_string()], Some("coder"));
+        let task = minimal_task(
+            "t-crash",
+            "p-crash",
+            vec!["s-crash".to_string()],
+            Some("coder"),
+        );
         darkmux_crew::lifecycle::save_task("dispatch-crashed-1", &task).unwrap();
         let step = minimal_step("s-crash", "t-crash", Some("crew-dispatch-coder-crashed"));
         darkmux_crew::lifecycle::save_step("dispatch-crashed-1", "p-crash", &step).unwrap();
@@ -7945,7 +9261,11 @@ mod tests {
 
         let runs = build_runs(flows.path(), None, &[]);
         assert_eq!(runs.len(), 1, "{runs:?}");
-        assert_eq!(runs[0].status, RunStatus::Abandoned, "a crashed session must not read as eternal Running");
+        assert_eq!(
+            runs[0].status,
+            RunStatus::Abandoned,
+            "a crashed session must not read as eternal Running"
+        );
         // (#1907) `mission.json` was never touched again — it stays
         // `MissionStatus::Active`, never `Aborted` — so this Abandoned row
         // must carry the honest "no ending recorded" reason, never the
@@ -8010,14 +9330,22 @@ mod tests {
         let older = minimal_mission(
             "review-1000000000-older",
             vec![],
-            Some(MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "fpo".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "review".to_string(),
+                inputs_fingerprint: "fpo".to_string(),
+                origin: None,
+            }),
         );
         darkmux_crew::lifecycle::save_mission(&older).unwrap();
 
         let active = minimal_mission(
             "review-2000000000-active",
             vec![],
-            Some(MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "fpn".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "review".to_string(),
+                inputs_fingerprint: "fpn".to_string(),
+                origin: None,
+            }),
         );
         darkmux_crew::lifecycle::save_mission(&active).unwrap();
 
@@ -8063,8 +9391,10 @@ mod tests {
         let runs = build_runs(flows.path(), None, &[]);
         assert_eq!(runs.len(), 2, "{runs:?}");
 
-        let active_run =
-            runs.iter().find(|r| r.id == "review-2000000000-active").expect("active mission row present");
+        let active_run = runs
+            .iter()
+            .find(|r| r.id == "review-2000000000-active")
+            .expect("active mission row present");
         assert_eq!(
             active_run.status,
             RunStatus::Running,
@@ -8078,9 +9408,20 @@ mod tests {
         // ui/src/lenses/runs/format.ts) sorts by
         // `updated_ts||completed_ts||started_ts` descending, so this is the
         // server-side half of "renders FIRST".
-        let older_run = runs.iter().find(|r| r.id == "review-1000000000-older").unwrap();
-        let active_key = active_run.updated_ts.or(active_run.completed_ts).or(active_run.started_ts).unwrap();
-        let older_key = older_run.updated_ts.or(older_run.completed_ts).or(older_run.started_ts).unwrap();
+        let older_run = runs
+            .iter()
+            .find(|r| r.id == "review-1000000000-older")
+            .unwrap();
+        let active_key = active_run
+            .updated_ts
+            .or(active_run.completed_ts)
+            .or(active_run.started_ts)
+            .unwrap();
+        let older_key = older_run
+            .updated_ts
+            .or(older_run.completed_ts)
+            .or(older_run.started_ts)
+            .unwrap();
         assert!(
             active_key > older_key,
             "the active mission must rank newer than the older, closed one: active={active_key} older={older_key}"
@@ -8101,10 +9442,17 @@ mod tests {
         let active = minimal_mission(
             id,
             vec![],
-            Some(MissionSpec { config_id: "freeform".to_string(), inputs_fingerprint: "fp".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "freeform".to_string(),
+                inputs_fingerprint: "fp".to_string(),
+                origin: None,
+            }),
         );
         darkmux_crew::lifecycle::save_mission(&active).unwrap();
-        let run_session = darkmux_types::session_id::SessionId::run(darkmux_types::session_id::RunId::mission(id).unwrap()).to_string();
+        let run_session = darkmux_types::session_id::SessionId::run(
+            darkmux_types::session_id::RunId::mission(id).unwrap(),
+        )
+        .to_string();
         let now = darkmux_flow::ts_utc_now();
         write_day_file(
             flows.path(),
@@ -8116,8 +9464,15 @@ mod tests {
             ],
         );
         let runs = build_runs(flows.path(), None, &[]);
-        let row = runs.iter().find(|r| r.id == id).expect("the freeform mission has a row");
-        assert_eq!(row.status, RunStatus::Running, "launch bookends must not complete an Active mission: {row:?}");
+        let row = runs
+            .iter()
+            .find(|r| r.id == id)
+            .expect("the freeform mission has a row");
+        assert_eq!(
+            row.status,
+            RunStatus::Running,
+            "launch bookends must not complete an Active mission: {row:?}"
+        );
     }
 
     /// (#2123) The SAME mission as above, once it later gets a `mission
@@ -8134,7 +9489,11 @@ mod tests {
         let mut mission = minimal_mission(
             "review-2000000000-active",
             vec![],
-            Some(MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "fpn".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "review".to_string(),
+                inputs_fingerprint: "fpn".to_string(),
+                origin: None,
+            }),
         );
         mission.status = MissionStatus::Finalized;
         mission.finalized_ts = Some(now_unix());
@@ -8142,11 +9501,15 @@ mod tests {
         // `MissionStatus::Finalized` reads its outcome off the envelope
         // (`mission_run_status`'s own doc) — Clean is what a real
         // happy-path `mission finalize` writes.
-        let env = MissionEnvelope::new("review-2000000000-active", MissionOutcomeStatus::Clean, &[]);
+        let env =
+            MissionEnvelope::new("review-2000000000-active", MissionOutcomeStatus::Clean, &[]);
         darkmux_crew::envelope::finalize_mission(&env);
 
         let runs = build_runs(flows.path(), None, &[]);
-        let row = runs.iter().find(|r| r.id == "review-2000000000-active").expect("row present after close");
+        let row = runs
+            .iter()
+            .find(|r| r.id == "review-2000000000-active")
+            .expect("row present after close");
         assert_eq!(row.status, RunStatus::Complete, "{row:?}");
         assert_eq!(
             row.updated_ts, row.completed_ts,
@@ -8163,7 +9526,11 @@ mod tests {
         let mission = minimal_mission(
             "dispatch-coder-2",
             vec!["p-2".to_string()],
-            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fp2".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "dispatch".to_string(),
+                inputs_fingerprint: "fp2".to_string(),
+                origin: None,
+            }),
         );
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
         let phase = minimal_phase("p-2", "dispatch-coder-2", vec!["t-2".to_string()]);
@@ -8201,7 +9568,10 @@ mod tests {
 
         let runs = build_runs(flows.path(), None, &[]);
         assert_eq!(runs.len(), 2, "{runs:?}");
-        let tracked = runs.iter().find(|r| r.id == "dispatch-coder-2").expect("tracked run present");
+        let tracked = runs
+            .iter()
+            .find(|r| r.id == "dispatch-coder-2")
+            .expect("tracked run present");
         assert!(tracked.tracked);
         let ghost = runs
             .iter()
@@ -8213,7 +9583,12 @@ mod tests {
 
     // ── #2902 step 2b: every row carries its usage-record token sum ──────
 
-    fn usage_record(ts: &str, session_id: &str, mission_id: Option<&str>, payload: serde_json::Value) -> serde_json::Value {
+    fn usage_record(
+        ts: &str,
+        session_id: &str,
+        mission_id: Option<&str>,
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
         let mut r = serde_json::json!({
             "ts": ts,
             "action": "telemetry.tokens",
@@ -8242,7 +9617,11 @@ mod tests {
         let mission = minimal_mission(
             "dispatch-coder-2",
             vec!["p-2".to_string()],
-            Some(MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "fp2".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: "dispatch".to_string(),
+                inputs_fingerprint: "fp2".to_string(),
+                origin: None,
+            }),
         );
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
         let phase = minimal_phase("p-2", "dispatch-coder-2", vec!["t-2".to_string()]);
@@ -8253,26 +9632,49 @@ mod tests {
         darkmux_crew::lifecycle::save_step("dispatch-coder-2", "p-2", &step).unwrap();
 
         let now = darkmux_flow::ts_utc_now();
-        let provider = |kind: &str, total: u64| {
-            serde_json::json!({ "call_kind": kind, "token_source": "provider", "total_tokens": total, "prompt_tokens": total - 10, "completion_tokens": 10 })
-        };
+        let provider = |kind: &str, total: u64| serde_json::json!({ "call_kind": kind, "token_source": "provider", "total_tokens": total, "prompt_tokens": total - 10, "completion_tokens": 10 });
         write_day_file(
             flows.path(),
             &today(),
             &[
                 // The tracked mission's step session, carrying its mission.
                 serde_json::json!({ "ts": "2026-07-24T09:00:00Z", "action": "dispatch.start", "session_id": "crew-dispatch-coder-known", "mission_id": "dispatch-coder-2" }),
-                usage_record("2026-07-24T09:01:00Z", "crew-dispatch-coder-known", Some("dispatch-coder-2"), provider("turn", 120)),
-                usage_record("2026-07-24T09:02:00Z", "crew-dispatch-coder-known", Some("dispatch-coder-2"), provider("turn", 180)),
+                usage_record(
+                    "2026-07-24T09:01:00Z",
+                    "crew-dispatch-coder-known",
+                    Some("dispatch-coder-2"),
+                    provider("turn", 120),
+                ),
+                usage_record(
+                    "2026-07-24T09:02:00Z",
+                    "crew-dispatch-coder-known",
+                    Some("dispatch-coder-2"),
+                    provider("turn", 180),
+                ),
                 // Its complete must NOT be read: the run has usage records.
                 serde_json::json!({ "ts": "2026-07-24T09:03:00Z", "action": "dispatch.complete", "session_id": "crew-dispatch-coder-known", "mission_id": "dispatch-coder-2", "payload": { "total_tokens": 999 } }),
                 // A ghost with a work turn and a compactor sub-execution.
                 serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "crew-dispatch-reviewer-orphan", "handle": "reviewer" }),
-                usage_record(&now, "crew-dispatch-reviewer-orphan", None, provider("turn", 60)),
-                usage_record(&now, "crew-dispatch-reviewer-orphan", None, provider("compaction", 90)),
+                usage_record(
+                    &now,
+                    "crew-dispatch-reviewer-orphan",
+                    None,
+                    provider("turn", 60),
+                ),
+                usage_record(
+                    &now,
+                    "crew-dispatch-reviewer-orphan",
+                    None,
+                    provider("compaction", 90),
+                ),
                 // A ghost whose only record reported nothing.
                 serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "crew-dispatch-silent", "handle": "reviewer" }),
-                usage_record(&now, "crew-dispatch-silent", None, serde_json::json!({ "call_kind": "turn", "token_source": "absent" })),
+                usage_record(
+                    &now,
+                    "crew-dispatch-silent",
+                    None,
+                    serde_json::json!({ "call_kind": "turn", "token_source": "absent" }),
+                ),
                 // A pre-5.0 ghost: no usage record at all, tokens only on its complete.
                 serde_json::json!({ "ts": "2026-07-24T09:10:00Z", "action": "dispatch.start", "session_id": "crew-dispatch-legacy", "handle": "reviewer" }),
                 serde_json::json!({ "ts": "2026-07-24T09:11:00Z", "action": "dispatch.complete", "session_id": "crew-dispatch-legacy", "payload": { "total_tokens": 700 } }),
@@ -8286,14 +9688,44 @@ mod tests {
         let fleet = vec![peer_record("mission.start", &now), peer_usage];
 
         let runs = build_runs(flows.path(), None, &fleet);
-        let tokens = |id: &str| runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("{id} in {runs:?}")).tokens;
-        assert_eq!(tokens("dispatch-coder-2"), Some(300), "tracked mission: its step session's records, not its complete");
-        assert_eq!(tokens("crew-dispatch-reviewer-orphan"), Some(150), "ghost: work + utility, all tokens");
-        assert_eq!(tokens("crew-dispatch-silent"), None, "nothing measured is absent, never 0");
-        assert_eq!(tokens("crew-dispatch-legacy"), None, "a complete carries no tokens: no usage record, nothing measured");
-        assert_eq!(tokens("review-on-the-hub"), Some(500), "peer mission: fleet records fold the same way");
+        let tokens = |id: &str| {
+            runs.iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("{id} in {runs:?}"))
+                .tokens
+        };
+        assert_eq!(
+            tokens("dispatch-coder-2"),
+            Some(300),
+            "tracked mission: its step session's records, not its complete"
+        );
+        assert_eq!(
+            tokens("crew-dispatch-reviewer-orphan"),
+            Some(150),
+            "ghost: work + utility, all tokens"
+        );
+        assert_eq!(
+            tokens("crew-dispatch-silent"),
+            None,
+            "nothing measured is absent, never 0"
+        );
+        assert_eq!(
+            tokens("crew-dispatch-legacy"),
+            None,
+            "a complete carries no tokens: no usage record, nothing measured"
+        );
+        assert_eq!(
+            tokens("review-on-the-hub"),
+            Some(500),
+            "peer mission: fleet records fold the same way"
+        );
         // The wire drops the field entirely when absent.
-        let silent = serde_json::to_value(runs.iter().find(|r| r.id == "crew-dispatch-silent").unwrap()).unwrap();
+        let silent = serde_json::to_value(
+            runs.iter()
+                .find(|r| r.id == "crew-dispatch-silent")
+                .unwrap(),
+        )
+        .unwrap();
         assert!(silent.get("tokens").is_none(), "{silent}");
     }
 
@@ -8313,15 +9745,30 @@ mod tests {
             &today(),
             &[
                 serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "lab-sess-1", "handle": "coder" }),
-                usage_record(&now, "lab-sess-1", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 4200 })),
+                usage_record(
+                    &now,
+                    "lab-sess-1",
+                    None,
+                    serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 4200 }),
+                ),
                 serde_json::json!({ "ts": now, "action": "dispatch.complete", "session_id": "lab-sess-1", "handle": "coder", "payload": { "total_tokens": 1 } }),
             ],
         );
         let runs = build_runs(flows.path(), Some(lab.path()), &[]);
-        let lab_row = runs.iter().find(|r| r.kind == RunKind::Lab).unwrap_or_else(|| panic!("{runs:?}"));
+        let lab_row = runs
+            .iter()
+            .find(|r| r.kind == RunKind::Lab)
+            .unwrap_or_else(|| panic!("{runs:?}"));
         assert_eq!(lab_row.dispatch_id.as_deref(), Some("lab-sess-1"));
-        assert_eq!(lab_row.tokens, Some(4200), "the lab row's own session, not its complete");
-        assert!(runs.iter().all(|r| r.kind != RunKind::Dispatch), "the session is claimed, no ghost: {runs:?}");
+        assert_eq!(
+            lab_row.tokens,
+            Some(4200),
+            "the lab row's own session, not its complete"
+        );
+        assert!(
+            runs.iter().all(|r| r.kind != RunKind::Dispatch),
+            "the session is claimed, no ghost: {runs:?}"
+        );
     }
 
     /// (#2902 step 2b) The same usage record in the fleet stream AND the
@@ -8334,14 +9781,23 @@ mod tests {
         let flows = TempDir::new().unwrap();
         let now = darkmux_flow::ts_utc_now();
         let start = serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "both-sinks", "handle": "coder", "source": "crew_dispatch" });
-        let mut usage = usage_record(&now, "both-sinks", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 333 }));
+        let mut usage = usage_record(
+            &now,
+            "both-sinks",
+            None,
+            serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 333 }),
+        );
         usage["handle"] = serde_json::json!("coder");
         write_day_file(flows.path(), &today(), &[start.clone(), usage.clone()]);
         let fleet = vec![start, usage];
         let built = build_runs_with_usage(flows.path(), None, &fleet, None);
         assert_eq!(built.usage.overall.total, 333, "{:?}", built.usage);
         assert_eq!(built.usage.overall.usage_records, 1);
-        let row = built.runs.iter().find(|r| r.id == "both-sinks").expect("one row");
+        let row = built
+            .runs
+            .iter()
+            .find(|r| r.id == "both-sinks")
+            .expect("one row");
         assert_eq!(row.tokens, Some(333));
     }
 
@@ -8360,20 +9816,41 @@ mod tests {
             &old_day,
             &[
                 serde_json::json!({ "ts": format!("{old_day}T12:00:00Z"), "action": "dispatch.start", "session_id": "straddle", "handle": "coder" }),
-                usage_record(&format!("{old_day}T12:01:00Z"), "straddle", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 900 })),
+                usage_record(
+                    &format!("{old_day}T12:01:00Z"),
+                    "straddle",
+                    None,
+                    serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 900 }),
+                ),
             ],
         );
         let now = darkmux_flow::ts_utc_now();
         write_day_file(
             flows.path(),
             &today(),
-            &[serde_json::json!({ "ts": now, "action": "dispatch.complete", "session_id": "straddle", "handle": "coder", "payload": { "total_tokens": 1000 } })],
+            &[
+                serde_json::json!({ "ts": now, "action": "dispatch.complete", "session_id": "straddle", "handle": "coder", "payload": { "total_tokens": 1000 } }),
+            ],
         );
         let built = build_runs_with_usage(flows.path(), None, &[], None);
-        assert_eq!(built.usage.overall.total, 0, "the bounded scan sees no usage record, and a complete is not tokens");
-        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let widened = build_runs_with_usage(flows.path(), None, &[], Some(now_secs - (RUNS_FLOW_SCAN_WINDOW_DAYS as u64 + 2) * 86_400));
-        assert_eq!(widened.usage.overall.total, 900, "widened past the edge, the usage records are read");
+        assert_eq!(
+            built.usage.overall.total, 0,
+            "the bounded scan sees no usage record, and a complete is not tokens"
+        );
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let widened = build_runs_with_usage(
+            flows.path(),
+            None,
+            &[],
+            Some(now_secs - (RUNS_FLOW_SCAN_WINDOW_DAYS as u64 + 2) * 86_400),
+        );
+        assert_eq!(
+            widened.usage.overall.total, 900,
+            "widened past the edge, the usage records are read"
+        );
     }
 
     /// (#3067) A resumed dispatch reuses its execution id under a new session:
@@ -8392,7 +9869,12 @@ mod tests {
         };
         let provider = |total: u64| serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": total });
         let routing = {
-            let mut r = usage_record(&now, "x", None, serde_json::json!({ "call_kind": "single_shot", "purpose": "utility", "token_source": "provider", "total_tokens": 9 }));
+            let mut r = usage_record(
+                &now,
+                "x",
+                None,
+                serde_json::json!({ "call_kind": "single_shot", "purpose": "utility", "token_source": "provider", "total_tokens": 9 }),
+            );
             r.as_object_mut().unwrap().remove("session_id");
             r["handle"] = serde_json::json!("radio-router");
             r
@@ -8409,11 +9891,25 @@ mod tests {
             ],
         );
         let built = build_runs_with_usage(flows.path(), None, &[], None);
-        let tokens = |id: &str| built.runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("{id} in {:?}", built.runs)).tokens;
-        assert_eq!((tokens("sess-first"), tokens("sess-resumed")), (Some(100), Some(40)));
+        let tokens = |id: &str| {
+            built
+                .runs
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("{id} in {:?}", built.runs))
+                .tokens
+        };
+        assert_eq!(
+            (tokens("sess-first"), tokens("sess-resumed")),
+            (Some(100), Some(40))
+        );
         let rows: u64 = built.runs.iter().filter_map(|r| r.tokens).sum();
         assert_eq!(built.usage.no_run.total, 9);
-        assert_eq!(rows + built.usage.no_run.total, built.usage.overall.total, "rows plus no-run are the overall");
+        assert_eq!(
+            rows + built.usage.no_run.total,
+            built.usage.overall.total,
+            "rows plus no-run are the overall"
+        );
     }
 
     /// (#3067) One usage entry is read by ONE row. Two peer missions share a
@@ -8430,15 +9926,44 @@ mod tests {
         write_day_file(
             flows.path(),
             &today(),
-            &[start("m-a"), start("m-b"), usage_record(&now, "s-shared", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 100 }))],
+            &[
+                start("m-a"),
+                start("m-b"),
+                usage_record(
+                    &now,
+                    "s-shared",
+                    None,
+                    serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 100 }),
+                ),
+            ],
         );
         for _ in 0..8 {
             let built = build_runs_with_usage(flows.path(), None, &[], None);
-            let tokens = |id: &str| built.runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("{id}")).tokens;
+            let tokens = |id: &str| {
+                built
+                    .runs
+                    .iter()
+                    .find(|r| r.id == id)
+                    .unwrap_or_else(|| panic!("{id}"))
+                    .tokens
+            };
             let rows: u64 = built.runs.iter().filter_map(|r| r.tokens).sum();
             let u = &built.usage;
-            assert_eq!(rows + u.no_run.total + u.unlisted.total, u.overall.total, "{:?}", built.runs.iter().map(|r| (&r.id, r.tokens)).collect::<Vec<_>>());
-            assert_eq!((tokens("m-a"), tokens("m-b")), (Some(100), None), "the lower id wins a tie, on every build");
+            assert_eq!(
+                rows + u.no_run.total + u.unlisted.total,
+                u.overall.total,
+                "{:?}",
+                built
+                    .runs
+                    .iter()
+                    .map(|r| (&r.id, r.tokens))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                (tokens("m-a"), tokens("m-b")),
+                (Some(100), None),
+                "the lower id wins a tie, on every build"
+            );
         }
     }
 
@@ -8451,21 +9976,40 @@ mod tests {
     fn the_same_records_attribute_the_same_whichever_mission_is_local() {
         let now = darkmux_flow::ts_utc_now();
         let start = |mission: &str| serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": "s-shared", "mission_id": mission, "handle": "coder" });
-        let records = [start("m-a"), start("m-b"), usage_record(&now, "s-shared", None, serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 100 }))];
+        let records = [
+            start("m-a"),
+            start("m-b"),
+            usage_record(
+                &now,
+                "s-shared",
+                None,
+                serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": 100 }),
+            ),
+        ];
         let serve_with_local = |local: &str| {
             let _g = CrewGuard::new();
             darkmux_crew::lifecycle::save_mission(&minimal_mission(local, vec![], None)).unwrap();
             let flows = TempDir::new().unwrap();
             write_day_file(flows.path(), &today(), &records);
             let built = build_runs_with_usage(flows.path(), None, &[], None);
-            let mut by_row: Vec<(String, Option<u64>)> = built.runs.iter().map(|r| (r.id.clone(), r.tokens)).collect();
+            let mut by_row: Vec<(String, Option<u64>)> = built
+                .runs
+                .iter()
+                .map(|r| (r.id.clone(), r.tokens))
+                .collect();
             by_row.sort();
             let rows: u64 = built.runs.iter().filter_map(|r| r.tokens).sum();
-            assert_eq!(rows + built.usage.no_run.total + built.usage.unlisted.total, built.usage.overall.total);
+            assert_eq!(
+                rows + built.usage.no_run.total + built.usage.unlisted.total,
+                built.usage.overall.total
+            );
             by_row
         };
         let (a_local, b_local) = (serve_with_local("m-a"), serve_with_local("m-b"));
-        assert_eq!(a_local, b_local, "the assignment is a property of the records, not of the serving machine");
+        assert_eq!(
+            a_local, b_local,
+            "the assignment is a property of the records, not of the serving machine"
+        );
     }
 
     /// (#3067) Two sessions of one mission started in the same instant: the
@@ -8476,7 +10020,11 @@ mod tests {
     fn the_representative_session_of_a_tie_is_the_lower_id_on_every_build() {
         let now = darkmux_flow::ts_utc_now();
         let start = |sid: &str| serde_json::json!({ "ts": now, "action": "dispatch.start", "session_id": sid, "mission_id": "m-tie", "handle": "coder" });
-        for order in [["s-b", "s-a", "s-c"], ["s-c", "s-a", "s-b"], ["s-a", "s-b", "s-c"]] {
+        for order in [
+            ["s-b", "s-a", "s-c"],
+            ["s-c", "s-a", "s-b"],
+            ["s-a", "s-b", "s-c"],
+        ] {
             let _g = CrewGuard::new();
             darkmux_crew::lifecycle::save_mission(&minimal_mission("m-tie", vec![], None)).unwrap();
             let flows = TempDir::new().unwrap();
@@ -8484,8 +10032,16 @@ mod tests {
             write_day_file(flows.path(), &today(), &recs);
             for _ in 0..6 {
                 let built = build_runs_with_usage(flows.path(), None, &[], None);
-                let row = built.runs.iter().find(|r| r.id == "m-tie").expect("the mission row");
-                assert_eq!(row.dispatch_id.as_deref(), Some("s-a"), "input order {order:?}");
+                let row = built
+                    .runs
+                    .iter()
+                    .find(|r| r.id == "m-tie")
+                    .expect("the mission row");
+                assert_eq!(
+                    row.dispatch_id.as_deref(),
+                    Some("s-a"),
+                    "input order {order:?}"
+                );
             }
         }
     }
@@ -8501,7 +10057,12 @@ mod tests {
         let now = darkmux_flow::ts_utc_now();
         let provider = |total: u64| serde_json::json!({ "call_kind": "turn", "token_source": "provider", "total_tokens": total });
         let sessionless = {
-            let mut r = usage_record(&now, "x", None, serde_json::json!({ "call_kind": "single_shot", "purpose": "utility", "token_source": "provider", "total_tokens": 9 }));
+            let mut r = usage_record(
+                &now,
+                "x",
+                None,
+                serde_json::json!({ "call_kind": "single_shot", "purpose": "utility", "token_source": "provider", "total_tokens": 9 }),
+            );
             r.as_object_mut().unwrap().remove("session_id");
             r
         };
@@ -8526,7 +10087,16 @@ mod tests {
         let rows: u64 = built.runs.iter().filter_map(|r| r.tokens).sum();
         let u = &built.usage;
         assert_eq!((u.no_run.total, u.no_run.calls), (9, 1));
-        assert_eq!((u.unlisted.total, u.unlisted.calls), (50, 1), "{:?}", built.runs.iter().map(|r| (&r.id, r.tokens)).collect::<Vec<_>>());
+        assert_eq!(
+            (u.unlisted.total, u.unlisted.calls),
+            (50, 1),
+            "{:?}",
+            built
+                .runs
+                .iter()
+                .map(|r| (&r.id, r.tokens))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(rows + u.no_run.total + u.unlisted.total, u.overall.total);
     }
 
@@ -8542,15 +10112,18 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let old_day = cutoff_date_string(RUNS_FLOW_SCAN_WINDOW_DAYS + 6);
-        let provider = |total: u64| {
-            serde_json::json!({ "call_kind": "turn", "purpose": "work", "token_source": "provider", "total_tokens": total, "prompt_tokens": total - 10, "completion_tokens": 10, "requested_model": "old-m", "endpoint": "http://h/v1" })
-        };
+        let provider = |total: u64| serde_json::json!({ "call_kind": "turn", "purpose": "work", "token_source": "provider", "total_tokens": total, "prompt_tokens": total - 10, "completion_tokens": 10, "requested_model": "old-m", "endpoint": "http://h/v1" });
         write_day_file(
             flows.path(),
             &old_day,
             &[
                 serde_json::json!({ "ts": format!("{old_day}T12:00:00Z"), "action": "dispatch.start", "session_id": "old-session", "handle": "coder" }),
-                usage_record(&format!("{old_day}T12:01:00Z"), "old-session", None, provider(1000)),
+                usage_record(
+                    &format!("{old_day}T12:01:00Z"),
+                    "old-session",
+                    None,
+                    provider(1000),
+                ),
             ],
         );
         let now = darkmux_flow::ts_utc_now();
@@ -8562,13 +10135,24 @@ mod tests {
                 usage_record(&now, "new-session", None, provider(40)),
             ],
         );
-        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
         // The default window: only today's session and its 40 tokens.
         let default = build_runs_with_usage(flows.path(), None, &[], None);
         assert_eq!(default.usage.overall.total, 40);
-        assert!(default.runs.iter().all(|r| r.id != "old-session"), "{:?}", default.runs);
-        assert_eq!(build_runs(flows.path(), None, &[]).len(), default.runs.len(), "build_runs is the same union");
+        assert!(
+            default.runs.iter().all(|r| r.id != "old-session"),
+            "{:?}",
+            default.runs
+        );
+        assert_eq!(
+            build_runs(flows.path(), None, &[]).len(),
+            default.runs.len(),
+            "build_runs is the same union"
+        );
 
         // A bound past the default window reaches the old day file: both
         // the breakdown and the row list now include the old session.
@@ -8576,8 +10160,15 @@ mod tests {
         let widened = build_runs_with_usage(flows.path(), None, &[], Some(since));
         assert_eq!(widened.usage.overall.total, 1040, "{:?}", widened.usage);
         assert_eq!(widened.usage.groups.len(), 1);
-        assert_eq!(widened.usage.groups[0].requested_model.as_deref(), Some("old-m"));
-        let old = widened.runs.iter().find(|r| r.id == "old-session").expect("the old session is a row now");
+        assert_eq!(
+            widened.usage.groups[0].requested_model.as_deref(),
+            Some("old-m")
+        );
+        let old = widened
+            .runs
+            .iter()
+            .find(|r| r.id == "old-session")
+            .expect("the old session is a row now");
         assert_eq!(old.tokens, Some(1000));
 
         // A bound INSIDE the default window narrows the breakdown to the
@@ -8619,7 +10210,9 @@ mod tests {
         // Three rostered peers: one nothing could read with no beat found (down),
         // one whose presence could not say (unknown), one whose card WAS read
         // though no beat was found (a peer that answered is up).
-        let peer = |name: &str, liveness: crate::fleet_view::Liveness, card: crate::fleet_view::CardOutcome| {
+        let peer = |name: &str,
+                    liveness: crate::fleet_view::Liveness,
+                    card: crate::fleet_view::CardOutcome| {
             let mut m = view.machines[0].clone();
             m.is_this_machine = false;
             m.entry = Some(crate::wire::RosterMachineEntry::from(&fv::entry(name)));
@@ -8629,8 +10222,16 @@ mod tests {
         };
         let read_card = view.machines[0].card.clone();
         let extra = vec![
-            peer("studio", crate::fleet_view::Liveness::NoBeat, crate::fleet_view::CardOutcome::Unknown),
-            peer("mystery", crate::fleet_view::Liveness::Unknown, crate::fleet_view::CardOutcome::Unknown),
+            peer(
+                "studio",
+                crate::fleet_view::Liveness::NoBeat,
+                crate::fleet_view::CardOutcome::Unknown,
+            ),
+            peer(
+                "mystery",
+                crate::fleet_view::Liveness::Unknown,
+                crate::fleet_view::CardOutcome::Unknown,
+            ),
             peer("answered", crate::fleet_view::Liveness::NoBeat, read_card),
         ];
         view.machines.extend(extra);
@@ -8669,14 +10270,34 @@ mod tests {
         ];
         let live: HashSet<String> = ["d-beating".to_string()].into();
         mark_not_reporting(&mut runs, &view, &live);
-        let flags: Vec<(&str, bool)> = runs.iter().map(|r| (r.id.as_str(), r.not_reporting)).collect();
-        assert_eq!(flags, [("down", true), ("beating", false), ("done", false), ("here", false), ("unknown-machine", false), ("liveness-unknown", false), ("card-read", false)]);
+        let flags: Vec<(&str, bool)> = runs
+            .iter()
+            .map(|r| (r.id.as_str(), r.not_reporting))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                ("down", true),
+                ("beating", false),
+                ("done", false),
+                ("here", false),
+                ("unknown-machine", false),
+                ("liveness-unknown", false),
+                ("card-read", false)
+            ]
+        );
     }
 
     #[test]
     fn hub_key_reads_the_stream_id_as_ms_times_1024_plus_seq() {
-        assert_eq!(hub_key("1700000000000-3"), Some(1_700_000_000_000 * 1024 + 3));
-        assert_eq!(hub_key("1700000000000-5000"), Some(1_700_000_000_000 * 1024 + 1023));
+        assert_eq!(
+            hub_key("1700000000000-3"),
+            Some(1_700_000_000_000 * 1024 + 3)
+        );
+        assert_eq!(
+            hub_key("1700000000000-5000"),
+            Some(1_700_000_000_000 * 1024 + 1023)
+        );
         assert_eq!(hub_key("nope"), None);
     }
 
@@ -8696,15 +10317,33 @@ mod tests {
             v
         };
         let fleet = vec![
-            rec("skewed-mission", "s-skewed", "2096-01-01T00:00:00Z", "1700000000000-0"),
-            rec("honest-mission", "s-honest", &darkmux_flow::ts_utc_now(), "1700000100000-0"),
+            rec(
+                "skewed-mission",
+                "s-skewed",
+                "2096-01-01T00:00:00Z",
+                "1700000000000-0",
+            ),
+            rec(
+                "honest-mission",
+                "s-honest",
+                &darkmux_flow::ts_utc_now(),
+                "1700000100000-0",
+            ),
         ];
         let runs = build_runs(flows.path(), None, &fleet);
-        let key = |id: &str| runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("{id}")).receive_key;
+        let key = |id: &str| {
+            runs.iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("{id}"))
+                .receive_key
+        };
         assert_eq!(key("skewed-mission"), 1_700_000_000_000 * 1024);
         assert!(key("skewed-mission") < key("honest-mission"));
         let skewed = runs.iter().find(|r| r.id == "skewed-mission").unwrap();
-        assert!(skewed.updated_ts > Some(3_900_000_000), "the executor's clock still says 2096; only the key ignores it");
+        assert!(
+            skewed.updated_ts > Some(3_900_000_000),
+            "the executor's clock still says 2096; only the key ignores it"
+        );
     }
 
     /// 5.0 (#3017): a mission sorts alike whichever machine serves it. The
@@ -8728,7 +10367,8 @@ mod tests {
         assert_eq!(peer_key, 1_700_000_007_000 * 1024 + 2);
 
         // The owning machine: the same mission, durable on disk.
-        darkmux_crew::lifecycle::save_mission(&minimal_mission("review-on-the-hub", vec![], None)).unwrap();
+        darkmux_crew::lifecycle::save_mission(&minimal_mission("review-on-the-hub", vec![], None))
+            .unwrap();
         let local = build_runs(flows.path(), None, &fleet);
         let row = local.iter().find(|r| r.id == "review-on-the-hub").unwrap();
         assert!(row.tracked, "built from the durable record");
@@ -8745,7 +10385,7 @@ mod tests {
         // `DARKMUX_HOME` a concurrent sibling happened to have set.
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap(); // deliberately EMPTY: the peer's
-        // records were never written to this machine's flows dir.
+                                             // records were never written to this machine's flows dir.
         let fleet = vec![
             peer_record("dispatch.start", &darkmux_flow::ts_utc_now()),
             peer_record("dispatch.complete", &darkmux_flow::ts_utc_now()),
@@ -8755,10 +10395,21 @@ mod tests {
             .iter()
             .find(|r| r.id == "review-on-the-hub")
             .expect("a mission seen only in the fleet stream must still produce a run row");
-        assert_eq!(row.kind, RunKind::Mission, "one row per mission, not one per session");
-        assert!(!row.tracked, "this machine has no durable record of a peer's mission");
+        assert_eq!(
+            row.kind,
+            RunKind::Mission,
+            "one row per mission, not one per session"
+        );
+        assert!(
+            !row.tracked,
+            "this machine has no durable record of a peer's mission"
+        );
         assert_eq!(row.machine.as_deref(), Some("m1-max-32gb-studio"));
-        assert_eq!(row.model.as_deref(), Some("gpt-4o"), "route/model borrowed from its sessions");
+        assert_eq!(
+            row.model.as_deref(),
+            Some("gpt-4o"),
+            "route/model borrowed from its sessions"
+        );
         // and NOT also a loose per-session ghost for the same work
         assert!(
             !runs.iter().any(|r| r.id == "peer-session-1"),
@@ -8777,15 +10428,29 @@ mod tests {
         let mut mission = minimal_mission(
             mission_id,
             vec![],
-            Some(MissionSpec { config_id: config_id.to_string(), inputs_fingerprint: "fp".to_string(), origin: None }),
+            Some(MissionSpec {
+                config_id: config_id.to_string(),
+                inputs_fingerprint: "fp".to_string(),
+                origin: None,
+            }),
         );
         mission.started_ts = None;
         darkmux_crew::lifecycle::save_mission(&mission).unwrap();
-        darkmux_crew::lifecycle::mission_start_with_reasoning(mission_id, Some("darkmux dispatch coder")).unwrap();
+        darkmux_crew::lifecycle::mission_start_with_reasoning(
+            mission_id,
+            Some("darkmux dispatch coder"),
+        )
+        .unwrap();
         darkmux_crew::lifecycle::mission_close_with_reasoning(mission_id, None).unwrap();
         let mut records: Vec<serde_json::Value> = std::fs::read_dir(peer.join("flows"))
             .unwrap()
-            .flat_map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap().lines().map(String::from).collect::<Vec<_>>())
+            .flat_map(|e| {
+                std::fs::read_to_string(e.unwrap().path())
+                    .unwrap()
+                    .lines()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            })
             .filter_map(|l| serde_json::from_str(&l).ok())
             .collect();
         assert!(
@@ -8825,8 +10490,14 @@ mod tests {
         let _here = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let runs = build_runs(flows.path(), None, &fleet);
-        let row = runs.iter().find(|r| r.id == "dispatch-coder-1791436244-b9a0-0").unwrap_or_else(|| panic!("{runs:?}"));
-        assert!(!row.tracked, "premise: this machine holds no record of the peer's run");
+        let row = runs
+            .iter()
+            .find(|r| r.id == "dispatch-coder-1791436244-b9a0-0")
+            .unwrap_or_else(|| panic!("{runs:?}"));
+        assert!(
+            !row.tracked,
+            "premise: this machine holds no record of the peer's run"
+        );
         assert_eq!(row.kind, RunKind::Dispatch, "{row:?}");
     }
 
@@ -8848,8 +10519,14 @@ mod tests {
         let _here = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let runs = build_runs(flows.path(), None, &fleet);
-        for id in ["review-1791436244-a1b2c3", "dispatch-coder-1791436599-c81c-0"] {
-            let row = runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("{id}: {runs:?}"));
+        for id in [
+            "review-1791436244-a1b2c3",
+            "dispatch-coder-1791436599-c81c-0",
+        ] {
+            let row = runs
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("{id}: {runs:?}"));
             assert!(!row.tracked, "{id}: premise");
             assert_eq!(row.kind, RunKind::Mission, "{id}: {row:?}");
         }
@@ -8868,7 +10545,10 @@ mod tests {
             peer_record("dispatch.complete", &darkmux_flow::ts_utc_now()),
         ];
         let runs = build_runs(flows.path(), None, &fleet);
-        let row = runs.iter().find(|r| r.id == "review-on-the-hub").expect("the peer's mission row");
+        let row = runs
+            .iter()
+            .find(|r| r.id == "review-on-the-hub")
+            .expect("the peer's mission row");
         assert_eq!(row.machine_uid.as_deref(), Some("PEER-UID-1"));
     }
 
@@ -8885,11 +10565,30 @@ mod tests {
             machine: Some("Mac".to_string()),
             ..Default::default()
         };
-        idx.insert("with-uid".to_string(), SessionAgg { machine_uid: Some("UID-A".to_string()), ..base.clone() });
+        idx.insert(
+            "with-uid".to_string(),
+            SessionAgg {
+                machine_uid: Some("UID-A".to_string()),
+                ..base.clone()
+            },
+        );
         idx.insert("no-uid".to_string(), base);
         let now_ms = parse_flow_ts("2026-07-24T10:00:00Z").unwrap() * 1_000;
-        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_ms);
-        let uid_of = |id: &str| ghosts.iter().find(|g| g.id == id).unwrap().machine_uid.clone();
+        let ghosts = ghost_runs(
+            &idx,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            now_ms,
+        );
+        let uid_of = |id: &str| {
+            ghosts
+                .iter()
+                .find(|g| g.id == id)
+                .unwrap()
+                .machine_uid
+                .clone()
+        };
         assert_eq!(uid_of("with-uid").as_deref(), Some("UID-A"));
         assert_eq!(uid_of("no-uid"), None);
     }
@@ -8905,7 +10604,12 @@ mod tests {
             serde_json::json!({"ts": darkmux_flow::ts_utc_now(), "action": "dispatch.start", "session_id": "s-nouid",
                 "handle": "coder", "machine_id": "Mac"}),
         ];
-        let idx = build_flow_session_index(flows.path(), &fleet, RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
+        let idx = build_flow_session_index(
+            flows.path(),
+            &fleet,
+            RUNS_FLOW_SCAN_WINDOW_DAYS,
+            &PeerClocks::default(),
+        );
         assert_eq!(idx["s-uid"].machine_uid.as_deref(), Some("UID-B"));
         assert_eq!(idx["s-nouid"].machine_uid, None);
     }
@@ -8929,7 +10633,10 @@ mod tests {
         ];
         let runs = build_runs(flows.path(), None, &fleet);
         let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
-        assert!(!row.tracked, "this test's own premise: the row must be untracked");
+        assert!(
+            !row.tracked,
+            "this test's own premise: the row must be untracked"
+        );
         assert_eq!(
             row.dispatch_id.as_deref(),
             Some("peer-session-1"),
@@ -8961,8 +10668,14 @@ mod tests {
             collided_record,
         ];
         let runs = build_runs(flows.path(), None, &fleet);
-        let row = runs.iter().find(|r| r.id == "review-on-the-hub").expect("row for review-on-the-hub");
-        assert!(!row.tracked, "this test's own premise: the row must be untracked");
+        let row = runs
+            .iter()
+            .find(|r| r.id == "review-on-the-hub")
+            .expect("row for review-on-the-hub");
+        assert!(
+            !row.tracked,
+            "this test's own premise: the row must be untracked"
+        );
         assert_eq!(
             row.dispatch_id, None,
             "a representative session shared by another mission must never be handed out as a drill target, \
@@ -9004,12 +10717,16 @@ mod tests {
         let known: HashSet<String> = HashSet::new();
 
         let via_build_runs = build_runs(flows.path(), None, &fleet);
-        let from_build_runs =
-            via_build_runs.iter().find(|r| r.id == "review-on-the-hub").expect("peer row from build_runs");
+        let from_build_runs = via_build_runs
+            .iter()
+            .find(|r| r.id == "review-on-the-hub")
+            .expect("peer row from build_runs");
 
         let narrow = peer_mission_runs(flows.path(), &fleet, &known);
-        let from_narrow =
-            narrow.iter().find(|r| r.id == "review-on-the-hub").expect("peer row from peer_mission_runs");
+        let from_narrow = narrow
+            .iter()
+            .find(|r| r.id == "review-on-the-hub")
+            .expect("peer row from peer_mission_runs");
 
         assert_eq!(from_narrow.status, from_build_runs.status);
         assert_eq!(from_narrow.machine, from_build_runs.machine);
@@ -9142,7 +10859,10 @@ mod tests {
         let runs = build_runs(flows.path(), None, &fleet);
         let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
         assert_eq!(row.status, RunStatus::Complete);
-        assert!(row.completed_ts.is_some(), "a closed mission carries its completion stamp");
+        assert!(
+            row.completed_ts.is_some(),
+            "a closed mission carries its completion stamp"
+        );
         // (#3074) Peer mission resolves role and model from sessions just like local mission
         assert_eq!(row.role.as_deref(), Some("azure-review"));
         assert_eq!(row.model.as_deref(), Some("gpt-4o"));
@@ -9165,7 +10885,10 @@ mod tests {
             }),
         ];
         let runs_complete = build_runs(flows.path(), None, &fleet_complete);
-        let row_complete = runs_complete.iter().find(|r| r.id == "review-on-the-hub").unwrap();
+        let row_complete = runs_complete
+            .iter()
+            .find(|r| r.id == "review-on-the-hub")
+            .unwrap();
         assert_eq!(row_complete.status, RunStatus::Complete);
         assert!(row_complete.completed_ts.is_some());
 
@@ -9180,7 +10903,10 @@ mod tests {
             }),
         ];
         let runs_error = build_runs(flows.path(), None, &fleet_error);
-        let row_error = runs_error.iter().find(|r| r.id == "review-on-the-hub").unwrap();
+        let row_error = runs_error
+            .iter()
+            .find(|r| r.id == "review-on-the-hub")
+            .unwrap();
         assert_eq!(row_error.status, RunStatus::Error);
     }
 
@@ -9200,9 +10926,15 @@ mod tests {
         };
         let mut records = Vec::new();
         if with_starts {
-            records.extend([rec("run.start", "peer-role.run", "review"), rec("dispatch.start", "peer-role.task.probe", "reviewer")]);
+            records.extend([
+                rec("run.start", "peer-role.run", "review"),
+                rec("dispatch.start", "peer-role.task.probe", "reviewer"),
+            ]);
         }
-        records.extend([rec("dispatch.complete", "peer-role.task.probe", "reviewer"), rec("run.complete", "peer-role.run", "review")]);
+        records.extend([
+            rec("dispatch.complete", "peer-role.task.probe", "reviewer"),
+            rec("run.complete", "peer-role.run", "review"),
+        ]);
         records
     }
 
@@ -9214,7 +10946,10 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let runs = build_runs(flows.path(), None, peer_run_and_execution(true));
-        let row = runs.iter().find(|r| r.id == "peer-role").expect("the peer mission's row");
+        let row = runs
+            .iter()
+            .find(|r| r.id == "peer-role")
+            .expect("the peer mission's row");
         assert_eq!(row.role.as_deref(), Some("reviewer"), "{row:?}");
     }
 
@@ -9227,7 +10962,10 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let runs = build_runs(flows.path(), None, peer_run_and_execution(false));
-        let row = runs.iter().find(|r| r.id == "peer-role").expect("the peer mission's row");
+        let row = runs
+            .iter()
+            .find(|r| r.id == "peer-role")
+            .expect("the peer mission's row");
         assert_eq!(row.role.as_deref(), Some("reviewer"), "{row:?}");
     }
 
@@ -9257,9 +10995,19 @@ mod tests {
         // The window reaches the fixture's own day (2026-09-27T00:00:00Z), so
         // the result never depends on today's date: the default 14-day window
         // aged these records out on 2026-10-12 and the row vanished.
-        let runs = build_runs_in(flows.path(), None, &fleet, &ScanWindow::since(1_790_467_200)).runs;
+        let runs = build_runs_in(
+            flows.path(),
+            None,
+            &fleet,
+            &ScanWindow::since(1_790_467_200),
+        )
+        .runs;
         let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
-        assert_eq!(row.status, RunStatus::Error, "the run's bookend outranks the close: {row:?}");
+        assert_eq!(
+            row.status,
+            RunStatus::Error,
+            "the run's bookend outranks the close: {row:?}"
+        );
     }
 
     /// (#3074) When dispatch.start has aged out, mission_to_run falls back to a session
@@ -9291,10 +11039,17 @@ mod tests {
             "phase_ids": [],
             "created_ts": 1_700_000_000u64,
         });
-        std::fs::write(mission_dir.join("mission.json"), serde_json::to_string(&mission).unwrap()).unwrap();
+        std::fs::write(
+            mission_dir.join("mission.json"),
+            serde_json::to_string(&mission).unwrap(),
+        )
+        .unwrap();
 
         let runs = build_runs(flows.path(), None, &[]);
-        let row = runs.iter().find(|r| r.id == "mission-aged-out").expect("mission row present");
+        let row = runs
+            .iter()
+            .find(|r| r.id == "mission-aged-out")
+            .expect("mission row present");
         assert_eq!(row.role.as_deref(), Some("fallback-coder"));
         assert_eq!(row.model.as_deref(), Some("qwen3.6"));
     }
@@ -9317,7 +11072,10 @@ mod tests {
         write_day_file(
             flows.path(),
             &today(),
-            &[rec("dispatch.complete", "mission-aged-two.task.t", "coder"), rec("run.complete", "mission-aged-two.run", "coder-phase")],
+            &[
+                rec("dispatch.complete", "mission-aged-two.task.t", "coder"),
+                rec("run.complete", "mission-aged-two.run", "coder-phase"),
+            ],
         );
         let mission_dir = _g.join("missions").join("mission-aged-two");
         std::fs::create_dir_all(&mission_dir).unwrap();
@@ -9327,10 +11085,17 @@ mod tests {
             "phase_ids": [],
             "created_ts": 1_700_000_000u64,
         });
-        std::fs::write(mission_dir.join("mission.json"), serde_json::to_string(&mission).unwrap()).unwrap();
+        std::fs::write(
+            mission_dir.join("mission.json"),
+            serde_json::to_string(&mission).unwrap(),
+        )
+        .unwrap();
 
         let runs = build_runs(flows.path(), None, &[]);
-        let row = runs.iter().find(|r| r.id == "mission-aged-two").expect("mission row present");
+        let row = runs
+            .iter()
+            .find(|r| r.id == "mission-aged-two")
+            .expect("mission row present");
         assert_eq!(row.role.as_deref(), Some("coder"), "{row:?}");
     }
 
@@ -9428,21 +11193,43 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let finalize = |id: &str, config: &str, stop: Option<&str>| {
-            let m = minimal_mission(id, vec![], Some(MissionSpec { config_id: config.to_string(), inputs_fingerprint: "fp".to_string(), origin: None }));
+            let m = minimal_mission(
+                id,
+                vec![],
+                Some(MissionSpec {
+                    config_id: config.to_string(),
+                    inputs_fingerprint: "fp".to_string(),
+                    origin: None,
+                }),
+            );
             darkmux_crew::lifecycle::save_mission(&m).unwrap();
-            let env = MissionEnvelope { stop_reason: stop.map(str::to_string), ..MissionEnvelope::new(id, MissionOutcomeStatus::Error, &[]) };
+            let env = MissionEnvelope {
+                stop_reason: stop.map(str::to_string),
+                ..MissionEnvelope::new(id, MissionOutcomeStatus::Error, &[])
+            };
             darkmux_crew::envelope::finalize_mission(&env);
         };
         finalize("m-stopped", "review", Some("SIGTERM"));
         finalize("d-stopped", "dispatch", Some("SIGTERM"));
         finalize("m-failed", "review", None);
         let runs = build_runs(flows.path(), None, &[]);
-        let row = |id: &str| runs.iter().find(|r| r.id == id).unwrap_or_else(|| panic!("no row {id}"));
+        let row = |id: &str| {
+            runs.iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("no row {id}"))
+        };
         assert_eq!(row("d-stopped").kind, RunKind::Dispatch);
         for id in ["m-stopped", "d-stopped"] {
-            assert_eq!((row(id).status, row(id).abandoned_reason), (RunStatus::Abandoned, Some(AbandonReason::Aborted)), "{id}");
+            assert_eq!(
+                (row(id).status, row(id).abandoned_reason),
+                (RunStatus::Abandoned, Some(AbandonReason::Aborted)),
+                "{id}"
+            );
         }
-        assert_eq!((row("m-failed").status, row("m-failed").abandoned_reason), (RunStatus::Error, None));
+        assert_eq!(
+            (row("m-failed").status, row("m-failed").abandoned_reason),
+            (RunStatus::Error, None)
+        );
     }
 
     /// The same decision read from the flow alone (a peer's mission): a
@@ -9453,10 +11240,26 @@ mod tests {
     #[serial_test::serial]
     fn a_peer_runs_terminal_reads_as_its_owner_decided_it() {
         for (action, payload, want) in [
-            ("run.error", serde_json::json!({"result_class": "error", "stop_reason": "SIGTERM"}), (RunStatus::Abandoned, Some(AbandonReason::Aborted))),
-            ("run.error", serde_json::json!({"result_class": "error"}), (RunStatus::Error, None)),
-            ("run.complete", serde_json::json!({"result_class": "ok", "status": "Degraded"}), (RunStatus::Degraded, None)),
-            ("run.complete", serde_json::json!({"result_class": "ok", "status": "Clean"}), (RunStatus::Complete, None)),
+            (
+                "run.error",
+                serde_json::json!({"result_class": "error", "stop_reason": "SIGTERM"}),
+                (RunStatus::Abandoned, Some(AbandonReason::Aborted)),
+            ),
+            (
+                "run.error",
+                serde_json::json!({"result_class": "error"}),
+                (RunStatus::Error, None),
+            ),
+            (
+                "run.complete",
+                serde_json::json!({"result_class": "ok", "status": "Degraded"}),
+                (RunStatus::Degraded, None),
+            ),
+            (
+                "run.complete",
+                serde_json::json!({"result_class": "ok", "status": "Clean"}),
+                (RunStatus::Complete, None),
+            ),
         ] {
             let _g = CrewGuard::new();
             let flows = TempDir::new().unwrap();
@@ -9475,10 +11278,17 @@ mod tests {
                     "payload": payload,
                 })
             };
-            let fleet = vec![run_rec("run.start", serde_json::json!({})), run_rec(action, payload.clone())];
+            let fleet = vec![
+                run_rec("run.start", serde_json::json!({})),
+                run_rec(action, payload.clone()),
+            ];
             let runs = build_runs(flows.path(), None, &fleet);
             let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
-            assert_eq!((row.status, row.abandoned_reason), want, "{action} {payload}");
+            assert_eq!(
+                (row.status, row.abandoned_reason),
+                want,
+                "{action} {payload}"
+            );
         }
     }
 
@@ -9513,9 +11323,20 @@ mod tests {
             ];
             let runs = build_runs(flows.path(), None, &fleet);
             let row = runs.iter().find(|r| r.id == "abort-first").unwrap();
-            assert_eq!(row.status, RunStatus::Abandoned, "abort then {late} must stay Abandoned");
-            assert_eq!(row.abandoned_reason, Some(AbandonReason::Aborted), "abort then {late}");
-            assert!(row.completed_ts.is_none(), "abort then {late} carries no completion stamp");
+            assert_eq!(
+                row.status,
+                RunStatus::Abandoned,
+                "abort then {late} must stay Abandoned"
+            );
+            assert_eq!(
+                row.abandoned_reason,
+                Some(AbandonReason::Aborted),
+                "abort then {late}"
+            );
+            assert!(
+                row.completed_ts.is_none(),
+                "abort then {late} carries no completion stamp"
+            );
         }
     }
 
@@ -9526,7 +11347,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_peer_mission_abort_outranks_an_earlier_terminal() {
-        for (early, outcome) in [("run.complete", "Clean"), ("run.error", ""), ("mission.close", "")] {
+        for (early, outcome) in [
+            ("run.complete", "Clean"),
+            ("run.error", ""),
+            ("mission.close", ""),
+        ] {
             let _g = CrewGuard::new();
             let flows = TempDir::new().unwrap();
             let rec = |action: &str| {
@@ -9550,9 +11375,20 @@ mod tests {
             ];
             let runs = build_runs(flows.path(), None, &fleet);
             let row = runs.iter().find(|r| r.id == "abort-last").unwrap();
-            assert_eq!(row.status, RunStatus::Abandoned, "{early} then abort must read Abandoned");
-            assert_eq!(row.abandoned_reason, Some(AbandonReason::Aborted), "{early} then abort");
-            assert!(row.completed_ts.is_none(), "{early} then abort carries no completion stamp");
+            assert_eq!(
+                row.status,
+                RunStatus::Abandoned,
+                "{early} then abort must read Abandoned"
+            );
+            assert_eq!(
+                row.abandoned_reason,
+                Some(AbandonReason::Aborted),
+                "{early} then abort"
+            );
+            assert!(
+                row.completed_ts.is_none(),
+                "{early} then abort carries no completion stamp"
+            );
         }
     }
 
@@ -9566,19 +11402,32 @@ mod tests {
         let flows = TempDir::new().unwrap();
         let now = now_unix();
         let at = |secs_ago: u64| darkmux_flow::ts_utc_at(now.saturating_sub(secs_ago) as i64);
-        let rec = |secs_ago: u64, action: &str| {
-            serde_json::json!({ "ts": at(secs_ago), "action": action, "session_id": "span-session", "mission_id": "span-mission", "handle": "coder" })
-        };
+        let rec = |secs_ago: u64, action: &str| serde_json::json!({ "ts": at(secs_ago), "action": action, "session_id": "span-session", "mission_id": "span-mission", "handle": "coder" });
         // Middle first, then the earliest, then the latest.
         write_day_file(
             flows.path(),
             &today(),
-            &[rec(600, "dispatch.start"), rec(900, "dispatch.turn"), rec(300, "dispatch.turn")],
+            &[
+                rec(600, "dispatch.start"),
+                rec(900, "dispatch.turn"),
+                rec(300, "dispatch.turn"),
+            ],
         );
         let runs = build_runs(flows.path(), None, &[]);
-        let row = runs.iter().find(|r| r.id == "span-mission").unwrap_or_else(|| panic!("no row: {runs:?}"));
-        assert_eq!(row.started_ts, parse_flow_ts(&at(900)), "started is the earliest record, not the first to arrive: {row:?}");
-        assert_eq!(row.updated_ts, parse_flow_ts(&at(300)), "updated is the latest record, not the first to arrive: {row:?}");
+        let row = runs
+            .iter()
+            .find(|r| r.id == "span-mission")
+            .unwrap_or_else(|| panic!("no row: {runs:?}"));
+        assert_eq!(
+            row.started_ts,
+            parse_flow_ts(&at(900)),
+            "started is the earliest record, not the first to arrive: {row:?}"
+        );
+        assert_eq!(
+            row.updated_ts,
+            parse_flow_ts(&at(300)),
+            "updated is the latest record, not the first to arrive: {row:?}"
+        );
     }
 
     /// A mission's session list names each session once, and an empty
@@ -9624,7 +11473,12 @@ mod tests {
         // written to both.
         let rec = peer_record("dispatch.start", &darkmux_flow::ts_utc_now());
         write_day_file(flows.path(), &today(), std::slice::from_ref(&rec));
-        let idx = build_flow_session_index(flows.path(), std::slice::from_ref(&rec), RUNS_FLOW_SCAN_WINDOW_DAYS, &PeerClocks::default());
+        let idx = build_flow_session_index(
+            flows.path(),
+            std::slice::from_ref(&rec),
+            RUNS_FLOW_SCAN_WINDOW_DAYS,
+            &PeerClocks::default(),
+        );
         let agg = idx.get("peer-session-1").expect("session present");
         assert!(agg.has_start);
         // The dedup is what this asserts: two sources, one session, and the
@@ -9667,7 +11521,10 @@ mod tests {
         // reject the falsy zero. An `.or()` chain would ACCEPT `Some(0)` as a
         // value and report a healthy sort key for exactly the rows #2812
         // makes invisible.
-        for ts in [r.updated_ts, r.completed_ts, r.started_ts].into_iter().flatten() {
+        for ts in [r.updated_ts, r.completed_ts, r.started_ts]
+            .into_iter()
+            .flatten()
+        {
             if ts != 0 {
                 return ts;
             }
@@ -9739,7 +11596,10 @@ mod tests {
             (RunKind::Dispatch, RunStatus::Abandoned) => true,
             (
                 RunKind::Dispatch,
-                RunStatus::Planned | RunStatus::Degraded | RunStatus::Unparseable | RunStatus::Escalated,
+                RunStatus::Planned
+                | RunStatus::Degraded
+                | RunStatus::Unparseable
+                | RunStatus::Escalated,
             ) => false,
             // `flow_mission_to_run`: a peer's mission, judged only by its
             // own terminal record and its sessions' liveness. It has no
@@ -9789,7 +11649,10 @@ mod tests {
             .filter(|(k, s)| untracked_cell_is_reachable(*k, *s))
             .count();
         assert_eq!(tracked, 19, "tracked cells: mission 7 + dispatch 7 + lab 5");
-        assert_eq!(untracked, 7, "untracked cells: ghost dispatch 4 + peer mission 3");
+        assert_eq!(
+            untracked, 7,
+            "untracked cells: ghost dispatch 4 + peer mission 3"
+        );
     }
 
     /// A `RunStatus` that no mapper can reach is dead vocabulary on the
@@ -9801,7 +11664,10 @@ mod tests {
             let reachable = ALL_KINDS.iter().any(|k| {
                 tracked_cell_is_reachable(*k, status) || untracked_cell_is_reachable(*k, status)
             });
-            assert!(reachable, "{status:?} is on the wire but no /runs mapper produces it");
+            assert!(
+                reachable,
+                "{status:?} is on the wire but no /runs mapper produces it"
+            );
         }
     }
 
@@ -9862,7 +11728,10 @@ mod tests {
             - std::time::Duration::from_millis(stale_after_ms() + 60_000);
         for entry in std::fs::read_dir(lab_dir.join(dir)).unwrap().flatten() {
             if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                let f = std::fs::File::options().write(true).open(entry.path()).unwrap();
+                let f = std::fs::File::options()
+                    .write(true)
+                    .open(entry.path())
+                    .unwrap();
                 f.set_modified(when).unwrap();
             }
         }
@@ -9884,10 +11753,18 @@ mod tests {
         let _g = CrewGuard::new();
         let flows = TempDir::new().unwrap();
         let lab = TempDir::new().unwrap();
-        write_lifecycle_only_lab_run(lab.path(), "long-agentic-dogfood-compact-1-1", "running", None);
+        write_lifecycle_only_lab_run(
+            lab.path(),
+            "long-agentic-dogfood-compact-1-1",
+            "running",
+            None,
+        );
 
         let runs = build_runs(flows.path(), Some(lab.path()), &[]);
-        let row = runs.iter().find(|r| r.kind == RunKind::Lab).expect("the lab row exists");
+        let row = runs
+            .iter()
+            .find(|r| r.kind == RunKind::Lab)
+            .expect("the lab row exists");
         assert_ne!(
             activity_key(row),
             0,
@@ -9919,7 +11796,9 @@ mod tests {
             "a lab run's newest-artifact time comes from READING its directory — a fixed list of \
              review-funnel filenames finds nothing in a coding-task run and leaves this absent",
         );
-        let started = row.started_ts.expect("the fixture's lifecycle record declares a start");
+        let started = row
+            .started_ts
+            .expect("the fixture's lifecycle record declares a start");
         assert!(
             updated > started,
             "`updated_ts` ({updated}) must track the run's newest artifact, which this fixture \
@@ -9946,7 +11825,12 @@ mod tests {
         let flows = TempDir::new().unwrap();
         let lab = TempDir::new().unwrap();
         let sid = "darkmux-coding-long-agentic-1789797003515";
-        write_lifecycle_only_lab_run(lab.path(), "long-agentic-dogfood-compact-2-1", "running", Some(sid));
+        write_lifecycle_only_lab_run(
+            lab.path(),
+            "long-agentic-dogfood-compact-2-1",
+            "running",
+            Some(sid),
+        );
         // The run is HOURS in: its host-side artifacts have not moved
         // since it started, which is what makes the artifact heuristic
         // and the session evidence actually disagree here. Without this
@@ -9966,7 +11850,10 @@ mod tests {
         );
 
         let runs = build_runs(flows.path(), Some(lab.path()), &[]);
-        let row = runs.iter().find(|r| r.kind == RunKind::Lab).expect("the lab row exists");
+        let row = runs
+            .iter()
+            .find(|r| r.kind == RunKind::Lab)
+            .expect("the lab row exists");
         assert_eq!(
             row.status,
             RunStatus::Running,
@@ -9974,8 +11861,15 @@ mod tests {
              abandoned is what made /runs return zero running rows with two dispatches in \
              flight: {row:?}"
         );
-        assert_eq!(row.abandoned_reason, None, "a running row carries no abandonment reason");
-        assert_ne!(activity_key(row), 0, "and it must still be orderable: {row:?}");
+        assert_eq!(
+            row.abandoned_reason, None,
+            "a running row carries no abandonment reason"
+        );
+        assert_ne!(
+            activity_key(row),
+            0,
+            "and it must still be orderable: {row:?}"
+        );
     }
 
     /// The operator's rule (2026-10-07): a lab run is RUNNING until its own
@@ -10005,7 +11899,10 @@ mod tests {
             ],
         );
         let runs = build_runs(flows.path(), Some(lab.path()), &[]);
-        let row = runs.iter().find(|r| r.kind == RunKind::Lab).expect("the lab row exists");
+        let row = runs
+            .iter()
+            .find(|r| r.kind == RunKind::Lab)
+            .expect("the lab row exists");
         assert_eq!(
             (row.status, row.abandoned_reason),
             (RunStatus::Running, None),
@@ -10039,8 +11936,15 @@ mod tests {
             ],
         );
         let runs = build_runs(flows.path(), Some(lab.path()), &[]);
-        let row = runs.iter().find(|r| r.kind == RunKind::Lab).expect("the lab row exists");
-        assert_eq!((row.status, row.abandoned_reason), (RunStatus::Abandoned, Some(AbandonReason::NoTerminal)), "{row:?}");
+        let row = runs
+            .iter()
+            .find(|r| r.kind == RunKind::Lab)
+            .expect("the lab row exists");
+        assert_eq!(
+            (row.status, row.abandoned_reason),
+            (RunStatus::Abandoned, Some(AbandonReason::NoTerminal)),
+            "{row:?}"
+        );
     }
 
     /// The inverted case, and the reason the session fact is more than a
@@ -10056,7 +11960,12 @@ mod tests {
         let flows = TempDir::new().unwrap();
         let lab = TempDir::new().unwrap();
         let sid = "darkmux-coding-long-agentic-dead-1";
-        write_lifecycle_only_lab_run(lab.path(), "long-agentic-dogfood-compact-3-1", "running", Some(sid));
+        write_lifecycle_only_lab_run(
+            lab.path(),
+            "long-agentic-dogfood-compact-3-1",
+            "running",
+            Some(sid),
+        );
         write_day_file(
             flows.path(),
             &today(),
@@ -10069,7 +11978,10 @@ mod tests {
         );
 
         let runs = build_runs(flows.path(), Some(lab.path()), &[]);
-        let row = runs.iter().find(|r| r.kind == RunKind::Lab).expect("the lab row exists");
+        let row = runs
+            .iter()
+            .find(|r| r.kind == RunKind::Lab)
+            .expect("the lab row exists");
         assert_eq!(
             row.status,
             RunStatus::Abandoned,
@@ -10118,7 +12030,10 @@ mod tests {
         );
 
         let runs = build_runs(flows.path(), Some(lab.path()), &[]);
-        assert!(runs.len() >= 5, "the fixture must actually produce rows of several kinds: {runs:?}");
+        assert!(
+            runs.len() >= 5,
+            "the fixture must actually produce rows of several kinds: {runs:?}"
+        );
         for row in &runs {
             assert_ne!(
                 activity_key(row),
@@ -10129,12 +12044,18 @@ mod tests {
         }
         // The fixture's own premise: it really does span kinds and
         // tracked-ness, so the sweep above is not vacuously scoped to one.
-        assert!(runs.iter().any(|r| r.kind == RunKind::Lab), "fixture premise: a lab row: {runs:?}");
+        assert!(
+            runs.iter().any(|r| r.kind == RunKind::Lab),
+            "fixture premise: a lab row: {runs:?}"
+        );
         assert!(
             runs.iter().any(|r| r.kind == RunKind::Dispatch),
             "fixture premise: a ghost dispatch row: {runs:?}"
         );
-        assert!(runs.iter().any(|r| !r.tracked), "fixture premise: an untracked row: {runs:?}");
+        assert!(
+            runs.iter().any(|r| !r.tracked),
+            "fixture premise: an untracked row: {runs:?}"
+        );
     }
 
     /// `started_ts` was unconditionally `None` for every lab run, so
@@ -10152,7 +12073,10 @@ mod tests {
         write_lifecycle_only_lab_run(lab.path(), "lab-start-1", "running", None);
 
         let runs = build_runs(flows.path(), Some(lab.path()), &[]);
-        let row = runs.iter().find(|r| r.kind == RunKind::Lab).expect("the lab row exists");
+        let row = runs
+            .iter()
+            .find(|r| r.kind == RunKind::Lab)
+            .expect("the lab row exists");
         assert_eq!(
             row.started_ts,
             Some(1_700_000_000),
@@ -10165,11 +12089,13 @@ mod tests {
     #[test]
     fn lab_summary_with_no_lifecycle_start_reports_no_start() {
         let summary = minimal_lab_summary("legacy/no-lifecycle", true, false);
-        assert_eq!(summary.lifecycle_started_at_ms, None, "this test's own premise");
+        assert_eq!(
+            summary.lifecycle_started_at_ms, None,
+            "this test's own premise"
+        );
         let run = lab_summary_to_run(&summary, None, FIXTURE_NOW_MS, None);
         assert_eq!(run.started_ts, None, "no record, no claim");
     }
-
 
     /// (#3035) A value a newer darkmux wrote reads as `Unknown`, not as an
     /// error that loses the whole record.

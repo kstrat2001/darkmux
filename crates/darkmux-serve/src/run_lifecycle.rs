@@ -88,33 +88,51 @@ struct Folded {
 /// `dispatch.queue.wait`'s time waited. Read only off those two, so no other
 /// record pays for the payload parse.
 fn model_elapsed_of(action: Option<&FlowAction>, v: &serde_json::Value) -> Option<u64> {
-    if !matches!(action, Some(FlowAction::DispatchModelLoading | FlowAction::DispatchQueueWait)) {
+    if !matches!(
+        action,
+        Some(FlowAction::DispatchModelLoading | FlowAction::DispatchQueueWait)
+    ) {
         return None;
     }
     match darkmux_flow::reader::payload_of(v) {
-        Some(darkmux_flow::Payload::DispatchModelLoading(p) | darkmux_flow::Payload::DispatchQueueWait(p)) => p.elapsed_ms,
+        Some(
+            darkmux_flow::Payload::DispatchModelLoading(p)
+            | darkmux_flow::Payload::DispatchQueueWait(p),
+        ) => p.elapsed_ms,
         _ => None,
     }
 }
 
 impl Folded {
-    fn of(action: Option<&FlowAction>, mission: Option<&str>, ts: &str, v: &serde_json::Value) -> Self {
+    fn of(
+        action: Option<&FlowAction>,
+        mission: Option<&str>,
+        ts: &str,
+        v: &serde_json::Value,
+    ) -> Self {
         let named = |r: &Option<String>| r.as_deref().is_some_and(|r| !r.is_empty());
-        let (names_a_reason, wait_ms, later_step_planned) = match darkmux_flow::reader::payload_of(v) {
-            Some(darkmux_flow::Payload::BudgetStop(p)) => (named(&p.reason), 0, false),
-            Some(darkmux_flow::Payload::DispatchError(p)) => (named(&p.stop_reason), 0, false),
-            Some(darkmux_flow::Payload::RunError(p)) => (named(&p.stop_reason), 0, false),
-            Some(darkmux_flow::Payload::StepError(p)) => (named(&p.stop_reason), 0, false),
-            Some(darkmux_flow::Payload::BudgetWait(p)) => (false, p.wait_ms.unwrap_or(0), false),
-            Some(darkmux_flow::Payload::StepComplete(p)) => (false, 0, p.later_step_planned == Some(true)),
-            _ => (false, 0, false),
-        };
+        let (names_a_reason, wait_ms, later_step_planned) =
+            match darkmux_flow::reader::payload_of(v) {
+                Some(darkmux_flow::Payload::BudgetStop(p)) => (named(&p.reason), 0, false),
+                Some(darkmux_flow::Payload::DispatchError(p)) => (named(&p.stop_reason), 0, false),
+                Some(darkmux_flow::Payload::RunError(p)) => (named(&p.stop_reason), 0, false),
+                Some(darkmux_flow::Payload::StepError(p)) => (named(&p.stop_reason), 0, false),
+                Some(darkmux_flow::Payload::BudgetWait(p)) => {
+                    (false, p.wait_ms.unwrap_or(0), false)
+                }
+                Some(darkmux_flow::Payload::StepComplete(p)) => {
+                    (false, 0, p.later_step_planned == Some(true))
+                }
+                _ => (false, 0, false),
+            };
         let degraded = matches!(darkmux_flow::reader::payload_of(v), Some(darkmux_flow::Payload::RunComplete(p)) if p.is_degraded());
         let model_elapsed_ms = model_elapsed_of(action, v);
         Folded {
             action: action.cloned(),
             mission: mission.map(str::to_string),
-            execution: action.filter(|a| a.grain() == Some(Grain::Execution)).and_then(|_| darkmux_flow::reader::execution_id_of(v)),
+            execution: action
+                .filter(|a| a.grain() == Some(Grain::Execution))
+                .and_then(|_| darkmux_flow::reader::execution_id_of(v)),
             ts: ts.to_string(),
             at: crate::runs::parse_flow_ts(ts),
             names_a_reason,
@@ -136,7 +154,10 @@ impl Folded {
 
     /// A bookend terminal: the outcome over any other close (rule 3).
     fn is_bookend_terminal(&self) -> bool {
-        self.action.as_ref().and_then(FlowAction::bookend).is_some_and(|b| b.edge.is_terminal())
+        self.action
+            .as_ref()
+            .and_then(FlowAction::bookend)
+            .is_some_and(|b| b.edge.is_terminal())
     }
 }
 
@@ -155,7 +176,11 @@ pub(crate) fn ending_of_record(v: &serde_json::Value) -> Option<Ending> {
 /// as aborted, not a failure. `degraded`: a `run.complete` whose status says
 /// the run completed degraded (its own wall-clock bound, a degraded step),
 /// which the run's row reads as degraded too.
-pub(crate) fn ending_of(action: &FlowAction, names_a_reason: bool, degraded: bool) -> Option<Ending> {
+pub(crate) fn ending_of(
+    action: &FlowAction,
+    names_a_reason: bool,
+    degraded: bool,
+) -> Option<Ending> {
     action
         .bookend()
         .and_then(|b| bookend_ending(&b.edge, names_a_reason, degraded))
@@ -186,10 +211,15 @@ fn closing_ending(action: &FlowAction, names_a_reason: bool) -> Option<Ending> {
     if *action == FlowAction::SessionEnd {
         return ended(RunStatus::Abandoned, Some(AbandonReason::NoTerminal));
     }
-    if *action == FlowAction::MissionAbort || (matches!(action, FlowAction::BudgetStop | FlowAction::StepError) && names_a_reason) {
+    if *action == FlowAction::MissionAbort
+        || (matches!(action, FlowAction::BudgetStop | FlowAction::StepError) && names_a_reason)
+    {
         return ended(RunStatus::Abandoned, Some(AbandonReason::Aborted));
     }
-    (*action == FlowAction::BudgetStop).then_some(Ending { status: RunStatus::Abandoned, reason: Some(AbandonReason::NoTerminal) })
+    (*action == FlowAction::BudgetStop).then_some(Ending {
+        status: RunStatus::Abandoned,
+        reason: Some(AbandonReason::NoTerminal),
+    })
 }
 
 /// Rules 2 and 3 as one decision: the first closing record closes, and the
@@ -217,7 +247,9 @@ impl CloseFold {
 
     /// How it ended: the bookend terminal over the first close.
     pub fn ending(&self) -> Option<Ending> {
-        self.close.as_ref().map(|(_, e)| self.terminal.unwrap_or(*e))
+        self.close
+            .as_ref()
+            .map(|(_, e)| self.terminal.unwrap_or(*e))
     }
 }
 
@@ -227,11 +259,21 @@ fn is_bookend_start(a: &FlowAction) -> bool {
 }
 
 fn is_reopener(a: &FlowAction) -> bool {
-    is_bookend_start(a) || matches!(a, FlowAction::BudgetWait | FlowAction::MissionStart | FlowAction::StepStart)
+    is_bookend_start(a)
+        || matches!(
+            a,
+            FlowAction::BudgetWait | FlowAction::MissionStart | FlowAction::StepStart
+        )
 }
 
 fn is_first_opener(a: &FlowAction) -> bool {
-    matches!(a, FlowAction::DispatchTurn | FlowAction::DispatchTurnHeartbeat | FlowAction::DispatchTool | FlowAction::DispatchRest)
+    matches!(
+        a,
+        FlowAction::DispatchTurn
+            | FlowAction::DispatchTurnHeartbeat
+            | FlowAction::DispatchTool
+            | FlowAction::DispatchRest
+    )
 }
 
 /// One attempt of a session (rule 1).
@@ -293,7 +335,9 @@ impl Attempt {
         if r.at.is_some() {
             self.last_activity_ts = Some(r.ts.clone());
         }
-        let Some(action) = r.action.as_ref() else { return };
+        let Some(action) = r.action.as_ref() else {
+            return;
+        };
         if is_bookend_start(action) && !self.has_start {
             self.has_start = true;
             self.start_ts = (!r.ts.is_empty()).then(|| r.ts.clone());
@@ -312,9 +356,13 @@ impl Attempt {
             FlowAction::DispatchModelStart => self.model_starting = Some(0),
             // A `.loading` is itself proof a start is under way (its
             // `.start` may sit in a day file the window no longer reads).
-            FlowAction::DispatchModelLoading => self.model_starting = r.model_elapsed_ms.or(self.model_starting),
+            FlowAction::DispatchModelLoading => {
+                self.model_starting = r.model_elapsed_ms.or(self.model_starting)
+            }
             FlowAction::DispatchModelReady => self.model_starting = None,
-            FlowAction::DispatchQueueWait => self.queued = r.model_elapsed_ms.or(self.queued).or(Some(0)),
+            FlowAction::DispatchQueueWait => {
+                self.queued = r.model_elapsed_ms.or(self.queued).or(Some(0))
+            }
             FlowAction::DispatchQueueResume => self.queued = None,
             _ => {}
         }
@@ -331,7 +379,9 @@ impl Attempt {
         if *action == FlowAction::BudgetWait {
             self.waited = true;
             self.wait_until_ms = r.at.map(|secs| {
-                secs.saturating_mul(1_000).saturating_add(r.wait_ms).saturating_add(crate::runs::BUDGET_WAIT_GRACE_MS)
+                secs.saturating_mul(1_000)
+                    .saturating_add(r.wait_ms)
+                    .saturating_add(crate::runs::BUDGET_WAIT_GRACE_MS)
             });
         } else if *action == FlowAction::BudgetResume {
             self.wait_until_ms = None;
@@ -340,21 +390,36 @@ impl Attempt {
 }
 
 /// The attempt a record joins (rule 1), by index.
-fn target_for(attempts: &[Attempt], mission: Option<&str>, execution: Option<&ExecutionId>) -> Option<usize> {
-    if let Some(own) = execution.and_then(|x| attempts.iter().rposition(|a| a.execution.as_ref() == Some(x))) {
+fn target_for(
+    attempts: &[Attempt],
+    mission: Option<&str>,
+    execution: Option<&ExecutionId>,
+) -> Option<usize> {
+    if let Some(own) = execution.and_then(|x| {
+        attempts
+            .iter()
+            .rposition(|a| a.execution.as_ref() == Some(x))
+    }) {
         return Some(own);
     }
     let cur = attempts.len().checked_sub(1);
     let Some(m) = mission else {
-        return attempts.iter().rposition(|a| a.fold.close.is_none()).or(cur);
+        return attempts
+            .iter()
+            .rposition(|a| a.fold.close.is_none())
+            .or(cur);
     };
-    let own = attempts.iter().rposition(|a| a.mission.as_deref() == Some(m));
+    let own = attempts
+        .iter()
+        .rposition(|a| a.mission.as_deref() == Some(m));
     own.or_else(|| cur.filter(|&i| attempts[i].mission.is_none()))
 }
 
 /// Whether `action` opens a new attempt rather than joining `mine` (rule 1).
 fn opens(attempts: &[Attempt], mine: Option<usize>, action: &FlowAction) -> bool {
-    let Some(i) = mine else { return is_reopener(action) || is_first_opener(action) };
+    let Some(i) = mine else {
+        return is_reopener(action) || is_first_opener(action);
+    };
     let a = &attempts[i];
     is_reopener(action) && (a.fold.close.is_some() || (is_bookend_start(action) && a.has_start))
 }
@@ -364,7 +429,9 @@ fn opens(attempts: &[Attempt], mine: Option<usize>, action: &FlowAction) -> bool
 /// when it names none) left with no close of its own.
 fn place_orphans(attempts: &mut [Attempt], orphans: &[&Folded]) {
     for o in orphans {
-        let home = attempts.iter_mut().find(|a| a.fold.close.is_none() && (o.mission.is_none() || a.mission == o.mission));
+        let home = attempts
+            .iter_mut()
+            .find(|a| a.fold.close.is_none() && (o.mission.is_none() || a.mission == o.mission));
         if let (Some(a), Some(ending)) = (home, o.ending()) {
             a.fold.close = Some((o.ts.clone(), ending));
         }
@@ -389,8 +456,14 @@ fn segment(records: &[Folded]) -> Vec<Attempt> {
     let mut orphans: Vec<&Folded> = Vec::new();
     for r in order {
         let mut target = target_for(&attempts, r.mission.as_deref(), r.execution.as_ref());
-        if r.action.as_ref().is_some_and(|a| opens(&attempts, target, a)) {
-            attempts.push(Attempt { mission: r.mission.clone(), ..Attempt::default() });
+        if r.action
+            .as_ref()
+            .is_some_and(|a| opens(&attempts, target, a))
+        {
+            attempts.push(Attempt {
+                mission: r.mission.clone(),
+                ..Attempt::default()
+            });
             target = Some(attempts.len() - 1);
         }
         match target {
@@ -405,7 +478,13 @@ fn segment(records: &[Folded]) -> Vec<Attempt> {
 
 impl RunFold {
     /// Keep one record (`ts` in the flow schema's spelling).
-    pub fn fold(&mut self, action: Option<&FlowAction>, mission: Option<&str>, ts: &str, v: &serde_json::Value) {
+    pub fn fold(
+        &mut self,
+        action: Option<&FlowAction>,
+        mission: Option<&str>,
+        ts: &str,
+        v: &serde_json::Value,
+    ) {
         Arc::make_mut(&mut self.records).push(Folded::of(action, mission, ts, v));
     }
 
@@ -423,7 +502,10 @@ impl RunFold {
     /// `mission`'s latest attempt on this session: how the session reads
     /// for that mission when several share it (as of `seal`).
     pub fn latest_of(&self, mission: &str) -> Option<&Attempt> {
-        self.attempts.iter().rev().find(|a| a.mission.as_deref() == Some(mission))
+        self.attempts
+            .iter()
+            .rev()
+            .find(|a| a.mission.as_deref() == Some(mission))
     }
 
     /// How the session (`mission`'s records on it, when named) recorded its
@@ -435,11 +517,22 @@ impl RunFold {
     /// closed. Read only where no attempt opened (`latest`/`latest_of` are
     /// `None`): an opened session's closes are its attempts'.
     pub fn recorded_end(&self, mission: Option<&str>) -> Option<Attempt> {
-        let mut closes: Vec<&Folded> =
-            self.records.iter().filter(|r| r.ending().is_some() && (mission.is_none() || r.mission.as_deref() == mission)).collect();
+        let mut closes: Vec<&Folded> = self
+            .records
+            .iter()
+            .filter(|r| {
+                r.ending().is_some() && (mission.is_none() || r.mission.as_deref() == mission)
+            })
+            .collect();
         closes.sort_by_key(|r| (r.at.is_none(), r.at));
-        let record = closes.iter().find(|r| r.is_bookend_terminal()).or(closes.first())?;
-        let mut end = Attempt { mission: record.mission.clone(), ..Attempt::default() };
+        let record = closes
+            .iter()
+            .find(|r| r.is_bookend_terminal())
+            .or(closes.first())?;
+        let mut end = Attempt {
+            mission: record.mission.clone(),
+            ..Attempt::default()
+        };
         end.add(record);
         Some(end)
     }
@@ -448,9 +541,18 @@ impl RunFold {
 /// The one staleness rule: live while `now` is within the window of the
 /// newest activity, or of an open wait's lapse when that is later (a wait
 /// still ahead holds it live outright). No activity at all is not live.
-pub(crate) fn quiet_clock_live(last_activity_ts: Option<&str>, wait_until_ms: Option<u64>, now_ms: u64, stale_after_ms: u64) -> bool {
-    let last_ms = last_activity_ts.and_then(crate::runs::parse_flow_ts).map(|s| s.saturating_mul(1_000));
-    let Some(quiet_from) = last_ms.max(wait_until_ms) else { return false };
+pub(crate) fn quiet_clock_live(
+    last_activity_ts: Option<&str>,
+    wait_until_ms: Option<u64>,
+    now_ms: u64,
+    stale_after_ms: u64,
+) -> bool {
+    let last_ms = last_activity_ts
+        .and_then(crate::runs::parse_flow_ts)
+        .map(|s| s.saturating_mul(1_000));
+    let Some(quiet_from) = last_ms.max(wait_until_ms) else {
+        return false;
+    };
     now_ms.saturating_sub(quiet_from) <= stale_after_ms
 }
 
@@ -465,13 +567,27 @@ mod tests {
     #[test]
     fn every_terminal_naming_the_operators_stop_reads_aborted() {
         let rec = |action: &str, payload: serde_json::Value| serde_json::json!({"action": action, "payload": payload});
-        let aborted = Some(Ending { status: RunStatus::Abandoned, reason: Some(AbandonReason::Aborted) });
-        let error = Some(Ending { status: RunStatus::Error, reason: None });
+        let aborted = Some(Ending {
+            status: RunStatus::Abandoned,
+            reason: Some(AbandonReason::Aborted),
+        });
+        let error = Some(Ending {
+            status: RunStatus::Error,
+            reason: None,
+        });
         for action in ["dispatch.error", "run.error", "step.error"] {
             // `cause` is `step.error`'s required field; the others ignore it.
             let stopped = serde_json::json!({"cause": "interrupted", "stop_reason": "SIGTERM"});
-            assert_eq!(ending_of_record(&rec(action, stopped)), aborted, "{action} naming a stop");
-            assert_eq!(ending_of_record(&rec(action, serde_json::json!({"cause": "boom"}))), error, "{action} naming none");
+            assert_eq!(
+                ending_of_record(&rec(action, stopped)),
+                aborted,
+                "{action} naming a stop"
+            );
+            assert_eq!(
+                ending_of_record(&rec(action, serde_json::json!({"cause": "boom"}))),
+                error,
+                "{action} naming none"
+            );
         }
     }
 
@@ -484,12 +600,28 @@ mod tests {
     #[test]
     fn reads_use_the_sealed_attempts_without_refolding() {
         let mut f = RunFold::default();
-        fold(&mut f, FlowAction::DispatchStart, "a", "2026-09-27T10:00:00Z");
+        fold(
+            &mut f,
+            FlowAction::DispatchStart,
+            "a",
+            "2026-09-27T10:00:00Z",
+        );
         f.seal();
-        fold(&mut f, FlowAction::DispatchComplete, "a", "2026-09-27T10:01:00Z");
-        assert!(f.latest().is_some_and(|a| a.fold.close.is_none()), "unsealed records are not read");
+        fold(
+            &mut f,
+            FlowAction::DispatchComplete,
+            "a",
+            "2026-09-27T10:01:00Z",
+        );
+        assert!(
+            f.latest().is_some_and(|a| a.fold.close.is_none()),
+            "unsealed records are not read"
+        );
         f.seal();
-        assert!(f.latest().is_some_and(|a| a.fold.close.is_some()), "a seal reads every record");
+        assert!(
+            f.latest().is_some_and(|a| a.fold.close.is_some()),
+            "a seal reads every record"
+        );
     }
 
     /// (#2101) A peer's run stays live through tool and turn records alone:
@@ -498,17 +630,45 @@ mod tests {
     #[test]
     fn a_run_stays_live_through_tool_and_turn_records_without_heartbeats() {
         let mut f = RunFold::default();
-        fold(&mut f, FlowAction::DispatchStart, "a", "2026-09-27T10:00:00Z");
-        fold(&mut f, FlowAction::DispatchTurn, "a", "2026-09-27T10:01:00Z");
-        fold(&mut f, FlowAction::DispatchTool, "a", "2026-09-27T10:02:00Z");
+        fold(
+            &mut f,
+            FlowAction::DispatchStart,
+            "a",
+            "2026-09-27T10:00:00Z",
+        );
+        fold(
+            &mut f,
+            FlowAction::DispatchTurn,
+            "a",
+            "2026-09-27T10:01:00Z",
+        );
+        fold(
+            &mut f,
+            FlowAction::DispatchTool,
+            "a",
+            "2026-09-27T10:02:00Z",
+        );
         f.seal();
         let latest = f.latest().expect("an attempt");
         assert!(latest.fold.close.is_none(), "still open");
-        assert_eq!(latest.last_activity_ts.as_deref(), Some("2026-09-27T10:02:00Z"));
+        assert_eq!(
+            latest.last_activity_ts.as_deref(),
+            Some("2026-09-27T10:02:00Z")
+        );
         let at = |ts: &str| crate::runs::parse_flow_ts(ts).unwrap() * 1_000;
         let stale = 1_200_000;
-        assert!(quiet_clock_live(latest.last_activity_ts.as_deref(), None, at("2026-09-27T10:12:00Z"), stale));
-        assert!(!quiet_clock_live(latest.last_activity_ts.as_deref(), None, at("2026-09-27T10:23:00Z"), stale));
+        assert!(quiet_clock_live(
+            latest.last_activity_ts.as_deref(),
+            None,
+            at("2026-09-27T10:12:00Z"),
+            stale
+        ));
+        assert!(!quiet_clock_live(
+            latest.last_activity_ts.as_deref(),
+            None,
+            at("2026-09-27T10:23:00Z"),
+            stale
+        ));
     }
 
     /// One record of execution `exec-a`, as the fold reads it.
@@ -532,17 +692,50 @@ mod tests {
     #[test]
     fn an_attempt_is_starting_its_model_between_model_start_and_ready() {
         let mut f = RunFold::default();
-        exec_record(&mut f, "dispatch.start", "2026-11-09T10:00:00Z", serde_json::json!({}));
+        exec_record(
+            &mut f,
+            "dispatch.start",
+            "2026-11-09T10:00:00Z",
+            serde_json::json!({}),
+        );
         f.seal();
-        assert_eq!(f.latest().unwrap().starting_model(), None, "a dispatch that starts no model");
-        exec_record(&mut f, "dispatch.model.start", "2026-11-09T10:00:01Z", model(None));
+        assert_eq!(
+            f.latest().unwrap().starting_model(),
+            None,
+            "a dispatch that starts no model"
+        );
+        exec_record(
+            &mut f,
+            "dispatch.model.start",
+            "2026-11-09T10:00:01Z",
+            model(None),
+        );
         f.seal();
         assert_eq!(f.latest().unwrap().starting_model(), Some(0));
-        exec_record(&mut f, "dispatch.model.loading", "2026-11-09T10:00:11Z", model(Some(10_000)));
-        exec_record(&mut f, "dispatch.model.loading", "2026-11-09T10:00:21Z", model(Some(20_000)));
+        exec_record(
+            &mut f,
+            "dispatch.model.loading",
+            "2026-11-09T10:00:11Z",
+            model(Some(10_000)),
+        );
+        exec_record(
+            &mut f,
+            "dispatch.model.loading",
+            "2026-11-09T10:00:21Z",
+            model(Some(20_000)),
+        );
         f.seal();
-        assert_eq!(f.latest().unwrap().starting_model(), Some(20_000), "the latest `.loading`'s elapsed time");
-        exec_record(&mut f, "dispatch.model.ready", "2026-11-09T10:00:25Z", model(Some(24_000)));
+        assert_eq!(
+            f.latest().unwrap().starting_model(),
+            Some(20_000),
+            "the latest `.loading`'s elapsed time"
+        );
+        exec_record(
+            &mut f,
+            "dispatch.model.ready",
+            "2026-11-09T10:00:25Z",
+            model(Some(24_000)),
+        );
         f.seal();
         let latest = f.latest().unwrap();
         assert_eq!(latest.starting_model(), None, "ready: running as usual");
@@ -553,10 +746,30 @@ mod tests {
     #[test]
     fn a_failed_model_start_is_not_starting_any_more() {
         let mut f = RunFold::default();
-        exec_record(&mut f, "dispatch.start", "2026-11-09T10:00:00Z", serde_json::json!({}));
-        exec_record(&mut f, "dispatch.model.start", "2026-11-09T10:00:01Z", model(None));
-        exec_record(&mut f, "dispatch.model.loading", "2026-11-09T10:00:11Z", model(Some(10_000)));
-        exec_record(&mut f, "dispatch.error", "2026-11-09T10:00:12Z", serde_json::json!({"code": "model_start_failed"}));
+        exec_record(
+            &mut f,
+            "dispatch.start",
+            "2026-11-09T10:00:00Z",
+            serde_json::json!({}),
+        );
+        exec_record(
+            &mut f,
+            "dispatch.model.start",
+            "2026-11-09T10:00:01Z",
+            model(None),
+        );
+        exec_record(
+            &mut f,
+            "dispatch.model.loading",
+            "2026-11-09T10:00:11Z",
+            model(Some(10_000)),
+        );
+        exec_record(
+            &mut f,
+            "dispatch.error",
+            "2026-11-09T10:00:12Z",
+            serde_json::json!({"code": "model_start_failed"}),
+        );
         f.seal();
         assert_eq!(f.latest().unwrap().starting_model(), None);
     }
@@ -565,7 +778,12 @@ mod tests {
     #[test]
     fn a_copy_shares_records_and_attempts() {
         let mut f = RunFold::default();
-        fold(&mut f, FlowAction::DispatchStart, "a", "2026-09-27T10:00:00Z");
+        fold(
+            &mut f,
+            FlowAction::DispatchStart,
+            "a",
+            "2026-09-27T10:00:00Z",
+        );
         f.seal();
         let copy = f.clone();
         assert!(Arc::ptr_eq(&f.records, &copy.records));

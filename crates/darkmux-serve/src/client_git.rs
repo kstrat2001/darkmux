@@ -151,8 +151,21 @@ pub fn command(wc: &WorkCopy, index: Option<&Path>, args: &[&str]) -> std::proce
 /// The subcommands that read or write a work copy's file CONTENT, and so
 /// pass it through any filter driver attributes name: `add` and `commit`
 /// hash files, `revert` (and the rest) check them out.
-const CONTENT_SUBCOMMANDS: [&str; 13] =
-    ["add", "commit", "revert", "checkout", "switch", "restore", "reset", "stash", "merge", "cherry-pick", "rebase", "apply", "pull"];
+const CONTENT_SUBCOMMANDS: [&str; 13] = [
+    "add",
+    "commit",
+    "revert",
+    "checkout",
+    "switch",
+    "restore",
+    "reset",
+    "stash",
+    "merge",
+    "cherry-pick",
+    "rebase",
+    "apply",
+    "pull",
+];
 
 /// (#3457) Refuses a content subcommand in a work copy whose held
 /// repository's config (not the operator's global one) defines a filter
@@ -165,10 +178,14 @@ fn refuse_repo_filters(wc: &WorkCopy, args: &[&str]) -> Result<(), String> {
     if !CONTENT_SUBCOMMANDS.contains(&sub) {
         return Ok(());
     }
-    let drivers = darkmux_types::host_git::HostGit::run_written(&wc.git_dir, &wc.work_tree).repo_filter_drivers();
+    let drivers = darkmux_types::host_git::HostGit::run_written(&wc.git_dir, &wc.work_tree)
+        .repo_filter_drivers();
     match drivers.is_empty() {
         true => Ok(()),
-        false => Err(repo_filter_refusal(&drivers, &format!("`git {sub}` in {}", wc.work_tree.display()))),
+        false => Err(repo_filter_refusal(
+            &drivers,
+            &format!("`git {sub}` in {}", wc.work_tree.display()),
+        )),
     }
 }
 
@@ -392,7 +409,10 @@ mod tests {
         }
         let sub = args.iter().position(|a| a == "status").unwrap();
         for held in ["--git-dir=/g", "--work-tree=/w"] {
-            let at = args.iter().position(|a| a == held).unwrap_or_else(|| panic!("{held} missing: {args:?}"));
+            let at = args
+                .iter()
+                .position(|a| a == held)
+                .unwrap_or_else(|| panic!("{held} missing: {args:?}"));
             assert!(at < sub, "{held} must come before the subcommand: {args:?}");
         }
         let nosystem = cmd

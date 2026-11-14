@@ -5,8 +5,8 @@
 //! reads a real `config.json`.
 
 use super::*;
-use crate::client_profiles::{describe_profile, describe_profiles, work_stays_here};
 use crate::client_git::WorkCopy;
+use crate::client_profiles::{describe_profile, describe_profiles, work_stays_here};
 
 /// A test repository at `dir` as host git sees it (its own `.git`).
 fn wc(dir: &Path) -> WorkCopy {
@@ -225,7 +225,11 @@ fn harness() -> Harness {
                 if let Some(w) = &spec.workdir {
                     std::fs::write(w.join("in-progress.txt"), "half done\n").unwrap();
                 }
-                return Err(RunError { reason: "exit 1".into(), error: "it broke".into(), code: None });
+                return Err(RunError {
+                    reason: "exit 1".into(),
+                    error: "it broke".into(),
+                    code: None,
+                });
             }
             // "finish-then-cancel" edits and finishes, and its cancel lands
             // only after its result is in (after `dispatch.complete`).
@@ -237,7 +241,11 @@ fn harness() -> Harness {
             }
             // "refused-busy" fails as a dispatch whose `dispatch.error` said `busy`.
             if spec.message == "refused-busy" {
-                return Err(RunError { reason: "exit 1".into(), error: "memory is held".into(), code: Some("busy".into()) });
+                return Err(RunError {
+                    reason: "exit 1".into(),
+                    error: "memory is held".into(),
+                    code: Some("busy".into()),
+                });
             }
             // A "wait" message runs until it is cancelled, as a dispatch child would.
             if spec.message == "wait" || spec.message == "edit-wait" {
@@ -279,7 +287,12 @@ fn harness() -> Harness {
             if spec.message == "nested-init" {
                 if let Some(w) = &spec.workdir {
                     std::fs::create_dir_all(w.join("sub")).unwrap();
-                    assert!(std::process::Command::new("git").args(["init", "--quiet"]).arg(w.join("sub")).status().unwrap().success());
+                    assert!(std::process::Command::new("git")
+                        .args(["init", "--quiet"])
+                        .arg(w.join("sub"))
+                        .status()
+                        .unwrap()
+                        .success());
                     std::fs::write(w.join("README.md"), "changed by the run\n").unwrap();
                 }
             }
@@ -288,7 +301,11 @@ fn harness() -> Harness {
                 if let Some(w) = &spec.workdir {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::write(w.join("locked.txt"), "secret\n").unwrap();
-                    std::fs::set_permissions(w.join("locked.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+                    std::fs::set_permissions(
+                        w.join("locked.txt"),
+                        std::fs::Permissions::from_mode(0o000),
+                    )
+                    .unwrap();
                     std::fs::write(w.join("README.md"), "changed by the run\n").unwrap();
                 }
             }
@@ -437,11 +454,20 @@ const SHARED_PEER_PORTS: u16 = 40_000;
 /// A request as this machine's app sends it: from a loopback peer, with a
 /// `Host` naming the listener (each added only when the test set none).
 async fn call(h: &Harness, mut req: Request<Body>) -> (u16, Value) {
-    if req.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>().is_none() {
-        req.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+    if req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .is_none()
+    {
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                [127, 0, 0, 1],
+                5555,
+            ))));
     }
     if !req.headers().contains_key(axum::http::header::HOST) {
-        req.headers_mut().insert(axum::http::header::HOST, BOUND.parse().unwrap());
+        req.headers_mut()
+            .insert(axum::http::header::HOST, BOUND.parse().unwrap());
     }
     call_raw(h, req).await
 }
@@ -521,7 +547,14 @@ async fn paired(h: &Harness) -> String {
 
 /// The id of the paired client named `name`.
 fn client_id(h: &Harness, name: &str) -> String {
-    h.store.read().unwrap().clients.into_iter().find(|c| c.name == name).unwrap().id
+    h.store
+        .read()
+        .unwrap()
+        .clients
+        .into_iter()
+        .find(|c| c.name == name)
+        .unwrap()
+        .id
 }
 
 // ─── Only this machine ───────────────────────────────────────────────────
@@ -538,7 +571,10 @@ fn forged_pair(headers: &[(&str, &str)], content_type: &str) -> Request<Body> {
     }
     let mut req = b.body(Body::from(pair_body().to_string())).unwrap();
     req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+        .insert(axum::extract::ConnectInfo(SocketAddr::from((
+            [127, 0, 0, 1],
+            5555,
+        ))));
     req
 }
 
@@ -555,36 +591,78 @@ async fn a_request_that_is_not_this_machines_app_is_refused_and_records_nothing(
     let h = harness();
     let json = "application/json";
     for (why, req) in [
-        ("a rebound Host", forged_pair(&[("host", "evil.example")], json)),
-        ("a rebound Host with a port", forged_pair(&[("host", "evil.example:8767")], json)),
-        ("an Origin", forged_pair(&[("host", BOUND), ("origin", "http://evil.example")], json)),
-        ("a null Origin", forged_pair(&[("host", BOUND), ("origin", "null")], json)),
-        ("a text/plain body", forged_pair(&[("host", BOUND)], "text/plain")),
-        ("a form body", forged_pair(&[("host", BOUND)], "application/x-www-form-urlencoded")),
-        ("another port", forged_pair(&[("host", "127.0.0.1:9999")], json)),
-        ("a proxy header", forged_pair(&[("host", BOUND), ("x-forwarded-for", "100.64.0.7")], json)),
+        (
+            "a rebound Host",
+            forged_pair(&[("host", "evil.example")], json),
+        ),
+        (
+            "a rebound Host with a port",
+            forged_pair(&[("host", "evil.example:8767")], json),
+        ),
+        (
+            "an Origin",
+            forged_pair(&[("host", BOUND), ("origin", "http://evil.example")], json),
+        ),
+        (
+            "a null Origin",
+            forged_pair(&[("host", BOUND), ("origin", "null")], json),
+        ),
+        (
+            "a text/plain body",
+            forged_pair(&[("host", BOUND)], "text/plain"),
+        ),
+        (
+            "a form body",
+            forged_pair(&[("host", BOUND)], "application/x-www-form-urlencoded"),
+        ),
+        (
+            "another port",
+            forged_pair(&[("host", "127.0.0.1:9999")], json),
+        ),
+        (
+            "a proxy header",
+            forged_pair(&[("host", BOUND), ("x-forwarded-for", "100.64.0.7")], json),
+        ),
         ("no Host", forged_pair(&[], json)),
     ] {
         let (code, v) = call_raw(&h, req).await;
         assert!(code == 403 || code == 415, "{why}: {code} {v}");
         assert!(v["error"].is_string(), "{why}: {v}");
-        assert_eq!(pending_count(&h), 0, "{why}: a pending request was recorded");
+        assert_eq!(
+            pending_count(&h),
+            0,
+            "{why}: a pending request was recorded"
+        );
     }
     // A request from a peer that is not loopback, whatever it says.
     let mut req = forged_pair(&[("host", BOUND)], json);
     req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(SocketAddr::from(([100, 64, 0, 7], 5555))));
+        .insert(axum::extract::ConnectInfo(SocketAddr::from((
+            [100, 64, 0, 7],
+            5555,
+        ))));
     let (code, _) = call_raw(&h, req).await;
     assert_eq!(code, 403);
     // And one with no peer at all (no connection to judge).
     let mut req = forged_pair(&[("host", BOUND)], json);
-    req.extensions_mut().remove::<axum::extract::ConnectInfo<SocketAddr>>();
+    req.extensions_mut()
+        .remove::<axum::extract::ConnectInfo<SocketAddr>>();
     let (code, _) = call_raw(&h, req).await;
     assert_eq!(code, 403);
     assert_eq!(pending_count(&h), 0);
     // The same request from this machine's app goes through.
-    for host in [BOUND, "localhost:8767", "localhost", "[::1]:8767", "127.0.0.1"] {
-        let (code, v) = call_raw(&h, forged_pair(&[("host", host)], "application/json; charset=utf-8")).await;
+    for host in [
+        BOUND,
+        "localhost:8767",
+        "localhost",
+        "[::1]:8767",
+        "127.0.0.1",
+    ] {
+        let (code, v) = call_raw(
+            &h,
+            forged_pair(&[("host", host)], "application/json; charset=utf-8"),
+        )
+        .await;
         assert_eq!(code, 202, "{host}: {v}");
     }
 }
@@ -834,7 +912,11 @@ async fn an_unreadable_policy_does_not_consume_the_token_delivery() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_held_open_flood_delays_pairing_by_at_most_two_lookup_rounds() {
     let mut h = harness();
-    let (rounds, inside, most) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let (rounds, inside, most) = (
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+    );
     let (c, n, m) = (rounds.clone(), inside.clone(), most.clone());
     h.state.peer_processes = Arc::new(move |_bound, wanted| {
         c.fetch_add(1, Ordering::SeqCst);
@@ -844,7 +926,11 @@ async fn a_held_open_flood_delays_pairing_by_at_most_two_lookup_rounds() {
         Some(test_peer_processes(wanted))
     });
     let _ = request_pairing(&h).await;
-    assert_eq!(rounds.swap(0, Ordering::SeqCst), 1, "a lone request asks once");
+    assert_eq!(
+        rounds.swap(0, Ordering::SeqCst),
+        1,
+        "a lone request asks once"
+    );
     let flood = (0..40u16).map(|i| call(&h, pair_from(CONTAINER_PEER_PORTS + i, "X")));
     let app = async {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -856,9 +942,16 @@ async fn a_held_open_flood_delays_pairing_by_at_most_two_lookup_rounds() {
     assert_eq!(code, 202, "{v}");
     // The round count below is the bound; the wall clock only has to tell
     // ~2 rounds apart from one lookup per queued request (8 s here).
-    assert!(waited < std::time::Duration::from_secs(2), "the app waited {waited:?}");
+    assert!(
+        waited < std::time::Duration::from_secs(2),
+        "the app waited {waited:?}"
+    );
     assert!(flooded.iter().all(|(code, _)| *code == 202));
-    assert!(rounds.load(Ordering::SeqCst) <= 3, "{} rounds", rounds.load(Ordering::SeqCst));
+    assert!(
+        rounds.load(Ordering::SeqCst) <= 3,
+        "{} rounds",
+        rounds.load(Ordering::SeqCst)
+    );
     assert_eq!(most.load(Ordering::SeqCst), 1, "never two rounds at once");
 }
 
@@ -876,7 +969,11 @@ async fn a_request_whose_sender_left_while_queued_starts_no_round() {
     let _ = request_pairing(&h).await;
     let before = rounds.load(Ordering::SeqCst);
     let held = h.state.pair_lookups.turn.clone().lock_owned().await;
-    let gone = tokio::time::timeout(std::time::Duration::from_millis(50), call(&h, pair_from(CONTAINER_PEER_PORTS, "X"))).await;
+    let gone = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        call(&h, pair_from(CONTAINER_PEER_PORTS, "X")),
+    )
+    .await;
     assert!(gone.is_err(), "it queued behind the held turn");
     drop(held);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -892,13 +989,25 @@ async fn an_uncollected_approval_can_be_revoked_or_denied() {
     let now = (h.state.now)();
     let id = request_pairing(&h).await;
     let name = approve(&h.store, &id, now).unwrap();
-    assert!(revoke(&h.store, &name).unwrap(), "revoke finds the uncollected approval");
-    assert_eq!(poll(&h, &id, SECRET).await, (200, serde_json::json!({"status": "denied"})));
-    assert!(list_clients(&h.store).unwrap().is_empty(), "no token was ever minted");
+    assert!(
+        revoke(&h.store, &name).unwrap(),
+        "revoke finds the uncollected approval"
+    );
+    assert_eq!(
+        poll(&h, &id, SECRET).await,
+        (200, serde_json::json!({"status": "denied"}))
+    );
+    assert!(
+        list_clients(&h.store).unwrap().is_empty(),
+        "no token was ever minted"
+    );
     let id = request_pairing(&h).await;
     approve(&h.store, &id, now).unwrap();
     deny(&h.store, &id, now).unwrap();
-    assert_eq!(poll(&h, &id, SECRET).await, (200, serde_json::json!({"status": "denied"})));
+    assert_eq!(
+        poll(&h, &id, SECRET).await,
+        (200, serde_json::json!({"status": "denied"}))
+    );
     assert!(list_clients(&h.store).unwrap().is_empty());
 }
 
@@ -972,8 +1081,13 @@ fn pair_from(port: u16, code: &str) -> Request<Body> {
     let mut body = pair_body();
     body["code"] = code.into();
     let mut req = post("/client/pair", None, body);
-    req.headers_mut().insert(axum::http::header::HOST, BOUND.parse().unwrap());
-    req.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], port))));
+    req.headers_mut()
+        .insert(axum::http::header::HOST, BOUND.parse().unwrap());
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(SocketAddr::from((
+            [127, 0, 0, 1],
+            port,
+        ))));
     req
 }
 
@@ -999,7 +1113,11 @@ async fn pending_requests_are_capped() {
 async fn a_container_flooding_pair_requests_never_crowds_out_the_app() {
     let h = harness();
     for i in 0..(MAX_PENDING as u16 * 2) {
-        let (code, v) = call(&h, pair_from(CONTAINER_PEER_PORTS + i, &format!("EVIL-{i}"))).await;
+        let (code, v) = call(
+            &h,
+            pair_from(CONTAINER_PEER_PORTS + i, &format!("EVIL-{i}")),
+        )
+        .await;
         assert_eq!(code, 202, "{v}");
     }
     let id = request_pairing(&h).await;
@@ -1014,7 +1132,10 @@ async fn a_container_flooding_pair_requests_never_crowds_out_the_app() {
     assert!(v["token"].is_string());
     // What it remembers of each request's process goes with the request.
     let _ = request_pairing(&h).await;
-    assert!(!h.state.pair_peers.lock().unwrap().contains_key(&id), "a collected request is forgotten");
+    assert!(
+        !h.state.pair_peers.lock().unwrap().contains_key(&id),
+        "a collected request is forgotten"
+    );
 }
 
 /// The app's own newest request replaces its oldest past the same bound,
@@ -1028,7 +1149,11 @@ async fn an_app_that_asks_again_replaces_its_oldest_request() {
     for _ in 0..PAIR_REQUESTS_PER_PROCESS + 2 {
         ids.push(request_pairing(&h).await);
     }
-    let live: Vec<String> = list_pending(&h.store, (h.state.now)()).unwrap().into_iter().map(|p| p.request_id).collect();
+    let live: Vec<String> = list_pending(&h.store, (h.state.now)())
+        .unwrap()
+        .into_iter()
+        .map(|p| p.request_id)
+        .collect();
     assert_eq!(live, [ids[2].clone(), ids[3].clone()], "its oldest went");
     for gone in &ids[..2] {
         let (code, _) = poll(&h, gone, SECRET).await;
@@ -1131,7 +1256,8 @@ fn client_serve_refuses_to_start_on_a_misspelled_clients_setting() {
     let guard = darkmux_types::config_access::set_config_for_test(cfg);
     let e = preflight().expect_err("refused").to_string();
     assert!(
-        e.contains("unknown key `clients.profile`") && e.contains("did you mean `clients.profiles`?"),
+        e.contains("unknown key `clients.profile`")
+            && e.contains("did you mean `clients.profiles`?"),
         "{e}"
     );
     drop(guard);
@@ -1156,8 +1282,14 @@ fn a_misspelled_policy_written_while_serving_refuses_work() {
         })
     };
     let e = read(r#"{"clients": {"profile": ["fast"]}}"#).unwrap_err();
-    assert!(e.contains("clients.profile") && e.contains("refusing client work"), "{e}");
-    assert_eq!(read(r#"{"clients": {"profiles": ["fast"]}}"#), Ok(Some(vec!["fast".to_string()])));
+    assert!(
+        e.contains("clients.profile") && e.contains("refusing client work"),
+        "{e}"
+    );
+    assert_eq!(
+        read(r#"{"clients": {"profiles": ["fast"]}}"#),
+        Ok(Some(vec!["fast".to_string()]))
+    );
     assert_eq!(read(r#"{}"#), Ok(None));
     std::fs::remove_file(&path).unwrap();
     assert_eq!(read_profiles_policy_at(&path), Ok(None), "no file is unset");
@@ -1170,12 +1302,18 @@ fn a_misspelled_policy_written_while_serving_refuses_work() {
 fn an_unreadable_or_broken_config_refuses_client_work() {
     let tmp = tempfile::tempdir().unwrap();
     let e = read_config_at(tmp.path()).unwrap_err();
-    assert!(e.contains("could not be read") && e.contains("refusing client work"), "{e}");
+    assert!(
+        e.contains("could not be read") && e.contains("refusing client work"),
+        "{e}"
+    );
     let path = tmp.path().join("config.json");
     for text in ["{not json", r#"{"clients": {"profiles": 5}}"#] {
         std::fs::write(&path, text).unwrap();
         let e = read_config_at(&path).unwrap_err();
-        assert!(e.contains("config.json") && e.contains("refusing client work"), "{text}: {e}");
+        assert!(
+            e.contains("config.json") && e.contains("refusing client work"),
+            "{text}: {e}"
+        );
     }
 }
 
@@ -1189,14 +1327,30 @@ fn replacing_the_store_replaces_the_file_or_fails_and_keeps_the_old() {
     let doc = ClientsFile::default();
     replace_store(&path, &doc).unwrap();
     let saved = format!("{}\n", serde_json::to_string_pretty(&doc).unwrap());
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), saved, "nothing of the old text is left");
-    let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&path).unwrap().permissions());
-    assert_eq!(mode & 0o777, 0o600, "written owner-only, not made so afterward");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        saved,
+        "nothing of the old text is left"
+    );
+    let mode =
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&path).unwrap().permissions());
+    assert_eq!(
+        mode & 0o777,
+        0o600,
+        "written owner-only, not made so afterward"
+    );
     // A folder where its temp file goes: the new store cannot be written.
     std::fs::create_dir_all(tmp.path().join("clients.json.tmp/held")).unwrap();
-    let changed = ClientsFile { legacy_owner: Some("c-1".into()), ..ClientsFile::default() };
+    let changed = ClientsFile {
+        legacy_owner: Some("c-1".into()),
+        ..ClientsFile::default()
+    };
     assert!(replace_store(&path, &changed).is_err());
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), saved, "the old store is untouched");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        saved,
+        "the old store is untouched"
+    );
 }
 
 // ─── Bind ────────────────────────────────────────────────────────────────
@@ -1284,13 +1438,41 @@ fn a_1_1_store_gives_each_client_a_stable_id() {
     )
     .unwrap();
     let store = ClientStore::at(path.clone());
-    let first: Vec<String> = store.read().unwrap().clients.into_iter().map(|c| c.id).collect();
-    assert!(first.iter().all(|id| id.starts_with("c-") && id.len() == 18), "{first:?}");
+    let first: Vec<String> = store
+        .read()
+        .unwrap()
+        .clients
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    assert!(
+        first
+            .iter()
+            .all(|id| id.starts_with("c-") && id.len() == 18),
+        "{first:?}"
+    );
     assert_ne!(first[0], first[1]);
-    let again: Vec<String> = store.read().unwrap().clients.into_iter().map(|c| c.id).collect();
+    let again: Vec<String> = store
+        .read()
+        .unwrap()
+        .clients
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
     assert_eq!(first, again, "stable across reads");
-    assert_eq!(store.peek().unwrap().clients.into_iter().map(|c| c.id).collect::<Vec<_>>(), first);
-    assert!(std::fs::read_to_string(&path).unwrap().contains(r#""schema_version": "1.2""#));
+    assert_eq!(
+        store
+            .peek()
+            .unwrap()
+            .clients
+            .into_iter()
+            .map(|c| c.id)
+            .collect::<Vec<_>>(),
+        first
+    );
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains(r#""schema_version": "1.2""#));
 }
 
 /// `peek` (doctor's read) never writes: an older store stays as it was and
@@ -1299,12 +1481,23 @@ fn a_1_1_store_gives_each_client_a_stable_id() {
 fn peeking_at_the_store_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("clients.json");
-    assert!(ClientStore::at(path.clone()).peek().unwrap().clients.is_empty());
+    assert!(ClientStore::at(path.clone())
+        .peek()
+        .unwrap()
+        .clients
+        .is_empty());
     assert!(!path.exists(), "an absent store is not created");
     let old = r#"{"schema_version":"1.1","pending":[],"clients":[{"name":"a","created":1,"token_hash":"00"}]}"#;
     std::fs::write(&path, old).unwrap();
-    assert_eq!(ClientStore::at(path.clone()).peek().unwrap().clients.len(), 1);
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), old, "not migrated on disk");
+    assert_eq!(
+        ClientStore::at(path.clone()).peek().unwrap().clients.len(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        old,
+        "not migrated on disk"
+    );
 }
 
 /// `peek` reads under the store's shared lock, so it never catches a store
@@ -1315,7 +1508,18 @@ fn peeking_never_sees_a_half_written_store() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("clients.json");
     let store = ClientStore::at(path.clone());
-    store.update(|f| { f.clients.push(ApprovedClient { name: "a".into(), id: "c-0000000000000001".into(), created: 1, token_hash: "00".into(), auto_approved: None }); Ok(()) }).unwrap();
+    store
+        .update(|f| {
+            f.clients.push(ApprovedClient {
+                name: "a".into(),
+                id: "c-0000000000000001".into(),
+                created: 1,
+                token_hash: "00".into(),
+                auto_approved: None,
+            });
+            Ok(())
+        })
+        .unwrap();
     let full = std::fs::read_to_string(&path).unwrap();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
     let p2 = path.clone();
@@ -1852,7 +2056,8 @@ async fn checkout_workspace(h: &Harness, token: &str) -> (PathBuf, String, PathB
     (mine, name, ws)
 }
 
-const A_RECIPE: &str = r#"{"schema_version": "1.0", "command": "npm run dev", "env": {"PORT": "{port}"}}"#;
+const A_RECIPE: &str =
+    r#"{"schema_version": "1.0", "command": "npm run dev", "env": {"PORT": "{port}"}}"#;
 
 /// The recipe comes from the user's own checkout, by workspace name or by
 /// the workspace's directory, checked.
@@ -1862,14 +2067,24 @@ async fn a_recipe_is_read_from_the_users_own_checkout() {
     let token = paired(&h).await;
     let (mine, name, ws) = checkout_workspace(&h, &token).await;
     write_recipe(&mine, A_RECIPE);
-    write_recipe(&ws, r#"{"schema_version": "1.0", "command": "touch pwned"}"#);
+    write_recipe(
+        &ws,
+        r#"{"schema_version": "1.0", "command": "touch pwned"}"#,
+    );
     for url in [recipe_url(&ws), format!("/client/recipe?workspace={name}")] {
         let (code, v) = call(&h, get(&url, &[("authorization", &bearer(&token))])).await;
         assert_eq!(code, 200, "{url}: {v}");
-        assert_eq!(v["recipe"]["command"], "npm run dev", "the checkout's, never the workspace's: {v}");
+        assert_eq!(
+            v["recipe"]["command"], "npm run dev",
+            "the checkout's, never the workspace's: {v}"
+        );
         assert_eq!(v["recipe"]["env"]["PORT"], "{port}");
     }
-    let (code, _) = call(&h, get("/client/recipe", &[("authorization", &bearer(&token))])).await;
+    let (code, _) = call(
+        &h,
+        get("/client/recipe", &[("authorization", &bearer(&token))]),
+    )
+    .await;
     assert_eq!(code, 400);
 }
 
@@ -1883,17 +2098,26 @@ async fn no_recipe_is_404_and_says_where_to_put_one() {
     write_recipe(&h.base.join("wt1"), A_RECIPE);
     let (code, v) = call(
         &h,
-        get(&recipe_url(&h.base.join("wt1")), &[("authorization", &bearer(&token))]),
+        get(
+            &recipe_url(&h.base.join("wt1")),
+            &[("authorization", &bearer(&token))],
+        ),
     )
     .await;
     assert_eq!(code, 404, "{v}");
     assert_eq!(v["code"], "no_source_checkout", "{v}");
-    assert!(v["error"].as_str().unwrap().contains("your own checkout"), "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("your own checkout"),
+        "{v}"
+    );
     let (_mine, name, ws) = checkout_workspace(&h, &token).await;
     write_recipe(&ws, A_RECIPE);
     let (code, v) = call(
         &h,
-        get(&format!("/client/recipe?workspace={name}"), &[("authorization", &bearer(&token))]),
+        get(
+            &format!("/client/recipe?workspace={name}"),
+            &[("authorization", &bearer(&token))],
+        ),
     )
     .await;
     assert_eq!(code, 404, "{v}");
@@ -1905,7 +2129,14 @@ async fn no_recipe_is_404_and_says_where_to_put_one() {
     );
     // A folder below a workspace is not a workspace.
     std::fs::create_dir_all(ws.join("sub")).unwrap();
-    let (code, v) = call(&h, get(&recipe_url(&ws.join("sub")), &[("authorization", &bearer(&token))])).await;
+    let (code, v) = call(
+        &h,
+        get(
+            &recipe_url(&ws.join("sub")),
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
     assert_eq!(code, 404, "{v}");
 }
 
@@ -1956,7 +2187,10 @@ async fn a_symlinked_recipe_is_refused() {
     std::os::unix::fs::symlink(&outside, mine.join(".darkmux/preview.json")).unwrap();
     let (code, v) = call(
         &h,
-        get(&format!("/client/recipe?workspace={name}"), &[("authorization", &bearer(&token))]),
+        get(
+            &format!("/client/recipe?workspace={name}"),
+            &[("authorization", &bearer(&token))],
+        ),
     )
     .await;
     assert_eq!(code, 403, "{v}");
@@ -1978,11 +2212,17 @@ async fn an_oversized_unknown_keyed_or_non_object_recipe_is_refused() {
     write_recipe(&mine, "[1, 2]");
     let (code, _) = call(&h, get(&url, &[("authorization", &auth)])).await;
     assert_eq!(code, 422);
-    write_recipe(&mine, r#"{"schema_version": "1.0", "command": "x", "port": 5173}"#);
+    write_recipe(
+        &mine,
+        r#"{"schema_version": "1.0", "command": "x", "port": 5173}"#,
+    );
     let (code, v) = call(&h, get(&url, &[("authorization", &auth)])).await;
     assert_eq!(code, 422, "{v}");
     assert_eq!(v["code"], "recipe_invalid", "{v}");
-    assert!(v["error"].as_str().unwrap().contains("unknown key `port`"), "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("unknown key `port`"),
+        "{v}"
+    );
 }
 
 // ─── The production executor ─────────────────────────────────────────────
@@ -2062,7 +2302,10 @@ fn the_child_runner_parses_the_json_envelope_and_reports_failures() {
     assert_eq!(e.code, None, "no dispatch.error code recorded");
 
     // (#3468) A child that failed carries the code its `dispatch.error` named.
-    let refused = FakeTeardown { code: Some("wont_fit".into()), ..FakeTeardown::default() };
+    let refused = FakeTeardown {
+        code: Some("wont_fit".into()),
+        ..FakeTeardown::default()
+    };
     let e = run_dispatch_child(&bad, &spec, &CancelFlag::default(), GRACE, &refused).unwrap_err();
     assert_eq!(e.code.as_deref(), Some("wont_fit"));
 
@@ -2077,8 +2320,19 @@ printf '{\"result\":\"refused\",\"code\":\"busy\",\"error\":\"held\"}'\necho 'he
     )
     .unwrap();
     std::fs::set_permissions(&no, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let e = run_dispatch_child(&no, &spec, &CancelFlag::default(), GRACE, &FakeTeardown::default()).unwrap_err();
-    assert_eq!((e.reason.as_str(), e.code.as_deref()), ("exit 1", Some("busy")), "{e:?}");
+    let e = run_dispatch_child(
+        &no,
+        &spec,
+        &CancelFlag::default(),
+        GRACE,
+        &FakeTeardown::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        (e.reason.as_str(), e.code.as_deref()),
+        ("exit 1", Some("busy")),
+        "{e:?}"
+    );
     assert_eq!(e.error, "held");
 }
 
@@ -2150,9 +2404,22 @@ async fn running_work_says_when_it_is_starting_its_model() {
     let t = paired(&h).await;
     let (_, v) = call(&h, post("/client/work", Some(&t), waiting_work())).await;
     let id = v["work_id"].as_str().unwrap().to_string();
-    let status = || async { call(&h, get(&format!("/client/work/{id}"), &[("authorization", &bearer(&t))])).await.1 };
+    let status = || async {
+        call(
+            &h,
+            get(
+                &format!("/client/work/{id}"),
+                &[("authorization", &bearer(&t))],
+            ),
+        )
+        .await
+        .1
+    };
     *h.activity.lock().unwrap() = (Some(crate::runs::RunActivity::StartingModel), Some(20_000));
-    assert_eq!(status().await, serde_json::json!({"status": "running", "activity": "starting_model", "activity_elapsed_ms": 20_000}));
+    assert_eq!(
+        status().await,
+        serde_json::json!({"status": "running", "activity": "starting_model", "activity_elapsed_ms": 20_000})
+    );
     *h.activity.lock().unwrap() = (None, None);
     assert_eq!(status().await, serde_json::json!({"status": "running"}));
     assert_eq!(cancel(&h, Some(&t), &id).await.0, 202);
@@ -2169,7 +2436,11 @@ fn the_work_activity_reader_follows_the_dispatchs_records() {
     let path = dir.path().join(format!("{day}.jsonl"));
     let append = |recs: &[serde_json::Value]| {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
         for r in recs {
             writeln!(f, "{r}").unwrap();
         }
@@ -2180,7 +2451,8 @@ fn the_work_activity_reader_follows_the_dispatchs_records() {
     };
     let model = |ms: u64| serde_json::json!({"engine": "tensorfold", "endpoint": "tf", "model": "TF/m", "elapsed_ms": ms});
     let ours = "run-x.adhoc.coder.w-1";
-    let store = crate::flow_window::FlowRecordStore::new(crate::client_pairing::feeds_work_activity);
+    let store =
+        crate::flow_window::FlowRecordStore::new(crate::client_pairing::feeds_work_activity);
     let read = || crate::client_pairing::work_activity_in(&store, dir.path(), "coder", "w-1");
     let theirs = "run-y.adhoc.coder.w-2";
     append(&[
@@ -2188,14 +2460,30 @@ fn the_work_activity_reader_follows_the_dispatchs_records() {
         rec(theirs, "dispatch.start", serde_json::json!({})),
         rec(theirs, "dispatch.model.start", model(0)),
     ]);
-    assert_eq!(read(), (None, None), "another work's start is not this one's");
-    append(&[rec(ours, "dispatch.model.start", model(0)), rec(ours, "dispatch.model.loading", model(30_000))]);
-    assert_eq!(read(), (Some(crate::runs::RunActivity::StartingModel), Some(30_000)));
+    assert_eq!(
+        read(),
+        (None, None),
+        "another work's start is not this one's"
+    );
+    append(&[
+        rec(ours, "dispatch.model.start", model(0)),
+        rec(ours, "dispatch.model.loading", model(30_000)),
+    ]);
+    assert_eq!(
+        read(),
+        (Some(crate::runs::RunActivity::StartingModel), Some(30_000))
+    );
     append(&[rec(ours, "dispatch.model.ready", model(31_000))]);
     assert_eq!(read(), (None, None), "ready: running as usual");
     // (#3504) A queued wait reads `queued`, its time the latest wait record's.
-    append(&[rec(ours, "dispatch.queue.wait", model(0)), rec(ours, "dispatch.queue.wait", model(20_000))]);
-    assert_eq!(read(), (Some(crate::runs::RunActivity::Queued), Some(20_000)));
+    append(&[
+        rec(ours, "dispatch.queue.wait", model(0)),
+        rec(ours, "dispatch.queue.wait", model(20_000)),
+    ]);
+    assert_eq!(
+        read(),
+        (Some(crate::runs::RunActivity::Queued), Some(20_000))
+    );
     append(&[rec(ours, "dispatch.queue.resume", model(21_000))]);
     assert_eq!(read(), (None, None), "resumed: running as usual");
 
@@ -2207,9 +2495,15 @@ fn the_work_activity_reader_follows_the_dispatchs_records() {
         "w-7",
     )
     .wire();
-    append(&[rec(&escaped, "dispatch.start", serde_json::json!({})), rec(&escaped, "dispatch.model.start", model(0))]);
+    append(&[
+        rec(&escaped, "dispatch.start", serde_json::json!({})),
+        rec(&escaped, "dispatch.model.start", model(0)),
+    ]);
     let got = crate::client_pairing::work_activity_in(&store, dir.path(), "code_writer", "w-7");
-    assert_eq!(got, (Some(crate::runs::RunActivity::StartingModel), Some(0)));
+    assert_eq!(
+        got,
+        (Some(crate::runs::RunActivity::StartingModel), Some(0))
+    );
 }
 
 #[tokio::test]
@@ -2221,7 +2515,10 @@ async fn cancelling_a_finished_run_is_409() {
     let _ = wait_done(&h, &token, &id).await;
     assert_eq!(
         cancel(&h, Some(&token), &id).await,
-        (409, serde_json::json!({"error": "not running", "code": "conflict"}))
+        (
+            409,
+            serde_json::json!({"error": "not running", "code": "conflict"})
+        )
     );
 }
 
@@ -2424,7 +2721,10 @@ fn the_cancelled_terminal_is_written_or_the_failure_named() {
         Ok(())
     })
     .unwrap();
-    assert_eq!(got.map(|r| r.action), Some(darkmux_flow::FlowAction::DispatchError));
+    assert_eq!(
+        got.map(|r| r.action),
+        Some(darkmux_flow::FlowAction::DispatchError)
+    );
     let err = write_cancelled(&started(), |_| Err(anyhow!("disk full"))).unwrap_err();
     assert!(err.contains("exec-1") && err.contains("disk full"), "{err}");
     let mut bad = started();
@@ -2489,10 +2789,25 @@ fn the_start_is_found_by_its_work_id_in_the_flow_day_files() {
         "w-1",
     )
     .wire();
-    assert!(!escaped.contains("code_writer"), "the wire escapes it: {escaped}");
-    std::fs::write(dir.path().join("2026-11-08.jsonl"), line("dispatch.start", &escaped, "exec-u")).unwrap();
-    let spec = WorkSpec { role: "code_writer".into(), ..spec_w1() };
-    assert_eq!(find_start_in(dir.path(), &spec).map(|r| r.execution).as_deref(), Some("exec-u"));
+    assert!(
+        !escaped.contains("code_writer"),
+        "the wire escapes it: {escaped}"
+    );
+    std::fs::write(
+        dir.path().join("2026-11-08.jsonl"),
+        line("dispatch.start", &escaped, "exec-u"),
+    )
+    .unwrap();
+    let spec = WorkSpec {
+        role: "code_writer".into(),
+        ..spec_w1()
+    };
+    assert_eq!(
+        find_start_in(dir.path(), &spec)
+            .map(|r| r.execution)
+            .as_deref(),
+        Some("exec-u")
+    );
 }
 
 #[test]
@@ -2617,15 +2932,46 @@ fn snapshot_runs_nothing_a_planted_submodule_or_nested_repo_names() {
     run_git(Some(&sub_src), &["add", "s.txt"]);
     run_git(Some(&sub_src), &["commit", "-qm", "s"]);
     let (w, g) = (root.join("w"), root.join(".w.git"));
-    run_git(None, &["init", "-q", "--separate-git-dir", g.to_str().unwrap(), w.to_str().unwrap()]);
-    run_git(Some(&w), &["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub_src.to_str().unwrap(), "sub"]);
+    run_git(
+        None,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            g.to_str().unwrap(),
+            w.to_str().unwrap(),
+        ],
+    );
+    run_git(
+        Some(&w),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub_src.to_str().unwrap(),
+            "sub",
+        ],
+    );
     run_git(Some(&w), &["commit", "-qm", "with sub"]);
-    let wd = WorkCopy { work_tree: w.clone(), git_dir: g.canonicalize().unwrap() };
+    let wd = WorkCopy {
+        work_tree: w.clone(),
+        git_dir: g.canonicalize().unwrap(),
+    };
     let before = snapshot_tree(&wd).expect("snapshots");
 
     let plant = |repo: &Path| {
         let _ = std::fs::remove_dir_all(repo);
-        run_git(None, &["clone", "-q", sub_src.to_str().unwrap(), repo.to_str().unwrap()]);
+        run_git(
+            None,
+            &[
+                "clone",
+                "-q",
+                sub_src.to_str().unwrap(),
+                repo.to_str().unwrap(),
+            ],
+        );
         let cfg = repo.join(".git").join("config");
         let mut config = std::fs::read_to_string(&cfg).unwrap();
         config.push_str(&format!(
@@ -2653,12 +2999,22 @@ fn snapshot_runs_nothing_a_planted_submodule_or_nested_repo_names() {
         .current_dir(&w)
         .output()
         .unwrap();
-    assert!(marker.exists(), "the fixture must arm: plain status runs the planted submodule's config");
+    assert!(
+        marker.exists(),
+        "the fixture must arm: plain status runs the planted submodule's config"
+    );
     std::fs::remove_file(&marker).unwrap();
 
     let changes = changes_since(&wd, &before.tree).expect("the changes read");
-    assert!(!marker.exists(), "host git ran a planted repository's config");
-    assert!(changes.skipped.contains(&"nested".to_string()), "{:?}", changes.skipped);
+    assert!(
+        !marker.exists(),
+        "host git ran a planted repository's config"
+    );
+    assert!(
+        changes.skipped.contains(&"nested".to_string()),
+        "{:?}",
+        changes.skipped
+    );
 }
 
 /// (#3457) A work copy whose held repository's config defines a filter
@@ -2672,7 +3028,10 @@ fn a_work_copy_whose_repo_config_defines_a_filter_is_refused() {
     std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
     run_git(Some(dir.path()), &["config", "filter.crypt.clean", "cat"]);
     let err = snapshot_tree(&wc(dir.path())).unwrap_err();
-    assert!(err.contains("filter.crypt") && err.contains("--global"), "{err}");
+    assert!(
+        err.contains("filter.crypt") && err.contains("--global"),
+        "{err}"
+    );
     let err = commit_run(&wc(dir.path()), &["a.txt".to_string()], "m").unwrap_err();
     assert!(err.contains("filter.crypt"), "{err}");
 }
@@ -2693,11 +3052,37 @@ fn reading_changes_runs_nothing_a_planted_submodule_names_under_diff_submodule_d
     run_git(Some(&sub_src), &["add", "s.txt"]);
     run_git(Some(&sub_src), &["commit", "-qm", "s"]);
     let (w, g) = (root.join("w"), root.join(".w.git"));
-    run_git(None, &["init", "-q", "--separate-git-dir", g.to_str().unwrap(), w.to_str().unwrap()]);
-    run_git(Some(&w), &["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub_src.to_str().unwrap(), "sub"]);
+    run_git(
+        None,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            g.to_str().unwrap(),
+            w.to_str().unwrap(),
+        ],
+    );
+    run_git(
+        Some(&w),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub_src.to_str().unwrap(),
+            "sub",
+        ],
+    );
     run_git(Some(&w), &["commit", "-qm", "with sub"]);
-    run_git(Some(&w), &["submodule", "--quiet", "deinit", "-f", "--", "sub"]);
-    let wd = WorkCopy { work_tree: w.clone(), git_dir: g.canonicalize().unwrap() };
+    run_git(
+        Some(&w),
+        &["submodule", "--quiet", "deinit", "-f", "--", "sub"],
+    );
+    let wd = WorkCopy {
+        work_tree: w.clone(),
+        git_dir: g.canonicalize().unwrap(),
+    };
     let global = root.join("global-config");
     std::fs::write(&global, "[diff]\n\tsubmodule = diff\n").unwrap();
     let prev = std::env::var_os("GIT_CONFIG_GLOBAL");
@@ -2709,7 +3094,15 @@ fn reading_changes_runs_nothing_a_planted_submodule_names_under_diff_submodule_d
         // and a textconv, and a changed file.
         let sub = w.join("sub");
         let _ = std::fs::remove_dir_all(&sub);
-        run_git(None, &["clone", "-q", sub_src.to_str().unwrap(), sub.to_str().unwrap()]);
+        run_git(
+            None,
+            &[
+                "clone",
+                "-q",
+                sub_src.to_str().unwrap(),
+                sub.to_str().unwrap(),
+            ],
+        );
         let cfg = sub.join(".git").join("config");
         let mut config = std::fs::read_to_string(&cfg).unwrap();
         config.push_str(&format!(
@@ -2719,8 +3112,14 @@ fn reading_changes_runs_nothing_a_planted_submodule_names_under_diff_submodule_d
         ));
         std::fs::write(&cfg, config).unwrap();
         std::fs::write(sub.join(".gitattributes"), "* filter=x diff=x\n").unwrap();
-        run_git(Some(&sub), &["-c", "filter.x.clean=cat", "add", ".gitattributes"]);
-        run_git(Some(&sub), &["-c", "filter.x.clean=cat", "commit", "-qm", "planted"]);
+        run_git(
+            Some(&sub),
+            &["-c", "filter.x.clean=cat", "add", ".gitattributes"],
+        );
+        run_git(
+            Some(&sub),
+            &["-c", "filter.x.clean=cat", "commit", "-qm", "planted"],
+        );
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::write(sub.join("s.txt"), "t\n").unwrap();
         let _ = std::fs::remove_file(&marker);
@@ -2733,8 +3132,15 @@ fn reading_changes_runs_nothing_a_planted_submodule_names_under_diff_submodule_d
         }
     }
     let changes = read.expect("the changes read");
-    assert!(changes.files.iter().any(|f| f.path == "sub"), "the fixture must arm: {:?}", changes.files);
-    assert!(!marker.exists(), "reading the changes ran the planted submodule's config");
+    assert!(
+        changes.files.iter().any(|f| f.path == "sub"),
+        "the fixture must arm: {:?}",
+        changes.files
+    );
+    assert!(
+        !marker.exists(),
+        "reading the changes ran the planted submodule's config"
+    );
 }
 
 /// A run that fills the work copy's unpopulated submodule with a repository
@@ -2755,24 +3161,58 @@ fn committing_a_run_runs_nothing_a_planted_submodule_names() {
     run_git(Some(&sub_src), &["add", "s.txt"]);
     run_git(Some(&sub_src), &["commit", "-qm", "s"]);
     let (w, g) = (root.join("w"), root.join(".w.git"));
-    run_git(None, &["init", "-q", "--separate-git-dir", g.to_str().unwrap(), w.to_str().unwrap()]);
+    run_git(
+        None,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            g.to_str().unwrap(),
+            w.to_str().unwrap(),
+        ],
+    );
     std::fs::write(w.join("a.txt"), "a\n").unwrap();
     run_git(Some(&w), &["add", "a.txt"]);
-    run_git(Some(&w), &["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub_src.to_str().unwrap(), "sub"]);
+    run_git(
+        Some(&w),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub_src.to_str().unwrap(),
+            "sub",
+        ],
+    );
     run_git(Some(&w), &["commit", "-qm", "with sub"]);
     // Unpopulated, as in a fresh worktree: the gitlink is in the index, the
     // folder is empty.
-    run_git(Some(&w), &["submodule", "--quiet", "deinit", "-f", "--", "sub"]);
+    run_git(
+        Some(&w),
+        &["submodule", "--quiet", "deinit", "-f", "--", "sub"],
+    );
     run_git(Some(&w), &["config", "user.name", "t"]);
     run_git(Some(&w), &["config", "user.email", "t@t"]);
-    let wd = WorkCopy { work_tree: w.clone(), git_dir: g.canonicalize().unwrap() };
+    let wd = WorkCopy {
+        work_tree: w.clone(),
+        git_dir: g.canonicalize().unwrap(),
+    };
     let before = snapshot_tree(&wd).expect("snapshots");
 
     // The run: its own clone at the recorded commit, carrying an fsmonitor
     // and a clean filter, a changed file inside it, `ignore = none`.
     let sub = w.join("sub");
     let _ = std::fs::remove_dir_all(&sub);
-    run_git(None, &["clone", "-q", sub_src.to_str().unwrap(), sub.to_str().unwrap()]);
+    run_git(
+        None,
+        &[
+            "clone",
+            "-q",
+            sub_src.to_str().unwrap(),
+            sub.to_str().unwrap(),
+        ],
+    );
     let cfg = sub.join(".git").join("config");
     let mut config = std::fs::read_to_string(&cfg).unwrap();
     config.push_str(&format!(
@@ -2789,15 +3229,39 @@ fn committing_a_run_runs_nothing_a_planted_submodule_names() {
     std::fs::write(w.join("a.txt"), "changed by the run\n").unwrap();
 
     let changes = changes_since(&wd, &before.tree).expect("the changes read");
-    assert!(!marker.exists(), "reading the changes ran the planted config");
+    assert!(
+        !marker.exists(),
+        "reading the changes ran the planted config"
+    );
     let paths: Vec<String> = changes.files.iter().map(|f| f.path.clone()).collect();
-    assert!(paths.contains(&"sub".to_string()), "the fixture must arm: the submodule is a change: {paths:?}");
+    assert!(
+        paths.contains(&"sub".to_string()),
+        "the fixture must arm: the submodule is a change: {paths:?}"
+    );
 
     let (sha, _) = commit_run(&wd, &paths, "coder: t (work w-1)").expect("the run's files commit");
-    assert!(!marker.exists(), "committing the run ran the planted submodule's config");
-    let committed = run_git(None, &[&format!("--git-dir={}", g.display()), "show", "--name-only", "--format=", &sha]);
-    assert!(committed.lines().any(|l| l == "a.txt"), "the run's file is committed: {committed}");
-    assert!(!committed.lines().any(|l| l == "sub"), "a gitlink is never committed: {committed}");
+    assert!(
+        !marker.exists(),
+        "committing the run ran the planted submodule's config"
+    );
+    let committed = run_git(
+        None,
+        &[
+            &format!("--git-dir={}", g.display()),
+            "show",
+            "--name-only",
+            "--format=",
+            &sha,
+        ],
+    );
+    assert!(
+        committed.lines().any(|l| l == "a.txt"),
+        "the run's file is committed: {committed}"
+    );
+    assert!(
+        !committed.lines().any(|l| l == "sub"),
+        "a gitlink is never committed: {committed}"
+    );
 }
 
 /// Each way a submodule reaches a run's paths stays out of its commit: a
@@ -2822,18 +3286,43 @@ fn a_runs_submodules_stay_out_of_its_commit() {
     std::fs::write(w.join("a.txt"), "a\n").unwrap();
     run_git(Some(&w), &["add", "a.txt"]);
     for s in ["gone", "kept"] {
-        run_git(Some(&w), &["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub_src.to_str().unwrap(), s]);
+        run_git(
+            Some(&w),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                sub_src.to_str().unwrap(),
+                s,
+            ],
+        );
     }
     run_git(Some(&w), &["commit", "-qm", "with subs"]);
     std::fs::remove_dir_all(w.join("gone")).unwrap();
-    run_git(None, &["clone", "-q", sub_src.to_str().unwrap(), w.join("made").to_str().unwrap()]);
+    run_git(
+        None,
+        &[
+            "clone",
+            "-q",
+            sub_src.to_str().unwrap(),
+            w.join("made").to_str().unwrap(),
+        ],
+    );
     std::fs::write(w.join("kept").join("s.txt"), "t\n").unwrap();
     std::fs::write(w.join("a.txt"), "changed by the run\n").unwrap();
 
-    let paths: Vec<String> = ["a.txt", "gone", "made", "kept/s.txt"].iter().map(|s| s.to_string()).collect();
+    let paths: Vec<String> = ["a.txt", "gone", "made", "kept/s.txt"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let (sha, _) = commit_run(&wc(&w), &paths, "m").expect("the run's file commits");
     let committed = run_git(Some(&w), &["show", "--name-only", "--format=", &sha]);
-    assert_eq!(committed, "a.txt", "only the run's ordinary file is committed");
+    assert_eq!(
+        committed, "a.txt",
+        "only the run's ordinary file is committed"
+    );
 }
 
 /// A run whose only change is a submodule commits nothing, and says why,
@@ -2852,7 +3341,18 @@ fn a_run_that_changed_only_a_submodule_commits_nothing() {
     let w = root.join("w");
     std::fs::create_dir_all(&w).unwrap();
     git_repo(&w);
-    run_git(Some(&w), &["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub_src.to_str().unwrap(), "sub"]);
+    run_git(
+        Some(&w),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub_src.to_str().unwrap(),
+            "sub",
+        ],
+    );
     run_git(Some(&w), &["commit", "-qm", "with sub"]);
     run_git(Some(&w), &["config", "user.name", "t"]);
     run_git(Some(&w), &["config", "user.email", "t@t"]);
@@ -2861,7 +3361,11 @@ fn a_run_that_changed_only_a_submodule_commits_nothing() {
     let head = run_git(Some(&w), &["rev-parse", "HEAD"]);
     let err = commit_run(&wc(&w), &["sub".to_string()], "m").unwrap_err();
     assert!(err.contains("submodule"), "{err}");
-    assert_eq!(run_git(Some(&w), &["rev-parse", "HEAD"]), head, "nothing was committed");
+    assert_eq!(
+        run_git(Some(&w), &["rev-parse", "HEAD"]),
+        head,
+        "nothing was committed"
+    );
 }
 
 #[test]
@@ -2886,7 +3390,11 @@ async fn a_done_run_reports_its_changes_and_null_outside_git() {
     git_repo(&wt);
     let (_, v) = call(&h, post("/client/work", Some(&token), body.clone())).await;
     let done = wait_done(&h, &token, v["work_id"].as_str().unwrap()).await;
-    assert_eq!(done["changes"], Value::Null, "a repository darkmux did not make: host git never reads it");
+    assert_eq!(
+        done["changes"],
+        Value::Null,
+        "a repository darkmux did not make: host git never reads it"
+    );
     hold(&h, "wt1");
     std::fs::remove_file(wt.join("made-by-run.txt")).unwrap();
     std::fs::write(wt.join("mine.txt"), "uncommitted, the user's\n").unwrap();
@@ -2911,12 +3419,38 @@ async fn once_stopping_a_request_that_could_start_something_is_refused() {
     let token = paired(&h).await;
     h.state.previews.begin_shutdown();
     let (code, v) = call(&h, post("/client/work", Some(&token), work_for("coder"))).await;
-    assert_eq!((code, v["code"].as_str()), (503, Some("unavailable")), "{v}");
-    let (code, v) = call(&h, post("/client/workspaces/wt1/preview", Some(&token), serde_json::json!({}))).await;
-    assert_eq!((code, v["code"].as_str()), (503, Some("unavailable")), "{v}");
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (503, Some("unavailable")),
+        "{v}"
+    );
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces/wt1/preview",
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (503, Some("unavailable")),
+        "{v}"
+    );
     assert!(h.ran.lock().unwrap().is_empty(), "no work ran");
-    assert!(h.containers.specs.lock().unwrap().is_empty(), "no preview container");
-    let (code, _) = call(&h, get("/client/profiles", &[("authorization", &format!("Bearer {token}"))])).await;
+    assert!(
+        h.containers.specs.lock().unwrap().is_empty(),
+        "no preview container"
+    );
+    let (code, _) = call(
+        &h,
+        get(
+            "/client/profiles",
+            &[("authorization", &format!("Bearer {token}"))],
+        ),
+    )
+    .await;
     assert_eq!(code, 200, "reads still answer");
 }
 
@@ -2964,7 +3498,12 @@ fn run_git(dir: Option<&Path>, args: &[&str]) -> String {
 /// Where a planted git hook would leave its mark if the host ran it: beside
 /// the worktrees base, outside every work copy.
 fn host_ran_marker(work_copy: &Path) -> PathBuf {
-    work_copy.parent().unwrap().parent().unwrap().join("host-ran-the-runs-git-config")
+    work_copy
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("host-ran-the-runs-git-config")
 }
 
 /// What a hostile run does to its work copy's git: replaces `.git` (a file
@@ -2986,10 +3525,16 @@ fn plant_git_config(w: &Path, kind: &str) {
         .success();
     assert!(ok);
     let config = match kind {
-        "fsmonitor" => format!("[core]\n\tfsmonitor = \"touch {}; false\"\n", marker.display()),
+        "fsmonitor" => format!(
+            "[core]\n\tfsmonitor = \"touch {}; false\"\n",
+            marker.display()
+        ),
         "filter" => {
             std::fs::write(w.join(".gitattributes"), "*.txt filter=evil\n").unwrap();
-            format!("[filter \"evil\"]\n\tclean = \"touch {}; cat\"\n", marker.display())
+            format!(
+                "[filter \"evil\"]\n\tclean = \"touch {}; cat\"\n",
+                marker.display()
+            )
         }
         other => panic!("no plant {other}"),
     };
@@ -3051,7 +3596,10 @@ async fn a_repo_url_is_cloned_into_a_named_workspace() {
     .await;
     assert_eq!(code, 201, "{v}");
     assert_eq!(v["workspace"], "hcr");
-    assert!(crate::client_workspace::is_bot_branch(v["branch"].as_str().unwrap(), "app"), "{v}");
+    assert!(
+        crate::client_workspace::is_bot_branch(v["branch"].as_str().unwrap(), "app"),
+        "{v}"
+    );
     assert_eq!(v["repo"], "github.com/kstrat2001/hcr");
     assert!(!v["head"].as_str().unwrap().is_empty());
     assert!(h.base.join("hcr/README.md").exists());
@@ -3090,7 +3638,11 @@ async fn a_ref_is_cloned_on_that_branch() {
     assert_eq!(v["from"], "dev", "{v}");
     let branch = v["branch"].as_str().unwrap();
     assert!(crate::client_workspace::is_bot_branch(branch, "app"), "{v}");
-    assert_eq!(held_git(&h, "hcr", &["rev-parse", branch]), held_git(&h, "hcr", &["rev-parse", "dev"]), "cut from dev");
+    assert_eq!(
+        held_git(&h, "hcr", &["rev-parse", branch]),
+        held_git(&h, "hcr", &["rev-parse", "dev"]),
+        "cut from dev"
+    );
 }
 
 #[tokio::test]
@@ -3140,12 +3692,36 @@ async fn a_clone_on_no_bots_branch_is_never_handed_out() {
     let h = harness();
     let token = paired(&h).await;
     let wt = h.base.join("hcr");
-    run_git(None, &["clone", "--quiet", h.fixture.to_str().unwrap(), wt.to_str().unwrap()]);
+    run_git(
+        None,
+        &[
+            "clone",
+            "--quiet",
+            h.fixture.to_str().unwrap(),
+            wt.to_str().unwrap(),
+        ],
+    );
     run_git(Some(&wt), &["remote", "set-url", "origin", HCR]);
     hold(&h, "hcr");
-    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
-    assert_eq!((code, v["workspace"].as_str()), (201, Some("kstrat2001-hcr")), "{v}");
-    assert_eq!(run_git(Some(&wt), &["branch", "--show-current"]), "main", "the old clone is left as it was");
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        (code, v["workspace"].as_str()),
+        (201, Some("kstrat2001-hcr")),
+        "{v}"
+    );
+    assert_eq!(
+        run_git(Some(&wt), &["branch", "--show-current"]),
+        "main",
+        "the old clone is left as it was"
+    );
 }
 
 #[tokio::test]
@@ -3295,7 +3871,10 @@ async fn a_failed_clone_leaves_nothing_behind() {
     left.sort();
     assert_eq!(
         left,
-        vec![std::ffi::OsString::from(".wt1.client"), std::ffi::OsString::from("wt1")],
+        vec![
+            std::ffi::OsString::from(".wt1.client"),
+            std::ffi::OsString::from("wt1")
+        ],
         "only what was there before"
     );
 }
@@ -3320,7 +3899,10 @@ async fn workspace_status_reports_branch_head_and_repo() {
     )
     .await;
     assert_eq!(code, 200, "{v}");
-    assert!(crate::client_workspace::is_bot_branch(v["branch"].as_str().unwrap(), "app"), "{v}");
+    assert!(
+        crate::client_workspace::is_bot_branch(v["branch"].as_str().unwrap(), "app"),
+        "{v}"
+    );
     assert_eq!(v["repo"], "github.com/kstrat2001/hcr");
     let (code, _) = call(
         &h,
@@ -3424,11 +4006,27 @@ async fn work_runs_only_in_a_workspace_made_for_this_app() {
     assert!(h.ran.lock().unwrap().is_empty(), "nothing ran");
     // Nor can it look at or start anything in another app's workspace.
     for req in [
-        get("/client/workspaces/theirs", &[("authorization", &bearer(&token))]),
-        get("/client/workspaces/theirs/changes", &[("authorization", &bearer(&token))]),
-        get("/client/recipe?workspace=theirs", &[("authorization", &bearer(&token))]),
-        post("/client/workspaces/theirs/preview", Some(&token), serde_json::json!({})),
-        get("/client/workspaces/theirs/preview", &[("authorization", &bearer(&token))]),
+        get(
+            "/client/workspaces/theirs",
+            &[("authorization", &bearer(&token))],
+        ),
+        get(
+            "/client/workspaces/theirs/changes",
+            &[("authorization", &bearer(&token))],
+        ),
+        get(
+            "/client/recipe?workspace=theirs",
+            &[("authorization", &bearer(&token))],
+        ),
+        post(
+            "/client/workspaces/theirs/preview",
+            Some(&token),
+            serde_json::json!({}),
+        ),
+        get(
+            "/client/workspaces/theirs/preview",
+            &[("authorization", &bearer(&token))],
+        ),
         Request::builder()
             .method("DELETE")
             .uri("/client/workspaces/theirs/preview")
@@ -3448,17 +4046,31 @@ async fn each_app_gets_its_own_workspace_of_a_repo() {
     let h = harness();
     let a = paired(&h).await;
     let b = paired(&h).await;
-    let make = |t: &str| post("/client/workspaces", Some(t), serde_json::json!({"repo_url": HCR}));
+    let make = |t: &str| {
+        post(
+            "/client/workspaces",
+            Some(t),
+            serde_json::json!({"repo_url": HCR}),
+        )
+    };
     let (code, va) = call(&h, make(&a)).await;
     assert_eq!(code, 201, "{va}");
     let (code, vb) = call(&h, make(&b)).await;
     assert_eq!(code, 201, "b gets its own, not a's: {vb}");
     assert_ne!(va["workspace"], vb["workspace"]);
     let (code, again) = call(&h, make(&a)).await;
-    assert_eq!((code, &again["workspace"]), (200, &va["workspace"]), "a reuses its own: {again}");
+    assert_eq!(
+        (code, &again["workspace"]),
+        (200, &va["workspace"]),
+        "a reuses its own: {again}"
+    );
     let (code, v) = call(
         &h,
-        post("/client/work", Some(&b), serde_json::json!({"role": "coder", "message": "hi", "workspace": va["workspace"]})),
+        post(
+            "/client/work",
+            Some(&b),
+            serde_json::json!({"role": "coder", "message": "hi", "workspace": va["workspace"]}),
+        ),
     )
     .await;
     assert_eq!((code, v["code"].as_str()), (403, Some("forbidden")), "{v}");
@@ -3485,19 +4097,45 @@ async fn a_cloned_workspaces_runs_commit_to_its_own_mux_branch_never_the_default
     let (code, v) = call(&h, post("/client/workspaces", Some(&token), body)).await;
     assert_eq!(code, 201, "{v}");
     let branch = v["branch"].as_str().unwrap().to_string();
-    assert!(crate::client_workspace::is_bot_branch(&branch, "bot-a"), "{v}");
+    assert!(
+        crate::client_workspace::is_bot_branch(&branch, "bot-a"),
+        "{v}"
+    );
     assert_eq!(v["from"], "origin/main", "{v}");
     let main_before = held_git(&h, "hcr", &["rev-parse", "main"]);
     let id = run_in(&h, &token, "hcr", "edit-readme").await;
     let done = status(&h, &token, &id).await;
     assert_eq!(done["branch"], branch.as_str(), "{done}");
-    assert_eq!(held_git(&h, "hcr", &["rev-parse", "main"]), main_before, "the default branch never moves");
+    assert_eq!(
+        held_git(&h, "hcr", &["rev-parse", "main"]),
+        main_before,
+        "the default branch never moves"
+    );
     let tip = held_git(&h, "hcr", &["rev-parse", &branch]);
-    assert!(tip.starts_with(done["commit"].as_str().unwrap()), "{tip} {done}");
-    let (code, c) = call(&h, get("/client/workspaces/hcr/changes", &[("authorization", &bearer(&token))])).await;
+    assert!(
+        tip.starts_with(done["commit"].as_str().unwrap()),
+        "{tip} {done}"
+    );
+    let (code, c) = call(
+        &h,
+        get(
+            "/client/workspaces/hcr/changes",
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
     assert_eq!(code, 200, "{c}");
-    assert_eq!((c["branch"].as_str(), c["base_branch"].as_str()), (Some(branch.as_str()), Some("main")), "{c}");
-    let files: Vec<&str> = c["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert_eq!(
+        (c["branch"].as_str(), c["base_branch"].as_str()),
+        (Some(branch.as_str()), Some("main")),
+        "{c}"
+    );
+    let files: Vec<&str> = c["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
     assert_eq!(files, ["README.md"], "{c}");
 }
 
@@ -3513,23 +4151,64 @@ async fn two_bots_of_one_app_get_their_own_workspace_and_branch_of_a_repo() {
     fixture_repo(&mine);
     run_git(Some(&mine), &["remote", "add", "origin", HCR]);
     let ask = |body: Value| post("/client/workspaces", Some(&token), body);
-    let (code, a) = call(&h, ask(serde_json::json!({"source_path": mine.to_str(), "bot": "Bot A"}))).await;
-    assert_eq!((code, a["workspace"].as_str()), (201, Some("my-site-bot-a")), "{a}");
-    let (code, b) = call(&h, ask(serde_json::json!({"repo_url": HCR, "bot": "Bot B"}))).await;
+    let (code, a) = call(
+        &h,
+        ask(serde_json::json!({"source_path": mine.to_str(), "bot": "Bot A"})),
+    )
+    .await;
+    assert_eq!(
+        (code, a["workspace"].as_str()),
+        (201, Some("my-site-bot-a")),
+        "{a}"
+    );
+    let (code, b) = call(
+        &h,
+        ask(serde_json::json!({"repo_url": HCR, "bot": "Bot B"})),
+    )
+    .await;
     assert_eq!(code, 201, "B gets its own, never A's worktree: {b}");
-    assert!(crate::client_workspace::is_bot_branch(b["branch"].as_str().unwrap(), "bot-b"), "{b}");
-    let (code, a_clone) = call(&h, ask(serde_json::json!({"repo_url": HCR, "bot": "Bot A"}))).await;
-    assert_eq!(code, 201, "a repo link never gets a worktree, even its own bot's: {a_clone}");
-    assert!(crate::client_workspace::is_bot_branch(a_clone["branch"].as_str().unwrap(), "bot-a"), "{a_clone}");
-    let (code, again) = call(&h, ask(serde_json::json!({"repo_url": HCR, "bot": "Bot B"}))).await;
-    assert_eq!((code, &again["workspace"], &again["branch"]), (200, &b["workspace"], &b["branch"]), "B reuses its own: {again}");
+    assert!(
+        crate::client_workspace::is_bot_branch(b["branch"].as_str().unwrap(), "bot-b"),
+        "{b}"
+    );
+    let (code, a_clone) = call(
+        &h,
+        ask(serde_json::json!({"repo_url": HCR, "bot": "Bot A"})),
+    )
+    .await;
+    assert_eq!(
+        code, 201,
+        "a repo link never gets a worktree, even its own bot's: {a_clone}"
+    );
+    assert!(
+        crate::client_workspace::is_bot_branch(a_clone["branch"].as_str().unwrap(), "bot-a"),
+        "{a_clone}"
+    );
+    let (code, again) = call(
+        &h,
+        ask(serde_json::json!({"repo_url": HCR, "bot": "Bot B"})),
+    )
+    .await;
+    assert_eq!(
+        (code, &again["workspace"], &again["branch"]),
+        (200, &b["workspace"], &b["branch"]),
+        "B reuses its own: {again}"
+    );
     // Bot "Bot" is not bot "Bot B", whose branch starts `mux/bot-`.
     let (code, plain) = call(&h, ask(serde_json::json!({"repo_url": HCR, "bot": "Bot"}))).await;
     assert_eq!(code, 201, "{plain}");
-    assert!(crate::client_workspace::is_bot_branch(plain["branch"].as_str().unwrap(), "bot"), "{plain}");
-    let (code, wt) = call(&h, ask(serde_json::json!({"source_path": mine.to_str(), "bot": "Bot"}))).await;
+    assert!(
+        crate::client_workspace::is_bot_branch(plain["branch"].as_str().unwrap(), "bot"),
+        "{plain}"
+    );
+    let (code, wt) = call(
+        &h,
+        ask(serde_json::json!({"source_path": mine.to_str(), "bot": "Bot"})),
+    )
+    .await;
     assert_eq!(code, 201, "never bot A's worktree: {wt}");
-    let names = [&a, &b, &a_clone, &plain, &wt].map(|v| v["workspace"].as_str().unwrap().to_string());
+    let names =
+        [&a, &b, &a_clone, &plain, &wt].map(|v| v["workspace"].as_str().unwrap().to_string());
     let distinct: std::collections::HashSet<_> = names.iter().collect();
     assert_eq!(distinct.len(), names.len(), "{names:?}");
 }
@@ -3552,7 +4231,10 @@ async fn bots_whose_names_make_the_same_slug_get_their_own_workspaces() {
         (Some(long(" one")), long(" two")),
     ];
     for (first, second) in pairs {
-        for source in [serde_json::json!({"repo_url": HCR}), serde_json::json!({"source_path": mine.to_str()})] {
+        for source in [
+            serde_json::json!({"repo_url": HCR}),
+            serde_json::json!({"source_path": mine.to_str()}),
+        ] {
             let ask = |bot: Option<&String>| {
                 let mut body = source.clone();
                 if let Some(b) = bot {
@@ -3564,10 +4246,17 @@ async fn bots_whose_names_make_the_same_slug_get_their_own_workspaces() {
             assert_eq!(code, 201, "{first:?} {source}: {a}");
             let (code, b) = call(&h, ask(Some(&second))).await;
             assert_eq!(code, 201, "{second} gets its own, not {first:?}'s: {b}");
-            assert_ne!((&a["workspace"], &a["branch"]), (&b["workspace"], &b["branch"]));
+            assert_ne!(
+                (&a["workspace"], &a["branch"]),
+                (&b["workspace"], &b["branch"])
+            );
             for (bot, made) in [(first.as_ref(), &a), (Some(&second), &b)] {
                 let (code, again) = call(&h, ask(bot)).await;
-                assert_eq!((code, &again["workspace"]), (200, &made["workspace"]), "{bot:?} gets its own back: {again}");
+                assert_eq!(
+                    (code, &again["workspace"]),
+                    (200, &made["workspace"]),
+                    "{bot:?} gets its own back: {again}"
+                );
             }
         }
     }
@@ -3594,28 +4283,78 @@ async fn a_clone_left_on_a_users_branch_moves_onto_a_bots_branch_before_a_run() 
         // is checked out.
         let first = run_in(&h, &token, "hcr", "edit-readme").await;
         let earlier = held_git(&h, "hcr", &["rev-parse", "HEAD"]);
-        held_git(&h, "hcr", &["update-ref", &format!("refs/heads/{old_branch}"), &earlier]);
-        held_git(&h, "hcr", &["symbolic-ref", "HEAD", &format!("refs/heads/{old_branch}")]);
+        held_git(
+            &h,
+            "hcr",
+            &["update-ref", &format!("refs/heads/{old_branch}"), &earlier],
+        );
+        held_git(
+            &h,
+            "hcr",
+            &["symbolic-ref", "HEAD", &format!("refs/heads/{old_branch}")],
+        );
         let (code, c) = changes_of(&h, &token, "hcr").await;
-        assert_eq!((code, c["code"].as_str()), (409, Some("no_own_branch")), "{old_branch}: {c}");
+        assert_eq!(
+            (code, c["code"].as_str()),
+            (409, Some("no_own_branch")),
+            "{old_branch}: {c}"
+        );
         assert!(c["error"].as_str().unwrap().contains(old_branch), "{c}");
         let id = run_after(&h, &token, "hcr", "edit-other", Some(&first)).await;
         let done = status(&h, &token, &id).await;
         let branch = done["branch"].as_str().unwrap().to_string();
-        assert!(crate::client_workspace::is_bot_branch(&branch, "app"), "{old_branch}: {done}");
-        assert_eq!(held_git(&h, "hcr", &["rev-parse", old_branch]), earlier, "{old_branch} never moves again");
-        let (code, info) = call(&h, get("/client/workspaces/hcr", &[("authorization", &bearer(&token))])).await;
-        assert_eq!((code, info["branch"].as_str()), (200, Some(branch.as_str())), "{info}");
+        assert!(
+            crate::client_workspace::is_bot_branch(&branch, "app"),
+            "{old_branch}: {done}"
+        );
+        assert_eq!(
+            held_git(&h, "hcr", &["rev-parse", old_branch]),
+            earlier,
+            "{old_branch} never moves again"
+        );
+        let (code, info) = call(
+            &h,
+            get(
+                "/client/workspaces/hcr",
+                &[("authorization", &bearer(&token))],
+            ),
+        )
+        .await;
+        assert_eq!(
+            (code, info["branch"].as_str()),
+            (200, Some(branch.as_str())),
+            "{info}"
+        );
         let (code, c) = changes_of(&h, &token, "hcr").await;
-        assert_eq!((code, c["branch"].as_str(), c["base_branch"].as_str()), (200, Some(branch.as_str()), Some("main")), "{c}");
-        let mut files: Vec<&str> = c["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+        assert_eq!(
+            (code, c["branch"].as_str(), c["base_branch"].as_str()),
+            (200, Some(branch.as_str()), Some("main")),
+            "{c}"
+        );
+        let mut files: Vec<&str> = c["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
         files.sort();
-        assert_eq!(files, ["README.md", "other.txt"], "what {old_branch} already held rides along: {c}");
+        assert_eq!(
+            files,
+            ["README.md", "other.txt"],
+            "what {old_branch} already held rides along: {c}"
+        );
     }
 }
 
 async fn changes_of(h: &Harness, token: &str, name: &str) -> (u16, Value) {
-    call(h, get(&format!("/client/workspaces/{name}/changes"), &[("authorization", &bearer(token))])).await
+    call(
+        h,
+        get(
+            &format!("/client/workspaces/{name}/changes"),
+            &[("authorization", &bearer(token))],
+        ),
+    )
+    .await
 }
 
 // ---- workspace locking: one name at a time, never one for all --------------
@@ -3623,9 +4362,18 @@ async fn changes_of(h: &Harness, token: &str, name: &str) -> (u16, Value) {
 /// A clone that waits, for any URL naming `slow`, until the test opens its
 /// gate: (the state cloning that way, a flag set once it is waiting, the
 /// gate).
-fn slow_clone_state(h: &Harness) -> (ClientServerState, Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicBool>) {
+fn slow_clone_state(
+    h: &Harness,
+) -> (
+    ClientServerState,
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
     use std::sync::atomic::AtomicBool;
-    let (waiting, open) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (waiting, open) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
     let (w, o, inner) = (waiting.clone(), open.clone(), h.state.clone_repo.clone());
     let state = ClientServerState {
         clone_repo: Arc::new(move |url, r, dest, gd| {
@@ -3663,7 +4411,11 @@ async fn a_slow_clone_never_holds_up_another_bots_workspace() {
     let token = paired(&h).await;
     let (state, waiting, open) = slow_clone_state(&h);
     let ask = |body: Value| post("/client/workspaces", Some(&token), body);
-    let (code, v) = call_with(state.clone(), ask(serde_json::json!({"repo_url": HCR, "bot": "Quick"}))).await;
+    let (code, v) = call_with(
+        state.clone(),
+        ask(serde_json::json!({"repo_url": HCR, "bot": "Quick"})),
+    )
+    .await;
     assert_eq!(code, 201, "{v}");
     let slow = tokio::spawn(call_with(
         state.clone(),
@@ -3675,11 +4427,22 @@ async fn a_slow_clone_never_holds_up_another_bots_workspace() {
     for (body, want) in [
         (serde_json::json!({"repo_url": HCR, "bot": "Other"}), 201),
         (serde_json::json!({"repo_url": HCR, "bot": "Quick"}), 200),
-        (serde_json::json!({"repo_url": HCR, "template": true, "bot": "Baker"}), 201),
-        (serde_json::json!({"source_path": mine.to_str(), "bot": "Quick"}), 201),
+        (
+            serde_json::json!({"repo_url": HCR, "template": true, "bot": "Baker"}),
+            201,
+        ),
+        (
+            serde_json::json!({"source_path": mine.to_str(), "bot": "Quick"}),
+            201,
+        ),
     ] {
-        let asked = tokio::time::timeout(std::time::Duration::from_secs(10), call_with(state.clone(), ask(body.clone())));
-        let (code, v) = asked.await.unwrap_or_else(|_| panic!("{body} waited for another bot's clone"));
+        let asked = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            call_with(state.clone(), ask(body.clone())),
+        );
+        let (code, v) = asked
+            .await
+            .unwrap_or_else(|_| panic!("{body} waited for another bot's clone"));
         assert_eq!(code, want, "{body}: {v}");
     }
     open.store(true, Ordering::SeqCst);
@@ -3695,11 +4458,20 @@ async fn one_bot_asking_twice_at_once_gets_one_workspace() {
     let token = paired(&h).await;
     let (state, waiting, open) = slow_clone_state(&h);
     let body = serde_json::json!({"repo_url": "https://github.com/kstrat2001/slow", "bot": "Slow"});
-    let first = tokio::spawn(call_with(state.clone(), post("/client/workspaces", Some(&token), body.clone())));
+    let first = tokio::spawn(call_with(
+        state.clone(),
+        post("/client/workspaces", Some(&token), body.clone()),
+    ));
     until_set(&waiting).await;
-    let second = tokio::spawn(call_with(state.clone(), post("/client/workspaces", Some(&token), body)));
+    let second = tokio::spawn(call_with(
+        state.clone(),
+        post("/client/workspaces", Some(&token), body),
+    ));
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(!second.is_finished(), "the second waits for the first's clone");
+    assert!(
+        !second.is_finished(),
+        "the second waits for the first's clone"
+    );
     open.store(true, Ordering::SeqCst);
     let ((c1, v1), (c2, v2)) = (first.await.unwrap(), second.await.unwrap());
     assert_eq!((c1, c2), (201, 200), "{v1} {v2}");
@@ -3714,17 +4486,32 @@ async fn one_bot_asking_twice_at_once_gets_one_workspace() {
 async fn reuse_runs_no_git_in_another_bots_or_apps_workspace() {
     let h = harness();
     let token = paired(&h).await;
-    let ask = |bot: &str| post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "bot": bot}));
+    let ask = |bot: &str| {
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR, "bot": bot}),
+        )
+    };
     let (code, other) = call(&h, ask("Other")).await;
     assert_eq!(code, 201, "{other}");
     let (code, theirs) = call(&h, ask("Theirs")).await;
     assert_eq!(code, 201, "{theirs}");
     // Another app's, for a bot of the very name asking.
-    crate::client_workspace::record_owner(&h.base, theirs["workspace"].as_str().unwrap(), "c-someone-else").unwrap();
-    crate::client_workspace::record_bot(&h.base, theirs["workspace"].as_str().unwrap(), "Mine").unwrap();
+    crate::client_workspace::record_owner(
+        &h.base,
+        theirs["workspace"].as_str().unwrap(),
+        "c-someone-else",
+    )
+    .unwrap();
+    crate::client_workspace::record_bot(&h.base, theirs["workspace"].as_str().unwrap(), "Mine")
+        .unwrap();
     let pipes: Vec<PathBuf> = [&other, &theirs]
         .iter()
-        .map(|v| crate::client_git::clone_git_dir(&h.base, v["workspace"].as_str().unwrap()).join("config"))
+        .map(|v| {
+            crate::client_git::clone_git_dir(&h.base, v["workspace"].as_str().unwrap())
+                .join("config")
+        })
         .collect();
     for config in &pipes {
         std::fs::remove_file(config).unwrap();
@@ -3738,7 +4525,10 @@ async fn reuse_runs_no_git_in_another_bots_or_apps_workspace() {
         for _ in 0..50 {
             for config in &pipes {
                 use std::os::unix::fs::OpenOptionsExt;
-                let _ = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(config);
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(config);
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
@@ -3756,7 +4546,13 @@ async fn reuse_runs_no_git_in_another_bots_or_apps_workspace() {
 async fn reuse_time_at_1_and_21_workspaces() {
     let h = harness();
     let token = paired(&h).await;
-    let ask = |bot: &str| post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "bot": bot}));
+    let ask = |bot: &str| {
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR, "bot": bot}),
+        )
+    };
     assert_eq!(call(&h, ask("Mine")).await.0, 201);
     reuse_timed(&h, &token, "1 workspace").await;
     for n in 0..20 {
@@ -3770,7 +4566,15 @@ async fn reuse_timed(h: &Harness, token: &str, label: &str) {
     let mut took = Vec::new();
     for _ in 0..5 {
         let start = std::time::Instant::now();
-        let (code, v) = call(h, post("/client/workspaces", Some(token), serde_json::json!({"repo_url": HCR, "bot": "Mine"}))).await;
+        let (code, v) = call(
+            h,
+            post(
+                "/client/workspaces",
+                Some(token),
+                serde_json::json!({"repo_url": HCR, "bot": "Mine"}),
+            ),
+        )
+        .await;
         assert_eq!(code, 200, "{v}");
         took.push(start.elapsed().as_millis());
     }
@@ -3787,7 +4591,10 @@ async fn remove_ws(h: &Harness, token: &str, name: &str, body: Option<Value>) ->
         .uri(format!("/client/workspaces/{name}"))
         .header("authorization", bearer(token))
         .header("content-type", "application/json")
-        .body(body.map(|b| Body::from(b.to_string())).unwrap_or_else(Body::empty))
+        .body(
+            body.map(|b| Body::from(b.to_string()))
+                .unwrap_or_else(Body::empty),
+        )
         .unwrap();
     call(h, req).await
 }
@@ -3810,19 +4617,50 @@ fn kept_for(h: &Harness, name: &str) -> Vec<String> {
 async fn an_app_removes_its_clone_and_its_name_is_free_again() {
     let h = harness();
     let token = paired(&h).await;
-    let ask = || post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "bot": "Bot A"}));
+    let ask = || {
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR, "bot": "Bot A"}),
+        )
+    };
     let (code, v) = call(&h, ask()).await;
     assert_eq!(code, 201, "{v}");
     assert!(!kept_for(&h, "hcr").is_empty());
     let (code, gone) = remove_ws(&h, &token, "hcr", None).await;
     assert_eq!(code, 200, "{gone}");
-    assert_eq!((gone["kind"].as_str(), gone["branch"].as_str()), (Some("clone"), v["branch"].as_str()), "{gone}");
-    assert_eq!((gone["branch_removed"].as_bool(), gone["preview_stopped"].as_bool()), (Some(true), Some(false)));
-    assert_eq!(kept_for(&h, "hcr"), Vec::<String>::new(), "nothing of it is left");
-    let (code, _) = call(&h, get("/client/workspaces/hcr", &[("authorization", &bearer(&token))])).await;
+    assert_eq!(
+        (gone["kind"].as_str(), gone["branch"].as_str()),
+        (Some("clone"), v["branch"].as_str()),
+        "{gone}"
+    );
+    assert_eq!(
+        (
+            gone["branch_removed"].as_bool(),
+            gone["preview_stopped"].as_bool()
+        ),
+        (Some(true), Some(false))
+    );
+    assert_eq!(
+        kept_for(&h, "hcr"),
+        Vec::<String>::new(),
+        "nothing of it is left"
+    );
+    let (code, _) = call(
+        &h,
+        get(
+            "/client/workspaces/hcr",
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
     assert_eq!(code, 404);
     let (code, again) = call(&h, ask()).await;
-    assert_eq!((code, again["workspace"].as_str()), (201, Some("hcr")), "{again}");
+    assert_eq!(
+        (code, again["workspace"].as_str()),
+        (201, Some("hcr")),
+        "{again}"
+    );
 }
 
 /// A bot's template projects take `<bot>`, `<bot>-2` ... `<bot>-99`; once
@@ -3834,15 +4672,37 @@ async fn a_template_name_is_free_again_once_its_project_is_removed() {
     for n in 2..100 {
         std::fs::create_dir(h.base.join(format!("bakery-{n}"))).unwrap();
     }
-    let ask = || post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"}));
+    let ask = || {
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"}),
+        )
+    };
     let (code, v) = call(&h, ask()).await;
-    assert_eq!((code, v["workspace"].as_str()), (201, Some("bakery")), "{v}");
+    assert_eq!(
+        (code, v["workspace"].as_str()),
+        (201, Some("bakery")),
+        "{v}"
+    );
     let (code, v) = call(&h, ask()).await;
-    assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "every name is taken: {v}");
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (409, Some("conflict")),
+        "every name is taken: {v}"
+    );
     let (code, gone) = remove_ws(&h, &token, "bakery", None).await;
-    assert_eq!((code, gone["kind"].as_str()), (200, Some("template")), "{gone}");
+    assert_eq!(
+        (code, gone["kind"].as_str()),
+        (200, Some("template")),
+        "{gone}"
+    );
     let (code, v) = call(&h, ask()).await;
-    assert_eq!((code, v["workspace"].as_str()), (201, Some("bakery")), "{v}");
+    assert_eq!(
+        (code, v["workspace"].as_str()),
+        (201, Some("bakery")),
+        "{v}"
+    );
 }
 
 /// A clone or a template project whose runs committed holds commits that
@@ -3852,15 +4712,26 @@ async fn a_template_name_is_free_again_once_its_project_is_removed() {
 async fn a_workspace_holding_commits_nowhere_else_is_removed_only_with_force() {
     let h = harness();
     let token = paired(&h).await;
-    for body in [serde_json::json!({"repo_url": HCR}), serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"})] {
+    for body in [
+        serde_json::json!({"repo_url": HCR}),
+        serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"}),
+    ] {
         let (code, v) = call(&h, post("/client/workspaces", Some(&token), body)).await;
         assert_eq!(code, 201, "{v}");
         let name = v["workspace"].as_str().unwrap().to_string();
         let _ = run_in(&h, &token, &name, "edit").await;
         let (code, refused) = remove_ws(&h, &token, &name, None).await;
-        assert_eq!((code, refused["code"].as_str()), (409, Some("unsaved_commits")), "{refused}");
-        assert!(h.base.join(&name).join("made-by-run.txt").exists(), "nothing was removed");
-        let (code, gone) = remove_ws(&h, &token, &name, Some(serde_json::json!({"force": true}))).await;
+        assert_eq!(
+            (code, refused["code"].as_str()),
+            (409, Some("unsaved_commits")),
+            "{refused}"
+        );
+        assert!(
+            h.base.join(&name).join("made-by-run.txt").exists(),
+            "nothing was removed"
+        );
+        let (code, gone) =
+            remove_ws(&h, &token, &name, Some(serde_json::json!({"force": true}))).await;
         assert_eq!(code, 200, "{gone}");
         assert_eq!(kept_for(&h, &name), Vec::<String>::new());
     }
@@ -3875,36 +4746,110 @@ async fn removing_a_worktree_never_touches_the_users_branches() {
     let h = harness();
     let token = paired(&h).await;
     let (mine, name, _ws) = checkout_workspace(&h, &token).await;
-    let users = || (run_git(Some(&mine), &["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/main", "refs/heads/dev"]), std::fs::read_to_string(mine.join("README.md")).unwrap());
+    let users = || {
+        (
+            run_git(
+                Some(&mine),
+                &[
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname)",
+                    "refs/heads/main",
+                    "refs/heads/dev",
+                ],
+            ),
+            std::fs::read_to_string(mine.join("README.md")).unwrap(),
+        )
+    };
     let before = users();
-    let worktrees = || run_git(Some(&mine), &["worktree", "list", "--porcelain"]).matches("worktree ").count();
+    let worktrees = || {
+        run_git(Some(&mine), &["worktree", "list", "--porcelain"])
+            .matches("worktree ")
+            .count()
+    };
     assert_eq!(worktrees(), 2);
     let (code, gone) = remove_ws(&h, &token, &name, None).await;
-    assert_eq!((code, gone["kind"].as_str(), gone["branch_removed"].as_bool()), (200, Some("worktree"), Some(true)), "a branch main holds goes: {gone}");
+    assert_eq!(
+        (
+            code,
+            gone["kind"].as_str(),
+            gone["branch_removed"].as_bool()
+        ),
+        (200, Some("worktree"), Some(true)),
+        "a branch main holds goes: {gone}"
+    );
     let branch = gone["branch"].as_str().unwrap().to_string();
-    assert!(run_git(Some(&mine), &["branch", "--list", &branch]).is_empty(), "{branch} is gone");
+    assert!(
+        run_git(Some(&mine), &["branch", "--list", &branch]).is_empty(),
+        "{branch} is gone"
+    );
     assert_eq!(worktrees(), 1, "its admin directory is gone");
     assert_eq!(kept_for(&h, &name), Vec::<String>::new());
     for force in [false, true] {
-        let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"source_path": mine.to_str(), "bot": "b"}))).await;
+        let (code, v) = call(
+            &h,
+            post(
+                "/client/workspaces",
+                Some(&token),
+                serde_json::json!({"source_path": mine.to_str(), "bot": "b"}),
+            ),
+        )
+        .await;
         assert_eq!(code, 201, "{v}");
         let _ = run_in(&h, &token, &name, "edit").await;
-        let (code, gone) = remove_ws(&h, &token, &name, Some(serde_json::json!({"force": force}))).await;
-        assert_eq!((code, gone["branch_removed"].as_bool()), (200, Some(force)), "{gone}");
-        let listed = run_git(Some(&mine), &["branch", "--list", gone["branch"].as_str().unwrap()]);
-        assert_eq!(listed.is_empty(), force, "the run's commits stay on their branch unless forced: {listed:?}");
+        let (code, gone) =
+            remove_ws(&h, &token, &name, Some(serde_json::json!({"force": force}))).await;
+        assert_eq!(
+            (code, gone["branch_removed"].as_bool()),
+            (200, Some(force)),
+            "{gone}"
+        );
+        let listed = run_git(
+            Some(&mine),
+            &["branch", "--list", gone["branch"].as_str().unwrap()],
+        );
+        assert_eq!(
+            listed.is_empty(),
+            force,
+            "the run's commits stay on their branch unless forced: {listed:?}"
+        );
         assert_eq!(worktrees(), 1);
     }
-    assert_eq!(users(), before, "the user's branches and files are as they were");
+    assert_eq!(
+        users(),
+        before,
+        "the user's branches and files are as they were"
+    );
     // A worktree on a branch of the user's (moved there by hand): even with
     // `force`, that branch stays.
-    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"source_path": mine.to_str(), "bot": "b"}))).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"source_path": mine.to_str(), "bot": "b"}),
+        ),
+    )
+    .await;
     assert_eq!(code, 201, "{v}");
     run_git(Some(&mine), &["branch", "feature"]);
-    run_git(Some(&h.base.join(&name)), &["checkout", "--quiet", "feature"]);
+    run_git(
+        Some(&h.base.join(&name)),
+        &["checkout", "--quiet", "feature"],
+    );
     let (code, gone) = remove_ws(&h, &token, &name, Some(serde_json::json!({"force": true}))).await;
-    assert_eq!((code, gone["branch"].as_str(), gone["branch_removed"].as_bool()), (200, Some("feature"), Some(false)), "{gone}");
-    assert!(!run_git(Some(&mine), &["branch", "--list", "feature"]).is_empty(), "the user's branch stays");
+    assert_eq!(
+        (
+            code,
+            gone["branch"].as_str(),
+            gone["branch_removed"].as_bool()
+        ),
+        (200, Some("feature"), Some(false)),
+        "{gone}"
+    );
+    assert!(
+        !run_git(Some(&mine), &["branch", "--list", "feature"]).is_empty(),
+        "the user's branch stays"
+    );
 }
 
 /// A workspace is not removed while something uses it: a run in it, or a
@@ -3917,28 +4862,72 @@ async fn a_workspace_in_use_is_not_removed_nor_used_while_removed() {
     let h = harness();
     let token = paired(&h).await;
     let other = paired(&h).await;
-    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
     assert_eq!(code, 201, "{v}");
     let edited = run_in(&h, &token, "hcr", "edit").await;
     let id = start_in(&h, &token, "hcr", "wait").await;
-    assert!(try_hold(&h.base, "hcr", Hold::Sole).unwrap().is_none(), "a run holds its workspace's name");
+    assert!(
+        try_hold(&h.base, "hcr", Hold::Sole).unwrap().is_none(),
+        "a run holds its workspace's name"
+    );
     let force = || Some(serde_json::json!({"force": true}));
     let (code, refused) = remove_ws(&h, &token, "hcr", force()).await;
-    assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "a run is in it: {refused}");
+    assert_eq!(
+        (code, refused["code"].as_str()),
+        (409, Some("conflict")),
+        "a run is in it: {refused}"
+    );
     let _ = cancel(&h, Some(&token), &id).await;
     let _ = wait_done(&h, &token, &id).await;
-    assert!(try_hold(&h.base, "hcr", Hold::Sole).unwrap().is_some(), "and lets go once it has ended");
+    assert!(
+        try_hold(&h.base, "hcr", Hold::Sole).unwrap().is_some(),
+        "and lets go once it has ended"
+    );
     let elsewhere = try_hold(&h.base, "hcr", Hold::Shared).unwrap().unwrap();
     let (code, refused) = remove_ws(&h, &token, "hcr", force()).await;
-    assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "held elsewhere: {refused}");
+    assert_eq!(
+        (code, refused["code"].as_str()),
+        (409, Some("conflict")),
+        "held elsewhere: {refused}"
+    );
     drop(elsewhere);
     let removing = try_hold(&h.base, "hcr", Hold::Sole).unwrap().unwrap();
     let body = serde_json::json!({"role": "coder", "message": "edit", "workspace": "hcr"});
     let (code, refused) = call(&h, post("/client/work", Some(&token), body)).await;
-    assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "no run starts in one being removed: {refused}");
-    let (code, refused) = call(&h, post(&format!("/client/work/{edited}/undo"), Some(&token), Value::Null)).await;
-    assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "no Undo either: {refused}");
-    assert!(refused["error"].as_str().unwrap().contains("being made or removed"), "{refused}");
+    assert_eq!(
+        (code, refused["code"].as_str()),
+        (409, Some("conflict")),
+        "no run starts in one being removed: {refused}"
+    );
+    let (code, refused) = call(
+        &h,
+        post(
+            &format!("/client/work/{edited}/undo"),
+            Some(&token),
+            Value::Null,
+        ),
+    )
+    .await;
+    assert_eq!(
+        (code, refused["code"].as_str()),
+        (409, Some("conflict")),
+        "no Undo either: {refused}"
+    );
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("being made or removed"),
+        "{refused}"
+    );
     drop(removing);
     let (code, _) = remove_ws(&h, &other, "hcr", None).await;
     assert_eq!(code, 403, "another app's");
@@ -3947,7 +4936,10 @@ async fn a_workspace_in_use_is_not_removed_nor_used_while_removed() {
     let (code, _) = remove_ws(&h, &token, "..", None).await;
     assert_eq!(code, 400);
     let (code, refused) = remove_ws(&h, &token, "wt1", None).await;
-    assert_eq!(code, 403, "a folder darkmux holds no repository for: {refused}");
+    assert_eq!(
+        code, 403,
+        "a folder darkmux holds no repository for: {refused}"
+    );
     assert!(h.base.join("wt1").is_dir());
     let (code, _) = remove_ws(&h, &token, "hcr", Some(serde_json::json!({"forse": true}))).await;
     assert_eq!(code, 400, "an unknown key");
@@ -3963,10 +4955,17 @@ async fn removing_a_workspace_stops_its_preview_first() {
     let h = harness();
     let token = paired(&h).await;
     let (mine, name, _ws) = served_workspace(&h, &token).await;
-    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}}));
+    recipe(
+        &mine,
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}}),
+    );
     let removing = try_hold(&h.base, &name, Hold::Sole).unwrap().unwrap();
     let (code, refused) = start_preview(&h, &token, &name).await;
-    assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "{refused}");
+    assert_eq!(
+        (code, refused["code"].as_str()),
+        (409, Some("conflict")),
+        "{refused}"
+    );
     drop(removing);
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 202, "{v}");
@@ -3974,7 +4973,11 @@ async fn removing_a_workspace_stops_its_preview_first() {
     assert_eq!(ready["status"], "ready", "{ready}");
     let port = ready["port"].as_u64().unwrap();
     let (code, gone) = remove_ws(&h, &token, &name, None).await;
-    assert_eq!((code, gone["preview_stopped"].as_bool()), (200, Some(true)), "{gone}");
+    assert_eq!(
+        (code, gone["preview_stopped"].as_bool()),
+        (200, Some(true)),
+        "{gone}"
+    );
     assert!(!answers(port), "its dev server is gone");
     assert!(!h.base.join(&name).exists());
 }
@@ -3985,7 +4988,8 @@ async fn removing_a_workspace_stops_its_preview_first() {
 async fn a_refused_removal_leaves_the_preview_running() {
     let h = harness();
     let token = paired(&h).await;
-    let json = serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}});
+    let json =
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}});
     let (name, _ws) = template_project(&h, &token, Some(json)).await;
     let _ = run_in(&h, &token, &name, "edit").await;
     let (code, v) = start_preview(&h, &token, &name).await;
@@ -3993,9 +4997,16 @@ async fn a_refused_removal_leaves_the_preview_running() {
     let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
     assert_eq!(ready["status"], "ready", "{ready}");
     let (code, refused) = remove_ws(&h, &token, &name, None).await;
-    assert_eq!((code, refused["code"].as_str()), (409, Some("unsaved_commits")), "{refused}");
+    assert_eq!(
+        (code, refused["code"].as_str()),
+        (409, Some("unsaved_commits")),
+        "{refused}"
+    );
     let still = preview_until(&h, &token, &name, &["ready", "stopped", "failed"]).await;
-    assert_eq!(still["status"], "ready", "the refused removal stopped nothing: {still}");
+    assert_eq!(
+        still["status"], "ready",
+        "the refused removal stopped nothing: {still}"
+    );
     assert!(answers(ready["port"].as_u64().unwrap()));
 }
 
@@ -4020,9 +5031,15 @@ fn a_half_done_clone_is_swept_and_its_name_freed() {
     assert!(!name_taken(base, "gone"), "its name is free again");
     assert_eq!(kept_for(&h, "gone"), Vec::<String>::new());
     let kept = kept_for(&h, "kept");
-    assert!(kept.contains(&".kept.git".to_string()) && kept.contains(&"kept".to_string()), "the workspace's repository stays: {kept:?}");
+    assert!(
+        kept.contains(&".kept.git".to_string()) && kept.contains(&"kept".to_string()),
+        "the workspace's repository stays: {kept:?}"
+    );
     assert!(!kept.contains(&".kept.partial".to_string()), "{kept:?}");
-    assert!(base.join(".busy.partial").exists(), "a clone in progress is left");
+    assert!(
+        base.join(".busy.partial").exists(),
+        "a clone in progress is left"
+    );
     drop(busy);
 }
 
@@ -4039,10 +5056,15 @@ async fn an_unreadable_or_oversized_branch_is_refused_as_before() {
     for (e, status, code) in cases {
         let resp = changes_refusal(e.clone());
         assert_eq!(resp.status().as_u16(), status, "{e:?}");
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["code"], code, "{e:?}: {v}");
-        assert!(!v.to_string().contains("a/b.txt"), "a 500 names no path: {v}");
+        assert!(
+            !v.to_string().contains("a/b.txt"),
+            "a 500 names no path: {v}"
+        );
     }
 }
 
@@ -4050,10 +5072,23 @@ async fn an_unreadable_or_oversized_branch_is_refused_as_before() {
 /// is unborn).
 fn empty_repo_state(h: &Harness) -> ClientServerState {
     let empty = h.dir.path().join("empty.git");
-    run_git(None, &["init", "--quiet", "--bare", empty.to_str().unwrap()]);
+    run_git(
+        None,
+        &["init", "--quiet", "--bare", empty.to_str().unwrap()],
+    );
     ClientServerState {
         clone_repo: Arc::new(move |url, _r, dest, gd| {
-            run_git(None, &["clone", "--quiet", "--separate-git-dir", gd.to_str().unwrap(), empty.to_str().unwrap(), dest.to_str().unwrap()]);
+            run_git(
+                None,
+                &[
+                    "clone",
+                    "--quiet",
+                    "--separate-git-dir",
+                    gd.to_str().unwrap(),
+                    empty.to_str().unwrap(),
+                    dest.to_str().unwrap(),
+                ],
+            );
             run_git(Some(dest), &["remote", "set-url", "origin", url]);
             run_git(Some(dest), &["config", "user.name", "Owner"]);
             run_git(Some(dest), &["config", "user.email", "owner@example.com"]);
@@ -4070,13 +5105,26 @@ async fn an_empty_repo_clones_onto_a_bots_branch() {
     let h = harness();
     let token = paired(&h).await;
     let state = empty_repo_state(&h);
-    let ask = || post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "bot": "Bot A"}));
+    let ask = || {
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR, "bot": "Bot A"}),
+        )
+    };
     let (code, v) = call_with(state.clone(), ask()).await;
     assert_eq!(code, 201, "{v}");
     let branch = v["branch"].as_str().unwrap().to_string();
-    assert!(crate::client_workspace::is_bot_branch(&branch, "bot-a"), "{v}");
+    assert!(
+        crate::client_workspace::is_bot_branch(&branch, "bot-a"),
+        "{v}"
+    );
     let (code, again) = call_with(state, ask()).await;
-    assert_eq!((code, &again["workspace"]), (200, &v["workspace"]), "{again}");
+    assert_eq!(
+        (code, &again["workspace"]),
+        (200, &v["workspace"]),
+        "{again}"
+    );
     let id = run_in(&h, &token, "hcr", "edit").await;
     let done = status(&h, &token, &id).await;
     assert_eq!(done["branch"], branch.as_str(), "{done}");
@@ -4091,8 +5139,20 @@ async fn a_clone_that_cannot_get_a_bots_branch_leaves_nothing_behind() {
     let h = harness();
     let token = paired(&h).await;
     run_git(Some(&h.fixture), &["branch", "mux"]);
-    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "ref": "mux"}))).await;
-    assert_eq!((code, v["code"].as_str()), (422, Some("branch_failed")), "{v}");
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR, "ref": "mux"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (422, Some("branch_failed")),
+        "{v}"
+    );
     let left: Vec<String> = std::fs::read_dir(&h.base)
         .unwrap()
         .flatten()
@@ -4110,23 +5170,44 @@ async fn a_clone_that_cannot_get_a_bots_branch_leaves_nothing_behind() {
 async fn a_run_whose_clone_cannot_move_off_a_users_branch_is_refused_and_forgotten() {
     let h = harness();
     let token = paired(&h).await;
-    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
     assert_eq!(code, 201, "{v}");
     let made = v["branch"].as_str().unwrap().to_string();
     held_git(&h, "hcr", &["symbolic-ref", "HEAD", "refs/heads/main"]);
     held_git(&h, "hcr", &["branch", "-D", &made]);
     held_git(&h, "hcr", &["branch", "mux"]);
-    let work = || post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": "edit", "workspace": "hcr"}));
+    let work = || {
+        post(
+            "/client/work",
+            Some(&token),
+            serde_json::json!({"role": "coder", "message": "edit", "workspace": "hcr"}),
+        )
+    };
     for attempt in 1..=2 {
         let (code, v) = call(&h, work()).await;
-        assert_eq!((code, v["code"].as_str()), (422, Some("branch_failed")), "attempt {attempt}, never busy: {v}");
+        assert_eq!(
+            (code, v["code"].as_str()),
+            (422, Some("branch_failed")),
+            "attempt {attempt}, never busy: {v}"
+        );
     }
     assert!(h.ran.lock().unwrap().is_empty());
     held_git(&h, "hcr", &["branch", "-D", "mux"]);
     let (code, v) = call(&h, work()).await;
     assert_eq!(code, 202, "{v}");
     let done = wait_done(&h, &token, v["work_id"].as_str().unwrap()).await;
-    assert!(crate::client_workspace::is_bot_branch(done["branch"].as_str().unwrap(), "app"), "{done}");
+    assert!(
+        crate::client_workspace::is_bot_branch(done["branch"].as_str().unwrap(), "app"),
+        "{done}"
+    );
 }
 
 /// A workspace from before bots' exact names were recorded is claimed by
@@ -4139,7 +5220,10 @@ async fn the_first_bot_to_reuse_an_unrecorded_workspace_keeps_it() {
     let token = paired(&h).await;
     let mine = h.dir.path().join("my-site");
     fixture_repo(&mine);
-    for source in [serde_json::json!({"source_path": mine.to_str()}), serde_json::json!({"repo_url": HCR})] {
+    for source in [
+        serde_json::json!({"source_path": mine.to_str()}),
+        serde_json::json!({"repo_url": HCR}),
+    ] {
         let ask = |bot: &str| {
             let mut body = source.clone();
             body["bot"] = bot.into();
@@ -4151,8 +5235,15 @@ async fn the_first_bot_to_reuse_an_unrecorded_workspace_keeps_it() {
         // As a workspace made before the record existed.
         std::fs::remove_file(h.base.join(format!(".{name}.bot"))).unwrap();
         let (code, again) = call(&h, ask("Bot A")).await;
-        assert_eq!((code, again["workspace"].as_str()), (200, Some(name.as_str())), "{again}");
-        assert_eq!(crate::client_workspace::bot_of(&h.base, &name).as_deref(), Some("Bot A"));
+        assert_eq!(
+            (code, again["workspace"].as_str()),
+            (200, Some(name.as_str())),
+            "{again}"
+        );
+        assert_eq!(
+            crate::client_workspace::bot_of(&h.base, &name).as_deref(),
+            Some("Bot A")
+        );
         let (code, other) = call(&h, ask("bot_a")).await;
         assert_eq!(code, 201, "bot_a gets its own, not Bot A's: {other}");
         assert_ne!(other["workspace"], again["workspace"]);
@@ -4168,7 +5259,15 @@ async fn a_long_checkout_and_bot_name_still_fit_a_workspace_name() {
     let mine = h.dir.path().join("a".repeat(40));
     fixture_repo(&mine);
     let bot = "b".repeat(32);
-    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"source_path": mine.to_str(), "bot": bot}))).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"source_path": mine.to_str(), "bot": bot}),
+        ),
+    )
+    .await;
     assert_eq!(code, 201, "{v}");
     let first = v["workspace"].as_str().unwrap().to_string();
     assert!(crate::client_workspace::valid_name(&first), "{first}");
@@ -4179,7 +5278,10 @@ async fn a_long_checkout_and_bot_name_still_fit_a_workspace_name() {
         assert!(crate::client_workspace::valid_name(n), "{n}");
     }
     let last = names.last().unwrap();
-    assert!(last.ends_with("-99"), "every numbered name fits, the last too: {last}");
+    assert!(
+        last.ends_with("-99"),
+        "every numbered name fits, the last too: {last}"
+    );
 }
 
 /// A store written before clients had ids, holding one client that
@@ -4207,15 +5309,34 @@ async fn workspaces_from_before_owners_go_to_the_client_paired_when_the_store_mo
     let second = paired(&h).await;
     git_workspace(&h, "site");
     std::fs::remove_file(h.base.join(".site.client")).unwrap();
-    let (code, v) = call(&h, post("/client/work", Some(&second), serde_json::json!({"role": "coder", "message": "hi", "workspace": "site"}))).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&second),
+            serde_json::json!({"role": "coder", "message": "hi", "workspace": "site"}),
+        ),
+    )
+    .await;
     assert_eq!(code, 403, "never the second app's: {v}");
     let id = run_in(&h, first, "site", "hello").await;
     assert_eq!(status(&h, first, &id).await["status"], "done");
-    assert_eq!(crate::client_workspace::owner_of(&h.base, "site"), Some(heir));
+    assert_eq!(
+        crate::client_workspace::owner_of(&h.base, "site"),
+        Some(heir)
+    );
     assert!(revoke(&h.store, "mux-bot").unwrap());
     git_workspace(&h, "old");
     std::fs::remove_file(h.base.join(".old.client")).unwrap();
-    let (code, v) = call(&h, post("/client/work", Some(&second), serde_json::json!({"role": "coder", "message": "hi", "workspace": "old"}))).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&second),
+            serde_json::json!({"role": "coder", "message": "hi", "workspace": "old"}),
+        ),
+    )
+    .await;
     assert_eq!(code, 403, "nothing adopts once the heir is revoked: {v}");
     assert_eq!(crate::client_workspace::owner_of(&h.base, "old"), None);
 }
@@ -4228,10 +5349,24 @@ async fn the_last_client_left_does_not_inherit_unowned_workspaces() {
     let h = harness();
     let a = paired(&h).await;
     let b = paired(&h).await;
-    let (code, v) = call(&h, post("/client/workspaces", Some(&a), serde_json::json!({"repo_url": HCR}))).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&a),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
     assert_eq!(code, 201, "{v}");
     std::fs::remove_file(h.base.join(".hcr.client")).unwrap();
-    let work = |t: &str| post("/client/work", Some(t), serde_json::json!({"role": "coder", "message": "hi", "workspace": "hcr"}));
+    let work = |t: &str| {
+        post(
+            "/client/work",
+            Some(t),
+            serde_json::json!({"role": "coder", "message": "hi", "workspace": "hcr"}),
+        )
+    };
     assert_eq!(call(&h, work(&b)).await.0, 403);
     assert!(revoke(&h.store, FIRST_CLIENT).unwrap());
     let (code, v) = call(&h, work(&b)).await;
@@ -4244,10 +5379,24 @@ async fn the_last_client_left_does_not_inherit_unowned_workspaces() {
 #[test]
 fn a_store_moved_with_several_clients_or_none_names_no_legacy_owner() {
     let dir = tempfile::tempdir().unwrap();
-    for (n, clients) in [(0, "[]"), (2, r#"[{"name":"a","created":1,"token_hash":"00"},{"name":"b","created":1,"token_hash":"00"}]"#)] {
+    for (n, clients) in [
+        (0, "[]"),
+        (
+            2,
+            r#"[{"name":"a","created":1,"token_hash":"00"},{"name":"b","created":1,"token_hash":"00"}]"#,
+        ),
+    ] {
         let path = dir.path().join(format!("clients-{n}.json"));
-        std::fs::write(&path, format!(r#"{{"schema_version":"1.1","pending":[],"clients":{clients}}}"#)).unwrap();
-        assert_eq!(ClientStore::at(path).read().unwrap().legacy_owner, None, "{n} clients");
+        std::fs::write(
+            &path,
+            format!(r#"{{"schema_version":"1.1","pending":[],"clients":{clients}}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            ClientStore::at(path).read().unwrap().legacy_owner,
+            None,
+            "{n} clients"
+        );
     }
 }
 
@@ -4258,7 +5407,13 @@ fn a_store_moved_with_several_clients_or_none_names_no_legacy_owner() {
 async fn with_two_apps_paired_only_the_operator_gives_out_an_unowned_workspace() {
     let h = harness();
     let a = paired(&h).await;
-    let make = |t: &str| post("/client/workspaces", Some(t), serde_json::json!({"repo_url": HCR}));
+    let make = |t: &str| {
+        post(
+            "/client/workspaces",
+            Some(t),
+            serde_json::json!({"repo_url": HCR}),
+        )
+    };
     let (code, v) = call(&h, make(&a)).await;
     assert_eq!((code, v["workspace"].as_str()), (201, Some("hcr")), "{v}");
     std::fs::remove_file(h.base.join(".hcr.client")).unwrap();
@@ -4267,14 +5422,26 @@ async fn with_two_apps_paired_only_the_operator_gives_out_an_unowned_workspace()
     let (code, v) = call(&h, make(&b)).await;
     assert_eq!(code, 201, "b gets its own, never the unowned one: {v}");
     assert_ne!(v["workspace"], "hcr");
-    let work = |t: &str| post("/client/work", Some(t), serde_json::json!({"role": "coder", "message": "hi", "workspace": "hcr"}));
+    let work = |t: &str| {
+        post(
+            "/client/work",
+            Some(t),
+            serde_json::json!({"role": "coder", "message": "hi", "workspace": "hcr"}),
+        )
+    };
     for t in [&a, &b] {
         let (code, v) = call(&h, work(t)).await;
         assert_eq!((code, v["code"].as_str()), (403, Some("forbidden")), "{v}");
     }
-    assert!(claim(&h.store, &h.base, "hcr", "nobody").is_err(), "an unknown client");
+    assert!(
+        claim(&h.store, &h.base, "hcr", "nobody").is_err(),
+        "an unknown client"
+    );
     std::fs::create_dir_all(h.base.join("darkmux-public/phase-1")).unwrap();
-    assert!(claim(&h.store, &h.base, "darkmux-public", FIRST_CLIENT).is_err(), "a mission's worktrees");
+    assert!(
+        claim(&h.store, &h.base, "darkmux-public", FIRST_CLIENT).is_err(),
+        "a mission's worktrees"
+    );
     claim(&h.store, &h.base, "hcr", FIRST_CLIENT).unwrap();
     assert!(unowned_workspaces(&h.store, &h.base).unwrap().is_empty());
     let (code, v) = call(&h, work(&a)).await;
@@ -4290,17 +5457,52 @@ async fn with_two_apps_paired_only_the_operator_gives_out_an_unowned_workspace()
 async fn a_new_pairing_never_inherits_a_revoked_clients_workspaces_or_runs() {
     let h = harness();
     let old = paired(&h).await;
-    let (code, v) = call(&h, post("/client/workspaces", Some(&old), serde_json::json!({"repo_url": HCR}))).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&old),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
     assert_eq!(code, 201, "{v}");
     let run = run_in(&h, &old, "hcr", "hello").await;
     assert!(revoke(&h.store, FIRST_CLIENT).unwrap());
     let new = paired(&h).await;
-    assert_eq!(list_clients(&h.store).unwrap()[0].name, FIRST_CLIENT, "the name is reused");
-    let (code, v) = call(&h, post("/client/work", Some(&new), serde_json::json!({"role": "coder", "message": "hi", "workspace": "hcr"}))).await;
+    assert_eq!(
+        list_clients(&h.store).unwrap()[0].name,
+        FIRST_CLIENT,
+        "the name is reused"
+    );
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&new),
+            serde_json::json!({"role": "coder", "message": "hi", "workspace": "hcr"}),
+        ),
+    )
+    .await;
     assert_eq!((code, v["code"].as_str()), (403, Some("forbidden")), "{v}");
-    let (code, _) = call(&h, get(&format!("/client/work/{run}"), &[("authorization", &bearer(&new))])).await;
+    let (code, _) = call(
+        &h,
+        get(
+            &format!("/client/work/{run}"),
+            &[("authorization", &bearer(&new))],
+        ),
+    )
+    .await;
     assert_eq!(code, 404, "the revoked client's run is not the new one's");
-    let (code, v) = call(&h, post("/client/workspaces", Some(&new), serde_json::json!({"repo_url": HCR}))).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&new),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
     assert_eq!(code, 201, "a workspace of its own: {v}");
     assert_ne!(v["workspace"], "hcr");
     assert_eq!(unowned_workspaces(&h.store, &h.base).unwrap(), ["hcr"]);
@@ -4317,7 +5519,11 @@ fn an_owner_record_is_replaced_atomically_and_only_when_it_changes() {
     ws(&base, "site", "c-a").unwrap();
     let ino = std::fs::metadata(base.join(".site.client")).unwrap().ino();
     ws(&base, "site", "c-a").unwrap();
-    assert_eq!(std::fs::metadata(base.join(".site.client")).unwrap().ino(), ino, "no write when it already says so");
+    assert_eq!(
+        std::fs::metadata(base.join(".site.client")).unwrap().ino(),
+        ino,
+        "no write when it already says so"
+    );
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (b2, st) = (base.clone(), stop.clone());
     let writer = std::thread::spawn(move || {
@@ -4328,11 +5534,17 @@ fn an_owner_record_is_replaced_atomically_and_only_when_it_changes() {
         }
     });
     for _ in 0..20_000 {
-        assert!(crate::client_workspace::owner_of(&base, "site").is_some(), "never unowned mid-change");
+        assert!(
+            crate::client_workspace::owner_of(&base, "site").is_some(),
+            "never unowned mid-change"
+        );
     }
     stop.store(true, Ordering::SeqCst);
     writer.join().unwrap();
-    let names: Vec<String> = std::fs::read_dir(&base).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    let names: Vec<String> = std::fs::read_dir(&base)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
     assert_eq!(names, [".site.client"], "no temporary file left");
 }
 
@@ -4452,7 +5664,11 @@ async fn a_source_path_must_be_the_top_of_a_real_checkout_outside_the_base() {
         .filter_map(|e| e.ok())
         .map(|e| e.file_name())
         .collect();
-    assert_eq!(names.len(), 3, "only wt1, its owner record and inside: {names:?}");
+    assert_eq!(
+        names.len(),
+        3,
+        "only wt1, its owner record and inside: {names:?}"
+    );
 }
 
 #[tokio::test]
@@ -4607,10 +5823,18 @@ async fn a_runs_paths_are_committed_literally_never_as_globs() {
     std::fs::write(wt.join("b.txt"), "the owner's, uncommitted\n").unwrap();
     std::fs::write(wt.join("a.txt"), "the owner's, untracked\n").unwrap();
     std::fs::write(wt.join("[ab].txt"), "made by the run\n").unwrap();
-    let (sha, _) = commit_run(&crate::client_git::work_copy_of(&h.base, "glob", &wt).unwrap(), &["[ab].txt".to_string()], "coder: glob (work w-1)").unwrap();
+    let (sha, _) = commit_run(
+        &crate::client_git::work_copy_of(&h.base, "glob", &wt).unwrap(),
+        &["[ab].txt".to_string()],
+        "coder: glob (work w-1)",
+    )
+    .unwrap();
     let files = run_git(Some(&wt), &["show", "--name-only", "--format=", &sha]);
     assert_eq!(files.lines().collect::<Vec<_>>(), ["[ab].txt"], "{files}");
-    let status = run_git(Some(&wt), &["status", "--porcelain", "--", "a.txt", "b.txt"]);
+    let status = run_git(
+        Some(&wt),
+        &["status", "--porcelain", "--", "a.txt", "b.txt"],
+    );
     assert!(
         status.contains("?? a.txt") && status.contains("M b.txt"),
         "a.txt and b.txt stay the owner's, uncommitted: {status}"
@@ -4625,20 +5849,42 @@ async fn a_runs_paths_are_committed_literally_never_as_globs() {
 async fn host_git_never_runs_config_a_run_planted() {
     let h = harness();
     let token = paired(&h).await;
-    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
     assert_eq!(code, 201, "{v}");
     let (_mine, checkout_ws, _) = checkout_workspace(&h, &token).await;
     for (workspace, plant, files) in [
         ("hcr", "plant-fsmonitor", vec!["made-by-run.txt"]),
-        ("hcr", "plant-filter", vec![".gitattributes", "made-by-run.txt"]),
-        (checkout_ws.as_str(), "plant-fsmonitor", vec!["made-by-run.txt"]),
+        (
+            "hcr",
+            "plant-filter",
+            vec![".gitattributes", "made-by-run.txt"],
+        ),
+        (
+            checkout_ws.as_str(),
+            "plant-fsmonitor",
+            vec!["made-by-run.txt"],
+        ),
     ] {
         let id = run_in(&h, &token, workspace, plant).await;
         let v = status(&h, &token, &id).await;
         let marker = host_ran_marker(&h.base.join(workspace));
-        assert!(!marker.exists(), "{workspace} {plant}: the host ran the run's git config");
+        assert!(
+            !marker.exists(),
+            "{workspace} {plant}: the host ran the run's git config"
+        );
         assert_eq!(v["status"], "done", "{v}");
-        assert!(v["commit"].is_string(), "{workspace} {plant}: the run's change was committed: {v}");
+        assert!(
+            v["commit"].is_string(),
+            "{workspace} {plant}: the run's change was committed: {v}"
+        );
         let committed: Vec<&str> = v["changes"]["files"]
             .as_array()
             .unwrap()
@@ -4649,14 +5895,34 @@ async fn host_git_never_runs_config_a_run_planted() {
         // The workspace's repository (not the planted one) holds the commit.
         let (code, info) = call(
             &h,
-            get(&format!("/client/workspaces/{workspace}"), &[("authorization", &bearer(&token))]),
+            get(
+                &format!("/client/workspaces/{workspace}"),
+                &[("authorization", &bearer(&token))],
+            ),
         )
         .await;
         assert_eq!(code, 200, "{info}");
-        assert!(v["commit"].as_str().unwrap().starts_with(info["head"].as_str().unwrap()), "{workspace}: {info} {v}");
-        assert!(!marker.exists(), "{workspace}: reading its status ran the planted config");
+        assert!(
+            v["commit"]
+                .as_str()
+                .unwrap()
+                .starts_with(info["head"].as_str().unwrap()),
+            "{workspace}: {info} {v}"
+        );
+        assert!(
+            !marker.exists(),
+            "{workspace}: reading its status ran the planted config"
+        );
         // Undo it so the next plant starts clean.
-        let (code, u) = call(&h, post(&format!("/client/work/{id}/undo"), Some(&token), serde_json::json!({}))).await;
+        let (code, u) = call(
+            &h,
+            post(
+                &format!("/client/work/{id}/undo"),
+                Some(&token),
+                serde_json::json!({}),
+            ),
+        )
+        .await;
         assert_eq!(code, 200, "{u}");
         assert!(!marker.exists());
     }
@@ -4673,14 +5939,28 @@ async fn a_nested_repository_is_left_out_of_the_snapshot_and_named() {
     let id = run_in(&h, &token, "nest", "nested-init").await;
     let v = status(&h, &token, &id).await;
     assert_eq!(v["changes_error"], Value::Null, "{v}");
-    let files: Vec<&str> = v["changes"]["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+    let files: Vec<&str> = v["changes"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
     assert_eq!(files, ["README.md"], "{v}");
     assert_eq!(v["changes"]["skipped"], serde_json::json!(["sub"]), "{v}");
     assert!(v["commit"].is_string(), "{v}");
     let id = run_in(&h, &token, "nest", "edit-other").await;
     let v = status(&h, &token, &id).await;
-    let files: Vec<&str> = v["changes"]["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
-    assert_eq!(files, ["other.txt"], "a later run still sees its change: {v}");
+    let files: Vec<&str> = v["changes"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        files,
+        ["other.txt"],
+        "a later run still sees its change: {v}"
+    );
 }
 
 /// (review) A snapshot that fails is never "no changes": the run says the
@@ -4695,12 +5975,17 @@ async fn a_failed_snapshot_is_reported_never_read_as_no_changes() {
     let v = status(&h, &token, &id).await;
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(wt.join("locked.txt"), std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(
+            wt.join("locked.txt"),
+            std::fs::Permissions::from_mode(0o600),
+        );
     }
     assert_eq!(v["status"], "done", "{v}");
     assert_eq!(v["changes"], Value::Null, "{v}");
     assert_eq!(v["commit"], Value::Null, "{v}");
-    let e = v["changes_error"].as_str().unwrap_or_else(|| panic!("the failure is named: {v}"));
+    let e = v["changes_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the failure is named: {v}"));
     assert!(e.contains("locked.txt"), "{v}");
 }
 
@@ -4718,7 +6003,11 @@ async fn a_worktree_that_cannot_be_recorded_is_removed_again() {
     std::fs::create_dir_all(base.join(".site-b.gitdir")).unwrap();
     let (code, v) = call(
         &h,
-        post("/client/workspaces", Some(&token), serde_json::json!({"source_path": mine.to_str(), "bot": "b"})),
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"source_path": mine.to_str(), "bot": "b"}),
+        ),
     )
     .await;
     assert_eq!(code, 500, "{v}");
@@ -4726,7 +6015,11 @@ async fn a_worktree_that_cannot_be_recorded_is_removed_again() {
     let branches = run_git(Some(&mine), &["branch", "--list", "mux/*"]);
     assert_eq!(branches, "", "no orphan branch");
     let worktrees = run_git(Some(&mine), &["worktree", "list", "--porcelain"]);
-    assert_eq!(worktrees.matches("worktree ").count(), 1, "only the checkout itself: {worktrees}");
+    assert_eq!(
+        worktrees.matches("worktree ").count(),
+        1,
+        "only the checkout itself: {worktrees}"
+    );
 }
 
 #[tokio::test]
@@ -4899,7 +6192,11 @@ async fn a_detached_work_copy_isnt_committed_and_says_why() {
 }
 
 fn undo(id: &str, token: &str) -> Request<Body> {
-    post(&format!("/client/work/{id}/undo"), Some(token), serde_json::json!({}))
+    post(
+        &format!("/client/work/{id}/undo"),
+        Some(token),
+        serde_json::json!({}),
+    )
 }
 
 /// Starts `message` in `workspace` and returns its id, without waiting.
@@ -4923,8 +6220,15 @@ async fn undo_is_refused_while_another_run_works_in_the_same_copy() {
     let busy = start_in(&h, &token, "site", "wait").await;
     let (code, v) = call(&h, undo(&first, &token)).await;
     assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "{v}");
-    assert!(v["error"].as_str().unwrap().contains(&busy), "names the run: {v}");
-    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head, "nothing reverted");
+    assert!(
+        v["error"].as_str().unwrap().contains(&busy),
+        "names the run: {v}"
+    );
+    assert_eq!(
+        run_git(Some(&wt), &["rev-parse", "HEAD"]),
+        head,
+        "nothing reverted"
+    );
     let _ = cancel(&h, Some(&token), &busy).await;
     let _ = wait_done(&h, &token, &busy).await;
     let (code, v) = call(&h, undo(&first, &token)).await;
@@ -4940,11 +6244,23 @@ async fn an_undo_that_lost_the_race_finds_the_run_already_undone() {
     let token = paired(&h).await;
     git_workspace(&h, "site");
     let first = run_in(&h, &token, "site", "edit-readme").await;
-    let held = UndoHold::take(&h.state.works, &first).unwrap_or_else(|_| panic!("the copy is free"));
-    assert!(UndoHold::take(&h.state.works, &first).is_err(), "held by the first Undo");
-    h.state.works.lock().unwrap().get_mut(&first).unwrap().decided = Some("undone by abc".into());
+    let held =
+        UndoHold::take(&h.state.works, &first).unwrap_or_else(|_| panic!("the copy is free"));
+    assert!(
+        UndoHold::take(&h.state.works, &first).is_err(),
+        "held by the first Undo"
+    );
+    h.state
+        .works
+        .lock()
+        .unwrap()
+        .get_mut(&first)
+        .unwrap()
+        .decided = Some("undone by abc".into());
     drop(held);
-    let refused = UndoHold::take(&h.state.works, &first).err().expect("already undone");
+    let refused = UndoHold::take(&h.state.works, &first)
+        .err()
+        .expect("already undone");
     assert_eq!(refused.status(), StatusCode::CONFLICT);
 }
 
@@ -4955,12 +6271,24 @@ async fn no_run_starts_while_an_undo_reverts_in_the_same_copy() {
     let token = paired(&h).await;
     git_workspace(&h, "site");
     let first = run_in(&h, &token, "site", "edit-readme").await;
-    h.state.works.lock().unwrap().get_mut(&first).unwrap().undoing = true;
+    h.state
+        .works
+        .lock()
+        .unwrap()
+        .get_mut(&first)
+        .unwrap()
+        .undoing = true;
     let body = serde_json::json!({"role": "coder", "message": "edit-other", "workspace": "site"});
     let (code, v) = call(&h, post("/client/work", Some(&token), body.clone())).await;
     assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "{v}");
     assert!(v["error"].as_str().unwrap().contains("being undone"), "{v}");
-    h.state.works.lock().unwrap().get_mut(&first).unwrap().undoing = false;
+    h.state
+        .works
+        .lock()
+        .unwrap()
+        .get_mut(&first)
+        .unwrap()
+        .undoing = false;
     let (code, v) = call(&h, post("/client/work", Some(&token), body)).await;
     assert_eq!(code, 202, "{v}");
 }
@@ -4973,7 +6301,13 @@ async fn an_undo_in_progress_is_never_forgotten_as_old_work() {
     let token = paired(&h).await;
     git_workspace(&h, "site");
     let first = run_in(&h, &token, "site", "edit-readme").await;
-    h.state.works.lock().unwrap().get_mut(&first).unwrap().undoing = true;
+    h.state
+        .works
+        .lock()
+        .unwrap()
+        .get_mut(&first)
+        .unwrap()
+        .undoing = true;
     h.clock.fetch_add(KEEP_WORK_SECS + 1, Ordering::SeqCst);
     let body = serde_json::json!({"role": "coder", "message": "edit-other", "workspace": "site"});
     let (code, v) = call(&h, post("/client/work", Some(&token), body)).await;
@@ -4993,12 +6327,28 @@ async fn a_cancelled_runs_edits_are_its_own_commit_never_the_next_runs() {
     let done = wait_done(&h, &token, &id).await;
     assert_eq!(done["status"], "cancelled", "{done}");
     assert!(done["commit"].as_str().is_some(), "{done}");
-    assert_eq!(done["files"], serde_json::json!(["in-progress.txt"]), "{done}");
-    assert_eq!(run_git(Some(&wt), &["show", "--name-only", "--format=%s", "HEAD"]), format!("coder: edit-wait (work {id}, cancelled)\n\nin-progress.txt"));
+    assert_eq!(
+        done["files"],
+        serde_json::json!(["in-progress.txt"]),
+        "{done}"
+    );
+    assert_eq!(
+        run_git(Some(&wt), &["show", "--name-only", "--format=%s", "HEAD"]),
+        format!("coder: edit-wait (work {id}, cancelled)\n\nin-progress.txt")
+    );
     let next = run_in(&h, &token, "site", "edit-other").await;
-    assert_eq!(status(&h, &token, &next).await["changes"]["files"][0]["path"], "other.txt");
-    assert_eq!(run_git(Some(&wt), &["show", "--name-only", "--format=", "HEAD"]), "other.txt");
-    assert_eq!(run_git(Some(&wt), &["status", "--porcelain"]), "?? notes.txt");
+    assert_eq!(
+        status(&h, &token, &next).await["changes"]["files"][0]["path"],
+        "other.txt"
+    );
+    assert_eq!(
+        run_git(Some(&wt), &["show", "--name-only", "--format=", "HEAD"]),
+        "other.txt"
+    );
+    assert_eq!(
+        run_git(Some(&wt), &["status", "--porcelain"]),
+        "?? notes.txt"
+    );
     let (code, v) = call(&h, undo(&id, &token)).await;
     assert_eq!(code, 200, "{v}");
     assert!(!wt.join("in-progress.txt").exists());
@@ -5013,11 +6363,21 @@ async fn a_failed_runs_edits_are_its_own_commit() {
     let wt = git_workspace(&h, "site");
     let id = run_in(&h, &token, "site", "edit-fail").await;
     let done = status(&h, &token, &id).await;
-    assert_eq!((done["status"].as_str(), done["code"].as_str()), (Some("error"), Some("dispatch_failed")), "{done}");
+    assert_eq!(
+        (done["status"].as_str(), done["code"].as_str()),
+        (Some("error"), Some("dispatch_failed")),
+        "{done}"
+    );
     assert!(done["commit"].as_str().is_some(), "{done}");
-    assert_eq!(run_git(Some(&wt), &["show", "--name-only", "--format=%s", "HEAD"]), format!("coder: edit-fail (work {id}, failed)\n\nin-progress.txt"));
+    assert_eq!(
+        run_git(Some(&wt), &["show", "--name-only", "--format=%s", "HEAD"]),
+        format!("coder: edit-fail (work {id}, failed)\n\nin-progress.txt")
+    );
     let next = run_in(&h, &token, "site", "edit-other").await;
-    assert_eq!(status(&h, &token, &next).await["changes"]["files"][0]["path"], "other.txt");
+    assert_eq!(
+        status(&h, &token, &next).await["changes"]["files"][0]["path"],
+        "other.txt"
+    );
 }
 
 /// A cancel that lands after the run already produced its result does not
@@ -5173,14 +6533,20 @@ fn fake_dev_server() {
         return;
     }
     use std::io::{Read, Write};
-    let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
     let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
     for stream in listener.incoming() {
         let Ok(mut s) = stream else { continue };
         let mut buf = [0u8; 4096];
         let _ = s.read(&mut buf);
         let body = std::fs::read("index.html").unwrap_or_else(|_| b"ok".to_vec());
-        let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
         let _ = s.write_all(head.as_bytes());
         let _ = s.write_all(&body);
     }
@@ -5305,15 +6671,27 @@ async fn a_preview_never_runs_the_workspaces_own_recipe() {
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 404, "{v}");
     let e = v["error"].as_str().unwrap();
-    assert!(e.contains("add .darkmux/preview.json to your own checkout"), "{v}");
-    assert!(e.contains(mine.to_str().unwrap()), "names the checkout: {v}");
-    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
+    assert!(
+        e.contains("add .darkmux/preview.json to your own checkout"),
+        "{v}"
+    );
+    assert!(
+        e.contains(mine.to_str().unwrap()),
+        "names the checkout: {v}"
+    );
+    recipe(
+        &mine,
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}),
+    );
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 202, "{v}");
     let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
     assert_eq!(ready["status"], "ready", "{ready}");
     h.state.previews.stop(&name);
-    assert!(!ws.join("pwned").exists() && !ws.join("pwned-install").exists(), "the workspace's recipe ran");
+    assert!(
+        !ws.join("pwned").exists() && !ws.join("pwned-install").exists(),
+        "the workspace's recipe ran"
+    );
 }
 
 /// (#3571) A clone's recipe is read from the commit darkmux cloned, never
@@ -5324,29 +6702,63 @@ async fn a_recipe_in_a_clones_work_tree_is_never_read() {
     let token = paired(&h).await;
     let (code, v) = call(
         &h,
-        post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": "https://github.com/kstrat2001/hcr"}))),
+        post(
+            "/client/workspaces",
+            Some(&token),
+            ws_body(serde_json::json!({"repo_url": "https://github.com/kstrat2001/hcr"})),
+        ),
     )
     .await;
     assert_eq!(code, 201, "{v}");
     let ws = h.base.join("hcr");
-    recipe(&ws, serde_json::json!({"command": format!("touch pwned; {}", serve())}));
+    recipe(
+        &ws,
+        serde_json::json!({"command": format!("touch pwned; {}", serve())}),
+    );
     let (code, v) = start_preview(&h, &token, "hcr").await;
     assert_eq!(code, 404, "{v}");
     assert_eq!(v["code"], "no_recipe", "{v}");
-    assert!(v["error"].as_str().unwrap().contains("the commit darkmux cloned"), "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("the commit darkmux cloned"),
+        "{v}"
+    );
     assert!(!ws.join("pwned").exists());
 }
 
 /// Commits everything in `dir` (a test repo).
 fn commit_all(dir: &Path, message: &str) {
     run_git(Some(dir), &["add", "-A"]);
-    run_git(Some(dir), &["-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "--quiet", "-m", message]);
+    run_git(
+        Some(dir),
+        &[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            message,
+        ],
+    );
 }
 
 /// Sets clone `name`'s approved recipe.
 async fn put_recipe(h: &Harness, token: &str, name: &str, recipe: Value) -> (u16, Value) {
     let body = serde_json::json!({ "recipe": recipe });
-    call(h, raw("put", &format!("/client/workspaces/{name}/recipe"), Some(token), Body::from(body.to_string()))).await
+    call(
+        h,
+        raw(
+            "put",
+            &format!("/client/workspaces/{name}/recipe"),
+            Some(token),
+            Body::from(body.to_string()),
+        ),
+    )
+    .await
 }
 
 /// (#3571) A clone previews from the recipe in the commit darkmux cloned; a
@@ -5355,20 +6767,41 @@ async fn put_recipe(h: &Harness, token: &str, name: &str, recipe: Value) -> (u16
 async fn a_clone_previews_from_the_recipe_in_the_commit_it_cloned() {
     let h = harness();
     let token = paired(&h).await;
-    recipe(&h.fixture, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
+    recipe(
+        &h.fixture,
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}),
+    );
     commit_all(&h.fixture, "add a recipe");
     let (code, v) = call(
         &h,
-        post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": "https://github.com/kstrat2001/hcr"}))),
+        post(
+            "/client/workspaces",
+            Some(&token),
+            ws_body(serde_json::json!({"repo_url": "https://github.com/kstrat2001/hcr"})),
+        ),
     )
     .await;
     assert_eq!(code, 201, "{v}");
     let ws = h.base.join("hcr");
-    recipe(&ws, serde_json::json!({"command": format!("touch pwned; {}", serve())}));
+    recipe(
+        &ws,
+        serde_json::json!({"command": format!("touch pwned; {}", serve())}),
+    );
     commit_all(&ws, "a run's recipe");
-    let (code, v) = call(&h, get("/client/recipe?workspace=hcr", &[("authorization", &bearer(&token))])).await;
+    let (code, v) = call(
+        &h,
+        get(
+            "/client/recipe?workspace=hcr",
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
     assert_eq!(code, 200, "{v}");
-    assert_eq!(v["recipe"]["command"], serve(), "the cloned commit's, never the run's: {v}");
+    assert_eq!(
+        v["recipe"]["command"],
+        serve(),
+        "the cloned commit's, never the run's: {v}"
+    );
     let (code, v) = start_preview(&h, &token, "hcr").await;
     assert_eq!(code, 202, "{v}");
     let ready = preview_until(&h, &token, "hcr", &["ready", "failed"]).await;
@@ -5385,15 +6818,33 @@ async fn an_approved_recipe_previews_a_clone_with_none() {
     let token = paired(&h).await;
     let (code, v) = call(
         &h,
-        post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": "https://github.com/kstrat2001/hcr"}))),
+        post(
+            "/client/workspaces",
+            Some(&token),
+            ws_body(serde_json::json!({"repo_url": "https://github.com/kstrat2001/hcr"})),
+        ),
     )
     .await;
     assert_eq!(code, 201, "{v}");
     let version = darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
-    let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"schema_version": version, "command": serve(), "comand": "x"})).await;
-    assert_eq!((code, v["code"].as_str()), (422, Some("recipe_invalid")), "{v}");
+    let (code, v) = put_recipe(
+        &h,
+        &token,
+        "hcr",
+        serde_json::json!({"schema_version": version, "command": serve(), "comand": "x"}),
+    )
+    .await;
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (422, Some("recipe_invalid")),
+        "{v}"
+    );
     let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"schema_version": version, "command": serve(), "env_from_source": [".env"]})).await;
-    assert_eq!((code, v["code"].as_str()), (422, Some("recipe_invalid")), "{v}");
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (422, Some("recipe_invalid")),
+        "{v}"
+    );
     let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"schema_version": version, "command": serve(), "env": {"PORT": "{port}"}})).await;
     assert_eq!(code, 200, "{v}");
     assert_eq!(v["recipe"]["command"], serve(), "{v}");
@@ -5413,7 +6864,13 @@ async fn only_a_clone_takes_an_approved_recipe() {
     let h = harness();
     let token = paired(&h).await;
     let (_mine, name, _ws) = checkout_workspace(&h, &token).await;
-    let (code, v) = put_recipe(&h, &token, &name, serde_json::json!({"schema_version": "1.0", "command": "npm run dev"})).await;
+    let (code, v) = put_recipe(
+        &h,
+        &token,
+        &name,
+        serde_json::json!({"schema_version": "1.0", "command": "npm run dev"}),
+    )
+    .await;
     assert_eq!(code, 409, "{v}");
     assert!(v["error"].as_str().unwrap().contains("not a clone"), "{v}");
 }
@@ -5426,7 +6883,10 @@ async fn a_preview_needs_the_workspace_to_still_be_a_worktree_of_the_checkout() 
     let h = harness();
     let token = paired(&h).await;
     let (mine, name, ws) = served_workspace(&h, &token).await;
-    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
+    recipe(
+        &mine,
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}),
+    );
     // A run rewrites the workspace's `.git`: host git never reads it, so the
     // preview is unaffected.
     std::fs::remove_file(ws.join(".git")).unwrap();
@@ -5436,24 +6896,39 @@ async fn a_preview_needs_the_workspace_to_still_be_a_worktree_of_the_checkout() 
     h.state.previews.stop(&name);
     // The checkout drops the worktree (`git worktree prune` after its admin
     // dir went): the workspace is no longer a worktree of it.
-    let admin: Vec<_> = std::fs::read_dir(mine.join(".git/worktrees")).unwrap().collect();
+    let admin: Vec<_> = std::fs::read_dir(mine.join(".git/worktrees"))
+        .unwrap()
+        .collect();
     for a in admin {
         std::fs::remove_dir_all(a.unwrap().path()).unwrap();
     }
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 404, "{v}");
     assert_eq!(v["code"], "no_source_checkout", "{v}");
-    assert!(v["error"].as_str().unwrap().contains("no longer a worktree"), "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("no longer a worktree"),
+        "{v}"
+    );
     // A stale record under the name a clone then takes.
     let base = h.base.canonicalize().unwrap();
     std::fs::write(base.join(".hcr.source"), format!("{}\n", mine.display())).unwrap();
     let (code, v) = call(
         &h,
-        post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": "https://github.com/kstrat2001/hcr"}))),
+        post(
+            "/client/workspaces",
+            Some(&token),
+            ws_body(serde_json::json!({"repo_url": "https://github.com/kstrat2001/hcr"})),
+        ),
     )
     .await;
     assert_eq!(code, 201, "{v}");
-    assert!(!base.join(".hcr.source").exists(), "the clone forgot the old record");
+    assert!(
+        !base.join(".hcr.source").exists(),
+        "the clone forgot the old record"
+    );
     let (code, v) = start_preview(&h, &token, "hcr").await;
     assert_eq!(code, 404, "{v}");
 }
@@ -5470,7 +6945,10 @@ async fn a_recorded_checkout_that_became_a_symlink_gets_no_preview() {
     let moved = h.dir.path().join("site-moved");
     std::fs::rename(&mine, &moved).unwrap();
     std::os::unix::fs::symlink(&moved, &mine).unwrap();
-    recipe(&moved, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
+    recipe(
+        &moved,
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}),
+    );
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 404, "{v}");
     assert!(v["error"].as_str().unwrap().contains("symlink"), "{v}");
@@ -5485,24 +6963,58 @@ async fn a_record_that_is_a_symlink_is_no_record() {
     let h = harness();
     let token = paired(&h).await;
     let (mine, _name, _ws) = checkout_workspace(&h, &token).await;
-    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
-    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
+    recipe(
+        &mine,
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}),
+    );
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
     assert_eq!(code, 201, "{v}");
     let base = h.base.canonicalize().unwrap();
+    // (#3571) A clone previews from the commit it cloned and never reads a
+    // source record; drop that record so the source path is the one tested.
+    std::fs::remove_file(base.join(".hcr.cloned")).unwrap();
     let named = h.dir.path().join("names-mine.txt");
-    std::fs::write(&named, format!("{}\n", mine.canonicalize().unwrap().display())).unwrap();
+    std::fs::write(
+        &named,
+        format!("{}\n", mine.canonicalize().unwrap().display()),
+    )
+    .unwrap();
     std::os::unix::fs::symlink(&named, base.join(".hcr.source")).unwrap();
     let (code, v) = start_preview(&h, &token, "hcr").await;
     assert_eq!(code, 404, "{v}");
-    assert!(v["error"].as_str().unwrap().contains("not made from a checkout of yours"), "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("not made from a checkout of yours"),
+        "{v}"
+    );
     // The repository record too: linked, host git has no repository there.
     let held = base.join(".hcr.gitdir");
     let real = h.dir.path().join("hcr-gitdir-record");
     std::fs::rename(&held, &real).unwrap();
     std::os::unix::fs::symlink(&real, &held).unwrap();
-    let (code, v) = call(&h, get("/client/workspaces/hcr", &[("authorization", &bearer(&token))])).await;
+    let (code, v) = call(
+        &h,
+        get(
+            "/client/workspaces/hcr",
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
     assert_eq!(code, 200, "{v}");
-    assert_eq!(v["head"], "", "no repository read through a linked record: {v}");
+    assert_eq!(
+        v["head"], "",
+        "no repository read through a linked record: {v}"
+    );
 }
 
 #[tokio::test]
@@ -5736,13 +7248,17 @@ async fn preview_status_and_stop_need_a_token() {
     let h = harness();
     let token = paired(&h).await;
     let (mine, name, _ws) = served_workspace(&h, &token).await;
-    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
+    recipe(
+        &mine,
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}),
+    );
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 202, "{v}");
     let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
     let path = format!("/client/workspaces/{name}/preview");
     for auth in [None, Some(bearer(&"0".repeat(64)))] {
-        let headers: Vec<(&str, &str)> = auth.iter().map(|a| ("authorization", a.as_str())).collect();
+        let headers: Vec<(&str, &str)> =
+            auth.iter().map(|a| ("authorization", a.as_str())).collect();
         let (code, v) = call(&h, get(&path, &headers)).await;
         assert_eq!(code, 401, "status: {v}");
         assert!(v.get("port").is_none(), "{v}");
@@ -5766,7 +7282,10 @@ async fn previews_are_refused_while_clients_preview_enabled_is_off() {
     let h = harness();
     let token = paired(&h).await;
     let (mine, name, ws) = served_workspace(&h, &token).await;
-    recipe(&mine, serde_json::json!({"command": format!("touch ran; {}", serve()), "env": {"PORT": "{port}"}}));
+    recipe(
+        &mine,
+        serde_json::json!({"command": format!("touch ran; {}", serve()), "env": {"PORT": "{port}"}}),
+    );
     *h.preview_on.lock().unwrap() = false;
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 403, "{v}");
@@ -5778,7 +7297,14 @@ async fn previews_are_refused_while_clients_preview_enabled_is_off() {
             && e.contains("in a sandbox with network access"),
         "{v}"
     );
-    let (code, v) = call(&h, get(&format!("/client/workspaces/{name}/preview"), &[("authorization", &bearer(&token))])).await;
+    let (code, v) = call(
+        &h,
+        get(
+            &format!("/client/workspaces/{name}/preview"),
+            &[("authorization", &bearer(&token))],
+        ),
+    )
+    .await;
     assert_eq!(code, 403, "{v}");
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(!ws.join("ran").exists(), "nothing started");
@@ -5798,11 +7324,18 @@ fn a_preview_runs_under_docker_and_seatbelt_and_landlock_refuses_it() {
     use darkmux_sandbox::BackendKind;
     assert!(crate::client_pairing::preview_sandbox_refusal(&Ok(BackendKind::Docker)).is_none());
     assert!(crate::client_pairing::preview_sandbox_refusal(&Ok(BackendKind::Seatbelt)).is_none());
-    let landlock = crate::client_pairing::preview_sandbox_refusal(&Ok(BackendKind::Landlock)).expect("refused");
-    for part in ["previews need `runtime.sandbox` `docker` here for now", "this machine's sandbox is `landlock`", "darkmux config set runtime.sandbox docker"] {
+    let landlock = crate::client_pairing::preview_sandbox_refusal(&Ok(BackendKind::Landlock))
+        .expect("refused");
+    for part in [
+        "previews need `runtime.sandbox` `docker` here for now",
+        "this machine's sandbox is `landlock`",
+        "darkmux config set runtime.sandbox docker",
+    ] {
         assert!(landlock.contains(part), "missing `{part}` in: {landlock}");
     }
-    let bad = crate::client_pairing::preview_sandbox_refusal(&Err("`x` is not a valid sandbox".into())).expect("refused");
+    let bad =
+        crate::client_pairing::preview_sandbox_refusal(&Err("`x` is not a valid sandbox".into()))
+            .expect("refused");
     assert!(bad.contains("`x` is not a valid sandbox"), "{bad}");
 }
 
@@ -5816,7 +7349,10 @@ async fn a_preview_start_follows_the_sandbox_read_per_request() {
     let mut h = harness();
     let token = paired(&h).await;
     let (mine, name, ws) = served_workspace(&h, &token).await;
-    recipe(&mine, serde_json::json!({"command": format!("touch ran; {}", serve()), "env": {"PORT": "{port}"}}));
+    recipe(
+        &mine,
+        serde_json::json!({"command": format!("touch ran; {}", serve()), "env": {"PORT": "{port}"}}),
+    );
     let runs = tempfile::TempDir::new().unwrap();
     let seatbelt = Arc::new(crate::client_preview::HostEmulator::default());
     *seatbelt.on_host.lock().unwrap() = true;
@@ -5824,25 +7360,41 @@ async fn a_preview_start_follows_the_sandbox_read_per_request() {
         crate::client_preview::Previews::new(runs.path().join("previews"), h.containers.clone())
             .with_backend(BackendKind::Seatbelt, seatbelt.clone()),
     );
-    let sandbox: Arc<Mutex<Result<BackendKind, String>>> = Arc::new(Mutex::new(Err("`podman` is not a sandbox darkmux runs".into())));
+    let sandbox: Arc<Mutex<Result<BackendKind, String>>> = Arc::new(Mutex::new(Err(
+        "`podman` is not a sandbox darkmux runs".into(),
+    )));
     let read = sandbox.clone();
     h.state.preview_sandbox = Arc::new(move || read.lock().unwrap().clone());
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 403, "{v}");
     assert_eq!(v["code"], "forbidden", "{v}");
-    assert!(v["error"].as_str().unwrap().contains("`podman` is not a sandbox darkmux runs"), "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("`podman` is not a sandbox darkmux runs"),
+        "{v}"
+    );
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(!ws.join("ran").exists(), "nothing started");
     for kind in [BackendKind::Seatbelt, BackendKind::Docker] {
         *sandbox.lock().unwrap() = Ok(kind);
         let (code, v) = start_preview(&h, &token, &name).await;
         assert!(code == 200 || code == 202, "{kind:?}: {code} {v}");
-        let ran_in = if kind == BackendKind::Seatbelt { &seatbelt } else { &h.containers };
+        let ran_in = if kind == BackendKind::Seatbelt {
+            &seatbelt
+        } else {
+            &h.containers
+        };
         let made = (0..200).find_map(|_| {
             std::thread::sleep(std::time::Duration::from_millis(10));
             ran_in.specs.lock().unwrap().first().map(|s| s.backend)
         });
-        assert_eq!(made, Some(kind), "the preview's sandbox is the one selected when it started");
+        assert_eq!(
+            made,
+            Some(kind),
+            "the preview's sandbox is the one selected when it started"
+        );
         h.state.previews.stop(&name);
     }
 }
@@ -5883,8 +7435,14 @@ fn clients_preview_enabled_is_read_fresh_and_defaults_off() {
         read_preview_enabled_at(&path)
     };
     assert_eq!(read("{}"), Ok(false), "absent is off");
-    assert_eq!(read(r#"{"clients": {"preview": {"enabled": true}}}"#), Ok(true));
-    assert_eq!(read(r#"{"clients": {"preview": {"enabled": false}}}"#), Ok(false));
+    assert_eq!(
+        read(r#"{"clients": {"preview": {"enabled": true}}}"#),
+        Ok(true)
+    );
+    assert_eq!(
+        read(r#"{"clients": {"preview": {"enabled": false}}}"#),
+        Ok(false)
+    );
     let e = read(r#"{"clients": {"preview": {"enable": true}}}"#).unwrap_err();
     assert!(e.contains("clients.preview.enable"), "{e}");
     std::fs::remove_file(&path).unwrap();
@@ -6079,10 +7637,19 @@ async fn previews_refuse_what_they_cant_run() {
     );
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 422, "{v}");
-    recipe(&mine, serde_json::json!({"command": serve(), "comand": "typo"}));
+    recipe(
+        &mine,
+        serde_json::json!({"command": serve(), "comand": "typo"}),
+    );
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 422, "{v}");
-    assert!(v["error"].as_str().unwrap().contains("unknown key `comand`"), "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown key `comand`"),
+        "{v}"
+    );
     write_recipe(&mine, &serde_json::json!({"command": serve()}).to_string());
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 422, "no schema_version: {v}");
@@ -6162,20 +7729,40 @@ async fn continues_may_not_name_another_apps_run_or_one_in_another_work_copy() {
     git_workspace(&h, "elsewhere");
     // The other app's run in this very work copy, before the operator
     // gave the copy to this app (`client claim`).
-    let ids: Vec<String> = h.store.read().unwrap().clients.iter().map(|c| c.id.clone()).collect();
+    let ids: Vec<String> = h
+        .store
+        .read()
+        .unwrap()
+        .clients
+        .iter()
+        .map(|c| c.id.clone())
+        .collect();
     own(&h, "site", &ids[1]);
     let foreign = run_in(&h, &other, "site", "edit-readme").await;
     own(&h, "site", &ids[0]);
     let first = run_in(&h, &token, "site", "edit-other").await;
-    let tweak = |ws: &str, cont: &str| post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": "edit", "workspace": ws, "continues": cont}));
+    let tweak = |ws: &str, cont: &str| {
+        post(
+            "/client/work",
+            Some(&token),
+            serde_json::json!({"role": "coder", "message": "edit", "workspace": ws, "continues": cont}),
+        )
+    };
     for (ws, cont) in [("elsewhere", first.as_str()), ("site", foreign.as_str())] {
         let (code, v) = call(&h, tweak(ws, cont)).await;
-        assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "{ws} {cont}: {v}");
+        assert_eq!(
+            (code, v["code"].as_str()),
+            (409, Some("conflict")),
+            "{ws} {cont}: {v}"
+        );
     }
     let failed = run_in(&h, &token, "site", "edit-fail").await;
     assert_eq!(status(&h, &token, &failed).await["status"], "error");
     let (code, v) = call(&h, tweak("site", &failed)).await;
-    assert_eq!(code, 202, "a failed run's committed edits can be tweaked: {v}");
+    assert_eq!(
+        code, 202,
+        "a failed run's committed edits can be tweaked: {v}"
+    );
 }
 
 /// "Tweak it" the next morning, or after `client serve` restarts: a
@@ -6190,13 +7777,21 @@ async fn continues_naming_a_forgotten_run_is_a_plain_new_run() {
     h.clock.fetch_add(KEEP_WORK_SECS + 1, Ordering::SeqCst);
     let next_morning = run_after(&h, &token, "site", "edit-other", Some(&first)).await;
     assert_eq!(status(&h, &token, &next_morning).await["status"], "done");
-    assert_eq!(h.state.works.lock().unwrap()[&next_morning].continues, None, "an unknown id labels nothing");
+    assert_eq!(
+        h.state.works.lock().unwrap()[&next_morning].continues,
+        None,
+        "an unknown id labels nothing"
+    );
     // A restart forgets every run.
     h.state.works.lock().unwrap().clear();
-    let after_restart = run_after(&h, &token, "site", "edit-readme-again", Some(&next_morning)).await;
+    let after_restart =
+        run_after(&h, &token, "site", "edit-readme-again", Some(&next_morning)).await;
     assert_eq!(status(&h, &token, &after_restart).await["status"], "done");
     let known = run_after(&h, &token, "site", "edit", Some(&after_restart)).await;
-    assert_eq!(h.state.works.lock().unwrap()[&known].continues.as_deref(), Some(after_restart.as_str()));
+    assert_eq!(
+        h.state.works.lock().unwrap()[&known].continues.as_deref(),
+        Some(after_restart.as_str())
+    );
 }
 
 /// Finished work is kept for its keep time from when it ended, not from
@@ -6205,23 +7800,63 @@ async fn continues_naming_a_forgotten_run_is_a_plain_new_run() {
 async fn ended_work_is_kept_for_the_keep_time_from_when_it_ended() {
     let h = harness();
     let token = paired(&h).await;
-    let (code, v) = call(&h, post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": "wait"}))).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&token),
+            serde_json::json!({"role": "coder", "message": "wait"}),
+        ),
+    )
+    .await;
     assert_eq!(code, 202, "{v}");
     let long = v["work_id"].as_str().unwrap().to_string();
     h.clock.fetch_add(KEEP_WORK_SECS - 10, Ordering::SeqCst);
-    call(&h, post(&format!("/client/work/{long}/cancel"), Some(&token), serde_json::json!({}))).await;
+    call(
+        &h,
+        post(
+            &format!("/client/work/{long}/cancel"),
+            Some(&token),
+            serde_json::json!({}),
+        ),
+    )
+    .await;
     assert_eq!(wait_done(&h, &token, &long).await["status"], "cancelled");
     h.clock.fetch_add(20, Ordering::SeqCst);
-    assert_eq!(poll_after_pruning(&h, &token, &long).await, 200, "ended 20 s ago, so it is kept");
+    assert_eq!(
+        poll_after_pruning(&h, &token, &long).await,
+        200,
+        "ended 20 s ago, so it is kept"
+    );
     h.clock.fetch_add(KEEP_WORK_SECS, Ordering::SeqCst);
-    assert_eq!(poll_after_pruning(&h, &token, &long).await, 404, "past its keep time from when it ended");
+    assert_eq!(
+        poll_after_pruning(&h, &token, &long).await,
+        404,
+        "past its keep time from when it ended"
+    );
 }
 
 /// Polls run `id` after a new work request, which forgets old work first.
 async fn poll_after_pruning(h: &Harness, token: &str, id: &str) -> u16 {
-    let (code, v) = call(h, post("/client/work", Some(token), serde_json::json!({"role": "coder", "message": "hello"}))).await;
+    let (code, v) = call(
+        h,
+        post(
+            "/client/work",
+            Some(token),
+            serde_json::json!({"role": "coder", "message": "hello"}),
+        ),
+    )
+    .await;
     assert_eq!(code, 202, "{v}");
-    let polled = call(h, get(&format!("/client/work/{id}"), &[("authorization", &bearer(token))])).await.0;
+    let polled = call(
+        h,
+        get(
+            &format!("/client/work/{id}"),
+            &[("authorization", &bearer(token))],
+        ),
+    )
+    .await
+    .0;
     wait_done(h, token, v["work_id"].as_str().unwrap()).await;
     polled
 }
@@ -6349,7 +7984,12 @@ async fn a_template_project_compares_with_its_first_commit() {
     run_git(Some(&wt), &["commit", "--quiet", "-m", "run"]);
     let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
     let auth = bearer(&token);
-    let changes = || get("/client/workspaces/book/changes", &[("authorization", &auth)]);
+    let changes = || {
+        get(
+            "/client/workspaces/book/changes",
+            &[("authorization", &auth)],
+        )
+    };
 
     let (code, v) = call(&h, changes()).await;
     assert_eq!(code, 409, "not recorded as a template project: {v}");
@@ -6683,7 +8323,11 @@ fn describe_profiles_reports_each_profiles_availability() {
          models) echo '{\"schema\":1,\"models\":[{\"repo\":\"TF/m\"}]}';;\n  *) exit 9;;\nesac\n",
     );
     let up = answering_401();
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let registry = tmp.path().join("profiles.json");
     std::fs::write(
         &registry,
@@ -6711,11 +8355,26 @@ fn describe_profiles_reports_each_profiles_availability() {
     let [lms, tf, url] = [0, 1, 2].map(|i| got[i].clone().unwrap());
     use darkmux_profiles::engine::availability::AvailabilityState as S;
     assert_eq!(lms.availability.state, S::Unknown, "{lms:?}");
-    assert!(lms.availability.reason.as_deref().unwrap().contains("LM Studio did not answer"), "{lms:?}");
-    assert_eq!((lms.reachable, lms.loaded), (false, None), "LM Studio's older fields as before");
+    assert!(
+        lms.availability
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("LM Studio did not answer"),
+        "{lms:?}"
+    );
+    assert_eq!(
+        (lms.reachable, lms.loaded),
+        (false, None),
+        "LM Studio's older fields as before"
+    );
     assert_eq!(tf.availability.state, S::Startable, "{tf:?}");
     assert_eq!(tf.endpoint, "tensorfold");
-    assert_eq!((tf.reachable, tf.loaded), (true, Some(false)), "a Tensorfold profile's older fields follow its availability");
+    assert_eq!(
+        (tf.reachable, tf.loaded),
+        (true, Some(false)),
+        "a Tensorfold profile's older fields follow its availability"
+    );
     assert_eq!(url.availability.state, S::External, "{url:?}");
     assert!(url.reachable, "the URL server is still probed: {url:?}");
 }
@@ -6736,12 +8395,18 @@ fn an_unavailable_engine_server_is_not_reachable() {
          capabilities) echo '{\"schema\":1,\"serve\":{\"flags\":{}}}';;\n  \
          models) echo '{\"schema\":1,\"models\":[{\"repo\":\"TF/m\"}]}';;\n  *) exit 9;;\nesac\n",
     );
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let registry = tmp.path().join("profiles.json");
     std::fs::write(
         &registry,
-        format!(r#"{{"profiles":{{"tf":{{"models":[{{"id":"TF/m","n_ctx":32000,"endpoint":"tf"}}]}}}},
-            "endpoints":{{"tf":{{"managed":"tensorfold","port":{port}}}}}}}"#),
+        format!(
+            r#"{{"profiles":{{"tf":{{"models":[{{"id":"TF/m","n_ctx":32000,"endpoint":"tf"}}]}}}},
+            "endpoints":{{"tf":{{"managed":"tensorfold","port":{port}}}}}}}"#
+        ),
     )
     .unwrap();
     let got = with_env_vars(
@@ -6778,15 +8443,26 @@ fn an_lm_studio_model_that_is_not_downloaded_is_not_reachable() {
     )
     .unwrap();
     let got = with_env_vars(
-        &[("DARKMUX_PROFILES", registry.as_os_str()), ("DARKMUX_LMS_BIN", lms.as_os_str())],
+        &[
+            ("DARKMUX_PROFILES", registry.as_os_str()),
+            ("DARKMUX_LMS_BIN", lms.as_os_str()),
+        ],
         || describe_profiles("coder", &["have".to_string(), "missing".to_string()]),
     );
     let [have, missing] = [0, 1].map(|i| got[i].clone().unwrap());
     use darkmux_profiles::engine::availability::AvailabilityState as S;
     assert_eq!(have.availability.state, S::Startable, "{have:?}");
-    assert_eq!((have.reachable, have.loaded), (true, Some(false)), "{have:?}");
+    assert_eq!(
+        (have.reachable, have.loaded),
+        (true, Some(false)),
+        "{have:?}"
+    );
     assert_eq!(missing.availability.state, S::Unavailable, "{missing:?}");
-    assert_eq!((missing.reachable, missing.loaded), (false, Some(false)), "LM Studio answered, but the model is not there: {missing:?}");
+    assert_eq!(
+        (missing.reachable, missing.loaded),
+        (false, Some(false)),
+        "LM Studio answered, but the model is not there: {missing:?}"
+    );
 }
 
 /// (#3466 review) The client listing reads the dispatch preflight: a role
@@ -6797,17 +8473,35 @@ fn an_lm_studio_model_that_is_not_downloaded_is_not_reachable() {
 fn a_dispatch_the_preflight_refuses_lists_unavailable() {
     let state = darkmux_types::test_isolation::IsolatedState::new();
     std::fs::create_dir_all(state.join("roles")).unwrap();
-    std::fs::write(state.join("roles/coder.json"), r#"{"id":"coder","zzz_bogus":1}"#).unwrap();
+    std::fs::write(
+        state.join("roles/coder.json"),
+        r#"{"id":"coder","zzz_bogus":1}"#,
+    )
+    .unwrap();
     let registry = state.join("profiles.json");
-    std::fs::write(&registry, r#"{"profiles":{"lms":{"models":[{"id":"qwen","n_ctx":8192}]}}}"#).unwrap();
+    std::fs::write(
+        &registry,
+        r#"{"profiles":{"lms":{"models":[{"id":"qwen","n_ctx":8192}]}}}"#,
+    )
+    .unwrap();
     let got = with_env_vars(
-        &[("DARKMUX_PROFILES", registry.as_os_str()), ("DARKMUX_LMS_BIN", std::ffi::OsStr::new("/nonexistent/lms"))],
+        &[
+            ("DARKMUX_PROFILES", registry.as_os_str()),
+            ("DARKMUX_LMS_BIN", std::ffi::OsStr::new("/nonexistent/lms")),
+        ],
         || describe_profiles("coder", &["lms".to_string()]),
     );
     let lms = got[0].clone().unwrap();
     use darkmux_profiles::engine::availability::AvailabilityState as S;
     assert_eq!(lms.availability.state, S::Unavailable, "{lms:?}");
-    assert!(lms.availability.reason.as_deref().unwrap().contains("zzz_bogus"), "{lms:?}");
+    assert!(
+        lms.availability
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("zzz_bogus"),
+        "{lms:?}"
+    );
     assert!(!lms.reachable);
 }
 
@@ -6845,18 +8539,42 @@ fn a_profile_is_local_only_when_its_selected_model_stays_on_this_machine() {
             ("DARKMUX_DEFAULT_ENGINE", std::ffi::OsStr::new("mlx")),
         ],
         || {
-            ["managed", "engine", "loop6", "hosted", "userinfo", "unresolved", "absent"]
-                .map(|n| work_stays_here("coder", n))
+            [
+                "managed",
+                "engine",
+                "loop6",
+                "hosted",
+                "userinfo",
+                "unresolved",
+                "absent",
+            ]
+            .map(|n| work_stays_here("coder", n))
         },
     );
     let [managed, engine, loop6, hosted, userinfo, unresolved, absent] = got;
     assert_eq!(managed, Ok(true), "LM Studio stays");
     assert_eq!(engine, Ok(true), "the default engine on loopback stays");
-    assert_eq!(loop6, Ok(false), "a loopback server that is not the default engine is not this machine's");
+    assert_eq!(
+        loop6,
+        Ok(false),
+        "a loopback server that is not the default engine is not this machine's"
+    );
     assert_eq!(hosted, Ok(false));
-    assert_eq!(userinfo, Ok(false), "the host is api.example.com, whatever the userinfo says");
-    assert!(unresolved.as_ref().is_err_and(|e| e.contains("nope")), "{unresolved:?}");
-    assert!(absent.as_ref().is_err_and(|e| e.contains("not in this machine's profiles.json")), "{absent:?}");
+    assert_eq!(
+        userinfo,
+        Ok(false),
+        "the host is api.example.com, whatever the userinfo says"
+    );
+    assert!(
+        unresolved.as_ref().is_err_and(|e| e.contains("nope")),
+        "{unresolved:?}"
+    );
+    assert!(
+        absent
+            .as_ref()
+            .is_err_and(|e| e.contains("not in this machine's profiles.json")),
+        "{absent:?}"
+    );
 }
 
 #[tokio::test]
@@ -6882,16 +8600,36 @@ async fn profiles_name_the_machine_they_run_on() {
 async fn profiles_carry_their_availability_on_the_wire() {
     let h = harness();
     let t = paired(&h).await;
-    let (code, v) = call(&h, get("/client/profiles?role=coder", &[("authorization", &bearer(&t))])).await;
+    let (code, v) = call(
+        &h,
+        get(
+            "/client/profiles?role=coder",
+            &[("authorization", &bearer(&t))],
+        ),
+    )
+    .await;
     assert_eq!(code, 200, "{v}");
-    let by = |n: &str| v["profiles"].as_array().unwrap().iter().find(|p| p["name"] == n).cloned();
+    let by = |n: &str| {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == n)
+            .cloned()
+    };
     let fast = by("fast").unwrap_or_else(|| panic!("{v}"));
-    assert_eq!(fast["availability"], serde_json::json!({"state": "external", "reason": null}));
+    assert_eq!(
+        fast["availability"],
+        serde_json::json!({"state": "external", "reason": null})
+    );
     assert_eq!(fast["reachable"], true, "the older field stays");
     assert_eq!(by("deep").unwrap()["availability"]["state"], "startable");
     let unknown = ClientProfileInfo::unknown("gone", "profile gone is not in the registry".into());
     let wire = serde_json::to_value(&unknown).unwrap();
-    assert_eq!(wire["availability"], serde_json::json!({"state": "unknown", "reason": "profile gone is not in the registry"}));
+    assert_eq!(
+        wire["availability"],
+        serde_json::json!({"state": "unknown", "reason": "profile gone is not in the registry"})
+    );
 }
 
 #[test]
@@ -6993,29 +8731,52 @@ async fn a_template_becomes_a_fresh_local_project_named_for_the_bot() {
     .await;
     assert_eq!(code, 201, "{v}");
     assert_eq!(v["workspace"], "bakery");
-    assert_eq!(v["branch"], "main", "a fresh repo on main, runs commit there");
-    assert_eq!(v["repo"], Value::Null, "no remote: it's local until it goes to GitHub");
+    assert_eq!(
+        v["branch"], "main",
+        "a fresh repo on main, runs commit there"
+    );
+    assert_eq!(
+        v["repo"],
+        Value::Null,
+        "no remote: it's local until it goes to GitHub"
+    );
     assert_eq!(v["from"], "github.com/kstrat2001/hcr@dev");
     let dir = h.base.join("bakery");
     assert!(dir.join("README.md").exists());
-    assert_eq!(run_git(Some(&dir), &["rev-list", "--count", "HEAD"]).trim(), "1", "none of the template's history");
+    assert_eq!(
+        run_git(Some(&dir), &["rev-list", "--count", "HEAD"]).trim(),
+        "1",
+        "none of the template's history"
+    );
     assert_eq!(
         run_git(Some(&dir), &["log", "-1", "--format=%s"]).trim(),
         "Start from github.com/kstrat2001/hcr@dev"
     );
     assert!(run_git(Some(&dir), &["remote"]).trim().is_empty());
-    assert!(run_git(Some(&dir), &["status", "--porcelain"]).trim().is_empty(), "everything is in the first commit");
+    assert!(
+        run_git(Some(&dir), &["status", "--porcelain"])
+            .trim()
+            .is_empty(),
+        "everything is in the first commit"
+    );
     assert!(!h.base.join(".bakery.partial").exists());
 }
 
 /// `req` through the router with `state` in place of the harness's, sent
 /// as this machine's app sends it.
 async fn call_with(state: ClientServerState, mut req: Request<Body>) -> (u16, Value) {
-    req.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
-    req.headers_mut().insert(axum::http::header::HOST, BOUND.parse().unwrap());
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(SocketAddr::from((
+            [127, 0, 0, 1],
+            5555,
+        ))));
+    req.headers_mut()
+        .insert(axum::http::header::HOST, BOUND.parse().unwrap());
     let resp = router(state).oneshot(req).await.unwrap();
     let code = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     (code, serde_json::from_slice(&bytes).unwrap())
 }
 
@@ -7025,13 +8786,24 @@ async fn call_with(state: ClientServerState, mut req: Request<Body>) -> (u16, Va
 async fn no_worktrees_base_makes_no_workspace() {
     let h = harness();
     let token = paired(&h).await;
-    let state = ClientServerState { worktrees_base: Arc::new(|| Err("no base".to_string())), ..h.state.clone() };
+    let state = ClientServerState {
+        worktrees_base: Arc::new(|| Err("no base".to_string())),
+        ..h.state.clone()
+    };
     for body in [
         serde_json::json!({"repo_url": HCR}),
         serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"}),
     ] {
-        let (code, v) = call_with(state.clone(), post("/client/workspaces", Some(&token), body.clone())).await;
-        assert_eq!((code, v["code"].as_str()), (500, Some("internal")), "{body}: {v}");
+        let (code, v) = call_with(
+            state.clone(),
+            post("/client/workspaces", Some(&token), body.clone()),
+        )
+        .await;
+        assert_eq!(
+            (code, v["code"].as_str()),
+            (500, Some("internal")),
+            "{body}: {v}"
+        );
     }
     assert!(h.cloned.lock().unwrap().is_empty(), "nothing was cloned");
 }
@@ -7048,7 +8820,11 @@ async fn a_template_that_cannot_be_committed_leaves_nothing_behind() {
     let state = ClientServerState {
         clone_repo: Arc::new(move |url, r, dest, gd| {
             clone(url, r, dest, gd)?;
-            std::fs::set_permissions(dest.join("README.md"), std::fs::Permissions::from_mode(0o000)).unwrap();
+            std::fs::set_permissions(
+                dest.join("README.md"),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
             Ok(())
         }),
         ..h.state.clone()
@@ -7072,16 +8848,37 @@ async fn a_template_that_cannot_be_committed_leaves_nothing_behind() {
 async fn host_git_touches_only_a_recorded_workspace_directly_under_the_base() {
     let h = harness();
     let token = paired(&h).await;
-    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
     assert_eq!(code, 201, "{v}");
     let base = h.base.canonicalize().unwrap();
     let hcr = base.join("hcr");
-    assert_eq!(work_copy_for(&h.state, &hcr).map(|w| w.work_tree), Some(hcr.clone()), "the recorded workspace");
+    assert_eq!(
+        work_copy_for(&h.state, &hcr).map(|w| w.work_tree),
+        Some(hcr.clone()),
+        "the recorded workspace"
+    );
     std::fs::create_dir_all(hcr.join("deeper")).unwrap();
-    assert!(work_copy_for(&h.state, &hcr.join("deeper")).is_none(), "a folder inside it");
+    assert!(
+        work_copy_for(&h.state, &hcr.join("deeper")).is_none(),
+        "a folder inside it"
+    );
     std::fs::create_dir_all(base.join("unrecorded")).unwrap();
-    assert!(work_copy_for(&h.state, &base.join("unrecorded")).is_none(), "no record");
-    let no_base = ClientServerState { worktrees_base: Arc::new(|| Err("no base".to_string())), ..h.state.clone() };
+    assert!(
+        work_copy_for(&h.state, &base.join("unrecorded")).is_none(),
+        "no record"
+    );
+    let no_base = ClientServerState {
+        worktrees_base: Arc::new(|| Err("no base".to_string())),
+        ..h.state.clone()
+    };
     assert!(work_copy_for(&no_base, &hcr).is_none(), "no base");
     assert!(work_copy_for(&h.state, Path::new("/")).is_none(), "no name");
 }
@@ -7094,15 +8891,36 @@ fn a_first_commit_on_a_machine_with_no_git_identity_is_darkmuxs() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let (w, g) = (root.join("w"), root.join(".w.git"));
-    run_git(None, &["init", "-q", "--separate-git-dir", g.to_str().unwrap(), w.to_str().unwrap()]);
+    run_git(
+        None,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            g.to_str().unwrap(),
+            w.to_str().unwrap(),
+        ],
+    );
     std::fs::write(w.join("page.txt"), "hi\n").unwrap();
-    let wd = WorkCopy { work_tree: w.clone(), git_dir: g.clone() };
+    let wd = WorkCopy {
+        work_tree: w.clone(),
+        git_dir: g.clone(),
+    };
     let empty = root.join("empty-global");
     std::fs::write(&empty, "").unwrap();
-    let sha = with_env_vars(&[("GIT_CONFIG_GLOBAL", empty.as_os_str())], || first_commit(&wd, "Start")).unwrap();
+    let sha = with_env_vars(&[("GIT_CONFIG_GLOBAL", empty.as_os_str())], || {
+        first_commit(&wd, "Start")
+    })
+    .unwrap();
     let gd = format!("--git-dir={}", g.display());
-    assert_eq!(run_git(None, &[&gd, "log", "-1", "--format=%an <%ae>", &sha]), "darkmux <darkmux@localhost>");
-    assert_eq!(run_git(None, &[&gd, "show", "--name-only", "--format=", &sha]), "page.txt");
+    assert_eq!(
+        run_git(None, &[&gd, "log", "-1", "--format=%an <%ae>", &sha]),
+        "darkmux <darkmux@localhost>"
+    );
+    assert_eq!(
+        run_git(None, &[&gd, "show", "--name-only", "--format=", &sha]),
+        "page.txt"
+    );
 }
 
 /// A project made from the fixture as a template, after committing `with`
@@ -7272,21 +9090,36 @@ async fn template_projects_without_a_usable_recipe_say_why() {
     // Read as a clone (#3571), never as the old template project: the
     // fixture's recipe (which lists `env_from_source`) is refused for a clone.
     assert_eq!(code, 422, "{v}");
-    assert!(v["error"].as_str().unwrap().contains("a clone has none"), "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("a clone has none"),
+        "{v}"
+    );
 }
 
 #[tokio::test]
 async fn a_template_is_never_reused() {
     let h = harness();
     let token = paired(&h).await;
-    let body = serde_json::json!({"repo_url": HCR, "ref": "dev", "template": true, "bot": "Bakery"});
+    let body =
+        serde_json::json!({"repo_url": HCR, "ref": "dev", "template": true, "bot": "Bakery"});
     let (first, a) = call(&h, post("/client/workspaces", Some(&token), body.clone())).await;
     let (second, b) = call(&h, post("/client/workspaces", Some(&token), body)).await;
     assert_eq!((first, second), (201, 201), "{a} {b}");
-    assert_eq!(b["workspace"], "bakery-2", "a second project, never the first one's files");
+    assert_eq!(
+        b["workspace"], "bakery-2",
+        "a second project, never the first one's files"
+    );
     assert_eq!(h.cloned.lock().unwrap().len(), 2);
     // And a plain clone of the same repo never picks up a template project.
-    let (code, c) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
+    let (code, c) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR}),
+        ),
+    )
+    .await;
     assert_eq!(code, 201, "{c}");
     assert_eq!(c["workspace"], "hcr");
 }
@@ -7334,13 +9167,51 @@ async fn every_refusal_names_its_code() {
     let (_, v) = call(&h, get("/client/nope", &[])).await;
     assert_eq!(code_of(&v).as_deref(), Some("not_found"), "{v}");
     let (status, v) = call(&h, get("/client/whoami", &[])).await;
-    assert_eq!((status, code_of(&v).as_deref()), (401, Some("unauthorized")), "{v}");
-    let (status, v) = call(&h, get("/client/whoami", &[("authorization", &bearer(&token)), ("origin", "https://evil.example")])).await;
-    assert_eq!((status, code_of(&v).as_deref()), (403, Some("not_local")), "{v}");
-    let (status, v) = call(&h, post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": ""}))).await;
-    assert_eq!((status, code_of(&v).as_deref()), (400, Some("bad_request")), "{v}");
-    let (status, v) = call(&h, get("/client/work/w-nope", &[("authorization", &bearer(&token))])).await;
-    assert_eq!((status, code_of(&v).as_deref()), (404, Some("not_found")), "{v}");
+    assert_eq!(
+        (status, code_of(&v).as_deref()),
+        (401, Some("unauthorized")),
+        "{v}"
+    );
+    let (status, v) = call(
+        &h,
+        get(
+            "/client/whoami",
+            &[
+                ("authorization", &bearer(&token)),
+                ("origin", "https://evil.example"),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(
+        (status, code_of(&v).as_deref()),
+        (403, Some("not_local")),
+        "{v}"
+    );
+    let (status, v) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&token),
+            serde_json::json!({"role": "coder", "message": ""}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        (status, code_of(&v).as_deref()),
+        (400, Some("bad_request")),
+        "{v}"
+    );
+    let (status, v) = call(
+        &h,
+        get("/client/work/w-nope", &[("authorization", &bearer(&token))]),
+    )
+    .await;
+    assert_eq!(
+        (status, code_of(&v).as_deref()),
+        (404, Some("not_found")),
+        "{v}"
+    );
 }
 
 /// (#3468) A failed work item carries its code: the one its run's
@@ -7349,10 +9220,22 @@ async fn every_refusal_names_its_code() {
 async fn a_failed_work_item_carries_its_dispatch_code() {
     let h = harness();
     let token = paired(&h).await;
-    let (_, v) = call(&h, post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": "refused-busy"}))).await;
+    let (_, v) = call(
+        &h,
+        post(
+            "/client/work",
+            Some(&token),
+            serde_json::json!({"role": "coder", "message": "refused-busy"}),
+        ),
+    )
+    .await;
     let id = v["work_id"].as_str().unwrap().to_string();
     let v = wait_done(&h, &token, &id).await;
-    assert_eq!((v["status"].as_str(), v["code"].as_str()), (Some("error"), Some("busy")), "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["code"].as_str()),
+        (Some("error"), Some("busy")),
+        "{v}"
+    );
 }
 
 /// (#3468) A template project previews from its first commit's recipe
@@ -7364,12 +9247,20 @@ async fn a_template_whose_first_commit_has_no_recipe_is_template_no_recipe() {
     let token = paired(&h).await;
     let (code, v) = call(
         &h,
-        post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"})),
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"}),
+        ),
     )
     .await;
     assert_eq!(code, 201, "{v}");
     let (code, v) = start_preview(&h, &token, "bakery").await;
-    assert_eq!((code, v["code"].as_str()), (404, Some("template_no_recipe")), "{v}");
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (404, Some("template_no_recipe")),
+        "{v}"
+    );
 }
 
 /// (#3468) A checkout whose own git config defines a filter driver is
@@ -7381,8 +9272,20 @@ async fn a_checkout_with_a_repo_filter_is_refused_with_its_code() {
     let mine = h.dir.path().join("crypt");
     fixture_repo(&mine);
     run_git(Some(&mine), &["config", "filter.crypt.clean", "cat"]);
-    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"source_path": mine.to_str(), "bot": "c"}))).await;
-    assert_eq!((code, v["code"].as_str()), (422, Some("filter_in_repo_config")), "{v}");
+    let (code, v) = call(
+        &h,
+        post(
+            "/client/workspaces",
+            Some(&token),
+            serde_json::json!({"source_path": mine.to_str(), "bot": "c"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (422, Some("filter_in_repo_config")),
+        "{v}"
+    );
 }
 
 /// (#3468) The production reader of a failed run's code: its dispatch
@@ -7397,16 +9300,42 @@ fn the_failed_run_code_reader_reads_the_dispatch_error() {
             "execution_id": format!("exec-{session}"), "payload": payload})
     };
     let lines = [
-        rec("run-x.adhoc.coder.w-1", "dispatch.start", serde_json::json!({})),
-        rec("run-x.adhoc.coder.w-1", "dispatch.error", serde_json::json!({"error": "no fit", "code": "wont_fit"})),
+        rec(
+            "run-x.adhoc.coder.w-1",
+            "dispatch.start",
+            serde_json::json!({}),
+        ),
+        rec(
+            "run-x.adhoc.coder.w-1",
+            "dispatch.error",
+            serde_json::json!({"error": "no fit", "code": "wont_fit"}),
+        ),
         // Only a `dispatch.error` names the failure, whatever else a record carries.
-        rec("run-x.adhoc.coder.w-1", "dispatch.model.loading", serde_json::json!({"engine": "e", "endpoint": "p", "model": "m", "code": "not_a_failure"})),
-        rec("run-y.adhoc.coder.w-2", "dispatch.error", serde_json::json!({"error": "held", "code": "busy"})),
-        rec("run-z.adhoc.coder.w-3", "dispatch.error", serde_json::json!({"error": "crashed"})),
+        rec(
+            "run-x.adhoc.coder.w-1",
+            "dispatch.model.loading",
+            serde_json::json!({"engine": "e", "endpoint": "p", "model": "m", "code": "not_a_failure"}),
+        ),
+        rec(
+            "run-y.adhoc.coder.w-2",
+            "dispatch.error",
+            serde_json::json!({"error": "held", "code": "busy"}),
+        ),
+        rec(
+            "run-z.adhoc.coder.w-3",
+            "dispatch.error",
+            serde_json::json!({"error": "crashed"}),
+        ),
     ];
-    std::fs::write(dir.path().join(format!("{day}.jsonl")), lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
-    let store = crate::flow_window::FlowRecordStore::new(crate::client_pairing::feeds_work_activity);
-    let read = |id: &str| crate::client_pairing::dispatch_error_code_in(&store, dir.path(), "coder", id);
+    std::fs::write(
+        dir.path().join(format!("{day}.jsonl")),
+        lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+    )
+    .unwrap();
+    let store =
+        crate::flow_window::FlowRecordStore::new(crate::client_pairing::feeds_work_activity);
+    let read =
+        |id: &str| crate::client_pairing::dispatch_error_code_in(&store, dir.path(), "coder", id);
     assert_eq!(read("w-1").as_deref(), Some("wont_fit"));
     // (#3468 review) A role id escaped on the wire is found too.
     let escaped = darkmux_types::session_id::SessionId::adhoc(
@@ -7420,11 +9349,20 @@ fn the_failed_run_code_reader_reads_the_dispatch_error() {
         .open(dir.path().join(format!("{day}.jsonl")))
         .and_then(|mut f| {
             use std::io::Write;
-            writeln!(f, "{}", rec(&escaped, "dispatch.error", serde_json::json!({"error": "held", "code": "busy"})))
+            writeln!(
+                f,
+                "{}",
+                rec(
+                    &escaped,
+                    "dispatch.error",
+                    serde_json::json!({"error": "held", "code": "busy"})
+                )
+            )
         })
         .unwrap();
     assert_eq!(
-        crate::client_pairing::dispatch_error_code_in(&store, dir.path(), "code_writer", "w-5").as_deref(),
+        crate::client_pairing::dispatch_error_code_in(&store, dir.path(), "code_writer", "w-5")
+            .as_deref(),
         Some("busy")
     );
     assert_eq!(read("w-3"), None, "a terminal with no code names none");
@@ -7441,10 +9379,18 @@ async fn an_unreadable_path_segment_is_a_coded_json_refusal() {
     for req in [
         get("/client/work/%FF", &[("authorization", &bearer(&token))]),
         get("/client/pair/%FF", &[("x-pair-secret", SECRET)]),
-        post("/client/workspaces/%FF/preview", Some(&token), serde_json::json!({})),
+        post(
+            "/client/workspaces/%FF/preview",
+            Some(&token),
+            serde_json::json!({}),
+        ),
     ] {
         let (code, v) = call(&h, req).await;
-        assert_eq!((code, v["code"].as_str()), (400, Some("bad_request")), "{v}");
+        assert_eq!(
+            (code, v["code"].as_str()),
+            (400, Some("bad_request")),
+            "{v}"
+        );
         assert!(v["error"].is_string(), "{v}");
     }
 }
@@ -7456,7 +9402,11 @@ async fn a_panicking_handler_is_a_coded_500() {
     let mut h = harness();
     let token = paired(&h).await;
     h.state.profiles_policy = Arc::new(|| panic!("the policy read panicked"));
-    let (code, v) = call(&h, get("/client/whoami", &[("authorization", &bearer(&token))])).await;
+    let (code, v) = call(
+        &h,
+        get("/client/whoami", &[("authorization", &bearer(&token))]),
+    )
+    .await;
     assert_eq!((code, v["code"].as_str()), (500, Some("internal")), "{v}");
 }
 
@@ -7464,10 +9414,22 @@ async fn a_panicking_handler_is_a_coded_500() {
 /// `ClientPath`, so none answers axum's plain-text rejection.
 #[test]
 fn every_client_route_reads_its_path_through_client_path() {
-    let src = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/client_pairing.rs")).unwrap();
-    let bare: Vec<&str> = src.lines().filter(|l| l.contains(": UrlPath<") || l.contains("): UrlPath<")).collect();
-    assert!(bare.is_empty(), "a handler takes a bare `UrlPath`: {bare:?}");
-    assert!(src.matches(": ClientPath<").count() >= 10, "the routes were found");
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/client_pairing.rs"),
+    )
+    .unwrap();
+    let bare: Vec<&str> = src
+        .lines()
+        .filter(|l| l.contains(": UrlPath<") || l.contains("): UrlPath<"))
+        .collect();
+    assert!(
+        bare.is_empty(),
+        "a handler takes a bare `UrlPath`: {bare:?}"
+    );
+    assert!(
+        src.matches(": ClientPath<").count() >= 10,
+        "the routes were found"
+    );
 }
 
 // ─── Production wiring ───────────────────────────────────────────────────
@@ -7479,9 +9441,15 @@ fn every_client_route_reads_its_path_through_client_path() {
 #[test]
 fn the_profile_verdict_follows_dispatchs_resolution() {
     use darkmux_fleet::{ProfileResolution as R, WorkSeat};
-    let work = |p: &str| R::Work { profile: p.into(), seat: WorkSeat::Local { model: "m".into() } };
+    let work = |p: &str| R::Work {
+        profile: p.into(),
+        seat: WorkSeat::Local { model: "m".into() },
+    };
     assert_eq!(profile_verdict(None, work("fast")), Ok("fast".to_string()));
-    assert_eq!(profile_verdict(Some("fast"), work("fast")), Ok("fast".to_string()));
+    assert_eq!(
+        profile_verdict(Some("fast"), work("fast")),
+        Ok("fast".to_string())
+    );
     assert_eq!(
         profile_verdict(Some("fast"), work("deep")),
         Err("profile fast resolves to deep here; refusing".to_string())
@@ -7490,7 +9458,10 @@ fn the_profile_verdict_follows_dispatchs_resolution() {
         profile_verdict(Some("utility"), R::UtilityOnly("utility".into())),
         Err("profile utility holds only the utility model; work never runs on it".to_string())
     );
-    assert_eq!(profile_verdict(None, R::Unresolved("no profile".into())), Err("no profile".to_string()));
+    assert_eq!(
+        profile_verdict(None, R::Unresolved("no profile".into())),
+        Err("no profile".to_string())
+    );
 }
 
 /// The worktrees base is made when missing and handed back canonical; one
@@ -7499,7 +9470,10 @@ fn the_profile_verdict_follows_dispatchs_resolution() {
 fn the_worktrees_base_is_made_and_canonical() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().join("a/../worktrees");
-    assert_eq!(canonical_base(&base).unwrap(), dir.path().canonicalize().unwrap().join("worktrees"));
+    assert_eq!(
+        canonical_base(&base).unwrap(),
+        dir.path().canonicalize().unwrap().join("worktrees")
+    );
     assert!(dir.path().join("worktrees").is_dir());
     std::fs::write(dir.path().join("file"), "").unwrap();
     let refused = canonical_base(&dir.path().join("file/worktrees")).unwrap_err();
@@ -7513,7 +9487,10 @@ fn the_worktrees_base_is_made_and_canonical() {
 fn the_production_peer_lookup_answers_the_peers_asked_about() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let local = listener.local_addr().unwrap();
-    let clients = [std::net::TcpStream::connect(local).unwrap(), std::net::TcpStream::connect(local).unwrap()];
+    let clients = [
+        std::net::TcpStream::connect(local).unwrap(),
+        std::net::TcpStream::connect(local).unwrap(),
+    ];
     let _accepted = [listener.accept().unwrap(), listener.accept().unwrap()];
     let asked = clients[0].local_addr().unwrap();
     let found = peer_processes_here(Some(local), &[asked]).unwrap();
@@ -7529,7 +9506,12 @@ fn a_store_that_cannot_be_locked_refuses() {
     std::fs::create_dir_all(dir.path().join("clients.json")).unwrap();
     let store = ClientStore::at(dir.path().join("clients.json"));
     assert!(store.read().is_err());
-    assert!(store.update(|f| { f.legacy_owner = Some("x".into()); Ok(()) }).is_err());
+    assert!(store
+        .update(|f| {
+            f.legacy_owner = Some("x".into());
+            Ok(())
+        })
+        .is_err());
     assert!(dir.path().join("clients.json").is_dir(), "nothing written");
 }
 
@@ -7538,7 +9520,14 @@ fn a_store_that_cannot_be_locked_refuses() {
 /// How one work item stands, read from the listener's own table (a revoked
 /// client can no longer ask).
 fn work_word(h: &Harness, id: &str) -> &'static str {
-    match h.state.works.lock().unwrap().get(id).map(|w| w.status.clone()) {
+    match h
+        .state
+        .works
+        .lock()
+        .unwrap()
+        .get(id)
+        .map(|w| w.status.clone())
+    {
         Some(WorkStatus::Running) => "running",
         Some(WorkStatus::Done { .. }) => "done",
         Some(WorkStatus::Error(_)) => "error",
@@ -7579,7 +9568,11 @@ async fn a_disconnect_during_admission_never_leaves_a_run_with_no_runner() {
     h.state.bound = Some(addr);
     let app = router(h.state.clone());
     let server = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
     });
     let body = work_for("coder").to_string();
     let request = format!(
@@ -7596,7 +9589,11 @@ async fn a_disconnect_during_admission_never_leaves_a_run_with_no_runner() {
     let ids: Vec<String> = h.state.works.lock().unwrap().keys().cloned().collect();
     assert_eq!(ids.len(), 1, "the request was admitted");
     assert_eq!(h.ran.lock().unwrap().len(), 1, "its run has a runner");
-    assert!(work_reaches(&h, &ids[0], "done").await, "it stands at {}", work_word(&h, &ids[0]));
+    assert!(
+        work_reaches(&h, &ids[0], "done").await,
+        "it stands at {}",
+        work_word(&h, &ids[0])
+    );
     server.abort();
 }
 
@@ -7609,18 +9606,28 @@ async fn work_still_being_admitted_when_the_stop_begins_is_refused() {
     let token = paired(&h).await;
     slow_admission(&mut h, 300);
     let mut req = post("/client/work", Some(&token), work_for("coder"));
-    req.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
-    req.headers_mut().insert(axum::http::header::HOST, BOUND.parse().unwrap());
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(SocketAddr::from((
+            [127, 0, 0, 1],
+            5555,
+        ))));
+    req.headers_mut()
+        .insert(axum::http::header::HOST, BOUND.parse().unwrap());
     let app = router(h.state.clone());
     let asked = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     h.state.previews.begin_shutdown();
     let resp = asked.await.unwrap();
     assert_eq!(resp.status().as_u16(), 503);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let v: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["code"], "unavailable", "{v}");
-    assert!(h.state.works.lock().unwrap().is_empty(), "nothing registered");
+    assert!(
+        h.state.works.lock().unwrap().is_empty(),
+        "nothing registered"
+    );
     assert!(h.ran.lock().unwrap().is_empty(), "nothing ran");
 }
 
@@ -7641,9 +9648,17 @@ async fn a_run_in_flight_at_shutdown_ends_canceled_with_its_commit() {
     }
     let began = begin_stop(&h.state.previews, &h.state.works);
     let within = std::time::Duration::from_secs(5);
-    let left = finish_stop(h.state.previews.clone(), h.state.works.clone(), began + within).await;
+    let left = finish_stop(
+        h.state.previews.clone(),
+        h.state.works.clone(),
+        began + within,
+    )
+    .await;
     assert_eq!(left, Vec::<String>::new(), "nothing is left running");
-    assert!(began.elapsed() < within, "it ended at its cancel, not at the bound");
+    assert!(
+        began.elapsed() < within,
+        "it ended at its cancel, not at the bound"
+    );
     let done = status(&h, &token, &id).await;
     assert_eq!(done["status"], "cancelled", "{done}");
     assert!(done["commit"].as_str().is_some(), "{done}");
@@ -7663,9 +9678,15 @@ fn shutdown_never_waits_past_its_bound_for_a_run_that_ignores_its_cancel() {
         std::thread::sleep(std::time::Duration::from_secs(3));
         Ok(serde_json::json!({"result": "stop"}))
     });
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let token = rt.block_on(paired(&h));
-    let (code, v) = rt.block_on(call(&h, post("/client/work", Some(&token), work_for("coder"))));
+    let (code, v) = rt.block_on(call(
+        &h,
+        post("/client/work", Some(&token), work_for("coder")),
+    ));
     assert_eq!(code, 202, "{v}");
     let began = std::time::Instant::now();
     let bound = std::time::Duration::from_millis(200);
@@ -7674,7 +9695,10 @@ fn shutdown_never_waits_past_its_bound_for_a_run_that_ignores_its_cancel() {
     assert!(began.elapsed() >= bound, "it waited its bound");
     end_runtime(rt, bound);
     let took = began.elapsed();
-    assert!(took < std::time::Duration::from_secs(2), "the exit waited {took:?} on a 3 s run");
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "the exit waited {took:?} on a 3 s run"
+    );
 }
 
 /// A wedged docker (each `docker stop` and `rm` waiting out its own bound)
@@ -7684,10 +9708,16 @@ fn shutdown_never_waits_past_its_bound_for_a_run_that_ignores_its_cancel() {
 #[test]
 fn shutdown_never_waits_past_its_bound_for_a_wedged_preview_stop() {
     let h = harness();
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let token = rt.block_on(paired(&h));
     let (mine, name, _ws) = rt.block_on(served_workspace(&h, &token));
-    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}}));
+    recipe(
+        &mine,
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}}),
+    );
     let (code, v) = rt.block_on(start_preview(&h, &token, &name));
     assert_eq!(code, 202, "{v}");
     let ready = rt.block_on(preview_until(&h, &token, &name, &["ready", "failed"]));
@@ -7695,11 +9725,22 @@ fn shutdown_never_waits_past_its_bound_for_a_wedged_preview_stop() {
     *h.containers.remove_delay.lock().unwrap() = std::time::Duration::from_secs(5);
     let began = begin_stop(&h.state.previews, &h.state.works);
     let bound = std::time::Duration::from_millis(300);
-    rt.block_on(finish_stop(h.state.previews.clone(), h.state.works.clone(), began + bound));
-    assert!(began.elapsed() < std::time::Duration::from_secs(2), "the stop waited {:?} on a wedged docker", began.elapsed());
+    rt.block_on(finish_stop(
+        h.state.previews.clone(),
+        h.state.works.clone(),
+        began + bound,
+    ));
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(2),
+        "the stop waited {:?} on a wedged docker",
+        began.elapsed()
+    );
     end_runtime(rt, bound);
     let took = began.elapsed();
-    assert!(took < std::time::Duration::from_secs(3), "the exit waited {took:?} on a wedged docker");
+    assert!(
+        took < std::time::Duration::from_secs(3),
+        "the exit waited {took:?} on a wedged docker"
+    );
 }
 
 /// `client revoke` ends what the client started: at the next look its
@@ -7711,7 +9752,10 @@ async fn a_revoked_clients_runs_are_canceled_and_its_previews_stopped() {
     let token = paired(&h).await;
     let other = paired(&h).await;
     let (mine, name, _ws) = served_workspace(&h, &token).await;
-    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
+    recipe(
+        &mine,
+        serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}),
+    );
     let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 202, "{v}");
     let ready = preview_until(&h, &token, &name, &["ready", "failed"]).await;
@@ -7721,7 +9765,10 @@ async fn a_revoked_clients_runs_are_canceled_and_its_previews_stopped() {
     let revoked_run = v["work_id"].as_str().unwrap().to_string();
     let (_, v) = call(&h, post("/client/work", Some(&other), waiting_work())).await;
     let others_run = v["work_id"].as_str().unwrap().to_string();
-    assert!(unpaired_tick(&h.state).is_empty(), "both are paired: nothing ends");
+    assert!(
+        unpaired_tick(&h.state).is_empty(),
+        "both are paired: nothing ends"
+    );
     assert_eq!(work_word(&h, &revoked_run), "running");
 
     let revoked = list_clients(&h.store).unwrap()[0].name.clone();
@@ -7730,7 +9777,11 @@ async fn a_revoked_clients_runs_are_canceled_and_its_previews_stopped() {
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert!(lines.iter().any(|l| l.contains(&revoked_run)), "{lines:?}");
     assert!(lines.iter().any(|l| l.contains(&name)), "{lines:?}");
-    assert!(work_reaches(&h, &revoked_run, "cancelled").await, "it stands at {}", work_word(&h, &revoked_run));
+    assert!(
+        work_reaches(&h, &revoked_run, "cancelled").await,
+        "it stands at {}",
+        work_word(&h, &revoked_run)
+    );
     assert_eq!(h.state.previews.status(&name).unwrap().status, "stopped");
     for _ in 0..100 {
         if !answers(port) {
@@ -7739,7 +9790,11 @@ async fn a_revoked_clients_runs_are_canceled_and_its_previews_stopped() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(!answers(port), "the dev server is gone");
-    assert_eq!(work_word(&h, &others_run), "running", "a paired client's run is left alone");
+    assert_eq!(
+        work_word(&h, &others_run),
+        "running",
+        "a paired client's run is left alone"
+    );
     assert!(unpaired_tick(&h.state).is_empty(), "said once");
     assert_eq!(cancel(&h, Some(&other), &others_run).await.0, 202);
 }
@@ -7809,7 +9864,11 @@ async fn the_check_thread_ends_a_revoked_clients_work_on_its_own() {
         let ended = work_reaches(&h, &id, "cancelled").await;
         stop.store(true, Ordering::SeqCst);
         thread.join().unwrap();
-        assert!(ended, "interval {interval_ms} ms: it stands at {}", work_word(&h, &id));
+        assert!(
+            ended,
+            "interval {interval_ms} ms: it stands at {}",
+            work_word(&h, &id)
+        );
     }
 }
 
@@ -7821,15 +9880,32 @@ fn the_store_is_replaced_whole_never_rewritten_in_place() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let store = ClientStore::at(dir.path().join("clients.json"));
-    store.update(|f| { f.legacy_owner = Some("before".into()); Ok(()) }).unwrap();
+    store
+        .update(|f| {
+            f.legacy_owner = Some("before".into());
+            Ok(())
+        })
+        .unwrap();
     let mut opened_before = std::fs::File::open(store.path()).unwrap();
-    store.update(|f| { f.legacy_owner = Some("after".into()); Ok(()) }).unwrap();
+    store
+        .update(|f| {
+            f.legacy_owner = Some("after".into());
+            Ok(())
+        })
+        .unwrap();
     let mut old = String::new();
     opened_before.read_to_string(&mut old).unwrap();
     let old: ClientsFile = serde_json::from_str(&old).expect("the old store, whole");
     assert_eq!(old.legacy_owner.as_deref(), Some("before"));
     assert_eq!(store.read().unwrap().legacy_owner.as_deref(), Some("after"));
-    assert_eq!(std::fs::metadata(store.path()).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
     let names: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -7843,7 +9919,12 @@ fn the_store_is_replaced_whole_never_rewritten_in_place() {
 fn a_change_that_waited_for_the_lock_builds_on_the_one_before_it() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(ClientStore::at(dir.path().join("clients.json")));
-    store.update(|f| { f.legacy_owner = Some("start".into()); Ok(()) }).unwrap();
+    store
+        .update(|f| {
+            f.legacy_owner = Some("start".into());
+            Ok(())
+        })
+        .unwrap();
     let (first, holding) = (store.clone(), Arc::new(std::sync::Barrier::new(2)));
     let held = holding.clone();
     let a = std::thread::spawn(move || {
@@ -7858,11 +9939,26 @@ fn a_change_that_waited_for_the_lock_builds_on_the_one_before_it() {
             .unwrap();
     });
     holding.wait();
-    let client = ApprovedClient { name: "second".into(), id: "c-2".into(), created: 1, token_hash: "h".into(), auto_approved: None };
-    store.update(|f| { f.clients.push(client.clone()); Ok(()) }).unwrap();
+    let client = ApprovedClient {
+        name: "second".into(),
+        id: "c-2".into(),
+        created: 1,
+        token_hash: "h".into(),
+        auto_approved: None,
+    };
+    store
+        .update(|f| {
+            f.clients.push(client.clone());
+            Ok(())
+        })
+        .unwrap();
     a.join().unwrap();
     let now = store.read().unwrap();
-    assert_eq!(now.legacy_owner.as_deref(), Some("first"), "the first change survived the second");
+    assert_eq!(
+        now.legacy_owner.as_deref(),
+        Some("first"),
+        "the first change survived the second"
+    );
     assert_eq!(now.clients, vec![client]);
 }
 
@@ -7872,7 +9968,12 @@ fn a_change_that_waited_for_the_lock_builds_on_the_one_before_it() {
 fn a_peek_that_waited_for_the_lock_reads_the_change_it_waited_on() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(ClientStore::at(dir.path().join("clients.json")));
-    store.update(|f| { f.legacy_owner = Some("start".into()); Ok(()) }).unwrap();
+    store
+        .update(|f| {
+            f.legacy_owner = Some("start".into());
+            Ok(())
+        })
+        .unwrap();
     let (writer, holding) = (store.clone(), Arc::new(std::sync::Barrier::new(2)));
     let held = holding.clone();
     let a = std::thread::spawn(move || {
@@ -8003,7 +10104,11 @@ async fn a_hand_edit_writes_typed_markup_characters_as_text() {
     let h = harness();
     let token = paired(&h).await;
     let wt = page_workspace(&h);
-    std::fs::write(wt.join("App.tsx"), "export const A = () => <p>Hello there</p>;\n").unwrap();
+    std::fs::write(
+        wt.join("App.tsx"),
+        "export const A = () => <p>Hello there</p>;\n",
+    )
+    .unwrap();
     std::fs::write(wt.join("plain.txt"), "Plain words\n").unwrap();
     run_git(Some(&wt), &["add", "App.tsx", "plain.txt"]);
     run_git(Some(&wt), &["commit", "--quiet", "-m", "more"]);
@@ -8011,10 +10116,19 @@ async fn a_hand_edit_writes_typed_markup_characters_as_text() {
     let (code, v) = edit(&h, &token, "Tea & cake", typed).await;
     assert_eq!(code, 200, "{v}");
     let page = std::fs::read_to_string(wt.join("page.html")).unwrap();
-    assert!(page.starts_with("<h1>Tea &lt;b&gt;&amp;&lt;/b&gt; &#123;cake&#125;</h1>\n"), "{page}");
+    assert!(
+        page.starts_with("<h1>Tea &lt;b&gt;&amp;&lt;/b&gt; &#123;cake&#125;</h1>\n"),
+        "{page}"
+    );
     let (code, v) = edit(&h, &token, typed, "Tea & cake").await;
-    assert_eq!((code, &v["matches"]), (200, &Value::from(1)), "the edited text is found by what the page shows: {v}");
-    assert!(std::fs::read_to_string(wt.join("page.html")).unwrap().starts_with("<h1>Tea &amp; cake</h1>"));
+    assert_eq!(
+        (code, &v["matches"]),
+        (200, &Value::from(1)),
+        "the edited text is found by what the page shows: {v}"
+    );
+    assert!(std::fs::read_to_string(wt.join("page.html"))
+        .unwrap()
+        .starts_with("<h1>Tea &amp; cake</h1>"));
     let (code, v) = edit(&h, &token, "Hello there", "{name} <i>").await;
     assert_eq!(code, 200, "{v}");
     assert_eq!(
@@ -8023,7 +10137,10 @@ async fn a_hand_edit_writes_typed_markup_characters_as_text() {
     );
     let (code, v) = edit(&h, &token, "Plain words", "<b>& {x}").await;
     assert_eq!(code, 200, "{v}");
-    assert_eq!(std::fs::read_to_string(wt.join("plain.txt")).unwrap(), "<b>& {x}\n");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("plain.txt")).unwrap(),
+        "<b>& {x}\n"
+    );
 }
 
 #[tokio::test]
@@ -8136,7 +10253,13 @@ async fn a_hand_edit_never_writes_through_a_file_swapped_for_a_link() {
     let base = run_git(Some(&wt), &["rev-parse", "HEAD"]);
     for attempt in 0..60 {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let swapper = swap_with_link(wt.join("page.html"), PAGE, host.clone(), scratch.clone(), stop.clone());
+        let swapper = swap_with_link(
+            wt.join("page.html"),
+            PAGE,
+            host.clone(),
+            scratch.clone(),
+            stop.clone(),
+        );
         let (code, v) = edit(&h, &token, "Tea & cake", "Coffee").await;
         stop.store(true, Ordering::SeqCst);
         swapper.join().unwrap();
@@ -8170,10 +10293,17 @@ async fn a_hand_edit_never_reads_or_writes_through_a_linked_file_or_folder() {
     std::os::unix::fs::symlink(&host_pages, wt.join("pages")).unwrap();
     for old in ["Tea & cake", "Only in pages"] {
         let (code, v) = edit(&h, &token, old, "Coffee").await;
-        assert_eq!((code, &v["matches"]), (200, &Value::from(0)), "{old}: never read through a link: {v}");
+        assert_eq!(
+            (code, &v["matches"]),
+            (200, &Value::from(0)),
+            "{old}: never read through a link: {v}"
+        );
     }
     assert_eq!(std::fs::read_to_string(&host).unwrap(), PAGE);
-    assert_eq!(std::fs::read_to_string(host_pages.join("index.html")).unwrap(), "<p>Only in pages</p>\n");
+    assert_eq!(
+        std::fs::read_to_string(host_pages.join("index.html")).unwrap(),
+        "<p>Only in pages</p>\n"
+    );
 }
 
 #[tokio::test]
@@ -8185,7 +10315,13 @@ async fn a_hand_edit_is_refused_while_its_workspace_is_being_removed() {
     let removing = try_hold(&h.base, "site", Hold::Sole).unwrap().unwrap();
     let (code, v) = edit(&h, &token, "Tea & cake", "Coffee").await;
     assert_eq!(code, 409, "{v}");
-    assert!(v["error"].as_str().unwrap_or_default().contains("being made or removed"), "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("being made or removed"),
+        "{v}"
+    );
     assert_eq!(std::fs::read_to_string(wt.join("page.html")).unwrap(), PAGE);
     drop(removing);
 }
@@ -8211,8 +10347,15 @@ async fn a_hand_edit_holds_its_workspace_name_until_it_has_committed() {
     });
     let (code, v) = edit(&h, &token, "Tea & cake", "Coffee").await;
     assert_eq!(code, 200, "{v}");
-    assert_eq!(*seen.lock().unwrap(), Some(true), "a removal could take the name mid-edit");
-    assert!(try_hold(&h.base, "site", Hold::Sole).unwrap().is_some(), "and lets go once it has ended");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(true),
+        "a removal could take the name mid-edit"
+    );
+    assert!(
+        try_hold(&h.base, "site", Hold::Sole).unwrap().is_some(),
+        "and lets go once it has ended"
+    );
 }
 
 #[tokio::test]
@@ -8238,14 +10381,21 @@ async fn a_hand_edit_that_panics_ends_its_record_and_frees_the_work_copy() {
         assert!(ended[0].finished.is_some());
     }
     let (code, v) = edit(&h, &token, "About us", "Who we are").await;
-    assert_eq!(code, 200, "the work copy is not held by an edit that ended: {v}");
+    assert_eq!(
+        code, 200,
+        "the work copy is not held by an edit that ended: {v}"
+    );
 }
 
 #[test]
 fn a_file_whose_status_git_cannot_read_is_not_edited() {
     let dir = tempfile::tempdir().unwrap();
-    let not_a_repo = WorkCopy { work_tree: dir.path().to_path_buf(), git_dir: dir.path().join("no-such-git-dir") };
-    let refused = refuse_unless_clean(&not_a_repo, "page.html").expect_err("an unreadable status is not clean");
+    let not_a_repo = WorkCopy {
+        work_tree: dir.path().to_path_buf(),
+        git_dir: dir.path().join("no-such-git-dir"),
+    };
+    let refused = refuse_unless_clean(&not_a_repo, "page.html")
+        .expect_err("an unreadable status is not clean");
     assert_eq!(refused.status(), StatusCode::CONFLICT);
 }
 
@@ -8464,7 +10614,9 @@ fn photo(len: usize) -> Vec<u8> {
     let mut out = vec![0xFF, 0xD8, 0xFF, 0xE0];
     let mut x: u64 = 0x2545_F491_4F6C_DD1D;
     while out.len() < len {
-        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        x = x
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         out.push((x >> 56) as u8);
     }
     out.truncate(len);
@@ -8502,11 +10654,19 @@ async fn an_image_of_several_megabytes_is_added_through_the_whole_router() {
     let token = paired(&h).await;
     let wt = image_workspace(&h);
     let jpeg = photo(3 * 1024 * 1024);
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "beach.jpg", "data": b64(&jpeg)})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "beach.jpg", "data": b64(&jpeg)}),
+    )
+    .await;
     assert_eq!(code, 200, "{v}");
     let path = v["path"].as_str().unwrap();
     assert_eq!(std::fs::read(wt.join(path)).unwrap(), jpeg);
-    assert!(run_git(Some(&wt), &["ls-files", "--", path]).contains(path), "committed");
+    assert!(
+        run_git(Some(&wt), &["ls-files", "--", path]).contains(path),
+        "committed"
+    );
 }
 
 /// (review) The image route's cap is exactly [`MAX_IMAGE_BODY_BYTES`]: a
@@ -8550,13 +10710,35 @@ async fn every_route_refuses_a_body_past_64_kb_before_its_handler() {
         if matches!(r.method, "get" | "head") {
             continue;
         }
-        let path = r.path.replace(":name", "site").replace(":work_id", "w-0").replace(":request_id", "r-0");
-        let (code, v) = call(&h, raw(r.method, &path, None, Body::from(vec![b' '; MAX_BODY_BYTES + 1]))).await;
+        let path = r
+            .path
+            .replace(":name", "site")
+            .replace(":work_id", "w-0")
+            .replace(":request_id", "r-0");
+        let (code, v) = call(
+            &h,
+            raw(
+                r.method,
+                &path,
+                None,
+                Body::from(vec![b' '; MAX_BODY_BYTES + 1]),
+            ),
+        )
+        .await;
         assert_eq!(code, 413, "{} {}: {v}", r.method, r.path);
-        assert_eq!(v["error"], format!("body larger than {MAX_BODY_BYTES} bytes"), "{} {}", r.method, r.path);
+        assert_eq!(
+            v["error"],
+            format!("body larger than {MAX_BODY_BYTES} bytes"),
+            "{} {}",
+            r.method,
+            r.path
+        );
         checked += 1;
     }
-    assert!(checked >= 9, "every route that takes a body was asked ({checked})");
+    assert!(
+        checked >= 9,
+        "every route that takes a body was asked ({checked})"
+    );
 }
 
 /// (review) A paired app's token raises the cap on the image route alone:
@@ -8570,8 +10752,21 @@ async fn a_paired_apps_token_raises_the_cap_on_no_other_route() {
         if matches!(r.method, "get" | "head") || r.path == IMAGE_ROUTE {
             continue;
         }
-        let path = r.path.replace(":name", "site").replace(":work_id", "w-0").replace(":request_id", "r-0");
-        let (code, v) = call(&h, raw(r.method, &path, Some(&token), Body::from(vec![b' '; MAX_BODY_BYTES + 1]))).await;
+        let path = r
+            .path
+            .replace(":name", "site")
+            .replace(":work_id", "w-0")
+            .replace(":request_id", "r-0");
+        let (code, v) = call(
+            &h,
+            raw(
+                r.method,
+                &path,
+                Some(&token),
+                Body::from(vec![b' '; MAX_BODY_BYTES + 1]),
+            ),
+        )
+        .await;
         assert_eq!(code, 413, "{} {}: {v}", r.method, r.path);
     }
 }
@@ -8585,11 +10780,26 @@ async fn an_image_keeps_its_turn_until_it_has_been_added() {
     let wt = image_workspace(&h);
     let seen = Arc::new(Mutex::new(None));
     let (turns, s) = (h.state.body_limits.image_reads.clone(), seen.clone());
-    on_edit_commit(&wt, move || *s.lock().unwrap() = Some(turns.available_permits()));
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    on_edit_commit(&wt, move || {
+        *s.lock().unwrap() = Some(turns.available_permits())
+    });
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG)}),
+    )
+    .await;
     assert_eq!(code, 200, "{v}");
-    assert_eq!(*seen.lock().unwrap(), Some(IMAGE_READS - 1), "its turn is held while it commits");
-    assert_eq!(h.state.body_limits.image_reads.available_permits(), IMAGE_READS, "and given back after");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(IMAGE_READS - 1),
+        "its turn is held while it commits"
+    );
+    assert_eq!(
+        h.state.body_limits.image_reads.available_permits(),
+        IMAGE_READS,
+        "and given back after"
+    );
 }
 
 /// A request with `method`, a JSON content type, the bearer `token` when
@@ -8618,7 +10828,10 @@ fn counted_body(total: usize, stall: bool) -> (Body, Arc<AtomicU64>) {
         Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b' '; chunk]))
     }));
     let body = if stall {
-        Body::from_stream(futures::StreamExt::chain(chunks, futures::stream::pending()))
+        Body::from_stream(futures::StreamExt::chain(
+            chunks,
+            futures::stream::pending(),
+        ))
     } else {
         Body::from_stream(chunks)
     };
@@ -8635,11 +10848,25 @@ async fn an_image_without_a_paired_token_is_refused_before_more_than_64_kb_is_re
     let _wt = image_workspace(&h);
     for token in [None, Some("not-a-token")] {
         let (body, taken) = counted_body(4 * 1024 * 1024, false);
-        let (code, v) = call(&h, raw("post", "/client/workspaces/site/image", token, body)).await;
-        assert_eq!(code, 413, "{token:?}: refused at 64 KB, not read and then refused 401: {v}");
-        assert_eq!(v["error"], format!("body larger than {MAX_BODY_BYTES} bytes"), "{token:?}");
+        let (code, v) = call(
+            &h,
+            raw("post", "/client/workspaces/site/image", token, body),
+        )
+        .await;
+        assert_eq!(
+            code, 413,
+            "{token:?}: refused at 64 KB, not read and then refused 401: {v}"
+        );
+        assert_eq!(
+            v["error"],
+            format!("body larger than {MAX_BODY_BYTES} bytes"),
+            "{token:?}"
+        );
         let read = taken.load(Ordering::SeqCst) as usize;
-        assert!(read <= MAX_BODY_BYTES + 16 * 1024, "{token:?}: {read} bytes were read");
+        assert!(
+            read <= MAX_BODY_BYTES + 16 * 1024,
+            "{token:?}: {read} bytes were read"
+        );
     }
 }
 
@@ -8652,9 +10879,17 @@ async fn only_a_post_to_the_image_route_reads_past_64_kb() {
     let _wt = image_workspace(&h);
     for method in ["put", "patch", "delete", "options"] {
         let body = Body::from(vec![b' '; 1024 * 1024]);
-        let (code, v) = call(&h, raw(method, "/client/workspaces/site/image", Some(&token), body)).await;
+        let (code, v) = call(
+            &h,
+            raw(method, "/client/workspaces/site/image", Some(&token), body),
+        )
+        .await;
         assert_eq!(code, 413, "{method}: {v}");
-        assert_eq!(v["error"], format!("body larger than {MAX_BODY_BYTES} bytes"), "{method}");
+        assert_eq!(
+            v["error"],
+            format!("body larger than {MAX_BODY_BYTES} bytes"),
+            "{method}"
+        );
     }
 }
 
@@ -8668,17 +10903,27 @@ async fn an_image_body_waits_for_a_turn_and_is_refused_when_none_frees() {
     let token = paired(&h).await;
     let _wt = image_workspace(&h);
     let turns = h.state.body_limits.image_reads.clone();
-    let held = turns.clone().try_acquire_many_owned(2).expect("two turns, both free");
+    let held = turns
+        .clone()
+        .try_acquire_many_owned(2)
+        .expect("two turns, both free");
     let body = serde_json::json!({"name": "a.png", "data": b64(PNG)});
     let started = std::time::Instant::now();
     let (code, v) = add_image(&h, &token, body.clone()).await;
     assert_eq!(code, 429, "{v}");
     assert_eq!(v["code"], "too_many_requests", "{v}");
-    assert!(started.elapsed() >= std::time::Duration::from_millis(300), "it waited for a turn first");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(300),
+        "it waited for a turn first"
+    );
     drop(held);
     let (code, v) = add_image(&h, &token, body).await;
     assert_eq!(code, 200, "{v}");
-    assert_eq!(turns.available_permits(), IMAGE_READS, "its turn is given back");
+    assert_eq!(
+        turns.available_permits(),
+        IMAGE_READS,
+        "its turn is given back"
+    );
 }
 
 /// (review) A body that stops arriving is refused once the read time is
@@ -8690,7 +10935,11 @@ async fn a_body_that_stops_arriving_is_refused_when_the_read_time_is_up() {
     h.state.body_limits = BodyLimits::new(std::time::Duration::from_millis(300));
     let token = paired(&h).await;
     let _wt = image_workspace(&h);
-    for path in ["/client/workspaces/site/image", "/client/workspaces/site/edit", "/client/pair"] {
+    for path in [
+        "/client/workspaces/site/image",
+        "/client/workspaces/site/edit",
+        "/client/pair",
+    ] {
         let (body, taken) = counted_body(0, true);
         let started = std::time::Instant::now();
         let (code, v) = tokio::time::timeout(
@@ -8700,10 +10949,20 @@ async fn a_body_that_stops_arriving_is_refused_when_the_read_time_is_up() {
         .await
         .unwrap_or_else(|_| panic!("{path}: a stalled body was waited on for good"));
         assert_eq!(code, 408, "{path}: {v}");
-        assert!(taken.load(Ordering::SeqCst) > 0, "{path}: the first chunk was read");
-        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{path}");
+        assert!(
+            taken.load(Ordering::SeqCst) > 0,
+            "{path}: the first chunk was read"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{path}"
+        );
     }
-    assert_eq!(h.state.body_limits.image_reads.available_permits(), IMAGE_READS, "no turn is kept");
+    assert_eq!(
+        h.state.body_limits.image_reads.available_permits(),
+        IMAGE_READS,
+        "no turn is kept"
+    );
 }
 
 /// (review) The decoded size is the real limit: a 10 MB image is taken
@@ -8717,17 +10976,30 @@ async fn a_ten_megabyte_image_as_a_swift_app_encodes_it_is_accepted() {
     let wt = image_workspace(&h);
     let mut jpeg = vec![0xFF; crate::client_image::MAX_IMAGE_BYTES];
     jpeg[1] = 0xD8;
-    let body = format!("{{\"name\":\"big.jpg\",\"data\":\"{}\"}}", swift_json_base64(&jpeg));
-    assert!(body.len() > 2 * jpeg.len(), "the worst case is being sent: {}", body.len());
+    let body = format!(
+        "{{\"name\":\"big.jpg\",\"data\":\"{}\"}}",
+        swift_json_base64(&jpeg)
+    );
+    assert!(
+        body.len() > 2 * jpeg.len(),
+        "the worst case is being sent: {}",
+        body.len()
+    );
     let (code, v) = add_image_raw(&h, &token, body).await;
     assert_eq!(code, 200, "{v}");
     let path = v["path"].as_str().unwrap();
-    assert!(std::fs::read(wt.join(path)).unwrap() == jpeg, "the bytes as sent");
+    assert!(
+        std::fs::read(wt.join(path)).unwrap() == jpeg,
+        "the bytes as sent"
+    );
     // A photo's bytes, encoded the same way, the way it most often is.
     let (code, v) = add_image_raw(
         &h,
         &token,
-        format!("{{\"name\":\"photo.jpg\",\"data\":\"{}\"}}", swift_json_base64(&photo(crate::client_image::MAX_IMAGE_BYTES))),
+        format!(
+            "{{\"name\":\"photo.jpg\",\"data\":\"{}\"}}",
+            swift_json_base64(&photo(crate::client_image::MAX_IMAGE_BYTES))
+        ),
     )
     .await;
     assert_eq!(code, 200, "{v}");
@@ -8742,7 +11014,12 @@ async fn an_image_one_byte_past_ten_megabytes_decoded_is_refused() {
     let wt = image_workspace(&h);
     let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
     let too_big = photo(crate::client_image::MAX_IMAGE_BYTES + 1);
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.jpg", "data": b64(&too_big)})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.jpg", "data": b64(&too_big)}),
+    )
+    .await;
     assert_eq!(code, 413, "{v}");
     assert_eq!(v["error"], "an image is at most 10 MiB", "{v}");
     assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
@@ -8755,7 +11032,10 @@ fn work_copy_state(wt: &Path) -> (String, String, String, String) {
     (
         run_git(Some(wt), &["rev-parse", "HEAD"]),
         run_git(Some(wt), &["ls-files", "--stage"]),
-        run_git(Some(wt), &["status", "--porcelain", "--untracked-files=all"]),
+        run_git(
+            Some(wt),
+            &["status", "--porcelain", "--untracked-files=all"],
+        ),
         std::fs::read_to_string(wt.join("page.html")).unwrap(),
     )
 }
@@ -8764,7 +11044,8 @@ fn work_copy_state(wt: &Path) -> (String, String, String, String) {
 /// the branch's ref while another `.lock` holds it.
 fn lock_branch(h: &Harness, wt: &Path) -> PathBuf {
     let branch = run_git(Some(wt), &["branch", "--show-current"]);
-    let lock = crate::client_git::clone_git_dir(&h.base, "site").join(format!("refs/heads/{branch}.lock"));
+    let lock =
+        crate::client_git::clone_git_dir(&h.base, "site").join(format!("refs/heads/{branch}.lock"));
     std::fs::write(&lock, "").unwrap();
     lock
 }
@@ -8779,10 +11060,25 @@ async fn an_image_whose_commit_fails_leaves_the_work_copy_as_it_was() {
     let wt = image_workspace(&h);
     let before = work_copy_state(&wt);
     let lock = lock_branch(&h, &wt);
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"}),
+    )
+    .await;
     assert_eq!(code, 409, "{v}");
-    assert!(v["error"].as_str().unwrap().contains("couldn't commit the image"), "{v}");
-    assert_eq!(work_copy_state(&wt), before, "HEAD, index, status and page as they were");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("couldn't commit the image"),
+        "{v}"
+    );
+    assert_eq!(
+        work_copy_state(&wt),
+        before,
+        "HEAD, index, status and page as they were"
+    );
     assert!(!wt.join("public").exists(), "the folders it made are gone");
     // A `public/` that was there (with a file of the site's) stays.
     std::fs::remove_file(&lock).unwrap();
@@ -8792,14 +11088,30 @@ async fn an_image_whose_commit_fails_leaves_the_work_copy_as_it_was() {
     run_git(Some(&wt), &["commit", "--quiet", "-m", "robots"]);
     let before = work_copy_state(&wt);
     let lock = lock_branch(&h, &wt);
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG)}),
+    )
+    .await;
     assert_eq!(code, 409, "{v}");
     assert_eq!(work_copy_state(&wt), before);
-    assert!(wt.join("public/robots.txt").exists(), "the site's folder stays");
-    assert!(!wt.join("public/images").exists(), "the folder it made is gone");
+    assert!(
+        wt.join("public/robots.txt").exists(),
+        "the site's folder stays"
+    );
+    assert!(
+        !wt.join("public/images").exists(),
+        "the folder it made is gone"
+    );
     // Once git can commit, the same image is added: nothing was left to refuse it.
     std::fs::remove_file(&lock).unwrap();
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG)}),
+    )
+    .await;
     assert_eq!(code, 200, "{v}");
     assert!(v["work_id"].is_string(), "{v}");
 }
@@ -8823,7 +11135,9 @@ async fn an_image_where_public_is_tracked_in_another_case_commits_where_git_file
     let h = harness();
     let token = paired(&h).await;
     let wt = image_workspace(&h);
-    if !case_insensitive(&wt) || run_git(Some(&wt), &["config", "--type=bool", "core.ignorecase"]) != "true" {
+    if !case_insensitive(&wt)
+        || run_git(Some(&wt), &["config", "--type=bool", "core.ignorecase"]) != "true"
+    {
         eprintln!("skipped: this filesystem tells names apart by case, so git files no path under another case");
         return;
     }
@@ -8833,17 +11147,36 @@ async fn an_image_where_public_is_tracked_in_another_case_commits_where_git_file
     run_git(Some(&wt), &["commit", "--quiet", "-m", "Public"]);
     let before = work_copy_state(&wt);
     let lock = lock_branch(&h, &wt);
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG)}),
+    )
+    .await;
     assert_eq!(code, 409, "{v}");
     assert_eq!(work_copy_state(&wt), before, "the index as it was");
-    assert!(!wt.join("Public/images").exists(), "the folder it made is gone");
+    assert!(
+        !wt.join("Public/images").exists(),
+        "the folder it made is gone"
+    );
     std::fs::remove_file(&lock).unwrap();
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG)}),
+    )
+    .await;
     assert_eq!(code, 200, "{v}");
     let path = v["path"].as_str().unwrap();
     assert!(path.starts_with("Public/images/a-"), "{path}");
-    assert!(run_git(Some(&wt), &["ls-files"]).lines().any(|l| l == path), "committed as {path}");
-    assert_eq!(run_git(Some(&wt), &["status", "--porcelain"]), "?? notes.txt");
+    assert!(
+        run_git(Some(&wt), &["ls-files"]).lines().any(|l| l == path),
+        "committed as {path}"
+    );
+    assert_eq!(
+        run_git(Some(&wt), &["status", "--porcelain"]),
+        "?? notes.txt"
+    );
 }
 
 /// (review) `replace` is a whole reference: `hero.jpg` is not found inside
@@ -8860,12 +11193,25 @@ async fn an_image_reference_is_a_whole_path_never_the_tail_of_a_longer_one() {
     };
     page("<img src=\"/assets/hero.jpg\">\n");
     let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "hero.jpg"})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "hero.jpg"}),
+    )
+    .await;
     assert_eq!((code, &v["matches"]), (200, &Value::from(0)), "{v}");
     assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
-    assert_eq!(std::fs::read_to_string(wt.join("page.html")).unwrap(), "<img src=\"/assets/hero.jpg\">\n");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("page.html")).unwrap(),
+        "<img src=\"/assets/hero.jpg\">\n"
+    );
     page("<img src=\"/hero.jpg\"><img src=\"/thumbs/hero.jpg\"><img src=\"/hero.jpg.bak\">\n");
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"}),
+    )
+    .await;
     assert_eq!((code, &v["matches"]), (200, &Value::from(1)), "{v}");
     let url = v["url"].as_str().unwrap();
     assert_eq!(
@@ -8884,10 +11230,21 @@ async fn an_image_is_refused_onto_a_referenced_file_with_uncommitted_changes() {
     let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
     let edited = "<img src=\"/hero.jpg\" alt=\"\">\n<p>edited by hand</p>\n";
     std::fs::write(wt.join("page.html"), edited).unwrap();
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"}),
+    )
+    .await;
     assert_eq!(code, 409, "{v}");
-    assert!(v["error"].as_str().unwrap().contains("aren't committed"), "{v}");
-    assert_eq!(std::fs::read_to_string(wt.join("page.html")).unwrap(), edited);
+    assert!(
+        v["error"].as_str().unwrap().contains("aren't committed"),
+        "{v}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("page.html")).unwrap(),
+        edited
+    );
     assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
     assert!(!wt.join("public").exists(), "no image written");
 }
@@ -8901,18 +11258,42 @@ async fn an_image_is_refused_in_a_busy_work_copy_or_over_a_different_file() {
     let wt = image_workspace(&h);
     let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
     let id = start_in(&h, &token, "site", "wait").await;
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG)}),
+    )
+    .await;
     assert_eq!(code, 409, "{v}");
-    assert!(v["error"].as_str().unwrap().contains("already working in this work copy"), "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("already working in this work copy"),
+        "{v}"
+    );
     assert!(!wt.join("public").exists(), "nothing written while busy");
     let _ = cancel(&h, Some(&token), &id).await;
     let _ = wait_done(&h, &token, &id).await;
-    let at = wt.join(crate::client_image::IMAGE_FOLDER).join(crate::client_image::file_name("a.png", PNG, "png"));
+    let at = wt
+        .join(crate::client_image::IMAGE_FOLDER)
+        .join(crate::client_image::file_name("a.png", PNG, "png"));
     std::fs::create_dir_all(at.parent().unwrap()).unwrap();
     std::fs::write(&at, b"another file").unwrap();
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG)}),
+    )
+    .await;
     assert_eq!(code, 409, "{v}");
-    assert!(v["error"].as_str().unwrap().contains("already holds a different file"), "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("already holds a different file"),
+        "{v}"
+    );
     assert_eq!(std::fs::read(&at).unwrap(), b"another file");
     assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
 }
@@ -8924,7 +11305,15 @@ fn index_only(wt: &Path, path: &str, text: &str) {
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::write(&file, text).unwrap();
     let sha = run_git(Some(wt), &["hash-object", "-w", path]);
-    run_git(Some(wt), &["update-index", "--add", "--cacheinfo", &format!("100644,{sha},{path}")]);
+    run_git(
+        Some(wt),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{sha},{path}"),
+        ],
+    );
 }
 
 /// The URL a page reaches `path` at: `path` without its first folder.
@@ -8941,7 +11330,9 @@ async fn an_image_where_the_index_holds_public_in_two_cases_commits_what_git_sta
     let h = harness();
     let token = paired(&h).await;
     let wt = image_workspace(&h);
-    if !case_insensitive(&wt) || run_git(Some(&wt), &["config", "--type=bool", "core.ignorecase"]) != "true" {
+    if !case_insensitive(&wt)
+        || run_git(Some(&wt), &["config", "--type=bool", "core.ignorecase"]) != "true"
+    {
         eprintln!("skipped: this filesystem tells names apart by case, so git files no path under another case");
         return;
     }
@@ -8950,20 +11341,36 @@ async fn an_image_where_the_index_holds_public_in_two_cases_commits_what_git_sta
     run_git(Some(&wt), &["commit", "--quiet", "-m", "two cases"]);
     let before = work_copy_state(&wt);
     let lock = lock_branch(&h, &wt);
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG)}),
+    )
+    .await;
     assert_eq!(code, 409, "{v}");
     assert_eq!(work_copy_state(&wt), before, "the index as it was");
     std::fs::remove_file(&lock).unwrap();
     for _ in 0..2 {
-        let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+        let (code, v) = add_image(
+            &h,
+            &token,
+            serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"}),
+        )
+        .await;
         assert_eq!(code, 200, "{v}");
         if v["work_id"].is_null() {
             continue;
         }
         let path = v["path"].as_str().unwrap();
-        assert!(run_git(Some(&wt), &["ls-files"]).lines().any(|l| l == path), "committed as {path}");
+        assert!(
+            run_git(Some(&wt), &["ls-files"]).lines().any(|l| l == path),
+            "committed as {path}"
+        );
         assert_eq!(v["url"], url_for(path), "{v}");
-        assert_eq!(run_git(Some(&wt), &["status", "--porcelain"]), "?? notes.txt");
+        assert_eq!(
+            run_git(Some(&wt), &["status", "--porcelain"]),
+            "?? notes.txt"
+        );
     }
 }
 
@@ -8978,7 +11385,12 @@ async fn an_images_url_follows_the_folder_it_was_filed_under() {
     let wt = image_workspace(&h);
     index_only(&wt, "public/IMAGES/old.png", "old\n");
     run_git(Some(&wt), &["commit", "--quiet", "-m", "old image"]);
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"}),
+    )
+    .await;
     assert_eq!(code, 200, "{v}");
     let path = v["path"].as_str().unwrap();
     assert_eq!(v["url"], url_for(path), "{v}");
@@ -8986,7 +11398,10 @@ async fn an_images_url_follows_the_folder_it_was_filed_under() {
         assert!(path.starts_with("public/IMAGES/a-"), "{path}");
     }
     let page = std::fs::read_to_string(wt.join("page.html")).unwrap();
-    assert!(page.contains(&format!("src=\"{}\"", url_for(path))), "{page}");
+    assert!(
+        page.contains(&format!("src=\"{}\"", url_for(path))),
+        "{page}"
+    );
 }
 
 /// (review) On a disk that tells case apart, a repository whose config
@@ -8999,17 +11414,31 @@ async fn an_image_git_would_file_elsewhere_on_a_case_sensitive_disk_is_refused()
     let token = paired(&h).await;
     let wt = image_workspace(&h);
     if case_insensitive(&wt) {
-        eprintln!("skipped: this filesystem ignores case (run with TMPDIR on a case-sensitive volume)");
+        eprintln!(
+            "skipped: this filesystem ignores case (run with TMPDIR on a case-sensitive volume)"
+        );
         return;
     }
     run_git(Some(&wt), &["config", "core.ignorecase", "true"]);
     index_only(&wt, "Public/x.txt", "x\n");
     run_git(Some(&wt), &["commit", "--quiet", "-m", "Public"]);
     let before = work_copy_state(&wt);
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"}),
+    )
+    .await;
     assert_eq!(code, 409, "{v}");
-    assert!(v["error"].as_str().unwrap().contains("core.ignorecase"), "{v}");
-    assert_eq!(work_copy_state(&wt), before, "HEAD, index, status and page as they were");
+    assert!(
+        v["error"].as_str().unwrap().contains("core.ignorecase"),
+        "{v}"
+    );
+    assert_eq!(
+        work_copy_state(&wt),
+        before,
+        "HEAD, index, status and page as they were"
+    );
     assert!(!wt.join("public").exists(), "nothing written");
 }
 
@@ -9028,10 +11457,23 @@ async fn an_image_whose_commit_fails_keeps_an_identical_image_already_staged() {
     run_git(Some(&wt), &["add", &at]);
     let before = work_copy_state(&wt);
     let lock = lock_branch(&h, &wt);
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"}),
+    )
+    .await;
     assert_eq!(code, 409, "{v}");
-    assert_eq!(work_copy_state(&wt), before, "still staged, as the person left it");
-    assert_eq!(std::fs::read(wt.join(&at)).unwrap(), PNG, "their file stays");
+    assert_eq!(
+        work_copy_state(&wt),
+        before,
+        "still staged, as the person left it"
+    );
+    assert_eq!(
+        std::fs::read(wt.join(&at)).unwrap(),
+        PNG,
+        "their file stays"
+    );
     // Other bytes staged at that name, the file since deleted: darkmux
     // writes and stages its image there, and a failed commit puts the
     // person's entry back as it was.
@@ -9040,7 +11482,12 @@ async fn an_image_whose_commit_fails_keeps_an_identical_image_already_staged() {
     index_only(&wt, &at, "theirs\n");
     std::fs::remove_file(wt.join(&at)).unwrap();
     let before = work_copy_state(&wt);
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"}),
+    )
+    .await;
     assert_eq!(code, 409, "{v}");
     assert_eq!(work_copy_state(&wt), before, "their staged entry as it was");
     assert!(!wt.join(&at).exists(), "the image darkmux wrote is gone");
@@ -9057,7 +11504,12 @@ async fn an_image_reference_in_the_pages_text_is_not_one_it_uses() {
     let text = "<img src=\"/hero.jpg\"> See hero.jpg, the hero.jpg.\n";
     std::fs::write(wt.join("page.html"), text).unwrap();
     run_git(Some(&wt), &["commit", "--quiet", "-am", "page"]);
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "hero.jpg"})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "hero.jpg"}),
+    )
+    .await;
     assert_eq!((code, &v["matches"]), (200, &Value::from(0)), "{v}");
     assert_eq!(std::fs::read_to_string(wt.join("page.html")).unwrap(), text);
 }
@@ -9080,8 +11532,15 @@ async fn an_image_reference_in_a_readme_is_never_edited_and_front_matter_is() {
     let (code, v) = add_image(&h, &token, body.clone()).await;
     assert_eq!((code, &v["matches"]), (200, &Value::from(0)), "{v}");
     assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
-    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), readme);
-    std::fs::write(wt.join("post.md"), "---\ntitle: Hello\nimage: /hero.jpg\n---\n\nWords.\n").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        readme
+    );
+    std::fs::write(
+        wt.join("post.md"),
+        "---\ntitle: Hello\nimage: /hero.jpg\n---\n\nWords.\n",
+    )
+    .unwrap();
     run_git(Some(&wt), &["add", "post.md"]);
     run_git(Some(&wt), &["commit", "--quiet", "-m", "post"]);
     let (code, v) = add_image(&h, &token, body).await;
@@ -9091,7 +11550,10 @@ async fn an_image_reference_in_a_readme_is_never_edited_and_front_matter_is() {
         std::fs::read_to_string(wt.join("post.md")).unwrap(),
         format!("---\ntitle: Hello\nimage: {url}\n---\n\nWords.\n")
     );
-    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), readme);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        readme
+    );
 }
 
 /// (review) A rollback that itself fails is never reported as one that
@@ -9105,14 +11567,25 @@ async fn an_image_whose_rollback_fails_says_the_work_copy_needs_attention() {
     let lock = crate::client_git::clone_git_dir(&h.base, "site").join("index.lock");
     let at = lock.clone();
     on_edit_commit(&wt, move || std::fs::write(&at, "").unwrap());
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG), "replace": "/hero.jpg"}),
+    )
+    .await;
     on_edit_commit(&wt, || {});
     std::fs::remove_file(&lock).unwrap();
     assert_eq!(code, 409, "{v}");
     let error = v["error"].as_str().unwrap();
     assert!(error.contains("couldn't commit the image"), "{error}");
-    assert!(error.contains("needs attention"), "the failed rollback is said: {error}");
-    assert!(error.contains("public/images/a-") && error.contains("page.html"), "what is left is named: {error}");
+    assert!(
+        error.contains("needs attention"),
+        "the failed rollback is said: {error}"
+    );
+    assert!(
+        error.contains("public/images/a-") && error.contains("page.html"),
+        "what is left is named: {error}"
+    );
 }
 
 /// (review) The documented limits, worked out here rather than read from
@@ -9133,7 +11606,9 @@ async fn an_image_already_tracked_in_another_case_commits_its_own_entry() {
     let token = paired(&h).await;
     let wt = image_workspace(&h);
     if case_insensitive(&wt) {
-        eprintln!("skipped: this filesystem ignores case (run with TMPDIR on a case-sensitive volume)");
+        eprintln!(
+            "skipped: this filesystem ignores case (run with TMPDIR on a case-sensitive volume)"
+        );
         return;
     }
     let name = crate::client_image::file_name("a.png", PNG, "png");
@@ -9142,11 +11617,22 @@ async fn an_image_already_tracked_in_another_case_commits_its_own_entry() {
     std::fs::write(wt.join(&theirs), PNG).unwrap();
     run_git(Some(&wt), &["add", &theirs]);
     run_git(Some(&wt), &["commit", "--quiet", "-m", "theirs"]);
-    let (code, v) = add_image(&h, &token, serde_json::json!({"name": "a.png", "data": b64(PNG)})).await;
+    let (code, v) = add_image(
+        &h,
+        &token,
+        serde_json::json!({"name": "a.png", "data": b64(PNG)}),
+    )
+    .await;
     assert_eq!(code, 200, "{v}");
     assert_eq!(v["path"], format!("public/images/{name}"), "{v}");
     let tracked = run_git(Some(&wt), &["ls-files"]);
-    assert!(tracked.lines().any(|l| l == theirs) && tracked.lines().any(|l| l == format!("public/images/{name}")), "{tracked}");
+    assert!(
+        tracked.lines().any(|l| l == theirs)
+            && tracked
+                .lines()
+                .any(|l| l == format!("public/images/{name}")),
+        "{tracked}"
+    );
 }
 
 // ─── (#3544) Pairing with no code: verified apps, and the Allow dialog ───
@@ -9156,7 +11642,9 @@ fn signed(team: &str, bundle: &str) -> darkmux_platform::SignedApp {
         team: team.into(),
         bundle: bundle.into(),
         signer: format!("Apple Development: Someone ({team})"),
-        icon: Some(PathBuf::from(format!("/Applications/{bundle}.app/Contents/Resources/AppIcon.icns"))),
+        icon: Some(PathBuf::from(format!(
+            "/Applications/{bundle}.app/Contents/Resources/AppIcon.icns"
+        ))),
     }
 }
 
@@ -9183,11 +11671,19 @@ impl Harness {
         self.trust.asked.lock().unwrap().clone()
     }
     fn status(&self, id: &str) -> Option<PendingStatus> {
-        self.store.read().unwrap().pending.iter().find(|p| p.request_id == id).map(|p| p.status)
+        self.store
+            .read()
+            .unwrap()
+            .pending
+            .iter()
+            .find(|p| p.request_id == id)
+            .map(|p| p.status)
     }
     fn set_pairing(&self, teams: &[&str], dialog: bool) {
-        *self.trust.policy.lock().unwrap() =
-            Ok(crate::client_trust::PairingPolicy { verified_teams: teams.iter().map(|t| t.to_string()).collect(), dialog });
+        *self.trust.policy.lock().unwrap() = Ok(crate::client_trust::PairingPolicy {
+            verified_teams: teams.iter().map(|t| t.to_string()).collect(),
+            dialog,
+        });
     }
 }
 
@@ -9224,9 +11720,15 @@ async fn a_verified_mux_bot_pairs_with_no_dialog_and_no_code() {
     let clients = list_clients(&h.store).unwrap();
     assert_eq!(
         clients[0].auto_approved,
-        Some(SigningIdentity { team: "5LDXYW8B6T".into(), bundle: "com.darklyenergized.darkmuxapp".into() })
+        Some(SigningIdentity {
+            team: "5LDXYW8B6T".into(),
+            bundle: "com.darklyenergized.darkmuxapp".into()
+        })
     );
-    assert_eq!(*h.trust.notices.lock().unwrap(), ["Mux Bot is now paired with darkmux on this Mac."]);
+    assert_eq!(
+        *h.trust.notices.lock().unwrap(),
+        ["Mux Bot is now paired with darkmux on this Mac."]
+    );
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(h.asked().is_empty(), "no dialog");
 }
@@ -9239,7 +11741,10 @@ async fn an_unverified_app_is_never_auto_approved() {
     let id = request_pairing(&h).await;
     let message = dialog_shown(&h, 1).await;
     assert_eq!(h.status(&id), Some(PendingStatus::Pending));
-    assert!(message.contains("Code 4F7-K2Q.") && message.contains("Not signed by a known developer."), "{message}");
+    assert!(
+        message.contains("Code 4F7-K2Q.") && message.contains("Not signed by a known developer."),
+        "{message}"
+    );
     assert!(h.trust.notices.lock().unwrap().is_empty());
 }
 
@@ -9254,7 +11759,10 @@ async fn an_unidentifiable_peer_is_never_auto_approved() {
     let id = v["request_id"].as_str().unwrap().to_string();
     let message = dialog_shown(&h, 1).await;
     assert_eq!(h.status(&id), Some(PendingStatus::Pending));
-    assert!(message.contains("Not signed by a known developer."), "{message}");
+    assert!(
+        message.contains("Not signed by a known developer."),
+        "{message}"
+    );
 }
 
 /// A verification that passes, then fails at the re-check just before
@@ -9267,7 +11775,10 @@ async fn a_verification_that_fails_at_the_recheck_does_not_approve() {
     let id = request_pairing(&h).await;
     let message = dialog_shown(&h, 1).await;
     assert_eq!(h.status(&id), Some(PendingStatus::Pending));
-    assert!(message.contains("Not signed by a known developer."), "{message}");
+    assert!(
+        message.contains("Not signed by a known developer."),
+        "{message}"
+    );
 }
 
 /// The re-check must find the same identity: a pid that verifies as
@@ -9288,7 +11799,10 @@ async fn a_sender_with_no_process_is_unverified() {
     let h = harness();
     h.app_signs_as(vec![Ok(mux_bot())]);
     let (sender, _) = crate::client_trust::sender_of(&h.state, &[]).await;
-    assert!(matches!(sender, crate::client_trust::Sender::Unverified(_)), "{sender:?}");
+    assert!(
+        matches!(sender, crate::client_trust::Sender::Unverified(_)),
+        "{sender:?}"
+    );
 }
 
 /// (#3544) A connection two processes hold never verifies, even when the
@@ -9303,7 +11817,10 @@ async fn a_connection_held_by_two_processes_never_verifies() {
     let id = v["request_id"].as_str().unwrap().to_string();
     let message = dialog_shown(&h, 1).await;
     assert_eq!(h.status(&id), Some(PendingStatus::Pending));
-    assert!(message.contains("Not signed by a known developer."), "{message}");
+    assert!(
+        message.contains("Not signed by a known developer."),
+        "{message}"
+    );
     assert!(h.trust.notices.lock().unwrap().is_empty());
 }
 
@@ -9314,9 +11831,15 @@ async fn two_holders_one_verified_is_not_trusted() {
     let h = harness();
     h.app_signs_as(vec![Ok(mux_bot())]);
     let (sender, _) = crate::client_trust::sender_of(&h.state, &[100, 555]).await;
-    assert!(matches!(sender, crate::client_trust::Sender::Unverified(ref why) if why.contains("held by 2 processes")), "{sender:?}");
+    assert!(
+        matches!(sender, crate::client_trust::Sender::Unverified(ref why) if why.contains("held by 2 processes")),
+        "{sender:?}"
+    );
     let (sender, _) = crate::client_trust::sender_of(&h.state, &[100]).await;
-    assert!(matches!(sender, crate::client_trust::Sender::Trusted(..)), "one holder verifies: {sender:?}");
+    assert!(
+        matches!(sender, crate::client_trust::Sender::Trusted(..)),
+        "one holder verifies: {sender:?}"
+    );
 }
 
 /// The re-check finds a second holder (the connection was shared after
@@ -9328,7 +11851,11 @@ async fn a_connection_shared_by_the_recheck_does_not_approve() {
     let looks = Arc::new(AtomicU64::new(0));
     let l = looks.clone();
     h.state.peer_processes = Arc::new(move |_bound, wanted| {
-        let holders = if l.fetch_add(1, Ordering::SeqCst) == 0 { vec![100] } else { vec![100, 555] };
+        let holders = if l.fetch_add(1, Ordering::SeqCst) == 0 {
+            vec![100]
+        } else {
+            vec![100, 555]
+        };
         Some(wanted.iter().map(|p| (*p, holders.clone())).collect())
     });
     let id = request_pairing(&h).await;
@@ -9354,13 +11881,20 @@ async fn a_connection_held_by_another_process_at_the_recheck_does_not_approve() 
     let looks = Arc::new(AtomicU64::new(0));
     let l = looks.clone();
     h.state.peer_processes = Arc::new(move |_bound, wanted| {
-        let pid = if l.fetch_add(1, Ordering::SeqCst) == 0 { 100 } else { 101 };
+        let pid = if l.fetch_add(1, Ordering::SeqCst) == 0 {
+            100
+        } else {
+            101
+        };
         Some(wanted.iter().map(|p| (*p, vec![pid])).collect())
     });
     let id = request_pairing(&h).await;
     let _ = dialog_shown(&h, 1).await;
     assert_eq!(h.status(&id), Some(PendingStatus::Pending));
-    assert!(looks.load(Ordering::SeqCst) >= 2, "the connection was looked up again");
+    assert!(
+        looks.load(Ordering::SeqCst) >= 2,
+        "the connection was looked up again"
+    );
 }
 
 /// An empty `clients.pairing.verified_teams` approves nothing on its own:
@@ -9411,7 +11945,10 @@ async fn each_dialog_answer_maps_to_its_outcome() {
         (A::Allow, Some(PendingStatus::Approved)),
         (A::DontAllow, Some(PendingStatus::Denied)),
         (A::NoAnswer, Some(PendingStatus::Pending)),
-        (A::NoDialog("no screen".into()), Some(PendingStatus::Pending)),
+        (
+            A::NoDialog("no screen".into()),
+            Some(PendingStatus::Pending),
+        ),
     ] {
         let h = harness();
         h.dialog_answers(answer.clone());
@@ -9437,10 +11974,20 @@ async fn allow_on_a_signed_app_remembers_it_and_it_pairs_at_once_next_time() {
     h.dialog_answers(darkmux_platform::AllowAnswer::Allow);
     let first = request_pairing(&h).await;
     let message = dialog_shown(&h, 1).await;
-    assert!(message.contains("com.example.muxfork") && message.contains("Allow pairs it now and next time."), "{message}");
+    assert!(
+        message.contains("com.example.muxfork")
+            && message.contains("Allow pairs it now and next time."),
+        "{message}"
+    );
     assert_eq!(h.status(&first), Some(PendingStatus::Approved));
     let remembered = remembered_apps(&h.store).unwrap();
-    assert_eq!(remembered.iter().map(|r| r.identity().to_string()).collect::<Vec<_>>(), ["AAAAAAAAAA/com.example.muxfork"]);
+    assert_eq!(
+        remembered
+            .iter()
+            .map(|r| r.identity().to_string())
+            .collect::<Vec<_>>(),
+        ["AAAAAAAAAA/com.example.muxfork"]
+    );
     assert!(poll(&h, &first, SECRET).await.1["token"].is_string());
 
     h.dialog_answers(darkmux_platform::AllowAnswer::NoAnswer);
@@ -9449,9 +11996,20 @@ async fn allow_on_a_signed_app_remembers_it_and_it_pairs_at_once_next_time() {
     assert!(v["token"].is_string(), "the second pairs at once: {v}");
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(h.asked().len(), 1, "no second dialog");
-    assert_eq!(*h.trust.notices.lock().unwrap(), ["com.example.muxfork is now paired with darkmux on this Mac."]);
-    let marked: Vec<_> = list_clients(&h.store).unwrap().into_iter().map(|c| c.auto_approved.is_some()).collect();
-    assert_eq!(marked, [false, true], "the dialog's approval is the operator's; the second is automatic");
+    assert_eq!(
+        *h.trust.notices.lock().unwrap(),
+        ["com.example.muxfork is now paired with darkmux on this Mac."]
+    );
+    let marked: Vec<_> = list_clients(&h.store)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.auto_approved.is_some())
+        .collect();
+    assert_eq!(
+        marked,
+        [false, true],
+        "the dialog's approval is the operator's; the second is automatic"
+    );
 }
 
 /// Allow on an app with no signature approves it once and remembers
@@ -9467,7 +12025,11 @@ async fn allow_on_an_unsigned_app_remembers_nothing() {
     assert!(remembered_apps(&h.store).unwrap().is_empty());
     let second = request_pairing(&h).await;
     let _ = dialog_shown(&h, 2).await;
-    assert_eq!(h.status(&second), Some(PendingStatus::Approved), "approved again by the second Allow, not on its own");
+    assert_eq!(
+        h.status(&second),
+        Some(PendingStatus::Approved),
+        "approved again by the second Allow, not on its own"
+    );
 }
 
 /// Container traffic (Docker's forwarder, which the platform never names
@@ -9475,7 +12037,12 @@ async fn allow_on_an_unsigned_app_remembers_nothing() {
 #[tokio::test]
 async fn container_traffic_is_never_remembered() {
     let h = harness();
-    h.trust.signed.lock().unwrap().insert(900, vec![Err("Docker Desktop's process: container traffic is never an app on this Mac".into())]);
+    h.trust.signed.lock().unwrap().insert(
+        900,
+        vec![Err(
+            "Docker Desktop's process: container traffic is never an app on this Mac".into(),
+        )],
+    );
     h.dialog_answers(darkmux_platform::AllowAnswer::Allow);
     let (code, _) = call(&h, pair_from(CONTAINER_PEER_PORTS, "C-1")).await;
     assert_eq!(code, 202);
@@ -9484,7 +12051,10 @@ async fn container_traffic_is_never_remembered() {
     h.dialog_answers(darkmux_platform::AllowAnswer::NoAnswer);
     let (_, v) = call(&h, pair_from(CONTAINER_PEER_PORTS + 1, "C-2")).await;
     let _ = dialog_shown(&h, 2).await;
-    assert_eq!(h.status(v["request_id"].as_str().unwrap()), Some(PendingStatus::Pending));
+    assert_eq!(
+        h.status(v["request_id"].as_str().unwrap()),
+        Some(PendingStatus::Pending)
+    );
 }
 
 /// A remembered identity is the pair (team, bundle id): another bundle
@@ -9492,10 +12062,16 @@ async fn container_traffic_is_never_remembered() {
 #[tokio::test]
 async fn a_remembered_identity_does_not_match_another_bundle_of_its_team() {
     let h = harness();
-    h.store.update(|f| {
-        f.remembered_apps.push(RememberedApp { team: "AAAAAAAAAA".into(), bundle: "com.example.muxfork".into(), allowed: 1 });
-        Ok(())
-    }).unwrap();
+    h.store
+        .update(|f| {
+            f.remembered_apps.push(RememberedApp {
+                team: "AAAAAAAAAA".into(),
+                bundle: "com.example.muxfork".into(),
+                allowed: 1,
+            });
+            Ok(())
+        })
+        .unwrap();
     h.app_signs_as(vec![Ok(signed("AAAAAAAAAA", "com.example.other"))]);
     let id = request_pairing(&h).await;
     let _ = dialog_shown(&h, 1).await;
@@ -9506,11 +12082,20 @@ async fn a_remembered_identity_does_not_match_another_bundle_of_its_team() {
 #[tokio::test]
 async fn forget_removes_a_remembered_app() {
     let h = harness();
-    let app = SigningIdentity { team: "AAAAAAAAAA".into(), bundle: "com.example.muxfork".into() };
-    h.store.update(|f| {
-        f.remembered_apps.push(RememberedApp { team: app.team.clone(), bundle: app.bundle.clone(), allowed: 1 });
-        Ok(())
-    }).unwrap();
+    let app = SigningIdentity {
+        team: "AAAAAAAAAA".into(),
+        bundle: "com.example.muxfork".into(),
+    };
+    h.store
+        .update(|f| {
+            f.remembered_apps.push(RememberedApp {
+                team: app.team.clone(),
+                bundle: app.bundle.clone(),
+                allowed: 1,
+            });
+            Ok(())
+        })
+        .unwrap();
     assert!(forget(&h.store, &app).unwrap());
     assert!(!forget(&h.store, &app).unwrap(), "already forgotten");
     h.app_signs_as(vec![Ok(fork())]);
@@ -9527,7 +12112,11 @@ async fn dialogs_never_block_the_listener_and_a_process_raises_at_most_its_bound
     let h = harness();
     h.trust.hold.store(true, Ordering::SeqCst);
     for i in 0..6u16 {
-        let answered = tokio::time::timeout(std::time::Duration::from_secs(2), call(&h, pair_from(CONTAINER_PEER_PORTS + i, "X"))).await;
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            call(&h, pair_from(CONTAINER_PEER_PORTS + i, "X")),
+        )
+        .await;
         assert_eq!(answered.expect("answered while the dialogs wait").0, 202);
     }
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -9545,12 +12134,20 @@ async fn dialogs_never_block_the_listener_and_a_process_raises_at_most_its_bound
 fn open_dialogs_are_bounded_per_process_and_in_all() {
     use crate::client_trust::{DialogSlots, MAX_OPEN_DIALOGS};
     let slots = Arc::new(DialogSlots::default());
-    let mine: Vec<_> = (0..PAIR_REQUESTS_PER_PROCESS).map(|_| slots.take(Some(1)).unwrap()).collect();
+    let mine: Vec<_> = (0..PAIR_REQUESTS_PER_PROCESS)
+        .map(|_| slots.take(Some(1)).unwrap())
+        .collect();
     assert!(slots.take(Some(1)).is_none(), "one process's bound");
-    let others: Vec<_> = (2..).take(MAX_OPEN_DIALOGS - mine.len()).map(|p| slots.take(Some(p)).unwrap()).collect();
+    let others: Vec<_> = (2..)
+        .take(MAX_OPEN_DIALOGS - mine.len())
+        .map(|p| slots.take(Some(p)).unwrap())
+        .collect();
     assert!(slots.take(Some(99)).is_none(), "the machine's bound");
     drop(mine);
-    assert!(slots.take(Some(1)).is_some(), "a closed dialog gives its place back");
+    assert!(
+        slots.take(Some(1)).is_some(),
+        "a closed dialog gives its place back"
+    );
     drop(others);
 }
 
@@ -9579,7 +12176,15 @@ async fn only_a_signed_apps_dialog_shows_its_own_icon() {
     let _ = request_pairing(&h).await;
     let _ = dialog_shown(&h, 2).await;
     let icons = h.trust.icons.lock().unwrap().clone();
-    assert_eq!(icons, [Some(PathBuf::from("/Applications/com.example.muxfork.app/Contents/Resources/AppIcon.icns")), None]);
+    assert_eq!(
+        icons,
+        [
+            Some(PathBuf::from(
+                "/Applications/com.example.muxfork.app/Contents/Resources/AppIcon.icns"
+            )),
+            None
+        ]
+    );
 }
 
 /// The app's own name for itself never reaches the dialog; the code does,
@@ -9593,7 +12198,10 @@ async fn the_apps_display_name_never_reaches_the_dialog() {
     let (code, _) = call(&h, post("/client/pair", None, body)).await;
     assert_eq!(code, 202);
     let message = dialog_shown(&h, 1).await;
-    assert!(!message.contains("do shell script") && !message.contains("Mux Bot"), "{message}");
+    assert!(
+        !message.contains("do shell script") && !message.contains("Mux Bot"),
+        "{message}"
+    );
 }
 
 /// `clients.pairing.*` is read from the config as it is now, with Mux
@@ -9607,10 +12215,23 @@ fn the_pairing_policy_is_read_fresh_with_its_defaults() {
         std::env::remove_var("DARKMUX_CLIENTS_PAIRING_VERIFIED_TEAMS");
         std::env::remove_var("DARKMUX_CLIENTS_PAIRING_DIALOG");
     }
-    let defaults = crate::client_trust::PairingPolicy { verified_teams: vec!["5LDXYW8B6T".into()], dialog: true };
+    let defaults = crate::client_trust::PairingPolicy {
+        verified_teams: vec!["5LDXYW8B6T".into()],
+        dialog: true,
+    };
     assert_eq!(read_pairing_policy_at(&path), Ok(defaults));
-    std::fs::write(&path, r#"{"clients": {"pairing": {"verified_teams": [], "dialog": false}}}"#).unwrap();
-    assert_eq!(read_pairing_policy_at(&path), Ok(crate::client_trust::PairingPolicy { verified_teams: vec![], dialog: false }));
+    std::fs::write(
+        &path,
+        r#"{"clients": {"pairing": {"verified_teams": [], "dialog": false}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        read_pairing_policy_at(&path),
+        Ok(crate::client_trust::PairingPolicy {
+            verified_teams: vec![],
+            dialog: false
+        })
+    );
 }
 
 /// `act_on_answer` against a request that expired meanwhile approves
@@ -9619,23 +12240,37 @@ fn the_pairing_policy_is_read_fresh_with_its_defaults() {
 fn an_allow_after_the_request_expired_approves_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let store = ClientStore::at(dir.path().join("clients.json"));
-    store.update(|f| {
-        f.pending.push(PendingRequest {
-            request_id: "r-1".into(),
-            device_name: "d".into(),
-            code: "C".into(),
-            pair_secret_hash: hash_hex(SECRET),
-            created: 1,
-            status: PendingStatus::Pending,
-            client_name: None,
-            client_id: None,
-            auto_approved: None,
-        });
-        Ok(())
-    }).unwrap();
-    let said = crate::client_trust::act_on_answer(&store, "r-1", 1 + PENDING_TTL_SECS + 1, darkmux_platform::AllowAnswer::Allow, Some(SigningIdentity { team: "A".into(), bundle: "b".into() }));
+    store
+        .update(|f| {
+            f.pending.push(PendingRequest {
+                request_id: "r-1".into(),
+                device_name: "d".into(),
+                code: "C".into(),
+                pair_secret_hash: hash_hex(SECRET),
+                created: 1,
+                status: PendingStatus::Pending,
+                client_name: None,
+                client_id: None,
+                auto_approved: None,
+            });
+            Ok(())
+        })
+        .unwrap();
+    let said = crate::client_trust::act_on_answer(
+        &store,
+        "r-1",
+        1 + PENDING_TTL_SECS + 1,
+        darkmux_platform::AllowAnswer::Allow,
+        Some(SigningIdentity {
+            team: "A".into(),
+            bundle: "b".into(),
+        }),
+    );
     assert!(said.contains("no longer pending"), "{said}");
-    assert!(store.read().unwrap().remembered_apps.is_empty(), "nothing remembered for an approval that did not happen");
+    assert!(
+        store.read().unwrap().remembered_apps.is_empty(),
+        "nothing remembered for an approval that did not happen"
+    );
 }
 
 #[test]
@@ -9654,11 +12289,23 @@ fn a_signing_identity_is_written_and_read_as_team_slash_bundle() {
 #[test]
 #[ignore = "reads this machine's real connections; pass DARKMUX_PEER_LISTENER"]
 fn peer_holders_live() {
-    let local: SocketAddr = std::env::var("DARKMUX_PEER_LISTENER").expect("DARKMUX_PEER_LISTENER").parse().unwrap();
-    let all = darkmux_platform::current().tcp_peers_of(local).expect("lsof answers");
+    let local: SocketAddr = std::env::var("DARKMUX_PEER_LISTENER")
+        .expect("DARKMUX_PEER_LISTENER")
+        .parse()
+        .unwrap();
+    let all = darkmux_platform::current()
+        .tcp_peers_of(local)
+        .expect("lsof answers");
     let peers: Vec<SocketAddr> = all.iter().map(|(p, _)| *p).collect();
     for (peer, holders) in peer_processes_here(Some(local), &peers).unwrap() {
-        println!("peer {peer}: held by {holders:?} -> {}", if holders.len() == 1 { "may verify" } else { "never verifies" });
+        println!(
+            "peer {peer}: held by {holders:?} -> {}",
+            if holders.len() == 1 {
+                "may verify"
+            } else {
+                "never verifies"
+            }
+        );
     }
 }
 
@@ -9672,9 +12319,22 @@ async fn allow_never_remembers_a_container_engine() {
     h.dialog_answers(darkmux_platform::AllowAnswer::Allow);
     let id = request_pairing(&h).await;
     let _ = dialog_shown(&h, 1).await;
-    assert_eq!(h.status(&id), Some(PendingStatus::Approved), "this one request is approved");
-    assert!(remembered_apps(&h.store).unwrap().is_empty(), "the engine is not remembered");
-    let said = crate::client_trust::act_on_answer(&h.store, "r-none", 1, darkmux_platform::AllowAnswer::Allow, None);
+    assert_eq!(
+        h.status(&id),
+        Some(PendingStatus::Approved),
+        "this one request is approved"
+    );
+    assert!(
+        remembered_apps(&h.store).unwrap().is_empty(),
+        "the engine is not remembered"
+    );
+    let said = crate::client_trust::act_on_answer(
+        &h.store,
+        "r-none",
+        1,
+        darkmux_platform::AllowAnswer::Allow,
+        None,
+    );
     assert!(said.contains("no pairing request"), "{said}");
 }
 
@@ -9689,17 +12349,29 @@ async fn the_dialog_shows_no_bidi_or_invisible_characters() {
     assert_eq!(code, 202);
     let message = dialog_shown(&h, 1).await;
     assert!(message.contains("Code 4F7-K2Q."), "{message}");
-    let app = darkmux_platform::SignedApp { signer: "Apple Development: \u{202E}evil".into(), ..fork() };
+    let app = darkmux_platform::SignedApp {
+        signer: "Apple Development: \u{202E}evil".into(),
+        ..fork()
+    };
     let shown = crate::client_trust::dialog_message("X", Some(&app));
-    assert!(shown.contains("Signed by Apple Development: evil,") && !shown.contains('\u{202E}'), "{shown}");
+    assert!(
+        shown.contains("Signed by Apple Development: evil,") && !shown.contains('\u{202E}'),
+        "{shown}"
+    );
 }
 
 /// (#3547 review) The dialog is every platform's (Linux's zenity too), so
 /// it names no one OS.
 #[test]
 fn the_pairing_dialog_names_no_one_platform() {
-    for shown in [crate::client_trust::dialog_message("X", None), crate::client_trust::dialog_message("X", Some(&fork()))] {
-        assert!(shown.starts_with("An app wants to use darkmux on this computer. Code X."), "{shown}");
+    for shown in [
+        crate::client_trust::dialog_message("X", None),
+        crate::client_trust::dialog_message("X", Some(&fork())),
+    ] {
+        assert!(
+            shown.starts_with("An app wants to use darkmux on this computer. Code X."),
+            "{shown}"
+        );
         assert!(!shown.contains("Mac"), "{shown}");
     }
 }
@@ -9718,6 +12390,9 @@ async fn an_auto_approval_is_the_approval_client_approve_makes() {
     assert_eq!(p.request_id, id);
     assert!(p.client_name.is_some() && p.client_id.is_some(), "{p:?}");
     assert!(p.auto_approved.is_some());
-    assert!(revoke(&h.store, p.client_name.as_deref().unwrap()).unwrap(), "revocable like any approval");
+    assert!(
+        revoke(&h.store, p.client_name.as_deref().unwrap()).unwrap(),
+        "revocable like any approval"
+    );
     assert_eq!(poll(&h, &id, SECRET).await.1["status"], "denied");
 }

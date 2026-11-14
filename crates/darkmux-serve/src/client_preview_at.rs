@@ -24,7 +24,9 @@ fn os_error() -> io::Error {
     let e = io::Error::last_os_error();
     match e.raw_os_error() {
         Some(libc::ELOOP) => io::Error::other("a symlink is on the way"),
-        Some(libc::ENOTDIR) => io::Error::other("a symlink or a file is on the way where a folder should be"),
+        Some(libc::ENOTDIR) => {
+            io::Error::other("a symlink or a file is on the way where a folder should be")
+        }
         _ => e,
     }
 }
@@ -34,10 +36,22 @@ fn cstr(name: &OsStr) -> io::Result<CString> {
 }
 
 /// `openat(dir, name)` with `O_NOFOLLOW | O_CLOEXEC` added.
-fn open_at(dir: RawFd, name: &OsStr, flags: libc::c_int, mode: libc::c_uint) -> io::Result<OwnedFd> {
+fn open_at(
+    dir: RawFd,
+    name: &OsStr,
+    flags: libc::c_int,
+    mode: libc::c_uint,
+) -> io::Result<OwnedFd> {
     let c = cstr(name)?;
     // SAFETY: a valid NUL-terminated name; the fd is checked before use.
-    let fd = unsafe { libc::openat(dir, c.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, mode) };
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            c.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            mode,
+        )
+    };
     if fd < 0 {
         return Err(os_error());
     }
@@ -127,7 +141,11 @@ impl Frame {
     fn open(dir: RawFd, name: &OsStr) -> io::Result<Frame> {
         let fd = open_at(dir, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
         let pending = names_in(&fd)?;
-        Ok(Frame { fd, name: name.to_os_string(), pending })
+        Ok(Frame {
+            fd,
+            name: name.to_os_string(),
+            pending,
+        })
     }
 }
 
@@ -193,14 +211,24 @@ fn parent_of(root: &Path, rel: &str) -> io::Result<(OwnedFd, OsString)> {
     let (last, folders) = parts.split_last().ok_or_else(|| invalid("an empty path"))?;
     let root = cstr(root.as_os_str())?;
     // SAFETY: a valid NUL-terminated path; the fd is checked before use.
-    let fd = unsafe { libc::open(root.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    let fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `open` just returned this fd.
     let mut at = unsafe { OwnedFd::from_raw_fd(fd) };
     for folder in folders {
-        at = open_at(at.as_raw_fd(), folder, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        at = open_at(
+            at.as_raw_fd(),
+            folder,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+        )?;
     }
     Ok((at, last.to_os_string()))
 }
@@ -215,7 +243,12 @@ pub(crate) fn remove(root: &Path, rel: &str) -> io::Result<()> {
 /// refused when anything is already there.
 pub(crate) fn create_new(root: &Path, rel: &str, mode: u32) -> io::Result<File> {
     let (dir, name) = parent_of(root, rel)?;
-    let fd = open_at(dir.as_raw_fd(), &name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, mode as libc::c_uint)?;
+    let fd = open_at(
+        dir.as_raw_fd(),
+        &name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        mode as libc::c_uint,
+    )?;
     Ok(File::from(fd))
 }
 
@@ -225,7 +258,12 @@ pub(crate) fn create_new(root: &Path, rel: &str, mode: u32) -> io::Result<File> 
 /// the folders it made, outermost first, so a later failure can take them
 /// out again ([`remove_empty_folder`]). A write that fails part way leaves
 /// nothing behind: the file is unlinked and the folders it made removed.
-pub(crate) fn write_new_making_folders(root: &Path, rel: &str, bytes: &[u8], mode: u32) -> io::Result<Vec<String>> {
+pub(crate) fn write_new_making_folders(
+    root: &Path,
+    rel: &str,
+    bytes: &[u8],
+    mode: u32,
+) -> io::Result<Vec<String>> {
     use io::Write;
     write_new_making_folders_with(root, rel, mode, |out| out.write_all(bytes))
 }
@@ -243,7 +281,12 @@ fn write_new_making_folders_with(
     let mut chain = vec![open_root(root)?];
     let first_made = make_folders(&mut chain, folders)?;
     let dir = chain.last().expect("the root").as_raw_fd();
-    let out = match open_at(dir, last, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, mode) {
+    let out = match open_at(
+        dir,
+        last,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        mode,
+    ) {
         Ok(fd) => File::from(fd),
         // Whatever is at `rel` is not this call's: it stays.
         Err(e) => return Err(unmade(&chain, folders, first_made, e)),
@@ -276,7 +319,11 @@ fn make_folders(chain: &mut Vec<OwnedFd>, folders: &[&OsStr]) -> io::Result<Opti
 
 /// Writes the new file `out` with `write`, sets its bits to `mode` (the
 /// umask may have narrowed what `O_CREAT` set), and syncs it.
-fn fill(mut out: File, mode: u32, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
+fn fill(
+    mut out: File,
+    mode: u32,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
     write(&mut out)?;
     out.set_permissions(std::fs::Permissions::from_mode(mode))?;
     out.sync_all()
@@ -285,7 +332,12 @@ fn fill(mut out: File, mode: u32, write: impl FnOnce(&mut File) -> io::Result<()
 /// Removes the folders a failed [`write_new_making_folders`] made (from
 /// `first_made` down, each through its parent's descriptor in `chain`),
 /// innermost first, and hands back `e`.
-fn unmade(chain: &[OwnedFd], folders: &[&OsStr], first_made: Option<usize>, e: io::Error) -> io::Error {
+fn unmade(
+    chain: &[OwnedFd],
+    folders: &[&OsStr],
+    first_made: Option<usize>,
+    e: io::Error,
+) -> io::Error {
     if let Some(first) = first_made {
         for i in (first..chain.len() - 1).rev() {
             let _ = unlink_at(chain[i].as_raw_fd(), folders[i], libc::AT_REMOVEDIR);
@@ -297,7 +349,13 @@ fn unmade(chain: &[OwnedFd], folders: &[&OsStr], first_made: Option<usize>, e: i
 /// The folders `folders[first..]` as paths from the root, outermost first.
 fn made_paths(folders: &[&OsStr], first: usize) -> Vec<String> {
     (first..folders.len())
-        .map(|i| folders[..=i].iter().map(|f| f.to_string_lossy()).collect::<Vec<_>>().join("/"))
+        .map(|i| {
+            folders[..=i]
+                .iter()
+                .map(|f| f.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
         .collect()
 }
 
@@ -323,7 +381,12 @@ fn plain_parts(rel: &str) -> io::Result<Vec<&OsStr>> {
 fn open_root(root: &Path) -> io::Result<OwnedFd> {
     let root = cstr(root.as_os_str())?;
     // SAFETY: a valid NUL-terminated path; the fd is checked before use.
-    let fd = unsafe { libc::open(root.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    let fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -372,13 +435,19 @@ pub(crate) fn open_regular(root: &Path, rel: &str) -> io::Result<(File, u32)> {
 /// a fresh file beside it, renamed over it in the folder the walk opened,
 /// so a link put there meanwhile is replaced, never written through. Its
 /// permission bits are kept.
-pub(crate) fn replace_regular(root: &Path, rel: &str, expected: &[u8], new: &[u8]) -> io::Result<()> {
+pub(crate) fn replace_regular(
+    root: &Path,
+    rel: &str,
+    expected: &[u8],
+    new: &[u8],
+) -> io::Result<()> {
     use io::Read;
     let (dir, name) = parent_of(root, rel)?;
     let file = regular_at(&dir, &name)?;
     let mode = file.metadata()?.mode() & 0o777;
     let mut held = Vec::with_capacity(expected.len());
-    file.take(expected.len() as u64 + 1).read_to_end(&mut held)?;
+    file.take(expected.len() as u64 + 1)
+        .read_to_end(&mut held)?;
     if held != expected {
         return Err(io::Error::other("it changed while darkmux read it"));
     }
@@ -402,7 +471,12 @@ fn write_new_at(dir: &OwnedFd, name: &OsStr, bytes: &[u8], mode: u32) -> io::Res
             return Err(e);
         }
     }
-    let mut out = File::from(open_at(dir.as_raw_fd(), name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, mode)?);
+    let mut out = File::from(open_at(
+        dir.as_raw_fd(),
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        mode,
+    )?);
     out.write_all(bytes)?;
     // The umask may have narrowed the bits `O_CREAT` set.
     out.set_permissions(std::fs::Permissions::from_mode(mode))?;
@@ -412,13 +486,20 @@ fn write_new_at(dir: &OwnedFd, name: &OsStr, bytes: &[u8], mode: u32) -> io::Res
 /// The regular file `name` in `dir`, opened read-only without following a
 /// link and without waiting on a FIFO.
 fn regular_at(dir: &OwnedFd, name: &OsStr) -> io::Result<File> {
-    let file = File::from(open_at(dir.as_raw_fd(), name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?);
+    let file = File::from(open_at(
+        dir.as_raw_fd(),
+        name,
+        libc::O_RDONLY | libc::O_NONBLOCK,
+        0,
+    )?);
     if !file.metadata()?.is_file() {
         return Err(invalid("not a regular file"));
     }
     // SAFETY: an fd we own; reads its flags and clears one.
     let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0 || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+    if flags < 0
+        || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0
+    {
         return Err(io::Error::last_os_error());
     }
     Ok(file)
@@ -461,9 +542,19 @@ mod tests {
             assert!(err.to_string().contains("symlink"), "{at}: {err}");
             let err = create_new(&root, "a/b/new", 0o600).unwrap_err();
             assert!(err.to_string().contains("symlink"), "{at}: {err}");
-            assert!(open_regular(&root, "a/b/c").is_err(), "{at}: read through the link");
-            assert!(replace_regular(&root, "a/b/c", b"x", b"y").is_err(), "{at}: replaced through the link");
-            assert_eq!(std::fs::read(outside.join("a/b/c")).unwrap(), b"x", "{at}: written outside");
+            assert!(
+                open_regular(&root, "a/b/c").is_err(),
+                "{at}: read through the link"
+            );
+            assert!(
+                replace_regular(&root, "a/b/c", b"x", b"y").is_err(),
+                "{at}: replaced through the link"
+            );
+            assert_eq!(
+                std::fs::read(outside.join("a/b/c")).unwrap(),
+                b"x",
+                "{at}: written outside"
+            );
             assert!(outside.join("a/b/c").exists(), "{at}: deleted outside");
             assert!(!outside.join("a/b/new").exists(), "{at}: created outside");
         }
@@ -482,20 +573,34 @@ mod tests {
             out.write_all(b"half")?;
             Err(io::Error::other("no space left on the device"))
         };
-        let err = write_new_making_folders_with(root, "public/images/deep/a.png", 0o644, half).unwrap_err();
+        let err = write_new_making_folders_with(root, "public/images/deep/a.png", 0o644, half)
+            .unwrap_err();
         assert!(err.to_string().contains("no space"), "{err}");
-        assert!(!root.join("public/images").exists(), "no folder it made is left");
-        assert!(root.join("public").is_dir(), "the folder that was there stays");
-        let made = write_new_making_folders(root, "public/images/deep/a.png", b"whole", 0o644).unwrap();
+        assert!(
+            !root.join("public/images").exists(),
+            "no folder it made is left"
+        );
+        assert!(
+            root.join("public").is_dir(),
+            "the folder that was there stays"
+        );
+        let made =
+            write_new_making_folders(root, "public/images/deep/a.png", b"whole", 0o644).unwrap();
         assert_eq!(made, ["public/images", "public/images/deep"]);
-        assert_eq!(std::fs::read(root.join("public/images/deep/a.png")).unwrap(), b"whole");
+        assert_eq!(
+            std::fs::read(root.join("public/images/deep/a.png")).unwrap(),
+            b"whole"
+        );
         // Made folders come out again once empty; one holding a file stays.
         std::fs::remove_file(root.join("public/images/deep/a.png")).unwrap();
         std::fs::write(root.join("public/keep"), "").unwrap();
         for f in made.iter().rev() {
             remove_empty_folder(root, f).unwrap();
         }
-        assert!(remove_empty_folder(root, "public").is_err(), "a folder holding a file is left");
+        assert!(
+            remove_empty_folder(root, "public").is_err(),
+            "a folder holding a file is left"
+        );
         assert!(root.join("public/keep").exists());
     }
 
@@ -505,13 +610,28 @@ mod tests {
         let (root, outside) = (dir.path().join("root"), dir.path().join("outside"));
         std::fs::create_dir_all(root.join("a")).unwrap();
         std::fs::write(root.join("a/run.sh"), "old").unwrap();
-        std::fs::set_permissions(root.join("a/run.sh"), std::fs::Permissions::from_mode(0o766)).unwrap();
+        std::fs::set_permissions(
+            root.join("a/run.sh"),
+            std::fs::Permissions::from_mode(0o766),
+        )
+        .unwrap();
         // A leftover temp file from an edit that never finished is replaced.
         std::fs::write(root.join("a/.run.sh.darkmux-edit"), "stale").unwrap();
         replace_regular(&root, "a/run.sh", b"old", b"new").unwrap();
         assert_eq!(std::fs::read(root.join("a/run.sh")).unwrap(), b"new");
-        assert_eq!(std::fs::metadata(root.join("a/run.sh")).unwrap().permissions().mode() & 0o777, 0o766);
-        assert_eq!(std::fs::read_dir(root.join("a")).unwrap().count(), 1, "no temp file is left");
+        assert_eq!(
+            std::fs::metadata(root.join("a/run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o766
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("a")).unwrap().count(),
+            1,
+            "no temp file is left"
+        );
         // Not what was read: nothing is written.
         let err = replace_regular(&root, "a/run.sh", b"old", b"other").unwrap_err();
         assert!(err.to_string().contains("changed"), "{err}");
@@ -534,10 +654,19 @@ mod tests {
         std::fs::write(outside.join("deps/keep"), "x").unwrap();
         std::fs::create_dir_all(&root).unwrap();
         std::os::unix::fs::symlink(outside.join("deps"), root.join("deps")).unwrap();
-        assert!(open_regular(&root, "deps").is_err(), "opened through the link");
-        assert!(create_new(&root, "deps", 0o600).is_err(), "created through the link");
+        assert!(
+            open_regular(&root, "deps").is_err(),
+            "opened through the link"
+        );
+        assert!(
+            create_new(&root, "deps", 0o600).is_err(),
+            "created through the link"
+        );
         remove(&root, "deps").unwrap();
-        assert!(std::fs::symlink_metadata(root.join("deps")).is_err(), "the link is gone");
+        assert!(
+            std::fs::symlink_metadata(root.join("deps")).is_err(),
+            "the link is gone"
+        );
         assert!(outside.join("deps/keep").exists(), "followed the link");
     }
 
@@ -549,9 +678,18 @@ mod tests {
         let name = std::ffi::CString::new("deep").unwrap();
         for _ in 0..depth {
             // SAFETY: valid fd and name.
-            assert_eq!(unsafe { libc::mkdirat(at.as_raw_fd(), name.as_ptr(), 0o700) }, 0);
+            assert_eq!(
+                unsafe { libc::mkdirat(at.as_raw_fd(), name.as_ptr(), 0o700) },
+                0
+            );
             // SAFETY: valid fd and name; the result is checked.
-            let fd = unsafe { libc::openat(at.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+            let fd = unsafe {
+                libc::openat(
+                    at.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                )
+            };
             assert!(fd >= 0);
             // SAFETY: a fresh fd.
             at = unsafe { File::from_raw_fd(fd) };
@@ -584,7 +722,10 @@ mod tests {
     fn a_tree_as_deep_as_the_walk_takes_is_removed() {
         let (dir, removed) = remove_nested(MAX_DELETE_DEPTH);
         removed.unwrap();
-        assert!(std::fs::symlink_metadata(dir.path().join("root/deep")).is_err(), "the tree is gone");
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("root/deep")).is_err(),
+            "the tree is gone"
+        );
     }
 
     /// A run can build a tree far deeper than [`MAX_DELETE_DEPTH`] (a
@@ -605,7 +746,10 @@ mod tests {
         let err = removed.unwrap_err();
         assert!(err.to_string().contains("deeper than"), "{err}");
         let after = open_fds();
-        assert!(after < before + MAX_DELETE_DEPTH / 2, "descriptors left open: {before} before, {after} after");
+        assert!(
+            after < before + MAX_DELETE_DEPTH / 2,
+            "descriptors left open: {before} before, {after} after"
+        );
     }
 
     /// A path that is not plain names, a root that is not there, a NUL in a
@@ -619,9 +763,20 @@ mod tests {
             let err = remove(dir.path(), bad).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}: {err}");
         }
-        assert_eq!(remove(&dir.path().join("missing"), "keep").unwrap_err().kind(), io::ErrorKind::NotFound);
-        assert_eq!(remove(dir.path(), "ke\0ep").unwrap_err().kind(), io::ErrorKind::InvalidInput);
-        assert!(create_new(dir.path(), "missing/new", 0o600).is_err(), "a missing folder on the way");
+        assert_eq!(
+            remove(&dir.path().join("missing"), "keep")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            remove(dir.path(), "ke\0ep").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(
+            create_new(dir.path(), "missing/new", 0o600).is_err(),
+            "a missing folder on the way"
+        );
         assert!(dir.path().join("keep").exists());
     }
 
@@ -654,7 +809,9 @@ mod tests {
         std::thread::spawn(move || {
             let _ = tx.send(open_regular(&root, ".env").map(|_| ()));
         });
-        let out = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("opening the FIFO blocked");
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opening the FIFO blocked");
         assert!(out.is_err(), "a FIFO is not a regular file");
     }
 
@@ -669,7 +826,10 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("deps/x/out")).unwrap();
         remove(&root, "deps").unwrap();
         assert!(!root.join("deps").exists());
-        assert!(outside.join("keep").exists(), "followed a link inside the tree");
+        assert!(
+            outside.join("keep").exists(),
+            "followed a link inside the tree"
+        );
         remove(&root, "deps").unwrap();
         std::fs::write(root.join("src"), "body").unwrap();
         let (mut from, mode) = open_regular(&root, "src").unwrap();

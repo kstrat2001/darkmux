@@ -110,12 +110,24 @@ pub(crate) struct StreamRedactor {
 impl StreamRedactor {
     /// For a body that claims to be JSON.
     pub(crate) fn json(r: Arc<Redaction>) -> Self {
-        Self { r, scan: Scan::Between, kinds: KindStack::default(), objects: Vec::new(), pending: Vec::new(), escaped: false, #[cfg(test)] high_water: 0 }
+        Self {
+            r,
+            scan: Scan::Between,
+            kinds: KindStack::default(),
+            objects: Vec::new(),
+            pending: Vec::new(),
+            escaped: false,
+            #[cfg(test)]
+            high_water: 0,
+        }
     }
 
     /// For a route declared non-JSON: redacted a line at a time.
     pub(crate) fn text(r: Arc<Redaction>) -> Self {
-        Self { scan: Scan::Text, ..Self::json(r) }
+        Self {
+            scan: Scan::Text,
+            ..Self::json(r)
+        }
     }
 
     /// Redact the next chunk of the body into `out`. A JSON body that turns out
@@ -192,7 +204,10 @@ impl StreamRedactor {
     }
 
     fn bare_step(&mut self, rest: &[u8], out: &mut Vec<u8>) -> Result<usize, Malformed> {
-        let n = rest.iter().position(|&b| is_delimiter(b)).unwrap_or(rest.len());
+        let n = rest
+            .iter()
+            .position(|&b| is_delimiter(b))
+            .unwrap_or(rest.len());
         self.pending.extend_from_slice(&rest[..n]);
         if n < rest.len() {
             if !is_json_scalar(&self.pending) {
@@ -225,7 +240,10 @@ impl StreamRedactor {
     fn open(&mut self, b: u8, out: &mut Vec<u8>) {
         self.kinds.push(b == b'{');
         if b == b'{' {
-            self.objects.push(Object { keys: HashMap::new(), expect_key: true });
+            self.objects.push(Object {
+                keys: HashMap::new(),
+                expect_key: true,
+            });
         }
         out.push(b);
     }
@@ -258,7 +276,11 @@ impl StreamRedactor {
         self.scan = Scan::Between;
         let redacted = redact_text(&text, &self.r);
         let changed = matches!(redacted, Cow::Owned(_));
-        let key_slot = if self.kinds.last() == Some(true) { self.objects.last_mut().filter(|o| o.expect_key) } else { None };
+        let key_slot = if self.kinds.last() == Some(true) {
+            self.objects.last_mut().filter(|o| o.expect_key)
+        } else {
+            None
+        };
         let name = match key_slot {
             Some(o) => unique_key(&mut o.keys, redacted.into_owned(), changed),
             None => redacted.into_owned(),
@@ -286,7 +308,10 @@ fn key_hash(key: &str) -> u64 {
 fn unique_key(keys: &mut HashMap<u64, bool>, name: String, changed: bool) -> String {
     let mut key = name.clone();
     let mut n = 2;
-    while keys.get(&key_hash(&key)).is_some_and(|&earlier_changed| earlier_changed || changed) {
+    while keys
+        .get(&key_hash(&key))
+        .is_some_and(|&earlier_changed| earlier_changed || changed)
+    {
         key = format!("{name} #{n}");
         n += 1;
     }
@@ -295,7 +320,10 @@ fn unique_key(keys: &mut HashMap<u64, bool>, name: String, changed: bool) -> Str
 }
 
 fn is_delimiter(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'{' | b'}' | b'[' | b']' | b',' | b':')
+    matches!(
+        b,
+        b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'{' | b'}' | b'[' | b']' | b',' | b':'
+    )
 }
 
 /// A bare JSON token: a number, `true`, `false` or `null`. The grammar is
@@ -352,7 +380,11 @@ mod tests {
 
     /// Run a body through the streaming redactor in chunks of `size` bytes.
     fn try_stream(body: &[u8], size: usize, json_mode: bool) -> (Vec<u8>, Result<(), Malformed>) {
-        let mut s = if json_mode { StreamRedactor::json(rules()) } else { StreamRedactor::text(rules()) };
+        let mut s = if json_mode {
+            StreamRedactor::json(rules())
+        } else {
+            StreamRedactor::text(rules())
+        };
         let mut out = Vec::new();
         for c in body.chunks(size) {
             if let Err(e) = s.feed(c, &mut out) {
@@ -392,7 +424,8 @@ mod tests {
             oracle(&r, &mut want);
             for size in [1, 2, 3, 7, 64, body.len().max(1)] {
                 let out = stream(body.as_bytes(), size, true);
-                let got: Value = serde_json::from_slice(&out).unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out)));
+                let got: Value = serde_json::from_slice(&out)
+                    .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out)));
                 assert_eq!(got, want, "chunk {size}: {body}");
             }
         }
@@ -406,15 +439,25 @@ mod tests {
 
     #[test]
     fn keys_that_redact_alike_all_survive() {
-        let body = json!({"100.64.7.7": 1, "10.0.0.1": 2, "(address hidden)": 3, "ok": 4}).to_string();
+        let body =
+            json!({"100.64.7.7": 1, "10.0.0.1": 2, "(address hidden)": 3, "ok": 4}).to_string();
         let out: Value = serde_json::from_slice(&stream(body.as_bytes(), 5, true)).unwrap();
         let o = out.as_object().unwrap();
         let mut got: Vec<i64> = o.values().map(|x| x.as_i64().unwrap()).collect();
         got.sort();
         assert_eq!(got, [1, 2, 3, 4], "{out}");
-        assert!(o.contains_key(ADDRESS_HIDDEN) && o.contains_key(&format!("{ADDRESS_HIDDEN} #2")) && o.contains_key(&format!("{ADDRESS_HIDDEN} #3")), "{out}");
+        assert!(
+            o.contains_key(ADDRESS_HIDDEN)
+                && o.contains_key(&format!("{ADDRESS_HIDDEN} #2"))
+                && o.contains_key(&format!("{ADDRESS_HIDDEN} #3")),
+            "{out}"
+        );
         let again: Value = serde_json::from_slice(&stream(br#"{"a":1,"a":2}"#, 4, true)).unwrap();
-        assert_eq!(again, json!({"a": 2}), "a duplicate the caller sent stays a duplicate");
+        assert_eq!(
+            again,
+            json!({"a": 2}),
+            "a duplicate the caller sent stays a duplicate"
+        );
     }
 
     /// Only a KEY is suffixed when it redacts like an earlier one: a value
@@ -422,10 +465,16 @@ mod tests {
     /// redacted, in every object and at every chunking.
     #[test]
     fn a_value_that_redacts_like_a_key_is_never_suffixed() {
-        let body = json!({"100.64.7.7": "10.0.0.1", "n": {"10.0.0.1": 1, "b": ["x"], "c": "100.64.7.7"}}).to_string();
+        let body =
+            json!({"100.64.7.7": "10.0.0.1", "n": {"10.0.0.1": 1, "b": ["x"], "c": "100.64.7.7"}})
+                .to_string();
         for size in [1, 3, body.len()] {
             let out: Value = serde_json::from_slice(&stream(body.as_bytes(), size, true)).unwrap();
-            assert_eq!(out, json!({ADDRESS_HIDDEN: ADDRESS_HIDDEN, "n": {ADDRESS_HIDDEN: 1, "b": ["x"], "c": ADDRESS_HIDDEN}}), "chunk {size}");
+            assert_eq!(
+                out,
+                json!({ADDRESS_HIDDEN: ADDRESS_HIDDEN, "n": {ADDRESS_HIDDEN: 1, "b": ["x"], "c": ADDRESS_HIDDEN}}),
+                "chunk {size}"
+            );
         }
     }
 
@@ -446,17 +495,32 @@ mod tests {
                 let (out, end) = try_stream(body.as_bytes(), size, true);
                 let out = String::from_utf8(out).unwrap();
                 assert!(end.is_err(), "chunk {size}: not an error: {body}");
-                assert!(!out.contains(IP) && !out.contains("/Users/") && !out.contains("kfake"), "chunk {size}: leaked in {out}");
+                assert!(
+                    !out.contains(IP) && !out.contains("/Users/") && !out.contains("kfake"),
+                    "chunk {size}: leaked in {out}"
+                );
             }
         }
-        let out = String::from_utf8(stream(format!("failed at {IP}\nnext {IP}").as_bytes(), 3, false)).unwrap();
-        assert_eq!(out, format!("failed at {ADDRESS_HIDDEN}\nnext {ADDRESS_HIDDEN}"));
+        let out = String::from_utf8(stream(
+            format!("failed at {IP}\nnext {IP}").as_bytes(),
+            3,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            out,
+            format!("failed at {ADDRESS_HIDDEN}\nnext {ADDRESS_HIDDEN}")
+        );
     }
 
     #[test]
     fn nesting_of_any_depth_stays_json_with_one_bit_per_level() {
         let depth = 200_000;
-        let body = format!("{}\"err\\n/Users/someone/x\\t{IP}\"{}", "[".repeat(depth), "]".repeat(depth));
+        let body = format!(
+            "{}\"err\\n/Users/someone/x\\t{IP}\"{}",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
         let mut s = StreamRedactor::json(rules());
         let mut out = Vec::new();
         for c in body.as_bytes().chunks(4096) {
@@ -465,14 +529,24 @@ mod tests {
         s.finish(&mut out).unwrap();
         assert!(s.kinds.words.is_empty(), "closed again");
         let out = String::from_utf8(out).unwrap();
-        assert!(!out.contains(IP) && !out.contains("/Users/") && out.starts_with("[[[") && out.ends_with("]]]"));
+        assert!(
+            !out.contains(IP)
+                && !out.contains("/Users/")
+                && out.starts_with("[[[")
+                && out.ends_with("]]]")
+        );
     }
 
     #[test]
     fn a_mismatched_bracket_is_an_error() {
         for body in [r#"["a"}"#, r#"{"a":1]"#, "]", r#"{"a":bad}"#] {
             let mut s = StreamRedactor::json(rules());
-            assert!(s.feed(body.as_bytes(), &mut Vec::new()).and_then(|()| s.finish(&mut Vec::new())).is_err(), "{body}");
+            assert!(
+                s.feed(body.as_bytes(), &mut Vec::new())
+                    .and_then(|()| s.finish(&mut Vec::new()))
+                    .is_err(),
+                "{body}"
+            );
         }
     }
 
@@ -504,6 +578,11 @@ mod tests {
         s.feed(b"]", &mut out).unwrap();
         s.finish(&mut out).unwrap();
         assert!(sent >= 100_000_000);
-        assert!(s.high_water <= record.len(), "peak buffer {} over one record {}", s.high_water, record.len());
+        assert!(
+            s.high_water <= record.len(),
+            "peak buffer {} over one record {}",
+            s.high_water,
+            record.len()
+        );
     }
 }

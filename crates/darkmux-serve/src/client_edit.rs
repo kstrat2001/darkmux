@@ -25,7 +25,9 @@ const ENTITIES: &[(&str, char)] = &[
 /// The file types whose source a page shows decoded, where `&`, `<`, `>`,
 /// `{` or `}` typed as text would read as markup or code: HTML, the
 /// templates and JSX built on it, and Markdown, which passes HTML through.
-const MARKUP: &[&str] = &["html", "htm", "vue", "svelte", "astro", "jsx", "tsx", "mdx", "md", "markdown"];
+const MARKUP: &[&str] = &[
+    "html", "htm", "vue", "svelte", "astro", "jsx", "tsx", "mdx", "md", "markdown",
+];
 
 /// `new`, the text a page is to show, as source for `file`. In a markup
 /// file ([`MARKUP`]) the characters that would read as markup or code are
@@ -33,7 +35,10 @@ const MARKUP: &[&str] = &["html", "htm", "vue", "svelte", "astro", "jsx", "tsx",
 /// reads back); quotes stay as typed, since in text they are only text.
 /// In any other file it is written as sent.
 pub fn as_source(file: &str, new: &str) -> String {
-    let ext = file.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    let ext = file
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
     if !MARKUP.contains(&ext.as_str()) {
         return new.to_string();
     }
@@ -107,8 +112,18 @@ pub fn find(source: &str, wanted: &str, limit: usize) -> Vec<(usize, usize)> {
 /// [`normalize`]d) and that `used` accepts, given each match's source span:
 /// [`crate::client_image_ref::find_reference`] asks whether a site uses a
 /// URL there.
-pub(crate) fn spans_of(source: &str, wanted: &str, limit: usize, used: impl Fn(usize, usize) -> bool) -> Vec<(usize, usize)> {
-    find_where(source, wanted, limit, &|page: &[Shown], _: &[char], at: usize, end: usize| used(page[at].1, page[end - 1].2))
+pub(crate) fn spans_of(
+    source: &str,
+    wanted: &str,
+    limit: usize,
+    used: impl Fn(usize, usize) -> bool,
+) -> Vec<(usize, usize)> {
+    find_where(
+        source,
+        wanted,
+        limit,
+        &|page: &[Shown], _: &[char], at: usize, end: usize| used(page[at].1, page[end - 1].2),
+    )
 }
 
 /// One rendered char of a page, with the source bytes it came from.
@@ -120,12 +135,7 @@ type Whole<'a> = dyn Fn(&[Shown], &[char], usize, usize) -> bool + 'a;
 
 /// The spans where `wanted` is the rendered text and `whole` says the match
 /// at `at..end` stands on its own.
-fn find_where(
-    source: &str,
-    wanted: &str,
-    limit: usize,
-    whole: &Whole,
-) -> Vec<(usize, usize)> {
+fn find_where(source: &str, wanted: &str, limit: usize, whole: &Whole) -> Vec<(usize, usize)> {
     let want: Vec<char> = wanted.chars().collect();
     let page = rendered(source);
     let mut found = Vec::new();
@@ -139,7 +149,13 @@ fn find_where(
             break;
         }
         let end = at + want.len();
-        if at >= free && page[at..end].iter().map(|(c, _, _)| *c).eq(want.iter().copied()) && whole(&page, &want, at, end) {
+        if at >= free
+            && page[at..end]
+                .iter()
+                .map(|(c, _, _)| *c)
+                .eq(want.iter().copied())
+            && whole(&page, &want, at, end)
+        {
             found.push((page[at].1, page[end - 1].2));
             free = end;
         }
@@ -150,7 +166,10 @@ fn find_where(
 /// Whether `want`, found at `at..end`, is whole words: a letter or digit
 /// on either side of one it starts or ends with cuts it.
 fn whole_words(page: &[Shown], want: &[char], at: usize, end: usize) -> bool {
-    let alnum = |i: Option<usize>| i.and_then(|i| page.get(i)).is_some_and(|(c, _, _)| c.is_alphanumeric());
+    let alnum = |i: Option<usize>| {
+        i.and_then(|i| page.get(i))
+            .is_some_and(|(c, _, _)| c.is_alphanumeric())
+    };
     let cut_word = (want[0].is_alphanumeric() && alnum(at.checked_sub(1)))
         || (want[want.len() - 1].is_alphanumeric() && alnum(Some(end)));
     !cut_word
@@ -168,8 +187,14 @@ mod tests {
     /// A hand edit's words still end at a slash or a dot, as prose does.
     #[test]
     fn a_hand_edits_words_end_at_a_slash_or_a_dot() {
-        assert_eq!(one("<p>tea/coffee</p>", "coffee").as_deref(), Some("coffee"));
-        assert_eq!(one("<p>See hero.jpg.</p>", "hero.jpg").as_deref(), Some("hero.jpg"));
+        assert_eq!(
+            one("<p>tea/coffee</p>", "coffee").as_deref(),
+            Some("coffee")
+        );
+        assert_eq!(
+            one("<p>See hero.jpg.</p>", "hero.jpg").as_deref(),
+            Some("hero.jpg")
+        );
     }
 
     #[test]
@@ -231,10 +256,23 @@ mod tests {
     fn typed_text_is_written_as_text_in_markup_files_only() {
         let typed = "Tea <b>&</b> {cake} \"it's\"";
         let escaped = "Tea &lt;b&gt;&amp;&lt;/b&gt; &#123;cake&#125; \"it's\"";
-        for file in ["a.html", "b/c.HTM", "x.vue", "x.svelte", "x.astro", "App.jsx", "App.tsx", "p.mdx", "README.md", "n.markdown"] {
+        for file in [
+            "a.html",
+            "b/c.HTM",
+            "x.vue",
+            "x.svelte",
+            "x.astro",
+            "App.jsx",
+            "App.tsx",
+            "p.mdx",
+            "README.md",
+            "n.markdown",
+        ] {
             assert_eq!(as_source(file, typed), escaped, "{file}");
         }
-        for file in ["a.txt", "app.js", "app.ts", "s.css", "d.json", "Makefile", "html"] {
+        for file in [
+            "a.txt", "app.js", "app.ts", "s.css", "d.json", "Makefile", "html",
+        ] {
             assert_eq!(as_source(file, typed), typed, "{file}");
         }
     }
@@ -242,7 +280,10 @@ mod tests {
     #[test]
     fn escaped_text_is_found_by_what_the_page_shows() {
         let src = format!("<p>{}</p>", as_source("a.html", "{a} & <b>"));
-        assert_eq!(one(&src, "{a} & <b>").as_deref(), Some("&#123;a&#125; &amp; &lt;b&gt;"));
+        assert_eq!(
+            one(&src, "{a} & <b>").as_deref(),
+            Some("&#123;a&#125; &amp; &lt;b&gt;")
+        );
     }
 
     #[test]
@@ -253,7 +294,10 @@ mod tests {
         assert_eq!(find("a a a", "a", 9).len(), 3);
         assert_eq!(find("x &amp;", "&", 2), vec![(2, 7)]);
         // A no-break space entity and the spaces after it are one run.
-        assert_eq!(one("Hi&nbsp;\n there", "Hi there").as_deref(), Some("Hi&nbsp;\n there"));
+        assert_eq!(
+            one("Hi&nbsp;\n there", "Hi there").as_deref(),
+            Some("Hi&nbsp;\n there")
+        );
     }
 
     #[test]

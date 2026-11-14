@@ -31,16 +31,15 @@
 #[cfg(test)]
 mod tests {
     use crate::mission_graph::{
-        EdgeKind, GraphEdge, GraphNode, GraphNodeStatus, MissionGraph, NodeKind, PhaseDisplayStatus, StepRow,
-        TaskDisplayStatus,
+        EdgeKind, GraphEdge, GraphNode, GraphNodeStatus, MissionGraph, NodeKind,
+        PhaseDisplayStatus, StepRow, TaskDisplayStatus,
     };
-    use darkmux_crew::types::{MissionStatus, NodeStatus};
     use crate::runs::{Run, RunKind, RunStatus};
+    use darkmux_crew::types::{MissionStatus, NodeStatus};
     use std::path::PathBuf;
 
     fn fixture_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/generated")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/generated")
     }
 
     /// Write-or-assert. The whole point is that a shape change is LOUD, so the
@@ -70,8 +69,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("generated fixture `{}` is not JSON ({e})", path.display()));
         let served = serde_json::to_value(value).expect("wire type must serialize");
         assert_eq!(
-            on_disk,
-            served,
+            on_disk, served,
             "\n\nThe wire shape of `{name}` changed and its generated fixture did not.\n\
              Every Playwright spec built on this fixture is now feeding a shape the server\n\
              no longer produces — which renders as an empty page, not as a failed assertion.\n\n\
@@ -91,7 +89,10 @@ mod tests {
         let ts = first.find("\"ts\"").unwrap();
         let level = first.find("\"level\"").unwrap();
         let action = first.find("\"action\"").unwrap();
-        assert!(ts < level && level < action, "keys left the archive's order: {first}");
+        assert!(
+            ts < level && level < action,
+            "keys left the archive's order: {first}"
+        );
     }
 
     /// `/flow-mission/<id>` over a one-day archive, as the served bytes.
@@ -116,7 +117,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec()
+        axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec()
     }
 
     /// A `/runs` row with every optional field POPULATED.

@@ -29,7 +29,12 @@ fn a_run_in(dir: &Path) -> RunIn {
 }
 
 fn a_toolchain(dir: &Path) -> Toolchain {
-    Toolchain { path: Some(format!("{}:/usr/bin:/bin", dir.join("node/bin").display())), read_only: vec![dir.join("node")], identity: "node=x".into(), env: Vec::new() }
+    Toolchain {
+        path: Some(format!("{}:/usr/bin:/bin", dir.join("node/bin").display())),
+        read_only: vec![dir.join("node")],
+        identity: "node=x".into(),
+        env: Vec::new(),
+    }
 }
 
 /// (#3112) A Seatbelt preview's policy: every path where the sandbox sees
@@ -43,21 +48,62 @@ fn a_seatbelt_preview_sees_its_paths_where_they_are_and_runs_the_host_shell() {
     let root = dir.path().canonicalize().unwrap();
     let at = a_run_in(&root);
     let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "npm run dev"}));
-    let spec = spec_in(BackendKind::Seatbelt, &recipe, &at, false, ("seatbelt".into(), Some("501:20".into())), vec!["darkmux.dispatch.host-pid=7".into()], &a_toolchain(&root));
+    let spec = spec_in(
+        BackendKind::Seatbelt,
+        &recipe,
+        &at,
+        false,
+        ("seatbelt".into(), Some("501:20".into())),
+        vec!["darkmux.dispatch.host-pid=7".into()],
+        &a_toolchain(&root),
+    );
     let policy = preview_policy(&spec);
-    assert_eq!(policy.workdir.as_deref(), Some(root.join("ws/site").to_str().unwrap()));
+    assert_eq!(
+        policy.workdir.as_deref(),
+        Some(root.join("ws/site").to_str().unwrap())
+    );
     assert_eq!(policy.entrypoint.as_deref(), Some("/bin/sh"));
     assert_eq!(policy.user, None, "Seatbelt runs as the caller");
-    let ro: Vec<&Path> = policy.mounts.iter().filter(|m| m.access == Access::ReadOnly).map(|m| m.host.as_path()).collect();
-    assert_eq!(ro, [spec.heartbeat.as_path(), root.join("node").as_path(), at.log.as_path()]);
+    let ro: Vec<&Path> = policy
+        .mounts
+        .iter()
+        .filter(|m| m.access == Access::ReadOnly)
+        .map(|m| m.host.as_path())
+        .collect();
+    assert_eq!(
+        ro,
+        [
+            spec.heartbeat.as_path(),
+            root.join("node").as_path(),
+            at.log.as_path()
+        ]
+    );
     assert_eq!(policy.mounts[0].host, at.workdir);
     assert_eq!(policy.mounts[0].access, Access::ReadWrite);
-    let beat = format!("{}/{HEARTBEAT_FILE}", root.join("p/heartbeats").join(&spec.name).display());
-    assert!(spec.script.contains(&beat), "the watchdog reads the heartbeat where the sandbox sees it: {}", spec.script);
+    let beat = format!(
+        "{}/{HEARTBEAT_FILE}",
+        root.join("p/heartbeats").join(&spec.name).display()
+    );
+    assert!(
+        spec.script.contains(&beat),
+        "the watchdog reads the heartbeat where the sandbox sees it: {}",
+        spec.script
+    );
     assert!(!spec.script.contains(HEARTBEAT_AT), "{}", spec.script);
-    assert!(!policy.env.iter().any(|(k, v)| k == "HOME" && v == "/tmp"), "{:?}", policy.env);
-    assert_eq!(policy.env[0], ("PATH".to_string(), a_toolchain(&root).path.unwrap()));
-    assert_eq!(policy.ports, vec![4100, 4200], "the same two ports, chosen the same way");
+    assert!(
+        !policy.env.iter().any(|(k, v)| k == "HOME" && v == "/tmp"),
+        "{:?}",
+        policy.env
+    );
+    assert_eq!(
+        policy.env[0],
+        ("PATH".to_string(), a_toolchain(&root).path.unwrap())
+    );
+    assert_eq!(
+        policy.ports,
+        vec![4100, 4200],
+        "the same two ports, chosen the same way"
+    );
 }
 
 /// (#3112) darkmux gives the dev server a loopback host on the host: a
@@ -71,15 +117,34 @@ fn the_dev_server_host_is_loopback_on_the_host_and_every_address_in_a_container(
         "schema_version": "1.1", "command": "npm run dev",
         "env": {"HOST": "0.0.0.0", "BIND": "::", "H2": "{host}", "URL": "http://{host}:{port}/", "KEEP": "10.0.0.0"}
     }));
-    let value = |env: &[(String, String)], k: &str| env.iter().rev().find(|(key, _)| key == k).map(|(_, v)| v.clone()).unwrap();
+    let value = |env: &[(String, String)], k: &str| {
+        env.iter()
+            .rev()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.clone())
+            .unwrap()
+    };
     let host = container_env_for(&recipe, 4100, 4200, BackendKind::Seatbelt, None);
     assert_eq!(
         ["HOST", "BIND", "H2", "URL", "KEEP"].map(|k| value(&host, k)),
-        ["127.0.0.1", "127.0.0.1", "127.0.0.1", "http://127.0.0.1:4100/", "10.0.0.0"]
+        [
+            "127.0.0.1",
+            "127.0.0.1",
+            "127.0.0.1",
+            "http://127.0.0.1:4100/",
+            "10.0.0.0"
+        ]
     );
     let docker = container_env_for(&recipe, 4100, 4200, BackendKind::Docker, None);
-    assert_eq!(["HOST", "BIND", "H2", "URL"].map(|k| value(&docker, k)), ["0.0.0.0", "::", "0.0.0.0", "http://0.0.0.0:4100/"]);
-    assert_eq!(container_env(&recipe, 4100, 4200), docker, "Docker's environment is the one it always was");
+    assert_eq!(
+        ["HOST", "BIND", "H2", "URL"].map(|k| value(&docker, k)),
+        ["0.0.0.0", "::", "0.0.0.0", "http://0.0.0.0:4100/"]
+    );
+    assert_eq!(
+        container_env(&recipe, 4100, 4200),
+        docker,
+        "Docker's environment is the one it always was"
+    );
 }
 
 /// (#3112) Only a listener beyond the loopback counts as exposed: every
@@ -88,16 +153,60 @@ fn the_dev_server_host_is_loopback_on_the_host_and_every_address_in_a_container(
 /// the preview, and the fix.
 #[test]
 fn a_listener_beyond_the_loopback_is_exposed_and_named() {
-    let at = |pid, addr: &str, scope: Option<&str>| PortListener { pid: Some(pid), addr: Some(addr.parse().unwrap()), text: addr.to_string(), scope: scope.map(str::to_string) };
+    let at = |pid, addr: &str, scope: Option<&str>| PortListener {
+        pid: Some(pid),
+        addr: Some(addr.parse().unwrap()),
+        text: addr.to_string(),
+        scope: scope.map(str::to_string),
+    };
     // An IPv6 address netstat cut short is no address: never loopback, even
     // when what is left of it starts like one.
-    let cut = PortListener { pid: Some(5), addr: None, text: "::1:2:3:4:5:6:7".into(), scope: None };
-    let all = vec![at(1, "127.0.0.1", None), at(1, "::1", None), at(1, "::ffff:127.0.0.1", None), at(1, "fe80::1", Some("lo0")), at(2, "::", None), at(3, "0.0.0.0", None), at(3, "192.168.1.5", None), at(4, "fe80::1", Some("en0")), cut.clone()];
+    let cut = PortListener {
+        pid: Some(5),
+        addr: None,
+        text: "::1:2:3:4:5:6:7".into(),
+        scope: None,
+    };
+    let all = vec![
+        at(1, "127.0.0.1", None),
+        at(1, "::1", None),
+        at(1, "::ffff:127.0.0.1", None),
+        at(1, "fe80::1", Some("lo0")),
+        at(2, "::", None),
+        at(3, "0.0.0.0", None),
+        at(3, "192.168.1.5", None),
+        at(4, "fe80::1", Some("en0")),
+        cut.clone(),
+    ];
     let exposed = on_host::beyond_loopback(&all);
-    assert_eq!(exposed, all[4..].to_vec(), "every address, a LAN address, a link-local one off the loopback interface, a cut one");
-    let found = vec![(4200, all[4].clone()), (4100, all[5].clone()), (4100, PortListener { pid: None, ..all[6].clone() }), (4100, cut)];
+    assert_eq!(
+        exposed,
+        all[4..].to_vec(),
+        "every address, a LAN address, a link-local one off the loopback interface, a cut one"
+    );
+    let found = vec![
+        (4200, all[4].clone()),
+        (4100, all[5].clone()),
+        (
+            4100,
+            PortListener {
+                pid: None,
+                ..all[6].clone()
+            },
+        ),
+        (4100, cut),
+    ];
     let why = on_host::exposure_reason(BackendKind::Seatbelt, &found, 4100, 4200);
-    for part in ["[::]:4200 (the HMR port, pid 2)", "0.0.0.0:4100 (the app port, pid 3)", "192.168.1.5:4100 (the app port)", "[::1:2:3:4:5:6:7…]:4100 (an IPv6 address netstat cut short", "seatbelt", "127.0.0.1", "#3559", "server.hmr.host"] {
+    for part in [
+        "[::]:4200 (the HMR port, pid 2)",
+        "0.0.0.0:4100 (the app port, pid 3)",
+        "192.168.1.5:4100 (the app port)",
+        "[::1:2:3:4:5:6:7…]:4100 (an IPv6 address netstat cut short",
+        "seatbelt",
+        "127.0.0.1",
+        "#3559",
+        "server.hmr.host",
+    ] {
         assert!(why.contains(part), "missing `{part}` in: {why}");
     }
 }
@@ -106,13 +215,24 @@ fn a_listener_beyond_the_loopback_is_exposed_and_named() {
 /// group listens on: nothing, IPv6 loopback only, or loopback but no answer.
 #[test]
 fn an_on_host_dev_server_that_never_answered_says_why_from_its_listeners() {
-    let at = |addr: &str| PortListener { pid: Some(1), addr: Some(addr.parse().unwrap()), text: addr.to_string(), scope: None };
+    let at = |addr: &str| PortListener {
+        pid: Some(1),
+        addr: Some(addr.parse().unwrap()),
+        text: addr.to_string(),
+        scope: None,
+    };
     let none = on_host::not_ready_reason(BackendKind::Seatbelt, 4100, Some(&[]));
-    assert!(none.contains("nothing listens on port 4100") && none.contains("127.0.0.1"), "{none}");
+    assert!(
+        none.contains("nothing listens on port 4100") && none.contains("127.0.0.1"),
+        "{none}"
+    );
     let v6 = on_host::not_ready_reason(BackendKind::Seatbelt, 4100, Some(&[at("::1")]));
     assert!(v6.contains("[::1]") && v6.contains("127.0.0.1"), "{v6}");
     let quiet = on_host::not_ready_reason(BackendKind::Seatbelt, 4100, Some(&[at("127.0.0.1")]));
-    assert!(quiet.contains("listens on 127.0.0.1:4100") && quiet.contains("2xx or 3xx"), "{quiet}");
+    assert!(
+        quiet.contains("listens on 127.0.0.1:4100") && quiet.contains("2xx or 3xx"),
+        "{quiet}"
+    );
     let unknown = on_host::not_ready_reason(BackendKind::Seatbelt, 4100, None);
     assert!(unknown.contains("didn't answer on port 4100"), "{unknown}");
 }
@@ -125,7 +245,12 @@ fn a_workspace(dir: &Path, recipe: serde_json::Value) -> PathBuf {
     wt
 }
 
-fn until_status(previews: &Previews, name: &str, want: &[&str], within: Duration) -> serde_json::Value {
+fn until_status(
+    previews: &Previews,
+    name: &str,
+    want: &[&str],
+    within: Duration,
+) -> serde_json::Value {
     let deadline = Instant::now() + within;
     loop {
         let v = serde_json::to_value(previews.status(name).unwrap()).unwrap();
@@ -142,7 +267,8 @@ fn two_backends(dir: &Path) -> (Previews, Arc<HostEmulator>, Arc<HostEmulator>) 
     let docker = Arc::new(HostEmulator::default());
     let seatbelt = Arc::new(HostEmulator::default());
     *seatbelt.on_host.lock().unwrap() = true;
-    let previews = Previews::new(dir.join("p"), docker.clone()).with_backend(BackendKind::Seatbelt, seatbelt.clone());
+    let previews = Previews::new(dir.join("p"), docker.clone())
+        .with_backend(BackendKind::Seatbelt, seatbelt.clone());
     (previews, docker, seatbelt)
 }
 
@@ -178,24 +304,80 @@ fn a_preview_on_the_host_that_listens_beyond_the_loopback_is_stopped() {
     // Only the read as it first answers can catch it: the periodic one is
     // a minute away.
     let previews = previews.with_exposure_every(Duration::from_secs(60));
-    let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.0", "command": serve_on("'0.0.0.0'"), "env": {"PORT": "{port}"}}));
-    previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
-    let v = until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(20));
+    let wt = a_workspace(
+        dir.path(),
+        serde_json::json!({"schema_version": "1.0", "command": serve_on("'0.0.0.0'"), "env": {"PORT": "{port}"}}),
+    );
+    previews
+        .start_in(
+            BackendKind::Seatbelt,
+            "w",
+            &wt,
+            &RecipeSource::Checkout(wt.clone()),
+        )
+        .unwrap();
+    let v = until_status(
+        &previews,
+        "w",
+        &["failed", "ready"],
+        Duration::from_secs(20),
+    );
     assert_eq!(v["status"], "failed", "{v}");
     let why = v["error"].as_str().unwrap();
-    assert!(why.contains(&format!("0.0.0.0:{}", v["port"])) && why.contains("beyond this Mac's loopback"), "{why}");
-    assert!(!seatbelt.removed.lock().unwrap().is_empty(), "its sandbox is removed");
-    let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.1", "command": serve_on(HOST_ENV), "env": {"PORT": "{port}", "HOST": "{host}"}}));
-    previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
-    let v = until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(20));
+    assert!(
+        why.contains(&format!("0.0.0.0:{}", v["port"]))
+            && why.contains("beyond this Mac's loopback"),
+        "{why}"
+    );
+    assert!(
+        !seatbelt.removed.lock().unwrap().is_empty(),
+        "its sandbox is removed"
+    );
+    let wt = a_workspace(
+        dir.path(),
+        serde_json::json!({"schema_version": "1.1", "command": serve_on(HOST_ENV), "env": {"PORT": "{port}", "HOST": "{host}"}}),
+    );
+    previews
+        .start_in(
+            BackendKind::Seatbelt,
+            "w",
+            &wt,
+            &RecipeSource::Checkout(wt.clone()),
+        )
+        .unwrap();
+    let v = until_status(
+        &previews,
+        "w",
+        &["failed", "ready"],
+        Duration::from_secs(20),
+    );
     assert_eq!(v["status"], "ready", "{v}");
     previews.stop("w");
     // Watched every 0.2 s, a loopback server stays ready.
     let previews = previews.with_exposure_every(Duration::from_millis(200));
-    previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
-    assert_eq!(until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(20))["status"], "ready");
+    previews
+        .start_in(
+            BackendKind::Seatbelt,
+            "w",
+            &wt,
+            &RecipeSource::Checkout(wt.clone()),
+        )
+        .unwrap();
+    assert_eq!(
+        until_status(
+            &previews,
+            "w",
+            &["failed", "ready"],
+            Duration::from_secs(20)
+        )["status"],
+        "ready"
+    );
     std::thread::sleep(Duration::from_millis(1000));
-    assert_eq!(until_status(&previews, "w", &[], Duration::ZERO)["status"], "ready", "still ready after several watches");
+    assert_eq!(
+        until_status(&previews, "w", &[], Duration::ZERO)["status"],
+        "ready",
+        "still ready after several watches"
+    );
     previews.stop("w");
 }
 
@@ -211,13 +393,34 @@ fn a_listener_that_appears_after_ready_stops_the_preview() {
     let previews = previews.with_exposure_every(Duration::from_millis(200));
     // The second server takes the HMR port, which the kernel lets it bind.
     let late = "(sleep 2; exec /usr/bin/python3 -c \"import os,socket,time;s=socket.socket();s.bind(('0.0.0.0',int(os.environ['DARKMUX_PREVIEW_HMR_PORT'])));s.listen();time.sleep(60)\") & ".to_string() + &serve_on(HOST_ENV);
-    let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.0", "command": late, "env": {"PORT": "{port}", "HOST": "0.0.0.0"}}));
-    previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
-    let ready = until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(20));
+    let wt = a_workspace(
+        dir.path(),
+        serde_json::json!({"schema_version": "1.0", "command": late, "env": {"PORT": "{port}", "HOST": "0.0.0.0"}}),
+    );
+    previews
+        .start_in(
+            BackendKind::Seatbelt,
+            "w",
+            &wt,
+            &RecipeSource::Checkout(wt.clone()),
+        )
+        .unwrap();
+    let ready = until_status(
+        &previews,
+        "w",
+        &["failed", "ready"],
+        Duration::from_secs(20),
+    );
     assert_eq!(ready["status"], "ready", "{ready}");
     let v = until_status(&previews, "w", &["failed"], Duration::from_secs(20));
     assert_eq!(v["status"], "failed", "{v}");
-    assert!(v["error"].as_str().unwrap().contains("beyond this Mac's loopback"), "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("beyond this Mac's loopback"),
+        "{v}"
+    );
 }
 
 /// (#3112) A preview is stopped in the backend it was started in: one
@@ -228,20 +431,42 @@ fn a_listener_that_appears_after_ready_stops_the_preview() {
 fn a_preview_is_stopped_in_the_backend_it_started_in() {
     let dir = tempfile::TempDir::new().unwrap();
     let (previews, docker, seatbelt) = two_backends(dir.path());
-    let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.0", "command": "sleep 30"}));
+    let wt = a_workspace(
+        dir.path(),
+        serde_json::json!({"schema_version": "1.0", "command": "sleep 30"}),
+    );
     let source = RecipeSource::Checkout(wt.clone());
-    previews.start_in(BackendKind::Seatbelt, "w", &wt, &source).unwrap();
+    previews
+        .start_in(BackendKind::Seatbelt, "w", &wt, &source)
+        .unwrap();
     for _ in 0..200 {
-        if previews.entries.lock().unwrap()["w"].lock().unwrap().container.is_some() {
+        if previews.entries.lock().unwrap()["w"]
+            .lock()
+            .unwrap()
+            .container
+            .is_some()
+        {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(seatbelt.specs.lock().unwrap()[0].backend, BackendKind::Seatbelt);
+    assert_eq!(
+        seatbelt.specs.lock().unwrap()[0].backend,
+        BackendKind::Seatbelt
+    );
     assert!(previews.stop("w"));
-    assert_eq!(seatbelt.removed.lock().unwrap().len(), 1, "removed where it was made");
-    assert!(docker.removed.lock().unwrap().is_empty() && docker.specs.lock().unwrap().is_empty(), "Docker never saw it");
-    previews.start_in(BackendKind::Docker, "w", &wt, &source).unwrap();
+    assert_eq!(
+        seatbelt.removed.lock().unwrap().len(),
+        1,
+        "removed where it was made"
+    );
+    assert!(
+        docker.removed.lock().unwrap().is_empty() && docker.specs.lock().unwrap().is_empty(),
+        "Docker never saw it"
+    );
+    previews
+        .start_in(BackendKind::Docker, "w", &wt, &source)
+        .unwrap();
     for _ in 0..200 {
         if !docker.specs.lock().unwrap().is_empty() {
             break;
@@ -272,16 +497,26 @@ fn a_backend_switch_reinstalls_saying_what_it_deleted() {
     let wt = a_workspace(dir.path(), recipe);
     std::fs::create_dir_all(wt.join("node_modules")).unwrap();
     std::fs::write(wt.join("node_modules/built"), "linux").unwrap();
-    let docker_made = install_fingerprint(&wt, "mkdir -p node_modules && echo mac > node_modules/built && echo installed >> installs.txt", "sha256:runtime");
+    let docker_made = install_fingerprint(
+        &wt,
+        "mkdir -p node_modules && echo mac > node_modules/built && echo installed >> installs.txt",
+        "sha256:runtime",
+    );
     crate::client_workspace::record_install(&dir.path().join("base"), "w", &docker_made).unwrap();
     // The recipe comes from the user's own checkout, never the workspace.
     let mine = dir.path().join("mine");
     std::fs::create_dir_all(mine.join(".darkmux")).unwrap();
-    std::fs::copy(wt.join(".darkmux/preview.json"), mine.join(".darkmux/preview.json")).unwrap();
+    std::fs::copy(
+        wt.join(".darkmux/preview.json"),
+        mine.join(".darkmux/preview.json"),
+    )
+    .unwrap();
     let source = RecipeSource::Checkout(mine);
     let log = dir.path().join("p/w.log");
     let run_once = |want_spec: usize| {
-        previews.start_in(BackendKind::Seatbelt, "w", &wt, &source).unwrap();
+        previews
+            .start_in(BackendKind::Seatbelt, "w", &wt, &source)
+            .unwrap();
         for _ in 0..400 {
             if seatbelt.specs.lock().unwrap().len() >= want_spec && log_has(&log, SERVING_LINE) {
                 break;
@@ -296,13 +531,32 @@ fn a_backend_switch_reinstalls_saying_what_it_deleted() {
         said
     };
     let said = run_once(1);
-    assert_eq!(std::fs::read_to_string(wt.join("node_modules/built")).unwrap().trim(), "mac", "reinstalled for this Mac");
-    assert!(said.contains("node_modules") && said.contains("deleted") && said.contains("Docker"), "{said}");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("node_modules/built"))
+            .unwrap()
+            .trim(),
+        "mac",
+        "reinstalled for this Mac"
+    );
+    assert!(
+        said.contains("node_modules") && said.contains("deleted") && said.contains("Docker"),
+        "{said}"
+    );
     let record = std::fs::read_to_string(dir.path().join("base/.w.install")).unwrap();
     assert!(record.trim().starts_with("seatbelt:"), "{record}");
     let said = run_once(2);
-    assert!(!said.contains("deleted"), "the same backend deletes nothing: {said}");
-    assert_eq!(std::fs::read_to_string(wt.join("installs.txt")).unwrap().lines().count(), 1, "and skips the install");
+    assert!(
+        !said.contains("deleted"),
+        "the same backend deletes nothing: {said}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("installs.txt"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "and skips the install"
+    );
 }
 
 /// (#3112) A real Seatbelt preview: it serves the workspace, its
@@ -321,12 +575,26 @@ fn a_seatbelt_preview_runs_with_no_host_files_or_host_env() {
     let prev_state = std::env::var_os(darkmux_sandbox::seatbelt::STATE_DIR_ENV);
     unsafe { std::env::set_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV, state.path()) };
     let dir = tempfile::TempDir::new().unwrap();
-    let group = |name: &str| -> u32 { std::fs::read_to_string(state.path().join(name).join("pid")).unwrap().trim().parse().unwrap() };
+    let group = |name: &str| -> u32 {
+        std::fs::read_to_string(state.path().join(name).join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
     let ((group, listened), _) = super::tests_shared::preview_with_no_host_files_or_host_env(
         dir.path(),
-        Previews::new(dir.path().join("p"), Arc::new(OnHost::new(BackendKind::Seatbelt))),
+        Previews::new(
+            dir.path().join("p"),
+            Arc::new(OnHost::new(BackendKind::Seatbelt)),
+        ),
         BackendKind::Seatbelt,
-        |name, port| (group(name), darkmux_platform::current().tcp_port_listeners(port)),
+        |name, port| {
+            (
+                group(name),
+                darkmux_platform::current().tcp_port_listeners(port),
+            )
+        },
     );
     let gone = (0..50).any(|_| {
         std::thread::sleep(Duration::from_millis(100));
@@ -339,7 +607,13 @@ fn a_seatbelt_preview_runs_with_no_host_files_or_host_env() {
         }
     }
     let listened = listened.expect("the dev server's listeners were read");
-    assert!(!listened.is_empty() && listened.iter().all(|l| l.addr.is_some_and(|a| a.is_loopback())), "{listened:?}");
+    assert!(
+        !listened.is_empty()
+            && listened
+                .iter()
+                .all(|l| l.addr.is_some_and(|a| a.is_loopback())),
+        "{listened:?}"
+    );
     assert!(gone, "a stop ends the whole process group");
 }
 
@@ -358,12 +632,27 @@ fn a_stale_seatbelt_preview_ends_with_its_dev_server() {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let at = a_run_in(&root);
-    let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "(while :; do echo x >> beat.txt; sleep 0.2; done) & sleep 300"}));
-    let mut spec = spec_in(BackendKind::Seatbelt, &recipe, &at, false, ("seatbelt".into(), None), Vec::new(), &Toolchain::default());
+    let recipe = a_recipe(
+        serde_json::json!({"schema_version": "1.0", "command": "(while :; do echo x >> beat.txt; sleep 0.2; done) & sleep 300"}),
+    );
+    let mut spec = spec_in(
+        BackendKind::Seatbelt,
+        &recipe,
+        &at,
+        false,
+        ("seatbelt".into(), None),
+        Vec::new(),
+        &Toolchain::default(),
+    );
     std::fs::create_dir_all(&spec.heartbeat).unwrap();
     let beat = spec.heartbeat.join(HEARTBEAT_FILE);
     std::fs::write(&beat, "").unwrap();
-    let watch = Watch { file: beat.display().to_string(), missed: 3, every: "0.1".into(), grace: "0.5".into() };
+    let watch = Watch {
+        file: beat.display().to_string(),
+        missed: 3,
+        every: "0.1".into(),
+        grace: "0.5".into(),
+    };
     spec.script = container_script(&recipe, false, &watch);
     let host = OnHost::new(BackendKind::Seatbelt);
     host.create(&spec).unwrap();
@@ -400,11 +689,31 @@ fn a_backend_with_no_preview_runner_is_refused() {
     let dir = tempfile::TempDir::new().unwrap();
     let docker = Arc::new(HostEmulator::default());
     let previews = Previews::new(dir.path().join("p"), docker.clone());
-    let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.0", "command": "sleep 30"}));
-    let why = previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap_err();
-    assert!(why.message().contains("previews cannot run in the `seatbelt` sandbox") && why.message().contains("darkmux config set runtime.sandbox docker"), "{why:?}");
+    let wt = a_workspace(
+        dir.path(),
+        serde_json::json!({"schema_version": "1.0", "command": "sleep 30"}),
+    );
+    let why = previews
+        .start_in(
+            BackendKind::Seatbelt,
+            "w",
+            &wt,
+            &RecipeSource::Checkout(wt.clone()),
+        )
+        .unwrap_err();
+    assert!(
+        why.message()
+            .contains("previews cannot run in the `seatbelt` sandbox")
+            && why
+                .message()
+                .contains("darkmux config set runtime.sandbox docker"),
+        "{why:?}"
+    );
     std::thread::sleep(Duration::from_millis(100));
-    assert!(docker.specs.lock().unwrap().is_empty(), "nothing ran in Docker instead");
+    assert!(
+        docker.specs.lock().unwrap().is_empty(),
+        "nothing ran in Docker instead"
+    );
 }
 
 /// (#3112) The watch reads a group's listeners through the platform: an
@@ -414,16 +723,49 @@ fn a_backend_with_no_preview_runner_is_refused() {
 #[test]
 fn the_watch_asks_once_more_then_stops_what_it_cannot_read() {
     use std::sync::atomic::AtomicU32;
-    let wide = PortListener { pid: Some(7), addr: Some("0.0.0.0".parse().unwrap()), text: "*".into(), scope: None };
-    let near = PortListener { pid: Some(7), addr: Some("127.0.0.1".parse().unwrap()), text: "127.0.0.1".into(), scope: None };
-    let once = darkmux_platform::FakePlatform { port_listeners: vec![(5, vec![wide.clone(), near.clone()]), (6, vec![near])], ..Default::default() };
-    assert_eq!(on_host::exposed_in(&once, BackendKind::Seatbelt, [5, 6]), Ok(vec![(5, wide)]));
-    assert_eq!(on_host::exposed_in(&once, BackendKind::Seatbelt, [6, 7]), Ok(vec![]));
-    let blind = darkmux_platform::FakePlatform { port_listeners_unreadable_reads: AtomicU32::new(1), ..Default::default() };
-    assert_eq!(on_host::exposed_in(&blind, BackendKind::Seatbelt, [5, 6]), Ok(vec![]), "one unreadable read is asked again");
-    let blind = darkmux_platform::FakePlatform { port_listeners_unreadable_reads: AtomicU32::new(2), ..Default::default() };
+    let wide = PortListener {
+        pid: Some(7),
+        addr: Some("0.0.0.0".parse().unwrap()),
+        text: "*".into(),
+        scope: None,
+    };
+    let near = PortListener {
+        pid: Some(7),
+        addr: Some("127.0.0.1".parse().unwrap()),
+        text: "127.0.0.1".into(),
+        scope: None,
+    };
+    let once = darkmux_platform::FakePlatform {
+        port_listeners: vec![(5, vec![wide.clone(), near.clone()]), (6, vec![near])],
+        ..Default::default()
+    };
+    assert_eq!(
+        on_host::exposed_in(&once, BackendKind::Seatbelt, [5, 6]),
+        Ok(vec![(5, wide)])
+    );
+    assert_eq!(
+        on_host::exposed_in(&once, BackendKind::Seatbelt, [6, 7]),
+        Ok(vec![])
+    );
+    let blind = darkmux_platform::FakePlatform {
+        port_listeners_unreadable_reads: AtomicU32::new(1),
+        ..Default::default()
+    };
+    assert_eq!(
+        on_host::exposed_in(&blind, BackendKind::Seatbelt, [5, 6]),
+        Ok(vec![]),
+        "one unreadable read is asked again"
+    );
+    let blind = darkmux_platform::FakePlatform {
+        port_listeners_unreadable_reads: AtomicU32::new(2),
+        ..Default::default()
+    };
     let why = on_host::exposed_in(&blind, BackendKind::Seatbelt, [5, 6]).unwrap_err();
-    assert!(why.contains("cannot read what listens on its port 5") && why.contains("darkmux config set runtime.sandbox docker"), "{why}");
+    assert!(
+        why.contains("cannot read what listens on its port 5")
+            && why.contains("darkmux config set runtime.sandbox docker"),
+        "{why}"
+    );
 }
 
 /// (#3112 review, BLOCKER C) After a stop, what still listens on the
@@ -431,12 +773,28 @@ fn the_watch_asks_once_more_then_stops_what_it_cannot_read() {
 /// report is a line per listener and the stop has no way to kill at all.
 #[test]
 fn what_lingers_on_a_stopped_previews_ports_is_reported() {
-    let holder = PortListener { pid: Some(7), addr: Some("0.0.0.0".parse().unwrap()), text: "*".into(), scope: None };
-    let fake = darkmux_platform::FakePlatform { port_listeners: vec![(4200, vec![holder])], ..Default::default() };
+    let holder = PortListener {
+        pid: Some(7),
+        addr: Some("0.0.0.0".parse().unwrap()),
+        text: "*".into(),
+        scope: None,
+    };
+    let fake = darkmux_platform::FakePlatform {
+        port_listeners: vec![(4200, vec![holder])],
+        ..Default::default()
+    };
     let lines = on_host::lingering(&fake, "darkmux-preview-w", [4100, 4200]);
     assert_eq!(lines.len(), 1, "{lines:?}");
-    assert!(lines[0].contains("* still listens on its port 4200 (pid 7): left running (a process"), "{lines:?}");
-    assert!(on_host::lingering(&darkmux_platform::FakePlatform::default(), "w", [4100, 4200]).is_empty());
+    assert!(
+        lines[0].contains("* still listens on its port 4200 (pid 7): left running (a process"),
+        "{lines:?}"
+    );
+    assert!(on_host::lingering(
+        &darkmux_platform::FakePlatform::default(),
+        "w",
+        [4100, 4200]
+    )
+    .is_empty());
 }
 
 /// A real Seatbelt preview's sandbox root for the duration of a test.
@@ -475,7 +833,9 @@ fn real_seatbelt(dir: &Path) -> Previews {
 
 /// Whether anything listens on `port`.
 fn listened(port: u16) -> bool {
-    darkmux_platform::current().tcp_port_listeners(port).is_some_and(|l| !l.is_empty())
+    darkmux_platform::current()
+        .tcp_port_listeners(port)
+        .is_some_and(|l| !l.is_empty())
 }
 
 /// (#3112 review, BLOCKER 1) A dev server that binds every address and then
@@ -502,12 +862,30 @@ if os.fork():
 while True:
     if os.fork(): os._exit(0)
     time.sleep(0.005)""#;
-    let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.1", "command": hopper, "env": {"PORT": "{port}"}}));
-    previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
-    let v = until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(30));
+    let wt = a_workspace(
+        dir.path(),
+        serde_json::json!({"schema_version": "1.1", "command": hopper, "env": {"PORT": "{port}"}}),
+    );
+    previews
+        .start_in(
+            BackendKind::Seatbelt,
+            "w",
+            &wt,
+            &RecipeSource::Checkout(wt.clone()),
+        )
+        .unwrap();
+    let v = until_status(
+        &previews,
+        "w",
+        &["failed", "ready"],
+        Duration::from_secs(30),
+    );
     assert_eq!(v["status"], "failed", "{v}");
     let why = v["error"].as_str().unwrap();
-    assert!(why.contains(&format!("0.0.0.0:{} (the app port", v["port"])), "{why}");
+    assert!(
+        why.contains(&format!("0.0.0.0:{} (the app port", v["port"])),
+        "{why}"
+    );
     let port = v["port"].as_u64().unwrap() as u16;
     let free = (0..40).any(|_| {
         std::thread::sleep(Duration::from_millis(100));
@@ -528,7 +906,11 @@ fn a_listener_on_an_unassigned_port_is_refused_by_the_kernel() {
     let _state = StateDir::set();
     let dir = tempfile::TempDir::new().unwrap();
     let previews = real_seatbelt(dir.path());
-    let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let other = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let probe = format!(
         r#"python3 -c "import socket
 for host in ('127.0.0.1', '0.0.0.0'):
@@ -539,15 +921,34 @@ for host in ('127.0.0.1', '0.0.0.0'):
         print('refused', host, e.errno)" > probe.txt; {}"#,
         serve_on(HOST_ENV)
     );
-    let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.1", "command": probe, "env": {"PORT": "{port}", "HOST": "{host}"}}));
-    previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
-    let v = until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(30));
+    let wt = a_workspace(
+        dir.path(),
+        serde_json::json!({"schema_version": "1.1", "command": probe, "env": {"PORT": "{port}", "HOST": "{host}"}}),
+    );
+    previews
+        .start_in(
+            BackendKind::Seatbelt,
+            "w",
+            &wt,
+            &RecipeSource::Checkout(wt.clone()),
+        )
+        .unwrap();
+    let v = until_status(
+        &previews,
+        "w",
+        &["failed", "ready"],
+        Duration::from_secs(30),
+    );
     previews.stop("w");
     assert_eq!(v["status"], "ready", "the assigned port serves: {v}");
     let said = std::fs::read_to_string(wt.join("probe.txt")).unwrap_or_default();
-    assert_eq!(said, "refused 127.0.0.1 1
+    assert_eq!(
+        said,
+        "refused 127.0.0.1 1
 refused 0.0.0.0 1
-", "binds on port {other}");
+",
+        "binds on port {other}"
+    );
 }
 
 /// Kills, when dropped, the process listening on `port` whose command
@@ -561,11 +962,15 @@ struct KillListener {
 impl Drop for KillListener {
     fn drop(&mut self) {
         for _ in 0..50 {
-            let owners: Vec<u32> = darkmux_platform::current().tcp_listeners(self.port).unwrap_or_default();
+            let owners: Vec<u32> = darkmux_platform::current()
+                .tcp_listeners(self.port)
+                .unwrap_or_default();
             let ours: Vec<u32> = owners
                 .into_iter()
                 .filter(|pid| {
-                    let cmd = std::process::Command::new("/bin/ps").args(["-o", "command=", "-p", &pid.to_string()]).output();
+                    let cmd = std::process::Command::new("/bin/ps")
+                        .args(["-o", "command=", "-p", &pid.to_string()])
+                        .output();
                     cmd.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(self.marker))
                 })
                 .collect();
@@ -596,20 +1001,42 @@ fn a_dev_server_that_leaves_the_group_is_ended_by_the_stop() {
     let dir = tempfile::TempDir::new().unwrap();
     let previews = real_seatbelt(dir.path());
     let escape = r#"python3 -c "import os; os.setpgid(0, 0); os.execvp('sh', ['sh', '-c', os.environ['SERVE']])""#;
-    let serve = serve_on(HOST_ENV).replace("serve_forever()", "serve_forever()  # darkmux-test-escapee");
-    let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.1", "command": escape, "env": {"PORT": "{port}", "HOST": "{host}", "SERVE": serve}}));
-    previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
-    let v = until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(30));
+    let serve =
+        serve_on(HOST_ENV).replace("serve_forever()", "serve_forever()  # darkmux-test-escapee");
+    let wt = a_workspace(
+        dir.path(),
+        serde_json::json!({"schema_version": "1.1", "command": escape, "env": {"PORT": "{port}", "HOST": "{host}", "SERVE": serve}}),
+    );
+    previews
+        .start_in(
+            BackendKind::Seatbelt,
+            "w",
+            &wt,
+            &RecipeSource::Checkout(wt.clone()),
+        )
+        .unwrap();
+    let v = until_status(
+        &previews,
+        "w",
+        &["failed", "ready"],
+        Duration::from_secs(30),
+    );
     assert_eq!(v["status"], "ready", "{v}");
     let port = v["port"].as_u64().unwrap() as u16;
-    let _cleanup = KillListener { port, marker: "darkmux-test-escapee" };
+    let _cleanup = KillListener {
+        port,
+        marker: "darkmux-test-escapee",
+    };
     assert!(previews.stop("w"));
     std::thread::sleep(Duration::from_millis(500));
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while http_ok(port, "/") && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(!http_ok(port, "/"), "the server that left the group outlived the stop on port {port}");
+    assert!(
+        !http_ok(port, "/"),
+        "the server that left the group outlived the stop on port {port}"
+    );
 }
 
 /// (#3112 review, BLOCKER C) A stop never kills a process outside the
@@ -624,9 +1051,24 @@ fn a_stop_never_kills_a_process_outside_the_sandbox() {
     let _state = StateDir::set();
     let dir = tempfile::TempDir::new().unwrap();
     let previews = real_seatbelt(dir.path());
-    let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.1", "command": serve_on(HOST_ENV), "env": {"PORT": "{port}", "HOST": "{host}"}}));
-    previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
-    let v = until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(30));
+    let wt = a_workspace(
+        dir.path(),
+        serde_json::json!({"schema_version": "1.1", "command": serve_on(HOST_ENV), "env": {"PORT": "{port}", "HOST": "{host}"}}),
+    );
+    previews
+        .start_in(
+            BackendKind::Seatbelt,
+            "w",
+            &wt,
+            &RecipeSource::Checkout(wt.clone()),
+        )
+        .unwrap();
+    let v = until_status(
+        &previews,
+        "w",
+        &["failed", "ready"],
+        Duration::from_secs(30),
+    );
     assert_eq!(v["status"], "ready", "{v}");
     let hmr = v["hmr_port"].as_u64().unwrap();
     let mut user = std::process::Command::new("/usr/bin/python3")
@@ -635,7 +1077,11 @@ fn a_stop_never_kills_a_process_outside_the_sandbox() {
         .spawn()
         .unwrap();
     let mut line = String::new();
-    std::io::BufRead::read_line(&mut std::io::BufReader::new(user.stdout.take().unwrap()), &mut line).unwrap();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(user.stdout.take().unwrap()),
+        &mut line,
+    )
+    .unwrap();
     assert!(previews.stop("w"));
     std::thread::sleep(Duration::from_millis(300));
     let alive = user.try_wait().unwrap().is_none();
@@ -665,12 +1111,30 @@ except OSError as e:
     print('refused', e.errno)" > probe.txt; {}"#,
         serve_on(HOST_ENV)
     );
-    let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.1", "command": probe, "env": {"PORT": "{port}", "HOST": "{host}"}}));
-    previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
-    let v = until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(30));
+    let wt = a_workspace(
+        dir.path(),
+        serde_json::json!({"schema_version": "1.1", "command": probe, "env": {"PORT": "{port}", "HOST": "{host}"}}),
+    );
+    previews
+        .start_in(
+            BackendKind::Seatbelt,
+            "w",
+            &wt,
+            &RecipeSource::Checkout(wt.clone()),
+        )
+        .unwrap();
+    let v = until_status(
+        &previews,
+        "w",
+        &["failed", "ready"],
+        Duration::from_secs(30),
+    );
     previews.stop("w");
     assert_eq!(v["status"], "ready", "the assigned port serves: {v}");
-    assert_eq!(std::fs::read_to_string(wt.join("probe.txt")).unwrap_or_default(), "refused 1\n");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("probe.txt")).unwrap_or_default(),
+        "refused 1\n"
+    );
 }
 
 /// (#3112 review, MINOR 6) `{host}` is new meaning in the recipe format, so
@@ -680,17 +1144,31 @@ except OSError as e:
 /// than pass `{host}` through. This darkmux reads both.
 #[test]
 fn host_is_recipe_schema_1_1_and_a_1_0_recipe_keeps_its_meaning() {
-    assert_eq!(darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION, "1.1");
+    assert_eq!(
+        darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION,
+        "1.1"
+    );
     let value = |v: &str, kind| {
-        let recipe = a_recipe(serde_json::json!({"schema_version": v, "command": "x", "env": {"H": "{host}:{port}"}}));
-        container_env_for(&recipe, 4100, 4200, kind, None).into_iter().find(|(k, _)| k == "H").unwrap().1
+        let recipe = a_recipe(
+            serde_json::json!({"schema_version": v, "command": "x", "env": {"H": "{host}:{port}"}}),
+        );
+        container_env_for(&recipe, 4100, 4200, kind, None)
+            .into_iter()
+            .find(|(k, _)| k == "H")
+            .unwrap()
+            .1
     };
     assert_eq!(value("1.1", BackendKind::Seatbelt), "127.0.0.1:4100");
     assert_eq!(value("1.1", BackendKind::Docker), "0.0.0.0:4100");
     assert_eq!(value("1.0", BackendKind::Seatbelt), "{host}:4100");
     assert_eq!(value("1.0", BackendKind::Docker), "{host}:4100");
-    let older_reader = darkmux_types::data_version::newer(&serde_json::json!({"schema_version": "1.1"}), "1.0");
-    assert_eq!(older_reader.as_deref(), Some("1.1"), "a 1.0 reader refuses a 1.1 recipe as newer");
+    let older_reader =
+        darkmux_types::data_version::newer(&serde_json::json!({"schema_version": "1.1"}), "1.0");
+    assert_eq!(
+        older_reader.as_deref(),
+        Some("1.1"),
+        "a 1.0 reader refuses a 1.1 recipe as newer"
+    );
 }
 
 /// (#3112 review, MINOR 9) A backend switch never deletes in the user's
@@ -703,10 +1181,18 @@ fn a_backend_switch_never_deletes_in_the_users_own_checkout() {
     let mut at = a_run_in(&root);
     at.checkout = Some(at.workdir.clone());
     std::fs::create_dir_all(at.workdir.join("node_modules")).unwrap();
-    let recipe = a_recipe(serde_json::json!({"schema_version": "1.1", "command": "x", "install": {"command": "npm ci", "unless_exists": "node_modules"}}));
+    let recipe = a_recipe(
+        serde_json::json!({"schema_version": "1.1", "command": "x", "install": {"command": "npm ci", "unless_exists": "node_modules"}}),
+    );
     let refused = reinstall_for(BackendKind::Seatbelt, BackendKind::Docker, &recipe, &at);
-    assert!(matches!(&refused, Err(Halt::Failed(why)) if why.contains("your own checkout")), "refused");
-    assert!(at.workdir.join("node_modules").is_dir(), "nothing deleted in the user's checkout");
+    assert!(
+        matches!(&refused, Err(Halt::Failed(why)) if why.contains("your own checkout")),
+        "refused"
+    );
+    assert!(
+        at.workdir.join("node_modules").is_dir(),
+        "nothing deleted in the user's checkout"
+    );
 }
 
 /// (#3112 review, MINOR 5) The reinstall deletes through the same guard as
@@ -720,10 +1206,15 @@ fn a_backend_switch_never_deletes_through_a_linked_folder() {
     let outside = root.join("outside");
     std::fs::create_dir_all(outside.join("node_modules/keep")).unwrap();
     std::os::unix::fs::symlink(&outside, at.workdir.join("web")).unwrap();
-    let recipe = a_recipe(serde_json::json!({"schema_version": "1.1", "command": "x", "install": {"command": "npm ci", "unless_exists": "web/node_modules"}}));
+    let recipe = a_recipe(
+        serde_json::json!({"schema_version": "1.1", "command": "x", "install": {"command": "npm ci", "unless_exists": "web/node_modules"}}),
+    );
     let refused = reinstall_for(BackendKind::Seatbelt, BackendKind::Docker, &recipe, &at);
     assert!(refused.is_err(), "deleted through a link");
-    assert!(outside.join("node_modules/keep").is_dir(), "deleted outside the workspace");
+    assert!(
+        outside.join("node_modules/keep").is_dir(),
+        "deleted outside the workspace"
+    );
 }
 
 /// (#3112 review, MINOR 7) A preview on the host names its sandbox as a
@@ -735,17 +1226,49 @@ fn a_preview_on_the_host_is_never_called_a_container() {
     let root = dir.path().canonicalize().unwrap();
     let at = a_run_in(&root);
     let recipe = a_recipe(serde_json::json!({"schema_version": "1.1", "command": "x"}));
-    let spec = spec_in(BackendKind::Seatbelt, &recipe, &at, false, ("seatbelt".into(), None), Vec::new(), &Toolchain::default());
-    assert!(spec.script.starts_with("echo 'darkmux-preview: sandbox started'"), "{}", spec.script);
+    let spec = spec_in(
+        BackendKind::Seatbelt,
+        &recipe,
+        &at,
+        false,
+        ("seatbelt".into(), None),
+        Vec::new(),
+        &Toolchain::default(),
+    );
+    assert!(
+        spec.script
+            .starts_with("echo 'darkmux-preview: sandbox started'"),
+        "{}",
+        spec.script
+    );
     let log = root.join("log");
     std::fs::write(&log, "sandbox-exec: something failed\n").unwrap();
-    let never = exit_reason_in(BackendKind::Seatbelt, &recipe, &log, Err(std::io::Error::other("gone")));
-    assert!(never.starts_with("the preview sandbox did not start"), "{never}");
+    let never = exit_reason_in(
+        BackendKind::Seatbelt,
+        &recipe,
+        &log,
+        Err(std::io::Error::other("gone")),
+    );
+    assert!(
+        never.starts_with("the preview sandbox did not start"),
+        "{never}"
+    );
     std::fs::write(&log, format!("{ON_HOST_STARTED_LINE}\n{STALE_LINE}\n")).unwrap();
-    let stale = exit_reason_in(BackendKind::Seatbelt, &recipe, &log, Err(std::io::Error::other("gone")));
-    assert_eq!(stale, "the preview's sandbox stopped itself: darkmux stopped answering");
+    let stale = exit_reason_in(
+        BackendKind::Seatbelt,
+        &recipe,
+        &log,
+        Err(std::io::Error::other("gone")),
+    );
+    assert_eq!(
+        stale,
+        "the preview's sandbox stopped itself: darkmux stopped answering"
+    );
     std::fs::write(&log, format!("{STARTED_LINE}\n{STALE_LINE}\n")).unwrap();
-    assert_eq!(exit_reason(&recipe, &log, Err(std::io::Error::other("gone"))), "the preview's container stopped itself: darkmux stopped answering");
+    assert_eq!(
+        exit_reason(&recipe, &log, Err(std::io::Error::other("gone"))),
+        "the preview's container stopped itself: darkmux stopped answering"
+    );
 }
 
 /// (#3561) A preview on the host runs darkmux's verified Node for its
@@ -766,21 +1289,54 @@ fn a_preview_on_the_host_runs_the_managed_node_its_workspace_declares() {
     let prev = std::env::var_os("DARKMUX_HOME");
     unsafe { std::env::set_var("DARKMUX_HOME", &home_path) };
     let stages = std::sync::Mutex::new(Vec::new());
-    let first = OnHost::new(BackendKind::Seatbelt).toolchain(&recipe, &ws, &|s| stages.lock().unwrap().push(s));
-    let again = OnHost::new(BackendKind::Seatbelt).toolchain(&recipe, &ws, &|s| stages.lock().unwrap().push(s));
+    let first = OnHost::new(BackendKind::Seatbelt)
+        .toolchain(&recipe, &ws, &|s| stages.lock().unwrap().push(s));
+    let again = OnHost::new(BackendKind::Seatbelt)
+        .toolchain(&recipe, &ws, &|s| stages.lock().unwrap().push(s));
     unsafe {
-        match prev { Some(v) => std::env::set_var("DARKMUX_HOME", v), None => std::env::remove_var("DARKMUX_HOME") }
+        match prev {
+            Some(v) => std::env::set_var("DARKMUX_HOME", v),
+            None => std::env::remove_var("DARKMUX_HOME"),
+        }
     }
     let first = first.unwrap();
     let platform = darkmux_platform::current().node_release_platform().unwrap();
     let node = home_path.join(format!("toolchains/node-24.22.3-{platform}"));
-    assert_eq!(first.read_only.first(), Some(&node), "{:?}", first.read_only);
-    assert_eq!(first.path.as_deref().unwrap().split(':').next(), node.join("bin").to_str(), "{:?}", first.path);
-    assert!(first.identity.contains(&node.display().to_string()), "{}", first.identity);
+    assert_eq!(
+        first.read_only.first(),
+        Some(&node),
+        "{:?}",
+        first.read_only
+    );
+    assert_eq!(
+        first.path.as_deref().unwrap().split(':').next(),
+        node.join("bin").to_str(),
+        "{:?}",
+        first.path
+    );
+    assert!(
+        first.identity.contains(&node.display().to_string()),
+        "{}",
+        first.identity
+    );
     let preload = node.join("darkmux/listen-loopback.cjs");
-    assert_eq!(first.env, vec![("NODE_OPTIONS".to_string(), format!("--require \"{}\"", preload.display()))], "the listen preload");
-    assert_eq!(*stages.lock().unwrap(), vec![Some(PreviewStage::getting("node", "Node", "24.22.3")), None]);
-    assert_eq!(again.unwrap(), first, "a second start resolved another toolchain");
+    assert_eq!(
+        first.env,
+        vec![(
+            "NODE_OPTIONS".to_string(),
+            format!("--require \"{}\"", preload.display())
+        )],
+        "the listen preload"
+    );
+    assert_eq!(
+        *stages.lock().unwrap(),
+        vec![Some(PreviewStage::getting("node", "Node", "24.22.3")), None]
+    );
+    assert_eq!(
+        again.unwrap(),
+        first,
+        "a second start resolved another toolchain"
+    );
 }
 
 /// (#3561) A preview on the host appends the managed Node's listen preload
@@ -791,13 +1347,47 @@ fn a_preview_appends_the_listen_preload_to_the_recipes_node_options() {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let at = a_run_in(&root);
-    let recipe = a_recipe(serde_json::json!({"schema_version": "1.1", "command": "npm run dev", "env": {"NODE_OPTIONS": "--max-old-space-size=4096"}}));
-    let toolchain = Toolchain { env: vec![("NODE_OPTIONS".into(), "--require \"/n/p.cjs\"".into())], ..a_toolchain(&root) };
-    let spec = spec_in(BackendKind::Seatbelt, &recipe, &at, false, ("seatbelt".into(), None), Vec::new(), &toolchain);
-    let options: Vec<&String> = spec.env.iter().filter(|(k, _)| k == "NODE_OPTIONS").map(|(_, v)| v).collect();
-    assert_eq!(options, ["--max-old-space-size=4096 --require \"/n/p.cjs\""]);
-    let docker = spec_in(BackendKind::Docker, &recipe, &at, false, ("img".into(), None), Vec::new(), &Toolchain::default());
-    let options: Vec<&String> = docker.env.iter().filter(|(k, _)| k == "NODE_OPTIONS").map(|(_, v)| v).collect();
+    let recipe = a_recipe(
+        serde_json::json!({"schema_version": "1.1", "command": "npm run dev", "env": {"NODE_OPTIONS": "--max-old-space-size=4096"}}),
+    );
+    let toolchain = Toolchain {
+        env: vec![("NODE_OPTIONS".into(), "--require \"/n/p.cjs\"".into())],
+        ..a_toolchain(&root)
+    };
+    let spec = spec_in(
+        BackendKind::Seatbelt,
+        &recipe,
+        &at,
+        false,
+        ("seatbelt".into(), None),
+        Vec::new(),
+        &toolchain,
+    );
+    let options: Vec<&String> = spec
+        .env
+        .iter()
+        .filter(|(k, _)| k == "NODE_OPTIONS")
+        .map(|(_, v)| v)
+        .collect();
+    assert_eq!(
+        options,
+        ["--max-old-space-size=4096 --require \"/n/p.cjs\""]
+    );
+    let docker = spec_in(
+        BackendKind::Docker,
+        &recipe,
+        &at,
+        false,
+        ("img".into(), None),
+        Vec::new(),
+        &Toolchain::default(),
+    );
+    let options: Vec<&String> = docker
+        .env
+        .iter()
+        .filter(|(k, _)| k == "NODE_OPTIONS")
+        .map(|(_, v)| v)
+        .collect();
     assert_eq!(options, ["--max-old-space-size=4096"]);
 }
 
@@ -809,11 +1399,32 @@ fn a_preview_stage_ends_however_the_fetch_ends() {
     use darkmux_crew::managed_toolchain::{Note, NODE};
     let pin = NODE.pins[0];
     let at = std::time::Duration::ZERO;
-    assert_eq!(on_host::preview_stage(&Note::Fetching { runtime: &NODE, pin: &pin }), Some(PreviewStage::getting("node", "Node", "26.13.1")));
+    assert_eq!(
+        on_host::preview_stage(&Note::Fetching {
+            runtime: &NODE,
+            pin: &pin
+        }),
+        Some(PreviewStage::getting("node", "Node", "26.13.1"))
+    );
     for ended in [
-        Note::Ready { runtime: &NODE, pin: &pin, elapsed: at },
-        Note::Failed { runtime: &NODE, pin: &pin, elapsed: at, reason: "x" },
-        Note::Unavailable { runtime: &NODE, pin: None, platform: "darwin-arm64", reason: "x", required: false },
+        Note::Ready {
+            runtime: &NODE,
+            pin: &pin,
+            elapsed: at,
+        },
+        Note::Failed {
+            runtime: &NODE,
+            pin: &pin,
+            elapsed: at,
+            reason: "x",
+        },
+        Note::Unavailable {
+            runtime: &NODE,
+            pin: None,
+            platform: "darwin-arm64",
+            reason: "x",
+            required: false,
+        },
     ] {
         assert_eq!(on_host::preview_stage(&ended), None, "{ended:?}");
     }

@@ -129,7 +129,10 @@ enum Line {
 
 impl FlowRecordStore {
     pub(crate) const fn new(keep: fn(&Value) -> bool) -> Self {
-        Self { keep, slot: Mutex::new(None) }
+        Self {
+            keep,
+            slot: Mutex::new(None),
+        }
     }
 
     /// The window's kept lines: day files in `flows_dir` dated at or after
@@ -152,7 +155,11 @@ impl FlowRecordStore {
     /// Lines parsed off disk so far for the directory last read.
     #[cfg(test)]
     pub(crate) fn lines_parsed(&self) -> u64 {
-        self.slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map_or(0, |s| s.lines_parsed)
+        self.slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map_or(0, |s| s.lines_parsed)
     }
 }
 
@@ -165,7 +172,9 @@ impl DirState {
         let mut on_disk: BTreeMap<String, PathBuf> = BTreeMap::new();
         for entry in entries.flatten() {
             let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else { continue };
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
             // A plain length check, not calendar validation: the goal is
             // bounding which files get opened.
             let Some(date) = name.strip_suffix(".jsonl").filter(|d| d.len() == 10) else {
@@ -184,7 +193,10 @@ impl DirState {
             #[cfg(not(test))]
             let parsed = &mut 0u64;
             match file.refresh(path, keep, parsed) {
-                Some(tail) => out.push(DayLines { committed: file.lines.clone(), tail }),
+                Some(tail) => out.push(DayLines {
+                    committed: file.lines.clone(),
+                    tail,
+                }),
                 None => {
                     self.files.remove(date);
                 }
@@ -198,7 +210,12 @@ impl DayFile {
     /// Bring this file's kept lines up to date with the bytes on disk.
     /// Returns the unterminated tail's line, or `None` when the file cannot
     /// be read (a walk skips it).
-    fn refresh(&mut self, path: &Path, keep: fn(&Value) -> bool, parsed: &mut u64) -> Option<Vec<Box<str>>> {
+    fn refresh(
+        &mut self,
+        path: &Path,
+        keep: fn(&Value) -> bool,
+        parsed: &mut u64,
+    ) -> Option<Vec<Box<str>>> {
         let mut file = std::fs::File::open(path).ok()?;
         let len = self.check(&mut file)?;
         if self.stopped || len == self.committed {
@@ -225,7 +242,10 @@ impl DayFile {
         let meta = file.metadata().ok()?;
         let (len, id) = (meta.len(), file_id(&meta));
         if self.id != id || len < self.committed || last_bytes(file, self.committed) != self.last {
-            *self = DayFile { id, ..DayFile::default() };
+            *self = DayFile {
+                id,
+                ..DayFile::default()
+            };
         }
         Some(len)
     }
@@ -233,7 +253,9 @@ impl DayFile {
     /// Keep the wanted lines of `whole` (newline-terminated lines), stopping
     /// the file at a non-UTF-8 one.
     fn keep_lines(&mut self, whole: &[u8], keep: fn(&Value) -> bool, parsed: &mut u64) {
-        let Some((_, lines)) = whole.split_last() else { return };
+        let Some((_, lines)) = whole.split_last() else {
+            return;
+        };
         let mut fresh = Vec::new();
         for raw in lines.split(|b| *b == b'\n') {
             match parse_line(raw, keep, parsed) {
@@ -278,7 +300,10 @@ pub(crate) fn last_bytes(file: &mut std::fs::File, upto: u64) -> Vec<u8> {
 #[cfg(unix)]
 pub(crate) fn file_id(meta: &std::fs::Metadata) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt;
-    Some(FileId { dev: meta.dev(), ino: meta.ino() })
+    Some(FileId {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
 }
 
 #[cfg(not(unix))]
@@ -323,12 +348,18 @@ mod tests {
     fn oracle(dir: &Path, cutoff: &str, keep: fn(&Value) -> bool) -> Vec<Value> {
         use std::io::BufRead;
         let mut out = Vec::new();
-        let Ok(entries) = std::fs::read_dir(dir) else { return out };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
         let mut day_files: Vec<PathBuf> = Vec::new();
         for entry in entries.flatten() {
             let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else { continue };
-            let Some(date) = name.strip_suffix(".jsonl") else { continue };
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(date) = name.strip_suffix(".jsonl") else {
+                continue;
+            };
             if date.len() != 10 || date < cutoff {
                 continue;
             }
@@ -336,14 +367,18 @@ mod tests {
         }
         day_files.sort();
         for path in day_files {
-            let Ok(file) = std::fs::File::open(&path) else { continue };
+            let Ok(file) = std::fs::File::open(&path) else {
+                continue;
+            };
             for line in std::io::BufReader::new(file).lines() {
                 let Ok(line) = line else { break };
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
                 }
-                let Some(v) = darkmux_flow::reader::parse_value(line) else { continue };
+                let Some(v) = darkmux_flow::reader::parse_value(line) else {
+                    continue;
+                };
                 if v.get("_type").and_then(|t| t.as_str()) == Some("schema") || !keep(&v) {
                     continue;
                 }
@@ -364,7 +399,11 @@ mod tests {
     }
 
     fn append(dir: &Path, date: &str, bytes: &[u8]) {
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{date}.jsonl"))).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(format!("{date}.jsonl")))
+            .unwrap();
         f.write_all(bytes).unwrap();
     }
 
@@ -373,8 +412,14 @@ mod tests {
         let kept = flat(&store.read(dir, cutoff));
         let fresh = flat(&FlowRecordStore::new(store.keep).read(dir, cutoff));
         let want = oracle(dir, cutoff, store.keep);
-        assert_eq!(fresh, want, "{step}: a from-scratch read differs from the pre-#2891 walk");
-        assert_eq!(kept, want, "{step}: the incremental read differs from a from-scratch walk");
+        assert_eq!(
+            fresh, want,
+            "{step}: a from-scratch read differs from the pre-#2891 walk"
+        );
+        assert_eq!(
+            kept, want,
+            "{step}: the incremental read differs from a from-scratch walk"
+        );
     }
 
     #[test]
@@ -382,11 +427,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let store = FlowRecordStore::new(keep_sessions);
-        append(dir, "2026-01-01", b"{\"_type\":\"schema\",\"session_id\":\"x\"}\n");
+        append(
+            dir,
+            "2026-01-01",
+            b"{\"_type\":\"schema\",\"session_id\":\"x\"}\n",
+        );
         for n in 0..5 {
             append(dir, "2026-01-01", rec(n).as_bytes());
         }
-        append(dir, "2026-01-01", b"\n   \nnot json\n{\"ts\":\"t\",\"action\":\"machine.telemetry\"}\n");
+        append(
+            dir,
+            "2026-01-01",
+            b"\n   \nnot json\n{\"ts\":\"t\",\"action\":\"machine.telemetry\"}\n",
+        );
         agree(&store, dir, "2026-01-01", "first read");
 
         append(dir, "2026-01-01", rec(5).as_bytes());
@@ -409,7 +462,11 @@ mod tests {
         // Rotation: the name now holds a different file.
         let day1 = dir.join("2026-01-01.jsonl");
         std::fs::rename(&day1, dir.join("rotated.old")).unwrap();
-        append(dir, "2026-01-01", format!("{}{}{}{}", rec(20), rec(21), rec(22), rec(23)).as_bytes());
+        append(
+            dir,
+            "2026-01-01",
+            format!("{}{}{}{}", rec(20), rec(21), rec(22), rec(23)).as_bytes(),
+        );
         agree(&store, dir, "2026-01-01", "rotation");
 
         // Truncation to fewer bytes than were parsed.
@@ -421,8 +478,17 @@ mod tests {
         agree(&store, dir, "2026-01-01", "rewrite that kept the head");
 
         // Rewritten in place, same inode, longer, its last parsed line changed.
-        std::fs::write(&day1, format!("{}{}{}{}", rec(30), rec(31), rec(33), rec(34))).unwrap();
-        agree(&store, dir, "2026-01-01", "rewrite that changed the last parsed line");
+        std::fs::write(
+            &day1,
+            format!("{}{}{}{}", rec(30), rec(31), rec(33), rec(34)),
+        )
+        .unwrap();
+        agree(
+            &store,
+            dir,
+            "2026-01-01",
+            "rewrite that changed the last parsed line",
+        );
 
         // A non-UTF-8 line ends the file's walk, appends after it included.
         append(dir, "2026-01-02", b"\xff\xfe\n");
@@ -446,11 +512,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let store = FlowRecordStore::new(keep_all);
-        append(dir, "2026-01-01", (1..=5).map(rec).collect::<String>().as_bytes());
+        append(
+            dir,
+            "2026-01-01",
+            (1..=5).map(rec).collect::<String>().as_bytes(),
+        );
         agree(&store, dir, "2026-01-01", "first read");
         let day = dir.join("2026-01-01.jsonl");
         std::fs::rename(&day, dir.join("rotated.old")).unwrap();
-        append(dir, "2026-01-01", [1, 9, 3, 4, 5, 6].map(rec).concat().as_bytes());
+        append(
+            dir,
+            "2026-01-01",
+            [1, 9, 3, 4, 5, 6].map(rec).concat().as_bytes(),
+        );
         agree(&store, dir, "2026-01-01", "replaced");
     }
 
@@ -466,10 +540,18 @@ mod tests {
         store.read(dir, "2026-01-01");
         assert_eq!(store.lines_parsed(), 20, "the first read parses every line");
         store.read(dir, "2026-01-01");
-        assert_eq!(store.lines_parsed(), 20, "a repeat read with nothing appended parses nothing");
+        assert_eq!(
+            store.lines_parsed(),
+            20,
+            "a repeat read with nothing appended parses nothing"
+        );
         append(dir, "2026-01-02", rec(10).as_bytes());
         let read = store.read(dir, "2026-01-01");
-        assert_eq!(store.lines_parsed(), 21, "a read after one append parses one line");
+        assert_eq!(
+            store.lines_parsed(),
+            21,
+            "a read after one append parses one line"
+        );
         assert_eq!(flat(&read).len(), 21);
     }
 
@@ -483,7 +565,11 @@ mod tests {
         store.read(dir, "2026-01-01");
         assert_eq!(flat(&store.read(dir, "2026-01-02")).len(), 1);
         store.read(dir, "2026-01-01");
-        assert_eq!(store.lines_parsed(), 3, "the file the narrower read left out was read again");
+        assert_eq!(
+            store.lines_parsed(),
+            3,
+            "the file the narrower read left out was read again"
+        );
     }
 
     #[test]
@@ -493,6 +579,9 @@ mod tests {
         append(b.path(), "2026-01-01", rec(2).as_bytes());
         let store = FlowRecordStore::new(keep_all);
         store.read(a.path(), "2026-01-01");
-        assert_eq!(flat(&store.read(b.path(), "2026-01-01")), oracle(b.path(), "2026-01-01", keep_all));
+        assert_eq!(
+            flat(&store.read(b.path(), "2026-01-01")),
+            oracle(b.path(), "2026-01-01", keep_all)
+        );
     }
 }

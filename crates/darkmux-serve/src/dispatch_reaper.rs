@@ -35,7 +35,10 @@ pub(crate) fn tick_lines(
         ReapTick::ListingUnavailable if *docker_warned => Vec::new(),
         ReapTick::ListingUnavailable => {
             *docker_warned = true;
-            let kinds: Vec<_> = darkmux_sandbox::available_backends().iter().map(|b| b.kind()).collect();
+            let kinds: Vec<_> = darkmux_sandbox::available_backends()
+                .iter()
+                .map(|b| b.kind())
+                .collect();
             vec![idle_line(&kinds)]
         }
         ReapTick::Listed { reaped } => {
@@ -60,7 +63,11 @@ fn idle_line(kinds: &[darkmux_sandbox::BackendKind]) -> String {
     if kinds.is_empty() {
         return "darkmux serve: dispatch reaper idle: this host runs no sandbox backend (no `docker` on PATH, no sandbox-exec)".to_string();
     }
-    let asked = kinds.iter().map(|k| format!("`{}`", darkmux_sandbox::setting_value(*k))).collect::<Vec<_>>().join(", ");
+    let asked = kinds
+        .iter()
+        .map(|k| format!("`{}`", darkmux_sandbox::setting_value(*k)))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("darkmux serve: dispatch reaper idle: no sandbox listing answered (asked {asked})")
 }
 
@@ -255,8 +262,13 @@ mod tests {
         }
         // (#3112 review) Seatbelt or Landlock, where it runs, still answers:
         // nothing to say. Where nothing runs, one line, then silence.
-        if darkmux_sandbox::SeatbeltBackend::available() || darkmux_sandbox::LandlockBackend::available().is_ok() {
-            assert!(first.is_empty() && second.is_empty(), "{first:?} {second:?}");
+        if darkmux_sandbox::SeatbeltBackend::available()
+            || darkmux_sandbox::LandlockBackend::available().is_ok()
+        {
+            assert!(
+                first.is_empty() && second.is_empty(),
+                "{first:?} {second:?}"
+            );
             return;
         }
         assert_eq!(first.len(), 1, "{first:?}");
@@ -271,7 +283,10 @@ mod tests {
         let src = include_str!("dispatch_reaper.rs");
         let tick = &src[src.find("pub(crate) fn this_host_tick_lines").unwrap()..];
         let tick = &tick[..tick.find("\n}\n").unwrap()];
-        assert!(tick.contains("darkmux_crew::contained_command::reap_orphaned_containers();"), "{tick}");
+        assert!(
+            tick.contains("darkmux_crew::contained_command::reap_orphaned_containers();"),
+            "{tick}"
+        );
     }
 
     /// (#3112) The idle line names every backend the tick asked, or says
@@ -282,7 +297,14 @@ mod tests {
         let both = idle_line(&[BackendKind::Docker, BackendKind::Seatbelt]);
         assert!(both.contains("asked `docker`, `seatbelt`"), "{both}");
         let seatbelt = idle_line(&[BackendKind::Seatbelt]);
-        assert!(seatbelt.contains("asked `seatbelt`") && !seatbelt.contains("docker"), "{seatbelt}");
-        assert!(idle_line(&[]).contains("no sandbox backend"), "{}", idle_line(&[]));
+        assert!(
+            seatbelt.contains("asked `seatbelt`") && !seatbelt.contains("docker"),
+            "{seatbelt}"
+        );
+        assert!(
+            idle_line(&[]).contains("no sandbox backend"),
+            "{}",
+            idle_line(&[])
+        );
     }
 }

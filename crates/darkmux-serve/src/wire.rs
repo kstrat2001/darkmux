@@ -535,13 +535,22 @@ pub struct LabStaffing {
 
 impl From<&darkmux_crew::run_record::SeatStaffingSnapshot> for LabSeat {
     fn from(s: &darkmux_crew::run_record::SeatStaffingSnapshot) -> Self {
-        Self { name: s.name.clone(), model: s.model.clone(), k: s.k, n_ctx: s.n_ctx, max_tokens: s.max_tokens }
+        Self {
+            name: s.name.clone(),
+            model: s.model.clone(),
+            k: s.k,
+            n_ctx: s.n_ctx,
+            max_tokens: s.max_tokens,
+        }
     }
 }
 
 impl From<&darkmux_crew::run_record::StaffingSnapshot> for LabStaffing {
     fn from(s: &darkmux_crew::run_record::StaffingSnapshot) -> Self {
-        Self { probes: s.probes.iter().map(LabSeat::from).collect(), judge: s.judge.as_ref().map(LabSeat::from) }
+        Self {
+            probes: s.probes.iter().map(LabSeat::from).collect(),
+            judge: s.judge.as_ref().map(LabSeat::from),
+        }
     }
 }
 
@@ -666,4 +675,3 @@ impl From<&darkmux_lab::lab::review::ReviewEnvelope> for LabReviewSummary {
         }
     }
 }
-
