@@ -3104,6 +3104,20 @@ printf '{\"result\":\"refused\",\"code\":\"busy\",\"error\":\"held\"}'\necho 'he
     let e = run_dispatch_child(&no, &spec, &CancelFlag::default(), GRACE, &FakeTeardown::default()).unwrap_err();
     assert_eq!((e.reason.as_str(), e.code.as_deref()), ("exit 1", Some("busy")), "{e:?}");
     assert_eq!(e.error, "held");
+
+    // (#3578) A dispatch that never reached the model prints its error
+    // envelope and exits 1: a failed run with the envelope's error, never
+    // `done` (Mux Bot showed "Changed nothing").
+    let down = dir.path().join("down");
+    std::fs::write(
+        &down,
+        "#!/bin/sh\ncat >/dev/null\nprintf '{\"result\":\"error\",\"error\":\"Connection refused (os error 61)\"}'\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&down, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let e = run_dispatch_child(&down, &spec, &CancelFlag::default(), GRACE, &FakeTeardown::default()).unwrap_err();
+    assert_eq!(e.reason, "exit 1");
+    assert!(e.error.contains("Connection refused"), "{e:?}");
 }
 
 // ─── Cancel ──────────────────────────────────────────────────────────────

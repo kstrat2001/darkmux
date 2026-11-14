@@ -6391,13 +6391,26 @@ pub(crate) fn run_dispatch_child(
     // (#3505) A refused dispatch prints its refusal envelope: a failed run,
     // carrying the envelope's code.
     let mut refused_code = None;
+    // (#3578) A dispatch that failed (exit non-zero, or its envelope says
+    // `error`: the model's server refused the connection, say) still prints
+    // an envelope; it is a failed run carrying the envelope's error, never
+    // `done`.
+    let mut envelope_error = None;
     if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(stdout.trim()) {
-        if v.get("result").and_then(Value::as_str) != Some("refused") {
+        let result = v.get("result").and_then(Value::as_str);
+        if result != Some("refused") && result != Some("error") && status.success() {
             return Ok(v);
         }
-        refused_code = v.get("code").and_then(Value::as_str).map(str::to_string);
+        if result == Some("refused") {
+            refused_code = v.get("code").and_then(Value::as_str).map(str::to_string);
+        }
+        envelope_error = v.get("error").and_then(Value::as_str).map(str::to_string);
     }
-    let tail = stderr_tail(&stderr_bytes);
+    let stderr = stderr_tail(&stderr_bytes);
+    let tail = match envelope_error {
+        Some(e) if !e.is_empty() && !stderr.contains(&e) => format!("{e}\n{stderr}").trim_end().to_string(),
+        _ => stderr,
+    };
     #[cfg(unix)]
     let signal = std::os::unix::process::ExitStatusExt::signal(&status);
     #[cfg(not(unix))]
