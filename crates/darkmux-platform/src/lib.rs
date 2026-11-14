@@ -367,21 +367,31 @@ pub(crate) fn answer_from_button(label: &str) -> AllowAnswer {
 pub(crate) fn output_within(mut cmd: std::process::Command, deadline: std::time::Duration) -> Option<std::process::Output> {
     use std::process::Stdio;
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().ok()?;
-    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
-            }
-            bytes
-        })
-    };
-    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
-    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let status = exit_within(&mut child, deadline)?;
+    Some(std::process::Output { status, stdout: stdout.join().ok()?, stderr: stderr.join().ok()? })
+}
+
+/// Reads `pipe` to its end on a thread of its own ([`output_within`]'s
+/// output, read while the command runs); no pipe reads as no bytes.
+pub(crate) fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
+
+/// `child`'s exit status once it ends, or `None` once `deadline` has passed
+/// (or its status cannot be read): it is then killed and reaped.
+fn exit_within(child: &mut std::process::Child, deadline: std::time::Duration) -> Option<std::process::ExitStatus> {
     let until = std::time::Instant::now() + deadline;
-    let status = loop {
+    loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => return Some(status),
             Ok(None) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
@@ -389,8 +399,7 @@ pub(crate) fn output_within(mut cmd: std::process::Command, deadline: std::time:
                 return None;
             }
         }
-    };
-    Some(std::process::Output { status, stdout: stdout.join().ok()?, stderr: stderr.join().ok()? })
+    }
 }
 
 /// Starts `cmd` and lets it finish on its own (reaped on a thread), for a
@@ -781,13 +790,12 @@ impl<'a> Elf<'a> {
         Some((self.field(off, off_w)?, self.field(size_at, 2)? as usize, self.field(num_at, 2)? as usize))
     }
 
-    /// Program header `ph`'s file offset and size.
+    /// Program header `ph`'s file offset and size (`p_offset`, `p_filesz`,
+    /// at this class's offsets and width); `None` when the entry is cut
+    /// short.
     fn interpreter_fields(&self, ph: usize) -> Option<(u64, u64)> {
-        if self.is64 {
-            Some((self.field(ph.checked_add(8)?, 8)?, self.field(ph.checked_add(32)?, 8)?))
-        } else {
-            Some((self.field(ph.checked_add(4)?, 4)?, self.field(ph.checked_add(16)?, 4)?))
-        }
+        let (offset_at, size_at, width) = if self.is64 { (8, 32, 8) } else { (4, 16, 4) };
+        Some((self.field(ph.checked_add(offset_at)?, width)?, self.field(ph.checked_add(size_at)?, width)?))
     }
 }
 
@@ -891,6 +899,23 @@ impl PortListener {
             None => format!("[{}…]:{port} (an IPv6 address netstat cut short; not a loopback one)", self.text),
         }
     }
+}
+
+/// (#3559) The TCP listeners `leader`'s sandbox holds: each of its
+/// members' ([`sandbox_members`] of the process `table`, `(pid, ppid, pgid,
+/// sid)` rows) as `held_by` reads them, in member order. `None` when there
+/// is no table, or when one member's listeners cannot be read: never a
+/// partial answer.
+pub(crate) fn listeners_held_by_members(
+    leader: u32,
+    table: Option<Vec<(u32, u32, u32, u32)>>,
+    mut held_by: impl FnMut(u32) -> Option<Vec<(u16, PortListener)>>,
+) -> Option<Vec<(u16, PortListener)>> {
+    let mut held = Vec::new();
+    for pid in sandbox_members(leader, &table?) {
+        held.extend(held_by(pid)?);
+    }
+    Some(held)
 }
 
 /// (#3559) A sandbox's processes in a process table of `(pid, ppid, pgid,

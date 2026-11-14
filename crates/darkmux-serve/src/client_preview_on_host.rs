@@ -150,9 +150,12 @@ pub(crate) fn exposed_in(platform: &dyn darkmux_platform::Platform, kind: Backen
 /// toolchain, and the listener watch through `darkmux-platform`.
 pub struct OnHost {
     kind: BackendKind,
+    /// The backend whose commands make, start and remove its sandboxes:
+    /// `kind`'s own, or a test's.
+    backend: &'static dyn darkmux_sandbox::SandboxBackend,
     /// Each running preview's two ports, by its sandbox's name, for the
     /// report after a stop.
-    ports: Mutex<HashMap<String, [u16; 2]>>,
+    pub(crate) ports: Mutex<HashMap<String, [u16; 2]>>,
 }
 
 /// How long one lifecycle command of a sandbox on the host may take.
@@ -160,7 +163,12 @@ const CALL_BOUND: Duration = Duration::from_secs(30);
 
 impl OnHost {
     pub fn new(kind: BackendKind) -> Self {
-        OnHost { kind, ports: Mutex::new(HashMap::new()) }
+        OnHost::with_backend(darkmux_sandbox::backend_of(kind))
+    }
+
+    /// One whose sandboxes are `backend`'s, of its kind.
+    pub(crate) fn with_backend(backend: &'static dyn darkmux_sandbox::SandboxBackend) -> Self {
+        OnHost { kind: backend.kind(), backend, ports: Mutex::new(HashMap::new()) }
     }
 
     fn handle(&self, name: &str) -> SandboxHandle {
@@ -215,7 +223,7 @@ impl PreviewContainers for OnHost {
 
     fn create(&self, spec: &ContainerSpec) -> Result<(), String> {
         use darkmux_crew::bounded_command::{run_bounded, Bounded};
-        let (cmd, _) = darkmux_sandbox::backend_of(self.kind).create(&super::preview_policy(spec));
+        let (cmd, _) = self.backend.create(&super::preview_policy(spec));
         match run_bounded(cmd, CALL_BOUND) {
             Bounded::Finished { success: true, .. } => {
                 self.ports.lock().unwrap().insert(spec.name.clone(), spec.ports);
@@ -230,7 +238,7 @@ impl PreviewContainers for OnHost {
         let out = std::fs::OpenOptions::new().append(true).create(true).open(log).map_err(|e| format!("opening {}: {e}", log.display()))?;
         let err = out.try_clone().map_err(|e| format!("opening {}: {e}", log.display()))?;
         let handle = self.handle(name);
-        let mut cmd = darkmux_sandbox::for_handle(&handle).start(&handle);
+        let mut cmd = self.backend.start(&handle);
         cmd.stdin(std::process::Stdio::null()).stdout(out).stderr(err);
         // The backend's launcher leads a process group of its own (under
         // Seatbelt, a session of its own, #3559, so no group is set here: a
@@ -258,9 +266,8 @@ impl PreviewContainers for OnHost {
             c
         };
         let handle = self.handle(name);
-        let backend = darkmux_sandbox::for_handle(&handle);
-        let _ = run_bounded(quiet(backend.stop(&handle, Duration::from_secs(5))), CALL_BOUND);
-        let _ = run_bounded(quiet(backend.remove(&handle)), CALL_BOUND);
+        let _ = run_bounded(quiet(self.backend.stop(&handle, Duration::from_secs(5))), CALL_BOUND);
+        let _ = run_bounded(quiet(self.backend.remove(&handle)), CALL_BOUND);
         if let Some(ports) = self.ports.lock().unwrap().remove(name) {
             for line in lingering(darkmux_platform::current(), name, ports) {
                 eprintln!("{line}");

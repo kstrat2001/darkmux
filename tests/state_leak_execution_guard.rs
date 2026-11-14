@@ -334,7 +334,14 @@ fn enumerate_units() -> Vec<Unit> {
         // in this workspace today has a `src/lib.rs`; this branch exists
         // so a FUTURE bin-only member gets `--bins` automatically instead
         // of silently failing loudly for the wrong stated reason.
-        if member_dir.join("src/lib.rs").exists() {
+        // (#3112) A library declared `test = false` has no unit tests to
+        // run here: `darkmux-runtime-linked` compiles `runtime/src` a second
+        // time and leaves its tests to `runtime/` (`cargo t-runtime`). An
+        // explicit `--lib` would compile them without their dev-dependencies
+        // and fail; `--bins` matches no target, a unit that never ran.
+        if member_manifest.as_deref().is_some_and(lib_tests_off) {
+            // Nothing to census for the library; its `tests/` still are.
+        } else if member_dir.join("src/lib.rs").exists() {
             units.push(Unit::PackageLib(pkg_name.clone()));
         } else {
             units.push(Unit::PackageBins(pkg_name.clone()));
@@ -368,6 +375,26 @@ fn enumerate_units() -> Vec<Unit> {
     units
 }
 
+/// Whether a member manifest's `[lib]` table says `test = false`: its library
+/// has no unit tests for this guard to run.
+fn lib_tests_off(manifest: &str) -> bool {
+    let mut in_lib = false;
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_lib = line == "[lib]";
+            continue;
+        }
+        if in_lib {
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim() == "test" && value.split('#').next().unwrap_or("").trim() == "false" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Units that still leak, each with its count measured and the reason the fix
 /// is not a per-test guard. EMPTY today: the one entry this list held
 /// (`cargo test -p darkmux --bins`, `mission_launch::launch()`'s `process-start`
@@ -382,6 +409,23 @@ fn enumerate_units() -> Vec<Unit> {
 /// deleted. And an entry has to name a unit this check actually runs, so it
 /// cannot outlive the thing it describes.
 const KNOWN_UNISOLATED_UNITS: &[(&str, usize, &str)] = &[];
+
+/// (#3112) A member whose library is `test = false` (the linked runtime)
+/// gets no `--lib` or `--bins` unit: an explicit `--lib` would compile its
+/// tests without their dev-dependencies and fail, and `--bins` matches no
+/// target, so the census would read a unit that never ran.
+#[test]
+fn a_library_with_its_tests_off_gets_no_unit() {
+    let units = enumerate_units();
+    let linked = units
+        .iter()
+        .filter(|u| matches!(u, Unit::PackageLib(p) | Unit::PackageBins(p) if p == "darkmux-runtime-linked"))
+        .count();
+    assert_eq!(linked, 0, "{units:?}");
+    assert!(lib_tests_off("[package]\nname = \"x\"\n[lib]\npath = \"a.rs\"\ntest = false # theirs\n"));
+    assert!(!lib_tests_off("[lib]\ntest = true\n[dev-dependencies]\ntest = false\n"));
+    assert!(!lib_tests_off("[package]\ntest = false\n"));
+}
 
 /// The free half: the enumeration itself, asserted on every `cargo test`.
 ///

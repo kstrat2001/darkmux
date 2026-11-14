@@ -589,6 +589,28 @@ mod tests {
         assert_eq!(for_handle(&handle).kind(), BackendKind::Seatbelt);
     }
 
+    /// (#3112) A message names the sandbox the setting resolves to now, and
+    /// a refused setting as refused (its entry point already said why),
+    /// never as Docker.
+    #[test]
+    #[serial_test::serial]
+    fn a_message_names_the_configured_sandbox_or_that_it_is_refused() {
+        let prev = std::env::var_os(SANDBOX_ENV);
+        let under = |value: &str| {
+            unsafe { std::env::set_var(SANDBOX_ENV, value) };
+            placed_in_configured()
+        };
+        let (docker, refused) = (under("docker"), under("podman"));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(SANDBOX_ENV, v),
+                None => std::env::remove_var(SANDBOX_ENV),
+            }
+        }
+        assert_eq!(docker, placed_in(BackendKind::Docker));
+        assert_eq!(refused, "the sandbox (`runtime.sandbox` is refused)");
+    }
+
     /// (#3112 review) A reaper lists every backend this host can run, so a
     /// sandbox left from before the default changed is still found.
     #[test]

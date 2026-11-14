@@ -1,0 +1,20 @@
+<pattern name="stale-consumer">
+Title: A consumer pins a library version its range cannot advance to, and imports symbols that changed
+
+Report a match when: The consumer's declared range for the library EXCLUDES the library version being examined (a lower major, or a caret/tilde range that cannot reach it), AND a symbol the consumer imports from that library has, in the library version being examined, a different signature, a different return shape, a changed default, or no longer exists. Report each consumer import line of such a symbol.
+
+Do NOT report when: The range already admits the library's current version. The imported symbol is unchanged between the pinned version and the library version being examined, as far as the library files listed above show. A comment at the consumer says the pin is deliberate and why.
+
+What evidence to cite: The consumer's import line, copied verbatim. `line` is where it appears.
+
+How to explain why: Name the symbol, the consumer's pinned range, the library version being examined, and what changed; quote the line from the provided library files that shows the change. A version gap alone, with no changed symbol, is context, not a finding.
+</pattern>
+
+Your scope is these import sites in `/workspace/app`. `read` numbers every line it returns as `N: content`, so the cited line is the one beginning `<line>: `. Cite it as `file:line`.
+- /workspace/app/src/pad.ts:3 (read lines 1-12)
+
+The library `left-pad` at the version being examined is at `/workspace/lib`; its entry files and changelog are: index.js, CHANGELOG.md. The consumer pins `^1.2.0`; the library version is `1.3.0`.
+
+For each match, call `create_finding` with these five keys exactly: `file`, `line`, `pattern`, `evidence`, `why`. `file` must be the full path exactly as listed above, starting with `/workspace/`. `evidence` must be the source line copied verbatim, and `line` must be where it appears.
+
+When you are done, say which files or sites you examined, which you did not get to, and whether you covered the whole scope.

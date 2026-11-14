@@ -3283,6 +3283,81 @@ fn the_unit_dispatch_message_is_frozen_with_and_without_intent() {
     assert_ne!(plain, with_intent, "the intent block must actually render");
 }
 
+/// An edge unit for the built-in `stale-consumer` rule: one import site in
+/// the consumer `app`, the library `lib` at `library_surface`.
+fn an_edge_unit(rule: &Rule, library_surface: Vec<String>) -> Unit {
+    Unit::Edge {
+        id: "u-golden-edge".into(),
+        rule: rule.id.clone(),
+        source: "app".into(),
+        library: "lib".into(),
+        package: "left-pad".into(),
+        pinned: "^1.2.0".into(),
+        library_version: "1.3.0".into(),
+        range_admits: false,
+        sites: vec![Site { file: "src/pad.ts".into(), line: 3, start: 1, end: 12, hits: vec![3] }],
+        library_tree: PathBuf::from("/ws/lib"),
+        library_surface,
+        note: None,
+        est_tokens: 80,
+    }
+}
+
+/// (#1959) The WHOLE dispatched message for an edge unit: the consumer's
+/// import sites, then the library at the version examined, its entry files
+/// and changelog, and both versions. With no surface the list reads
+/// `(none)`, and nothing else moves.
+#[test]
+fn the_edge_unit_dispatch_message_is_frozen() {
+    let rule = builtin_rule("stale-consumer");
+    let rules_by_id = BTreeMap::from([(rule.id.clone(), rule.clone())]);
+    let surface = vec!["index.js".to_string(), "CHANGELOG.md".to_string()];
+    let message = build_message(&rules_by_id, &an_edge_unit(&rule, surface), None).unwrap();
+    assert_text_golden("build-message-edge.txt", &message);
+    let bare = build_message(&rules_by_id, &an_edge_unit(&rule, Vec::new()), None).unwrap();
+    assert_eq!(
+        bare,
+        message.replace("are: index.js, CHANGELOG.md.", "are: (none)."),
+        "an empty surface changes only its list"
+    );
+}
+
+/// (#2310) A unit whose rule the current rule set no longer declares is
+/// refused, naming the rule and the way out, for every kind of unit: a
+/// message is never built around a missing pattern.
+#[test]
+fn a_unit_naming_a_rule_no_longer_declared_is_refused() {
+    let rule = builtin_rule("stale-consumer");
+    let rules_by_id = BTreeMap::from([(rule.id.clone(), rule.clone())]);
+    let gone = builtin_rule("swallowed-error");
+    let site = Unit::Site {
+        id: "u-1".into(),
+        rule: gone.id.clone(),
+        source: "app".into(),
+        sites: vec![Site { file: "src/a.ts".into(), line: 1, start: 1, end: 2, hits: vec![1] }],
+        est_tokens: 1,
+    };
+    let read = Unit::Read {
+        id: "u-2".into(),
+        rules: vec![rule.id.clone(), gone.id.clone()],
+        source: "app".into(),
+        files: vec![ReadFileEntry::Whole("src/a.ts".into())],
+        est_tokens: 1,
+    };
+    for unit in [site, read, an_edge_unit(&gone, Vec::new())] {
+        let why = build_message(&rules_by_id, &unit, None).unwrap_err().to_string();
+        assert_eq!(
+            why,
+            format!(
+                "dispatch.unit: no rule resolved for id `{}`: the plan names a rule the current rule set no longer \
+                 declares; re-plan this rule",
+                gone.id
+            ),
+            "{unit:?}"
+        );
+    }
+}
+
 /// (#3112 review) The production wiring, through `selected()`: under
 /// `DARKMUX_SANDBOX=seatbelt` (on a Mac) a unit's dispatch is briefed with
 /// the tree's own path and stamps it as `context.root`; under Docker (a test

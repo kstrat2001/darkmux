@@ -228,6 +228,55 @@ fn an_unreadable_form_is_refused_by_name() {
     );
 }
 
+/// (#3561) `^` keeps a version's first nonzero part, as npm reads it: below
+/// 1.0.0 that part is the minor (`^0.2` stays under 0.3.0) or, under 0.1.0,
+/// the patch (`^0.0.3` is 0.0.3 alone); `^*` allows every version. Read
+/// against pins below 1.0.0, which the real table has none of.
+#[test]
+fn a_caret_keeps_the_first_nonzero_part() {
+    let pins: Vec<Pin> = [
+        (2, 0, 0),
+        (1, 4, 0),
+        (1, 0, 0),
+        (0, 9, 9),
+        (0, 3, 0),
+        (0, 2, 9),
+        (0, 2, 5),
+        (0, 1, 0),
+        (0, 0, 4),
+        (0, 0, 3),
+    ]
+    .into_iter()
+    .map(|(major, minor, patch)| Pin {
+        version: Version::new(major, minor, patch),
+        ..NODE.pins[0]
+    })
+    .collect();
+    let pick_among = |text: &str| {
+        choose(Some(&request(Declared::Engines, text)), &pins).map(|p| p.version.to_string())
+    };
+    for (text, want) in [
+        ("^1", "1.4.0"),
+        ("^1.0.0", "1.4.0"),
+        ("^0", "0.9.9"),
+        ("^0.x", "0.9.9"),
+        ("^0.2", "0.2.9"),
+        ("^0.2.5", "0.2.9"),
+        ("^0.0", "0.0.4"),
+        ("^0.0.3", "0.0.3"),
+        ("^*", "2.0.0"),
+        ("^x", "2.0.0"),
+    ] {
+        assert_eq!(pick_among(text).as_deref(), Ok(want), "`{text}`");
+    }
+    let why = pick_among("^0.1.1").unwrap_err();
+    assert!(why.contains("no version darkmux pins satisfies"), "{why}");
+    for text in ["^0.4294967295", "^0.0.4294967295", "^4294967295"] {
+        let why = pick_among(text).unwrap_err();
+        assert!(why.contains("cannot read") && why.contains(&format!("`{text}`")), "{text}: {why}");
+    }
+}
+
 /// (#3561 review) A version part at the largest a part holds is refused as
 /// unreadable wherever its bound would step past it: never a panic, and
 /// never a wrap-around (`>4294967295` read as `>=0.0.0` picked 26).
@@ -547,6 +596,40 @@ fn a_partial_unpack_never_becomes_an_install() {
         left.is_empty(),
         "a failed install left {left:?} in the toolchains folder"
     );
+}
+
+/// (#3561) An archive that hashes to its pin but holds no program where the
+/// release keeps it (`<top>/bin/node`) installs nothing and says what it
+/// lacked: a release folder without its runtime is never marked verified.
+#[test]
+fn an_archive_without_its_program_installs_nothing() {
+    let (_d, root) = a_dir();
+    let (source, toolchains) = a_source(&root);
+    let pin = pin_of(&source, 24);
+    let staging = root.join("hollow");
+    fixture::release_tree(&staging, pin.top, "node", "24.22.3");
+    std::fs::remove_file(staging.join(pin.top).join("bin/node")).unwrap();
+    let archive = root.join("hollow-dist").join(pin.archive());
+    fixture::pack(&staging, pin.top, &archive);
+    let hollow = Pin {
+        sha256: fixture::leak(darkmux_types::sha256::file_hex(&archive).unwrap()),
+        url: fixture::leak(format!("file://{}", archive.display())),
+        ..pin
+    };
+    let source = Source { pins: vec![hollow] };
+    let why = install(&hollow, &toolchains, &source).unwrap_err();
+    assert_eq!(
+        why,
+        format!(
+            "{} from {} holds no `{}/bin/node`; nothing was installed",
+            hollow.archive(),
+            hollow.url,
+            hollow.top
+        )
+    );
+    assert!(!toolchains.join(hollow.dir_name()).exists());
+    assert_eq!(staging_left(&toolchains), Vec::<String>::new());
+    assert_eq!(installed(&NODE, &hollow, &toolchains), Ok(None));
 }
 
 /// (#3561) A folder at the install's path that darkmux did not verify is
