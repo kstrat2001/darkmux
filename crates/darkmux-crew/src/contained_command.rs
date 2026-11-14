@@ -317,10 +317,16 @@ pub fn remove_container(handle: &SandboxHandle) {
 /// version-checked the same way, pulled if absent). Refuses when Docker is
 /// not reachable, naming the opt-out.
 pub fn lab_test_image(workload_image: Option<&str>) -> anyhow::Result<String> {
+    let sandbox = darkmux_sandbox::selected().map_err(|why| anyhow::anyhow!(why))?;
+    lab_test_image_in(sandbox, workload_image)
+}
+
+/// [`lab_test_image`] under the selected `sandbox`.
+fn lab_test_image_in(sandbox: darkmux_sandbox::BackendKind, workload_image: Option<&str>) -> anyhow::Result<String> {
     use anyhow::Context;
     // (#3112 step 2) A Seatbelt sandbox runs this host's own toolchain: there
     // is no image to name, resolve or pull.
-    if darkmux_sandbox::selected().map_err(|why| anyhow::anyhow!(why))?.on_host() {
+    if sandbox.on_host() {
         // (#3112 review) A pinned image is a toolchain pin the sandbox cannot
         // honor: the run says so here and records it in its manifest
         // (`isolation.image_not_used`) rather than being refused, which would
@@ -334,16 +340,19 @@ pub fn lab_test_image(workload_image: Option<&str>) -> anyhow::Result<String> {
         crate::dispatch_internal::validate_image_ref(image)?;
         return Ok(image.to_string());
     }
-    // (#3112) Docker is asked for only here, under `runtime.sandbox docker`:
-    // the message says so, and how to need no Docker where that can run.
+    crate::dispatch_internal::test_runtime_image().with_context(tests_need_docker)
+}
+
+/// (#3112) Why a lab run's tests could not get the runtime image: Docker is
+/// asked for only under `runtime.sandbox docker`, so the message says so,
+/// and how to need no Docker where that can run.
+fn tests_need_docker() -> String {
     let remedy = darkmux_sandbox::docker_needs().unwrap_or_else(|| "Docker must be installed and running".to_string());
-    crate::dispatch_internal::test_runtime_image().with_context(|| {
-        format!(
-            "model-written tests run in {}: {remedy}; \
-             to run them on this machine as your user instead, `darkmux config set runtime.tests_on_host true`",
-            darkmux_sandbox::placed_in(darkmux_sandbox::BackendKind::Docker),
-        )
-    })
+    format!(
+        "model-written tests run in {}: {remedy}; \
+         to run them on this machine as your user instead, `darkmux config set runtime.tests_on_host true`",
+        darkmux_sandbox::placed_in(darkmux_sandbox::BackendKind::Docker),
+    )
 }
 
 /// (#3112 review) What a run says when its workload pins an image a
@@ -797,5 +806,67 @@ mod tests {
         // A missing image never ran the command.
         let missing = run(&Placement::Container("darkmux-no-such-image:0".into()), &run_, Duration::from_secs(60));
         assert!(missing.is_err(), "{missing:?}");
+    }
+
+    /// `f`'s result with `DARKMUX_SANDBOX` set to `value`, then restored.
+    /// Every caller is `#[serial]`.
+    fn under_sandbox<T>(value: &str, f: impl FnOnce() -> T) -> T {
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        // SAFETY: every caller is `#[serial]`.
+        unsafe { std::env::set_var("DARKMUX_SANDBOX", value) };
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_SANDBOX", v),
+                None => std::env::remove_var("DARKMUX_SANDBOX"),
+            }
+        }
+        out
+    }
+
+    /// (#906, #3112) The image a lab run's tests run in, by sandbox: a
+    /// sandbox on the host runs them on the host whatever the workload pins;
+    /// Docker runs the workload's pinned image when it names one (a ref
+    /// Docker could read as a flag is refused), else the runtime image a
+    /// dispatch resolves.
+    #[test]
+    fn a_lab_runs_its_tests_in_the_image_its_sandbox_uses() {
+        use darkmux_sandbox::BackendKind::{Docker, Landlock, Seatbelt};
+        for on_host in [Seatbelt, Landlock] {
+            assert_eq!(lab_test_image_in(on_host, None).unwrap(), "host", "{on_host:?}");
+            assert_eq!(lab_test_image_in(on_host, Some("node:22")).unwrap(), "host", "{on_host:?}: a pinned image is not used on the host");
+        }
+        assert_eq!(lab_test_image_in(Docker, Some("node:22")).unwrap(), "node:22");
+        let why = lab_test_image_in(Docker, Some("--privileged")).unwrap_err().to_string();
+        assert!(why.contains("starts with `-`"), "{why}");
+        let runtime = crate::dispatch_internal::test_runtime_image().unwrap();
+        assert_ne!(runtime, "host");
+        assert_eq!(lab_test_image_in(Docker, None).unwrap(), runtime, "no pin: the dispatch's own runtime image");
+    }
+
+    /// (#3112) The configured sandbox decides: a refused `runtime.sandbox`
+    /// refuses the lab's tests by name, never falling back to Docker.
+    #[test]
+    #[serial_test::serial] // sets DARKMUX_SANDBOX
+    fn a_lab_test_image_follows_the_configured_sandbox() {
+        assert_eq!(under_sandbox("docker", || lab_test_image(Some("node:22"))).unwrap(), "node:22");
+        let why = under_sandbox("podman", || lab_test_image(Some("node:22"))).unwrap_err().to_string();
+        assert!(why.contains("podman") && why.contains("runtime.sandbox"), "{why}");
+    }
+
+    /// (#3112) Tests that cannot get the runtime image say why Docker was
+    /// needed and the way to run them on this machine instead, whether or not
+    /// the configured sandbox can be read.
+    #[test]
+    #[serial_test::serial] // sets DARKMUX_SANDBOX
+    fn tests_without_docker_say_why_docker_and_the_way_to_run_them_here() {
+        for sandbox in ["docker", "podman"] {
+            let why = under_sandbox(sandbox, tests_need_docker);
+            assert!(
+                why.starts_with("model-written tests run in a Docker container (`runtime.sandbox` is `docker`): Docker must be installed and running"),
+                "{sandbox}: {why}"
+            );
+            assert!(why.ends_with("; to run them on this machine as your user instead, `darkmux config set runtime.tests_on_host true`"), "{sandbox}: {why}");
+        }
     }
 }
