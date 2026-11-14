@@ -492,28 +492,14 @@ impl RecipeSource {
         match self {
             RecipeSource::Checkout(checkout) => load_recipe(checkout),
             RecipeSource::TemplateCommit { git_dir, commit } => {
-                let recipe = parse_recipe(&read_recipe_at_commit(git_dir, commit)?)?;
-                if recipe.env_from_source.is_empty() {
-                    return Ok(recipe);
-                }
-                Err(RecipeRefusal::Invalid(format!(
-                    "{RECIPE_PATH}: `env_from_source` names files to copy from a checkout of yours, and a \
-                     project made from a template has none; remove `env_from_source` from the template's recipe"
-                )))
+                without_checkout_files(parse_recipe(&read_recipe_at_commit(git_dir, commit)?)?, "a project made from a template", "the template's recipe")
             }
             RecipeSource::ClonedCommit { git_dir, commit, approved } => {
                 let text = match (read_recipe_at_commit(git_dir, commit), approved) {
                     (Err(RecipeRefusal::NotFound(_)), Some(approved)) => approved.clone(),
                     (read, _) => read?,
                 };
-                let recipe = parse_recipe(&text)?;
-                if recipe.env_from_source.is_empty() {
-                    return Ok(recipe);
-                }
-                Err(RecipeRefusal::Invalid(format!(
-                    "{RECIPE_PATH}: `env_from_source` names files to copy from a checkout of yours, and a \
-                     clone has none; remove `env_from_source` from the recipe"
-                )))
+                without_checkout_files(parse_recipe(&text)?, "a clone", "the recipe")
             }
         }
     }
@@ -525,6 +511,18 @@ impl RecipeSource {
             RecipeSource::TemplateCommit { .. } | RecipeSource::ClonedCommit { .. } => None,
         }
     }
+}
+
+/// A recipe from a source with no checkout of the user's (`what`) to copy
+/// `env_from_source` files from: refused naming the key when it lists any.
+fn without_checkout_files(recipe: Recipe, what: &str, whose: &str) -> Result<Recipe, RecipeRefusal> {
+    if recipe.env_from_source.is_empty() {
+        return Ok(recipe);
+    }
+    Err(RecipeRefusal::Invalid(format!(
+        "{RECIPE_PATH}: `env_from_source` names files to copy from a checkout of yours, and {what} has \
+         none; remove `env_from_source` from {whose}"
+    )))
 }
 
 /// (#3460) The recipe's text as it is in `commit` of the repository at
