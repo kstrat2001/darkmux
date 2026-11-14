@@ -20840,7 +20840,8 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         }
     }
 
-    /// (#3121) Both mid-run exits of `dispatch()` close their bookend through
+    /// (#3121) Both mid-run exits of a container dispatch
+    /// (`supervise_container`) close their bookend through
     /// that terminal before returning, so the guard's Drop fallback never
     /// writes one for them. Source-pinned: both need a live container.
     #[test]
@@ -20857,7 +20858,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         ] {
             let branch = &src[src.find(start).unwrap_or_else(|| panic!("{start}"))..];
             let branch = &branch[..branch.find("return Err(").unwrap()];
-            assert!(branch.contains("close_ended_mid_run(&mut bookend, &err, &trajectory_summary);"), "{branch}");
+            assert!(branch.contains("close_ended_mid_run(bookend, &err, &trajectory_summary);"), "{branch}");
         }
     }
 
