@@ -5567,6 +5567,97 @@ async fn a_stale_clone_record_never_makes_a_worktree_a_clone() {
     assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "{v}");
 }
 
+/// (#3573 review) An approved recipe is written whole and never through a
+/// link planted where it is kept.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_approved_recipe_is_never_written_through_a_link() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": HCR})))).await;
+    assert_eq!(code, 201, "{v}");
+    let base = h.base.canonicalize().unwrap();
+    let outside = h.dir.path().join("not-a-recipe.txt");
+    std::fs::write(&outside, "untouched").unwrap();
+    std::os::unix::fs::symlink(&outside, base.join(".hcr.recipe")).unwrap();
+    let version = darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
+    let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"schema_version": version, "command": serve()})).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched", "written through the link");
+    let kept = base.join(".hcr.recipe");
+    assert!(std::fs::symlink_metadata(&kept).unwrap().is_file(), "the link was replaced by the recipe");
+    let text: Value = serde_json::from_str(&std::fs::read_to_string(&kept).unwrap()).unwrap();
+    assert_eq!(text["command"], serve());
+}
+
+/// (#3573 review) Approved-recipe writes at once each succeed, and what is
+/// kept is one of them whole.
+#[test]
+fn approved_recipe_writes_at_once_each_succeed() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().to_path_buf();
+    let texts: Vec<String> = (0..8).map(|i| format!("{{\"command\": \"run {i}\"}}")).collect();
+    let threads: Vec<_> = texts
+        .iter()
+        .cloned()
+        .map(|text| {
+            let base = base.clone();
+            std::thread::spawn(move || (0..50).map(|_| crate::client_workspace::record_approved_recipe(&base, "hcr", &text)).collect::<Vec<_>>())
+        })
+        .collect();
+    for t in threads {
+        for r in t.join().unwrap() {
+            r.unwrap();
+        }
+    }
+    let kept = std::fs::read_to_string(base.join(".hcr.recipe")).unwrap();
+    assert!(texts.contains(&kept), "{kept:?}");
+    let left: Vec<_> = std::fs::read_dir(&base).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, vec![std::ffi::OsString::from(".hcr.recipe")], "no temp file left behind");
+}
+
+/// (#3573 review) A `.darkmux` folder in the held repository that is not
+/// what its id says is refused, never read as "no recipe" (which would let
+/// an approved recipe stand in for the repo's own).
+#[tokio::test]
+async fn a_forged_recipe_folder_is_refused_not_missing() {
+    let h = harness();
+    let token = paired(&h).await;
+    recipe(&h.fixture, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
+    commit_all(&h.fixture, "add a recipe");
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": HCR})))).await;
+    assert_eq!(code, 201, "{v}");
+    let base = h.base.canonicalize().unwrap();
+    let held = base.join(".hcr.git");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").arg("--git-dir").arg(&held).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let folder = git(&["rev-parse", "HEAD:.darkmux"]);
+    // The empty tree's loose object, written in a scratch repo, put where
+    // the `.darkmux` tree's loose object is.
+    let scratch = h.dir.path().join("scratch.git");
+    run_git(None, &["init", "--quiet", "--bare", scratch.to_str().unwrap()]);
+    let empty = std::process::Command::new("git").arg("--git-dir").arg(&scratch).args(["hash-object", "-w", "-t", "tree", "--stdin"]).stdin(std::process::Stdio::null()).output().unwrap();
+    let empty = String::from_utf8(empty.stdout).unwrap().trim().to_string();
+    let loose = |dir: &Path, oid: &str| dir.join("objects").join(&oid[..2]).join(&oid[2..]);
+    let target = loose(&held, &folder);
+    assert!(target.exists(), "the fixture's objects are loose");
+    let mut perms = std::fs::metadata(&target).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&target, perms).unwrap();
+    std::fs::copy(loose(&scratch, &empty), &target).unwrap();
+    let version = darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
+    std::fs::write(base.join(".hcr.recipe"), serde_json::json!({"schema_version": version, "command": "npm run dev"}).to_string()).unwrap();
+    let (code, v) = call(&h, get("/client/recipe?workspace=hcr", &[("authorization", &bearer(&token))])).await;
+    assert_eq!((code, v["code"].as_str()), (422, Some("recipe_invalid")), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("does not match its content"), "{v}");
+    let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"command": "npm run dev"})).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "{v}");
+}
+
 /// (#3571) A template project reads its first commit: it takes no approved
 /// recipe.
 #[tokio::test]

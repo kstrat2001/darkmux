@@ -42,8 +42,9 @@ pub enum ClientCode {
     // ── Previews ──
     /// `clients.preview.enabled` is off on this machine (403).
     PreviewDisabled,
-    /// The workspace was cloned, or is no longer a worktree of the user's
-    /// checkout: no checkout of theirs to read a recipe from (404).
+    /// A worktree with no recorded checkout of the user's, or no longer a
+    /// worktree of it: no checkout of theirs to read a recipe from (404). A
+    /// clone of a repo URL answers `NoRecipe` instead (#3571).
     NoSourceCheckout,
     /// A template project whose first commit, the recipe a preview of it
     /// trusts (#3460), has no `.darkmux/preview.json` (404).

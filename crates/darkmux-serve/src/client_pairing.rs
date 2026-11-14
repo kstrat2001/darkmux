@@ -83,9 +83,10 @@
 //! workspace, where a Coder run writes. A project made from a template
 //! (#3460) trusts the recipe in its first commit, the one darkmux made,
 //! read from the repository darkmux holds. A workspace cloned from a URL
-//! gets no preview, and neither does one whose checkout has no recipe; the
-//! refusal names why and says to add `.darkmux/preview.json` to your own
-//! checkout of the repo ([`crate::client_preview`]).
+//! (#3571) trusts the recipe in the commit darkmux cloned, else one its user
+//! approved through the app, kept beside the workspace. A workspace with no
+//! recipe in any of these gets no preview; the refusal names why and what
+//! to do ([`crate::client_preview`]).
 //!
 //! **Host git never reads what a run can write.** A workspace is mounted
 //! read-write into the run's container, so its `.git` and config are the
@@ -3837,7 +3838,8 @@ struct RecipeSetBody {
 /// (#3571) `PUT /client/workspaces/{name}/recipe`: keeps the recipe the user
 /// approved for clone `name`, beside the workspace (never in it, so no run
 /// writes it). Checked as strictly as a checkout's (contract 7). Taken only
-/// while it is the recipe the preview runs, so a 200 means it will: when the
+/// while it is the recipe the preview runs, so a 200 means it will, from
+/// the next start (a live preview keeps the recipe it started with): when the
 /// commit darkmux cloned has a `.darkmux/preview.json` of its own (even one
 /// refused), that one decides, and this is refused (409). A worktree of the
 /// user's checkout reads that checkout and a template project its first
@@ -3910,8 +3912,8 @@ fn refuse_unless_clone_without_recipe(name: &str, source: &crate::client_preview
     }
 }
 
-/// (#3571) An approved recipe's text, as kept, and the recipe: within the
-/// recipe cap as sent, parsed as strictly as a checkout's (contract 7), and
+/// (#3571) An approved recipe's text, as kept (compact JSON), and the
+/// recipe: that text within the recipe cap, parsed as strictly as a checkout's (contract 7), and
 /// with no `env_from_source` (a clone has no checkout of the user's).
 fn checked_approved_recipe(recipe: &serde_json::Value) -> Result<(String, crate::client_preview::Recipe), Refused> {
     use crate::client_preview::{MAX_RECIPE_BYTES, RECIPE_PATH};

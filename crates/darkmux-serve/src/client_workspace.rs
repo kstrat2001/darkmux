@@ -859,7 +859,6 @@ pub fn cloned_commit_of(base: &Path, name: &str) -> Option<String> {
 pub fn forget_cloned(base: &Path, name: &str) {
     let _ = std::fs::remove_file(cloned_record(base, name));
     let _ = std::fs::remove_file(approved_recipe_record(base, name));
-    let _ = std::fs::remove_file(base.join(format!(".{name}.recipe.next")));
 }
 
 /// (#3571) Where darkmux keeps the recipe the user approved for clone
@@ -869,14 +868,17 @@ fn approved_recipe_record(base: &Path, name: &str) -> PathBuf {
 }
 
 /// Keep `text` (already parsed as a recipe) as clone `name`'s approved
-/// recipe. Replaces any earlier one whole (written beside it, then renamed
-/// over it, so a preview starting meanwhile reads the old or the new one),
-/// never through a link.
+/// recipe. Replaces any earlier one whole (written beside it under a name
+/// no other write uses, then renamed over it, so a preview starting
+/// meanwhile reads the old or the new one, and of two writes at once the
+/// later rename wins), never through a link.
 pub fn record_approved_recipe(base: &Path, name: &str, text: &str) -> Result<(), String> {
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     let path = approved_recipe_record(base, name);
-    let next = base.join(format!(".{name}.recipe.next"));
-    let _ = std::fs::remove_file(&next);
+    let n = WRITES.fetch_add(1, Ordering::Relaxed);
+    let next = base.join(format!(".{name}.recipe.next-{}-{n}", std::process::id()));
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

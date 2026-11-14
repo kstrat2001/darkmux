@@ -552,23 +552,32 @@ pub fn read_recipe_at_commit(git_dir: &Path, commit: &str) -> Result<String, Rec
     // its id (git does not check a loose object's hash when it reads it), so
     // what `ls-tree` reports below comes from objects that are what their
     // ids say. Replace refs are off in every `HostGit` call.
-    let commit_body = verified_object(&git, "commit", commit)?;
+    let root = verified_root_tree(&git, commit)?;
+    // (#3573 review) One verified tree at a time: `.darkmux` is listed in
+    // the verified root, and the recipe in the verified `.darkmux`, so a
+    // forged folder can never make a recipe read as missing.
+    let top = git_stdout(&git, &["ls-tree", "-l", &root, "--", ".darkmux"])?;
+    let folder = recipe_folder_entry(&top, commit)?;
+    verified_object(&git, "tree", &folder)?;
+    let inside = git_stdout(&git, &["ls-tree", "-l", &folder, "--", RECIPE_FILE])?;
+    let blob = recipe_file_entry(&inside, commit)?;
+    // The size was checked on the tree entry, before reading the blob.
+    String::from_utf8(verified_object(&git, "blob", &blob)?)
+        .map_err(|_| RecipeRefusal::Invalid(format!("{RECIPE_PATH} at {commit} is not UTF-8")))
+}
+
+/// The root tree of `commit`, the commit and the tree each checked against
+/// its id ([`verified_object`]).
+fn verified_root_tree(git: &darkmux_types::host_git::HostGit, commit: &str) -> Result<String, RecipeRefusal> {
+    let commit_body = verified_object(git, "commit", commit)?;
     let root = String::from_utf8_lossy(&commit_body)
         .lines()
         .next()
         .and_then(|l| l.strip_prefix("tree "))
         .map(str::to_string)
         .ok_or_else(|| RecipeRefusal::Invalid(format!("commit {commit} names no tree")))?;
-    verified_object(&git, "tree", &root)?;
-    let listed = git_stdout(
-        &git,
-        &["ls-tree", "-l", "-t", commit, "--", ".darkmux", RECIPE_PATH],
-    )?;
-    let (folder, blob) = check_recipe_entries(&listed, commit)?;
-    verified_object(&git, "tree", &folder)?;
-    // The size was checked on the tree entry, before reading the blob.
-    String::from_utf8(verified_object(&git, "blob", &blob)?)
-        .map_err(|_| RecipeRefusal::Invalid(format!("{RECIPE_PATH} at {commit} is not UTF-8")))
+    verified_object(git, "tree", &root)?;
+    Ok(root)
 }
 
 /// `git <args>`'s stdout, through host git; a failure is unreadable.
@@ -629,28 +638,36 @@ fn verified_object(
     Ok(read.stdout)
 }
 
-/// `git ls-tree -l` lines for `.darkmux` and the recipe in `commit`: no
-/// symlink on the way, `.darkmux` a folder, and the recipe a regular file
-/// within the size cap. Returns the folder's and the recipe's object ids.
-fn check_recipe_entries(listed: &str, commit: &str) -> Result<(String, String), RecipeRefusal> {
-    let entries: Vec<LsTreeEntry> = listed.lines().filter_map(ls_tree_entry).collect();
-    if let Some(e) = entries.iter().find(|e| e.mode == "120000") {
-        return Err(RecipeRefusal::Symlink(format!(
-            "{} is a symlink in commit {commit}; refusing",
-            e.path
-        )));
+/// The recipe's file name inside `.darkmux`.
+const RECIPE_FILE: &str = "preview.json";
+
+/// The root tree's `git ls-tree -l` line for `.darkmux` in `commit`: a
+/// folder (never a symlink). Returns its object id; none (or not a folder)
+/// is no recipe.
+fn recipe_folder_entry(listed: &str, commit: &str) -> Result<String, RecipeRefusal> {
+    let not_found = || RecipeRefusal::NotFound(format!("no {RECIPE_PATH} in commit {commit}"));
+    let entry = listed.lines().filter_map(ls_tree_entry).find(|e| e.path == ".darkmux").ok_or_else(not_found)?;
+    match entry.mode {
+        "120000" => Err(RecipeRefusal::Symlink(format!(".darkmux is a symlink in commit {commit}; refusing"))),
+        "040000" => Ok(entry.oid.to_string()),
+        _ => Err(not_found()),
     }
-    let Some(recipe) = entries.iter().find(|e| e.path == RECIPE_PATH) else {
-        return Err(RecipeRefusal::NotFound(format!(
-            "no {RECIPE_PATH} in commit {commit}"
-        )));
-    };
-    check_recipe_blob(recipe.mode, recipe.size, commit)?;
-    let folder = entries
-        .iter()
-        .find(|e| e.path == ".darkmux" && e.mode == "040000")
-        .ok_or_else(|| RecipeRefusal::Invalid(format!(".darkmux is not a folder in {commit}")))?;
-    Ok((folder.oid.to_string(), recipe.oid.to_string()))
+}
+
+/// The `.darkmux` tree's `git ls-tree -l` line for the recipe in `commit`:
+/// a regular file within the size cap (never a symlink). Returns its
+/// object id.
+fn recipe_file_entry(listed: &str, commit: &str) -> Result<String, RecipeRefusal> {
+    let entry = listed
+        .lines()
+        .filter_map(ls_tree_entry)
+        .find(|e| e.path == RECIPE_FILE)
+        .ok_or_else(|| RecipeRefusal::NotFound(format!("no {RECIPE_PATH} in commit {commit}")))?;
+    if entry.mode == "120000" {
+        return Err(RecipeRefusal::Symlink(format!("{RECIPE_PATH} is a symlink in commit {commit}; refusing")));
+    }
+    check_recipe_blob(entry.mode, entry.size, commit)?;
+    Ok(entry.oid.to_string())
 }
 
 /// One `git ls-tree -l` line.
