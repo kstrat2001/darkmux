@@ -2887,8 +2887,8 @@ pub(crate) struct RecipeQuery {
 
 /// `GET /client/recipe?workspace=<name>` (or `workdir=<the workspace's
 /// directory>`): the workspace's preview recipe, read and checked exactly as
-/// a preview start reads it: from the user's own checkout the workspace was
-/// made from, never from the workspace.
+/// a preview start reads it ([`workspace_and_recipe_source`]), never from
+/// the workspace.
 pub(crate) async fn recipe_handler(
     State(state): State<ClientServerState>,
     headers: HeaderMap,
@@ -3276,7 +3276,12 @@ fn new_clone(state: &ClientServerState, base: &Path, (url, normalized): (&str, &
         held.forget();
         return *r;
     }
-    let from = match start_bot_branch(state, base, &name, made.git_ref, made.bot.slug) {
+    // (#3571) The commit cloned is the repo's own: its recipe is the one a
+    // preview of this clone trusts, recorded beside the workspace.
+    let from = match start_bot_branch(state, base, &name, made.git_ref, made.bot.slug).and_then(|from| {
+        record_cloned_head(state, base, &name)?;
+        Ok(from)
+    }) {
         Ok(from) => from,
         Err(r) => {
             forget_clone(base, &name);
@@ -3285,6 +3290,18 @@ fn new_clone(state: &ClientServerState, base: &Path, (url, normalized): (&str, &
         }
     };
     created_from(state, &name, from)
+}
+
+/// (#3571) Records the commit new clone `name` checked out, before any run.
+fn record_cloned_head(state: &ClientServerState, base: &Path, name: &str) -> Result<(), Refused> {
+    let wc = work_copy_for(state, &base.join(name))
+        .ok_or_else(|| Box::new(internal(anyhow!("darkmux holds no repository for {name}"))))?;
+    // An empty repository has no commit yet, so no recipe either: nothing
+    // to record (its preview runs only a recipe the user approves).
+    let Some(head) = git_line(&wc, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]) else {
+        return Ok(());
+    };
+    crate::client_workspace::record_cloned_commit(base, name, &head).map_err(|e| Box::new(internal(anyhow!(e))))
 }
 
 /// Puts new clone `name` on a new branch of the bot's, at the commit the
@@ -3335,6 +3352,7 @@ fn forget_clone(base: &Path, name: &str) {
     let _ = std::fs::remove_dir_all(crate::client_git::clone_git_dir(base, name));
     crate::client_git::forget_git_dir(base, name);
     crate::client_workspace::forget_template_commit(base, name);
+    crate::client_workspace::forget_cloned(base, name);
     crate::client_workspace::forget_owner(base, name);
     crate::client_workspace::forget_bot(base, name);
 }
@@ -3689,7 +3707,7 @@ fn recipe_refusal(source: &crate::client_preview::RecipeSource, r: &crate::clien
     use crate::client_preview::{RecipeRefusal as R, RecipeSource};
     let missing = match source {
         RecipeSource::TemplateCommit { .. } => ClientCode::TemplateNoRecipe,
-        RecipeSource::Checkout(_) => ClientCode::NoRecipe,
+        RecipeSource::Checkout(_) | RecipeSource::ClonedCommit { .. } => ClientCode::NoRecipe,
     };
     let (status, code) = match r {
         R::NotFound(_) => (StatusCode::NOT_FOUND, missing),
@@ -3702,8 +3720,10 @@ fn recipe_refusal(source: &crate::client_preview::RecipeSource, r: &crate::clien
 }
 
 /// Workspace `name`'s directory and where its recipe is trusted from: the
-/// first commit of a project darkmux made from a template (#3460), else the
-/// user's own checkout it was made from; a 404 naming why there is neither.
+/// first commit of a project darkmux made from a template (#3460), a clone's
+/// cloned commit or approved recipe (#3571; a clone told by where darkmux
+/// keeps its repository, never by a record), else the user's own checkout
+/// it was made from; a 404 naming why there is none.
 fn workspace_and_recipe_source(
     state: &ClientServerState,
     name: &str,
@@ -3723,6 +3743,15 @@ fn workspace_and_recipe_source(
         })?;
         let git_dir = held.git_dir;
         return Ok((dir, RecipeSource::TemplateCommit { git_dir, commit }));
+    }
+    // (#3571) A clone of a repo URL: the recipe as it was in the commit
+    // darkmux cloned, else the one the user approved for it.
+    if let Some(held) = crate::client_git::work_copy_of(&base, name, &dir) {
+        if crate::client_workspace::is_clone(&base, name, &held) {
+            let commit = crate::client_workspace::cloned_commit_of(&base, name);
+            let approved = crate::client_workspace::approved_recipe_of(&base, name);
+            return Ok((dir, RecipeSource::ClonedCommit { git_dir: held.git_dir, commit, approved }));
+        }
     }
     let checkout = crate::client_workspace::own_checkout_of(&base, name, &dir)
         .map_err(|e| refuse(StatusCode::NOT_FOUND, e.code(), e.to_string()))?;
@@ -3748,15 +3777,26 @@ fn no_recipe_in(
             "the template this project was made from had no .darkmux/preview.json in its first commit \
              {commit}, so it has no preview (a recipe added in the workspace is never read)"
         )),
+        (R::NotFound(_), RecipeSource::ClonedCommit { commit: Some(commit), .. }) => R::NotFound(format!(
+            "this clone's repo had no .darkmux/preview.json at {commit}, the commit darkmux cloned, and \
+             no recipe was approved for it: set one with PUT /client/workspaces/{{name}}/recipe, or add \
+             .darkmux/preview.json to the repo (a recipe added in the workspace is never read)"
+        )),
+        (R::NotFound(_), RecipeSource::ClonedCommit { commit: None, .. }) => R::NotFound(
+            "darkmux recorded no commit for this clone (its repo was empty when cloned, or the clone was \
+             made before darkmux recorded one), and no recipe was approved for it: set one with PUT \
+             /client/workspaces/{name}/recipe (a recipe added in the workspace is never read)"
+                .to_string(),
+        ),
         (other, _) => other,
     }
 }
 
 /// `POST /client/workspaces/{name}/preview`: runs the workspace's dev
-/// server, from the `.darkmux/preview.json` in the user's own checkout the
-/// workspace was made from, on free ports. 202 while it starts, 200 when it
+/// server, from the recipe trusted for it ([`workspace_and_recipe_source`]),
+/// on free ports. 202 while it starts, 200 when it
 /// was already running; poll GET for `ready` and `url`. 404 when there is no
-/// recipe to run (a cloned workspace, or none in the checkout).
+/// recipe to run ([`no_recipe_in`] says why and what to do).
 pub(crate) async fn preview_start_handler(
     State(state): State<ClientServerState>,
     ClientPath(name): ClientPath<String>,
@@ -3784,6 +3824,110 @@ pub(crate) async fn preview_start_handler(
     })
     .await
     .unwrap_or_else(|e| internal(anyhow!("preview start panicked: {e}")))
+}
+
+/// (#3571) `PUT /client/workspaces/{name}/recipe`'s body: the recipe the
+/// user approved for a clone whose repo has none.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeSetBody {
+    recipe: serde_json::Value,
+}
+
+/// (#3571) `PUT /client/workspaces/{name}/recipe`: keeps the recipe the user
+/// approved for clone `name`, beside the workspace (never in it, so no run
+/// writes it). Checked as strictly as a checkout's (contract 7). Taken only
+/// while it is the recipe the preview runs, so a 200 means it will: when the
+/// commit darkmux cloned has a `.darkmux/preview.json` of its own (even one
+/// refused), that one decides, and this is refused (409). A worktree of the
+/// user's checkout reads that checkout and a template project its first
+/// commit: either refuses one (409) too.
+pub(crate) async fn recipe_set_handler(
+    State(state): State<ClientServerState>,
+    ClientPath(name): ClientPath<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let client = match authenticate(&state, &headers) {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let req: RecipeSetBody = match json_body(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || match set_recipe(&st, &client, &name, &req.recipe) {
+        Ok(reply) => Json(reply).into_response(),
+        Err(r) => *r,
+    })
+    .await
+    .unwrap_or_else(|e| internal(anyhow!("recipe set panicked: {e}")))
+}
+
+fn set_recipe(
+    state: &ClientServerState,
+    client: &ApprovedClient,
+    name: &str,
+    recipe: &serde_json::Value,
+) -> Result<RecipeReply, Refused> {
+    owned_workspace(state, client, name)?;
+    let _held = held_in_use(state, name)?;
+    let (_dir, source) = workspace_and_recipe_source(state, name)?;
+    refuse_unless_clone_without_recipe(name, &source)?;
+    let (text, parsed) = checked_approved_recipe(recipe)?;
+    let base = (state.worktrees_base)().map_err(|e| Box::new(internal(anyhow!(e))))?;
+    crate::client_workspace::record_approved_recipe(&base, name, &text).map_err(|e| Box::new(internal(anyhow!(e))))?;
+    eprintln!("{}", preview_log_line(name, "recipe", "approved recipe kept"));
+    Ok(RecipeReply { recipe: parsed })
+}
+
+/// (#3571) A 409 unless workspace `name`'s recipe `source` is a clone whose
+/// cloned commit has no recipe (one refused counts: it decides), so an
+/// approved recipe kept for it is the one its preview runs.
+fn refuse_unless_clone_without_recipe(name: &str, source: &crate::client_preview::RecipeSource) -> Result<(), Refused> {
+    use crate::client_preview::{RecipeRefusal as R, RecipeSource, RECIPE_PATH};
+    let conflict = |why: String| refuse(StatusCode::CONFLICT, ClientCode::Conflict, why);
+    let RecipeSource::ClonedCommit { git_dir, commit, .. } = source else {
+        return Err(conflict(format!(
+            "workspace {name} is not a clone of a repo URL: its preview's recipe is read from your own \
+             checkout (or a template project's first commit), never set here"
+        )));
+    };
+    // What the preview would run with no approved recipe: the commit's own.
+    let own = RecipeSource::ClonedCommit { git_dir: git_dir.clone(), commit: commit.clone(), approved: None };
+    match own.load() {
+        Err(R::NotFound(_)) => Ok(()),
+        Ok(_) => Err(conflict(format!(
+            "workspace {name}'s repo has its own {RECIPE_PATH} in the commit darkmux cloned, and that is the \
+             recipe its preview runs: change it in the repo"
+        ))),
+        Err(refused) => Err(conflict(format!(
+            "workspace {name}'s repo has a {RECIPE_PATH} in the commit darkmux cloned, and its preview runs \
+             that one or none: {}; fix it in the repo",
+            refused.message()
+        ))),
+    }
+}
+
+/// (#3571) An approved recipe's text, as kept, and the recipe: within the
+/// recipe cap as sent, parsed as strictly as a checkout's (contract 7), and
+/// with no `env_from_source` (a clone has no checkout of the user's).
+fn checked_approved_recipe(recipe: &serde_json::Value) -> Result<(String, crate::client_preview::Recipe), Refused> {
+    use crate::client_preview::{MAX_RECIPE_BYTES, RECIPE_PATH};
+    let invalid = |why: String| refuse(StatusCode::UNPROCESSABLE_ENTITY, ClientCode::RecipeInvalid, why);
+    let text = serde_json::to_string(recipe).map_err(|e| Box::new(internal(anyhow!(e))))?;
+    if text.len() as u64 > MAX_RECIPE_BYTES {
+        return Err(invalid(format!("the recipe is larger than {MAX_RECIPE_BYTES} bytes")));
+    }
+    let parsed = crate::client_preview::parse_recipe(&text).map_err(|r| invalid(r.message().to_string()))?;
+    if !parsed.env_from_source.is_empty() {
+        return Err(invalid(format!(
+            "{RECIPE_PATH}: `env_from_source` names files to copy from a checkout of yours, and a clone has \
+             none; remove it"
+        )));
+    }
+    Ok((text, parsed))
 }
 
 /// Why previews are refused on this machine right now, if they are: off

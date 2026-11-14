@@ -16,6 +16,19 @@ darkmux release.
 
 ### Added
 
+- **A workspace cloned from a repo URL can run a preview (#3571).** darkmux records the commit it
+  cloned and reads `.darkmux/preview.json` as it was there, the way a template project's first commit
+  is read: a run's commit or a work-tree edit never changes it, and `env_from_source` is refused (a
+  clone has no checkout of yours to copy from). For a repo with no recipe, a paired app can keep the
+  one its user approved with the new `PUT /client/workspaces/{name}/recipe` (body `{"recipe": {..}}`,
+  checked as strictly as a checkout's, answering `RecipeReply`); darkmux keeps it beside the
+  workspace, never in it, and uses it only when the cloned commit has none, so a 200 means it is the
+  recipe that runs. It is refused (409) when the repo's commit has a recipe of its own, and for a
+  worktree of your checkout or a template project. A clone of an empty repo, or one made before
+  this release, has no recorded commit and previews only from an approved recipe. A clone is told
+  by where darkmux keeps its repository, never by a record an earlier workspace of the name left. A
+  clone's missing recipe is now `no_recipe`, not `no_source_checkout`.
+
 - **darkmux supplies a verified, pinned Node.js to the sandboxes it starts on this machine (#3561).**
   Under Seatbelt (macOS) and Landlock (Linux), a dispatch, a contained command (a lab run's tests, the
   mods gate) and a client preview run Node from darkmux, first on the sandbox's PATH, its folder

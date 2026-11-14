@@ -257,8 +257,10 @@ pub struct DiscardReply {
     pub removed: Vec<String>,
 }
 
-/// `GET /client/recipe`: the workspace's preview recipe, as read from the
-/// user's own checkout.
+/// `GET /client/recipe` and `PUT /client/workspaces/{name}/recipe`: the
+/// recipe the workspace's preview runs, read where it is trusted from (the
+/// user's own checkout, a template project's first commit, or a clone's
+/// cloned commit or approved recipe), never from the workspace.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct RecipeReply {
     pub recipe: Recipe,

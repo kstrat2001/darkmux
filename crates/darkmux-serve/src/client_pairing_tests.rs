@@ -5316,10 +5316,10 @@ async fn a_preview_never_runs_the_workspaces_own_recipe() {
     assert!(!ws.join("pwned").exists() && !ws.join("pwned-install").exists(), "the workspace's recipe ran");
 }
 
-/// A workspace cloned from a URL has no checkout of the user's, so no
-/// preview, even with a recipe in it; the refusal names the repo.
+/// (#3571) A clone's recipe is read from the commit darkmux cloned, never
+/// its work tree: one written there (and not in the repo) is no recipe.
 #[tokio::test]
-async fn a_cloned_workspace_gets_no_preview() {
+async fn a_recipe_in_a_clones_work_tree_is_never_read() {
     let h = harness();
     let token = paired(&h).await;
     let (code, v) = call(
@@ -5332,10 +5332,251 @@ async fn a_cloned_workspace_gets_no_preview() {
     recipe(&ws, serde_json::json!({"command": format!("touch pwned; {}", serve())}));
     let (code, v) = start_preview(&h, &token, "hcr").await;
     assert_eq!(code, 404, "{v}");
-    assert_eq!(v["code"], "no_source_checkout", "{v}");
-    let e = v["error"].as_str().unwrap();
-    assert!(e.contains("not made from a checkout of yours") && e.contains("github.com/kstrat2001/hcr"), "{v}");
+    assert_eq!(v["code"], "no_recipe", "{v}");
+    assert!(v["error"].as_str().unwrap().contains("the commit darkmux cloned"), "{v}");
     assert!(!ws.join("pwned").exists());
+}
+
+/// Commits everything in `dir` (a test repo).
+fn commit_all(dir: &Path, message: &str) {
+    run_git(Some(dir), &["add", "-A"]);
+    run_git(Some(dir), &["-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "--quiet", "-m", message]);
+}
+
+/// Sets clone `name`'s approved recipe.
+async fn put_recipe(h: &Harness, token: &str, name: &str, recipe: Value) -> (u16, Value) {
+    let body = serde_json::json!({ "recipe": recipe });
+    call(h, raw("put", &format!("/client/workspaces/{name}/recipe"), Some(token), Body::from(body.to_string()))).await
+}
+
+/// (#3571) A clone previews from the recipe in the commit darkmux cloned; a
+/// run that commits another recipe changes nothing.
+#[tokio::test]
+async fn a_clone_previews_from_the_recipe_in_the_commit_it_cloned() {
+    let h = harness();
+    let token = paired(&h).await;
+    recipe(&h.fixture, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
+    commit_all(&h.fixture, "add a recipe");
+    let (code, v) = call(
+        &h,
+        post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": "https://github.com/kstrat2001/hcr"}))),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    let ws = h.base.join("hcr");
+    recipe(&ws, serde_json::json!({"command": format!("touch pwned; {}", serve())}));
+    commit_all(&ws, "a run's recipe");
+    let (code, v) = call(&h, get("/client/recipe?workspace=hcr", &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["recipe"]["command"], serve(), "the cloned commit's, never the run's: {v}");
+    let (code, v) = start_preview(&h, &token, "hcr").await;
+    assert_eq!(code, 202, "{v}");
+    let ready = preview_until(&h, &token, "hcr", &["ready", "failed"]).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    h.state.previews.stop("hcr");
+    assert!(!ws.join("pwned").exists(), "the run's recipe ran");
+}
+
+/// (#3571) A clone whose repo has no recipe previews from the one the user
+/// approved, checked as strictly as a checkout's.
+#[tokio::test]
+async fn an_approved_recipe_previews_a_clone_with_none() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": "https://github.com/kstrat2001/hcr"}))),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    let version = darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
+    let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"schema_version": version, "command": serve(), "comand": "x"})).await;
+    assert_eq!((code, v["code"].as_str()), (422, Some("recipe_invalid")), "{v}");
+    let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"schema_version": version, "command": serve(), "env_from_source": [".env"]})).await;
+    assert_eq!((code, v["code"].as_str()), (422, Some("recipe_invalid")), "{v}");
+    let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"schema_version": version, "command": serve(), "env": {"PORT": "{port}"}})).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["recipe"]["command"], serve(), "{v}");
+    let (code, v) = start_preview(&h, &token, "hcr").await;
+    assert_eq!(code, 202, "{v}");
+    let ready = preview_until(&h, &token, "hcr", &["ready", "failed"]).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    h.state.previews.stop("hcr");
+    // Nothing of it is in the work tree a run writes.
+    assert!(!h.base.join("hcr").join(".darkmux").exists());
+}
+
+/// (#3571) A worktree of the user's checkout reads that checkout: it takes
+/// no approved recipe.
+#[tokio::test]
+async fn only_a_clone_takes_an_approved_recipe() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (_mine, name, _ws) = checkout_workspace(&h, &token).await;
+    let (code, v) = put_recipe(&h, &token, &name, serde_json::json!({"schema_version": "1.0", "command": "npm run dev"})).await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("not a clone"), "{v}");
+}
+
+/// (#3571) The repo's own recipe, in the commit darkmux cloned, decides: an
+/// approved one is refused (409) rather than kept and never run, and one
+/// left beside the workspace anyway is never read over it.
+#[tokio::test]
+async fn a_clones_own_recipe_wins_over_an_approved_one() {
+    let h = harness();
+    let token = paired(&h).await;
+    recipe(&h.fixture, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
+    commit_all(&h.fixture, "add a recipe");
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": HCR})))).await;
+    assert_eq!(code, 201, "{v}");
+    let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"command": "npm run dev"})).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("its own"), "{v}");
+    let base = h.base.canonicalize().unwrap();
+    assert!(!base.join(".hcr.recipe").exists(), "nothing kept: {v}");
+    let version = darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
+    std::fs::write(base.join(".hcr.recipe"), serde_json::json!({"schema_version": version, "command": "npm run dev"}).to_string()).unwrap();
+    let (code, v) = call(&h, get("/client/recipe?workspace=hcr", &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["recipe"]["command"], serve(), "the repo's, never the approved one: {v}");
+    // A recipe in the commit that is refused decides too: no approved one
+    // stands in for it.
+    write_recipe(&h.fixture, "{not json");
+    commit_all(&h.fixture, "a broken recipe");
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": "https://github.com/kstrat2001/other"})))).await;
+    assert_eq!(code, 201, "{v}");
+    let other = v["workspace"].as_str().unwrap().to_string();
+    let (code, v) = put_recipe(&h, &token, &other, serde_json::json!({"command": "npm run dev"})).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("fix it in the repo"), "{v}");
+}
+
+/// (#3571) Only the app a clone is for sets its recipe, and an approved
+/// recipe is capped like a checkout's.
+#[tokio::test]
+async fn an_approved_recipe_is_the_owners_and_capped() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": HCR})))).await;
+    assert_eq!(code, 201, "{v}");
+    let max = crate::client_preview::MAX_RECIPE_BYTES as usize;
+    let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"command": "npm run dev", "env": {"BIG": "x".repeat(max)}})).await;
+    assert_eq!((code, v["code"].as_str()), (422, Some("recipe_invalid")), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("larger than"), "{v}");
+    let base = h.base.canonicalize().unwrap();
+    assert!(!base.join(".hcr.recipe").exists());
+    own(&h, "hcr", "c-0000000000000000");
+    let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"command": "npm run dev"})).await;
+    assert_eq!((code, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+    assert!(!base.join(".hcr.recipe").exists(), "another app's clone keeps no recipe of this one's");
+}
+
+/// (#3571) A clone's records are read only as plain files: a linked or
+/// oversized approved recipe is none, and a linked cloned-commit record is
+/// no commit (so the repo's recipe is not read through it).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_clones_records_are_never_read_through_a_link() {
+    let h = harness();
+    let token = paired(&h).await;
+    recipe(&h.fixture, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
+    commit_all(&h.fixture, "add a recipe");
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": HCR})))).await;
+    assert_eq!(code, 201, "{v}");
+    let base = h.base.canonicalize().unwrap();
+    let get_recipe = || get("/client/recipe?workspace=hcr", &[("authorization", &bearer(&token))]);
+    let cloned = base.join(".hcr.cloned");
+    let elsewhere = h.dir.path().join("cloned-elsewhere");
+    std::fs::rename(&cloned, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &cloned).unwrap();
+    let (code, v) = call(&h, get_recipe()).await;
+    assert_eq!((code, v["code"].as_str()), (404, Some("no_recipe")), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("recorded no commit"), "{v}");
+    let version = darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
+    let approved = h.dir.path().join("approved-elsewhere");
+    std::fs::write(&approved, serde_json::json!({"schema_version": version, "command": "npm run dev"}).to_string()).unwrap();
+    std::os::unix::fs::symlink(&approved, base.join(".hcr.recipe")).unwrap();
+    let (code, v) = call(&h, get_recipe()).await;
+    assert_eq!((code, v["code"].as_str()), (404, Some("no_recipe")), "a linked approved recipe is none: {v}");
+    std::fs::remove_file(base.join(".hcr.recipe")).unwrap();
+    let big = serde_json::json!({"schema_version": version, "command": "npm run dev", "env": {"BIG": "x".repeat(crate::client_preview::MAX_RECIPE_BYTES as usize)}});
+    std::fs::write(base.join(".hcr.recipe"), big.to_string()).unwrap();
+    let (code, v) = call(&h, get_recipe()).await;
+    assert_eq!((code, v["code"].as_str()), (404, Some("no_recipe")), "an oversized approved recipe is none: {v}");
+}
+
+/// (#3571) A clone of an empty repo (no commit to record) previews from the
+/// recipe the user approved, and a run's commit is never read for one.
+#[tokio::test]
+async fn an_empty_repos_clone_previews_an_approved_recipe() {
+    let h = harness();
+    let token = paired(&h).await;
+    let state = empty_repo_state(&h);
+    let (code, v) = call_with(state.clone(), post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": HCR})))).await;
+    assert_eq!(code, 201, "{v}");
+    let base = h.base.canonicalize().unwrap();
+    assert!(!base.join(".hcr.cloned").exists(), "no commit to record");
+    // A run writes a recipe: never read (with no commit recorded, nothing
+    // in the repo is).
+    let ws = h.base.join("hcr");
+    recipe(&ws, serde_json::json!({"command": format!("touch pwned; {}", serve())}));
+    let auth = bearer(&token);
+    let (code, v) = call_with(state.clone(), get("/client/recipe?workspace=hcr", &[("authorization", &auth)])).await;
+    assert_eq!((code, v["code"].as_str()), (404, Some("no_recipe")), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("recorded no commit"), "{v}");
+    let body = serde_json::json!({"recipe": {"schema_version": darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION, "command": serve()}});
+    let (code, v) = call_with(state.clone(), raw("put", "/client/workspaces/hcr/recipe", Some(&token), Body::from(body.to_string()))).await;
+    assert_eq!(code, 200, "{v}");
+    let (code, v) = call_with(state.clone(), get("/client/recipe?workspace=hcr", &[("authorization", &auth)])).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["recipe"]["command"], serve(), "the approved one: {v}");
+    assert!(!ws.join("pwned").exists());
+}
+
+/// (#3571) Records an earlier clone of the name left (its removal failed
+/// part way) never make a worktree of the user's checkout a clone: it reads
+/// its checkout and takes no approved recipe, and making it forgets them.
+#[tokio::test]
+async fn a_stale_clone_record_never_makes_a_worktree_a_clone() {
+    let h = harness();
+    let token = paired(&h).await;
+    let mine = h.dir.path().join("site");
+    fixture_repo(&mine);
+    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
+    let base = h.base.canonicalize().unwrap();
+    let out = std::process::Command::new("git").arg("-C").arg(&mine).args(["rev-parse", "HEAD"]).output().unwrap();
+    let head = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    let version = darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
+    let stale = serde_json::json!({"schema_version": version, "command": "npm run dev"}).to_string();
+    for name in ["site-b", "site-b-2"] {
+        std::fs::write(base.join(format!(".{name}.cloned")), format!("{head}\n")).unwrap();
+        std::fs::write(base.join(format!(".{name}.recipe")), &stale).unwrap();
+    }
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"source_path": mine.to_str(), "bot": "b"}))).await;
+    assert_eq!(code, 201, "{v}");
+    let name = v["workspace"].as_str().unwrap().to_string();
+    assert!(!base.join(format!(".{name}.cloned")).exists(), "making it forgot the stale record");
+    assert!(!base.join(format!(".{name}.recipe")).exists(), "and the stale recipe");
+    // Records written after it was made are never read for it either.
+    std::fs::write(base.join(format!(".{name}.cloned")), format!("{head}\n")).unwrap();
+    std::fs::write(base.join(format!(".{name}.recipe")), &stale).unwrap();
+    let (code, v) = call(&h, get(&format!("/client/recipe?workspace={name}"), &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["recipe"]["command"], serve(), "the checkout's: {v}");
+    let (code, v) = put_recipe(&h, &token, &name, serde_json::json!({"command": "npm run dev"})).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "{v}");
+}
+
+/// (#3571) A template project reads its first commit: it takes no approved
+/// recipe.
+#[tokio::test]
+async fn a_template_project_takes_no_approved_recipe() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (name, _dir) = template_project(&h, &token, None).await;
+    let (code, v) = put_recipe(&h, &token, &name, serde_json::json!({"command": "npm run dev"})).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("not a clone"), "{v}");
 }
 
 /// What darkmux recorded is what counts: a clone that takes the name of an
@@ -5404,16 +5645,21 @@ async fn a_recorded_checkout_that_became_a_symlink_gets_no_preview() {
 async fn a_record_that_is_a_symlink_is_no_record() {
     let h = harness();
     let token = paired(&h).await;
-    let (mine, _name, _ws) = checkout_workspace(&h, &token).await;
+    let (mine, name, _ws) = checkout_workspace(&h, &token).await;
     recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
     let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR}))).await;
     assert_eq!(code, 201, "{v}");
     let base = h.base.canonicalize().unwrap();
+    // The worktree's source record, linked (to a file naming the same
+    // checkout): no record. (#3571: a clone never reads one.)
     let named = h.dir.path().join("names-mine.txt");
     std::fs::write(&named, format!("{}\n", mine.canonicalize().unwrap().display())).unwrap();
-    std::os::unix::fs::symlink(&named, base.join(".hcr.source")).unwrap();
-    let (code, v) = start_preview(&h, &token, "hcr").await;
+    let record = base.join(format!(".{name}.source"));
+    std::fs::remove_file(&record).unwrap();
+    std::os::unix::fs::symlink(&named, &record).unwrap();
+    let (code, v) = start_preview(&h, &token, &name).await;
     assert_eq!(code, 404, "{v}");
+    assert_eq!(v["code"], "no_source_checkout", "{v}");
     assert!(v["error"].as_str().unwrap().contains("not made from a checkout of yours"), "{v}");
     // The repository record too: linked, host git has no repository there.
     let held = base.join(".hcr.gitdir");
@@ -7189,14 +7435,10 @@ async fn template_projects_without_a_usable_recipe_say_why() {
         "the clone forgot the old record"
     );
     let (code, v) = start_preview(&h, &token, "hcr").await;
-    assert_eq!(code, 404, "{v}");
-    assert!(
-        v["error"]
-            .as_str()
-            .unwrap()
-            .contains("not made from a checkout of yours"),
-        "{v}"
-    );
+    // Read as a clone (#3571), never as the old template project: the
+    // fixture's recipe (which lists `env_from_source`) is refused for a clone.
+    assert_eq!(code, 422, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("a clone has none"), "{v}");
 }
 
 #[tokio::test]
