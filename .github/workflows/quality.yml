@@ -1056,6 +1056,23 @@ jobs:
       # non-zero on any failing test, which is what fails the job. The report
       # steps run on `!cancelled()` and read the profile this step left,
       # whatever its verdict. `report` reuses that profile: the tests run once.
+      # (#3575) Ubuntu 24.04 restricts unprivileged user namespaces through
+      # AppArmor, so the Landlock sandbox's own tests (darkmux-platform's
+      # `confine`, the sandbox and preview backends) found the host unable to
+      # confine and returned early: every line of the Linux sandbox read as
+      # never executed, and its CRAP as untested. Lift the restriction for
+      # this runner so those tests run where coverage is measured.
+      - name: Let the Linux sandbox's tests run (unprivileged user namespaces)
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare -Urm true && echo "unprivileged user namespaces: allowed"
+          # What darkmux's own Landlock probe also needs (#3575 diagnosis):
+          # the Landlock LSM, and a /proc mounted in new PID/mount namespaces.
+          echo "LSMs: $(cat /sys/kernel/security/lsm 2>/dev/null || echo unreadable)"
+          unshare -Urmpf --mount-proc true && echo "a /proc mount in new namespaces: allowed" || echo "a /proc mount in new namespaces: REFUSED"
+
       - name: Measure the workspace
         env:
           NEXTEST_PROFILE: ci

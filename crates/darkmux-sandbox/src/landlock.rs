@@ -337,19 +337,27 @@ fn add_rule(c: &mut Confinement, line: &str) -> Result<(), String> {
 /// rules say and exec the program. It returns only when it cannot start,
 /// with exit code 125. Run it before any thread starts.
 pub fn helper(args: &[OsString]) -> std::process::ExitCode {
-    let Some(dir) = args.first().map(PathBuf::from) else {
-        eprintln!("landlock: {HELPER_ARG} needs the sandbox's directory");
-        return std::process::ExitCode::from(125);
-    };
-    let rules = std::fs::read_to_string(dir.join("rules")).map_err(|e| e.to_string());
-    match rules.and_then(|r| confinement(&dir, &r)) {
-        Ok(c) => {
-            let e = darkmux_platform::confine::enter(&c, &args[1..]);
+    match helper_plan(args) {
+        Ok((c, program)) => {
+            let e = darkmux_platform::confine::enter(&c, program);
             eprintln!("landlock: could not start the sandbox: {e}");
         }
-        Err(why) => eprintln!("landlock: {}: {why}", dir.join("rules").display()),
+        Err(why) => eprintln!("landlock: {why}"),
     }
     std::process::ExitCode::from(125)
+}
+
+/// What [`helper`] would confine and run, from its arguments: the
+/// directory's rules read into a confinement, and the program with its
+/// arguments; or why not, as the helper says it.
+fn helper_plan(args: &[OsString]) -> Result<(darkmux_platform::confine::Confinement, &[OsString]), String> {
+    let dir = args.first().map(PathBuf::from).ok_or_else(|| format!("{HELPER_ARG} needs the sandbox's directory"))?;
+    let rules = dir.join("rules");
+    std::fs::read_to_string(&rules)
+        .map_err(|e| e.to_string())
+        .and_then(|r| confinement(&dir, &r))
+        .map(|c| (c, &args[1..]))
+        .map_err(|why| format!("{}: {why}", rules.display()))
 }
 
 /// [`helper`], when `args` (this process's own) ask for it; it never
@@ -568,6 +576,57 @@ mod tests {
         assert!(!c.host_network);
         assert_eq!(c.workdir, Some(PathBuf::from("/w")));
         assert!(confinement(Path::new("/s"), "mount /x\n").is_err());
+    }
+
+    /// A rules line naming a port or a link it cannot read is refused,
+    /// naming the line; a port and the host's network read back.
+    #[test]
+    fn a_rule_it_cannot_read_is_refused_naming_it() {
+        let c = confinement(Path::new("/s"), "net host\nport 8080\n").unwrap();
+        assert!(c.host_network);
+        assert_eq!(c.bind_ports, [8080]);
+        assert_eq!(confinement(Path::new("/s"), "port http\n").unwrap_err(), "not a port: port http");
+        assert_eq!(confinement(Path::new("/s"), "link /bin\n").unwrap_err(), "not a link: link /bin");
+    }
+
+    /// A program's environment is the policy's, a PATH, a HOME and a
+    /// TMPDIR (the sandbox's own writable tmp) added only where it set none.
+    #[test]
+    fn the_environment_adds_path_home_and_tmpdir_only_where_unset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tmp = canonical(&dir.path().join("tmp")).to_string_lossy().into_owned();
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let mut p = policy(Vec::new(), Network::None);
+        assert_eq!(
+            LandlockBackend::environment(&p, dir.path()),
+            [pair("A", "1"), pair("PATH", DEFAULT_PATH), pair("HOME", &tmp), pair("TMPDIR", &tmp)]
+        );
+        p.env = vec![pair("PATH", "/mine"), pair("HOME", "/h")];
+        assert_eq!(LandlockBackend::environment(&p, dir.path()), [pair("PATH", "/mine"), pair("HOME", "/h"), pair("TMPDIR", &tmp)]);
+    }
+
+    /// The helper exits 125 when it cannot start a sandbox, and says why: no
+    /// directory, no rules in it, a line that is not a rule. A rules file it
+    /// can read becomes the confinement, with the program passed on (#3575
+    /// review: an exit code alone could not tell these apart).
+    #[test]
+    fn the_helper_refuses_what_it_cannot_start() {
+        let refused = |args: &[OsString]| format!("{:?}", helper(args)) == format!("{:?}", std::process::ExitCode::from(125));
+        let why = |args: &[OsString]| helper_plan(args).err().unwrap_or_default();
+        let dir = tempfile::TempDir::new().unwrap();
+        let at = || dir.path().as_os_str().to_owned();
+        assert!(refused(&[]));
+        assert!(why(&[]).contains("needs the sandbox's directory"), "{}", why(&[]));
+        assert!(refused(&[at()]), "no rules");
+        assert!(why(&[at()]).contains("rules"), "{}", why(&[at()]));
+        std::fs::write(dir.path().join("rules"), "mount /x\n").unwrap();
+        assert!(refused(&[at()]), "not a rule");
+        assert!(why(&[at()]).contains("mount /x"), "{}", why(&[at()]));
+        std::fs::write(dir.path().join("rules"), "net none\n").unwrap();
+        assert!(refused(&[at()]), "nothing to run");
+        let args = [at(), OsString::from("sh"), OsString::from("-c")];
+        let (_, program) = helper_plan(&args).expect("a rules file it can read");
+        assert_eq!(program, &args[1..]);
     }
 
     /// Arguments that do not ask for the helper return at once.

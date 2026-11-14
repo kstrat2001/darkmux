@@ -975,6 +975,12 @@ fn both_lockfiles_resolve_the_runtimes_dependencies_to_the_same_versions() {
 /// the same dispatch gets past that point (and fails later, on the role).
 #[test]
 fn a_seatbelt_dispatch_refuses_once_the_running_binary_is_replaced() {
+    // A Seatbelt dispatch needs sandbox-exec (macOS); elsewhere it is
+    // refused before the startup record is consulted, so there is nothing to
+    // test (the coverage and nightly mutation runs are on Linux).
+    if !darkmux_sandbox::SeatbeltBackend::available() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join("bin")).unwrap();
     let bin = tmp.path().join("bin/darkmux");

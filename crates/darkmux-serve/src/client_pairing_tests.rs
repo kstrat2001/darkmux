@@ -9372,6 +9372,54 @@ async fn an_image_whose_rollback_fails_says_the_work_copy_needs_attention() {
     assert!(error.contains("public/images/a-") && error.contains("page.html"), "what is left is named: {error}");
 }
 
+/// (review) Putting back a failed image names each thing it could not put
+/// back, and only those: an image under a folder that became a link (never
+/// followed), a "folder" darkmux made that is now a file, and an edited file
+/// HEAD does not hold. A folder that still holds something, or is gone,
+/// stays without a word; and when everything goes back, nothing is named.
+#[test]
+fn putting_an_image_back_names_only_what_could_not_be_put_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let w = dir.path().canonicalize().unwrap();
+    run_git(Some(&w), &["init", "-q"]);
+    std::fs::write(w.join("page.html"), "<img src=\"/hero.jpg\">\n").unwrap();
+    run_git(Some(&w), &["add", "page.html"]);
+    run_git(Some(&w), &["commit", "-q", "-m", "page"]);
+    let wc = wc(&w);
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("a.png"), PNG).unwrap();
+    std::fs::create_dir_all(w.join("public/held")).unwrap();
+    std::fs::write(w.join("public/held/theirs.txt"), "theirs\n").unwrap();
+    std::fs::write(w.join("public/flat"), "a file now\n").unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), w.join("public/linked")).unwrap();
+    let image = Image { path: "public/linked/a.png".into(), bytes: PNG.to_vec() };
+    let placed = Placed {
+        wrote: true,
+        made: vec!["public/held".into(), "public/gone".into(), "public/flat".into()],
+        prior: None,
+        edited: Some("never-committed.html".into()),
+    };
+    let left = put_image_back(&wc, &image, &placed);
+    assert_eq!(left.len(), 3, "{left:?}");
+    assert!(left[0].starts_with("public/linked/a.png is still in the work copy ("), "{left:?}");
+    assert!(left[1].starts_with("the folder public/flat is still there ("), "{left:?}");
+    assert!(left[2].starts_with("never-committed.html still points at the image, not as committed ("), "{left:?}");
+    assert!(elsewhere.path().join("a.png").exists(), "a link was followed");
+    assert!(w.join("public/held/theirs.txt").exists(), "a folder holding something was emptied");
+
+    // The inverse: the image written, its folder made, the page edited, and
+    // every one of them goes back.
+    std::fs::create_dir_all(w.join("site/images")).unwrap();
+    std::fs::write(w.join("site/images/a.png"), PNG).unwrap();
+    std::fs::write(w.join("page.html"), "<img src=\"/images/a.png\">\n").unwrap();
+    let image = Image { path: "site/images/a.png".into(), bytes: PNG.to_vec() };
+    let placed = Placed { wrote: true, made: vec!["site".into(), "site/images".into()], prior: None, edited: Some("page.html".into()) };
+    assert_eq!(put_image_back(&wc, &image, &placed), Vec::<String>::new());
+    assert!(!w.join("site").exists(), "the folders darkmux made are gone");
+    assert_eq!(std::fs::read_to_string(w.join("page.html")).unwrap(), "<img src=\"/hero.jpg\">\n");
+}
+
 /// (review) The documented limits, worked out here rather than read from
 /// the constants: two image bodies at once, 30 seconds for a body.
 #[test]

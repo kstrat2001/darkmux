@@ -408,22 +408,31 @@ const CONTAINER_TREE_ROOT: &str = "/workspace";
 /// byte for byte), the tree's own host path in a sandbox on the host, where
 /// `/workspace` is a directory that does not exist.
 pub fn build_message_at(root: &str, rules_by_id: &BTreeMap<String, Rule>, unit: &Unit, intent: Option<&str>) -> Result<String> {
-    let missing = |rule: &str| {
-        anyhow!(
-            "dispatch.unit: no rule resolved for id `{rule}`: the plan names a rule the current \
-             rule set no longer declares; re-plan this rule"
-        )
-    };
     let mut out = String::new();
     if let Some(text) = intent {
         out.push_str(&format!(
             "The stated intent for this change (a PR body or intent file) is:\n\n{text}\n\n"
         ));
     }
+    push_scope(&mut out, root, rules_by_id, unit)?;
+    out.push_str(&report_finding_instructions(root));
+    Ok(out)
+}
+
+/// The unit's patterns, then its scope as the sandbox sees it at `root`: the
+/// sites, the files, or the import sites and the library they come from.
+fn push_scope(out: &mut String, root: &str, rules_by_id: &BTreeMap<String, Rule>, unit: &Unit) -> Result<()> {
+    let rule_for = |rule: &str| {
+        rules_by_id.get(rule).ok_or_else(|| {
+            anyhow!(
+                "dispatch.unit: no rule resolved for id `{rule}`: the plan names a rule the current \
+                 rule set no longer declares; re-plan this rule"
+            )
+        })
+    };
     match unit {
         Unit::Site { rule, sites, source, .. } => {
-            let r = rules_by_id.get(rule).ok_or_else(|| missing(rule))?;
-            out.push_str(&pattern_block(r));
+            out.push_str(&pattern_block(rule_for(rule)?));
             out.push_str(&format!(
                 "Your scope is these sites in `{root}/{source}`. For each, read lines noted below and decide whether the cited line matches the pattern. `read` numbers every line it returns as `N: content`, so the cited line is the one beginning `<line>: ` — do not count lines. Cite it as `file:line`. Sites:\n{}\n",
                 render_sites(root, source, sites)
@@ -431,8 +440,7 @@ pub fn build_message_at(root: &str, rules_by_id: &BTreeMap<String, Rule>, unit: 
         }
         Unit::Read { rules: rule_ids, files, source, .. } => {
             for rid in rule_ids {
-                let r = rules_by_id.get(rid).ok_or_else(|| missing(rid))?;
-                out.push_str(&pattern_block(r));
+                out.push_str(&pattern_block(rule_for(rid)?));
             }
             out.push_str(&format!(
                 "Your scope is these files in `{root}/{source}`. Read each one in full and apply every pattern above:\n{}\n",
@@ -450,20 +458,23 @@ pub fn build_message_at(root: &str, rules_by_id: &BTreeMap<String, Rule>, unit: 
             library_surface,
             ..
         } => {
-            let r = rules_by_id.get(rule).ok_or_else(|| missing(rule))?;
-            out.push_str(&pattern_block(r));
+            out.push_str(&pattern_block(rule_for(rule)?));
             out.push_str(&format!(
                 "Your scope is these import sites in `{root}/{source}`. `read` numbers every line it returns as `N: content`, so the cited line is the one beginning `<line>: `. Cite it as `file:line`.\n{}\n\n",
                 render_sites(root, source, sites)
             ));
             out.push_str(&format!(
                 "The library `{package}` at the version being examined is at `{root}/{library}`; its entry files and changelog are: {}. The consumer pins `{pinned}`; the library version is `{library_version}`.\n",
-                if library_surface.is_empty() { "(none)".to_string() } else { library_surface.join(", ") }
+                surface_list(library_surface)
             ));
         }
     }
-    out.push_str(&report_finding_instructions(root));
-    Ok(out)
+    Ok(())
+}
+
+/// An edge unit's library files as its message lists them.
+fn surface_list(library_surface: &[String]) -> String {
+    if library_surface.is_empty() { "(none)".to_string() } else { library_surface.join(", ") }
 }
 
 // ── dispatch classification ──────────────────────────────────────────────

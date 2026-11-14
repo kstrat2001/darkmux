@@ -863,6 +863,37 @@ mod tests {
         assert_eq!(ended, Vec::<&str>::new(), "an unrelated session was ended");
     }
 
+    /// A lifecycle command runs its script with `$d` the sandbox's
+    /// directory under the state root and its extra arguments after it, on
+    /// the backend's own PATH and nothing else of the caller's environment.
+    /// A name that could leave the state root runs none of the script: it
+    /// fails, naming the name. Plain `sh`, so it holds on every OS.
+    #[test]
+    #[serial_test::serial]
+    fn a_lifecycle_command_runs_on_its_sandboxs_directory_or_refuses_the_name() {
+        let root = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var_os(STATE_DIR_ENV);
+        unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
+        let on = |id: &str, extra: &[String]| {
+            let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: id.into() };
+            SeatbeltBackend::on_dir(&handle, r#"printf '%s|%s|%s|%s' "$d" "$2" "$PATH" "${HOME-unset}""#, extra).output().unwrap()
+        };
+        let ran = on("darkmux-x.1", &["7".into()]);
+        let refused = on("../escape", &[]);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(STATE_DIR_ENV, v),
+                None => std::env::remove_var(STATE_DIR_ENV),
+            }
+        }
+        let dir = canonical(root.path()).join("darkmux-x.1");
+        assert_eq!(String::from_utf8_lossy(&ran.stdout), format!("{}|7|{DEFAULT_PATH}|unset", dir.display()));
+        assert!(ran.status.success());
+        assert_eq!(refused.status.code(), Some(125));
+        assert!(refused.stdout.is_empty(), "the script ran for a refused name");
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("not a sandbox name: ../escape"), "{refused:?}");
+    }
+
     /// A quote or backslash in a path cannot end the SBPL string.
     #[test]
     fn a_path_cannot_break_out_of_its_string() {

@@ -1529,6 +1529,15 @@ fn a_dialog_tool_is_read_or_killed_at_its_deadline() {
     assert!(crate::output_within(std::process::Command::new("/nonexistent/tool"), std::time::Duration::from_secs(1)).is_none());
 }
 
+/// A command's output is read on a thread of its own, to its end; no pipe
+/// at all reads as no bytes (never a wait on one).
+#[test]
+fn a_drained_pipe_is_read_to_its_end_and_no_pipe_is_no_bytes() {
+    let whole = vec![7u8; 200_000];
+    assert_eq!(crate::drain(Some(std::io::Cursor::new(whole.clone()))).join().unwrap(), whole);
+    assert_eq!(crate::drain(None::<std::io::Empty>).join().unwrap(), Vec::<u8>::new());
+}
+
 #[test]
 fn a_dialog_run_that_never_ended_is_no_dialog() {
     assert!(matches!(macos::dialog_run_answer(None), AllowAnswer::NoDialog(_)));
@@ -1856,6 +1865,26 @@ fn a_sandboxs_processes_are_its_group_and_their_descendants() {
     // launchd or init is never a sandbox's leader: nothing would be outside it.
     assert_eq!(crate::sandbox_members(1, &table), Vec::<u32>::new());
     assert_eq!(crate::sandbox_members(0, &table), Vec::<u32>::new());
+}
+
+/// (#3559) The listeners a sandbox holds are each of its members' own
+/// (`sandbox_members` of the process table), gathered in member order;
+/// a process outside it is never asked. No table, or one member whose
+/// listeners cannot be read, is no answer, never a partial one.
+#[test]
+fn a_sandboxs_listeners_are_its_members_and_one_unread_member_is_no_answer() {
+    let table = vec![(100, 50, 100, 100), (101, 100, 100, 100), (200, 1, 200, 200)];
+    let on = |port: u16, pid: u32| (port, PortListener { addr: None, text: "0.0.0.0".into(), scope: None, pid: Some(pid) });
+    let mut asked = Vec::new();
+    let held = crate::listeners_held_by_members(100, Some(table.clone()), |pid| {
+        asked.push(pid);
+        Some(if pid == 101 { vec![on(4100, 101), on(4200, 101)] } else { vec![on(9000, pid)] })
+    });
+    assert_eq!(held, Some(vec![on(9000, 100), on(4100, 101), on(4200, 101)]));
+    assert_eq!(asked, vec![100, 101], "only the sandbox's own processes are read");
+    assert_eq!(crate::listeners_held_by_members(100, None, |pid| Some(vec![on(9000, pid)])), None, "no process table");
+    let one_unread = crate::listeners_held_by_members(100, Some(table), |pid| (pid != 101).then(|| vec![on(9000, pid)]));
+    assert_eq!(one_unread, None, "a member that cannot be read is no answer");
 }
 
 /// (#3559) `/proc/<pid>/stat` as (pid, ppid, pgrp, session): the name, in
@@ -2224,6 +2253,28 @@ fn an_elf(is64: bool, big: bool, interp: Option<&str>) -> Vec<u8> {
     let len = b.len() as u64;
     header(&mut b, phnum - 1, 1, 0, len);
     b
+}
+
+/// A program header's file offset and size are read at its class's
+/// offsets (64-bit: 8 and 32, eight bytes each; 32-bit: 4 and 16, four
+/// bytes each), in its byte order. An entry cut short before either field,
+/// or one placed where an offset would overflow, names none: it is never
+/// read past its end.
+#[test]
+fn a_program_headers_offset_and_size_are_its_classs_fields_and_never_read_past_it() {
+    let interp = "/lib/ld-musl-x86_64.so.1";
+    for (is64, big) in [(true, false), (true, true), (false, false), (false, true)] {
+        let elf = an_elf(is64, big, Some(interp));
+        let (ehsize, phentsize, offset_at, size_at) = if is64 { (64, 56, 8, 32) } else { (52, 32, 4, 16) };
+        let width = if is64 { 8 } else { 4 };
+        let table = |len: usize| crate::Elf { bytes: &elf[ehsize..ehsize + len], is64, big };
+        let want = Some(((ehsize + phentsize * 3) as u64, interp.len() as u64 + 1));
+        assert_eq!(table(phentsize * 3).interpreter_fields(phentsize), want, "is64 {is64} big {big}");
+        assert_eq!(table(phentsize + size_at + width).interpreter_fields(phentsize), want, "the entry's own bytes suffice");
+        assert_eq!(table(phentsize + size_at + width - 1).interpreter_fields(phentsize), None, "size cut short");
+        assert_eq!(table(phentsize + offset_at + width - 1).interpreter_fields(phentsize), None, "offset cut short");
+        assert_eq!(table(phentsize * 3).interpreter_fields(usize::MAX - 1), None, "an offset that overflows");
+    }
 }
 
 /// (#3568) A `/bin/sh` that is not a regular file reads as glibc without

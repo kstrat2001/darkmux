@@ -8080,8 +8080,9 @@ fn container_toolchain(
 
 /// The container run, from its `dispatch.start` to its terminal record.
 /// It owns the bookend guard (contract 2): `dispatch.start` opens it, and
-/// every exit closes it exactly once, explicitly on the two mid-run exits
-/// and the clean one, and through the guard's Drop on any `?` or panic.
+/// every exit closes it exactly once, explicitly on a refused toolchain or
+/// launch here and on the two mid-run exits and the clean one in
+/// [`supervise_container`], and through the guard's Drop on any `?` or panic.
 fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: ContainerRun) -> Result<DispatchResult> {
     let session = opts.session.clone();
     let phase_id = opts.phase_id.clone();
@@ -8100,7 +8101,7 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
     // Held to end-of-fn; an early `?`-return drops it, and `SessionEmitter::
     // drop` (#2344) now removes the key itself the same way `stop()` does,
     // rather than only halting the thread and leaving the TTL to age it out.
-    let session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
+    let mut session_emitter = darkmux_flow::session_presence::spawn_session_emitter(
         &session,
         Some(opts.role_id.clone()),
         Some(model.clone()),
@@ -8142,6 +8143,43 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
     // settled before its model is made resident.
     let ask = ToolchainFor { kind: sandbox_of(&run), workspace: &run.workspace, model: &run.model, endpoint: run.unmanaged_endpoint_raw_label.as_deref() };
     run.toolchain = container_toolchain(opts, execution, ask, &mut bookend, dispatch_start_instant)?;
+    let _engine = container_model_resident(
+        opts,
+        execution,
+        &model,
+        run.brain.agentic_pm.as_ref(),
+        run.unmanaged_endpoint_raw_label.as_deref(),
+        &mut bookend,
+        dispatch_start_instant,
+    )?;
+
+    let remote_auth = run.remote_auth.take();
+    let launched = launch_container(opts, execution, &run, remote_auth).inspect_err(|e| {
+        let wall_ms = dispatch_start_instant.elapsed().as_millis() as u64;
+        let refused = refused_launch_terminal(e, wall_ms, run.unmanaged_endpoint_raw_label.as_deref(), opts.resume_from.as_deref());
+        close_if_refused(&mut bookend, refused.map(|mut payload| {
+            merge_record_context(&mut payload, &opts.record_context);
+            crate::dispatch::build_dispatch_record(darkmux_flow::Level::Error, &opts.role_id, &session, execution, Some(&model), phase_id.as_deref(), payload)
+        }));
+    })?;
+    supervise_container(opts, execution, &mut run, &mut bookend, launched, &mut session_emitter, dispatch_start_instant)
+}
+
+/// The launched container's run, from its observers to its terminal record:
+/// watch it, wait for it, then close the bookend `run_container` opened
+/// (contract 2) with what ended it. A failed wait and a killed run close it
+/// explicitly; a `?` leaves it to the guard's Drop in `run_container`.
+/// `session_emitter` is taken where the run stops it, so an early return
+/// leaves it to `run_container`, dropped after the bookend as before.
+fn supervise_container(
+    opts: &DispatchOpts,
+    execution: &ExecutionId,
+    run: &mut ContainerRun,
+    bookend: &mut DispatchBookendGuard<'_>,
+    mut launched: LaunchedContainer,
+    session_emitter: &mut Option<darkmux_flow::session_presence::SessionEmitter>,
+    dispatch_start_instant: std::time::Instant,
+) -> Result<DispatchResult> {
     // (#3121) A run that ended mid-way closes with the error that ended it
     // and the turns it finished, never the guard's "early return or panic".
     let close_ended_mid_run =
@@ -8157,36 +8195,17 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
             bookend.close(crate::dispatch::build_dispatch_record(
                 level,
                 &opts.role_id,
-                &session,
+                &opts.session,
                 execution,
-                Some(&model),
-                phase_id.as_deref(),
+                Some(&run.model),
+                opts.phase_id.as_deref(),
                 payload,
             ));
         };
 
-    let _engine = container_model_resident(
-        opts,
-        execution,
-        &model,
-        run.brain.agentic_pm.as_ref(),
-        run.unmanaged_endpoint_raw_label.as_deref(),
-        &mut bookend,
-        dispatch_start_instant,
-    )?;
-
-    let remote_auth = run.remote_auth.take();
-    let mut launched = launch_container(opts, execution, &run, remote_auth).inspect_err(|e| {
-        let wall_ms = dispatch_start_instant.elapsed().as_millis() as u64;
-        let refused = refused_launch_terminal(e, wall_ms, run.unmanaged_endpoint_raw_label.as_deref(), opts.resume_from.as_deref());
-        close_if_refused(&mut bookend, refused.map(|mut payload| {
-            merge_record_context(&mut payload, &opts.record_context);
-            crate::dispatch::build_dispatch_record(darkmux_flow::Level::Error, &opts.role_id, &session, execution, Some(&model), phase_id.as_deref(), payload)
-        }));
-    })?;
     // (#2925) This dispatch's own stop: see `DispatchStop`.
     let local_stop = DispatchStop::new(launched.sandbox.clone());
-    let (_observer_guards, threads) = spawn_observers(opts, execution, &run, &launched, &local_stop)?;
+    let (_observer_guards, threads) = spawn_observers(opts, execution, run, &launched, &local_stop)?;
     // (#3559) Watched while it runs, ended right after the wait.
     let listener_watch = watch_dispatch_listeners(&launched.sandbox, launched.child.id(), &local_stop);
     panic_after_guard_spawn_if_asked();
@@ -8229,7 +8248,7 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
             // it polled `trajectory.jsonl` forever in the background.
             let trajectory_summary = threads.teardown(&launched.sandbox);
             let err = anyhow::Error::from(e).context("waiting for darkmux-runtime container");
-            close_ended_mid_run(&mut bookend, &err, &trajectory_summary);
+            close_ended_mid_run(bookend, &err, &trajectory_summary);
             // (#2131 review round 2, NEW-2) No explicit deregister here —
             // `container_child_registration` (declared at the spawn
             // site) deregisters on Drop, which fires when this early
@@ -8304,7 +8323,7 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
     // reads this same global flag independently.
     if run_was_killed(&local_stop, output.status.success()) {
         let trajectory_summary = threads.teardown(&launched.sandbox);
-        stop_session_emitter(session_emitter);
+        stop_session_emitter(session_emitter.take());
         // (#2131 review round 2, F1) `container_child_registration` is
         // already deregistered by this point — this branch only runs
         // after a SUCCESSFUL `wait_with_output`, which dropped it
@@ -8315,20 +8334,20 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
         // not as a signal: the launcher reads the signal wording as "the
         // whole run was interrupted", which a phase stop is not.
         let err = killed_mid_run_error(&launched.sandbox, &local_stop);
-        close_ended_mid_run(&mut bookend, &err, &trajectory_summary);
+        close_ended_mid_run(bookend, &err, &trajectory_summary);
         return Err(err);
     }
 
     let outcome = collect_container_outcome(
         threads,
-        session_emitter,
+        session_emitter.take(),
         output,
         dispatch_start_instant,
         &run.host_out,
         &launched.sandbox,
         (launched.inactivity_timeout_seconds, launched.inactivity_timeout_seconds_source),
     );
-    close_container_run(opts, execution, &mut run, &mut bookend, outcome)
+    close_container_run(opts, execution, run, bookend, outcome)
 }
 
 /// The `dispatch.start` payload of a container run: the runtime metadata
