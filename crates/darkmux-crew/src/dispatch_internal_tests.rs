@@ -24325,6 +24325,7 @@ fn a_containers_kill_dispositions_are_as_they_were() {
 #[test]
 #[serial]
 fn an_on_host_dispatch_ended_mid_run_names_its_sandbox_not_a_container() {
+    darkmux_types::run_in_own_process!();
     darkmux_types::interrupt::reset_for_test();
     let on_host = |kind| darkmux_sandbox::SandboxHandle { backend: kind, id: "darkmux-dispatch-b3567".to_string() };
     for kind in [darkmux_sandbox::BackendKind::Landlock, darkmux_sandbox::BackendKind::Seatbelt] {
