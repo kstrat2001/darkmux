@@ -26,7 +26,7 @@
 //! carries what they cannot: no signal or abstract unix socket reaches past
 //! the sandbox, no outside process can be traced, a pathname unix socket
 //! resolves only inside a granted tree (ABI 9), TCP binds only the granted
-//! ports, and no path outside the granted ones is reachable. Inside the
+//! ports when any are named, and no path outside the granted ones is reachable. Inside the
 //! granted ones it is the mounts that hold a read-only path, since Landlock's
 //! rules add up: a read-only path nested in a writable one is writable to
 //! Landlock and read-only as a mount.
@@ -84,8 +84,12 @@ pub struct Confinement {
     /// its own with only a loopback: nothing of the host's, its loopback
     /// services included, is reachable.
     pub host_network: bool,
-    /// TCP ports it may bind on the host's network. Landlock grants a bind
-    /// by port, at any address.
+    /// TCP ports it may bind on the host's network, at any address, when
+    /// any are named (a preview's); with none named (a dispatch's), it may
+    /// bind any port, as under Seatbelt (#3567): Landlock grants a bind by
+    /// port, never by address, so holding binds to no port refuses a
+    /// loopback server too, while a `listen` with no bind still reaches
+    /// every address.
     pub bind_ports: Vec<u16>,
     /// Its working directory.
     pub workdir: Option<PathBuf>,
@@ -785,15 +789,23 @@ mod imp {
         Ok(())
     }
 
+    /// The network rights the ruleset handles: TCP binds, on the host's
+    /// network with ports named; none otherwise (a network of its own has
+    /// nothing of the host's to bind, and with no ports named any bind is
+    /// allowed, #3567).
+    fn handled_net(c: &Confinement) -> u64 {
+        if c.host_network && !c.bind_ports.is_empty() { NET_BIND_TCP } else { 0 }
+    }
+
     /// Restrict this process with Landlock: every right this ABI handles is
-    /// denied but on the granted paths, TCP binds (on the host's network)
-    /// but on the granted ports, and signals and abstract unix sockets stay
-    /// inside the sandbox.
+    /// denied but on the granted paths, TCP binds (on the host's network,
+    /// with ports named) but on the granted ports, and signals and abstract
+    /// unix sockets stay inside the sandbox.
     fn restrict(c: &Confinement, abi: u32) -> Result<(), Error> {
         let handled = fs_rights(abi);
         let attr = RulesetAttr {
             handled_access_fs: handled,
-            handled_access_net: if c.host_network { NET_BIND_TCP } else { 0 },
+            handled_access_net: handled_net(c),
             scoped: SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL,
         };
         // SAFETY: a live attr of its declared size.
@@ -807,7 +819,7 @@ mod imp {
             for (path, rights) in grants {
                 add_path_rule(fd, path, rights & handled)?;
             }
-            if c.host_network {
+            if handled_net(c) != 0 {
                 for port in &c.bind_ports {
                     let rule = NetPort { allowed_access: NET_BIND_TCP, port: u64::from(*port) };
                     // SAFETY: a live rule of the type named.
@@ -871,6 +883,19 @@ mod imp {
             assert_eq!(super::fs_rights(1), (1 << 13) - 1);
             assert_eq!(super::fs_rights(6), (1 << 16) - 1);
             assert_eq!(super::fs_rights(9), (1 << 17) - 1);
+        }
+
+        /// (#3567) Binds are held only on the host's network with ports
+        /// named (a preview's), to those ports; with none named (a
+        /// dispatch's) any bind is allowed, a loopback server included; a
+        /// network of its own has no host port to hold.
+        #[test]
+        fn binds_are_held_only_to_named_ports_on_the_hosts_network() {
+            let c = |host_network, bind_ports: &[u16]| crate::confine::Confinement { host_network, bind_ports: bind_ports.to_vec(), ..Default::default() };
+            assert_eq!(super::handled_net(&c(true, &[8080])), super::NET_BIND_TCP);
+            assert_eq!(super::handled_net(&c(true, &[])), 0);
+            assert_eq!(super::handled_net(&c(false, &[8080])), 0);
+            assert_eq!(super::handled_net(&c(false, &[])), 0);
         }
     }
 }

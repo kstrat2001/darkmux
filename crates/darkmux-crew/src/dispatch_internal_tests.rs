@@ -24070,11 +24070,42 @@ fn a_dispatch_the_listener_watch_stopped_closes_as_an_error_naming_the_listener(
     let stop = DispatchStop::new(docker_sandbox("darkmux-dispatch-b3559-record"));
     stop.request(why);
     assert!(run_was_killed(&stop, false), "a stopped dispatch that did not exit cleanly was killed");
-    let err = killed_mid_run_error("darkmux-dispatch-b3559-record", &stop);
+    let err = killed_mid_run_error(&docker_sandbox("darkmux-dispatch-b3559-record"), &stop);
     let (payload, _) = super::ended_mid_run_terminal(&format!("{err:#}"), 10, &super::TrajectorySummary::default(), None, None);
     assert_eq!(payload.action(), darkmux_flow::FlowAction::DispatchError);
     let payload = serde_json::to_value(payload).unwrap();
     let error = payload["error"].as_str().unwrap_or_default();
     assert!(error.contains("0.0.0.0:4321 (pid 8)") && error.contains("#3559"), "{payload}");
     assert!(!error.contains(darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL), "{error}");
+}
+
+/// (#3567) A dispatch in a sandbox on the host that was ended mid-run (a
+/// scoped stop, the listener watch's, or a signal) names its sandbox, never
+/// a container; a Docker dispatch's error is as it was.
+#[test]
+#[serial]
+fn an_on_host_dispatch_ended_mid_run_names_its_sandbox_not_a_container() {
+    darkmux_types::interrupt::reset_for_test();
+    let on_host = |kind| darkmux_sandbox::SandboxHandle { backend: kind, id: "darkmux-dispatch-b3567".to_string() };
+    for kind in [darkmux_sandbox::BackendKind::Landlock, darkmux_sandbox::BackendKind::Seatbelt] {
+        let stop = DispatchStop::new(on_host(kind));
+        stop.request("the program listened on 0.0.0.0:4321".to_string());
+        let stopped = format!("{:#}", killed_mid_run_error(&on_host(kind), &stop));
+        darkmux_types::interrupt::raise_for_test();
+        let signaled = format!("{:#}", killed_mid_run_error(&on_host(kind), &DispatchStop::new(on_host(kind))));
+        darkmux_types::interrupt::reset_for_test();
+        for err in [&stopped, &signaled] {
+            assert!(!err.contains("container"), "{err}");
+            assert!(err.contains(&format!("the `{}` sandbox `darkmux-dispatch-b3567`", darkmux_sandbox::setting_value(kind))), "{err}");
+        }
+        assert!(stopped.contains("was stopped (the program listened on 0.0.0.0:4321)"), "{stopped}");
+        assert!(signaled.contains(darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL), "{signaled}");
+    }
+    let docker = docker_sandbox("c");
+    let stop = DispatchStop::new(docker.clone());
+    stop.request("a phase stop".to_string());
+    assert_eq!(
+        format!("{:#}", killed_mid_run_error(&docker, &stop)),
+        "darkmux-runtime container dispatch was stopped (a phase stop) : the container `c` was killed mid-run"
+    );
 }

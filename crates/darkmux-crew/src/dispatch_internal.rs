@@ -5558,19 +5558,22 @@ fn run_was_killed(local_stop: &DispatchStop, exited_cleanly: bool) -> bool {
     !exited_cleanly && (darkmux_types::interrupt::is_set() || local_stop.is_requested())
 }
 
-/// The error for a container dispatch ended mid-run: by a signal (the
-/// launcher reads [`darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL`] as "the
-/// whole run was interrupted"), or by a stop scoped to this dispatch, which is
-/// reported as itself, because a phase stop is not a run-wide interrupt.
-fn killed_mid_run_error(container_name: &str, local_stop: &DispatchStop) -> anyhow::Error {
+/// The error for a dispatch ended mid-run: by a signal (the launcher reads
+/// [`darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL`] as "the whole run was
+/// interrupted"), or by a stop scoped to this dispatch, which is reported as
+/// itself, because a phase stop is not a run-wide interrupt. It names the
+/// container, or for a sandbox on the host the sandbox (#3567).
+fn killed_mid_run_error(sandbox: &darkmux_sandbox::SandboxHandle, local_stop: &DispatchStop) -> anyhow::Error {
+    let (what, ended) = if sandbox.backend.on_host() {
+        (format!("the `{}` sandbox `{}`", darkmux_sandbox::setting_value(sandbox.backend), sandbox.id), "ended")
+    } else {
+        (format!("the container `{}`", sandbox.id), "killed")
+    };
+    let dispatch = if sandbox.backend.on_host() { "darkmux-runtime dispatch" } else { "darkmux-runtime container dispatch" };
     match (darkmux_types::interrupt::is_set(), local_stop.reason()) {
-        (false, Some(reason)) => anyhow!(
-            "darkmux-runtime container dispatch was stopped ({reason}) \
-             : the container `{container_name}` was killed mid-run"
-        ),
+        (false, Some(reason)) => anyhow!("{dispatch} was stopped ({reason}) : {what} was {ended} mid-run"),
         _ => anyhow!(
-            "darkmux-runtime container dispatch {} \
-             (SIGINT/SIGTERM/SIGHUP): the container `{container_name}` was killed mid-run",
+            "{dispatch} {} (SIGINT/SIGTERM/SIGHUP): {what} was {ended} mid-run",
             darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL
         ),
     }
@@ -8128,7 +8131,7 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
         // (#2925) A stop scoped to this dispatch is reported as itself,
         // not as a signal: the launcher reads the signal wording as "the
         // whole run was interrupted", which a phase stop is not.
-        let err = killed_mid_run_error(&launched.container_name, &local_stop);
+        let err = killed_mid_run_error(&launched.sandbox, &local_stop);
         close_ended_mid_run(&mut bookend, &err, &trajectory_summary);
         return Err(err);
     }

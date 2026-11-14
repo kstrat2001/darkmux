@@ -31,12 +31,14 @@
 //! - **Limit memory or processes, or switch user.** `limits` and `user` are
 //!   unused; the process runs as the caller's user.
 //! - **Bind a port on the loopback only (#3559).** The default network is
-//!   the host's: Landlock lets it bind only the policy's `ports` (none, for
-//!   a dispatch), but at any address, so a published port can answer beyond
-//!   the loopback if the program binds it there. And a `listen` on a socket
-//!   with no bind is no bind Landlock sees: the kernel binds it to every
-//!   address, on a port of its choosing, so even a policy naming no ports
-//!   can listen beyond the loopback. UDP is not filtered at all. darkmux
+//!   the host's, and Landlock grants a bind by port, never by address. A
+//!   policy naming `ports` (a preview's) binds only those, at any address,
+//!   so a published port can answer beyond the loopback if the program
+//!   binds it there. A policy naming none (a dispatch's) binds any port, as
+//!   under Seatbelt (#3567): holding it to no port would refuse a loopback
+//!   server too, while a `listen` on a socket with no bind, which the kernel
+//!   binds to every address, is no bind Landlock sees. UDP is not filtered
+//!   at all. darkmux
 //!   watches a dispatch instead: the TCP listeners its processes hold are
 //!   read every second and one beyond the loopback stops it
 //!   (`darkmux-crew`'s `sandbox_listeners`; detection with a window, not a
