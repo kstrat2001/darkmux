@@ -334,11 +334,11 @@ fn enumerate_units() -> Vec<Unit> {
         // in this workspace today has a `src/lib.rs`; this branch exists
         // so a FUTURE bin-only member gets `--bins` automatically instead
         // of silently failing loudly for the wrong stated reason.
-        // (#3112) A library declared `test = false` has no unit-test target
-        // to run here: `darkmux-runtime-linked` compiles `runtime/src` a
-        // second time and leaves its tests to `runtime/` (`cargo
-        // t-runtime`), so `--lib` builds nothing and `--bins` matches no
-        // target, and either reads as a unit that never ran.
+        // (#3112) A library declared `test = false` has no unit tests to
+        // run here: `darkmux-runtime-linked` compiles `runtime/src` a second
+        // time and leaves its tests to `runtime/` (`cargo t-runtime`). An
+        // explicit `--lib` would compile them without their dev-dependencies
+        // and fail; `--bins` matches no target, a unit that never ran.
         if member_manifest.as_deref().is_some_and(lib_tests_off) {
             // Nothing to census for the library; its `tests/` still are.
         } else if member_dir.join("src/lib.rs").exists() {
@@ -410,15 +410,10 @@ fn lib_tests_off(manifest: &str) -> bool {
 /// cannot outlive the thing it describes.
 const KNOWN_UNISOLATED_UNITS: &[(&str, usize, &str)] = &[];
 
-/// The free half: the enumeration itself, asserted on every `cargo test`.
-///
-/// Anti-vacuity in both directions — a walk that silently returned nothing
-/// (a renamed directory, a manifest reformat that breaks the `members`
-/// scrape) would make the measurement below pass while measuring nothing,
-/// which is precisely the shape the guard this replaces failed in.
 /// (#3112) A member whose library is `test = false` (the linked runtime)
-/// gets no `--lib` or `--bins` unit: either would run no test binary and
-/// fail the census as a unit that never ran.
+/// gets no `--lib` or `--bins` unit: an explicit `--lib` would compile its
+/// tests without their dev-dependencies and fail, and `--bins` matches no
+/// target, so the census would read a unit that never ran.
 #[test]
 fn a_library_with_its_tests_off_gets_no_unit() {
     let units = enumerate_units();
@@ -432,6 +427,12 @@ fn a_library_with_its_tests_off_gets_no_unit() {
     assert!(!lib_tests_off("[package]\ntest = false\n"));
 }
 
+/// The free half: the enumeration itself, asserted on every `cargo test`.
+///
+/// Anti-vacuity in both directions — a walk that silently returned nothing
+/// (a renamed directory, a manifest reformat that breaks the `members`
+/// scrape) would make the measurement below pass while measuring nothing,
+/// which is precisely the shape the guard this replaces failed in.
 #[test]
 fn every_test_unit_the_leak_check_would_run_is_enumerated_from_disk() {
     let units = enumerate_units();
