@@ -818,3 +818,106 @@ fn a_preview_stage_ends_however_the_fetch_ends() {
         assert_eq!(on_host::preview_stage(&ended), None, "{ended:?}");
     }
 }
+
+/// A backend whose make and start are the shell scripts a test names, its
+/// stop and remove `true`, each call appended to the file `calls`. Nothing
+/// else of it is used.
+struct Scripted {
+    create: &'static str,
+    start: &'static str,
+    calls: PathBuf,
+}
+
+impl Scripted {
+    fn sh(&self, call: &str, script: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", &format!("echo {call} >> \"$0\"; {script}")]).arg(&self.calls);
+        cmd
+    }
+}
+
+impl darkmux_sandbox::SandboxBackend for Scripted {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Seatbelt
+    }
+    fn place(&self, mount: &darkmux_sandbox::Mount) -> String {
+        mount.host.display().to_string()
+    }
+    fn run(&self, _: &darkmux_sandbox::SandboxPolicy) -> (std::process::Command, darkmux_sandbox::SandboxHandle) {
+        unreachable!("a preview is made, then started")
+    }
+    fn create(&self, policy: &darkmux_sandbox::SandboxPolicy) -> (std::process::Command, darkmux_sandbox::SandboxHandle) {
+        (self.sh("create", self.create), darkmux_sandbox::SandboxHandle { backend: self.kind(), id: policy.name.clone() })
+    }
+    fn start(&self, _: &darkmux_sandbox::SandboxHandle) -> std::process::Command {
+        self.sh("start", self.start)
+    }
+    fn stop(&self, _: &darkmux_sandbox::SandboxHandle, _: Duration) -> std::process::Command {
+        self.sh("stop", "true")
+    }
+    fn kill(&self, _: &darkmux_sandbox::SandboxHandle) -> std::process::Command {
+        unreachable!("a preview is stopped, then removed")
+    }
+    fn remove(&self, _: &darkmux_sandbox::SandboxHandle) -> std::process::Command {
+        self.sh("remove", "true")
+    }
+    fn list(&self, _: &darkmux_sandbox::Query) -> std::process::Command {
+        unreachable!("the reaper lists, not a preview")
+    }
+    fn parse_list(&self, _: &darkmux_sandbox::Query, _: &str) -> Vec<darkmux_sandbox::Listed> {
+        unreachable!("the reaper lists, not a preview")
+    }
+}
+
+/// A preview's spec, its ports two nothing listens on.
+fn a_spec_in(dir: &Path) -> ContainerSpec {
+    let free = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    ContainerSpec {
+        name: "darkmux-preview-t".into(),
+        backend: BackendKind::Seatbelt,
+        image: "seatbelt".into(),
+        workspace: dir.to_path_buf(),
+        heartbeat: dir.to_path_buf(),
+        ports: [free(), free()],
+        user: None,
+        labels: Vec::new(),
+        env: Vec::new(),
+        script: "true".into(),
+        read_only: Vec::new(),
+    }
+}
+
+/// (#3575 CRAP) A preview on the host is made, started (its output in its
+/// log) and removed by its backend's own commands, in that order, its
+/// ports kept from the make until the remove.
+#[test]
+fn an_on_host_preview_is_made_started_and_removed_by_its_backend() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend: &'static Scripted = Box::leak(Box::new(Scripted { create: "true", start: "echo served", calls: dir.path().join("calls") }));
+    let host = OnHost::with_backend(backend);
+    assert_eq!(host.kind(), BackendKind::Seatbelt);
+    let spec = a_spec_in(dir.path());
+    host.create(&spec).unwrap();
+    assert_eq!(host.ports.lock().unwrap().get(&spec.name), Some(&spec.ports));
+    let log = dir.path().join("preview.log");
+    host.start(&spec.name, &log).unwrap().wait().unwrap();
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "served\n");
+    host.remove(&spec.name);
+    assert!(host.ports.lock().unwrap().is_empty());
+    assert_eq!(std::fs::read_to_string(dir.path().join("calls")).unwrap(), "create\nstart\nstop\nremove\n");
+}
+
+/// A make that fails says what the backend said, and keeps no ports; a
+/// start whose log cannot be opened says so, starting nothing.
+#[test]
+fn an_on_host_preview_that_cannot_be_made_or_logged_says_why() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend: &'static Scripted = Box::leak(Box::new(Scripted { create: "echo refused >&2; exit 1", start: "true", calls: dir.path().join("calls") }));
+    let host = OnHost::with_backend(backend);
+    let spec = a_spec_in(dir.path());
+    assert_eq!(host.create(&spec).unwrap_err(), "making the preview's sandbox: refused");
+    assert!(host.ports.lock().unwrap().is_empty());
+    let log = dir.path().join("missing/preview.log");
+    assert!(host.start(&spec.name, &log).unwrap_err().starts_with(&format!("opening {}", log.display())));
+    assert_eq!(std::fs::read_to_string(dir.path().join("calls")).unwrap(), "create\n");
+}

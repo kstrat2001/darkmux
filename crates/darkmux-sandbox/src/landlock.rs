@@ -560,6 +560,49 @@ mod tests {
         assert!(confinement(Path::new("/s"), "mount /x\n").is_err());
     }
 
+    /// A rules line naming a port or a link it cannot read is refused,
+    /// naming the line; a port and the host's network read back.
+    #[test]
+    fn a_rule_it_cannot_read_is_refused_naming_it() {
+        let c = confinement(Path::new("/s"), "net host\nport 8080\n").unwrap();
+        assert!(c.host_network);
+        assert_eq!(c.bind_ports, [8080]);
+        assert_eq!(confinement(Path::new("/s"), "port http\n").unwrap_err(), "not a port: port http");
+        assert_eq!(confinement(Path::new("/s"), "link /bin\n").unwrap_err(), "not a link: link /bin");
+    }
+
+    /// A program's environment is the policy's, a PATH, a HOME and a
+    /// TMPDIR (the sandbox's own writable tmp) added only where it set none.
+    #[test]
+    fn the_environment_adds_path_home_and_tmpdir_only_where_unset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tmp = canonical(&dir.path().join("tmp")).to_string_lossy().into_owned();
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let mut p = policy(Vec::new(), Network::None);
+        assert_eq!(
+            LandlockBackend::environment(&p, dir.path()),
+            [pair("A", "1"), pair("PATH", DEFAULT_PATH), pair("HOME", &tmp), pair("TMPDIR", &tmp)]
+        );
+        p.env = vec![pair("PATH", "/mine"), pair("HOME", "/h")];
+        assert_eq!(LandlockBackend::environment(&p, dir.path()), [pair("PATH", "/mine"), pair("HOME", "/h"), pair("TMPDIR", &tmp)]);
+    }
+
+    /// The helper exits 125, saying why, when it cannot start a sandbox: no
+    /// directory, no rules in it, a line that is not a rule, or rules with
+    /// nothing to run (refused before anything is forked).
+    #[test]
+    fn the_helper_refuses_what_it_cannot_start() {
+        let refused = |args: &[OsString]| format!("{:?}", helper(args)) == format!("{:?}", std::process::ExitCode::from(125));
+        let dir = tempfile::TempDir::new().unwrap();
+        let at = || dir.path().as_os_str().to_owned();
+        assert!(refused(&[]));
+        assert!(refused(&[at()]), "no rules");
+        std::fs::write(dir.path().join("rules"), "mount /x\n").unwrap();
+        assert!(refused(&[at()]), "not a rule");
+        std::fs::write(dir.path().join("rules"), "net none\n").unwrap();
+        assert!(refused(&[at()]), "nothing to run");
+    }
+
     /// Arguments that do not ask for the helper return at once.
     #[test]
     fn other_arguments_do_not_start_the_helper() {
