@@ -212,11 +212,7 @@ impl Platform for MacPlatform {
     /// which answers for this user's processes), then each member's own open
     /// files (`PROC_PIDLISTFDS`, and `PROC_PIDFDSOCKETINFO` for each socket).
     fn tcp_listeners_held_by(&self, leader: u32) -> Option<Vec<(u16, crate::PortListener)>> {
-        let mut held = Vec::new();
-        for pid in crate::sandbox_members(leader, &process_table()?) {
-            held.extend(listeners_held_by_pid(pid)?);
-        }
-        Some(held)
+        crate::listeners_held_by_members(leader, process_table(), listeners_held_by_pid)
     }
 
     fn process_group(&self, pid: u32) -> Option<u32> {
