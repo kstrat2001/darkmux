@@ -24211,7 +24211,7 @@ fn an_on_host_inactivity_timeout_names_its_sandbox_not_a_container() {
             assert!(!text.contains("container") && !text.contains("docker"), "{text}");
         }
         assert!(confirmed.contains(&format!("{named} was ended by the watchdog")), "{confirmed}");
-        assert!(absent.contains(&format!("the watchdog found NO {named} to end")) && absent.contains("nothing was stopped"), "{absent}");
+        assert!(absent.contains(&format!("the watchdog did not find {named} to end")) && absent.contains("nothing was stopped"), "{absent}");
         assert!(!absent.to_lowercase().contains("still be running and holding"), "{absent}");
         assert!(unconfirmed.contains(&format!("COULD NOT CONFIRM {named} stopped")), "{unconfirmed}");
         assert!(unconfirmed.contains("may still be running and holding its model load"), "{unconfirmed}");
@@ -24235,7 +24235,7 @@ fn an_on_host_watchdog_give_up_names_its_sandbox_not_a_container() {
     for text in [&absent, &unconfirmed] {
         assert!(!text.contains("container") && !text.contains("docker"), "{text}");
     }
-    assert!(absent.contains(&format!("found NO {named} across 5 attempts — nothing was ended")), "{absent}");
+    assert!(absent.contains(&format!("did not find {named} across 5 attempts — nothing was ended")), "{absent}");
     assert!(unconfirmed.contains(&format!("could not confirm {named} stopped after 5 attempts")), "{unconfirmed}");
     assert!(unconfirmed.contains("may still be running and holding its model load") && unconfirmed.contains("Last error: it went wrong"), "{unconfirmed}");
     assert_eq!(KillOutcome::Confirmed { attempts: 1 }.warning(&landlock), None);

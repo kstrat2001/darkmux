@@ -5795,7 +5795,7 @@ impl KillOutcome {
         match self {
             KillOutcome::Confirmed { .. } => None,
             KillOutcome::Absent { attempts } => Some(format!(
-                "darkmux dispatch: ⚠ the inactivity watchdog found NO {named} across {attempts} \
+                "darkmux dispatch: ⚠ the inactivity watchdog did not find {named} across {attempts} \
                  attempts — nothing was ended. It may not have started yet, or have ended as the \
                  deadline fired, so the watchdog re-arms for a full budget and keeps watching it. \
                  (#2232, #2252)"
@@ -6116,7 +6116,7 @@ fn on_host_kill_disposition(sandbox: &darkmux_sandbox::SandboxHandle, kill: Kill
     match kill {
         KillDisposition::Confirmed => format!("{named} was ended by the watchdog"),
         KillDisposition::Absent => format!(
-            "the watchdog found NO {named} to end across {CONTAINER_KILL_MAX_ATTEMPTS} attempts — nothing was stopped"
+            "the watchdog did not find {named} to end across {CONTAINER_KILL_MAX_ATTEMPTS} attempts — nothing was stopped"
         ),
         KillDisposition::Unconfirmed => format!(
             "the watchdog COULD NOT CONFIRM {named} stopped after {CONTAINER_KILL_MAX_ATTEMPTS} attempts — it may \
