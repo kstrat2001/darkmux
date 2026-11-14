@@ -300,28 +300,41 @@ mod imp {
         std::fs::write(path, text).map_err(|e| Error::new(e.kind(), format!("writing {path}: {e}")))
     }
 
+    /// The namespaces a sandbox gets: user, mount and pid, and a network
+    /// of its own unless it shares the host's.
+    fn namespace_flags(host_network: bool) -> libc::c_int {
+        let flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID;
+        if host_network {
+            flags
+        } else {
+            flags | libc::CLONE_NEWNET
+        }
+    }
+
+    /// `uid_map`'s and `gid_map`'s text mapping this user and group to
+    /// themselves.
+    fn self_maps(uid: libc::uid_t, gid: libc::gid_t) -> (String, String) {
+        (format!("{uid} {uid} 1"), format!("{gid} {gid} 1"))
+    }
+
     /// Make the user, mount and pid namespaces (and the network one, unless
     /// shared) and map this user and group to themselves in them.
     fn unshare(host_network: bool) -> Result<(), Error> {
         // SAFETY: plain syscalls on this process.
-        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-        let mut flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID;
-        if !host_network {
-            flags |= libc::CLONE_NEWNET;
-        }
-        check(unsafe { libc::unshare(flags) } as libc::c_long, "unshare")?;
-        write_file("/proc/self/setgroups", "deny")?;
-        write_file("/proc/self/uid_map", &format!("{uid} {uid} 1"))?;
-        write_file("/proc/self/gid_map", &format!("{gid} {gid} 1"))
+        let (uid_map, gid_map) = unsafe { self_maps(libc::getuid(), libc::getgid()) };
+        check(unsafe { libc::unshare(namespace_flags(host_network)) } as libc::c_long, "unshare")
+            .and_then(|()| write_file("/proc/self/setgroups", "deny"))
+            .and_then(|()| write_file("/proc/self/uid_map", &uid_map))
+            .and_then(|()| write_file("/proc/self/gid_map", &gid_map))
     }
 
     pub fn support() -> ConfineSupport {
         // SAFETY: getuid and getgid take nothing.
-        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let (uid_map, gid_map) = unsafe { self_maps(libc::getuid(), libc::getgid()) };
         // Everything the probe writes is made before it forks: after the
         // fork only async-signal-safe calls run.
-        let uid_map = CString::new(format!("{uid} {uid} 1")).unwrap();
-        let gid_map = CString::new(format!("{gid} {gid} 1")).unwrap();
+        let uid_map = CString::new(uid_map).unwrap();
+        let gid_map = CString::new(gid_map).unwrap();
         // SAFETY: the probe's children call only async-signal-safe functions.
         let probed = unsafe { probe(&uid_map, &gid_map) };
         ConfineSupport {
@@ -338,15 +351,29 @@ mod imp {
     const PROBE_NO_NAMESPACES: i32 = 1;
     const PROBE_NO_ROOT: i32 = 2;
 
+    /// Fork, the child running `child` and exiting with what it returns:
+    /// the child's pid, or a negative value when the fork failed. Nothing
+    /// here allocates, so `child` may be a forked child's async-signal-safe
+    /// code.
+    unsafe fn forked(child: impl FnOnce() -> i32) -> libc::pid_t {
+        let pid = libc::fork();
+        if pid == 0 {
+            libc::_exit(child());
+        }
+        pid
+    }
+
+    /// [`forked`], a failed fork an error.
+    unsafe fn fork_checked(child: impl FnOnce() -> i32) -> Result<libc::pid_t, Error> {
+        let pid = forked(child);
+        check(pid as libc::c_long, "fork").map(|()| pid)
+    }
+
     /// Try what [`enter`] needs in a short-lived child: the namespaces, then,
     /// as pid 1 of the new pid namespace, what `build_root` does. Returns 0
     /// when all of it worked.
     unsafe fn probe(uid_map: &std::ffi::CStr, gid_map: &std::ffi::CStr) -> i32 {
-        let child = libc::fork();
-        if child == 0 {
-            libc::_exit(probe_namespaces(uid_map, gid_map));
-        }
-        exit_of(child).unwrap_or(PROBE_NO_NAMESPACES)
+        exit_of(forked(|| probe_namespaces(uid_map, gid_map))).unwrap_or(PROBE_NO_NAMESPACES)
     }
 
     /// A child's exit code, when it exited.
@@ -356,34 +383,63 @@ mod imp {
     }
 
     unsafe fn probe_namespaces(uid_map: &std::ffi::CStr, gid_map: &std::ffi::CStr) -> i32 {
-        if !make_namespaces(uid_map, gid_map) {
-            return PROBE_NO_NAMESPACES;
+        probe_status(make_namespaces(uid_map, gid_map), || exit_of(forked(|| probe_root_status())))
+    }
+
+    /// The probe's exit: [`PROBE_NO_NAMESPACES`] when the namespaces were
+    /// not made, else 0 when `root` (a child building a root in them, asked
+    /// only then) exited 0, else [`PROBE_NO_ROOT`].
+    fn probe_status(namespaces: bool, root: impl FnOnce() -> Option<i32>) -> i32 {
+        if !namespaces {
+            PROBE_NO_NAMESPACES
+        } else if root() == Some(0) {
+            0
+        } else {
+            PROBE_NO_ROOT
         }
-        let init = libc::fork();
-        if init == 0 {
-            libc::_exit(if probe_root() { 0 } else { PROBE_NO_ROOT });
+    }
+
+    unsafe fn probe_root_status() -> i32 {
+        if probe_root() {
+            0
+        } else {
+            PROBE_NO_ROOT
         }
-        match exit_of(init) {
-            Some(0) => 0,
-            _ => PROBE_NO_ROOT,
-        }
+    }
+
+    /// Whether every step succeeded, run in order and stopping at the first
+    /// that fails (each one async-signal-safe, as the probe's are).
+    fn in_order(steps: &[&dyn Fn() -> bool]) -> bool {
+        steps.iter().all(|step| step())
     }
 
     /// What [`unshare`] does, in async-signal-safe calls: the namespaces,
     /// this user mapped to itself, and mounts private to them.
     unsafe fn make_namespaces(uid_map: &std::ffi::CStr, gid_map: &std::ffi::CStr) -> bool {
-        libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWNET) == 0
-            && map_to_self(uid_map, gid_map)
-            && libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) == 0
+        in_order(&[
+            &|| libc::unshare(namespace_flags(false)) == 0,
+            &|| map_to_self(uid_map, gid_map),
+            &|| libc::mount(std::ptr::null(), ROOT.as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) == 0,
+        ])
     }
+
+    const ROOT: &std::ffi::CStr = c"/";
+    const SETGROUPS: &std::ffi::CStr = c"/proc/self/setgroups";
+    const DENY: &std::ffi::CStr = c"deny";
+    const UID_MAP: &std::ffi::CStr = c"/proc/self/uid_map";
+    const GID_MAP: &std::ffi::CStr = c"/proc/self/gid_map";
 
     /// This user and group mapped to themselves in the new user namespace.
     unsafe fn map_to_self(uid_map: &std::ffi::CStr, gid_map: &std::ffi::CStr) -> bool {
-        let write = |path: &std::ffi::CStr, text: &std::ffi::CStr| {
-            let fd = libc::open(path.as_ptr(), libc::O_WRONLY);
-            fd >= 0 && libc::write(fd, text.as_ptr().cast(), text.to_bytes().len()) >= 0
-        };
-        write(c"/proc/self/setgroups", c"deny") && write(c"/proc/self/uid_map", uid_map) && write(c"/proc/self/gid_map", gid_map)
+        [(SETGROUPS, DENY), (UID_MAP, uid_map), (GID_MAP, gid_map)]
+            .iter()
+            .all(|(path, text)| write_text(path, text))
+    }
+
+    /// `text` written to the file at `path`, in async-signal-safe calls.
+    unsafe fn write_text(path: &std::ffi::CStr, text: &std::ffi::CStr) -> bool {
+        let fd = libc::open(path.as_ptr(), libc::O_WRONLY);
+        fd >= 0 && libc::write(fd, text.as_ptr().cast(), text.to_bytes().len()) >= 0
     }
 
     /// What `build_root` needs, on a tmpfs over `/tmp` that only this mount
@@ -391,12 +447,14 @@ mod imp {
     /// `mount_setattr` and `pivot_root`.
     unsafe fn probe_root() -> bool {
         let read_only = MountAttr { attr_set: libc::MOUNT_ATTR_RDONLY, attr_clr: 0, propagation: 0, userns_fd: 0 };
-        libc::mount(c"none".as_ptr(), c"/tmp".as_ptr(), c"tmpfs".as_ptr(), libc::MS_NOSUID | libc::MS_NODEV, c"mode=0755,size=64k".as_ptr().cast()) == 0
-            && libc::mkdir(c"/tmp/proc".as_ptr(), 0o755) == 0
-            && libc::mount(c"proc".as_ptr(), c"/tmp/proc".as_ptr(), c"proc".as_ptr(), libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, std::ptr::null()) == 0
-            && libc::syscall(libc::SYS_mount_setattr, libc::AT_FDCWD, c"/tmp".as_ptr(), 0, &read_only, std::mem::size_of::<MountAttr>()) == 0
-            && libc::chdir(c"/tmp".as_ptr()) == 0
-            && libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c".".as_ptr()) == 0
+        in_order(&[
+            &|| libc::mount(c"none".as_ptr(), c"/tmp".as_ptr(), c"tmpfs".as_ptr(), libc::MS_NOSUID | libc::MS_NODEV, c"mode=0755,size=64k".as_ptr().cast()) == 0,
+            &|| libc::mkdir(c"/tmp/proc".as_ptr(), 0o755) == 0,
+            &|| libc::mount(c"proc".as_ptr(), c"/tmp/proc".as_ptr(), c"proc".as_ptr(), libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, std::ptr::null()) == 0,
+            &|| libc::syscall(libc::SYS_mount_setattr, libc::AT_FDCWD, c"/tmp".as_ptr(), 0, &read_only, std::mem::size_of::<MountAttr>()) == 0,
+            &|| libc::chdir(c"/tmp".as_ptr()) == 0,
+            &|| libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c".".as_ptr()) == 0,
+        ])
     }
 
     extern "C" fn ignore(_: libc::c_int) {}
@@ -404,15 +462,23 @@ mod imp {
     /// Reap children until `pid` exits, and the status to exit with as it
     /// did. Any other child reaped on the way (as pid 1 must) is dropped.
     fn wait_code(pid: libc::pid_t) -> i32 {
+        reaped_code(pid, |status| {
+            // SAFETY: waiting on our own children.
+            let r = unsafe { libc::waitpid(-1, status, 0) };
+            (r >= 0).then_some(r).ok_or_else(|| Error::last_os_error().raw_os_error())
+        })
+    }
+
+    /// [`wait_code`] with its reaping given: `reap` fills a wait status and
+    /// returns the child it reaped, or the errno it failed with. A failure
+    /// other than EINTR ends the wait with status 1.
+    fn reaped_code(pid: libc::pid_t, mut reap: impl FnMut(&mut i32) -> Result<libc::pid_t, Option<i32>>) -> i32 {
         let mut status = 0;
         loop {
-            // SAFETY: waiting on our own children.
-            let r = unsafe { libc::waitpid(-1, &mut status, 0) };
-            if r == pid {
-                break;
-            }
-            if r < 0 && Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                return 1;
+            match reap(&mut status) {
+                Ok(r) if r == pid => break,
+                Err(errno) if errno != Some(libc::EINTR) => return 1,
+                _ => {}
             }
         }
         let exited = libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status));
@@ -421,35 +487,48 @@ mod imp {
     }
 
     pub fn enter(c: &Confinement, argv: &[OsString]) -> Error {
-        match run(c, argv) {
-            Ok(never) => match never {},
-            Err(e) => e,
-        }
+        let Err(e) = run(c, argv);
+        e
     }
 
     fn run(c: &Confinement, argv: &[OsString]) -> Result<std::convert::Infallible, Error> {
-        let abi = landlock_abi().filter(|a| *a >= super::LANDLOCK_ABI_NEEDED).ok_or_else(|| Error::other("Landlock ABI 6 or later is needed"))?;
+        let (abi, argv) = ready(landlock_abi(), argv)?;
+        ends_with_its_parent().and_then(|()| unshare(c.host_network)).and_then(|()| become_init(c, abi, &argv))
+    }
+
+    /// The Landlock ABI to confine with and the program's argv as C strings,
+    /// or why it cannot start: an ABI older than needed, an argument that
+    /// holds a NUL, or no program at all.
+    fn ready(abi: Option<u32>, argv: &[OsString]) -> Result<(u32, Vec<CString>), Error> {
+        let abi = abi.filter(|a| *a >= super::LANDLOCK_ABI_NEEDED).ok_or_else(|| Error::other("Landlock ABI 6 or later is needed"))?;
         let argv: Vec<CString> = argv.iter().map(|a| CString::new(a.as_bytes())).collect::<Result<_, _>>().map_err(|_| Error::other("an argument holds a NUL"))?;
         if argv.is_empty() {
             return Err(Error::other("no program to run"));
         }
-        ends_with_its_parent()?;
-        unshare(c.host_network)?;
+        Ok((abi, argv))
+    }
+
+    /// Start the sandbox's init, pid 1 of the new pid namespace, and exit as
+    /// it does. The stop signals are ignored here: the init passes them on.
+    fn become_init(c: &Confinement, abi: u32, argv: &[CString]) -> Result<std::convert::Infallible, Error> {
         // SAFETY: this process is single-threaded (the caller's contract), so
-        // the children may allocate; each exits through _exit or exec.
+        // the child may allocate; it exits through _exit.
         unsafe {
-            for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-                libc::signal(sig, ignore as *const () as libc::sighandler_t);
-            }
-            let init = libc::fork();
-            check(init as libc::c_long, "fork")?;
-            if init == 0 {
+            set_handlers(&STOP_SIGNALS, ignore as *const () as libc::sighandler_t);
+            fork_checked(|| {
                 // Ends with this process. (Its parent is outside its pid
                 // namespace, so `getppid` reads 0 and cannot check this.)
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-                libc::_exit(as_init(c, abi, &argv));
-            }
-            std::process::exit(wait_code(init))
+                as_init(c, abi, argv)
+            })
+        }
+        .map(|init| std::process::exit(wait_code(init)))
+    }
+
+    /// `handler` for each of `signals`.
+    unsafe fn set_handlers(signals: &[libc::c_int], handler: libc::sighandler_t) {
+        for sig in signals {
+            libc::signal(*sig, handler);
         }
     }
 
@@ -460,51 +539,68 @@ mod imp {
     fn ends_with_its_parent() -> Result<(), Error> {
         // SAFETY: getppid and prctl take no pointers.
         let parent = unsafe { libc::getppid() };
-        check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } as libc::c_long, "prctl")?;
+        check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } as libc::c_long, "prctl").map(|()| exit_if_orphaned(parent))
+    }
+
+    /// Exit 137 now when this process's parent is no longer `parent`.
+    fn exit_if_orphaned(parent: libc::pid_t) {
+        // SAFETY: getppid takes nothing.
         if unsafe { libc::getppid() } != parent {
             std::process::exit(137);
         }
-        Ok(())
+    }
+
+    /// What a step of starting the sandbox that failed prints, and the
+    /// status the sandbox exits with for it.
+    fn failed(e: Error) -> i32 {
+        eprintln!("landlock: {e}");
+        125
     }
 
     /// Pid 1 of the sandbox: build its root, start the program, reap until
     /// the program exits, and exit as it did.
     fn as_init(c: &Confinement, abi: u32, argv: &[CString]) -> i32 {
-        if let Err(e) = build_root(c) {
-            eprintln!("landlock: building the sandbox's root: {e}");
-            return 125;
+        build_root(c)
+            .map_err(|e| Error::new(e.kind(), format!("building the sandbox's root: {e}")))
+            .and_then(|()| own_loopback_up(c))
+            // SAFETY: still single-threaded; the child execs or _exits.
+            .and_then(|()| unsafe { start_program(c, abi, argv) })
+            .unwrap_or_else(failed)
+    }
+
+    /// A network of the sandbox's own has its loopback brought up; the
+    /// host's is left as it is.
+    fn own_loopback_up(c: &Confinement) -> Result<(), Error> {
+        if c.host_network {
+            Ok(())
+        } else {
+            loopback_up()
         }
-        if !c.host_network {
-            if let Err(e) = loopback_up() {
-                eprintln!("landlock: {e}");
-                return 125;
-            }
-        }
-        // SAFETY: still single-threaded; the child execs or _exits. The
-        // stop signals are blocked across the fork, so one that arrives
-        // before the program's pid is known is passed on once it is.
-        unsafe {
-            let mut stops: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut stops);
-            for sig in STOP_SIGNALS {
-                libc::sigaddset(&mut stops, sig);
-            }
-            let mut before: libc::sigset_t = std::mem::zeroed();
-            libc::sigprocmask(libc::SIG_BLOCK, &stops, &mut before);
-            let program = libc::fork();
-            if program < 0 {
-                return 125;
-            }
-            if program == 0 {
-                libc::_exit(as_program(c, abi, argv));
-            }
+    }
+
+    /// Fork the program and wait for it, as the init. The stop signals are
+    /// blocked across the fork, so one that arrives before the program's pid
+    /// is known is passed on once it is.
+    unsafe fn start_program(c: &Confinement, abi: u32, argv: &[CString]) -> Result<i32, Error> {
+        let before = block(&STOP_SIGNALS);
+        fork_checked(|| as_program(c, abi, argv)).map(|program| {
             PROGRAM.store(program, std::sync::atomic::Ordering::SeqCst);
-            for sig in STOP_SIGNALS {
-                libc::signal(sig, pass_on as *const () as libc::sighandler_t);
-            }
+            set_handlers(&STOP_SIGNALS, pass_on as *const () as libc::sighandler_t);
             libc::sigprocmask(libc::SIG_SETMASK, &before, std::ptr::null_mut());
             wait_code(program)
+        })
+    }
+
+    /// Block `signals`, returning the mask before.
+    unsafe fn block(signals: &[libc::c_int]) -> libc::sigset_t {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in signals {
+            libc::sigaddset(&mut set, *sig);
         }
+        let mut before: libc::sigset_t = std::mem::zeroed();
+        libc::sigprocmask(libc::SIG_BLOCK, &set, &mut before);
+        before
     }
 
     /// The signals a stop sends the sandbox's process group, which the init
@@ -519,9 +615,17 @@ mod imp {
     /// through here; to the program alone while its session is not made yet.
     extern "C" fn pass_on(sig: libc::c_int) {
         let program = PROGRAM.load(std::sync::atomic::Ordering::SeqCst);
+        if program > 0 {
+            signal_group_or_process(program, sig);
+        }
+    }
+
+    /// `sig` to the process group `pid` leads, or to `pid` alone when it
+    /// leads none (yet). Async-signal-safe.
+    fn signal_group_or_process(pid: libc::pid_t, sig: libc::c_int) {
         // SAFETY: kill is async-signal-safe.
-        if program > 0 && unsafe { libc::kill(-program, sig) } != 0 {
-            unsafe { libc::kill(program, sig) };
+        if unsafe { libc::kill(-pid, sig) } != 0 {
+            unsafe { libc::kill(pid, sig) };
         }
     }
 
@@ -531,33 +635,41 @@ mod imp {
     /// it cannot.
     fn as_program(c: &Confinement, abi: u32, argv: &[CString]) -> i32 {
         // SAFETY: setsid takes nothing.
-        if unsafe { libc::setsid() } < 0 {
-            eprintln!("landlock: a session of its own: {}", Error::last_os_error());
-            return 125;
-        }
-        if let Some(dir) = &c.workdir {
-            if let Err(e) = std::env::set_current_dir(dir) {
-                eprintln!("landlock: working directory {}: {e}", dir.display());
-                return 125;
-            }
-        }
-        // SAFETY: a flag on this process.
-        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-            eprintln!("landlock: no_new_privs: {}", Error::last_os_error());
-            return 125;
-        }
-        if let Err(e) = restrict(c, abi).and_then(|()| filter_syscalls()) {
-            eprintln!("landlock: {e}");
-            return 125;
-        }
-        signals_at_default();
+        check(unsafe { libc::setsid() } as libc::c_long, "a session of its own")
+            .and_then(|()| into_workdir(c))
+            // SAFETY: a flag on this process.
+            .and_then(|()| check(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } as libc::c_long, "no_new_privs"))
+            .and_then(|()| restrict(c, abi))
+            .and_then(|()| filter_syscalls())
+            .map(|()| {
+                signals_at_default();
+                exec(argv)
+            })
+            .unwrap_or_else(failed)
+    }
+
+    /// Into the sandbox's working directory, when it has one.
+    fn into_workdir(c: &Confinement) -> Result<(), Error> {
+        c.workdir.as_ref().map_or(Ok(()), |dir| {
+            std::env::set_current_dir(dir).map_err(|e| Error::new(e.kind(), format!("working directory {}: {e}", dir.display())))
+        })
+    }
+
+    /// Exec `argv`; returns only the status to exit with when it cannot.
+    fn exec(argv: &[CString]) -> i32 {
         let mut ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
         ptrs.push(std::ptr::null());
         // SAFETY: a NUL-terminated argv of live CStrings.
         unsafe { libc::execvp(ptrs[0], ptrs.as_ptr()) };
         let e = Error::last_os_error();
         eprintln!("landlock: {}: {e}", argv[0].to_string_lossy());
-        if e.raw_os_error() == Some(libc::ENOENT) {
+        exec_failed(e.raw_os_error())
+    }
+
+    /// The status for an exec that failed, as a shell's: 127 when the
+    /// program was not found, else 126.
+    fn exec_failed(errno: Option<i32>) -> i32 {
+        if errno == Some(libc::ENOENT) {
             127
         } else {
             126
@@ -665,26 +777,50 @@ mod imp {
         root.join(path.components().filter(|c| matches!(c, Component::Normal(_))).collect::<PathBuf>())
     }
 
+    /// mount(2)'s strings, each NUL-terminated, or absent.
+    struct MountArgs {
+        source: Option<CString>,
+        target: CString,
+        fstype: Option<CString>,
+        data: Option<CString>,
+    }
+
+    fn mount_args(source: Option<&Path>, target: &Path, fstype: Option<&str>, data: Option<&str>) -> Result<MountArgs, Error> {
+        Ok(MountArgs {
+            source: source.map(cstr).transpose()?,
+            target: cstr(target)?,
+            fstype: fstype.map(|f| CString::new(f).unwrap()),
+            data: data.map(|d| CString::new(d).unwrap()),
+        })
+    }
+
     fn mount(source: Option<&Path>, target: &Path, fstype: Option<&str>, flags: libc::c_ulong, data: Option<&str>) -> Result<(), Error> {
-        let source = source.map(cstr).transpose()?;
-        let target_c = cstr(target)?;
-        let fstype = fstype.map(|f| CString::new(f).unwrap());
-        let data = data.map(|d| CString::new(d).unwrap());
         let ptr = |c: &Option<CString>| c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
-        // SAFETY: NUL-terminated strings or null, as mount(2) takes them.
-        let rc = unsafe { libc::mount(ptr(&source), target_c.as_ptr(), ptr(&fstype), flags, ptr(&data).cast()) };
-        check(rc as libc::c_long, &format!("mounting on {}", target.display()))
+        mount_args(source, target, fstype, data).and_then(|a| {
+            // SAFETY: NUL-terminated strings or null, as mount(2) takes them.
+            let rc = unsafe { libc::mount(ptr(&a.source), a.target.as_ptr(), ptr(&a.fstype), flags, ptr(&a.data).cast()) };
+            check(rc as libc::c_long, &format!("mounting on {}", target.display()))
+        })
+    }
+
+    /// `mount_setattr`'s flags: every mount beneath too, with `recursive`.
+    fn attr_flags(recursive: bool) -> libc::c_uint {
+        if recursive {
+            libc::AT_RECURSIVE as libc::c_uint
+        } else {
+            0
+        }
     }
 
     /// Set `attrs` on the mount at `target` and, with `recursive`, every
     /// mount beneath it.
     fn set_attrs(target: &Path, attrs: u64, recursive: bool) -> Result<(), Error> {
-        let target_c = cstr(target)?;
         let attr = MountAttr { attr_set: attrs, attr_clr: 0, propagation: 0, userns_fd: 0 };
-        let flags = if recursive { libc::AT_RECURSIVE as libc::c_uint } else { 0 };
-        // SAFETY: a live mount_attr of its declared size.
-        let rc = unsafe { libc::syscall(libc::SYS_mount_setattr, libc::AT_FDCWD, target_c.as_ptr(), flags, &attr, std::mem::size_of::<MountAttr>()) };
-        check(rc, &format!("setting {} read-only or nosuid", target.display()))
+        cstr(target).and_then(|target_c| {
+            // SAFETY: a live mount_attr of its declared size.
+            let rc = unsafe { libc::syscall(libc::SYS_mount_setattr, libc::AT_FDCWD, target_c.as_ptr(), attr_flags(recursive), &attr, std::mem::size_of::<MountAttr>()) };
+            check(rc, &format!("setting {} read-only or nosuid", target.display()))
+        })
     }
 
     /// An empty directory or file at `target` to bind `source` over, of the
@@ -704,135 +840,182 @@ mod imp {
     }
 
     fn bind(source: &Path, target: &Path, attrs: u64) -> Result<(), Error> {
-        mount_point(source, target)?;
-        mount(Some(source), target, None, libc::MS_BIND | libc::MS_REC, None)?;
-        set_attrs(target, attrs, true)
+        mount_point(source, target)
+            .and_then(|()| mount(Some(source), target, None, libc::MS_BIND | libc::MS_REC, None))
+            .and_then(|()| set_attrs(target, attrs, true))
     }
 
     /// The sandbox's root: a tmpfs holding the granted paths, devices and a
     /// fresh `/proc`, read-only, pivoted into.
     fn build_root(c: &Confinement) -> Result<(), Error> {
         let root = &c.root;
-        mount(None, Path::new("/"), None, libc::MS_REC | libc::MS_PRIVATE, None)?;
-        mount(None, root, Some("tmpfs"), libc::MS_NOSUID | libc::MS_NODEV, Some("mode=0755,size=4m"))?;
-        grant_paths(c)?;
-        kernel_trees(root)?;
-        set_attrs(root, libc::MOUNT_ATTR_RDONLY | libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV, false)?;
-        pivot_into(root)
+        mount(None, Path::new("/"), None, libc::MS_REC | libc::MS_PRIVATE, None)
+            .and_then(|()| mount(None, root, Some("tmpfs"), libc::MS_NOSUID | libc::MS_NODEV, Some("mode=0755,size=4m")))
+            .and_then(|()| grant_paths(c))
+            .and_then(|()| kernel_trees(root))
+            .and_then(|()| set_attrs(root, libc::MOUNT_ATTR_RDONLY | libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV, false))
+            .and_then(|()| pivot_into(root))
     }
 
-    /// The granted links, paths and devices, each at its own path in `root`.
-    fn grant_paths(c: &Confinement) -> Result<(), Error> {
-        let root = &c.root;
-        for (path, target) in &c.links {
-            std::os::unix::fs::symlink(target, under(root, path))?;
-        }
-        for Bind { path, writable } in &c.binds {
+    /// Each granted path and device, where it is bound in the root, and the
+    /// mount attributes it gets there: the paths in order (read-only unless
+    /// writable), then the devices.
+    fn root_binds(c: &Confinement) -> Vec<(&Path, PathBuf, u64)> {
+        let paths = c.binds.iter().map(|Bind { path, writable }| {
             let ro = if *writable { 0 } else { libc::MOUNT_ATTR_RDONLY };
-            bind(path, &under(root, path), libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV | ro)?;
-        }
-        for device in &c.devices {
-            bind(device, &under(root, device), libc::MOUNT_ATTR_NOSUID)?;
-        }
-        Ok(())
+            (path.as_path(), under(&c.root, path), libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV | ro)
+        });
+        let devices = c.devices.iter().map(|device| (device.as_path(), under(&c.root, device), libc::MOUNT_ATTR_NOSUID));
+        paths.chain(devices).collect()
     }
+
+    /// The granted links, paths and devices, each at its own path in the root.
+    fn grant_paths(c: &Confinement) -> Result<(), Error> {
+        c.links
+            .iter()
+            .try_for_each(|(path, target)| std::os::unix::fs::symlink(target, under(&c.root, path)))
+            .and_then(|()| root_binds(c).into_iter().try_for_each(|(source, target, attrs)| bind(source, &target, attrs)))
+    }
+
+    /// `/dev`'s standard links, as name and target.
+    const DEV_LINKS: [(&str, &str); 4] = [("fd", "/proc/self/fd"), ("stdin", "/proc/self/fd/0"), ("stdout", "/proc/self/fd/1"), ("stderr", "/proc/self/fd/2")];
 
     /// `/dev`'s standard links, an empty `/tmp` and a fresh `/proc`.
     fn kernel_trees(root: &Path) -> Result<(), Error> {
-        let dev = root.join("dev");
-        std::fs::create_dir_all(&dev)?;
-        for (name, target) in [("fd", "/proc/self/fd"), ("stdin", "/proc/self/fd/0"), ("stdout", "/proc/self/fd/1"), ("stderr", "/proc/self/fd/2")] {
-            std::os::unix::fs::symlink(target, dev.join(name))?;
-        }
-        std::fs::create_dir_all(root.join("tmp"))?;
-        let proc = root.join("proc");
-        std::fs::create_dir_all(&proc)?;
-        mount(Some(Path::new("proc")), &proc, Some("proc"), libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, None)
+        let (dev, proc) = (root.join("dev"), root.join("proc"));
+        std::fs::create_dir_all(&dev)
+            .and_then(|()| DEV_LINKS.iter().try_for_each(|(name, target)| std::os::unix::fs::symlink(target, dev.join(name))))
+            .and_then(|()| std::fs::create_dir_all(root.join("tmp")))
+            .and_then(|()| std::fs::create_dir_all(&proc))
+            .and_then(|()| mount(Some(Path::new("proc")), &proc, Some("proc"), libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, None))
     }
 
     /// Make `root` this process's `/`, the old root detached.
     fn pivot_into(root: &Path) -> Result<(), Error> {
-        std::env::set_current_dir(root)?;
         let dot = c".";
         // SAFETY: pivot_root(".", ".") stacks the old root over the new one,
         // and the detach drops it, as pivot_root(2) describes.
-        unsafe {
-            check(libc::syscall(libc::SYS_pivot_root, dot.as_ptr(), dot.as_ptr()), "pivot_root")?;
-            check(libc::umount2(dot.as_ptr(), libc::MNT_DETACH) as libc::c_long, "detaching the old root")?;
+        std::env::set_current_dir(root)
+            .and_then(|()| check(unsafe { libc::syscall(libc::SYS_pivot_root, dot.as_ptr(), dot.as_ptr()) }, "pivot_root"))
+            .and_then(|()| check(unsafe { libc::umount2(dot.as_ptr(), libc::MNT_DETACH) } as libc::c_long, "detaching the old root"))
+            .and_then(|()| std::env::set_current_dir("/"))
+    }
+
+    /// An `ifreq` naming the interface `name`.
+    fn ifreq_named(name: &[u8]) -> libc::ifreq {
+        // SAFETY: an all-zero ifreq is a valid one.
+        let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+        for (slot, b) in req.ifr_name.iter_mut().zip(name) {
+            *slot = *b as libc::c_char;
         }
-        std::env::set_current_dir("/")
+        req
     }
 
     /// Bring the new network namespace's loopback up, as a container's is.
     fn loopback_up() -> Result<(), Error> {
-        // SAFETY: an ioctl on a socket this function owns, with a zeroed ifreq.
-        unsafe {
-            let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
-            check(fd as libc::c_long, "a socket for the loopback")?;
-            let mut req: libc::ifreq = std::mem::zeroed();
-            for (i, b) in b"lo".iter().enumerate() {
-                req.ifr_name[i] = *b as libc::c_char;
-            }
-            let got = libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut req);
-            req.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
-            let set = if got == 0 { libc::ioctl(fd, libc::SIOCSIFFLAGS, &req) } else { got };
-            let e = Error::last_os_error();
-            libc::close(fd);
-            if set != 0 {
-                return Err(Error::new(e.kind(), format!("bringing the loopback up: {e}")));
-            }
-        }
-        Ok(())
-    }
-
-    /// Restrict this process with Landlock: every right this ABI handles is
-    /// denied but on the granted paths, TCP binds (on the host's network)
-    /// but on the granted ports, and signals and abstract unix sockets stay
-    /// inside the sandbox.
-    fn restrict(c: &Confinement, abi: u32) -> Result<(), Error> {
-        let handled = fs_rights(abi);
-        let attr = RulesetAttr {
-            handled_access_fs: handled,
-            handled_access_net: if c.host_network { NET_BIND_TCP } else { 0 },
-            scoped: SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL,
-        };
-        // SAFETY: a live attr of its declared size.
-        let fd = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, &attr, std::mem::size_of::<RulesetAttr>(), 0u32) };
-        check(fd, "creating the Landlock ruleset")?;
-        let fd = fd as libc::c_int;
-        let mut grants: Vec<(&Path, u64)> = vec![(Path::new("/"), FS_READ_DIR), (Path::new("/proc"), FS_READ_FILE | FS_READ_DIR)];
-        grants.extend(c.binds.iter().map(|b| (b.path.as_path(), if b.writable { handled } else { READ })));
-        grants.extend(c.devices.iter().map(|d| (d.as_path(), FS_READ_FILE | FS_WRITE_FILE | FS_IOCTL_DEV)));
-        let result = (|| {
-            for (path, rights) in grants {
-                add_path_rule(fd, path, rights & handled)?;
-            }
-            if c.host_network {
-                for port in &c.bind_ports {
-                    let rule = NetPort { allowed_access: NET_BIND_TCP, port: u64::from(*port) };
-                    // SAFETY: a live rule of the type named.
-                    check(unsafe { libc::syscall(libc::SYS_landlock_add_rule, fd, RULE_NET_PORT, &rule, 0u32) }, &format!("granting port {port}"))?;
-                }
-            }
-            // SAFETY: a ruleset fd this function made.
-            check(unsafe { libc::syscall(libc::SYS_landlock_restrict_self, fd, 0u32) }, "applying the Landlock ruleset")
-        })();
-        // SAFETY: closing the fd made above.
+        // SAFETY: a socket this function owns, closed below.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        check(fd as libc::c_long, "a socket for the loopback")?;
+        let result = interface_up(fd, ifreq_named(b"lo"));
+        // SAFETY: closing the socket made above.
         unsafe { libc::close(fd) };
         result
     }
 
+    /// The UP flag set on the interface `req` names, through the socket `fd`.
+    fn interface_up(fd: libc::c_int, mut req: libc::ifreq) -> Result<(), Error> {
+        // SAFETY: ioctls on a live socket with a live ifreq, its flags the
+        // union member SIOCGIFFLAGS filled.
+        check(unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut req) } as libc::c_long, "bringing the loopback up").and_then(|()| {
+            unsafe { req.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short };
+            check(unsafe { libc::ioctl(fd, libc::SIOCSIFFLAGS, &req) } as libc::c_long, "bringing the loopback up")
+        })
+    }
+
+    /// What [`restrict`] asks of Landlock: the rights it handles, and each
+    /// path's and port's grant.
+    struct Ruleset {
+        attr: RulesetAttr,
+        paths: Vec<(PathBuf, u64)>,
+        ports: Vec<u16>,
+    }
+
+    /// Every right this ABI handles is denied but on the granted paths (the
+    /// root's listing and `/proc` read, a writable bind's every right, a
+    /// read-only one's read and execute, a device's read and write), TCP
+    /// binds (on the host's network) but on the granted ports, and signals
+    /// and abstract unix sockets stay inside the sandbox.
+    fn ruleset(c: &Confinement, abi: u32) -> Ruleset {
+        let handled = fs_rights(abi);
+        let paths = [(PathBuf::from("/"), FS_READ_DIR), (PathBuf::from("/proc"), FS_READ_FILE | FS_READ_DIR)]
+            .into_iter()
+            .chain(c.binds.iter().map(|b| (b.path.clone(), if b.writable { handled } else { READ })))
+            .chain(c.devices.iter().map(|d| (d.clone(), FS_READ_FILE | FS_WRITE_FILE | FS_IOCTL_DEV)))
+            .map(|(path, rights)| (path, rights & handled))
+            .collect();
+        let (net, ports) = if c.host_network { (NET_BIND_TCP, c.bind_ports.clone()) } else { (0, Vec::new()) };
+        Ruleset {
+            attr: RulesetAttr { handled_access_fs: handled, handled_access_net: net, scoped: SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL },
+            paths,
+            ports,
+        }
+    }
+
+    /// Restrict this process with Landlock as [`ruleset`] says.
+    fn restrict(c: &Confinement, abi: u32) -> Result<(), Error> {
+        let rules = ruleset(c, abi);
+        // SAFETY: a live attr of its declared size.
+        let fd = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, &rules.attr, std::mem::size_of::<RulesetAttr>(), 0u32) };
+        check(fd, "creating the Landlock ruleset")?;
+        let result = apply(fd as libc::c_int, &rules);
+        // SAFETY: closing the fd made above.
+        unsafe { libc::close(fd as libc::c_int) };
+        result
+    }
+
+    /// `rules`' grants added to the ruleset `fd`, then this process
+    /// restricted by it.
+    fn apply(fd: libc::c_int, rules: &Ruleset) -> Result<(), Error> {
+        rules
+            .paths
+            .iter()
+            .try_for_each(|(path, rights)| add_path_rule(fd, path, *rights))
+            .and_then(|()| rules.ports.iter().try_for_each(|port| add_port_rule(fd, *port)))
+            // SAFETY: a ruleset fd the caller made.
+            .and_then(|()| check(unsafe { libc::syscall(libc::SYS_landlock_restrict_self, fd, 0u32) }, "applying the Landlock ruleset"))
+    }
+
+    fn add_port_rule(ruleset: libc::c_int, port: u16) -> Result<(), Error> {
+        let rule = NetPort { allowed_access: NET_BIND_TCP, port: u64::from(port) };
+        // SAFETY: a live rule of the type named.
+        check(unsafe { libc::syscall(libc::SYS_landlock_add_rule, ruleset, RULE_NET_PORT, &rule, 0u32) }, &format!("granting port {port}"))
+    }
+
     fn add_path_rule(ruleset: libc::c_int, path: &Path, rights: u64) -> Result<(), Error> {
-        let path_c = cstr(path)?;
-        // SAFETY: an O_PATH open of a NUL-terminated path.
-        let fd = unsafe { libc::open(path_c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
-        check(fd as libc::c_long, &format!("opening {}", path.display()))?;
-        let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
-        let rule = PathBeneath { allowed_access: if is_dir { rights } else { rights & FILE_RIGHTS }, parent_fd: fd };
+        let fd = open_path(path)?;
+        let rule = PathBeneath { allowed_access: rule_rights(path, rights), parent_fd: fd };
         // SAFETY: a live rule of the type named, then closing its fd.
         let rc = unsafe { libc::syscall(libc::SYS_landlock_add_rule, ruleset, RULE_PATH_BENEATH, &rule, 0u32) };
         unsafe { libc::close(fd) };
         check(rc, &format!("granting {}", path.display()))
+    }
+
+    /// `path` opened `O_PATH`, for a rule beneath it.
+    fn open_path(path: &Path) -> Result<libc::c_int, Error> {
+        let path_c = cstr(path)?;
+        // SAFETY: an O_PATH open of a NUL-terminated path.
+        let fd = unsafe { libc::open(path_c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        check(fd as libc::c_long, &format!("opening {}", path.display())).map(|()| fd)
+    }
+
+    /// The rights a rule beneath `path` carries: all of `rights` on a
+    /// directory, only those a file can have on anything else.
+    fn rule_rights(path: &Path, rights: u64) -> u64 {
+        if std::fs::metadata(path).is_ok_and(|m| m.is_dir()) {
+            rights
+        } else {
+            rights & FILE_RIGHTS
+        }
     }
 
     #[cfg(test)]
@@ -871,6 +1054,288 @@ mod imp {
             assert_eq!(super::fs_rights(1), (1 << 13) - 1);
             assert_eq!(super::fs_rights(6), (1 << 16) - 1);
             assert_eq!(super::fs_rights(9), (1 << 17) - 1);
+        }
+
+        use super::*;
+        use std::path::{Path, PathBuf};
+
+        /// A sandbox has a network of its own unless it shares the host's;
+        /// the user, mount and pid namespaces it always has.
+        #[test]
+        fn the_namespaces_follow_the_network() {
+            let always = libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID;
+            assert_eq!(namespace_flags(true), always);
+            assert_eq!(namespace_flags(false), always | libc::CLONE_NEWNET);
+        }
+
+        #[test]
+        fn the_maps_map_this_user_and_group_to_themselves() {
+            assert_eq!(self_maps(1000, 100), ("1000 1000 1".to_string(), "100 100 1".to_string()));
+        }
+
+        /// The probe's exit: no namespaces (the root never tried), a root
+        /// that built, and one that did not or whose child never exited.
+        #[test]
+        fn the_probe_says_what_failed_first() {
+            assert_eq!(probe_status(false, || panic!("no root is tried without namespaces")), PROBE_NO_NAMESPACES);
+            assert_eq!(probe_status(true, || Some(0)), 0);
+            assert_eq!(probe_status(true, || Some(3)), PROBE_NO_ROOT);
+            assert_eq!(probe_status(true, || None), PROBE_NO_ROOT);
+        }
+
+        /// Reaping waits through other children and EINTR for the program,
+        /// then exits as it did: its code, or 128 plus its signal; any other
+        /// failure to reap is status 1.
+        #[test]
+        fn the_init_exits_as_its_program_did() {
+            let reaping = |steps: Vec<(Result<libc::pid_t, Option<i32>>, i32)>| {
+                let mut steps = steps.into_iter();
+                reaped_code(7, move |status| {
+                    let (r, s) = steps.next().expect("reaped past the program");
+                    *status = s;
+                    r
+                })
+            };
+            assert_eq!(reaping(vec![(Ok(8), 0), (Err(Some(libc::EINTR)), 0), (Ok(7), 3 << 8)]), 3);
+            assert_eq!(reaping(vec![(Ok(7), libc::SIGTERM)]), 128 + libc::SIGTERM);
+            assert_eq!(reaping(vec![(Err(Some(libc::ECHILD)), 0)]), 1);
+            assert_eq!(reaping(vec![(Err(None), 0)]), 1);
+        }
+
+        /// Nothing starts without the ABI it needs, an argv of C strings
+        /// and a program; what was wrong is said.
+        #[test]
+        fn a_sandbox_starts_only_with_its_abi_and_a_program() {
+            let os = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+            let refused = |abi, args: &[&str]| ready(abi, &os(args)).unwrap_err().to_string();
+            assert!(refused(None, &["true"]).contains("ABI 6 or later"));
+            assert!(refused(Some(super::super::LANDLOCK_ABI_NEEDED - 1), &["true"]).contains("ABI 6 or later"));
+            assert!(refused(Some(9), &[]).contains("no program to run"));
+            assert!(refused(Some(9), &["tr\0ue"]).contains("holds a NUL"));
+            let (abi, argv) = ready(Some(9), &os(&["sh", "-c", "true"])).unwrap();
+            assert_eq!(abi, 9);
+            assert_eq!(argv, vec![c"sh".to_owned(), c"-c".to_owned(), c"true".to_owned()]);
+        }
+
+        /// `enter` with nothing to run returns why, here, before it forks or
+        /// makes a namespace: this test goes on running.
+        #[test]
+        fn entering_with_no_program_returns_why_without_starting_anything() {
+            let e = enter(&Confinement::default(), &[]).to_string();
+            assert!(e.contains("no program to run") || e.contains("ABI 6 or later"), "{e}");
+        }
+
+        #[test]
+        fn an_exec_that_fails_exits_as_a_shell_would() {
+            assert_eq!(exec_failed(Some(libc::ENOENT)), 127);
+            assert_eq!(exec_failed(Some(libc::EACCES)), 126);
+            assert_eq!(exec_failed(None), 126);
+        }
+
+        /// The filter's shape: another architecture's call ends the
+        /// process; each refused call, `clone3` and a namespace-making
+        /// `clone` answer an errno; anything else is allowed.
+        #[test]
+        fn the_syscall_filter_refuses_what_it_says() {
+            let arch = 0xc000_00b7;
+            let f = syscall_filter(arch);
+            let at = |i: usize| (f[i].code, f[i].k);
+            assert_eq!(at(0), (BPF_LD_W_ABS, DATA_ARCH));
+            assert_eq!(at(1), (BPF_JEQ_K, arch));
+            assert_eq!(at(2), (BPF_RET_K, SECCOMP_RET_KILL_PROCESS));
+            assert_eq!(at(3), (BPF_LD_W_ABS, DATA_NR));
+            assert_eq!(*f.last().map(|i| (i.code, i.k)).as_ref().unwrap(), (BPF_RET_K, SECCOMP_RET_ALLOW));
+            let answers = |nr: libc::c_long| {
+                let i = f.iter().position(|i| i.code == BPF_JEQ_K && i.k == nr as u32).unwrap_or_else(|| panic!("call {nr} not matched"));
+                f[i + 1].k
+            };
+            for nr in REFUSED {
+                assert_eq!(answers(nr), SECCOMP_RET_ERRNO | libc::EPERM as u32, "call {nr}");
+            }
+            assert_eq!(answers(libc::SYS_clone3), SECCOMP_RET_ERRNO | libc::ENOSYS as u32);
+            let clone = f.iter().position(|i| i.code == BPF_JEQ_K && i.k == libc::SYS_clone as u32).unwrap();
+            assert_eq!(at(clone + 1), (BPF_LD_W_ABS, DATA_ARG0_LOW));
+            assert_eq!(at(clone + 2), (BPF_JSET_K, NAMESPACE_FLAGS as u32));
+            assert_eq!(at(clone + 3), (BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
+        }
+
+        /// mount(2)'s strings: a path holding a NUL is refused, absent ones
+        /// stay absent.
+        #[test]
+        fn the_mount_strings_are_what_was_asked() {
+            assert!(mount_args(None, Path::new("/a\0b"), None, None).is_err());
+            assert!(mount_args(Some(Path::new("/a\0b")), Path::new("/t"), None, None).is_err());
+            let a = mount_args(None, Path::new("/t"), None, None).unwrap();
+            assert_eq!((a.source, a.target, a.fstype, a.data), (None, c"/t".to_owned(), None, None));
+            let a = mount_args(Some(Path::new("proc")), Path::new("/t"), Some("proc"), Some("mode=0755")).unwrap();
+            assert_eq!((a.source, a.fstype, a.data), (Some(c"proc".to_owned()), Some(c"proc".to_owned()), Some(c"mode=0755".to_owned())));
+        }
+
+        #[test]
+        fn attributes_reach_the_mounts_beneath_only_when_recursive() {
+            assert_eq!(attr_flags(true), libc::AT_RECURSIVE as libc::c_uint);
+            assert_eq!(attr_flags(false), 0);
+        }
+
+        /// A bind's mount point is of its source's kind, its parents made;
+        /// an existing file is kept; a missing source is named.
+        #[test]
+        fn a_mount_point_is_made_like_its_source() {
+            let t = tempfile::TempDir::new().unwrap();
+            let (dir, file) = (t.path().join("dir"), t.path().join("file"));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(&file, "source").unwrap();
+            let root = t.path().join("root");
+            mount_point(&dir, &root.join("a/dir")).unwrap();
+            assert!(root.join("a/dir").is_dir());
+            mount_point(&file, &root.join("b/file")).unwrap();
+            assert_eq!(std::fs::read_to_string(root.join("b/file")).unwrap(), "");
+            std::fs::write(root.join("b/file"), "kept").unwrap();
+            mount_point(&file, &root.join("b/file")).unwrap();
+            assert_eq!(std::fs::read_to_string(root.join("b/file")).unwrap(), "kept");
+            let missing = t.path().join("missing");
+            assert!(mount_point(&missing, &root.join("c")).unwrap_err().to_string().contains(&missing.display().to_string()));
+            assert!(!root.join("c").exists());
+        }
+
+        /// Each granted path is bound at its own path in the root, in order,
+        /// read-only unless writable, then each device; none setuid or a
+        /// device node but the devices.
+        #[test]
+        fn the_root_binds_each_grant_at_its_own_path() {
+            let c = Confinement {
+                root: PathBuf::from("/r"),
+                binds: vec![Bind { path: "/w".into(), writable: true }, Bind { path: "/o/p".into(), writable: false }],
+                devices: vec!["/dev/null".into()],
+                ..Default::default()
+            };
+            let (nosuid, nodev, ro) = (libc::MOUNT_ATTR_NOSUID, libc::MOUNT_ATTR_NODEV, libc::MOUNT_ATTR_RDONLY);
+            assert_eq!(
+                root_binds(&c),
+                vec![
+                    (Path::new("/w"), PathBuf::from("/r/w"), nosuid | nodev),
+                    (Path::new("/o/p"), PathBuf::from("/r/o/p"), nosuid | nodev | ro),
+                    (Path::new("/dev/null"), PathBuf::from("/r/dev/null"), nosuid),
+                ]
+            );
+        }
+
+        #[test]
+        fn an_ifreq_names_its_interface() {
+            let req = ifreq_named(b"lo");
+            assert_eq!(&req.ifr_name[..3], &[b'l' as libc::c_char, b'o' as libc::c_char, 0]);
+            assert!(req.ifr_name[3..].iter().all(|b| *b == 0));
+        }
+
+        /// What Landlock is asked: every right the ABI knows handled; the
+        /// root listed, `/proc` read, a writable bind's every right, a
+        /// read-only one's read and execute, a device's read, write and
+        /// ioctl, each cut to the ABI; TCP binds held to the granted ports on
+        /// the host's network, and nothing of the network handled on a
+        /// network of its own; signals and abstract sockets scoped.
+        #[test]
+        fn the_ruleset_grants_what_the_confinement_says() {
+            let mut c = Confinement {
+                binds: vec![Bind { path: "/w".into(), writable: true }, Bind { path: "/o".into(), writable: false }],
+                devices: vec!["/dev/null".into()],
+                host_network: true,
+                bind_ports: vec![8080],
+                ..Default::default()
+            };
+            let all = fs_rights(9);
+            let r = ruleset(&c, 9);
+            assert_eq!((r.attr.handled_access_fs, r.attr.handled_access_net, r.attr.scoped), (all, NET_BIND_TCP, SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL));
+            assert_eq!(
+                r.paths,
+                vec![
+                    (PathBuf::from("/"), FS_READ_DIR),
+                    (PathBuf::from("/proc"), FS_READ_FILE | FS_READ_DIR),
+                    (PathBuf::from("/w"), all),
+                    (PathBuf::from("/o"), READ),
+                    (PathBuf::from("/dev/null"), FS_READ_FILE | FS_WRITE_FILE | FS_IOCTL_DEV),
+                ]
+            );
+            assert_eq!(r.ports, vec![8080]);
+            // ABI 1 knows no ioctl right: it is not asked for.
+            assert_eq!(ruleset(&c, 1).paths[4].1, FS_READ_FILE | FS_WRITE_FILE);
+            c.host_network = false;
+            let r = ruleset(&c, 9);
+            assert_eq!((r.attr.handled_access_net, r.ports), (0, Vec::new()));
+        }
+
+        /// A rule beneath a directory carries every right asked; beneath
+        /// anything else, only a file's.
+        #[test]
+        fn a_rule_beneath_a_file_carries_only_a_files_rights() {
+            let t = tempfile::TempDir::new().unwrap();
+            let file = t.path().join("f");
+            std::fs::write(&file, "").unwrap();
+            let all = fs_rights(9);
+            assert_eq!(rule_rights(t.path(), all), all);
+            assert_eq!(rule_rights(&file, all), all & FILE_RIGHTS);
+            assert_eq!(rule_rights(&t.path().join("missing"), all), all & FILE_RIGHTS);
+            assert_ne!(all & FILE_RIGHTS, all, "a directory's rights reach past a file's");
+        }
+
+        /// Whether `pid` ends (signaled, reaped) within five seconds; it is
+        /// killed and reaped either way.
+        fn ends_within(pid: libc::pid_t) -> Option<i32> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut status = 0;
+            while std::time::Instant::now() < deadline {
+                // SAFETY: waiting on this test's own child.
+                if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid {
+                    return libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            // SAFETY: ending and reaping this test's own child.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+            None
+        }
+
+        /// A stop's signal reaches a program that leads no group yet (its
+        /// session not made), and the whole group of one that does.
+        #[test]
+        fn a_stop_reaches_the_program_and_its_group() {
+            // SAFETY: the children call only async-signal-safe functions.
+            unsafe {
+                let alone = forked(|| {
+                    libc::pause();
+                    0
+                });
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                signal_group_or_process(alone, libc::SIGTERM);
+                assert_eq!(ends_within(alone), Some(libc::SIGTERM), "a program leading no group");
+
+                let mut pipe = [0; 2];
+                assert_eq!(libc::pipe(pipe.as_mut_ptr()), 0);
+                let leader = forked(|| {
+                    libc::close(pipe[0]);
+                    libc::setsid();
+                    // Its child holds the pipe too: it reads EOF only once
+                    // both are gone.
+                    forked(|| {
+                        libc::pause();
+                        0
+                    });
+                    libc::pause();
+                    0
+                });
+                libc::close(pipe[1]);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                signal_group_or_process(leader, libc::SIGTERM);
+                let mut poll = libc::pollfd { fd: pipe[0], events: libc::POLLIN, revents: 0 };
+                let mut byte = 0u8;
+                let ended = libc::poll(&mut poll, 1, 5000) == 1 && libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1) == 0;
+                assert_eq!(ends_within(leader), Some(libc::SIGTERM), "the group's leader");
+                libc::close(pipe[0]);
+                assert!(ended, "the group's other process outlived the stop");
+            }
         }
     }
 }
