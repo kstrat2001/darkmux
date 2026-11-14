@@ -743,6 +743,7 @@ pub fn record_source(base: &Path, name: &str, checkout: &Path) -> Result<(), Str
 pub fn forget_source(base: &Path, name: &str) {
     let _ = std::fs::remove_file(source_record(base, name));
     let _ = std::fs::remove_file(template_record(base, name));
+    forget_cloned(base, name);
     let _ = std::fs::remove_file(install_record(base, name));
 }
 
@@ -814,6 +815,79 @@ pub fn record_template_commit(base: &Path, name: &str, commit: &str) -> Result<(
 /// Forget that workspace `name` was made from a template.
 pub fn forget_template_commit(base: &Path, name: &str) {
     let _ = std::fs::remove_file(template_record(base, name));
+}
+
+/// (#3571) Where darkmux records the commit it cloned for workspace `name`
+/// (a clone of a repo URL): beside the workspace, outside anything a run
+/// can write.
+fn cloned_record(base: &Path, name: &str) -> PathBuf {
+    base.join(format!(".{name}.cloned"))
+}
+
+/// Record that clone `name` was made at `commit` (the repo's own, as
+/// fetched). Its preview's recipe is read there, never from the work tree.
+pub fn record_cloned_commit(base: &Path, name: &str, commit: &str) -> Result<(), String> {
+    use std::io::Write;
+    if !is_commit_sha(commit) {
+        return Err(format!("{commit:?} is not a full commit SHA"));
+    }
+    let path = cloned_record(base, name);
+    let _ = std::fs::remove_file(&path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "{commit}"))
+        .map_err(|e| format!("recording the commit {} was cloned at: {e}", path.display()))
+}
+
+/// The commit recorded for clone `name`, if any: a plain file (a link is no
+/// record) holding a full commit SHA.
+pub fn cloned_commit_of(base: &Path, name: &str) -> Option<String> {
+    let path = cloned_record(base, name);
+    if !std::fs::symlink_metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let commit = text.trim_end_matches('\n');
+    is_commit_sha(commit).then(|| commit.to_string())
+}
+
+/// Forget clone `name`'s commit and approved recipe.
+pub fn forget_cloned(base: &Path, name: &str) {
+    let _ = std::fs::remove_file(cloned_record(base, name));
+    let _ = std::fs::remove_file(approved_recipe_record(base, name));
+}
+
+/// (#3571) Where darkmux keeps the recipe the user approved for clone
+/// `name` (its repo has none): beside the workspace, never in it.
+fn approved_recipe_record(base: &Path, name: &str) -> PathBuf {
+    base.join(format!(".{name}.recipe"))
+}
+
+/// Keep `text` (already parsed as a recipe) as clone `name`'s approved
+/// recipe. Replaces any earlier one, never through a link.
+pub fn record_approved_recipe(base: &Path, name: &str, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let path = approved_recipe_record(base, name);
+    let _ = std::fs::remove_file(&path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .map_err(|e| format!("keeping the approved recipe {}: {e}", path.display()))
+}
+
+/// Clone `name`'s approved recipe, if any: a plain file (a link is none)
+/// within the recipe size cap.
+pub fn approved_recipe_of(base: &Path, name: &str) -> Option<String> {
+    let path = approved_recipe_record(base, name);
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > crate::client_preview::MAX_RECIPE_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(&path).ok()
 }
 
 /// The first commit recorded for template project `name`, if any: a plain

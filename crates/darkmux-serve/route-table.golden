@@ -51,6 +51,7 @@ POST /client/workspaces/:name/image  json ImageReply (client listener: 127.0.0.1
 POST /client/workspaces/:name/preview  json PreviewState (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 GET /client/workspaces/:name/preview  json PreviewState (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 DELETE /client/workspaces/:name/preview  json StatusWord (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+PUT /client/workspaces/:name/recipe  json RecipeReply (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 
 # client listener response types: Type.field: type, from the JSON schema (every refusal is ClientError)
 Availability.reason?: string | null

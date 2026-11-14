@@ -5316,10 +5316,10 @@ async fn a_preview_never_runs_the_workspaces_own_recipe() {
     assert!(!ws.join("pwned").exists() && !ws.join("pwned-install").exists(), "the workspace's recipe ran");
 }
 
-/// A workspace cloned from a URL has no checkout of the user's, so no
-/// preview, even with a recipe in it; the refusal names the repo.
+/// (#3571) A clone's recipe is read from the commit darkmux cloned, never
+/// its work tree: one written there (and not in the repo) is no recipe.
 #[tokio::test]
-async fn a_cloned_workspace_gets_no_preview() {
+async fn a_recipe_in_a_clones_work_tree_is_never_read() {
     let h = harness();
     let token = paired(&h).await;
     let (code, v) = call(
@@ -5332,10 +5332,90 @@ async fn a_cloned_workspace_gets_no_preview() {
     recipe(&ws, serde_json::json!({"command": format!("touch pwned; {}", serve())}));
     let (code, v) = start_preview(&h, &token, "hcr").await;
     assert_eq!(code, 404, "{v}");
-    assert_eq!(v["code"], "no_source_checkout", "{v}");
-    let e = v["error"].as_str().unwrap();
-    assert!(e.contains("not made from a checkout of yours") && e.contains("github.com/kstrat2001/hcr"), "{v}");
+    assert_eq!(v["code"], "no_recipe", "{v}");
+    assert!(v["error"].as_str().unwrap().contains("the commit darkmux cloned"), "{v}");
     assert!(!ws.join("pwned").exists());
+}
+
+/// Commits everything in `dir` (a test repo).
+fn commit_all(dir: &Path, message: &str) {
+    run_git(Some(dir), &["add", "-A"]);
+    run_git(Some(dir), &["-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "--quiet", "-m", message]);
+}
+
+/// Sets clone `name`'s approved recipe.
+async fn put_recipe(h: &Harness, token: &str, name: &str, recipe: Value) -> (u16, Value) {
+    let body = serde_json::json!({ "recipe": recipe });
+    call(h, raw("put", &format!("/client/workspaces/{name}/recipe"), Some(token), Body::from(body.to_string()))).await
+}
+
+/// (#3571) A clone previews from the recipe in the commit darkmux cloned; a
+/// run that commits another recipe changes nothing.
+#[tokio::test]
+async fn a_clone_previews_from_the_recipe_in_the_commit_it_cloned() {
+    let h = harness();
+    let token = paired(&h).await;
+    recipe(&h.fixture, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}}));
+    commit_all(&h.fixture, "add a recipe");
+    let (code, v) = call(
+        &h,
+        post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": "https://github.com/kstrat2001/hcr"}))),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    let ws = h.base.join("hcr");
+    recipe(&ws, serde_json::json!({"command": format!("touch pwned; {}", serve())}));
+    commit_all(&ws, "a run's recipe");
+    let (code, v) = call(&h, get("/client/recipe?workspace=hcr", &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["recipe"]["command"], serve(), "the cloned commit's, never the run's: {v}");
+    let (code, v) = start_preview(&h, &token, "hcr").await;
+    assert_eq!(code, 202, "{v}");
+    let ready = preview_until(&h, &token, "hcr", &["ready", "failed"]).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    h.state.previews.stop("hcr");
+    assert!(!ws.join("pwned").exists(), "the run's recipe ran");
+}
+
+/// (#3571) A clone whose repo has no recipe previews from the one the user
+/// approved, checked as strictly as a checkout's.
+#[tokio::test]
+async fn an_approved_recipe_previews_a_clone_with_none() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(
+        &h,
+        post("/client/workspaces", Some(&token), ws_body(serde_json::json!({"repo_url": "https://github.com/kstrat2001/hcr"}))),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    let version = darkmux_types::data_version::PREVIEW_RECIPE_SCHEMA_VERSION;
+    let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"schema_version": version, "command": serve(), "comand": "x"})).await;
+    assert_eq!((code, v["code"].as_str()), (422, Some("recipe_invalid")), "{v}");
+    let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"schema_version": version, "command": serve(), "env_from_source": [".env"]})).await;
+    assert_eq!((code, v["code"].as_str()), (422, Some("recipe_invalid")), "{v}");
+    let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"schema_version": version, "command": serve(), "env": {"PORT": "{port}"}})).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["recipe"]["command"], serve(), "{v}");
+    let (code, v) = start_preview(&h, &token, "hcr").await;
+    assert_eq!(code, 202, "{v}");
+    let ready = preview_until(&h, &token, "hcr", &["ready", "failed"]).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    h.state.previews.stop("hcr");
+    // Nothing of it is in the work tree a run writes.
+    assert!(!h.base.join("hcr").join(".darkmux").exists());
+}
+
+/// (#3571) A worktree of the user's checkout reads that checkout: it takes
+/// no approved recipe.
+#[tokio::test]
+async fn only_a_clone_takes_an_approved_recipe() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (_mine, name, _ws) = checkout_workspace(&h, &token).await;
+    let (code, v) = put_recipe(&h, &token, &name, serde_json::json!({"schema_version": "1.0", "command": "npm run dev"})).await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("not a clone"), "{v}");
 }
 
 /// What darkmux recorded is what counts: a clone that takes the name of an
@@ -7189,14 +7269,10 @@ async fn template_projects_without_a_usable_recipe_say_why() {
         "the clone forgot the old record"
     );
     let (code, v) = start_preview(&h, &token, "hcr").await;
-    assert_eq!(code, 404, "{v}");
-    assert!(
-        v["error"]
-            .as_str()
-            .unwrap()
-            .contains("not made from a checkout of yours"),
-        "{v}"
-    );
+    // Read as a clone (#3571), never as the old template project: the
+    // fixture's recipe (which lists `env_from_source`) is refused for a clone.
+    assert_eq!(code, 422, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("a clone has none"), "{v}");
 }
 
 #[tokio::test]

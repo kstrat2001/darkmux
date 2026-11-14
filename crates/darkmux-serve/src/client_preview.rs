@@ -162,11 +162,18 @@
 //! the user's own checkout: the `source_path` checkout the workspace's
 //! worktree was made from, as darkmux recorded it when it made the workspace
 //! (`client_workspace::own_checkout_of`), never from the workspace itself. A
-//! file a Coder run wrote in the workspace is never read. A workspace cloned
-//! from a URL has no checkout of the user's, so it gets no preview; neither
-//! does one whose checkout has no recipe (a copy in the workspace does not
-//! count). Each refusal says why and what to do: add
-//! `.darkmux/preview.json` to your own checkout of the repo.
+//! file a Coder run wrote in the workspace is never read. A workspace whose
+//! checkout has no recipe gets no preview (a copy in the workspace does not
+//! count); the refusal says why and what to do: add `.darkmux/preview.json`
+//! to your own checkout of the repo.
+//!
+//! (#3571) A workspace cloned from a URL has no checkout of the user's: its
+//! recipe is read as it was in the commit darkmux cloned (recorded beside the
+//! workspace, `.<name>.cloned`), like a template's first commit below, else
+//! the recipe the user approved for it through the app
+//! (`PUT /client/workspaces/{name}/recipe`, kept as `.<name>.recipe`). A
+//! run's commit or work-tree edit changes neither
+//! ([`RecipeSource::ClonedCommit`]).
 //!
 //! A project darkmux made from a template (#3460) has no checkout of the
 //! user's either, but its first commit is darkmux's own (`start_fresh`).
@@ -470,6 +477,11 @@ pub enum RecipeSource {
     /// host git from the repository darkmux holds, never from the work tree.
     /// A later commit (a run's) never changes what is trusted.
     TemplateCommit { git_dir: PathBuf, commit: String },
+    /// (#3571) A clone of a repo URL: the recipe as it was in the commit
+    /// darkmux cloned (read like a template's), else `approved`, the recipe
+    /// the user approved for it, kept beside the workspace. A run's commit or
+    /// work-tree edit changes neither.
+    ClonedCommit { git_dir: PathBuf, commit: String, approved: Option<String> },
 }
 
 impl RecipeSource {
@@ -489,6 +501,20 @@ impl RecipeSource {
                      project made from a template has none; remove `env_from_source` from the template's recipe"
                 )))
             }
+            RecipeSource::ClonedCommit { git_dir, commit, approved } => {
+                let text = match (read_recipe_at_commit(git_dir, commit), approved) {
+                    (Err(RecipeRefusal::NotFound(_)), Some(approved)) => approved.clone(),
+                    (read, _) => read?,
+                };
+                let recipe = parse_recipe(&text)?;
+                if recipe.env_from_source.is_empty() {
+                    return Ok(recipe);
+                }
+                Err(RecipeRefusal::Invalid(format!(
+                    "{RECIPE_PATH}: `env_from_source` names files to copy from a checkout of yours, and a \
+                     clone has none; remove `env_from_source` from the recipe"
+                )))
+            }
         }
     }
 
@@ -496,7 +522,7 @@ impl RecipeSource {
     pub fn checkout(&self) -> Option<&Path> {
         match self {
             RecipeSource::Checkout(c) => Some(c),
-            RecipeSource::TemplateCommit { .. } => None,
+            RecipeSource::TemplateCommit { .. } | RecipeSource::ClonedCommit { .. } => None,
         }
     }
 }
