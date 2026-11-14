@@ -4637,14 +4637,14 @@ pub(crate) async fn stop_own_server_handler(
     match outcome {
         Ok(Some(OwnServerStop::Stopped(_))) => Json(StatusWord { status: "stopped".to_string() }).into_response(),
         Ok(Some(OwnServerStop::NotRunning)) => {
-            err(StatusCode::CONFLICT, ClientCode::Conflict, &format!("{engine}'s own server is not running"))
+            err(StatusCode::CONFLICT, ClientCode::Conflict, format!("{engine}'s own server is not running"))
         }
         Ok(Some(OwnServerStop::Darkmuxs)) => err(
             StatusCode::CONFLICT,
             ClientCode::Conflict,
-            &format!("the {engine} server running is darkmux's own, not the engine's"),
+            format!("the {engine} server running is darkmux's own, not the engine's"),
         ),
-        Ok(None) => err(StatusCode::NOT_FOUND, ClientCode::NotFound, &format!("no engine {engine} with its own server")),
+        Ok(None) => err(StatusCode::NOT_FOUND, ClientCode::NotFound, format!("no engine {engine} with its own server")),
         Err(why) => err(StatusCode::INTERNAL_SERVER_ERROR, ClientCode::Internal, &why),
     }
 }
