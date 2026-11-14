@@ -1043,7 +1043,8 @@ pub fn own_checkout_of(base: &Path, name: &str, dir: &Path) -> Result<PathBuf, C
     let Some(source) = recorded_source(base, name) else {
         return Err(gone(format!(
             "workspace {name} was not made from a checkout of yours, so it has no \
-             preview: a preview runs only from .darkmux/preview.json in your own checkout. Make the \
+             preview: a worktree's preview runs only from .darkmux/preview.json in your own checkout darkmux \
+             recorded for it. Make the \
              workspace from your checkout (`source_path`), and add .darkmux/preview.json to your own \
              checkout of {repo}"
         )));

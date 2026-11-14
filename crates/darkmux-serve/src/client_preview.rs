@@ -4316,6 +4316,39 @@ mod tests {
     /// (#3460 review) An object overwritten in place (git does not check a
     /// loose object's hash when it reads it) is refused: every object on the
     /// recipe's path must hash to its id.
+    /// (#3573 review) A `.darkmux` that is a file (or a submodule, listed
+    /// the same way) holds no recipe: none, never a read of it as a tree.
+    #[test]
+    fn a_darkmux_that_is_not_a_folder_is_no_recipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, first) = a_repo_with(dir.path(), &[(".darkmux", "not a folder")]);
+        let r = read_recipe_at_commit(&repo.join(".git"), &first);
+        assert!(matches!(r, Err(RecipeRefusal::NotFound(_))), "{r:?}");
+    }
+
+    /// (#3573 review) A commit object that is not what its id says (here,
+    /// one whose tree has no `.darkmux`) is refused, never read as "no
+    /// recipe": the root tree id is taken from darkmux's own read of it.
+    #[test]
+    fn a_forged_commit_is_refused_not_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, first) = a_repo_with(dir.path(), &[(RECIPE_PATH, TEMPLATE_RECIPE), ("README", "x")]);
+        std::fs::remove_dir_all(repo.join(".darkmux")).unwrap();
+        git(&repo, &["add", "-A"]);
+        let tree = git(&repo, &["write-tree"]);
+        let forged = git(&repo, &["commit-tree", &tree, "-m", "first"]);
+        let object = |oid: &str| repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+        let bytes = std::fs::read(object(&forged)).unwrap();
+        let at = object(&first);
+        let mut perms = std::fs::metadata(&at).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&at, perms).unwrap();
+        std::fs::write(&at, bytes).unwrap();
+        let r = read_recipe_at_commit(&repo.join(".git"), &first);
+        assert!(matches!(r, Err(RecipeRefusal::Invalid(ref m)) if m.contains("does not match")), "{r:?}");
+    }
+
     #[test]
     fn an_overwritten_object_is_refused() {
         // Overwrites `which`'s object with a valid object of the same type
