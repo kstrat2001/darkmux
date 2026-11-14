@@ -1068,6 +1068,10 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           unshare -Urm true && echo "unprivileged user namespaces: allowed"
+          # What darkmux's own Landlock probe also needs (#3575 diagnosis):
+          # the Landlock LSM, and a /proc mounted in new PID/mount namespaces.
+          echo "LSMs: $(cat /sys/kernel/security/lsm 2>/dev/null || echo unreadable)"
+          unshare -Urmpf --mount-proc true && echo "a /proc mount in new namespaces: allowed" || echo "a /proc mount in new namespaces: REFUSED"
 
       - name: Measure the workspace
         env:
