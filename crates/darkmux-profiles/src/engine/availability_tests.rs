@@ -329,6 +329,7 @@ fn lms_model() -> ProfileModel {
 #[test]
 fn lm_studio_judges_by_darkmuxs_own_instance_and_its_catalog() {
     let answer = |loaded: Vec<LoadedModel>, catalog: &[&str]| LmStudioAnswer {
+        server_up: true,
         loaded: Ok(loaded),
         catalog: Ok(catalog.iter().map(|s| meta(s)).collect()),
     };
@@ -351,10 +352,38 @@ fn lm_studio_judges_by_darkmuxs_own_instance_and_its_catalog() {
     assert!(none.reason.unwrap().contains("`qwen`"));
 }
 
+/// LM Studio's app answering with its local server off (models loaded, a
+/// dispatch refused at connect) is `unavailable`, saying the server is off,
+/// even for darkmux's own resident instance (#3578).
+#[test]
+fn lm_studio_with_its_server_off_is_unavailable() {
+    let off = LmStudioAnswer {
+        server_up: false,
+        loaded: Ok(vec![lm("darkmux:qwen", "qwen", 65536)]),
+        catalog: Ok(vec![meta("qwen")]),
+    };
+    let a = off.judge(&lms_model());
+    assert_eq!(state(&a), AvailabilityState::Unavailable, "{a:?}");
+    assert!(a.reason.unwrap().starts_with("LM Studio's local server is off"));
+}
+
+/// A base URL's server is found by host and port, with or without a scheme.
+#[test]
+fn server_accepts_reads_the_base_url() {
+    let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = open.local_addr().unwrap().port();
+    assert!(server_accepts(&format!("http://127.0.0.1:{port}")));
+    assert!(server_accepts(&format!("localhost:{port}/v1")));
+    drop(open);
+    assert!(!server_accepts(&format!("http://127.0.0.1:{port}")));
+    assert!(!server_accepts("http://"));
+}
+
 /// LM Studio not answering is `unknown`, never `unavailable`.
 #[test]
 fn lm_studio_down_is_unknown() {
     let down = LmStudioAnswer {
+        server_up: true,
         loaded: Err("running `lms ps --json`: exited 1".into()),
         catalog: Ok(vec![meta("qwen")]),
     };
@@ -362,6 +391,7 @@ fn lm_studio_down_is_unknown() {
     assert_eq!(state(&a), AvailabilityState::Unknown, "{a:?}");
     assert!(a.reason.unwrap().contains("LM Studio did not answer"));
     let no_catalog = LmStudioAnswer {
+        server_up: true,
         loaded: Ok(vec![]),
         catalog: Err("`lms ls --json` exited with status 1".into()),
     };
@@ -543,6 +573,7 @@ fn a_model_with_no_context_or_port_is_unavailable() {
     let mut no_ctx = lms_model();
     no_ctx.n_ctx = None;
     let lms = LmStudioAnswer {
+        server_up: true,
         loaded: Ok(vec![]),
         catalog: Ok(vec![meta("qwen")]),
     }
@@ -644,8 +675,11 @@ esac
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&lms, std::fs::Permissions::from_mode(0o755)).unwrap();
     let _ = std::process::Command::new(&lms).arg("--version").output();
+    // LM Studio's local server, up (#3578).
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}", server.local_addr().unwrap().port());
     let answer = with_env(
-        &[("DARKMUX_LMS_BIN", lms.to_str().unwrap())],
+        &[("DARKMUX_LMS_BIN", lms.to_str().unwrap()), ("DARKMUX_LMSTUDIO_URL", &url)],
         LmStudioAnswer::ask,
     );
     let judge = |id: &str| {

@@ -366,6 +366,10 @@ pub struct LmStudioAnswer {
     pub loaded: Result<Vec<LoadedModel>, String>,
     /// The models it has downloaded, with every name it loads each by.
     pub catalog: Result<Vec<super::ModelMeta>, String>,
+    /// Whether its local server (the base URL a dispatch sends to) accepts
+    /// a connection. `lms` answers from the app while the server is off, so
+    /// a model can be loaded and still not answer a dispatch (#3578).
+    pub server_up: bool,
 }
 
 impl LmStudioAnswer {
@@ -384,7 +388,11 @@ impl LmStudioAnswer {
                     super::lmstudio().catalog().map_err(msg)
                 })
             });
+            let server_up = s.spawn(|| {
+                server_accepts(&darkmux_types::config_access::lmstudio_url())
+            });
             LmStudioAnswer {
+                server_up: server_up.join().unwrap_or(false),
                 loaded: loaded
                     .join()
                     .unwrap_or_else(|_| Err("listing its residents panicked".into())),
@@ -396,6 +404,35 @@ impl LmStudioAnswer {
     }
 }
 
+/// Whether anything accepts a connection at a base URL's host and port
+/// (`http://localhost:1234`, or `localhost:1234` with no scheme; port 80 or
+/// 443 by scheme when none is given). Within about 300 ms per address.
+pub fn server_accepts(base_url: &str) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let (scheme, rest) = match base_url.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => ("http", base_url),
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let with_port = if authority.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
+        authority.to_string()
+    } else {
+        format!("{authority}:{}", if scheme == "https" { 443 } else { 80 })
+    };
+    let Ok(addrs) = with_port.to_socket_addrs() else {
+        return false;
+    };
+    addrs
+        .into_iter()
+        .any(|a| TcpStream::connect_timeout(&a, Duration::from_millis(300)).is_ok())
+}
+
+/// The reason a model on LM Studio reads `unavailable` while its local
+/// server is off. Clients match on its start (`LM Studio's local server is off`).
+pub const LMSTUDIO_SERVER_OFF: &str =
+    "LM Studio's local server is off, so a dispatch can't reach the model";
+
 impl EngineAnswer for LmStudioAnswer {
     fn judge(&self, model: &ProfileModel) -> Availability {
         let n_ctx = match model.require_n_ctx() {
@@ -406,6 +443,9 @@ impl EngineAnswer for LmStudioAnswer {
             Ok(l) => l,
             Err(e) => return Availability::unknown(format!("LM Studio did not answer: {e}")),
         };
+        if !self.server_up {
+            return Availability::unavailable(LMSTUDIO_SERVER_OFF);
+        }
         // The planner's own residency rule: darkmux's instance of the model,
         // at the profile's context or more, is what a dispatch reuses. A
         // copy someone else loaded is never one (contract 4).
