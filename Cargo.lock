@@ -675,7 +675,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "darkmux"
-version = "5.10.0"
+version = "5.11.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -717,7 +717,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-crew"
-version = "5.10.0"
+version = "5.11.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-doctor"
-version = "5.10.0"
+version = "5.11.0"
 dependencies = [
  "anyhow",
  "darkmux-crew",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-eureka"
-version = "5.10.0"
+version = "5.11.0"
 dependencies = [
  "anyhow",
  "darkmux-hardware",
@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-fleet"
-version = "5.10.0"
+version = "5.11.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-flow"
-version = "5.10.0"
+version = "5.11.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-gestalt"
-version = "5.10.0"
+version = "5.11.0"
 dependencies = [
  "darkmux-types",
  "serde",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-hardware"
-version = "5.10.0"
+version = "5.11.0"
 dependencies = [
  "darkmux-platform",
  "serde",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-heuristics"
-version = "5.10.0"
+version = "5.11.0"
 dependencies = [
  "darkmux-hardware",
  "darkmux-profiles",
@@ -853,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-lab"
-version = "5.10.0"
+version = "5.11.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-platform"
-version = "5.10.0"
+version = "5.11.0"
 dependencies = [
  "libc",
  "tempfile",
@@ -886,7 +886,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-profiles"
-version = "5.10.0"
+version = "5.11.0"
 dependencies = [
  "anyhow",
  "darkmux-gestalt",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-serve"
-version = "5.10.0"
+version = "5.11.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -964,7 +964,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-trajectory"
-version = "5.10.0"
+version = "5.11.0"
 dependencies = [
  "schemars 1.2.2",
  "serde",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-types"
-version = "5.10.0"
+version = "5.11.0"
 dependencies = [
  "anyhow",
  "darkmux-platform",
