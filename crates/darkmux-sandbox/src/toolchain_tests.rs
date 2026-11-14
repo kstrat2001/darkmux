@@ -357,3 +357,29 @@ fn a_workspace_script_that_is_a_fifo_never_hangs_the_resolution() {
     let got = got.expect("resolving a FIFO script hung").unwrap();
     assert!(got.read_only.is_empty(), "{:?}", got.read_only);
 }
+
+/// A recipe program named by its absolute path is granted where it really
+/// is (nvm's node: its version folder), as one found on PATH would be,
+/// and is part of the toolchain's identity.
+#[test]
+fn an_absolute_recipe_program_is_granted_where_it_is() {
+    let host = a_fake_host();
+    let node = host.nvm.join("bin/node").display().to_string();
+    let got = host.resolve(&[format!("{node} server.js").as_str()], None).unwrap();
+    assert_eq!(got.read_only, vec![host.nvm.clone()]);
+    assert!(got.identity.contains(&format!("node={node}")), "{}", got.identity);
+}
+
+/// A relative recipe word that is no file in the workspace (an argument,
+/// or a script not written yet) grants nothing and refuses nothing, with a
+/// workspace or without one.
+#[test]
+fn a_relative_recipe_word_with_no_file_behind_it_grants_nothing() {
+    let host = a_fake_host();
+    let ws = tempfile::TempDir::new().unwrap();
+    for workdir in [Some(ws.path()), None] {
+        let got = host.resolve(&["./build.sh --watch"], workdir).unwrap();
+        assert!(got.read_only.is_empty(), "{:?}", got.read_only);
+        assert!(got.identity.is_empty(), "{}", got.identity);
+    }
+}
