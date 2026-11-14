@@ -137,6 +137,18 @@ pub trait Platform: Send + Sync {
     /// when this machine is not one darkmux can say it of.
     fn gpu_api(&self) -> Option<&'static str>;
 
+    /// (#3561) The platform part of the official Node.js release archive
+    /// for this machine (`darwin-arm64`, `linux-x64`), the build darkmux
+    /// fetches for a sandbox on the host. `None` where Node publishes no
+    /// build darkmux has a pin for.
+    fn node_release_platform(&self) -> Option<&'static str>;
+
+    /// (#3561 re-review) Which C library this machine's programs link
+    /// against, where that is a question (Linux): glibc, or musl (Alpine),
+    /// whose machines no official glibc-linked build (Node's) runs on.
+    /// `None` where the platform has no such choice.
+    fn c_library(&self) -> Option<CLibrary>;
+
     /// What this machine was bought with beyond its chip and RAM: the CPU
     /// and GPU core counts and the model, the choices a buyer makes. What
     /// the OS does not say is left empty, never guessed.
@@ -591,6 +603,221 @@ pub enum ContainerHostAccess {
     /// The name has to be mapped to the engine's host gateway when the
     /// container starts (Docker Engine on Linux).
     HostGateway,
+}
+
+/// (#3561 re-review) A Linux machine's C library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CLibrary {
+    Glibc,
+    Musl,
+}
+
+/// The C library a program with ELF interpreter `interp` uses: musl when
+/// the interpreter's file name starts with `ld-musl` (Alpine's
+/// `/lib/ld-musl-<arch>.so.1`), glibc for any other, and glibc when it has
+/// none (a static program, a file darkmux could not read or that is not
+/// ELF): the default, as nearly every distribution.
+pub(crate) fn c_library_of_interpreter(interp: Option<&str>) -> CLibrary {
+    let name = interp.map(|p| p.rsplit('/').next().unwrap_or(p));
+    if name.is_some_and(|n| n.starts_with("ld-musl")) {
+        CLibrary::Musl
+    } else {
+        CLibrary::Glibc
+    }
+}
+
+/// The most [`c_library_of_program`] reads of each part of a program: its
+/// ELF header, its program header table (wherever `e_phoff` puts it), and
+/// its interpreter's path (wherever `p_offset` puts it). A table larger
+/// than its bound names no interpreter. A path is read up to its bound and
+/// anything longer is cut there, which is harmless: the kernel refuses a
+/// `PT_INTERP` longer than `PATH_MAX`, so a shell naming one cannot run.
+const ELF_HEADER_BOUND: usize = 64;
+const PROGRAM_HEADERS_BOUND: usize = 64 * 1024;
+const INTERPRETER_BOUND: usize = 4096;
+
+/// The C library the program at `path` (a machine's `/bin/sh`) uses, from
+/// its ELF interpreter ([`c_library_of_interpreter`]): the header, then the
+/// program header table and the interpreter's path where the header says,
+/// each a bounded read, so its layout does not matter (Fedora's bash has
+/// its interpreter about 968 KiB in). A file that cannot be read whole
+/// where it says reads as having none: glibc.
+pub(crate) fn c_library_of_program(path: &std::path::Path) -> CLibrary {
+    use std::io::{Read, Seek, SeekFrom};
+    // (#3568) Opened without blocking: a FIFO with no writer would hang a
+    // plain open. A FIFO cannot seek, so it then names no interpreter.
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NONBLOCK);
+    let Ok(mut file) = open.open(path) else { return CLibrary::Glibc };
+    let mut read_at = |at: u64, len: usize| -> Option<Vec<u8>> {
+        file.seek(SeekFrom::Start(at)).ok()?;
+        let mut out = Vec::with_capacity(len);
+        (&mut file).take(len as u64).read_to_end(&mut out).ok()?;
+        Some(out)
+    };
+    c_library_of_interpreter(elf_interpreter_at(&mut read_at).as_deref())
+}
+
+/// The interpreter (`PT_INTERP`) an ELF file in memory names
+/// ([`elf_interpreter_at`] over `bytes`).
+#[cfg(test)]
+pub(crate) fn elf_interpreter(bytes: &[u8]) -> Option<String> {
+    elf_interpreter_at(&mut |at, len| {
+        let at = usize::try_from(at).ok()?;
+        Some(bytes.get(at..).unwrap_or_default().iter().take(len).copied().collect())
+    })
+}
+
+/// The interpreter (`PT_INTERP`) an ELF file names, 64- or 32-bit, either
+/// byte order, read through `read_at(offset, len)` (at most `len` bytes,
+/// fewer at the file's end). `None` for a file with none (static), one cut
+/// short where its header points (a `p_filesz` larger than the bytes left
+/// in the file, up to the path's bound, included), one whose table is past
+/// its bound, or one that is not ELF. The path is read up to
+/// [`INTERPRETER_BOUND`], anything longer cut there (harmless: the kernel
+/// refuses a `PT_INTERP` longer than `PATH_MAX`). All arithmetic is
+/// checked.
+fn elf_interpreter_at(read_at: &mut ReadAt) -> Option<String> {
+    let found = program_header_table(read_at)?;
+    let table = Elf { bytes: &found.bytes, is64: found.is64, big: found.big };
+    let ph = (0..found.count).map(|n| n * found.entry).find(|ph| table.field(*ph, 4) == Some(PT_INTERP))?;
+    let (offset, size) = table.interpreter_fields(ph)?;
+    let raw = read_whole(read_at, offset, usize::try_from(size).ok()?.min(INTERPRETER_BOUND))?;
+    let path = raw.split(|b| *b == 0).next()?;
+    (!path.is_empty()).then(|| String::from_utf8_lossy(path).into_owned())
+}
+
+/// The program header table (read at `e_phoff`), the file's class and
+/// byte order, and the table's entry size and count; `None` for a file
+/// that is not ELF, or whose entries are smaller than its class's, or
+/// whose table is past [`PROGRAM_HEADERS_BOUND`] or cut short.
+fn program_header_table(read_at: &mut ReadAt) -> Option<Table> {
+    let header = read_at(0, ELF_HEADER_BOUND)?;
+    let head = Elf::read(&header)?;
+    let (phoff, phentsize, phnum) = head.table_fields()?;
+    let table_len = phentsize.checked_mul(phnum)?;
+    if phentsize < head.entry_min() || table_len > PROGRAM_HEADERS_BOUND {
+        return None;
+    }
+    Some(Table { bytes: read_whole(read_at, phoff, table_len)?, is64: head.is64, big: head.big, entry: phentsize, count: phnum })
+}
+
+/// A file's program header table, its class and byte order, and its
+/// entry size and count.
+struct Table {
+    bytes: Vec<u8>,
+    is64: bool,
+    big: bool,
+    entry: usize,
+    count: usize,
+}
+
+/// A read of a file at an offset: at most `len` bytes, fewer at its end.
+type ReadAt<'r> = dyn FnMut(u64, usize) -> Option<Vec<u8>> + 'r;
+
+/// Exactly `len` bytes at `at`, or `None` when the file has fewer there.
+fn read_whole(read_at: &mut ReadAt, at: u64, len: usize) -> Option<Vec<u8>> {
+    read_at(at, len).filter(|b| b.len() == len)
+}
+
+/// Bytes of an ELF file (its header, or its program header table), its
+/// class and its byte order.
+#[derive(Clone, Copy)]
+struct Elf<'a> {
+    bytes: &'a [u8],
+    is64: bool,
+    big: bool,
+}
+
+/// A program header's type for the interpreter's path.
+const PT_INTERP: u64 = 3;
+
+impl<'a> Elf<'a> {
+    /// `bytes` as an ELF header: the magic, then a known class and byte
+    /// order.
+    fn read(bytes: &'a [u8]) -> Option<Self> {
+        if bytes.get(..4)? != b"\x7fELF" {
+            return None;
+        }
+        let is64 = Self::one_of(*bytes.get(4)?)?;
+        let big = Self::one_of(*bytes.get(5)?)?;
+        Some(Elf { bytes, is64, big })
+    }
+
+    /// An identification byte that is 1 (`false`: 32-bit, little-endian)
+    /// or 2 (`true`: 64-bit, big-endian).
+    fn one_of(b: u8) -> Option<bool> {
+        match b {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// The smallest program header entry of this class.
+    fn entry_min(&self) -> usize {
+        if self.is64 {
+            56
+        } else {
+            32
+        }
+    }
+
+    /// The `width`-byte unsigned field at `at`, in the file's byte order.
+    fn field(&self, at: usize, width: usize) -> Option<u64> {
+        let raw = self.bytes.get(at..at.checked_add(width)?)?;
+        Some(raw.iter().enumerate().fold(0u64, |acc, (i, b)| {
+            let shift = if self.big { 8 * (width - 1 - i) } else { 8 * i };
+            acc | (u64::from(*b) << shift)
+        }))
+    }
+
+    /// The header's program header table fields: file offset, entry size,
+    /// count.
+    fn table_fields(&self) -> Option<(u64, usize, usize)> {
+        let ((off, off_w), size_at, num_at) = if self.is64 { ((0x20, 8), 0x36, 0x38) } else { ((0x1C, 4), 0x2A, 0x2C) };
+        Some((self.field(off, off_w)?, self.field(size_at, 2)? as usize, self.field(num_at, 2)? as usize))
+    }
+
+    /// Program header `ph`'s file offset and size.
+    fn interpreter_fields(&self, ph: usize) -> Option<(u64, u64)> {
+        if self.is64 {
+            Some((self.field(ph.checked_add(8)?, 8)?, self.field(ph.checked_add(32)?, 8)?))
+        } else {
+            Some((self.field(ph.checked_add(4)?, 4)?, self.field(ph.checked_add(16)?, 4)?))
+        }
+    }
+}
+
+/// The Node.js archive platform for a Linux machine on CPU `arch` with C
+/// library `libc`: none on musl (the official builds link glibc).
+pub(crate) fn linux_node_release_platform(arch: &str, libc: CLibrary) -> Option<&'static str> {
+    match libc {
+        CLibrary::Musl => None,
+        CLibrary::Glibc => node_release_platform_for(NodeOs::Linux, arch),
+    }
+}
+
+/// (#3561) The two kernels Node.js publishes builds for that darkmux pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NodeOs {
+    Darwin,
+    Linux,
+}
+
+/// The Node.js archive platform for `os` on CPU `arch` (Rust's
+/// `std::env::consts::ARCH` spelling): Node names Apple Silicon and 64-bit
+/// ARM `arm64` and x86-64 `x64`. Any other CPU has no build darkmux pins.
+pub(crate) fn node_release_platform_for(os: NodeOs, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        (NodeOs::Darwin, "aarch64") => Some("darwin-arm64"),
+        (NodeOs::Darwin, "x86_64") => Some("darwin-x64"),
+        (NodeOs::Linux, "aarch64") => Some("linux-arm64"),
+        (NodeOs::Linux, "x86_64") => Some("linux-x64"),
+        _ => None,
+    }
 }
 
 /// The strategy for the OS this binary was built for.

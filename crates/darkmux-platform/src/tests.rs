@@ -1809,6 +1809,25 @@ fn a_bounded_command_with_more_output_than_a_pipe_holds_finishes() {
     assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
 }
 
+/// (#3561) The Node.js build darkmux fetches for a sandbox on the host:
+/// the archive name's platform part for the two Mac and two Linux CPUs
+/// Node publishes, and nothing for a CPU or OS it has no pin for.
+#[test]
+fn the_node_release_platform_names_the_official_build_for_the_cpu() {
+    assert_eq!(node_release_platform_for(NodeOs::Darwin, "aarch64"), Some("darwin-arm64"));
+    assert_eq!(node_release_platform_for(NodeOs::Darwin, "x86_64"), Some("darwin-x64"));
+    assert_eq!(node_release_platform_for(NodeOs::Linux, "aarch64"), Some("linux-arm64"));
+    assert_eq!(node_release_platform_for(NodeOs::Linux, "x86_64"), Some("linux-x64"));
+    assert_eq!(node_release_platform_for(NodeOs::Linux, "riscv64"), None);
+    assert_eq!(OtherPlatform.node_release_platform(), None);
+    let fake = FakePlatform { node_release_platform: Some("linux-arm64"), ..Default::default() };
+    assert_eq!(fake.node_release_platform(), Some("linux-arm64"));
+    assert_eq!(FakePlatform::default().node_release_platform(), None);
+    let arch = std::env::consts::ARCH;
+    assert_eq!(MacPlatform.node_release_platform(), node_release_platform_for(NodeOs::Darwin, arch));
+    assert_eq!(LinuxPlatform.node_release_platform(), node_release_platform_for(NodeOs::Linux, arch));
+}
+
 /// (#3559) A sandbox's processes in a process table of (pid, ppid, pgid,
 /// sid): its leader, every process in the leader's group or session (an
 /// orphan the leader left behind among them, one in a group of its own
@@ -2153,4 +2172,269 @@ fn another_users_open_files_are_no_answer() {
     if cfg!(target_os = "linux") {
         assert_eq!(crate::linux::socket_inodes_held_by(1), None);
     }
+}
+
+/// A minimal ELF file shaped like a real one: a header, then program
+/// headers in a real binary's order (`PT_PHDR`, `PT_INTERP` naming `interp`
+/// when given, then a `PT_LOAD` covering the whole file), in 64- or 32-bit
+/// form and either byte order. Only `PT_INTERP` names an interpreter: a
+/// reader that took another header for it would read the table or the ELF
+/// header as a path.
+fn an_elf(is64: bool, big: bool, interp: Option<&str>) -> Vec<u8> {
+    let (ehsize, phentsize) = if is64 { (64usize, 56usize) } else { (52, 32) };
+    let phnum = 2 + usize::from(interp.is_some());
+    let interp_at = ehsize + phentsize * phnum;
+    let mut b = vec![0u8; interp_at];
+    b[..4].copy_from_slice(b"\x7fELF");
+    b[4] = if is64 { 2 } else { 1 };
+    b[5] = if big { 2 } else { 1 };
+    b[6] = 1;
+    let put = |b: &mut Vec<u8>, at: usize, v: u64, width: usize| {
+        let bytes = if big { v.to_be_bytes() } else { v.to_le_bytes() };
+        let part = if big { &bytes[8 - width..] } else { &bytes[..width] };
+        b[at..at + width].copy_from_slice(part);
+    };
+    if is64 {
+        put(&mut b, 0x20, ehsize as u64, 8);
+        put(&mut b, 0x36, phentsize as u64, 2);
+        put(&mut b, 0x38, phnum as u64, 2);
+    } else {
+        put(&mut b, 0x1C, ehsize as u64, 4);
+        put(&mut b, 0x2A, phentsize as u64, 2);
+        put(&mut b, 0x2C, phnum as u64, 2);
+    }
+    // One program header: type, file offset, file size.
+    let header = |b: &mut Vec<u8>, n: usize, kind: u64, offset: u64, size: u64| {
+        let ph = ehsize + n * phentsize;
+        put(b, ph, kind, 4);
+        if is64 {
+            put(b, ph + 8, offset, 8);
+            put(b, ph + 32, size, 8);
+        } else {
+            put(b, ph + 4, offset, 4);
+            put(b, ph + 16, size, 4);
+        }
+    };
+    header(&mut b, 0, 6, ehsize as u64, (phentsize * phnum) as u64);
+    if let Some(path) = interp {
+        header(&mut b, 1, 3, interp_at as u64, path.len() as u64 + 1);
+        b.extend_from_slice(path.as_bytes());
+        b.push(0);
+    }
+    let len = b.len() as u64;
+    header(&mut b, phnum - 1, 1, 0, len);
+    b
+}
+
+/// (#3568) A `/bin/sh` that is not a regular file reads as glibc without
+/// blocking: a FIFO with no writer would hang a plain open forever (every
+/// sandbox start and `darkmux doctor` with it).
+#[cfg(unix)]
+#[test]
+fn a_shell_that_is_a_fifo_reads_as_glibc_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("sh");
+    let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "mkfifo");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(c_library_of_program(&fifo));
+    });
+    let read = rx.recv_timeout(std::time::Duration::from_secs(5));
+    assert_eq!(read, Ok(CLibrary::Glibc), "the read blocked on a FIFO with no writer, or misread it");
+
+    // A FIFO already holding a musl ELF is still no musl shell: it cannot
+    // seek, so nothing is read from it (the bytes stay in the pipe).
+    use std::io::{Read, Write};
+    let busybox = an_elf(true, false, Some("/lib/ld-musl-x86_64.so.1"));
+    let fifo = dir.path().join("sh");
+    let mut held = std::fs::OpenOptions::new().read(true).write(true).open(&fifo).unwrap();
+    held.write_all(&busybox).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let at = fifo.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(c_library_of_program(&at));
+    });
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(CLibrary::Glibc));
+    let mut left = vec![0u8; busybox.len()];
+    held.read_exact(&mut left).unwrap();
+    assert_eq!(left, busybox, "nothing was taken from the pipe");
+}
+
+/// (#3561 re-review) A Linux machine's C library is its `/bin/sh`'s ELF
+/// interpreter: musl where it is `ld-musl-*` (Alpine's busybox, also with
+/// `gcompat` installed beside it), glibc for any other (Debian with the
+/// `musl` package, NixOS's store path). Read from 64- and 32-bit files in
+/// either byte order; a file with no interpreter, cut short or not ELF
+/// reads as having none, which is glibc. A musl machine has no official
+/// Node build darkmux pins (they link glibc), so it names none; a Mac has
+/// no such question.
+#[test]
+fn a_linux_c_library_is_its_shells_elf_interpreter() {
+    let busybox = an_elf(true, false, Some("/lib/ld-musl-x86_64.so.1"));
+    assert_eq!(elf_interpreter(&busybox).as_deref(), Some("/lib/ld-musl-x86_64.so.1"));
+    assert_eq!(c_library_of_interpreter(elf_interpreter(&busybox).as_deref()), CLibrary::Musl);
+    for (elf, want) in [
+        (an_elf(true, false, Some("/lib/ld-musl-aarch64.so.1")), CLibrary::Musl),
+        (an_elf(true, false, Some("/lib64/ld-linux-x86-64.so.2")), CLibrary::Glibc),
+        (an_elf(true, false, Some("/nix/store/0abc-glibc-2.39-52/lib/ld-linux-x86-64.so.2")), CLibrary::Glibc),
+        (an_elf(false, true, Some("/lib/ld-musl-mips.so.1")), CLibrary::Musl),
+        (an_elf(false, false, Some("/lib/ld-linux-armhf.so.3")), CLibrary::Glibc),
+        (an_elf(true, true, Some("/lib64/ld64.so.2")), CLibrary::Glibc),
+    ] {
+        assert_eq!(c_library_of_interpreter(elf_interpreter(&elf).as_deref()), want, "{:?}", elf_interpreter(&elf));
+    }
+    let static_sh = an_elf(true, false, None);
+    assert_eq!(elf_interpreter(&static_sh), None, "a static shell has no interpreter");
+    let cut = &busybox[..busybox.len() - 10];
+    assert_eq!(elf_interpreter(cut), None, "an interpreter cut short is not read");
+    assert_eq!(elf_interpreter(&busybox[..40]), None, "a header cut short is not read");
+    assert_eq!(elf_interpreter(b"#!/bin/busybox sh\n"), None, "not ELF");
+    let mut no_magic = busybox.clone();
+    no_magic[1] = b'X';
+    assert_eq!(elf_interpreter(&no_magic), None, "a file without the ELF magic is not ELF, whatever follows");
+    assert_eq!(elf_interpreter(&[]), None);
+    let mut lying = busybox.clone();
+    lying[0x38] = 0xff;
+    lying[0x39] = 0xff;
+    assert_eq!(elf_interpreter(&lying), None, "a program header table past the file is not read");
+    assert_eq!(c_library_of_interpreter(None), CLibrary::Glibc, "no interpreter: glibc, the default");
+    assert_eq!(linux_node_release_platform("x86_64", CLibrary::Musl), None);
+    assert_eq!(linux_node_release_platform("aarch64", CLibrary::Musl), None);
+    assert_eq!(linux_node_release_platform("x86_64", CLibrary::Glibc), Some("linux-x64"));
+    assert_eq!(MacPlatform.c_library(), None);
+    assert_eq!(OtherPlatform.c_library(), None);
+    let fake = FakePlatform { c_library: Some(CLibrary::Musl), ..Default::default() };
+    assert_eq!(fake.c_library(), Some(CLibrary::Musl));
+    assert_eq!(FakePlatform::default().c_library(), None);
+}
+
+/// `an_elf`, its interpreter's path moved to file offset `at` (past the
+/// program headers, the gap zero-filled), as Fedora's bash has its
+/// `PT_INTERP` about 968 KiB in.
+fn an_elf_with_interpreter_at(interp: &str, at: usize) -> Vec<u8> {
+    let mut b = an_elf(true, false, Some(interp));
+    let (ehsize, phentsize) = (64usize, 56usize);
+    let start = ehsize + 3 * phentsize;
+    b.truncate(start);
+    b.resize(at, 0);
+    b.extend_from_slice(interp.as_bytes());
+    b.push(0);
+    let ph = ehsize + phentsize;
+    b[ph + 8..ph + 16].copy_from_slice(&(at as u64).to_le_bytes());
+    b
+}
+
+/// (#3561 re-review) A program is read where its ELF says, not from a
+/// fixed prefix: the header, then the program header table at `e_phoff`,
+/// then the interpreter's path at its `p_offset`, however far into the
+/// file. A musl shell whose path lies past the first 64 KiB is musl.
+#[test]
+fn a_shells_interpreter_is_read_wherever_the_file_puts_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let sh = dir.path().join("sh");
+    let far = an_elf_with_interpreter_at("/lib/ld-musl-x86_64.so.1", 0xf2000);
+    assert_eq!(elf_interpreter(&far).as_deref(), Some("/lib/ld-musl-x86_64.so.1"));
+    std::fs::write(&sh, &far).unwrap();
+    assert_eq!(c_library_of_program(&sh), CLibrary::Musl, "an interpreter 968 KiB in");
+    std::fs::write(&sh, &far[..far.len() - 5]).unwrap();
+    assert_eq!(c_library_of_program(&sh), CLibrary::Glibc, "a path cut short is not read");
+    std::fs::write(&sh, an_elf(true, false, Some("/lib/ld-musl-x86_64.so.1"))).unwrap();
+    assert_eq!(c_library_of_program(&sh), CLibrary::Musl, "and one near the start");
+    assert_eq!(c_library_of_program(&dir.path().join("none")), CLibrary::Glibc, "no file: glibc");
+}
+
+/// (#3561 re-review) Whatever a header claims, no read asks for more than
+/// its bound: a table of 65535 entries of 65535 bytes (4 GiB) is refused
+/// unread, and an interpreter claiming 4 GiB of path is read only to 4 KiB.
+#[test]
+fn a_header_cannot_make_the_reader_ask_for_more_than_its_bounds() {
+    let asks = |bytes: Vec<u8>| {
+        let mut asked = Vec::new();
+        let got = elf_interpreter_at(&mut |at, len| {
+            asked.push(len);
+            let at = usize::try_from(at).ok()?;
+            Some(bytes.get(at..).unwrap_or_default().iter().take(len).copied().collect())
+        });
+        (got, asked)
+    };
+    let mut huge_table = an_elf(true, false, Some("/lib/ld-musl-x86_64.so.1"));
+    huge_table[0x36..0x38].copy_from_slice(&u16::MAX.to_le_bytes());
+    huge_table[0x38..0x3A].copy_from_slice(&u16::MAX.to_le_bytes());
+    let (got, asked) = asks(huge_table);
+    assert_eq!(got, None);
+    assert!(asked.iter().all(|n| *n <= 64 * 1024), "{asked:?}");
+    let mut long_path = an_elf(true, false, Some("/lib/ld-musl-x86_64.so.1"));
+    let ph = 64 + 56;
+    long_path[ph + 32..ph + 40].copy_from_slice(&u64::from(u32::MAX).to_le_bytes());
+    long_path.resize(long_path.len() + 8192, b'a');
+    let (got, asked) = asks(long_path);
+    assert!(asked.iter().all(|n| *n <= 64 * 1024) && asked.last() == Some(&4096), "{asked:?}");
+    assert_eq!(got.as_deref(), Some("/lib/ld-musl-x86_64.so.1"), "the path ends at its NUL within the bound");
+}
+
+/// (#3561 re-review) Two malformed tables name no interpreter: program
+/// header entries smaller than their class's (entries that would overlap,
+/// one's fields read from the next), and a `PT_INTERP` whose path is empty.
+#[test]
+fn a_malformed_program_header_table_names_no_interpreter() {
+    // An ELF64 file whose entries claim 8 bytes: the second "entry" has the
+    // interpreter type, and the bytes 8 and 32 past it point at a path.
+    let mut small = an_elf(true, false, Some("/lib/ld-musl-x86_64.so.1"));
+    let (ehsize, real) = (64usize, 56usize);
+    let path_at = (ehsize + 3 * real) as u64;
+    small[0x36..0x38].copy_from_slice(&8u16.to_le_bytes());
+    // Six 8-byte entries: a 48-byte table, which holds the second entry's
+    // offset and size fields (8 and 32 bytes past it).
+    small[0x38..0x3A].copy_from_slice(&6u16.to_le_bytes());
+    let second = ehsize + 8;
+    small[second..second + 4].copy_from_slice(&3u32.to_le_bytes());
+    small[second + 8..second + 16].copy_from_slice(&path_at.to_le_bytes());
+    small[second + 32..second + 40].copy_from_slice(&25u64.to_le_bytes());
+    assert_eq!(elf_interpreter(&small), None, "an entry smaller than its class is not read");
+    // The same for ELF32, whose entries are 32 bytes: four 8-byte entries
+    // (a 32-byte table) hold the second entry's offset and size fields (4
+    // and 16 bytes past it).
+    let interp = "/lib/ld-musl-mips.so.1";
+    let mut small32 = an_elf(false, false, Some(interp));
+    let (ehsize32, real32) = (52usize, 32usize);
+    let path_at32 = (ehsize32 + 3 * real32) as u32;
+    small32[0x2A..0x2C].copy_from_slice(&8u16.to_le_bytes());
+    small32[0x2C..0x2E].copy_from_slice(&4u16.to_le_bytes());
+    let second32 = ehsize32 + 8;
+    small32[second32..second32 + 4].copy_from_slice(&3u32.to_le_bytes());
+    small32[second32 + 4..second32 + 8].copy_from_slice(&path_at32.to_le_bytes());
+    small32[second32 + 16..second32 + 20].copy_from_slice(&(interp.len() as u32 + 1).to_le_bytes());
+    assert_eq!(elf_interpreter(&small32), None, "an ELF32 entry smaller than 32 bytes is not read");
+    let empty = an_elf(true, false, Some(""));
+    assert_eq!(elf_interpreter(&empty), None, "an empty interpreter path is none");
+}
+
+/// (#3561 re-review) `LinuxPlatform` itself reads its shell (here a temp
+/// file standing in for `/bin/sh`): Alpine's busybox, `gcompat` or not,
+/// is musl and names no build; a glibc shell names the glibc build; a shell
+/// it cannot read is glibc.
+#[test]
+fn the_linux_platform_reads_its_own_shell() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let sh = dir.path().join("sh");
+    let read = |bytes: Option<Vec<u8>>| {
+        let _ = std::fs::remove_file(&sh);
+        if let Some(b) = bytes {
+            std::fs::write(&sh, b).unwrap();
+        }
+        crate::linux::with_shell(sh.clone(), || (LinuxPlatform.c_library(), LinuxPlatform.node_release_platform()))
+    };
+    let glibc_build = node_release_platform_for(NodeOs::Linux, std::env::consts::ARCH);
+    assert_eq!(read(Some(an_elf(true, false, Some("/lib/ld-musl-x86_64.so.1")))), (Some(CLibrary::Musl), None));
+    assert_eq!(read(Some(an_elf(true, false, Some("/lib64/ld-linux-x86-64.so.2")))), (Some(CLibrary::Glibc), glibc_build));
+    assert_eq!(read(None), (Some(CLibrary::Glibc), glibc_build), "no shell to read: glibc");
+}
+
+/// (#3561 re-review) This CI host's real `/bin/sh` (Arch on the Omarchy
+/// runner, glibc) reads as glibc.
+#[cfg(target_os = "linux")]
+#[test]
+fn this_linux_hosts_shell_reads_as_glibc() {
+    assert_eq!(LinuxPlatform.c_library(), Some(CLibrary::Glibc));
 }

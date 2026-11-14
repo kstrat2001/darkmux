@@ -51,6 +51,10 @@ pub struct FakePlatform {
     pub signed_apps: Vec<(u32, crate::SignedApp)>,
     /// What [`Platform::ask_allow`] answers.
     pub allow_answer: crate::AllowAnswer,
+    /// What [`Platform::node_release_platform`] answers.
+    pub node_release_platform: Option<&'static str>,
+    /// What [`Platform::c_library`] answers.
+    pub c_library: Option<crate::CLibrary>,
 }
 
 /// Every answer at its "nothing to report" value, so a test sets only the
@@ -85,6 +89,8 @@ impl Default for FakePlatform {
             process_groups: Vec::new(),
             signed_apps: Vec::new(),
             allow_answer: crate::AllowAnswer::NoDialog("a fake platform shows no dialog".to_string()),
+            node_release_platform: None,
+            c_library: None,
         }
     }
 }
@@ -177,6 +183,14 @@ impl Platform for FakePlatform {
 
     fn gpu_api(&self) -> Option<&'static str> {
         None
+    }
+
+    fn c_library(&self) -> Option<crate::CLibrary> {
+        self.c_library
+    }
+
+    fn node_release_platform(&self) -> Option<&'static str> {
+        self.node_release_platform
     }
 
     fn machine_config(&self) -> crate::MachineConfig {

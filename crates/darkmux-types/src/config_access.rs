@@ -2604,6 +2604,27 @@ pub fn cache_dir() -> std::path::PathBuf {
     resolved.root.join("cache")
 }
 
+/// (#3561) Where darkmux keeps the toolchains it fetches and verifies
+/// itself for a sandbox on the host (a pinned Node.js):
+/// `<darkmux root>/toolchains`. Internal state, no override tier: the root
+/// follows `DARKMUX_HOME` like every other directory. Carries the same
+/// test-build redirect as [`runtime_cache_dir`], since a sandbox start
+/// writes an install here.
+#[cfg(not(any(test, feature = "test-support")))]
+pub fn toolchains_dir() -> std::path::PathBuf {
+    crate::paths::resolve(crate::paths::ResolveScope::ForceUser).root.join("toolchains")
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn toolchains_dir() -> std::path::PathBuf {
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::ForceUser);
+    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
+    if real_user_root.as_ref() == Some(&resolved.root) {
+        return crate::paths::test_isolated_dir("toolchains");
+    }
+    resolved.root.join("toolchains")
+}
+
 /// The fleet roster file: `env(DARKMUX_FLEET_FILE) > config.dirs.fleet_file >
 /// `<darkmux root>/fleet.json`. Backs `fleet::roster::roster_path`.
 pub fn fleet_file() -> std::path::PathBuf {
@@ -2808,6 +2829,7 @@ location_accessors!(
     lab_dir,
     runtime_cache_dir,
     cache_dir,
+    toolchains_dir,
     fleet_file,
     identity_path_override,
     templates_override_dirs,
@@ -4251,6 +4273,7 @@ mod tests {
             ("liveness", liveness_dir()),
             ("runtime cache", runtime_cache_dir()),
             ("cache", cache_dir()),
+            ("toolchains", toolchains_dir()),
             ("fleet file", fleet_file()),
         ];
         unsafe {

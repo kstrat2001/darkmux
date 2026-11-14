@@ -234,6 +234,9 @@ const ACTION_WIRE = {
   ThermalStopUnresolved: "thermal.stop_unresolved",
   ThermalTier5Eject: "thermal.tier5_eject",
   ThermalTier5EjectFailed: "thermal.tier5_eject_failed",
+  ToolchainFetch: "toolchain.fetch",
+  ToolchainReady: "toolchain.ready",
+  ToolchainError: "toolchain.error",
   UtilityStart: "utility.start",
   UtilityError: "utility.error",
   // flow-action-guard:allow — a live-only action the daemon never writes

@@ -162,6 +162,18 @@ impl Platform for LinuxPlatform {
         read_to_string("/proc/device-tree/compatible").and_then(|c| apple_chip_from_compatible(&c)).map(|_| "Vulkan")
     }
 
+    /// Only for glibc: an official Node build does not run on musl.
+    fn node_release_platform(&self) -> Option<&'static str> {
+        crate::linux_node_release_platform(std::env::consts::ARCH, self.c_library()?)
+    }
+
+    /// From `/bin/sh`'s ELF interpreter: musl where it is `ld-musl-*`
+    /// (Alpine's busybox, `gcompat` installed or not), glibc otherwise and
+    /// when it cannot be read ([`crate::c_library_of_program`]).
+    fn c_library(&self) -> Option<crate::CLibrary> {
+        Some(crate::c_library_of_program(&shell()))
+    }
+
     /// The CPU tiers [`Platform::cpu_clusters`] reads, one core per online
     /// CPU (Apple Silicon has no SMT; an offlined core is not counted), on
     /// Apple Silicon only. The GPU core count
@@ -1024,4 +1036,30 @@ fn read_hwmon() -> Vec<HwmonInput> {
 #[cfg(not(target_os = "linux"))]
 fn read_hwmon() -> Vec<HwmonInput> {
     Vec::new()
+}
+
+/// The program whose ELF interpreter names a Linux machine's C library.
+const SHELL: &str = "/bin/sh";
+
+#[cfg(test)]
+thread_local! {
+    static SHELL_FOR_TEST: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// [`SHELL`], or a test's own file standing in for it.
+fn shell() -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(path) = SHELL_FOR_TEST.with(|p| p.borrow().clone()) {
+        return path;
+    }
+    std::path::PathBuf::from(SHELL)
+}
+
+/// Run `f` with `path` as this thread's shell.
+#[cfg(test)]
+pub(crate) fn with_shell<T>(path: std::path::PathBuf, f: impl FnOnce() -> T) -> T {
+    SHELL_FOR_TEST.with(|p| *p.borrow_mut() = Some(path));
+    let out = f();
+    SHELL_FOR_TEST.with(|p| *p.borrow_mut() = None);
+    out
 }

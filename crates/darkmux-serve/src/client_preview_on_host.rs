@@ -1,7 +1,8 @@
 //! (#3112) Previews in a sandbox on the host ([`BackendKind::on_host`]:
-//! Seatbelt now, Landlock later): no image, so the recipe runs this
-//! machine's own toolchain, granted read-only
-//! ([`darkmux_sandbox::toolchain`]); no published port, so the dev server
+//! Seatbelt now, Landlock later): no image, so the recipe runs darkmux's
+//! verified Node (#3561, [`darkmux_crew::managed_toolchain`]) and this machine's
+//! own toolchain, granted read-only ([`darkmux_sandbox::toolchain`]); no
+//! published port, so the dev server
 //! binds host ports itself. The kernel holds it to its two assigned ports
 //! (the policy names them: no bind and no inbound traffic on any other
 //! local port), but not to the loopback (#3559), so darkmux reads what
@@ -11,6 +12,7 @@
 //! killed ([`lingering`]).
 
 use super::{ContainerSpec, PreviewContainers, Recipe};
+use crate::client_wire::PreviewStage;
 use darkmux_platform::PortListener;
 use darkmux_sandbox::toolchain::Toolchain;
 use darkmux_sandbox::{BackendKind, SandboxHandle};
@@ -19,39 +21,55 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// The folders darkmux manages programs in, searched before the host's
-/// PATH. None yet: #3561 puts a darkmux-verified Node.js under
-/// `~/.darkmux/toolchains/<tool>/<v>/` and names its `bin` here; it is then
-/// found, granted (its version folder) and put first on the PATH by the
-/// same [`darkmux_sandbox::toolchain::resolve`] a host-installed one goes
-/// through. A dispatch on the host can call the same two functions.
-fn managed_toolchain_bins() -> Vec<PathBuf> {
-    Vec::new()
-}
-
 /// (#3112) The host toolchain `recipe` runs with under `kind`, found on
-/// `path_var` (darkmux's managed folders first): see
+/// `path_var` with darkmux's own toolchains (`managed`, #3561) first: see
 /// [`darkmux_sandbox::toolchain`] for what is granted and refused.
 pub(crate) fn resolve_toolchain(
     recipe: &Recipe,
     kind: BackendKind,
     workdir: &Path,
-    path_var: &str,
-    home: Option<&Path>,
+    (path_var, home): (&str, Option<&Path>),
+    managed: &[darkmux_sandbox::toolchain::Managed],
 ) -> Result<Toolchain, String> {
-    use darkmux_sandbox::toolchain::{resolve, search_path, Ask};
+    use darkmux_sandbox::toolchain::{resolve, Ask};
     let backend = darkmux_sandbox::backend_of(kind);
-    let path = search_path(&managed_toolchain_bins(), path_var);
     let commands = std::iter::once(recipe.command.as_str()).chain(recipe.install.as_ref().map(|i| i.command.as_str())).collect();
     resolve(&Ask {
         commands,
         workdir: Some(workdir),
-        path_var: &path,
+        path_var,
         home,
         reads: &|p| backend.host_reads(p),
+        managed: managed.to_vec(),
         placed: format!("a preview in {}", darkmux_sandbox::placed_in(kind)),
         runs_with: "`darkmux client serve`",
     })
+}
+
+/// (#3561) The verified runtimes (Node) a preview of `workdir` runs, each
+/// fetched on first use with `getting_<runtime>` as its stage meanwhile;
+/// one the project does not declare and that cannot be had is skipped,
+/// said on the serve log.
+fn managed_runtimes(workdir: &Path, stage: &dyn Fn(Option<PreviewStage>)) -> Result<Vec<darkmux_crew::managed_toolchain::Installed>, String> {
+    use darkmux_crew::managed_toolchain::{for_sandbox, Note};
+    for_sandbox(&[workdir], darkmux_flow::payload::ToolchainUse::Preview, None, &mut |n| {
+        if let (Some(line), Note::Unavailable { .. } | Note::Notice { .. }) = (darkmux_crew::managed_toolchain::said(n), n) {
+            eprintln!("darkmux client serve: preview of {}: {line}", workdir.display());
+        }
+        stage(preview_stage(n));
+    })
+}
+
+/// (#3561) The stage a preview shows for a step: `getting_<runtime>` while
+/// a fetch runs, and none once it ended, however it ended (installed,
+/// failed, or skipped for a project that declares no version), so a
+/// preview never sticks at it.
+pub(crate) fn preview_stage(n: &darkmux_crew::managed_toolchain::Note) -> Option<PreviewStage> {
+    use darkmux_crew::managed_toolchain::Note;
+    match n {
+        Note::Fetching { runtime, pin } => Some(PreviewStage::getting(runtime.name, runtime.display, &pin.version.to_string())),
+        Note::Ready { .. } | Note::Failed { .. } | Note::Unavailable { .. } | Note::Notice { .. } => None,
+    }
 }
 
 /// The listeners bound beyond the loopback: every address (`0.0.0.0`,
@@ -180,9 +198,13 @@ impl PreviewContainers for OnHost {
         Ok((darkmux_sandbox::setting_value(self.kind).to_string(), None))
     }
 
-    fn toolchain(&self, recipe: &Recipe, workdir: &Path) -> Result<Toolchain, String> {
+    /// (#3561) darkmux's verified Node first (with its listen preload), then
+    /// this machine's PATH.
+    fn toolchain(&self, recipe: &Recipe, workdir: &Path, stage: &dyn Fn(Option<PreviewStage>)) -> Result<Toolchain, String> {
+        let installed = managed_runtimes(workdir, stage)?;
         let home = std::env::var_os("HOME").map(PathBuf::from).map(|h| h.canonicalize().unwrap_or(h));
-        resolve_toolchain(recipe, self.kind, workdir, &std::env::var("PATH").unwrap_or_default(), home.as_deref())
+        let path = std::env::var("PATH").unwrap_or_default();
+        resolve_toolchain(recipe, self.kind, workdir, (&path, home.as_deref()), &darkmux_crew::managed_toolchain::managed(&installed))
     }
 
     fn host_labels(&self) -> Vec<String> {

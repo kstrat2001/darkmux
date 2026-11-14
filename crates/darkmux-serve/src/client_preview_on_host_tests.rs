@@ -29,7 +29,7 @@ fn a_run_in(dir: &Path) -> RunIn {
 }
 
 fn a_toolchain(dir: &Path) -> Toolchain {
-    Toolchain { path: Some(format!("{}:/usr/bin:/bin", dir.join("node/bin").display())), read_only: vec![dir.join("node")], identity: "node=x".into() }
+    Toolchain { path: Some(format!("{}:/usr/bin:/bin", dir.join("node/bin").display())), read_only: vec![dir.join("node")], identity: "node=x".into(), env: Vec::new() }
 }
 
 /// (#3112) A Seatbelt preview's policy: every path where the sandbox sees
@@ -746,4 +746,75 @@ fn a_preview_on_the_host_is_never_called_a_container() {
     assert_eq!(stale, "the preview's sandbox stopped itself: darkmux stopped answering");
     std::fs::write(&log, format!("{STARTED_LINE}\n{STALE_LINE}\n")).unwrap();
     assert_eq!(exit_reason(&recipe, &log, Err(std::io::Error::other("gone"))), "the preview's container stopped itself: darkmux stopped answering");
+}
+
+/// (#3561) A preview on the host runs darkmux's verified Node for its
+/// workspace (the test build's local fixture of it, under this test's own
+/// `DARKMUX_HOME`): a first use shows `getting_node` as its stage and then
+/// none, its `npm` and `node` resolve to the managed install, whose folder
+/// is the toolchain's grant and whose `bin` is first on the PATH; a second
+/// start fetches nothing.
+#[test]
+#[serial_test::serial]
+fn a_preview_on_the_host_runs_the_managed_node_its_workspace_declares() {
+    let home = tempfile::TempDir::new().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let ws = home_path.join("ws/site");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("package.json"), r#"{"engines": {"node": "^24"}}"#).unwrap();
+    let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "npm run dev"}));
+    let prev = std::env::var_os("DARKMUX_HOME");
+    unsafe { std::env::set_var("DARKMUX_HOME", &home_path) };
+    let stages = std::sync::Mutex::new(Vec::new());
+    let first = OnHost::new(BackendKind::Seatbelt).toolchain(&recipe, &ws, &|s| stages.lock().unwrap().push(s));
+    let again = OnHost::new(BackendKind::Seatbelt).toolchain(&recipe, &ws, &|s| stages.lock().unwrap().push(s));
+    unsafe {
+        match prev { Some(v) => std::env::set_var("DARKMUX_HOME", v), None => std::env::remove_var("DARKMUX_HOME") }
+    }
+    let first = first.unwrap();
+    let platform = darkmux_platform::current().node_release_platform().unwrap();
+    let node = home_path.join(format!("toolchains/node-24.22.3-{platform}"));
+    assert_eq!(first.read_only.first(), Some(&node), "{:?}", first.read_only);
+    assert_eq!(first.path.as_deref().unwrap().split(':').next(), node.join("bin").to_str(), "{:?}", first.path);
+    assert!(first.identity.contains(&node.display().to_string()), "{}", first.identity);
+    let preload = node.join("darkmux/listen-loopback.cjs");
+    assert_eq!(first.env, vec![("NODE_OPTIONS".to_string(), format!("--require \"{}\"", preload.display()))], "the listen preload");
+    assert_eq!(*stages.lock().unwrap(), vec![Some(PreviewStage::getting("node", "Node", "24.22.3")), None]);
+    assert_eq!(again.unwrap(), first, "a second start resolved another toolchain");
+}
+
+/// (#3561) A preview on the host appends the managed Node's listen preload
+/// to the recipe's own `NODE_OPTIONS`, never replacing it; a container
+/// (whose toolchain is its image's) gets none.
+#[test]
+fn a_preview_appends_the_listen_preload_to_the_recipes_node_options() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let at = a_run_in(&root);
+    let recipe = a_recipe(serde_json::json!({"schema_version": "1.1", "command": "npm run dev", "env": {"NODE_OPTIONS": "--max-old-space-size=4096"}}));
+    let toolchain = Toolchain { env: vec![("NODE_OPTIONS".into(), "--require \"/n/p.cjs\"".into())], ..a_toolchain(&root) };
+    let spec = spec_in(BackendKind::Seatbelt, &recipe, &at, false, ("seatbelt".into(), None), Vec::new(), &toolchain);
+    let options: Vec<&String> = spec.env.iter().filter(|(k, _)| k == "NODE_OPTIONS").map(|(_, v)| v).collect();
+    assert_eq!(options, ["--max-old-space-size=4096 --require \"/n/p.cjs\""]);
+    let docker = spec_in(BackendKind::Docker, &recipe, &at, false, ("img".into(), None), Vec::new(), &Toolchain::default());
+    let options: Vec<&String> = docker.env.iter().filter(|(k, _)| k == "NODE_OPTIONS").map(|(_, v)| v).collect();
+    assert_eq!(options, ["--max-old-space-size=4096"]);
+}
+
+/// (#3561) A preview shows `getting_node` only while a fetch runs: once it
+/// ends, installed, failed or skipped (a project that declares no Node
+/// version runs without it), the stage is gone, so a preview never sticks.
+#[test]
+fn a_preview_stage_ends_however_the_fetch_ends() {
+    use darkmux_crew::managed_toolchain::{Note, NODE};
+    let pin = NODE.pins[0];
+    let at = std::time::Duration::ZERO;
+    assert_eq!(on_host::preview_stage(&Note::Fetching { runtime: &NODE, pin: &pin }), Some(PreviewStage::getting("node", "Node", "26.13.1")));
+    for ended in [
+        Note::Ready { runtime: &NODE, pin: &pin, elapsed: at },
+        Note::Failed { runtime: &NODE, pin: &pin, elapsed: at, reason: "x" },
+        Note::Unavailable { runtime: &NODE, pin: None, platform: "darwin-arm64", reason: "x", required: false },
+    ] {
+        assert_eq!(on_host::preview_stage(&ended), None, "{ended:?}");
+    }
 }

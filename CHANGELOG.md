@@ -16,6 +16,59 @@ darkmux release.
 
 ### Added
 
+- **A workspace cloned from a repo URL can run a preview (#3571).** darkmux records the commit it
+  cloned and reads `.darkmux/preview.json` as it was there, the way a template project's first commit
+  is read: a run's commit or a work-tree edit never changes it, and `env_from_source` is refused (a
+  clone has no checkout of yours to copy from). For a repo with no recipe, a paired app can keep the
+  one its user approved with the new `PUT /client/workspaces/{name}/recipe` (body `{"recipe": {..}}`,
+  checked as strictly as a checkout's, answering `RecipeReply`); darkmux keeps it beside the
+  workspace, never in it, and uses it only when the cloned commit has none, so a 200 means it is the
+  recipe that runs. It is refused (409) when the repo's commit has a recipe of its own, and for a
+  worktree of your checkout or a template project. A clone of an empty repo, or one made before
+  this release, has no recorded commit and previews only from an approved recipe. A clone is told
+  by where darkmux keeps its repository, never by a record an earlier workspace of the name left. A
+  clone's missing recipe is now `no_recipe`, not `no_source_checkout`.
+
+- **darkmux supplies a verified, pinned Node.js to the sandboxes it starts on this machine (#3561).**
+  Under Seatbelt (macOS) and Landlock (Linux), a dispatch, a contained command (a lab run's tests, the
+  mods gate) and a client preview run Node from darkmux, first on the sandbox's PATH, its folder
+  granted read-only; no other part of `~/.darkmux` is added to what a sandbox reads (a dispatch's
+  existing `~/.darkmux/cache` mount is unchanged). A fresh Mac needs no Node of its own. Docker
+  sandboxes are unchanged: they keep the image's Node.
+  - **Which version:** the project's own, from `.nvmrc`, then `.node-version`, then `package.json`'s
+    `engines.node` (in the workspace root for a dispatch or a preview; a contained command looks in its
+    working folder, then its tree's root); with none, Node 26 (the Active LTS line). darkmux reads an
+    exact version, a partial one (`22`, `22.x`), comparators, `^`, `~`, hyphen ranges and `||`, and
+    `lts/*` or `lts/<codename>` in the version files; it picks the newest pinned build that satisfies
+    it and refuses, by name, anything else (`node`, `latest`, a pre-release). A `package.json` darkmux
+    cannot read (a link, over 1 MiB, not JSON) declares nothing, and darkmux says why.
+  - **Required only when declared:** a project that declares its Node gets that Node or its sandbox is
+    refused (a version no pin satisfies, naming the nearest pinned one; a failed download or hash
+    mismatch, with the reason and the fix), never falling back to the host's Node. A project that
+    declares none gets the default build when it can be had and otherwise runs without darkmux's Node
+    (and its listen preload), with a warning (`toolchain.error` at warn level).
+  - **Verified installs:** only a build pinned in the binary is ever downloaded (Node 26.13.1, 24.22.3
+    and 22.23.5 for macOS on Apple Silicon and Intel, and glibc Linux on x64 and arm64), each archive
+    checked against its pinned SHA-256 (never a checksum fetched at run time) and installed atomically
+    under `~/.darkmux/toolchains/node-<version>-<platform>/` on first use. A Linux machine using musl
+    (Alpine, also with `gcompat`), told by `/bin/sh`'s ELF interpreter (`ld-musl-*`), has no pinned
+    build: a project that declares Node is refused there, one that declares none runs without it. A
+    glibc machine with the `musl` package installed is still glibc. A build this binary no longer pins
+    is removed by a later install only once nobody has used it for 7 days, so a daemon still running
+    an older darkmux keeps its Node.
+  - **Visible:** a first use writes `toolchain.fetch` and then `toolchain.ready` or `toolchain.error`
+    to the flow; a starting preview shows it as `stage` (`{"code": "getting_node", "detail": "getting
+    Node 26.13.1, first use only"}`), an additive field of `PreviewState`. `darkmux doctor` has a row per
+    managed runtime (`managed node`: the verified install, or that it is fetched on first use).
+  - **A server that names no host listens on the loopback:** the managed Node loads a preload darkmux
+    writes into its install (`NODE_OPTIONS=--require "<install>/darkmux/listen-loopback.cjs"`, appended
+    to any `NODE_OPTIONS` already set), so `listen(port)`, `listen(0)`, `listen(cb)` and an options
+    object with no `host`, `path`, `fd` or `handle` (Express's `app.listen`, supertest) listen on
+    `127.0.0.1`, which `fetch('http://localhost:<port>')` also reaches. An explicit host, `0.0.0.0` and
+    `::` included, a unix socket, an fd or a handle is left as asked, and darkmux's watch still stops a
+    server listening beyond the loopback (#3559). A project that replaces `NODE_OPTIONS` itself loses the
+    preload, and then the watch applies.
+
 - **An app can add a picture to a workspace (#3545).** `POST /client/workspaces/{name}/image`
   takes `{"name", "data", "replace"?}`: the image's bytes as base64, never a path, so darkmux never
   reads a file a client names. darkmux takes only PNG, JPEG, GIF and WebP, recognized by their first

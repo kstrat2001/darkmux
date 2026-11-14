@@ -51,6 +51,7 @@ POST /client/workspaces/:name/image  json ImageReply (client listener: 127.0.0.1
 POST /client/workspaces/:name/preview  json PreviewState (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 GET /client/workspaces/:name/preview  json PreviewState (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 DELETE /client/workspaces/:name/preview  json StatusWord (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+PUT /client/workspaces/:name/recipe  json RecipeReply (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 
 # client listener response types: Type.field: type, from the JSON schema (every refusal is ClientError)
 Availability.reason?: string | null
@@ -106,10 +107,13 @@ KeepReply.commit?: string | null
 KeepReply.files: Array<string>
 PairAccepted.request_id: string
 PairPoll = { status: "pending" } | { status: "denied" } | { status: "expired" } | { client_name: string, token: string, scopes: ClientScopes, status: "approved" }
+PreviewStage.code: string
+PreviewStage.detail: string
 PreviewState.error?: string | null
 PreviewState.hmr_port: integer
 PreviewState.log_tail?: string | null
 PreviewState.port: integer
+PreviewState.stage?: PreviewStage | null
 PreviewState.status: string
 PreviewState.url: string
 PreviewState.workspace: string

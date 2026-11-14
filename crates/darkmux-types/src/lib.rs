@@ -38,6 +38,7 @@ pub mod residency_lock;
 pub mod residency_reservation;
 pub mod run_pause;
 pub mod session_id;
+pub mod sha256;
 pub mod shell;
 pub mod size;
 /// (#2695/#2697/#2698) The single test-isolation guard. Gated the same
