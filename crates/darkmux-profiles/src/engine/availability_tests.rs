@@ -735,8 +735,30 @@ fn a_probe_running_past_the_bound_is_killed() {
         "the fakes ran (a probe and the child it forked, at least): {started:?}"
     );
     for pid in started {
-        let alive = unsafe { libc_kill(pid, 0) } == 0;
-        assert!(!alive, "lms probe {pid} outlived the listing");
+        assert!(gone_soon(pid), "lms probe {pid} outlived the listing");
+    }
+}
+
+/// Whether `pid` is gone, or a zombie, within a second. The listing kills
+/// the probe's whole group before it returns, but the child the fake forked
+/// is not the listing's to reap: orphaned by the kill, it waits for init to
+/// reap it, and until then `kill(pid, 0)` still finds it. A probe left
+/// running is a `sleep 30`, so a second tells the two apart.
+fn gone_soon(pid: i32) -> bool {
+    let until = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let zombie = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim_start().starts_with('Z'))
+            .unwrap_or(false);
+        if unsafe { libc_kill(pid, 0) } != 0 || zombie {
+            return true;
+        }
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
