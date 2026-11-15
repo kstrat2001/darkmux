@@ -36,8 +36,9 @@ pub enum ClientCode {
     /// (#3560) Through the tailnet entry with a valid token (or polling a
     /// pairing), from a tailnet user other than the one the device paired as.
     RemoteIdentityMismatch,
-    /// (#3560) Not sent by this darkmux: pairing over the tailnet shipped in
-    /// the same release as the code that once refused it.
+    /// (#3560) No longer sent: darkmux stopped sending it when pairing over
+    /// the tailnet landed. Kept only because the wire contract only grows
+    /// from 5.0 on.
     RemotePairingUnavailable,
     /// (#3560) Through the tailnet entry, but Tailscale's own record of the
     /// device at the forwarded address names another tailnet user than the

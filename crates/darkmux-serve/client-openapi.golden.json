@@ -767,7 +767,7 @@
           {
             "type": "string",
             "const": "remote_pairing_unavailable",
-            "description": "(#3560) Not sent by this darkmux: pairing over the tailnet shipped in\nthe same release as the code that once refused it."
+            "description": "(#3560) No longer sent: darkmux stopped sending it when pairing over\nthe tailnet landed. Kept only because the wire contract only grows\nfrom 5.0 on."
           },
           {
             "type": "string",
