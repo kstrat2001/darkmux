@@ -1125,6 +1125,11 @@
             "type": "string",
             "const": "remote_tailscale",
             "description": "(#3560) `GET /client/whoami` carries `remote`: whether this machine's\n`client serve` is published on its tailnet (`clients.remote\ntailscale`), at which HTTPS URL, or why not. What the build can do:\n`remote.state` says what this machine did. Reach is not access: a\nrequest that arrives through that URL is still refused until remote\npairing ships."
+          },
+          {
+            "type": "string",
+            "const": "availability_codes",
+            "description": "(#3574) A model's `availability` (`GET /client/profiles`) carries a\n`code` whenever a dispatch refusal fits, the same code that refusal\ncarries (`engine_in_use`, `engine_unavailable`, ...). With this\nlisted, a missing `code` means none fits; without it, the darkmux\npredates codes and an app reads only `reason`."
           }
         ],
         "description": "One thing the client API can do that an app may need to check for."

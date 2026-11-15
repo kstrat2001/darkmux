@@ -673,7 +673,7 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
                            "version": env!("CARGO_PKG_VERSION"),
                            "capabilities": ["clean_preview", "template_workspace", "continues", "clone_preview",
                                             "recipe_set", "workspace_image", "workspace_edit", "workspace_remove",
-                                            "remote_tailscale"],
+                                            "remote_tailscale", "availability_codes"],
                            "remote": {"state": "off", "url": null, "reason": null}})
     );
 }

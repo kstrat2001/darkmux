@@ -160,7 +160,7 @@ impl Availability {
     /// the same reason carries.
     pub fn refused(code: ClientCode, reason: impl Into<String>) -> Self {
         let mut a = Self::unavailable(reason);
-        a.code = Some(code.wire());
+        a.code = Some(code.as_str().to_string());
         a
     }
 }
