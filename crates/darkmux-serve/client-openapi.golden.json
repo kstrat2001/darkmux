@@ -1045,6 +1045,10 @@
               "$ref": "#/components/schemas/ClientCapability"
             },
             "description": "(#3494) Every capability this darkmux's client API has, in\ndeclaration order: exactly what it supports. A darkmux with no\n`capabilities` field is 5.10 or 5.11; `ClientCapability`'s docs say\nwhat each has and how to tell them apart. The preview ones are what\nthe build can do: `preview_disabled` still answers when this machine\nhas previews off."
+          },
+          "remote": {
+            "$ref": "#/components/schemas/ClientRemote",
+            "description": "(#3560) Whether this `client serve` is reached from other devices on\nthe tailnet, decided at its start (`clients.remote`)."
           }
         },
         "required": [
@@ -1052,7 +1056,8 @@
           "scopes",
           "machine",
           "version",
-          "capabilities"
+          "capabilities",
+          "remote"
         ],
         "description": "`GET /client/whoami`."
       },
@@ -1115,9 +1120,60 @@
             "type": "string",
             "const": "workspace_remove",
             "description": "(#3520) `DELETE /client/workspaces/{name}`: a workspace removed, with\nwhat darkmux made for it."
+          },
+          {
+            "type": "string",
+            "const": "remote_tailscale",
+            "description": "(#3560) `GET /client/whoami` carries `remote`: whether this machine's\n`client serve` is published on its tailnet (`clients.remote\ntailscale`), at which HTTPS URL, or why not. What the build can do:\n`remote.state` says what this machine did. Reach is not access: a\nrequest that arrives through that URL is still refused until remote\npairing ships."
           }
         ],
         "description": "One thing the client API can do that an app may need to check for."
+      },
+      "ClientRemote": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/RemoteState"
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The HTTPS URL another device on the tailnet opens, when `available`."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why not, naming the fix, when `unavailable`."
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "description": "(#3560) Where `client serve` stands on the tailnet, as `whoami` reports\nit: what this process did at its start, from `clients.remote`. Reach is\nnot access: until remote pairing ships, a request that arrives through\n`url` is refused like any request not from this machine."
+      },
+      "RemoteState": {
+        "oneOf": [
+          {
+            "type": "string",
+            "const": "off",
+            "description": "`clients.remote` is `off`: this machine only, and the tailnet untouched."
+          },
+          {
+            "type": "string",
+            "const": "available",
+            "description": "Published on the tailnet at `url`."
+          },
+          {
+            "type": "string",
+            "const": "unavailable",
+            "description": "`clients.remote` asks for the tailnet, and `reason` says why it could\nnot be published; `client serve` serves this machine only."
+          }
+        ],
+        "description": "(#3560) `whoami.remote.state`."
       },
       "ClientOpenApi": {
         "description": "(#3494) `GET /client/openapi.json`: this API's OpenAPI 3.1 document,\nbuilt from the route table (`client_openapi`)."

@@ -2489,3 +2489,24 @@ fn the_linux_platform_reads_its_own_shell() {
 fn this_linux_hosts_shell_reads_as_glibc() {
     assert_eq!(LinuxPlatform.c_library(), Some(CLibrary::Glibc));
 }
+
+/// (#3560) Where the overlay network's tool is looked for when `PATH` does
+/// not reach it (a launchd job gets a short `PATH`): on macOS the installs
+/// darkmux has always tried, in order (moved here from darkmux-fleet's
+/// identity provider, unchanged); on Linux none, since its packages install
+/// on every `PATH`; elsewhere what darkmux tried before; a fake answers what
+/// the test sets.
+#[test]
+fn the_overlay_tool_is_looked_for_where_each_platform_installs_it() {
+    let mac = [
+        "/usr/local/bin/tailscale",
+        "/opt/homebrew/bin/tailscale",
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    ];
+    assert_eq!(MacPlatform.overlay_tool_locations(), mac);
+    assert!(LinuxPlatform.overlay_tool_locations().is_empty());
+    assert_eq!(OtherPlatform.overlay_tool_locations(), mac);
+    let fake = crate::fake::FakePlatform { overlay_tool_locations: vec!["/x/t".into()], ..Default::default() };
+    assert_eq!(fake.overlay_tool_locations(), ["/x/t"]);
+    assert!(crate::fake::FakePlatform::default().overlay_tool_locations().is_empty());
+}

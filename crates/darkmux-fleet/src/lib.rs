@@ -5,6 +5,7 @@
 mod identity;
 mod identity_knowledge;
 mod job;
+pub mod overlay;
 mod peer;
 mod roster;
 mod routing;

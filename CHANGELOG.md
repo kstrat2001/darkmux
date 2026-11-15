@@ -19,7 +19,8 @@ darkmux release.
 - **A paired app can ask what this darkmux's client API can do (#3494).** `GET /client/whoami` now
   carries `version` (darkmux's version, for display and diagnostics) and `capabilities`, every
   capability this build has, in a fixed order: `clean_preview`, `template_workspace`, `continues`,
-  `clone_preview`, `recipe_set`, `workspace_image`, `workspace_edit`, `workspace_remove`. An app gates
+  `clone_preview`, `recipe_set`, `workspace_image`, `workspace_edit`, `workspace_remove` (and, with
+  #3560 below, `remote_tailscale`). An app gates
   a feature on its capability, never on the version or on how a handler happens to answer. A darkmux
   that lists capabilities supports exactly those; one with no `capabilities` field is 5.10 (which has
   `clean_preview`, `template_workspace`, `continues`, `workspace_edit`, `workspace_remove`) or 5.11
@@ -27,6 +28,22 @@ darkmux release.
   `GET /client/workspaces/{any}/recipe` is a 405 `method_not_allowed` on 5.11 and a 404 `not_found` on
   5.10. The preview capabilities say what the build can do; `preview_disabled` still answers when this
   machine has previews off. Additive: no field changed.
+- **`darkmux client serve` can be reached over the tailnet (#3560, first of four parts).** A new
+  setting, `clients.remote` (CONFIG 2.10, `DARKMUX_CLIENTS_REMOTE`; `off` or `tailscale`, default
+  `off`), read at `client serve`'s start. With `tailscale`, `client serve` publishes its port on this
+  machine's tailnet over HTTPS (`tailscale serve --bg --https=<port> http://127.0.0.1:<port>`, so a
+  phone reaches `https://<machine>.<tailnet>.ts.net:<port>/`) and removes that entry on shutdown,
+  Ctrl-C included; an entry a killed `client serve` left is removed by the next start on that port.
+  darkmux changes only an entry it recorded publishing (`~/.darkmux/client-remote/<port>.json`) that
+  the tailnet still shows exactly as published, never the operator's other serve entries, and never
+  runs `tailscale` at all with the setting off. It needs Tailscale 1.52 or later, running and logged
+  in, with MagicDNS and HTTPS certificates; otherwise `client serve` still runs on this machine and
+  logs one reason with the fix. `GET /client/whoami` gains `remote` (`{"state": "off" | "available" |
+  "unavailable", "url", "reason"}`), the capability list gains `remote_tailscale`, and `darkmux
+  doctor` gains a `client serve on the tailnet` row. **Reach is not access:** a request that arrives
+  through the tailnet URL is still refused like any request not from this machine, until remote
+  pairing and the tailnet request path ship in the next parts. An older darkmux refuses a config
+  carrying `clients.remote`.
 - **The client API describes itself as OpenAPI 3.1 (#3494).** `GET /client/openapi.json`
   (authenticated as `whoami` is) answers a document built from the client route table: every route's
   path parameters, query, request body and reply, each from its type's JSON schema, the bearer token

@@ -242,6 +242,8 @@ fn run_on(
     checks.extend(check_thermal_governor());
     // What `darkmux client serve` reads on every request (`clients.*`).
     checks.extend(checks_clients::check_clients_settings());
+    // (#3560) What `client serve` does on the tailnet (`clients.remote`).
+    checks.push(checks_clients::check_clients_remote());
     checks.extend(vec![
         check_host_probe(),
         check_quarantined_mirrors(),
@@ -4970,48 +4972,21 @@ const TAILNET_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
 /// and which `check_daemon_reachable_impl` below already guards against with
 /// explicit socket timeouts.
 ///
-/// Poll-and-kill rather than a watchdog thread: `try_wait` keeps ownership of
-/// the child so the kill is guaranteed on every exit path, and the cost is a
-/// few 25ms sleeps in the rare slow case.
+/// (#3560) The tool is found and run the way every darkmux caller runs it
+/// (`darkmux_fleet::overlay`: on `PATH`, else the platform's known install
+/// locations; bounded, killed at the deadline so a wedged tailscaled leaves
+/// no orphan behind us).
 fn tailnet_viewer_url_bounded(
     bind: &str,
     port: u16,
     timeout: std::time::Duration,
 ) -> Option<String> {
-    let mut child = std::process::Command::new("tailscale")
-        .args(["serve", "status", "--json"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                break;
-            }
-            // Still running — give up at the deadline and reap, so a wedged
-            // tailscaled leaves no orphan behind us.
-            Ok(None) if start.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
+    use darkmux_fleet::overlay;
+    let (ok, out, _) = overlay::run_bounded(&overlay::tool_path(), &["serve", "status", "--json"], timeout).ok()?;
+    if !ok {
+        return None;
     }
-
-    let out = child.wait_with_output().ok()?;
-    parse_tailnet_viewer_url(&String::from_utf8_lossy(&out.stdout), bind, port)
+    parse_tailnet_viewer_url(&String::from_utf8_lossy(&out), bind, port)
 }
 
 /// (#1569 packet A) The base URL that linkified CLI output points at — the
@@ -12988,8 +12963,11 @@ mod tests {
         // (#3561) 82: `checks_sandbox::managed_runtime_rows` joined beside the
         // sandbox row, one row per managed runtime (Node, the one darkmux
         // ships).
+        //
+        // (#3560) 83: `checks_clients::check_clients_remote`, the
+        // `clients.remote` row (what `client serve` does on the tailnet).
         let expected =
-            82 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            83 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

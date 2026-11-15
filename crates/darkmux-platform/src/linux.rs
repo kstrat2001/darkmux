@@ -284,6 +284,12 @@ impl Platform for LinuxPlatform {
         crate::SecretStore::PrivateFile
     }
 
+    /// A Linux package installs the tool in `/usr/bin`, on every `PATH`
+    /// (a systemd unit's included), so there is nowhere else to look (#3560).
+    fn overlay_tool_locations(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// `MemTotal` is under the size sold (firmware's share): on the Apple
     /// chips Asahi runs on, every size sold is a multiple of 8 GB.
     fn ram_as_sold_gb(&self) -> Option<u64> {

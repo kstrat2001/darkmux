@@ -157,6 +157,13 @@ pub trait Platform: Send + Sync {
     /// Where darkmux keeps a secret it is handed (an upload token).
     fn secret_store(&self) -> SecretStore;
 
+    /// (#3560) Where the overlay network's command-line tool is installed
+    /// when a process's `PATH` does not reach it, tried in order: a daemon
+    /// started by launchd gets a short `PATH` without `/usr/local/bin`, while
+    /// a shell finds the tool (#2916 review). Empty where the platform's
+    /// packages install it on every `PATH`.
+    fn overlay_tool_locations(&self) -> Vec<String>;
+
     /// (#3453) Where a tool that follows the XDG base-directory layout keeps
     /// per-user data: `$XDG_DATA_HOME` when it is an absolute path, else
     /// `~/.local/share` ([`xdg_data_home_from`]). rec (the Flint engine)
@@ -544,6 +551,16 @@ impl MemorySnapshot {
 /// makes Seatbelt this host's default sandbox, and the Seatbelt backend
 /// runs it.
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+/// (#3560) Where the overlay network's tool is installed on a Mac when no
+/// `PATH` reaches it ([`Platform::overlay_tool_locations`]), in the order
+/// darkmux tries them. Compiled on every OS so each strategy's answer is
+/// tested everywhere.
+pub(crate) const MAC_OVERLAY_TOOL_LOCATIONS: &[&str] = &[
+    "/usr/local/bin/tailscale",
+    "/opt/homebrew/bin/tailscale",
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+];
 
 /// (#3112) The sandbox a host runs isolated work in by default
 /// ([`Platform::default_sandbox`]).

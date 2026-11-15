@@ -202,6 +202,7 @@ pub const CONFIG_SHOWN: &[&str] = &[
     "clients.preview.idle_minutes",
     "clients.pairing.verified_teams",
     "clients.pairing.dialog",
+    "clients.remote",
     "hooks.enabled",
     "hooks.max_outbox_mb",
     "hooks.jq_timeout_ms",

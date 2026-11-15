@@ -13289,8 +13289,13 @@ fn every_enum_setting_is_refused_by_every_cli_entry_point_that_consumes_it() {
                 // `fleet.identity.provider`) are covered in-process by
                 // darkmux-types' `the_serve_preflight_refuses_a_bad_fleet_listener_enum`.
                 Scope::Serve => continue,
-                // `client serve` binds a port too; no enum setting is
-                // scoped to it (its gate is the config.json key walk).
+                // `client serve` binds a port too, so a missing preflight
+                // would hang here rather than fail. Its enum refusals
+                // (`runtime.sandbox`, `clients.remote`) are covered
+                // in-process: `config_cmd::every_enum_setting_obeys_the_rule_on_every_surface`
+                // runs its preflight, and darkmux-serve's
+                // `clients_remote_is_read_at_the_start_and_a_bad_value_refuses`
+                // the read at its start.
                 Scope::ClientServe => continue,
             };
             for args in cases {
@@ -15903,6 +15908,127 @@ fn client_serve_shuts_down_cleanly_on_sigterm_sighup_and_sigint() {
         assert!(said().contains(&format!("stopping ({name})")), "{name}: {}", said());
         assert!(said().contains("previews stopped"), "{name}: the cleanup ran: {}", said());
     }
+}
+
+/// (#3560) A fake `tailscale` for `client serve`'s tailnet tests: answers
+/// `version` and `status --json` as a running, logged-in machine with HTTPS,
+/// keeps its serve configuration in `serve.json` (the operator's own viewer
+/// entry on :80 to start with), applies exactly darkmux's publish and remove
+/// for `port`, refuses anything else, and logs every argument list to
+/// `args.log`. Returns its directory (put it first on `PATH`).
+fn fake_tailnet_tool(dir: &std::path::Path, port: u16) -> std::path::PathBuf {
+    let operator = r#"{"TCP":{"80":{"HTTP":true}},"Web":{"studio.example.ts.net:80":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8765"}}}}}"#;
+    let published = format!(
+        r#"{{"TCP":{{"80":{{"HTTP":true}},"{port}":{{"HTTPS":true}}}},"Web":{{"studio.example.ts.net:80":{{"Handlers":{{"/":{{"Proxy":"http://127.0.0.1:8765"}}}}}},"studio.example.ts.net:{port}":{{"Handlers":{{"/":{{"Proxy":"http://127.0.0.1:{port}"}}}}}}}}}}"#
+    );
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("operator.json"), operator).unwrap();
+    fs::write(dir.join("serve.json"), operator).unwrap();
+    fs::write(dir.join("published.json"), published).unwrap();
+    fs::write(
+        dir.join("status.json"),
+        r#"{"BackendState":"Running","Self":{"DNSName":"studio.example.ts.net."},"CertDomains":["studio.example.ts.net"]}"#,
+    )
+    .unwrap();
+    let d = dir.display();
+    let script = format!(
+        "#!/bin/sh
+d=\"{d}\"
+echo \"$*\" >> \"$d/args.log\"
+case \"$*\" in
+  version) echo 1.102.4 ;;
+  \"status --json\") cat \"$d/status.json\" ;;
+  \"serve status --json\") cat \"$d/serve.json\" ;;
+  \"serve --bg --https={port} http://127.0.0.1:{port}\") cp \"$d/published.json\" \"$d/serve.json\" ;;
+  \"serve --https={port} off\") cp \"$d/operator.json\" \"$d/serve.json\" ;;
+  *) echo \"fake tailscale: unexpected $*\" >&2; exit 2 ;;
+esac
+"
+    );
+    let tool = dir.join("tailscale");
+    fs::write(&tool, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    dir.to_path_buf()
+}
+
+/// (#3560) `client serve` with `clients.remote` = `tailscale` publishes its
+/// port on the tailnet through `tailscale serve` (a fake, first on `PATH`;
+/// nothing here reaches the real tool), removes exactly that entry on
+/// Ctrl-C, and the entry a SIGKILLed one left is reaped by the next start.
+/// With the setting off, the tool is never run. The operator's own entry is
+/// never changed.
+#[test]
+fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed_ones() {
+    let tmp = TempDir::new().unwrap();
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let fake = fake_tailnet_tool(&tmp.path().join("fake"), port);
+    let home = tmp.path().join("darkmux-home");
+    fs::create_dir_all(&home).unwrap();
+    let read = |f: &str| fs::read_to_string(fake.join(f)).unwrap_or_default();
+    let changes = || read("args.log").lines().filter(|l| !l.starts_with("serve status") && l.starts_with("serve ")).map(str::to_string).collect::<Vec<_>>();
+    let spawn = |remote: &str| {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let mut cmd = darkmux_std_cmd();
+        let path = cmd.get_envs().find(|(k, _)| *k == "PATH").and_then(|(_, v)| v).unwrap().to_owned();
+        let mut with_fake = std::ffi::OsString::from(fake.as_os_str());
+        with_fake.push(":");
+        with_fake.push(path);
+        cmd.args(["client", "serve", "--port", &port.to_string()])
+            .env("PATH", with_fake)
+            .env("DARKMUX_HOME", &home)
+            .env("DARKMUX_CLIENTS_REMOTE", remote)
+            .stdout(std::process::Stdio::null())
+            .stderr(log.reopen().unwrap());
+        let mut child = DirectChildGuard(cmd.spawn().expect("spawning darkmux client serve"));
+        let deadline = std::time::Instant::now() + FLEET_TEST_HANG_BOUND;
+        while !fs::read_to_string(log.path()).unwrap_or_default().contains("listening on") {
+            assert!(child.try_wait().unwrap().is_none(), "client serve exited early: {}", fs::read_to_string(log.path()).unwrap());
+            assert!(std::time::Instant::now() < deadline, "client serve never listened");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        (child, log)
+    };
+    let said = |log: &tempfile::NamedTempFile| fs::read_to_string(log.path()).unwrap_or_default();
+    let url = format!("https://studio.example.ts.net:{port}/");
+    let publish = format!("serve --bg --https={port} http://127.0.0.1:{port}");
+    let off = format!("serve --https={port} off");
+
+    // Off: the tool is never run.
+    let (mut child, log) = spawn("off");
+    unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    let (_, status) = exits_within(&mut child, std::time::Duration::from_secs(20)).expect("client serve exits");
+    assert_eq!(status.code(), Some(0), "{}", said(&log));
+    assert_eq!(read("args.log"), "", "off ran the tool: {}", said(&log));
+
+    // On: published, then removed on Ctrl-C.
+    let (mut child, log) = spawn("tailscale");
+    assert!(said(&log).contains(&format!("on the tailnet at {url}")), "{}", said(&log));
+    assert_eq!(changes(), std::slice::from_ref(&publish), "{}", said(&log));
+    unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    let (_, status) = exits_within(&mut child, std::time::Duration::from_secs(20)).expect("client serve exits");
+    assert_eq!(status.code(), Some(0), "{}", said(&log));
+    assert!(said(&log).contains(&format!("removed its tailnet entry ({url})")), "{}", said(&log));
+    assert_eq!(changes(), [publish.clone(), off.clone()]);
+    assert_eq!(read("serve.json"), read("operator.json"), "only darkmux's entry was removed");
+
+    // Killed: its entry stays, with its record; the next start reaps it.
+    let (mut child, _log) = spawn("tailscale");
+    unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+    exits_within(&mut child, std::time::Duration::from_secs(20)).expect("killed");
+    assert_eq!(read("serve.json"), read("published.json"), "a killed client serve leaves its entry");
+    assert!(home.join("client-remote").join(format!("{port}.json")).is_file(), "and its record");
+    let (mut child, log) = spawn("tailscale");
+    assert!(said(&log).contains("removed the tailnet entry a stopped client serve left"), "{}", said(&log));
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let (_, status) = exits_within(&mut child, std::time::Duration::from_secs(20)).expect("client serve exits");
+    assert_eq!(status.code(), Some(0), "{}", said(&log));
+    assert_eq!(changes(), [publish.clone(), off.clone(), publish.clone(), off.clone(), publish, off]);
+    assert_eq!(read("serve.json"), read("operator.json"));
+    assert!(!home.join("client-remote").join(format!("{port}.json")).exists(), "no record left");
 }
 
 /// Spawns `client serve` on an isolated HOME and its own port; returns the

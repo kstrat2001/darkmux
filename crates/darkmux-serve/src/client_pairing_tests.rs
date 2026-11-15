@@ -384,6 +384,7 @@ fn harness() -> Harness {
         notify: Arc::new(|_| {}),
         dialogs: Arc::new(crate::client_trust::DialogSlots::default()),
         body_limits: BodyLimits::default(),
+        remote: ClientRemote::off(),
     };
     let trust = TrustSeams::new();
     let mut state = state;
@@ -671,7 +672,52 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
                            "machine": {"id": "m-0123456789abcdef", "name": "studio"},
                            "version": env!("CARGO_PKG_VERSION"),
                            "capabilities": ["clean_preview", "template_workspace", "continues", "clone_preview",
-                                            "recipe_set", "workspace_image", "workspace_edit", "workspace_remove"]})
+                                            "recipe_set", "workspace_image", "workspace_edit", "workspace_remove",
+                                            "remote_tailscale"],
+                           "remote": {"state": "off", "url": null, "reason": null}})
+    );
+}
+
+/// (#3560) Reach is not access: a request the way `tailscale serve`
+/// forwards one (from loopback, with the tailnet name as `Host` and its
+/// proxy and identity headers) is refused as not from this machine, even
+/// with a paired app's token and with the entry published. Accepting it is
+/// a later PR's, behind identity checks.
+#[tokio::test]
+async fn a_request_through_the_tailnet_entry_is_still_refused() {
+    let mut h = harness();
+    let token = paired(&h).await;
+    h.state.remote = ClientRemote::available("https://studio.example.ts.net:8767/".into());
+    let auth = bearer(&token);
+    for headers in [
+        vec![("host", "studio.example.ts.net:8767"), ("x-forwarded-for", "100.64.0.9"), ("tailscale-user-login", "sam@example.com")],
+        vec![("host", "studio.example.ts.net:8767")],
+        vec![("host", BOUND), ("x-forwarded-for", "100.64.0.9")],
+        vec![("host", BOUND), ("tailscale-user-login", "sam@example.com")],
+    ] {
+        let mut all = headers.clone();
+        all.push(("authorization", auth.as_str()));
+        let (status, v) = call(&h, get("/client/whoami", &all)).await;
+        assert_eq!((status, v["code"].as_str()), (403, Some("not_local")), "{headers:?}: {v}");
+    }
+}
+
+/// (#3560) `whoami.remote` is what this `client serve` did about the
+/// tailnet at its start: published (the URL), or why not (the reason).
+#[tokio::test]
+async fn whoami_says_whether_and_where_client_serve_is_on_the_tailnet() {
+    let mut h = harness();
+    let token = paired(&h).await;
+    let whoami = || get("/client/whoami", &[("authorization", &bearer(&token))]);
+    h.state.remote = ClientRemote::available("https://studio.example.ts.net:8767/".into());
+    assert_eq!(
+        call(&h, whoami()).await.1["remote"],
+        serde_json::json!({"state": "available", "url": "https://studio.example.ts.net:8767/", "reason": null})
+    );
+    h.state.remote = ClientRemote::unavailable("this machine is not logged in to Tailscale (log in)".into());
+    assert_eq!(
+        call(&h, whoami()).await.1["remote"],
+        serde_json::json!({"state": "unavailable", "url": null, "reason": "this machine is not logged in to Tailscale (log in)"})
     );
 }
 
@@ -6341,6 +6387,29 @@ fn clients_preview_idle_minutes_is_read_fresh_and_defaults_to_15() {
     assert!(e.contains("clients.preview.idle_minute"), "{e}");
     std::fs::remove_file(&path).unwrap();
     assert_eq!(read_preview_idle_minutes_at(&path), Ok(15), "no file is 15");
+}
+
+/// (#3560) `clients.remote` is read from `config.json` at the start through
+/// the config gate: absent is off, `tailscale` is read, and a bad value or a
+/// misspelled key refuses the start rather than reading as off.
+#[test]
+#[serial_test::serial]
+fn clients_remote_is_read_at_the_start_and_a_bad_value_refuses() {
+    use darkmux_types::config::ClientsRemote;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    unsafe { std::env::remove_var("DARKMUX_CLIENTS_REMOTE") };
+    assert_eq!(read_remote_setting_at(&path).unwrap(), ClientsRemote::Off, "no file is off");
+    let read = |text: &str| {
+        std::fs::write(&path, text).unwrap();
+        read_remote_setting_at(&path)
+    };
+    assert_eq!(read(r#"{"clients": {"remote": "tailscale"}}"#).unwrap(), ClientsRemote::Tailscale);
+    assert_eq!(read(r#"{"clients": {"remote": "off"}}"#).unwrap(), ClientsRemote::Off);
+    let e = read(r#"{"clients": {"remote": "funnel"}}"#).unwrap_err().to_string();
+    assert!(e.contains("`funnel`") && e.contains("clients.remote"), "{e}");
+    let e = read(r#"{"clients": {"remot": "tailscale"}}"#).unwrap_err().to_string();
+    assert!(e.contains("clients.remot"), "{e}");
 }
 
 #[tokio::test]

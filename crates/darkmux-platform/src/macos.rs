@@ -228,6 +228,13 @@ impl Platform for MacPlatform {
         crate::SecretStore::Keychain
     }
 
+    /// The installs darkmux-fleet's identity provider always tried (moved
+    /// here unchanged, #3560): the standalone package's CLI link, Homebrew's,
+    /// and the Mac app's own binary.
+    fn overlay_tool_locations(&self) -> Vec<String> {
+        crate::MAC_OVERLAY_TOOL_LOCATIONS.iter().map(|p| p.to_string()).collect()
+    }
+
     /// `security -i` reads the command from stdin, so the secret is never on
     /// an argv. It can exit 0 when the command failed: the caller reads back.
     fn store_secret(&self, item: &str, account: &str, secret: &str) -> Result<(), String> {

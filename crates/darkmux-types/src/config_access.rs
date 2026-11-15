@@ -770,6 +770,31 @@ fn clients_preview_enabled_with_source_in(cfg: &DarkmuxConfig) -> (bool, Source)
         None => (false, Source::BuiltIn),
     }
 }
+/// (#3560) `clients.remote` against `cfg` (a `config.json` read fresh), the
+/// env tier still live: `env(DARKMUX_CLIENTS_REMOTE)` > config > `off`. An
+/// unregistered value is refused (contract 9), never read as `off`.
+pub fn clients_remote_with_source_in(
+    cfg: &DarkmuxConfig,
+) -> Result<(crate::config::ClientsRemote, Source), crate::config_enum::BadEnumValue> {
+    let setting = crate::config_enum::setting("clients.remote").expect("clients.remote is registered");
+    let (token, source) = crate::config_enum::resolve_in(setting, cfg, env_str)?;
+    let value = <crate::config::ClientsRemote as crate::config_enum::ConfigEnum>::from_token(token)
+        .expect("a resolved token is a token of the registered enum");
+    Ok((value, source))
+}
+
+/// (#3560) `clients.remote` against this process's config tier.
+pub fn clients_remote() -> Result<crate::config::ClientsRemote, crate::config_enum::BadEnumValue> {
+    clients_remote_with_source().map(|(v, _)| v)
+}
+
+/// [`clients_remote_with_source_in`] against this process's config tier,
+/// for `darkmux doctor`.
+pub fn clients_remote_with_source(
+) -> Result<(crate::config::ClientsRemote, Source), crate::config_enum::BadEnumValue> {
+    resolve_enum("clients.remote")
+}
+
 /// The built-in `clients.preview.idle_minutes`.
 pub const CLIENTS_PREVIEW_IDLE_MINUTES_DEFAULT: u64 = 15;
 /// (#3459) How many minutes a live preview may go without an app asking
@@ -2885,6 +2910,9 @@ mod location_guard {
         ("sandbox_with_source", "an enum value and its tier"),
         ("sandbox_default", "an enum token"),
         ("sandbox_with_source_in", "an enum value and its tier"),
+        ("clients_remote", "an enum value"),
+        ("clients_remote_with_source", "an enum value and its tier"),
+        ("clients_remote_with_source_in", "an enum value and its tier"),
         ("MEMORY_PRESSURE_GATE_DEFAULT", "the default memory pressure gate token, public in the source"),
         ("thermal_resume_at", "an enum value"),
         ("resolved_locations", "the union of LOCATION_ACCESSORS itself"),
@@ -4636,6 +4664,35 @@ mod tests {
                     Some(v) => std::env::set_var(k, v),
                     None => std::env::remove_var(k),
                 }
+            }
+        }
+    }
+
+    /// (#3560) `clients.remote`: `env(DARKMUX_CLIENTS_REMOTE)` > config >
+    /// `off`, against a given config (what `client serve` reads at its
+    /// start), and an unregistered value is refused, never read as off.
+    #[serial_test::serial]
+    #[test]
+    fn clients_remote_is_env_then_config_then_off() {
+        use crate::config::ClientsRemote;
+        let key = "DARKMUX_CLIENTS_REMOTE";
+        let prev = std::env::var(key).ok();
+        unsafe { std::env::remove_var(key) };
+        let with = |v: &str| crate::config::DarkmuxConfig {
+            clients: Some(crate::config::ClientsConfig { remote: Some(v.to_string()), ..Default::default() }),
+            ..Default::default()
+        };
+        let unset = crate::config::DarkmuxConfig::default();
+        assert_eq!(clients_remote_with_source_in(&unset), Ok((ClientsRemote::Off, Source::BuiltIn)));
+        assert_eq!(clients_remote_with_source_in(&with("tailscale")), Ok((ClientsRemote::Tailscale, Source::Config)));
+        let bad = clients_remote_with_source_in(&with("lan")).unwrap_err();
+        assert_eq!(bad.raw, "lan");
+        unsafe { std::env::set_var(key, "off") };
+        assert_eq!(clients_remote_with_source_in(&with("tailscale")), Ok((ClientsRemote::Off, Source::Env)));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
             }
         }
     }

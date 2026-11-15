@@ -784,6 +784,7 @@ dependencies = [
  "blake3",
  "darkmux-crew",
  "darkmux-flow",
+ "darkmux-platform",
  "darkmux-profiles",
  "darkmux-types",
  "schemars 1.2.2",

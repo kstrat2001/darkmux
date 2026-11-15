@@ -466,7 +466,13 @@ use std::path::Path;
 //           `init`: the right value depends on the platform, so a literal
 //           would be wrong somewhere (the `container_user` rule). An older
 //           binary refuses a config carrying it.
-pub const CONFIG_SCHEMA_VERSION: &str = "2.9";
+//   2.10 (#3560): additive `clients.remote` (`DARKMUX_CLIENTS_REMOTE`;
+//           `off` or `tailscale`, default `off`), how `darkmux client serve`
+//           is reached from another device: with `tailscale`, its port is
+//           published on this machine's tailnet over HTTPS by `tailscale
+//           serve`, and removed on shutdown. An older binary refuses a
+//           config carrying it.
+pub const CONFIG_SCHEMA_VERSION: &str = "2.10";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
 /// that this one does not. The unknown-key gate (`user_files`) names it with
@@ -1901,6 +1907,14 @@ pub struct ClientsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub preview: Option<ClientsPreviewConfig>,
     /// (#3544) How a pairing request is approved — see [`ClientsPairingConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")] pub pairing: Option<ClientsPairingConfig>,
+    /// (CONFIG 2.10, #3560) How `client serve` is reached from another
+    /// device ([`ClientsRemote`]): absent or `off`, from this machine only;
+    /// `tailscale`, its port is also published on this machine's tailnet over
+    /// HTTPS (`tailscale serve`), and removed again on shutdown. Read at
+    /// `client serve`'s start. Reach is not access: until remote pairing
+    /// ships, the request gate still refuses every request that is not from
+    /// this machine. `darkmux config set clients.remote tailscale`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub remote: Option<String>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -2297,6 +2311,21 @@ crate::config_enum!(SandboxKind, "sandbox", [
     Docker = "docker" => "a Docker container: needs Docker installed and its daemon running",
     Seatbelt = "seatbelt" => "macOS Seatbelt (sandbox-exec): part of macOS, nothing to install",
     Landlock = "landlock" => "Linux namespaces and Landlock: part of the kernel (Landlock ABI 6, Linux 6.12, and unprivileged user namespaces), nothing to install",
+]);
+
+/// (#3560) `clients.remote`: how `darkmux client serve` is reached from
+/// another device. Only `off` adds nothing; every other value names the
+/// overlay network whose own tool publishes the client port, so a new
+/// method is a new value, never a new key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientsRemote {
+    Off,
+    Tailscale,
+}
+
+crate::config_enum!(ClientsRemote, "remote reach", [
+    Off = "off" => "client serve is reached from this machine only, and darkmux never touches the tailnet's configuration",
+    Tailscale = "tailscale" => "client serve also publishes its port on this machine's tailnet over HTTPS (`tailscale serve`), removed on shutdown; requests that arrive through it are still refused until remote pairing ships",
 ]);
 
 /// (#3538) `runtime.memory.pressure_gate`: the memory pressure at which

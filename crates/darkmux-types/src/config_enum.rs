@@ -927,6 +927,9 @@ fn read_memory_pressure_gate(c: &DarkmuxConfig) -> Option<&str> {
 fn read_sandbox(c: &DarkmuxConfig) -> Option<&str> {
     c.runtime.as_ref()?.sandbox.as_deref()
 }
+fn read_clients_remote(c: &DarkmuxConfig) -> Option<&str> {
+    c.clients.as_ref()?.remote.as_deref()
+}
 fn read_fleet_mode(c: &DarkmuxConfig) -> Option<&str> {
     c.fleet.as_ref()?.mode.as_deref()
 }
@@ -1043,6 +1046,15 @@ pub static ENUM_SETTINGS: &[EnumSetting] = &[
         "refuse",
         &[Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun, Scope::FleetSubmission, Scope::Serve],
         read_fleet_busy_policy,
+    ),
+    // (#3560) Read by `client serve` at its start, the only process that
+    // publishes (or removes) the client port's tailnet entry.
+    EnumSetting::of::<crate::config::ClientsRemote>(
+        "clients.remote",
+        Some("DARKMUX_CLIENTS_REMOTE"),
+        "off",
+        &[Scope::ClientServe],
+        read_clients_remote,
     ),
     // (#2947 review C2) A typo here used to match nothing, silently.
     EnumSetting::each::<crate::config::HookLevel>("hooks.rules[].match.level", &[], read_hook_match_levels)
@@ -1561,6 +1573,25 @@ mod tests {
         let bad = bad_in(s, &config_with_value(s, "podman"), no_env);
         assert_eq!(bad.len(), 1);
         assert!(bad[0].to_string().contains("runtime.sandbox"), "{}", bad[0]);
+    }
+
+    /// (#3560) `clients.remote` decides whether `client serve` is reached
+    /// from another device: `DARKMUX_CLIENTS_REMOTE` over the key, `off`
+    /// (the default, the same on every machine) or `tailscale`, refused by
+    /// `client serve`, the one entry point that reads it.
+    #[test]
+    fn the_clients_remote_setting_is_registered_off_by_default() {
+        let s = setting("clients.remote").expect("clients.remote is registered");
+        assert_eq!(s.env, Some("DARKMUX_CLIENTS_REMOTE"));
+        assert_eq!(s.rust_name, "ClientsRemote");
+        assert_eq!(s.tokens_joined(), "off, tailscale");
+        assert_eq!(s.scopes, &[Scope::ClientServe][..]);
+        assert!(!s.shipped_by_host(), "off is the default everywhere");
+        assert_eq!(s.shipped(), Some("off"));
+        let bad = bad_in(s, &config_with_value(s, "funnel"), no_env);
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].to_string().contains("clients.remote") && bad[0].to_string().contains("`funnel`"), "{}", bad[0]);
+        assert!(bad_in(s, &config_with_value(s, "Tailscale"), no_env).is_empty(), "case-insensitive");
     }
 
     /// `docs/ENVIRONMENT.md`'s row for each setting carries the value list

@@ -97,6 +97,47 @@ pub struct Whoami {
     /// the build can do: `preview_disabled` still answers when this machine
     /// has previews off.
     pub capabilities: Vec<darkmux_types::client_capability::ClientCapability>,
+    /// (#3560) Whether this `client serve` is reached from other devices on
+    /// the tailnet, decided at its start (`clients.remote`).
+    pub remote: ClientRemote,
+}
+
+/// (#3560) Where `client serve` stands on the tailnet, as `whoami` reports
+/// it: what this process did at its start, from `clients.remote`. Reach is
+/// not access: until remote pairing ships, a request that arrives through
+/// `url` is refused like any request not from this machine.
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ClientRemote {
+    pub state: RemoteState,
+    /// The HTTPS URL another device on the tailnet opens, when `available`.
+    pub url: Option<String>,
+    /// Why not, naming the fix, when `unavailable`.
+    pub reason: Option<String>,
+}
+
+/// (#3560) `whoami.remote.state`.
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteState {
+    /// `clients.remote` is `off`: this machine only, and the tailnet untouched.
+    Off,
+    /// Published on the tailnet at `url`.
+    Available,
+    /// `clients.remote` asks for the tailnet, and `reason` says why it could
+    /// not be published; `client serve` serves this machine only.
+    Unavailable,
+}
+
+impl ClientRemote {
+    pub fn off() -> Self {
+        ClientRemote { state: RemoteState::Off, url: None, reason: None }
+    }
+    pub fn available(url: String) -> Self {
+        ClientRemote { state: RemoteState::Available, url: Some(url), reason: None }
+    }
+    pub fn unavailable(reason: String) -> Self {
+        ClientRemote { state: RemoteState::Unavailable, url: None, reason: Some(reason) }
+    }
 }
 
 /// (#3494) `GET /client/openapi.json`: this API's OpenAPI 3.1 document,

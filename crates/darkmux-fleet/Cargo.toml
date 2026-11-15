@@ -12,6 +12,8 @@ rust-version = "1.89"
 
 [dependencies]
 darkmux-types = { path = "../darkmux-types" }
+# (#3560) Where the overlay network's tool is installed (`overlay::tool_path`).
+darkmux-platform = { path = "../darkmux-platform" }
 darkmux-flow = { path = "../darkmux-flow" }
 darkmux-crew = { path = "../darkmux-crew" }
 anyhow = "1.0"
