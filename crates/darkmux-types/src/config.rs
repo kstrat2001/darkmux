@@ -1913,9 +1913,10 @@ pub struct ClientsConfig {
     /// an entry its own record proves an earlier run left);
     /// `tailscale`, its port is also published on this machine's tailnet over
     /// HTTPS (`tailscale serve`), and removed again on shutdown. Read at
-    /// `client serve`'s start. Reach is not access: until remote pairing
-    /// ships, the request gate still refuses every request that is not from
-    /// this machine. `darkmux config set clients.remote tailscale`.
+    /// `client serve`'s start. A request through the tailnet entry is
+    /// answered only for a paired device: its bearer token, from the tailnet
+    /// user recorded for it at pairing. `darkmux config set clients.remote
+    /// tailscale`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub remote: Option<String>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
@@ -2327,7 +2328,7 @@ pub enum ClientsRemote {
 
 crate::config_enum!(ClientsRemote, "remote reach", [
     Off = "off" => "client serve is reached from this machine only: it never publishes, and runs `tailscale` only to remove an entry its own record proves an earlier client serve left",
-    Tailscale = "tailscale" => "client serve also publishes its port on this machine's tailnet over HTTPS (`tailscale serve`), removed on shutdown; requests that arrive through it are still refused until remote pairing ships",
+    Tailscale = "tailscale" => "client serve also publishes its port on this machine's tailnet over HTTPS (`tailscale serve`), removed on shutdown; a request through it is answered only for a paired device, with its token, from the tailnet user it paired as",
 ]);
 
 /// (#3538) `runtime.memory.pressure_gate`: the memory pressure at which

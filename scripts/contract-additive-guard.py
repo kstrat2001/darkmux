@@ -64,8 +64,28 @@ def show(root, ref, path):
     return r.stdout if r.returncode == 0 else None
 
 
-def line_members(text):
+ROUTE_LINE = re.compile(r"^([A-Z]+ /\S*  .*?) \((.*)\)$")
+
+
+def route_member(ln):
+    """A route-table route line as a wire member: method, path, kind and
+    reply type, plus the listener its trailing note names (the note's text
+    before its first colon, `client listener` in `(client listener:
+    127.0.0.1, ...)`). The rest of the note describes the route and is not
+    wire, so rewording it is no removal; moving the route to another
+    listener is. A note with no colon is kept whole, as before."""
+    m = ROUTE_LINE.match(ln)
+    if not m:
+        return ln
+    head, note = m.groups()
+    return f"{head} ({note.split(':', 1)[0]}: ...)" if ":" in note else ln
+
+
+def line_members(text, routes=False):
     """(line number, member) for a golden file.
+
+    With `routes` (the route-table golden), a route line's trailing note
+    counts only for the listener it names ([`route_member`]).
 
     An indented line is a field of the unindented header above it, and its
     member names that header, so a field moved to another type is a removal
@@ -88,7 +108,7 @@ def line_members(text):
             continue
         header = ln.split(" = ")[0].strip()
         if " = " not in ln:
-            out.append((i, norm(ln)))
+            out.append((i, norm(route_member(ln) if routes else ln)))
             continue
         out.extend((i, m) for m in union_members(header, ln.split(" = ", 1)[1]))
     return out
@@ -231,10 +251,11 @@ def violations(root, base):
         if new is None:
             found.append(f"{path}: the file was deleted")
             continue
+        routes = path == "crates/darkmux-serve/route-table.golden"
         remaining = {}
-        for _, ln in line_members(new):
+        for _, ln in line_members(new, routes):
             remaining[ln] = remaining.get(ln, 0) + 1
-        for num, ln in line_members(old):
+        for num, ln in line_members(old, routes):
             if remaining.get(ln, 0) > 0:
                 remaining[ln] -= 1
             else:
@@ -298,7 +319,9 @@ BASE_FILES = {
         'Mode = "a" | "b"\nTypeA\n  f: string\nTypeB\n  g: string\n'
     ),
     "crates/darkmux-serve/route-table.golden": (
-        "GET /health  json HealthResponse\n\n# response types\nHealthResponse.build: string\n"
+        "GET /health  json HealthResponse\n"
+        "GET /client/whoami  json Whoami (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)\n"
+        "\n# response types\nHealthResponse.build: string\n"
         'WorkState = { status: "running" } | { error: string, reason: string, status: "error" }\n'
         'Plain = { a: string, b: number } | "x"\n'
     ),
@@ -339,7 +362,7 @@ RT = "crates/darkmux-serve/route-table.golden"
 
 def _rt(work_state, plain='Plain = { a: string, b: number } | "x"\n'):
     """The base route golden with its two union lines replaced."""
-    return "GET /health  json HealthResponse\n\n# response types\nHealthResponse.build: string\n" + work_state + plain
+    return BASE_FILES[RT].split("WorkState = ")[0] + work_state + plain
 
 
 def self_test():
@@ -398,6 +421,18 @@ def self_test():
             'WorkState = { status: "running" } | { error: string, reason: string, status: "error" }\n',
             'Plain = { a: string, b: number } | "x" | "y"\n',
         )}, [], 0),
+        ("a route note reworded, same listener, passes", {RT: BASE_FILES[RT].replace(
+            "this machine's apps only", "this machine's apps and paired devices through its tailnet entry"
+        )}, [], 0),
+        ("a route moved to another listener fails", {RT: BASE_FILES[RT].replace(
+            "(client listener: 127.0.0.1", "(fleet listener: 127.0.0.1"
+        )}, [], 1),
+        ("a noted route's reply type changed fails", {RT: BASE_FILES[RT].replace(
+            "json Whoami (client", "json WhoamiV2 (client"
+        )}, [], 1),
+        ("a cli-json line is still compared whole", {
+            "tests/cli-json.golden": BASE_FILES["tests/cli-json.golden"].replace("flow status  FlowStatus", "flow status  FlowStatus (a note)"),
+        }, [], 1),
         ("a removal with the breaking-v6 label passes", {
             "crates/darkmux-serve/route-table.golden": "GET /health  json HealthResponse\n\n# response types\n",
         }, [BREAKING_LABEL], 0),

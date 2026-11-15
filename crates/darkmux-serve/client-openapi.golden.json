@@ -3,7 +3,7 @@
   "info": {
     "title": "darkmux client API",
     "version": "<darkmux version>",
-    "description": "`darkmux client serve`: 127.0.0.1 only, for apps on this machine. Every route but the pairing ones takes the token a pairing delivered. An app gates a feature on `GET /client/whoami`'s `capabilities`, never on `version`."
+    "description": "`darkmux client serve`: listens on 127.0.0.1 only. With `clients.remote` set to `tailscale`, it is also reached through this machine's `tailscale serve` entry, where a request is answered only with a paired device's token and the tailnet login that device paired as. Every route but the pairing ones takes the token a pairing delivered. An app gates a feature on `GET /client/whoami`'s `capabilities`, never on `version`."
   },
   "security": [
     {
@@ -746,6 +746,31 @@
           },
           {
             "type": "string",
+            "const": "not_forwarded",
+            "description": "(#3560) Not from an app on this machine, and not through the tailnet\nentry this `client serve` published either (another proxy, or a\n`Host` other than the entry's name and port). Only answered while\nthe entry is up (`whoami.remote.state` `available`); otherwise such a\nrequest is `not_local`."
+          },
+          {
+            "type": "string",
+            "const": "not_paired_remotely",
+            "description": "(#3560) Through the tailnet entry with a valid token, but the token's\npairing recorded no tailnet identity (it was paired on the Mac): the\ndevice must pair over the tailnet. The token still works on the Mac."
+          },
+          {
+            "type": "string",
+            "const": "remote_identity_missing",
+            "description": "(#3560) Through the tailnet entry with a valid token, but Tailscale\nnamed no tailnet user for the request: a tagged device (Tailscale\nsends no user for one), or a login that is not valid UTF-8 (sent\nempty). A Funnel request never gets here: it is `not_forwarded`."
+          },
+          {
+            "type": "string",
+            "const": "remote_identity_mismatch",
+            "description": "(#3560) Through the tailnet entry with a valid token, from a tailnet\nuser other than the one the device paired as."
+          },
+          {
+            "type": "string",
+            "const": "remote_pairing_unavailable",
+            "description": "(#3560) A pairing route (`POST /client/pair`, its poll) through the\ntailnet entry: pairing over the tailnet is not in this darkmux yet."
+          },
+          {
+            "type": "string",
             "const": "not_found",
             "description": "No such route, id or workspace."
           },
@@ -1049,6 +1074,10 @@
           "remote": {
             "$ref": "#/components/schemas/ClientRemote",
             "description": "(#3560) Whether this `client serve` is reached from other devices on\nthe tailnet, decided at its start (`clients.remote`)."
+          },
+          "via": {
+            "$ref": "#/components/schemas/RequestVia",
+            "description": "(#3560) How this request reached `client serve`: from an app on this\nmachine, or from a paired device through the tailnet entry."
           }
         },
         "required": [
@@ -1057,7 +1086,8 @@
           "machine",
           "version",
           "capabilities",
-          "remote"
+          "remote",
+          "via"
         ],
         "description": "`GET /client/whoami`."
       },
@@ -1124,7 +1154,7 @@
           {
             "type": "string",
             "const": "remote_tailscale",
-            "description": "(#3560) `GET /client/whoami` carries `remote`: whether this machine's\n`client serve` is published on its tailnet (`clients.remote\ntailscale`), at which HTTPS URL, or why not. What the build can do:\n`remote.state` says what this machine did. Reach is not access: a\nrequest that arrives through that URL is still refused until remote\npairing ships."
+            "description": "(#3560) `GET /client/whoami` carries `remote`: whether this machine's\n`client serve` is published on its tailnet (`clients.remote\ntailscale`), at which HTTPS URL, or why not. What the build can do:\n`remote.state` says what this machine did."
           },
           {
             "type": "string",
@@ -1158,7 +1188,7 @@
         "required": [
           "state"
         ],
-        "description": "(#3560) Where `client serve` stands on the tailnet, as `whoami` reports\nit: what this process did at its start, from `clients.remote`. Reach is\nnot access: until remote pairing ships, a request that arrives through\n`url` is refused like any request not from this machine."
+        "description": "(#3560) Where `client serve` stands on the tailnet, as `whoami` reports\nit: what this process did at its start, from `clients.remote`. A request\nthrough `url` is answered only for a paired device: its token, and the\ntailnet user it paired as (`RequestVia::Tailnet`)."
       },
       "RemoteState": {
         "oneOf": [
@@ -1179,6 +1209,21 @@
           }
         ],
         "description": "(#3560) `whoami.remote.state`."
+      },
+      "RequestVia": {
+        "oneOf": [
+          {
+            "type": "string",
+            "const": "local",
+            "description": "From an app on this machine."
+          },
+          {
+            "type": "string",
+            "const": "tailnet",
+            "description": "From a paired device on the tailnet, through `remote.url`: its token\nchecked, and its tailnet user the one it paired as."
+          }
+        ],
+        "description": "(#3560) `whoami.via`: how the request reached `client serve`."
       },
       "ClientOpenApi": {
         "description": "(#3494) `GET /client/openapi.json`: this API's OpenAPI 3.1 document,\nbuilt from the route table (`client_openapi`)."

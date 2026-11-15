@@ -58,9 +58,7 @@ pub enum ClientCapability {
     /// (#3560) `GET /client/whoami` carries `remote`: whether this machine's
     /// `client serve` is published on its tailnet (`clients.remote
     /// tailscale`), at which HTTPS URL, or why not. What the build can do:
-    /// `remote.state` says what this machine did. Reach is not access: a
-    /// request that arrives through that URL is still refused until remote
-    /// pairing ships.
+    /// `remote.state` says what this machine did.
     RemoteTailscale,
     /// (#3574) A model's `availability` (`GET /client/profiles`) carries a
     /// `code` whenever a dispatch refusal fits, the same code that refusal

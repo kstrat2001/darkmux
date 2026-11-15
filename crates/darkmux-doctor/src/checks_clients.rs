@@ -160,7 +160,8 @@ pub(crate) fn off_check(
 
 /// The remote row once the network can carry the entry.
 fn tailnet_ready_check(from: &str, seen: &RemoteLook) -> Check {
-    const NOT_ACCESS: &str = "reach, not access: a request through it is refused until remote pairing ships";
+    const NOT_ACCESS: &str =
+        "a request through it is answered only for a paired device, with its token, from the tailnet user it paired as";
     let dns = seen.net.dns_name.as_deref().unwrap_or_default();
     if let Some(warn) = seen.published.iter().find_map(|(e, shown)| record_problem(from, dns, e, shown)) {
         return warn;
@@ -356,7 +357,7 @@ mod tests {
         let ready = remote_check(on.clone(), Vec::new(), look(vec![]));
         assert_eq!(ready.status, Status::Pass, "{ready:?}");
         assert!(ready.message.starts_with("tailscale (from config.json)"), "{ready:?}");
-        assert!(ready.message.contains("https://laptop.example.ts.net:<port>/") && ready.message.contains("refused"), "{ready:?}");
+        assert!(ready.message.contains("https://laptop.example.ts.net:<port>/") && ready.message.contains("paired device, with its token"), "{ready:?}");
 
         let live = remote_check(on.clone(), rec.clone(), look(vec![(entry.clone(), Shown::Exactly)]));
         assert_eq!(live.status, Status::Pass, "{live:?}");

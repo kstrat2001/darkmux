@@ -15996,17 +15996,52 @@ fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed
     let publish = format!("serve --bg --https={port} http://127.0.0.1:{port}");
     let off = format!("serve --https={port} --set-path=/ off");
 
-    // Off: the tool is never run.
+    // (#3560) A paired device whose pairing recorded its tailnet user: a
+    // request as `tailscale serve` forwards it, sent straight to loopback
+    // (no real tool runs), with that device's token.
+    let token = "ab".repeat(32);
+    let clients = serde_json::json!({
+        "schema_version": "1.3",
+        "clients": [{"name": "phone", "id": "c-0000000000000001", "created": 1,
+                     "token_hash": blake3::hash(token.as_bytes()).to_hex().to_string(),
+                     "tailnet": {"login": "sam@example.com"}}],
+    });
+    fs::write(home.join("clients.json"), clients.to_string()).unwrap();
+    let whoami = |bearer: Option<&str>| {
+        use std::io::{Read, Write};
+        let host = format!("studio.example.ts.net:{port}");
+        let auth = bearer.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            s,
+            "GET /client/whoami HTTP/1.1\r\nHost: {host}\r\nX-Forwarded-Host: {host}\r\nX-Forwarded-Proto: https\r\n\
+             X-Forwarded-For: 100.64.1.2\r\nTailscale-User-Login: sam@example.com\r\n{auth}Connection: close\r\n\r\n"
+        )
+        .unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(15))).unwrap();
+        let mut reply = String::new();
+        let _ = s.read_to_string(&mut reply);
+        reply
+    };
+
+    // Off: the tool is never run, and the tailnet request is not this machine's.
     let (mut child, log) = spawn("off");
+    let reply = whoami(Some(&token));
+    assert!(reply.starts_with("HTTP/1.1 403") && reply.contains(r#""code":"not_local""#), "{reply}");
     unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
     let (_, status) = exits_within(&mut child, std::time::Duration::from_secs(20)).expect("client serve exits");
     assert_eq!(status.code(), Some(0), "{}", said(&log));
     assert_eq!(read("args.log"), "", "off ran the tool: {}", said(&log));
 
-    // On: published, then removed on Ctrl-C.
+    // On: published; the paired device is answered through it, never
+    // without its token; then removed on Ctrl-C.
     let (mut child, log) = spawn("tailscale");
     assert!(said(&log).contains(&format!("on the tailnet at {url}")), "{}", said(&log));
     assert_eq!(changes(), std::slice::from_ref(&publish), "{}", said(&log));
+    let reply = whoami(Some(&token));
+    assert!(reply.starts_with("HTTP/1.1 200") && reply.contains(r#""via":"tailnet""#), "{reply}\n{}", said(&log));
+    let reply = whoami(None);
+    assert!(reply.starts_with("HTTP/1.1 401") && reply.contains(r#""code":"unauthorized""#), "{reply}");
     unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
     let (_, status) = exits_within(&mut child, std::time::Duration::from_secs(20)).expect("client serve exits");
     assert_eq!(status.code(), Some(0), "{}", said(&log));
