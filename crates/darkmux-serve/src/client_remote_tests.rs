@@ -166,7 +166,8 @@ fn off_with_a_record_and_no_readable_name_removes_nothing() {
 }
 
 /// (#3560 review) Off with a record whose entry the operator has since
-/// changed: one status read, nothing removed, the record dropped.
+/// changed: the name read and one serve status read, nothing removed, the
+/// record dropped.
 #[test]
 fn off_leaves_an_entry_that_changed_since_its_record() {
     let changed = with(
