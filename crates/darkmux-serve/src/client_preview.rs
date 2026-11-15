@@ -259,7 +259,8 @@ pub const MAX_RECIPE_BYTES: u64 = 16 * 1024;
 /// A `.darkmux/preview.json`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, schemars::JsonSchema)]
 pub struct Recipe {
-    /// The recipe format's version ([`PREVIEW_RECIPE_SCHEMA_VERSION`]).
+    /// The recipe format's version; one newer than this darkmux reads is
+    /// refused.
     pub schema_version: String,
     pub command: String,
     #[serde(default)]

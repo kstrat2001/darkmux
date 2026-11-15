@@ -128,6 +128,7 @@ use serde_json::Value;
 
 use crate::client_git::WorkCopy;
 use crate::client_wire::*;
+use darkmux_types::client_capability::ClientCapability;
 use darkmux_types::client_code::ClientCode;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -1948,9 +1949,9 @@ fn clean_text(s: &str, field: &str, min: usize, max: usize) -> Result<(), Refuse
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct PairBody {
+pub(crate) struct PairBody {
     device_name: String,
     code: String,
     pair_secret: String,
@@ -1958,6 +1959,7 @@ struct PairBody {
     /// a paired app may run is this machine's `clients.profiles`.
     #[serde(default)]
     #[allow(dead_code)]
+    #[schemars(with = "Option<serde_json::Value>")]
     scopes: Option<serde::de::IgnoredAny>,
 }
 
@@ -2241,7 +2243,7 @@ impl ClientMachine {
 
 pub use crate::client_profiles::ClientProfileInfo;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub(crate) struct ProfilesQuery {
     role: Option<String>,
 }
@@ -2253,13 +2255,17 @@ pub(crate) struct ProfilesQuery {
 /// an app picks among these per run.
 pub(crate) async fn profiles_handler(
     State(state): State<ClientServerState>,
-    query: axum::extract::Query<ProfilesQuery>,
+    query: Result<axum::extract::Query<ProfilesQuery>, axum::extract::rejection::QueryRejection>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = authenticate(&state, &headers) {
         return *r;
     }
-    let role = query.role.clone().unwrap_or_else(|| "coder".to_string());
+    let query = match query {
+        Ok(axum::extract::Query(q)) => q,
+        Err(e) => return err(StatusCode::BAD_REQUEST, ClientCode::BadRequest, e.body_text()),
+    };
+    let role = query.role.unwrap_or_else(|| "coder".to_string());
     let names = match listable_profiles(&state, &role) {
         Ok(names) => names,
         Err(r) => return *r,
@@ -2336,9 +2342,20 @@ pub(crate) async fn whoami_handler(State(state): State<ClientServerState>, heade
                 client_name: client.name,
                 scopes: ClientScopes::of(&policy),
                 machine: state.machine.clone(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                capabilities: ClientCapability::ALL.to_vec(),
             })
             .into_response()
         }
+        Err(r) => *r,
+    }
+}
+
+/// (#3494) `GET /client/openapi.json`: the API's OpenAPI 3.1 document,
+/// authenticated as `whoami` is.
+pub(crate) async fn openapi_handler(State(state): State<ClientServerState>, headers: HeaderMap) -> Response {
+    match authenticate(&state, &headers) {
+        Ok(_) => Json(crate::client_openapi::served()).into_response(),
         Err(r) => *r,
     }
 }
@@ -2350,9 +2367,9 @@ fn checked_workdir(state: &ClientServerState, w: &str) -> Result<PathBuf, Refuse
     (state.check_workdir)(Path::new(w)).map_err(|e| refuse(StatusCode::FORBIDDEN, ClientCode::Forbidden, e))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct WorkBody {
+pub(crate) struct WorkBody {
     role: String,
     message: String,
     /// Absent or null: resolved as `darkmux dispatch <role>` would.
@@ -2878,7 +2895,7 @@ fn work_title(req: &WorkBody) -> String {
 
 pub use crate::client_preview::MAX_RECIPE_BYTES;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub(crate) struct RecipeQuery {
     #[serde(default)]
     workdir: Option<String>,
@@ -2901,7 +2918,8 @@ pub(crate) async fn recipe_handler(
     };
     let q = match query {
         Ok(axum::extract::Query(q)) if q.workdir.is_some() != q.workspace.is_some() => q,
-        _ => {
+        Err(e) => return err(StatusCode::BAD_REQUEST, ClientCode::BadRequest, e.body_text()),
+        Ok(_) => {
             return err(
                 StatusCode::BAD_REQUEST, ClientCode::BadRequest,
                 "one of the `workdir` or `workspace` query parameters is required",
@@ -3017,9 +3035,9 @@ fn workspace_json(state: &ClientServerState, name: &str, dir: &Path, created: bo
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct WorkspaceBody {
+pub(crate) struct WorkspaceBody {
     /// Clone (or reuse a checkout of) this repo.
     #[serde(default)]
     repo_url: Option<String>,
@@ -3829,9 +3847,15 @@ pub(crate) async fn preview_start_handler(
 
 /// (#3571) `PUT /client/workspaces/{name}/recipe`'s body: the recipe the
 /// user approved for a clone whose repo has none.
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct RecipeSetBody {
+pub(crate) struct RecipeSetBody {
+    /// A `.darkmux/preview.json`, checked as strictly as one in a checkout
+    /// and refused (422 `recipe_invalid`) unless it holds: no key the
+    /// recipe format does not know, a `schema_version` this darkmux reads,
+    /// no `env_from_source` (a clone has no checkout of yours to copy from),
+    /// and at most 16 KB (16384 bytes) as JSON.
+    #[schemars(with = "crate::client_preview::Recipe")]
     recipe: serde_json::Value,
 }
 
@@ -3996,9 +4020,9 @@ fn previews_run_here(state: &ClientServerState) -> Result<darkmux_sandbox::Backe
 }
 
 /// (#3484) `POST /client/workspaces/{name}/preview`'s optional body.
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct PreviewStartBody {
+pub(crate) struct PreviewStartBody {
     /// Stop the preview, delete its install record and the recipe's
     /// `install.unless_exists` path in the workspace, then start it: a fresh
     /// install.
@@ -4341,9 +4365,9 @@ pub(crate) async fn workspace_remove_handler(
     .unwrap_or_else(|e| internal(anyhow!("workspace removal panicked: {e}")))
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct RemoveBody {
+pub(crate) struct RemoveBody {
     /// Also remove what holds commits nothing else does.
     #[serde(default)]
     force: bool,
@@ -4597,14 +4621,14 @@ pub const MAX_EDIT_NEW_CHARS: usize = 10_000;
 /// A tracked file larger than this is not searched (a bundle, a lockfile).
 const MAX_EDIT_FILE_BYTES: u64 = 1024 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct EditBody {
+pub(crate) struct EditBody {
     /// The text as the page shows it (whitespace is collapsed for the match).
     old: String,
     /// The text the page is to show instead: written as sent, except that
-    /// in a markup file what would read as markup is written as text
-    /// ([`crate::client_edit::as_source`]).
+    /// in a markup file what would read as markup is written as text,
+    /// escaped.
     new: String,
 }
 
@@ -5020,9 +5044,9 @@ const MAX_IMAGE_BODY_BYTES: usize = {
     base64 * 2 + base64.div_ceil(64) * 4 + 64 * 1024
 };
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ImageBody {
+pub(crate) struct ImageBody {
     /// The picked file's name: only a hint for the name darkmux gives it.
     name: String,
     /// The image's bytes, base64.

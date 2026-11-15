@@ -14,6 +14,36 @@ darkmux release.
 
 ## [Unreleased]
 
+### Added
+
+- **A paired app can ask what this darkmux's client API can do (#3494).** `GET /client/whoami` now
+  carries `version` (darkmux's version, for display and diagnostics) and `capabilities`, every
+  capability this build has, in a fixed order: `clean_preview`, `template_workspace`, `continues`,
+  `clone_preview`, `recipe_set`, `workspace_image`, `workspace_edit`, `workspace_remove`. An app gates
+  a feature on its capability, never on the version or on how a handler happens to answer. A darkmux
+  that lists capabilities supports exactly those; one with no `capabilities` field is 5.10 (which has
+  `clean_preview`, `template_workspace`, `continues`, `workspace_edit`, `workspace_remove`) or 5.11
+  (those and `clone_preview`, `recipe_set`, `workspace_image`), told apart by the route table:
+  `GET /client/workspaces/{any}/recipe` is a 405 `method_not_allowed` on 5.11 and a 404 `not_found` on
+  5.10. The preview capabilities say what the build can do; `preview_disabled` still answers when this
+  machine has previews off. Additive: no field changed.
+- **The client API describes itself as OpenAPI 3.1 (#3494).** `GET /client/openapi.json`
+  (authenticated as `whoami` is) answers a document built from the client route table: every route's
+  path parameters, query, request body and reply, each from its type's JSON schema, the bearer token
+  as its security scheme (the pairing request needs none; the pairing poll takes its `X-Pair-Secret`
+  header), and every refusal as the one `ClientError` response. Tests hold the route table to the
+  handlers (each declared body's fields are the ones its handler reads, each declared query field is
+  read, each route takes a token or not as declared), and
+  `crates/darkmux-serve/client-openapi.golden.json` pins the document, so a route, reply or body that
+  changes shows in the diff.
+
+### Fixed
+
+- **`GET /client/profiles` answers a query it cannot read with the coded `ClientError` (#3494).** A
+  repeated `role` was axum's plain-text 400; it is now `{"error": "...", "code": "bad_request"}` like
+  every other refusal. `GET /client/recipe` now names a query it cannot read the same way (still
+  `bad_request`) instead of asking for `workdir` or `workspace`.
+
 ## [5.11.0] - 2026-11-14
 
 **darkmux no longer needs Docker.** On a Mac it runs every sandbox in macOS's own (Seatbelt); on

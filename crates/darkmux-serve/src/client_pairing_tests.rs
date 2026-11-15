@@ -668,7 +668,10 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
     assert_eq!(
         who,
         serde_json::json!({"client_name": name, "scopes": {"profiles": "local", "workspace": true},
-                           "machine": {"id": "m-0123456789abcdef", "name": "studio"}})
+                           "machine": {"id": "m-0123456789abcdef", "name": "studio"},
+                           "version": env!("CARGO_PKG_VERSION"),
+                           "capabilities": ["clean_preview", "template_workspace", "continues", "clone_preview",
+                                            "recipe_set", "workspace_image", "workspace_edit", "workspace_remove"]})
     );
 }
 
@@ -1054,6 +1057,37 @@ async fn whoami_without_or_with_a_wrong_token_is_401() {
     )
     .await;
     assert_eq!(code, 401);
+}
+
+/// (#3494 review) How an app tells 5.11 from 5.10, neither of which lists
+/// `capabilities` (`ClientCapability`'s docs): the recipe path exists from
+/// 5.11, for `PUT` only, so another method is the router's 405; a path no
+/// release has is the router's 404, the answer 5.10 gives that path. No
+/// token needed for either.
+#[tokio::test]
+async fn an_older_darkmux_is_told_apart_by_its_route_table() {
+    let h = harness();
+    let (code, v) = call(&h, get("/client/workspaces/any/recipe", &[])).await;
+    assert_eq!((code, v["code"].as_str()), (405, Some("method_not_allowed")), "{v}");
+    let (code, v) = call(&h, get("/client/workspaces/any/no-such-thing", &[])).await;
+    assert_eq!((code, v["code"].as_str(), v["error"].as_str()), (404, Some("not_found"), Some("no such route")), "{v}");
+}
+
+/// (#3494) The OpenAPI document is authenticated as `whoami` is, and is
+/// the document built from the route table, naming this build's version.
+#[tokio::test]
+async fn openapi_is_the_route_tables_document_behind_the_token() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(&h, get("/client/openapi.json", &[])).await;
+    assert_eq!(code, 401, "{v}");
+    assert_eq!(v["code"], "unauthorized");
+    let (code, _) = call(&h, get("/client/openapi.json", &[("authorization", &bearer(&"0".repeat(64)))])).await;
+    assert_eq!(code, 401);
+    let (code, doc) = call(&h, get("/client/openapi.json", &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 200, "{doc}");
+    assert_eq!(doc, crate::client_openapi::document(env!("CARGO_PKG_VERSION")));
+    assert_eq!(doc["info"]["version"], env!("CARGO_PKG_VERSION"));
 }
 
 #[tokio::test]
@@ -6686,6 +6720,18 @@ async fn profiles_need_a_token() {
     assert_eq!(code, 401);
 }
 
+/// (#3494 review) A query the router cannot read is a coded JSON 400, as
+/// every refusal is, never axum's plain-text rejection.
+#[tokio::test]
+async fn a_profiles_query_that_cannot_be_read_is_a_coded_400() {
+    let h = harness();
+    let t = paired(&h).await;
+    let (code, v) = call(&h, get("/client/profiles?role=a&role=b", &[("authorization", &bearer(&t))])).await;
+    assert_eq!(code, 400, "{v}");
+    assert_eq!(v["code"], "bad_request");
+    assert!(v["error"].as_str().unwrap().contains("query"), "{v}");
+}
+
 #[tokio::test]
 async fn profiles_unset_policy_lists_every_local_one_the_roles_own_first() {
     let h = harness();
@@ -8814,6 +8860,138 @@ async fn every_route_refuses_a_body_past_64_kb_before_its_handler() {
         checked += 1;
     }
     assert!(checked >= 9, "every route that takes a body was asked ({checked})");
+}
+
+/// (#3494 review) What the table declares about a route's token is what its
+/// handler does. Without a token: a token route is the coded 401; the
+/// pairing request (open) goes on to read its body, so an empty object is
+/// its `bad_request` for the missing fields; the pairing poll, asked about
+/// a real pending request, is an unknown one (404) without its
+/// `X-Pair-Secret` or with another, and answers (200) with it.
+#[tokio::test]
+async fn every_route_is_open_or_not_as_the_table_declares() {
+    use crate::routes::ClientAuth;
+    let h = harness();
+    let _ = paired(&h).await;
+    for r in crate::routes::client_table() {
+        let path = r.path.replace(":name", "site").replace(":work_id", "w-0");
+        match r.auth {
+            ClientAuth::Bearer => {
+                let (code, v) = call(&h, raw(r.method, &path, None, Body::from("{}"))).await;
+                assert_eq!((code, v["code"].as_str()), (401, Some("unauthorized")), "{} {}: {v}", r.method, r.path);
+            }
+            ClientAuth::Open => {
+                let (code, v) = call(&h, raw(r.method, &path, None, Body::from("{}"))).await;
+                let refused = (code, v["code"].as_str(), v["error"].as_str().unwrap_or_default().starts_with("bad JSON body"));
+                assert_eq!(refused, (400, Some("bad_request"), true), "{} {}: {v}", r.method, r.path);
+            }
+            ClientAuth::PairSecret => {
+                let pending = path.replace(":request_id", &request_pairing(&h).await);
+                for (secret, want) in [(None, 404), (Some("not-the-secret"), 404), (Some(SECRET), 200)] {
+                    let mut req = raw(r.method, &pending, None, Body::empty());
+                    if let Some(s) = secret {
+                        req.headers_mut().insert("x-pair-secret", s.parse().unwrap());
+                    }
+                    let (code, v) = call(&h, req).await;
+                    assert_eq!(code, want, "{} {} with secret {secret:?}: {v}", r.method, r.path);
+                }
+            }
+        }
+    }
+}
+
+/// (#3494 review) The table's request bodies are the ones the handlers
+/// read. Every body type refuses an unknown key, naming the fields it has,
+/// so a probe key reads the handler's field list, which must be the
+/// declared type's properties, and an empty body is refused exactly where
+/// the body is declared required. A route that declares no body is probed
+/// on real items (this app's finished run, its workspace with a running
+/// preview, a pending pairing with its secret), so its handler runs past
+/// every lookup (no 404, no 401), and it never answers the body with `bad
+/// JSON body`. This compares field names only: a handler reading a
+/// same-named type whose fields differ in type or optionality passes.
+#[tokio::test]
+async fn every_declared_body_is_the_one_its_handler_reads() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (mine, name, _ws) = served_workspace(&h, &token).await;
+    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}}));
+    let run = run_in(&h, &token, &name, "edit-readme").await;
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 202, "{v}");
+    assert_eq!(preview_until(&h, &token, &name, &["ready", "failed"]).await["status"], "ready");
+    let pairing = request_pairing(&h).await;
+    let real = |p: &str| {
+        let p = p.replace(":name", &name).replace(":work_id", &run).replace(":request_id", &pairing);
+        if p == "/client/recipe" { format!("{p}?workspace={name}") } else { p }
+    };
+    let (mut bodies, mut reached) = (0, 0);
+    for r in crate::routes::client_table() {
+        let mut req = raw(r.method, &real(r.path), Some(&token), Body::from(r#"{"__probe__":1}"#));
+        req.headers_mut().insert("x-pair-secret", SECRET.parse().unwrap());
+        let (code, v) = call(&h, req).await;
+        let at = format!("{} {}: {code} {v}", r.method, r.path);
+        let error = v["error"].as_str().unwrap_or_default();
+        match r.body {
+            Some(body) => {
+                assert_eq!(code, 400, "{at}");
+                assert_eq!(fields_serde_expected(error), declared_properties(body.schema), "{at}");
+                // Empty, against no real item: an optional body must not
+                // start or remove anything here.
+                let nowhere = r.path.replace(":name", "nope").replace(":work_id", "w-0");
+                let (_, empty) = call(&h, raw(r.method, &nowhere, Some(&token), Body::empty())).await;
+                let refused = empty["error"].as_str().unwrap_or_default().starts_with("bad JSON body");
+                assert_eq!(refused, body.required, "an empty body is refused only where one is required: {at} / {empty}");
+                bodies += 1;
+            }
+            None => {
+                assert!(!error.starts_with("bad JSON body"), "reads a body it does not declare: {at}");
+                assert!(code != 404 && code != 401, "never got past its lookups: {at}");
+                reached += 1;
+            }
+        }
+    }
+    assert_eq!(bodies, 8, "every route that declares a body was probed");
+    assert_eq!(reached, 14, "every route that declares none was probed past its lookups");
+}
+
+/// (#3494 review) Each property a route's declared query has is a field its
+/// handler reads: sent twice, it is refused as serde refuses a duplicate
+/// field, with the coded 400. (The query types take unknown keys, so this
+/// cannot show the handler reads no field the declaration lacks.)
+#[tokio::test]
+async fn every_declared_query_field_is_one_its_handler_reads() {
+    let h = harness();
+    let token = paired(&h).await;
+    let mut checked = 0;
+    for r in crate::routes::client_table() {
+        let Some(query) = r.query else { continue };
+        let props = query(&mut schemars::SchemaGenerator::default()).to_value()["properties"].clone();
+        for p in props.as_object().expect("a query object").keys() {
+            let (code, v) = call(&h, get(&format!("{}?{p}=a&{p}=b", r.path), &[("authorization", &bearer(&token))])).await;
+            assert_eq!((code, v["code"].as_str()), (400, Some("bad_request")), "{} ?{p}: {v}", r.path);
+            assert!(v["error"].as_str().unwrap().contains(&format!("duplicate field `{p}`")), "{} ?{p}: {v}", r.path);
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 3, "role, workdir, workspace");
+}
+
+/// The fields serde names in an unknown-field refusal (`expected one of
+/// `a`, `b``, `expected `a``, or `there are no fields`).
+fn fields_serde_expected(error: &str) -> Vec<String> {
+    let Some((_, list)) = error.split_once("expected") else {
+        panic!("not an unknown-field refusal: {error}");
+    };
+    list.split('`').skip(1).step_by(2).map(str::to_string).collect()
+}
+
+/// The properties of the type a schema function names.
+fn declared_properties(schema: crate::routes::SchemaFn) -> Vec<String> {
+    let mut g = schemars::SchemaGenerator::default();
+    let named = schema(&mut g).to_value();
+    let name = named["$ref"].as_str().expect("a named body type").rsplit('/').next().unwrap().to_string();
+    g.definitions()[&name]["properties"].as_object().expect("an object").keys().cloned().collect()
 }
 
 /// (review) A paired app's token raises the cap on the image route alone:

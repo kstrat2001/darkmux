@@ -7,7 +7,9 @@
 //! does not exist), and `route-table.golden` pins every route and every
 //! field below, read from the type's JSON schema. A handler builds no `json!`
 //! object by hand. The viewer imports none of these, so no TypeScript twin is
-//! generated for them; the golden is their only record.
+//! generated for them; the goldens are their record: `route-table.golden`,
+//! and (#3494) `client-openapi.golden.json`, the OpenAPI document an app
+//! reads at `GET /client/openapi.json`.
 //!
 //! Fields the producer could not read are `null`; an optional field marked
 //! `skip_serializing_if` is absent instead.
@@ -85,7 +87,23 @@ pub struct Whoami {
     pub client_name: String,
     pub scopes: ClientScopes,
     pub machine: ClientMachine,
+    /// (#3494) This darkmux's version, for display and diagnostics. An app
+    /// gates a feature on `capabilities`, never on this.
+    pub version: String,
+    /// (#3494) Every capability this darkmux's client API has, in
+    /// declaration order: exactly what it supports. A darkmux with no
+    /// `capabilities` field is 5.10 or 5.11; `ClientCapability`'s docs say
+    /// what each has and how to tell them apart. The preview ones are what
+    /// the build can do: `preview_disabled` still answers when this machine
+    /// has previews off.
+    pub capabilities: Vec<darkmux_types::client_capability::ClientCapability>,
 }
+
+/// (#3494) `GET /client/openapi.json`: this API's OpenAPI 3.1 document,
+/// built from the route table (`client_openapi`).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct ClientOpenApi(pub serde_json::Value);
 
 /// `GET /client/profiles`.
 #[derive(Debug, Clone, Serialize, JsonSchema)]

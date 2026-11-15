@@ -1,0 +1,2229 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "darkmux client API",
+    "version": "<darkmux version>",
+    "description": "`darkmux client serve`: 127.0.0.1 only, for apps on this machine. Every route but the pairing ones takes the token a pairing delivered. An app gates a feature on `GET /client/whoami`'s `capabilities`, never on `version`."
+  },
+  "security": [
+    {
+      "bearer": []
+    }
+  ],
+  "paths": {
+    "/client/pair": {
+      "post": {
+        "responses": {
+          "2XX": {
+            "description": "PairAccepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PairAccepted"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PairBody"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/client/pair/{request_id}": {
+      "get": {
+        "responses": {
+          "2XX": {
+            "description": "PairPoll",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PairPoll"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Pair-Secret",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The `pair_secret` the pairing request sent. Without it, or with another, the request is unknown (404)."
+          }
+        ],
+        "security": []
+      }
+    },
+    "/client/whoami": {
+      "get": {
+        "responses": {
+          "2XX": {
+            "description": "Whoami",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Whoami"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        }
+      }
+    },
+    "/client/openapi.json": {
+      "get": {
+        "responses": {
+          "2XX": {
+            "description": "ClientOpenApi",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientOpenApi"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        }
+      }
+    },
+    "/client/profiles": {
+      "get": {
+        "responses": {
+          "2XX": {
+            "description": "ClientProfiles",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientProfiles"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "role",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "/client/work": {
+      "post": {
+        "responses": {
+          "2XX": {
+            "description": "WorkAccepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkAccepted"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkBody"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/client/work/{work_id}": {
+      "get": {
+        "responses": {
+          "2XX": {
+            "description": "WorkState",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkState"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "work_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/client/work/{work_id}/cancel": {
+      "post": {
+        "responses": {
+          "2XX": {
+            "description": "StatusWord",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusWord"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "work_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/client/work/{work_id}/keep": {
+      "post": {
+        "responses": {
+          "2XX": {
+            "description": "KeepReply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeepReply"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "work_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/client/work/{work_id}/discard": {
+      "post": {
+        "responses": {
+          "2XX": {
+            "description": "DiscardReply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiscardReply"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "work_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/client/work/{work_id}/undo": {
+      "post": {
+        "responses": {
+          "2XX": {
+            "description": "UndoReply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UndoReply"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "work_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/client/recipe": {
+      "get": {
+        "responses": {
+          "2XX": {
+            "description": "RecipeReply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecipeReply"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "workdir",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            }
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            }
+          }
+        ]
+      }
+    },
+    "/client/workspaces": {
+      "post": {
+        "responses": {
+          "2XX": {
+            "description": "WorkspaceInfo",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceInfo"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceBody"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/client/workspaces/{name}": {
+      "get": {
+        "responses": {
+          "2XX": {
+            "description": "WorkspaceInfo",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceInfo"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      },
+      "delete": {
+        "responses": {
+          "2XX": {
+            "description": "WorkspaceRemoved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceRemoved"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemoveBody"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/client/workspaces/{name}/changes": {
+      "get": {
+        "responses": {
+          "2XX": {
+            "description": "BranchChanges",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchChanges"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/client/workspaces/{name}/edit": {
+      "post": {
+        "responses": {
+          "2XX": {
+            "description": "EditReply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EditReply"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditBody"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/client/workspaces/{name}/image": {
+      "post": {
+        "responses": {
+          "2XX": {
+            "description": "ImageReply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImageReply"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImageBody"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/client/workspaces/{name}/preview": {
+      "post": {
+        "responses": {
+          "2XX": {
+            "description": "PreviewState",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewState"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewStartBody"
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "responses": {
+          "2XX": {
+            "description": "PreviewState",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewState"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      },
+      "delete": {
+        "responses": {
+          "2XX": {
+            "description": "StatusWord",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusWord"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/client/workspaces/{name}/recipe": {
+      "put": {
+        "responses": {
+          "2XX": {
+            "description": "RecipeReply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecipeReply"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecipeSetBody"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "ClientError": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "code": {
+            "$ref": "#/components/schemas/ClientCode"
+          }
+        },
+        "required": [
+          "error",
+          "code"
+        ],
+        "description": "Every refusal: `{\"error\": \"...\", \"code\": \"...\"}`. The status says the\nclass, `code` which refusal it is (#3468): an app branches on `code`,\nnever on `error`'s wording, which is for a person."
+      },
+      "ClientCode": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "unsupported_media_type",
+              "bad_request",
+              "payload_too_large",
+              "method_not_allowed"
+            ]
+          },
+          {
+            "type": "string",
+            "const": "not_local",
+            "description": "Not from an app on this machine (a proxy, another host, a web page)."
+          },
+          {
+            "type": "string",
+            "const": "not_found",
+            "description": "No such route, id or workspace."
+          },
+          {
+            "type": "string",
+            "const": "unauthorized",
+            "description": "A missing or unknown bearer token."
+          },
+          {
+            "type": "string",
+            "const": "forbidden",
+            "description": "Outside what this machine lets an app run (a profile, a workdir)."
+          },
+          {
+            "type": "string",
+            "const": "conflict",
+            "description": "The state does not allow it now (not running, already undone)."
+          },
+          {
+            "type": "string",
+            "const": "unprocessable",
+            "description": "Valid JSON that cannot be acted on as asked."
+          },
+          {
+            "type": "string",
+            "const": "too_many_requests",
+            "description": "Too many pending pairings or running work items."
+          },
+          {
+            "type": "string",
+            "const": "unavailable",
+            "description": "Not now: this machine's config could not be read, or `client serve`\nis stopping (send the request again once it is back)."
+          },
+          {
+            "type": "string",
+            "const": "internal",
+            "description": "darkmux failed; its log says why."
+          },
+          {
+            "type": "string",
+            "const": "preview_disabled",
+            "description": "`clients.preview.enabled` is off on this machine (403)."
+          },
+          {
+            "type": "string",
+            "const": "no_source_checkout",
+            "description": "A worktree with no recorded checkout of the user's, or no longer a\nworktree of it: no checkout of theirs to read a recipe from (404). A\nclone of a repo URL answers `NoRecipe` instead (#3571)."
+          },
+          {
+            "type": "string",
+            "const": "template_no_recipe",
+            "description": "A template project whose first commit, the recipe a preview of it\ntrusts (#3460), has no `.darkmux/preview.json` (404)."
+          },
+          {
+            "type": "string",
+            "const": "no_recipe",
+            "description": "No `.darkmux/preview.json` in the user's checkout (404)."
+          },
+          {
+            "type": "string",
+            "const": "recipe_invalid",
+            "description": "The recipe cannot be used as written (422)."
+          },
+          {
+            "type": "string",
+            "const": "filter_in_repo_config",
+            "description": "The repository's own git config defines a filter driver darkmux\ndoes not run (#3457)."
+          },
+          {
+            "type": "string",
+            "const": "network_key_in_repo_config",
+            "description": "The checkout's own git config sets a network key darkmux does not\nread; the fetch was refused (#3457)."
+          },
+          {
+            "type": "string",
+            "const": "fetch_failed",
+            "description": "Fetching the checkout's remote failed for another reason."
+          },
+          {
+            "type": "string",
+            "const": "clone_failed",
+            "description": "Cloning the repository failed."
+          },
+          {
+            "type": "string",
+            "const": "no_own_branch",
+            "description": "The workspace is not on a `mux/` branch of its own (a clone made\nbefore clones got one, left on the default branch or the ref it was\ncloned at), so a PR or backup from it would push onto that branch\n(409); its next run moves it onto one."
+          },
+          {
+            "type": "string",
+            "const": "branch_failed",
+            "description": "darkmux could not put the workspace on a `mux/` branch of its own\n(a branch of the repo's, such as one named `mux`, is in the way;\n422); `error` carries git's reason."
+          },
+          {
+            "type": "string",
+            "const": "unsaved_commits",
+            "description": "Removing the workspace would lose commits nothing else holds (a\nclone's branch, a template project's history; 409): save them, then\nremove it with `force`."
+          },
+          {
+            "type": "string",
+            "const": "busy",
+            "description": "The memory is held by a running dispatch; retry later."
+          },
+          {
+            "type": "string",
+            "const": "wont_fit",
+            "description": "The model does not fit this machine; retrying cannot help."
+          },
+          {
+            "type": "string",
+            "const": "memory_in_use",
+            "description": "(#3510) The memory is held by programs darkmux did not start; retry\nonce they free it."
+          },
+          {
+            "type": "string",
+            "const": "model_start_failed",
+            "description": "The engine server would not start, or exited."
+          },
+          {
+            "type": "string",
+            "const": "model_stop_failed",
+            "description": "darkmux's own engine server would not stop to make way."
+          },
+          {
+            "type": "string",
+            "const": "port_in_use",
+            "description": "A server darkmux did not start holds the endpoint's port."
+          },
+          {
+            "type": "string",
+            "const": "engine_unavailable",
+            "description": "No engine binary, or a version darkmux was not verified against."
+          },
+          {
+            "type": "string",
+            "const": "engine_in_use",
+            "description": "The engine's own server is running (rec runs one per machine)."
+          },
+          {
+            "type": "string",
+            "const": "dispatch_failed",
+            "description": "The run failed with no code of its own (it exited, was killed, or\nprinted no result)."
+          }
+        ],
+        "description": "Why the client API refused a request, or why a work item failed."
+      },
+      "PairAccepted": {
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id"
+        ],
+        "description": "`POST /client/pair`, 202: the request to poll."
+      },
+      "PairBody": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "device_name": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "pair_secret": {
+            "type": "string"
+          },
+          "scopes": {
+            "description": "Accepted for apps built against the first contract, and ignored: what\na paired app may run is this machine's `clients.profiles`."
+          }
+        },
+        "required": [
+          "device_name",
+          "code",
+          "pair_secret"
+        ]
+      },
+      "PairPoll": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "const": "pending"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "const": "denied"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "const": "expired"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "client_name": {
+                "type": "string"
+              },
+              "token": {
+                "type": "string"
+              },
+              "scopes": {
+                "$ref": "#/components/schemas/ClientScopes"
+              },
+              "status": {
+                "type": "string",
+                "const": "approved"
+              }
+            },
+            "required": [
+              "status",
+              "client_name",
+              "token",
+              "scopes"
+            ]
+          }
+        ],
+        "description": "`GET /client/pair/{id}`: `pending`, `denied` or `expired`, or, once,\n`approved` with the token."
+      },
+      "ClientScopes": {
+        "type": "object",
+        "properties": {
+          "profiles": {
+            "$ref": "#/components/schemas/ProfilesGrant"
+          },
+          "workspace": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "profiles",
+          "workspace"
+        ],
+        "description": "What a paired app may run: `profiles` is this machine's\n`clients.profiles`, or the word `\"local\"` when it is unset (any profile\nwhose work stays on this machine). `workspace` is always true."
+      },
+      "ProfilesGrant": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "string",
+            "description": "Always the word `local`."
+          }
+        ],
+        "description": "The granted list, or `\"local\"`."
+      },
+      "Whoami": {
+        "type": "object",
+        "properties": {
+          "client_name": {
+            "type": "string"
+          },
+          "scopes": {
+            "$ref": "#/components/schemas/ClientScopes"
+          },
+          "machine": {
+            "$ref": "#/components/schemas/ClientMachine"
+          },
+          "version": {
+            "type": "string",
+            "description": "(#3494) This darkmux's version, for display and diagnostics. An app\ngates a feature on `capabilities`, never on this."
+          },
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientCapability"
+            },
+            "description": "(#3494) Every capability this darkmux's client API has, in\ndeclaration order: exactly what it supports. A darkmux with no\n`capabilities` field is 5.10 or 5.11; `ClientCapability`'s docs say\nwhat each has and how to tell them apart. The preview ones are what\nthe build can do: `preview_disabled` still answers when this machine\nhas previews off."
+          }
+        },
+        "required": [
+          "client_name",
+          "scopes",
+          "machine",
+          "version",
+          "capabilities"
+        ],
+        "description": "`GET /client/whoami`."
+      },
+      "ClientMachine": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "`m-` and 16 hex digits of a hash of the hardware uuid (never the\nuuid itself): stable across renames and every device that pairs."
+          },
+          "name": {
+            "type": "string",
+            "description": "The fleet name (`DARKMUX_MACHINE_ID`, else the hostname)."
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "description": "This machine, as `/client/whoami` and `/client/profiles` name it."
+      },
+      "ClientCapability": {
+        "oneOf": [
+          {
+            "type": "string",
+            "const": "clean_preview",
+            "description": "(#3486) `POST /client/workspaces/{name}/preview` takes `{\"clean\":\ntrue}`: a clean restart, with a fresh install."
+          },
+          {
+            "type": "string",
+            "const": "template_workspace",
+            "description": "(#3460) `POST /client/workspaces` takes `template: true`: a new\nproject from a template repo, which previews from its first commit."
+          },
+          {
+            "type": "string",
+            "const": "continues",
+            "description": "`POST /client/work` takes `continues`: a run that follows up on an\nearlier run of this client's in the same work copy."
+          },
+          {
+            "type": "string",
+            "const": "clone_preview",
+            "description": "(#3571) A workspace cloned from a repo URL runs a preview, from the\nrecipe in the commit darkmux cloned."
+          },
+          {
+            "type": "string",
+            "const": "recipe_set",
+            "description": "(#3571) `PUT /client/workspaces/{name}/recipe`: the recipe a clone's\nuser approved, for a clone whose commit has none."
+          },
+          {
+            "type": "string",
+            "const": "workspace_image",
+            "description": "(#3545) `POST /client/workspaces/{name}/image`: an image added to a\nworkspace."
+          },
+          {
+            "type": "string",
+            "const": "workspace_edit",
+            "description": "(#3533) `POST /client/workspaces/{name}/edit`: a hand edit of a text\nspan, committed like a run."
+          },
+          {
+            "type": "string",
+            "const": "workspace_remove",
+            "description": "(#3520) `DELETE /client/workspaces/{name}`: a workspace removed, with\nwhat darkmux made for it."
+          }
+        ],
+        "description": "One thing the client API can do that an app may need to check for."
+      },
+      "ClientOpenApi": {
+        "description": "(#3494) `GET /client/openapi.json`: this API's OpenAPI 3.1 document,\nbuilt from the route table (`client_openapi`)."
+      },
+      "ClientProfiles": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "type": "string"
+          },
+          "profiles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientProfileInfo"
+            }
+          },
+          "machine": {
+            "$ref": "#/components/schemas/ClientMachine"
+          }
+        },
+        "required": [
+          "role",
+          "profiles",
+          "machine"
+        ],
+        "description": "`GET /client/profiles`."
+      },
+      "ClientProfileInfo": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model the role's work would run on (the resolved selection)."
+          },
+          "endpoint": {
+            "type": "string",
+            "description": "`url` (an unmanaged server darkmux only sends to) or the managed\nbackend's name (`lmstudio`, `tensorfold`, `flint`)."
+          },
+          "reachable": {
+            "type": "boolean",
+            "description": "For a managed model (LM Studio, a server darkmux starts), darkmux can\nmake it resident now: its `availability` is `resident` or\n`startable`. For a URL server, it answered just now."
+          },
+          "loaded": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "The model is loaded and serving (`None`: couldn't tell)."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it couldn't be described (e.g. not in the registry)."
+          },
+          "availability": {
+            "$ref": "#/components/schemas/Availability",
+            "description": "(#3466) Whether darkmux can make the model resident: `resident`,\n`startable` (a stopped engine server darkmux would start),\n`unavailable`, `external` (a server darkmux only sends to) or\n`unknown` (a probe failed or ran out of time), with a reason for the\nlast two. `reachable` and `loaded` stay for older apps."
+          }
+        },
+        "required": [
+          "name",
+          "endpoint",
+          "reachable",
+          "availability"
+        ],
+        "description": "One profile an app may run on this machine, as `GET /client/profiles`\nreports it. Read-only: what the registry declares and whether its server\nanswers right now."
+      },
+      "Availability": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/AvailabilityState"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "description": "A model's availability and, for every state but `resident`, `startable`\nand `external`, a one-line reason."
+      },
+      "AvailabilityState": {
+        "oneOf": [
+          {
+            "type": "string",
+            "const": "resident",
+            "description": "Loaded or served now, at the profile's context."
+          },
+          {
+            "type": "string",
+            "const": "startable",
+            "description": "Not resident, and darkmux can load it or start its server."
+          },
+          {
+            "type": "string",
+            "const": "unavailable",
+            "description": "darkmux cannot make it resident; the reason says why."
+          },
+          {
+            "type": "string",
+            "const": "external",
+            "description": "An endpoint darkmux only sends requests to."
+          },
+          {
+            "type": "string",
+            "const": "unknown",
+            "description": "A probe failed or ran out of time; the reason names which. Never read\nas `unavailable`. (#3450) Also a state a newer darkmux states that\nthis one does not know, as a peer's machine card may carry one."
+          }
+        ],
+        "description": "Whether darkmux can make a model resident."
+      },
+      "WorkAccepted": {
+        "type": "object",
+        "properties": {
+          "work_id": {
+            "type": "string"
+          },
+          "profile": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_id",
+          "profile"
+        ],
+        "description": "`POST /client/work`, 202: the run and the profile it resolved to."
+      },
+      "WorkBody": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "role": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "profile": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Absent or null: resolved as `darkmux dispatch <role>` would.",
+            "default": null
+          },
+          "workdir": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "workspace": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A workspace name (`POST /client/workspaces`), in place of `workdir`.",
+            "default": null
+          },
+          "continues": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A Tweak: the id of this client's finished run in the same work copy\nthat this run follows up on.",
+            "default": null
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A short title for the run's commit message (default: the message's\nfirst line).",
+            "default": null
+          }
+        },
+        "required": [
+          "role",
+          "message"
+        ]
+      },
+      "WorkState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "activity": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/RunActivity"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "(#3467) `starting_model` while the run's dispatch is starting its\nmodel (an engine server, a load), and (#3504) `queued` while it\nwaits for a busy endpoint or memory, as the run lifecycle decides\nit (the same `activity` `GET /runs` and `run list --json` carry).\nAbsent otherwise."
+              },
+              "activity_elapsed_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "uint64",
+                "minimum": 0,
+                "description": "With `activity`: how long the start (or the wait) has taken so far, ms."
+              },
+              "status": {
+                "type": "string",
+                "const": "running"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "const": "cancelling"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "result": {
+                "description": "The dispatch's own `--json` envelope (that verb's contract)."
+              },
+              "changes": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/RunChanges"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "`null` without a git work copy."
+              },
+              "commit": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The run's commit (short id), `null` when nothing was committed."
+              },
+              "branch": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "commit_error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "changes_error": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Why the run's changes could not be read (`changes` is then\n`null` and nothing was committed): never \"no changes\"."
+              },
+              "undone": {
+                "type": "boolean"
+              },
+              "status": {
+                "type": "string",
+                "const": "done"
+              }
+            },
+            "required": [
+              "status",
+              "result",
+              "undone"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "code": {
+                "$ref": "#/components/schemas/ClientCode",
+                "description": "(#3468) Why it failed, for an app: the code its run's\n`dispatch.error` named (`busy`, `wont_fit`, ...), else\n`dispatch_failed`."
+              },
+              "commit": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The commit (short id) holding what the run left."
+              },
+              "branch": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "files": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "The files it holds."
+              },
+              "commit_error": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Why what the run left could not be read or committed."
+              },
+              "undone": {
+                "type": "boolean",
+                "description": "Undone (its commit reverted)."
+              },
+              "status": {
+                "type": "string",
+                "const": "error"
+              }
+            },
+            "required": [
+              "status",
+              "error",
+              "reason",
+              "code"
+            ],
+            "description": "What a run that failed or was cancelled had already changed in its work\ncopy. It is committed as that run's own commit, so the next run's commit\nnever carries it and Undo can revert it. Every field is absent when the\nrun changed nothing."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "type": "string",
+                "description": "Always `cancelled`."
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "commit": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The commit (short id) holding what the run left."
+              },
+              "branch": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "files": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "The files it holds."
+              },
+              "commit_error": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Why what the run left could not be read or committed."
+              },
+              "undone": {
+                "type": "boolean",
+                "description": "Undone (its commit reverted)."
+              },
+              "status": {
+                "type": "string",
+                "const": "cancelled"
+              }
+            },
+            "required": [
+              "status",
+              "reason"
+            ],
+            "description": "What a run that failed or was cancelled had already changed in its work\ncopy. It is committed as that run's own commit, so the next run's commit\nnever carries it and Undo can revert it. Every field is absent when the\nrun changed nothing."
+          }
+        ],
+        "description": "`GET /client/work/{id}`: where a run stands."
+      },
+      "RunActivity": {
+        "oneOf": [
+          {
+            "type": "string",
+            "const": "starting_model",
+            "description": "A dispatch is starting its model (an engine server, a load)."
+          },
+          {
+            "type": "string",
+            "const": "queued",
+            "description": "(#3504) A dispatch is waiting for an endpoint or memory a running\ndispatch holds (`fleet.busy_policy` `queue`)."
+          }
+        ],
+        "description": "(#3467) What a running run is doing besides its turns. One wire spelling\nper value; a new one is additive."
+      },
+      "RunChanges": {
+        "type": "object",
+        "properties": {
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FileChange"
+            }
+          },
+          "diff": {
+            "type": "string"
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Repositories the run made inside the work copy (`git init sub`),\nleft out of the snapshot and so of the run's changes and commit."
+          }
+        },
+        "required": [
+          "files",
+          "diff",
+          "skipped"
+        ],
+        "description": "What a run changed in its work copy, against its baseline: the files and\nthe unified diff (capped)."
+      },
+      "FileChange": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "added": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 0
+          },
+          "removed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "description": "One file a run changed: lines added and removed (`null` for a binary\nfile)."
+      },
+      "StatusWord": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "description": "`POST /client/work/{id}/cancel` (202) and `DELETE\n/client/workspaces/{name}/preview`: what is happening now (`cancelling`,\n`stopped`)."
+      },
+      "KeepReply": {
+        "type": "object",
+        "properties": {
+          "commit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "files"
+        ],
+        "description": "`POST /client/work/{id}/keep` (older apps): the run's commit."
+      },
+      "DiscardReply": {
+        "type": "object",
+        "properties": {
+          "restored": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "removed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "restored",
+          "removed"
+        ],
+        "description": "`POST /client/work/{id}/discard` (older apps): an Undo, reported as the\nfiles restored (`removed` is always empty: an Undo is a revert commit)."
+      },
+      "UndoReply": {
+        "type": "object",
+        "properties": {
+          "revert": {
+            "type": "string"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "revert",
+          "files"
+        ],
+        "description": "`POST /client/work/{id}/undo`: the revert commit (short id) and the files\nit put back."
+      },
+      "RecipeReply": {
+        "type": "object",
+        "properties": {
+          "recipe": {
+            "$ref": "#/components/schemas/Recipe"
+          }
+        },
+        "required": [
+          "recipe"
+        ],
+        "description": "`GET /client/recipe` and `PUT /client/workspaces/{name}/recipe`: the\nrecipe the workspace's preview runs, read where it is trusted from (the\nuser's own checkout, a template project's first commit, or a clone's\ncloned commit or approved recipe), never from the workspace."
+      },
+      "Recipe": {
+        "type": "object",
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "description": "The recipe format's version; one newer than this darkmux reads is\nrefused."
+          },
+          "command": {
+            "type": "string"
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {}
+          },
+          "ready": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Ready"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "install": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Install"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "env_from_source": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          }
+        },
+        "required": [
+          "schema_version",
+          "command"
+        ],
+        "description": "A `.darkmux/preview.json`."
+      },
+      "Ready": {
+        "type": "object",
+        "properties": {
+          "http": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Install": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "unless_exists": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "WorkspaceInfo": {
+        "type": "object",
+        "properties": {
+          "workspace": {
+            "type": "string"
+          },
+          "branch": {
+            "type": "string",
+            "description": "Empty when detached."
+          },
+          "head": {
+            "type": "string"
+          },
+          "repo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The normalized origin (`host/owner/repo`), `null` with none."
+          },
+          "created": {
+            "type": "boolean"
+          },
+          "from": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where a new workspace started (a ref, or `<repo>@<ref>` for a\ntemplate). A clone or a worktree is on a new `mux/<bot>-<id>` branch\ncut from there."
+          },
+          "fetch_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the fetch of a reused (or source) checkout failed."
+          },
+          "fetch_error_code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ClientCode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "(#3468) With `fetch_error`: its code (`network_key_in_repo_config`,\n`fetch_failed`)."
+          }
+        },
+        "required": [
+          "workspace",
+          "branch",
+          "head",
+          "created"
+        ],
+        "description": "`POST /client/workspaces` and `GET /client/workspaces/{name}`."
+      },
+      "WorkspaceBody": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "repo_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Clone (or reuse a checkout of) this repo.",
+            "default": null
+          },
+          "source_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Or start from this local checkout, as a git worktree on a new branch.",
+            "default": null
+          },
+          "ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "bot": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The asking bot's name, for the workspace and branch names.",
+            "default": null
+          },
+          "template": {
+            "type": "boolean",
+            "description": "`repo_url` is a template: make a new project from it (at `ref`) with\nnone of its history and no remote, named for the bot; never reuse a\nworkspace.",
+            "default": false
+          }
+        }
+      },
+      "WorkspaceRemoved": {
+        "type": "object",
+        "properties": {
+          "workspace": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`clone`, `template` or `worktree`."
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The branch it was on, `null` when detached."
+          },
+          "branch_removed": {
+            "type": "boolean",
+            "description": "Whether that branch is gone: a clone's or a template project's goes\nwith it; a worktree's `mux/` branch in the user's checkout only once\nmerged into another branch, or with `force`; a branch of the user's\nnever."
+          },
+          "preview_stopped": {
+            "type": "boolean",
+            "description": "Whether its live preview was stopped first."
+          }
+        },
+        "required": [
+          "workspace",
+          "kind",
+          "branch_removed",
+          "preview_stopped"
+        ],
+        "description": "`DELETE /client/workspaces/{name}`: what removing the workspace did."
+      },
+      "RemoveBody": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "force": {
+            "type": "boolean",
+            "description": "Also remove what holds commits nothing else does.",
+            "default": false
+          }
+        }
+      },
+      "BranchChanges": {
+        "type": "object",
+        "properties": {
+          "base": {
+            "type": "string"
+          },
+          "base_branch": {
+            "type": "string"
+          },
+          "head": {
+            "type": "string"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BranchFile"
+            }
+          }
+        },
+        "required": [
+          "base",
+          "base_branch",
+          "head",
+          "branch",
+          "files"
+        ],
+        "description": "`GET /client/workspaces/{name}/changes`: the branch's committed changes\nagainst origin's default branch, for an app to open a PR itself."
+      },
+      "BranchFile": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "deleted": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "description": "One file on the workspace's branch that origin's default branch lacks:\nits content (base64) and mode, or `deleted: true`."
+      },
+      "EditReply": {
+        "type": "object",
+        "properties": {
+          "matches": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "work_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "commit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "matches"
+        ],
+        "description": "`POST /client/workspaces/{name}/edit` (#3533): a hand edit. `matches`\nis how many places in the workspace's tracked files hold the old text\n(counted up to 2). Exactly one: the file changed and was committed as a\nwork record, which `/client/work/{work_id}` reports and `/undo` reverts.\nAny other count: nothing changed and every other field is `null`."
+      },
+      "EditBody": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "old": {
+            "type": "string",
+            "description": "The text as the page shows it (whitespace is collapsed for the match)."
+          },
+          "new": {
+            "type": "string",
+            "description": "The text the page is to show instead: written as sent, except that\nin a markup file what would read as markup is written as text,\nescaped."
+          }
+        },
+        "required": [
+          "old",
+          "new"
+        ]
+      },
+      "ImageReply": {
+        "type": "object",
+        "properties": {
+          "matches": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint32",
+            "minimum": 0
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "work_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "commit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "description": "`POST /client/workspaces/{name}/image` (#3545): an image added to the\nworkspace. `matches` is set only when `replace` was sent: how many places\nheld that reference (counted up to 2). Committed (`work_id` set): the\nimage is at `path` (repo-relative), the page reaches it at `url`, and\n`/undo` reverts it. Not committed: a `replace` found other than once\n(every other field `null`), or the same image already there with nothing\nto point at it (`path` and `url` set, no `work_id`)."
+      },
+      "ImageBody": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The picked file's name: only a hint for the name darkmux gives it."
+          },
+          "data": {
+            "type": "string",
+            "description": "The image's bytes, base64."
+          },
+          "replace": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The image reference as the page reads it (an `<img>`'s `src`\nattribute): its one place in the tracked files is pointed at the new\nimage, in the same commit.",
+            "default": null
+          }
+        },
+        "required": [
+          "name",
+          "data"
+        ]
+      },
+      "PreviewState": {
+        "type": "object",
+        "properties": {
+          "workspace": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "description": "`installing`, `starting`, `ready`, `failed` or `stopped`."
+          },
+          "url": {
+            "type": "string"
+          },
+          "port": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "hmr_port": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it failed."
+          },
+          "log_tail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The end of its log, when it failed."
+          },
+          "stage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreviewStage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "(#3561) What a starting preview is doing that an app may show;\nabsent the rest of the time."
+          }
+        },
+        "required": [
+          "workspace",
+          "status",
+          "url",
+          "port",
+          "hmr_port"
+        ],
+        "description": "`POST` / `GET /client/workspaces/{name}/preview`: a preview's state."
+      },
+      "PreviewStage": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Which step, for an app to branch on: `getting_node` (darkmux is\nfetching and verifying the project's Node.js for a sandbox on this\nmachine, first use of that version only)."
+          },
+          "detail": {
+            "type": "string",
+            "description": "The same for a person: `getting Node 26.13.1, first use only`."
+          }
+        },
+        "required": [
+          "code",
+          "detail"
+        ],
+        "description": "(#3561) A step of a preview's start that an app may show."
+      },
+      "PreviewStartBody": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "clean": {
+            "type": "boolean",
+            "description": "Stop the preview, delete its install record and the recipe's\n`install.unless_exists` path in the workspace, then start it: a fresh\ninstall.",
+            "default": false
+          }
+        },
+        "description": "(#3484) `POST /client/workspaces/{name}/preview`'s optional body."
+      },
+      "RecipeSetBody": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "recipe": {
+            "$ref": "#/components/schemas/Recipe",
+            "description": "A `.darkmux/preview.json`, checked as strictly as one in a checkout\nand refused (422 `recipe_invalid`) unless it holds: no key the\nrecipe format does not know, a `schema_version` this darkmux reads,\nno `env_from_source` (a clone has no checkout of yours to copy from),\nand at most 16 KB (16384 bytes) as JSON."
+          }
+        },
+        "required": [
+          "recipe"
+        ],
+        "description": "(#3571) `PUT /client/workspaces/{name}/recipe`'s body: the recipe the\nuser approved for a clone whose repo has none."
+      }
+    },
+    "responses": {
+      "ClientError": {
+        "description": "Every refusal: the status says the class, `code` which refusal it is.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ClientError"
+            }
+          }
+        }
+      }
+    }
+  }
+}
