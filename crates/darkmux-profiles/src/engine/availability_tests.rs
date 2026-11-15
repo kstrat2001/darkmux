@@ -952,3 +952,125 @@ fn asking_flint_reads_recs_version_status_and_install() {
     });
     assert_eq!(state, Availability::startable());
 }
+
+// ─── The code (#3574) ────────────────────────────────────────────────────
+
+/// The code an `unavailable` carries, by the engine's own case.
+fn code(a: &Availability) -> Option<&str> {
+    a.code.as_deref()
+}
+
+/// (#3574) Every `unavailable` an engine gives carries the code a dispatch
+/// refusing for the same reason carries (`engine_dispatch`'s `refuse`, and
+/// the wave planner's `block_code` for LM Studio), so an app branches on it
+/// and never on the wording: one vocabulary.
+#[test]
+fn each_engines_unavailable_carries_the_code_its_dispatch_refusal_carries() {
+    let dir = tempfile::tempdir().unwrap();
+    // LM Studio: a model it has not downloaded is the planner's
+    // `UnknownModelKey`, `engine_unavailable`.
+    let lms = LmStudioAnswer { loaded: Ok(vec![]), catalog: Ok(vec![meta("other")]) }.judge(&lms_model());
+    assert_eq!((state(&lms), code(&lms)), (AvailabilityState::Unavailable, Some("engine_unavailable")), "{lms:?}");
+
+    // Tensorfold: `plan`'s `verified_version` is `engine_unavailable`, its
+    // `engine_args` check `model_start_failed`, a model it does not list
+    // fails the start (`model_start_failed`), and a port someone else holds
+    // is the server lifecycle's `port_in_use`.
+    let tf = |facts: TensorfoldProbe, port: u16, args: &str| tf_answer(facts, &dir).judge(&tf_model(port, args));
+    let mut gone = facts("tensorfold-native 1.2.4", &[TF_MODEL]);
+    gone.version = Err("`tensorfold-native --version` failed: `tensorfold-native` was not found".into());
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let held_port = held.local_addr().unwrap().port();
+    for (a, want) in [
+        (tf(facts("tensorfold-native 1.3.0", &[TF_MODEL]), free_port(), "[]"), "engine_unavailable"),
+        (tf(gone, free_port(), "[]"), "engine_unavailable"),
+        (tf(facts("tensorfold-native 1.2.4", &[TF_MODEL]), free_port(), r#"["--turbo"]"#), "model_start_failed"),
+        (tf(facts("tensorfold-native 1.2.4", &["other/model"]), free_port(), "[]"), "model_start_failed"),
+        (tf(facts("tensorfold-native 1.2.4", &[TF_MODEL]), held_port, "[]"), "port_in_use"),
+    ] {
+        assert_eq!((state(&a), code(&a)), (AvailabilityState::Unavailable, Some(want)), "{a:?}");
+    }
+
+    // Flint: `Rec::plan` refuses an unverified rec and an install it cannot
+    // read `engine_unavailable`; rec's own server up is `engine_in_use`; a
+    // port someone else holds is `port_in_use`.
+    let flint = |runtimes: usize, revs: &[&str], version: Result<&str, &str>, own: Option<&str>, port: u16| {
+        let dir = tempfile::tempdir().unwrap();
+        rec_install(&dir.path().join("rec"), runtimes, revs);
+        flint_answer(&dir, version, Ok(own)).judge(&flint_model(port))
+    };
+    for (a, want) in [
+        (flint(1, &["flint-int4"], Err("rec 0.2.0 is installed"), None, free_port()), "engine_unavailable"),
+        (flint(0, &["flint-int4"], Ok("0.1.0"), None, free_port()), "engine_unavailable"),
+        (flint(1, &[], Ok("0.1.0"), None, free_port()), "engine_unavailable"),
+        (flint(1, &["flint-int4"], Ok("0.1.0"), Some("http://127.0.0.1:11500/v1"), free_port()), "engine_in_use"),
+        (flint(1, &["flint-int4"], Ok("0.1.0"), None, held_port), "port_in_use"),
+    ] {
+        assert_eq!((state(&a), code(&a)), (AvailabilityState::Unavailable, Some(want)), "{a:?}");
+    }
+}
+
+/// (#3574) darkmux's own Flint server resident beside rec's own server is
+/// refused `engine_in_use` by a dispatch, so the listing carries that code.
+#[test]
+fn darkmuxs_flint_server_beside_recs_own_carries_engine_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    rec_install(&dir.path().join("rec"), 1, &["flint-int4"]);
+    let port = serving("flint");
+    let model = flint_model(port);
+    let answer = flint_answer(&dir, Ok("0.1.0"), Ok(Some("http://127.0.0.1:11500/v1")));
+    let argv = answer.rec.serve_spec("fl", port, &model, "0.1.0").unwrap().argv;
+    record_for(&answer.dirs, "fl", "flint", port, argv);
+    assert_eq!(code(&answer.judge(&model)), Some("engine_in_use"));
+}
+
+/// (#3574) No code where no dispatch refusal fits: a registry problem a
+/// dispatch refuses before any engine is asked (no `n_ctx`, no `port`, an
+/// endpoint that does not resolve, a refused user file), and every state
+/// that is not `unavailable`.
+#[test]
+fn no_code_where_no_dispatch_refusal_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut no_ctx = lms_model();
+    no_ctx.n_ctx = None;
+    let lms = LmStudioAnswer { loaded: Ok(vec![]), catalog: Ok(vec![meta("qwen")]) }.judge(&no_ctx);
+    assert_eq!((state(&lms), code(&lms)), (AvailabilityState::Unavailable, None));
+    let mut no_port = tf_model(free_port(), "[]");
+    no_port.endpoint.as_mut().unwrap().port = None;
+    let tf = tf_answer(facts("tensorfold-native 1.2.4", &[TF_MODEL]), &dir).judge(&no_port);
+    assert_eq!((state(&tf), code(&tf)), (AvailabilityState::Unavailable, None));
+    let mut flint_no_port = flint_model(free_port());
+    flint_no_port.endpoint.as_mut().unwrap().port = None;
+    let fl = flint_answer(&dir, Ok("0.1.0"), Ok(None)).judge(&flint_no_port);
+    assert_eq!((state(&fl), code(&fl)), (AvailabilityState::Unavailable, None));
+
+    let ms = models(
+        r#"{"profiles":{"a":{"models":[{"id":"l1","n_ctx":8},{"id":"x","n_ctx":8,"endpoint":"nope"}]}}}"#,
+    );
+    let refused = list_with(&ms, Some("bad config".into()), |_| panic!("no engine is asked"), |_| Duration::from_secs(5));
+    assert!(refused.each.iter().all(|a| a.code.is_none()), "{refused:?}");
+    let listing = list_with(&ms, None, |_| Box::new(Fixed(Availability::resident())), |_| Duration::from_secs(5));
+    assert_eq!((state(&listing.each[1]), code(&listing.each[1])), (AvailabilityState::Unavailable, None));
+
+    for a in [Availability::resident(), Availability::startable(), Availability::external(), Availability::unknown("x")] {
+        assert_eq!(a.code, None, "{a:?}");
+    }
+}
+
+/// (#3574) The code is additive on the wire: absent when there is none (a
+/// reader of card schema 1.4 sees the shape it knew), carried as its text
+/// when there is, and a code a newer darkmux sends that this one does not
+/// know reads back as that text, never failing the availability.
+#[test]
+fn the_code_is_absent_when_none_and_kept_as_text_when_unknown() {
+    let plain = serde_json::to_value(Availability::unavailable("why")).unwrap();
+    assert_eq!(plain, serde_json::json!({"state": "unavailable", "reason": "why"}));
+    let coded = serde_json::to_value(Availability::refused(ClientCode::EngineInUse, "rec's own server")).unwrap();
+    assert_eq!(coded["code"], "engine_in_use");
+    let old: Availability = serde_json::from_value(serde_json::json!({"state": "unavailable", "reason": "why"})).unwrap();
+    assert_eq!(old.code, None);
+    let newer: Availability =
+        serde_json::from_value(serde_json::json!({"state": "unavailable", "reason": "why", "code": "from_a_newer_darkmux"}))
+            .unwrap();
+    assert_eq!(newer.code.as_deref(), Some("from_a_newer_darkmux"));
+}

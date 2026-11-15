@@ -910,7 +910,8 @@ fn profile_list_names_each_defined_endpoint() {
 /// `startable`, a model on LM Studio while LM Studio does not answer is
 /// `unknown`, and an unmanaged endpoint is `external`. The registry is still
 /// printed as before. Fakes stand in for `lms` and `tensorfold-native`, and
-/// each logs its calls: the listing loads and starts nothing.
+/// each logs its calls: the listing loads and starts nothing. (#3574) A
+/// model the engine does not list is `unavailable` with its dispatch code.
 #[test]
 fn profile_list_json_reports_each_models_availability() {
     let tmp = TempDir::new().unwrap();
@@ -934,6 +935,7 @@ fn profile_list_json_reports_each_models_availability() {
          models) echo '{\"schema\":1,\"models\":[{\"repo\":\"TF/m\"}]}';;\n  *) exit 9;;\nesac\n",
     );
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let port2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let p = tmp.path().join("profiles.json");
     fs::write(
         &p,
@@ -941,8 +943,10 @@ fn profile_list_json_reports_each_models_availability() {
             r#"{{"profiles":{{
                 "a-lms":{{"models":[{{"id":"qwen","n_ctx":8192}}]}},
                 "b-tf":{{"models":[{{"id":"TF/m","n_ctx":8192,"endpoint":"tf"}}]}},
-                "c-api":{{"models":[{{"id":"gpt","endpoint":"api"}}]}}
-            }},"endpoints":{{"tf":{{"managed":"tensorfold","port":{port}}},"api":{{"url":"https://h.example/v1"}}}}}}"#
+                "c-api":{{"models":[{{"id":"gpt","endpoint":"api"}}]}},
+                "d-tf":{{"models":[{{"id":"TF/other","n_ctx":8192,"endpoint":"tf2"}}]}}
+            }},"endpoints":{{"tf":{{"managed":"tensorfold","port":{port}}},"tf2":{{"managed":"tensorfold","port":{port2}}},
+                "api":{{"url":"https://h.example/v1"}}}}}}"#
         ),
     )
     .unwrap();
@@ -966,6 +970,11 @@ fn profile_list_json_reports_each_models_availability() {
     assert_eq!(row("b-tf")["model"], "TF/m");
     assert_eq!(row("c-api")["state"], "external", "{v}");
     assert_eq!(row("c-api")["engine"], serde_json::Value::Null);
+    // (#3574) An `unavailable` carries its dispatch code; no other state does.
+    assert_eq!((row("d-tf")["state"].as_str(), row("d-tf")["code"].as_str()), (Some("unavailable"), Some("model_start_failed")), "{v}");
+    for profile in ["a-lms", "b-tf", "c-api"] {
+        assert!(row(profile).get("code").is_none(), "{profile}: {v}");
+    }
     let log = fs::read_to_string(&calls).unwrap();
     for line in log.lines() {
         let read_only = ["lms ps", "lms ls", "lms --version", "tensorfold-native --version", "tensorfold-native capabilities", "tensorfold-native models"];
@@ -2150,7 +2159,7 @@ fn machine_list_builds_this_machines_row_from_a_local_card_and_never_dials_its_a
     assert_eq!(row["is_this_machine"], true);
     assert_eq!(row["liveness"], "live");
     assert_eq!(row["card"]["state"], "available", "{row}");
-    assert_eq!(row["card"]["card"]["card_schema_version"], "1.4");
+    assert_eq!(row["card"]["card"]["card_schema_version"], "1.5");
     assert_eq!(v["cache_ttl_ms"], 0, "the CLI's gather is not cached");
 }
 

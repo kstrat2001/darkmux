@@ -103,6 +103,15 @@ pub enum ClientCode {
 }
 
 impl ClientCode {
+    /// The one wire spelling, as serde writes it: what a `code` field
+    /// carries (#3574, a model's `availability`).
+    pub fn wire(self) -> String {
+        match serde_json::to_value(self) {
+            Ok(serde_json::Value::String(s)) => s,
+            _ => unreachable!("a unit variant serializes as its name"),
+        }
+    }
+
     /// A failed run's code from its `dispatch.error` `code` (`None`: the
     /// record names none, or there is no record): the same spelling, read.
     /// A code this build does not know is [`ClientCode::DispatchFailed`].
@@ -168,6 +177,7 @@ mod tests {
             (UnsavedCommits, "unsaved_commits"),
         ] {
             assert_eq!(wire(c), s);
+            assert_eq!(c.wire(), s, "the method spells it as serde does");
             assert_eq!(
                 serde_json::from_value::<ClientCode>(serde_json::json!(s)).unwrap(),
                 c,

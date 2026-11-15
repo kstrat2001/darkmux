@@ -90,6 +90,10 @@ pub(crate) struct ModelAvailability {
     pub state: darkmux_profiles::engine::availability::AvailabilityState,
     /// Why, for `unavailable` and `unknown`.
     pub reason: Option<String>,
+    /// (#3574) The code a dispatch refusing for the same reason carries
+    /// (`engine_in_use`, `engine_unavailable`, ...); absent when none fits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 impl ModelAvailability {
@@ -113,6 +117,7 @@ impl ModelAvailability {
                 },
                 state: a.state,
                 reason: a.reason,
+                code: a.code,
             })
             .collect()
     }
