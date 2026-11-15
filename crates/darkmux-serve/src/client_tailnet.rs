@@ -5,15 +5,18 @@
 //! `127.0.0.1:<port>`, so it arrives from loopback, and in Tailscale
 //! 1.102.4 (`ipn/ipnlocal/serve.go`) it carries:
 //!
-//! - `Host`: the `Host` the device sent (`r.Out.Host = r.In.Host`), which is
-//!   the entry's MagicDNS name and port (no port for 443);
+//! - `Host`: the `Host` the device sent, passed through as it came
+//!   (`r.Out.Host = r.In.Host`). Tailscale picks the handler by the TLS SNI,
+//!   not by `Host`, so this is the device's choice and proves nothing; it is
+//!   required to name the entry only as one more sign of the shape;
 //! - `X-Forwarded-Host` (the same), `X-Forwarded-Proto: https` (set when the
 //!   request came over TLS, which an `--https` entry always does) and
 //!   `X-Forwarded-For` (the device's tailnet address, one address);
 //!   `addProxyForwardedHeaders`. Go's `ReverseProxy` drops any of these the
 //!   device sent before Tailscale sets them;
 //! - for a device logged in as a user (not a tagged one, and not through
-//!   Funnel), `Tailscale-User-Login`, `Tailscale-User-Name`,
+//!   Funnel, which this rule refuses before identity is read),
+//!   `Tailscale-User-Login` (`""` for a login that is not valid UTF-8), `Tailscale-User-Name`,
 //!   `Tailscale-User-Profile-Pic` and `Tailscale-Headers-Info`, each deleted
 //!   first so a device cannot squat on them (`addTailscaleIdentityHeaders`).
 //!   A Funnel request gets `Tailscale-Funnel-Request` and no user. No header
@@ -164,9 +167,9 @@ pub(crate) fn identity_refusal(
     let Some(login) = login else {
         return Some((
             ClientCode::RemoteIdentityMissing,
-            "Tailscale named no tailnet user for this request (a device logged in with a tag, or a request through \
-             Funnel, has none), so it cannot be checked against the user this device paired as: log the device in to \
-             Tailscale as that user"
+            "Tailscale named no tailnet user for this request (a device logged in with a tag has none, and a login \
+             that is not valid UTF-8 is sent empty), so it cannot be checked against the user this device paired as: \
+             log the device in to Tailscale as that user, not with a tag"
                 .to_string(),
         ));
     };

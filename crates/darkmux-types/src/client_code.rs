@@ -28,7 +28,9 @@ pub enum ClientCode {
     /// device must pair over the tailnet. The token still works on the Mac.
     NotPairedRemotely,
     /// (#3560) Through the tailnet entry with a valid token, but Tailscale
-    /// named no tailnet user for the request (a tagged device, or Funnel).
+    /// named no tailnet user for the request: a tagged device (Tailscale
+    /// sends no user for one), or a login that is not valid UTF-8 (sent
+    /// empty). A Funnel request never gets here: it is `not_forwarded`.
     RemoteIdentityMissing,
     /// (#3560) Through the tailnet entry with a valid token, from a tailnet
     /// user other than the one the device paired as.

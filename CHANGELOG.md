@@ -20,7 +20,7 @@ darkmux release.
   carries `version` (darkmux's version, for display and diagnostics) and `capabilities`, every
   capability this build has, in a fixed order: `clean_preview`, `template_workspace`, `continues`,
   `clone_preview`, `recipe_set`, `workspace_image`, `workspace_edit`, `workspace_remove` (and, with
-  #3560 below, `remote_tailscale` and `remote_requests`). An app gates
+  #3560 below, `remote_tailscale`). An app gates
   a feature on its capability, never on the version or on how a handler happens to answer. A darkmux
   that lists capabilities supports exactly those; one with no `capabilities` field is 5.10 (which has
   `clean_preview`, `template_workspace`, `continues`, `workspace_edit`, `workspace_remove`) or 5.11
@@ -61,12 +61,15 @@ darkmux release.
   the entry, answered only while the entry is up; otherwise such a request is `not_local` as before),
   `not_paired_remotely` (the token's pairing recorded no tailnet identity: every pairing made on the Mac;
   that token still works on the Mac), `remote_identity_missing` (Tailscale named no user: a tagged
-  device), `remote_identity_mismatch`, and `remote_pairing_unavailable` (pairing and its poll are refused
+  device, or a login that is not valid UTF-8, which Tailscale sends empty; a Funnel request is
+  `not_forwarded`), `remote_identity_mismatch`, and `remote_pairing_unavailable` (pairing and its poll are refused
   through the entry until remote pairing ships). `GET /client/whoami` gains `via` (`local` or
-  `tailnet`), the capability list gains `remote_requests`, and `clients.json` moves to schema 1.3: a
-  client may carry `tailnet` (`{"login": ...}`), the identity it paired with. A 1.2 store is read as
-  1.3 and rewritten as 1.3, which a darkmux that reads 1.2 refuses as written by a newer darkmux.
-  Nothing records an identity yet: pairing over the tailnet, which does, is the next part.
+  `tailnet`), and `clients.json` moves to schema 1.3: a client may carry `tailnet` (`{"login": ...}`),
+  the identity it paired with. Nothing records an identity yet: pairing over the tailnet, which does,
+  is the next part, so no capability is advertised for remote requests until it ships.
+  **Upgrade note:** the first change this darkmux makes to `clients.json` rewrites it as schema 1.3, and
+  from then on an older darkmux refuses the whole store ("written by a newer darkmux ... Upgrade
+  darkmux"), pairings included, until it is upgraded.
 - **`darkmux doctor` and `mission status` find `tailscale` where the fleet identity provider does
   (#3560).** The tailnet viewer URL used to run a bare `tailscale` from `PATH`; it now looks on `PATH`
   and then at the known install locations (on macOS `/usr/local/bin/tailscale`,

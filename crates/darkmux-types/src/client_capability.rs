@@ -60,18 +60,11 @@ pub enum ClientCapability {
     /// tailscale`), at which HTTPS URL, or why not. What the build can do:
     /// `remote.state` says what this machine did.
     RemoteTailscale,
-    /// (#3560) A request through `remote.url` from a paired device is
-    /// answered, with the scopes a request on this machine has, when it
-    /// carries the device's token AND comes from the tailnet user the device
-    /// paired as (Tailscale's `Tailscale-User-Login`); `whoami.via` says
-    /// which way a request came. A token paired on the Mac has no tailnet
-    /// identity and is refused remotely (`not_paired_remotely`).
-    RemoteRequests,
 }
 
 impl ClientCapability {
     /// Every capability, in declaration order: what `whoami` lists.
-    pub const ALL: [ClientCapability; 10] = [
+    pub const ALL: [ClientCapability; 9] = [
         ClientCapability::CleanPreview,
         ClientCapability::TemplateWorkspace,
         ClientCapability::Continues,
@@ -81,7 +74,6 @@ impl ClientCapability {
         ClientCapability::WorkspaceEdit,
         ClientCapability::WorkspaceRemove,
         ClientCapability::RemoteTailscale,
-        ClientCapability::RemoteRequests,
     ];
 }
 
@@ -113,7 +105,6 @@ mod tests {
                 "workspace_edit",
                 "workspace_remove",
                 "remote_tailscale",
-                "remote_requests",
             ]
         );
         for c in ClientCapability::ALL {

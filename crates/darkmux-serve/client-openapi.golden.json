@@ -757,7 +757,7 @@
           {
             "type": "string",
             "const": "remote_identity_missing",
-            "description": "(#3560) Through the tailnet entry with a valid token, but Tailscale\nnamed no tailnet user for the request (a tagged device, or Funnel)."
+            "description": "(#3560) Through the tailnet entry with a valid token, but Tailscale\nnamed no tailnet user for the request: a tagged device (Tailscale\nsends no user for one), or a login that is not valid UTF-8 (sent\nempty). A Funnel request never gets here: it is `not_forwarded`."
           },
           {
             "type": "string",
@@ -1155,11 +1155,6 @@
             "type": "string",
             "const": "remote_tailscale",
             "description": "(#3560) `GET /client/whoami` carries `remote`: whether this machine's\n`client serve` is published on its tailnet (`clients.remote\ntailscale`), at which HTTPS URL, or why not. What the build can do:\n`remote.state` says what this machine did."
-          },
-          {
-            "type": "string",
-            "const": "remote_requests",
-            "description": "(#3560) A request through `remote.url` from a paired device is\nanswered, with the scopes a request on this machine has, when it\ncarries the device's token AND comes from the tailnet user the device\npaired as (Tailscale's `Tailscale-User-Login`); `whoami.via` says\nwhich way a request came. A token paired on the Mac has no tailnet\nidentity and is refused remotely (`not_paired_remotely`)."
           }
         ],
         "description": "One thing the client API can do that an app may need to check for."
