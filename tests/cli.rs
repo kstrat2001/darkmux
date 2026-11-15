@@ -15932,11 +15932,17 @@ fn fake_tailnet_tool(dir: &std::path::Path, home: &std::path::Path, port: u16) -
     fs::write(dir.join("serve.json"), FAKE_TAILNET_OPERATOR).unwrap();
     fs::write(
         dir.join("status.json"),
-        r#"{"BackendState":"Running","Self":{"DNSName":"studio.example.ts.net."},"CertDomains":["studio.example.ts.net"]}"#,
+        r#"{"BackendState":"Running","Self":{"ID":"nSTUDIO","DNSName":"studio.example.ts.net.","UserID":1},"User":{"1":{"LoginName":"sam@example.com"}},"Peer":{"nodekey:phone":{"ID":"nPHONE1CNTRL","DNSName":"peer.example.ts.net.","TailscaleIPs":["100.64.1.2"],"UserID":1}},"CertDomains":["studio.example.ts.net"]}"#,
     )
     .unwrap();
     let record = home.join("client-remote").join(format!("{port}.json"));
     fs::write(dir.join("record_path"), record.to_string_lossy().as_bytes()).unwrap();
+    // (#3560) Sam's phone, at the address every forwarded request below comes from.
+    fs::write(
+        dir.join("whois.json"),
+        r#"{"100.64.1.2":{"Node":{"StableID":"nPHONE1CNTRL","Name":"peer.example.ts.net.","Addresses":["100.64.1.2/32"],"Hostinfo":{"Hostname":"Sam's iPhone"}},"UserProfile":{"LoginName":"sam@example.com","DisplayName":"Sam"}}}"#,
+    )
+    .unwrap();
     let tool = dir.join("tailscale");
     fs::write(&tool, include_str!("../crates/darkmux-serve/tests/fixtures/fake_tailscale.py")).unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -15980,6 +15986,8 @@ fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed
             .env("PATH", with_fake)
             .env("DARKMUX_HOME", &home)
             .env("DARKMUX_CLIENTS_REMOTE", remote)
+            // No real pairing dialog on the machine running the tests.
+            .env("DARKMUX_CLIENTS_PAIRING_DIALOG", "false")
             .stdout(std::process::Stdio::null())
             .stderr(log.reopen().unwrap());
         let mut child = DirectChildGuard(cmd.spawn().expect("spawning darkmux client serve"));
@@ -16004,18 +16012,19 @@ fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed
         "schema_version": "1.3",
         "clients": [{"name": "phone", "id": "c-0000000000000001", "created": 1,
                      "token_hash": blake3::hash(token.as_bytes()).to_hex().to_string(),
-                     "tailnet": {"login": "sam@example.com"}}],
+                     "tailnet": {"login": "sam@example.com", "device": {"id": "nPHONE1CNTRL", "name": "peer"}}}],
     });
     fs::write(home.join("clients.json"), clients.to_string()).unwrap();
-    let whoami = |bearer: Option<&str>| {
+    // A request as `tailscale serve` forwards one from Sam's phone.
+    let through = |method: &str, path: &str, extra: &str, body: &str| {
         use std::io::{Read, Write};
         let host = format!("studio.example.ts.net:{port}");
-        let auth = bearer.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
         let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let typed = if body.is_empty() { String::new() } else { format!("Content-Type: application/json\r\nContent-Length: {}\r\n", body.len()) };
         write!(
             s,
-            "GET /client/whoami HTTP/1.1\r\nHost: {host}\r\nX-Forwarded-Host: {host}\r\nX-Forwarded-Proto: https\r\n\
-             X-Forwarded-For: 100.64.1.2\r\nTailscale-User-Login: sam@example.com\r\n{auth}Connection: close\r\n\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nX-Forwarded-Host: {host}\r\nX-Forwarded-Proto: https\r\n\
+             X-Forwarded-For: 100.64.1.2\r\nTailscale-User-Login: sam@example.com\r\n{extra}{typed}Connection: close\r\n\r\n{body}"
         )
         .unwrap();
         s.set_read_timeout(Some(std::time::Duration::from_secs(15))).unwrap();
@@ -16023,6 +16032,11 @@ fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed
         let _ = s.read_to_string(&mut reply);
         reply
     };
+    let whoami = |bearer: Option<&str>| {
+        let auth = bearer.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+        through("GET", "/client/whoami", &auth, "")
+    };
+    let reply_json = |reply: &str| serde_json::from_str::<serde_json::Value>(reply.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap_or_default();
 
     // Off: the tool is never run, and the tailnet request is not this machine's.
     let (mut child, log) = spawn("off");
@@ -16042,6 +16056,31 @@ fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed
     assert!(reply.starts_with("HTTP/1.1 200") && reply.contains(r#""via":"tailnet""#), "{reply}\n{}", said(&log));
     let reply = whoami(None);
     assert!(reply.starts_with("HTTP/1.1 401") && reply.contains(r#""code":"unauthorized""#), "{reply}");
+    // (#3560) The phone pairs through the entry: it waits for the operator,
+    // who approves it with `client approve` on this machine; the token it
+    // then collects works through the entry.
+    let secret = "phone-secret-0123456789";
+    let body = format!(r#"{{"device_name":"Sam's iPhone","code":"R3M-0TE","pair_secret":"{secret}"}}"#);
+    let reply = through("POST", "/client/pair", "", &body);
+    assert!(reply.starts_with("HTTP/1.1 202"), "{reply}\n{}", said(&log));
+    let request_id = reply_json(&reply)["request_id"].as_str().unwrap().to_string();
+    let poll = || through("GET", &format!("/client/pair/{request_id}"), &format!("X-Pair-Secret: {secret}\r\n"), "");
+    assert_eq!(reply_json(&poll())["status"], "pending", "never approved on its own");
+    assert!(said(&log).contains("through the tailnet entry naming tailnet user sam@example.com, device peer (Sam's iPhone)"), "{}", said(&log));
+    assert!(!said(&log).contains(secret), "the pair secret is never logged");
+    let mut approve = darkmux_std_cmd();
+    approve.args(["client", "approve", "--code", "R3M-0TE"]).env("DARKMUX_HOME", &home).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+    let mut approving = approve.spawn().unwrap();
+    std::io::Write::write_all(approving.stdin.as_mut().unwrap(), b"y\n").unwrap();
+    let out = approving.wait_with_output().unwrap();
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && shown.contains("tailnet: tailnet user sam@example.com, device peer") && shown.contains("approve only if peer itself shows code R3M-0TE"), "{shown}");
+    let collected = reply_json(&poll());
+    let phone_token = collected["token"].as_str().unwrap_or_else(|| panic!("{collected}")).to_string();
+    let reply = whoami(Some(&phone_token));
+    assert!(reply.starts_with("HTTP/1.1 200") && reply.contains(r#""via":"tailnet""#) && reply.contains("remote_requests"), "{reply}");
+    // Whois runs only for requests through the entry, never to change anything.
+    assert!(read("args.log").lines().filter(|l| l.starts_with("whois")).all(|l| l == "whois --json 100.64.1.2"), "{}", read("args.log"));
     unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
     let (_, status) = exits_within(&mut child, std::time::Duration::from_secs(20)).expect("client serve exits");
     assert_eq!(status.code(), Some(0), "{}", said(&log));

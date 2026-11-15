@@ -29,24 +29,46 @@ fn loopback() -> Option<SocketAddr> {
 
 const BOUND: Option<SocketAddr> = None;
 
+/// The device address [`forwarded`] names.
+const PHONE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 1, 2));
+
+/// Sam's phone as the tailnet's `whois` names it, and as a pairing records it.
+fn phone_node() -> darkmux_fleet::NodeIdentity {
+    let mut n = darkmux_fleet::test_node("nPHONE1CNTRL", "sams-iphone", "100.64.1.2");
+    n.host_name = Some("Sam's iPhone".into());
+    n.login = Some("sam@example.com".into());
+    n
+}
+
+const SAM: &str = "sam@example.com";
+
+fn phone() -> TailnetDevice {
+    TailnetDevice { id: "nPHONE1CNTRL".into(), name: "sams-iphone".into(), host_name: Some("Sam's iPhone".into()) }
+}
+
+fn sam() -> TailnetIdentity {
+    TailnetIdentity { login: "sam@example.com".into(), device: phone() }
+}
+
 #[test]
 fn a_request_as_the_entry_forwards_it_is_from_the_tailnet_with_its_login() {
     assert_eq!(
         arrival(loopback(), &forwarded(), BOUND, Some(&entry())),
         Arrival::Tailnet {
-            login: Some("sam@example.com".into())
+            login: Some("sam@example.com".into()),
+            from: PHONE,
         }
     );
     let mut none = forwarded();
     none.remove(LOGIN);
     assert_eq!(
         arrival(loopback(), &none, BOUND, Some(&entry())),
-        Arrival::Tailnet { login: None }
+        Arrival::Tailnet { login: None, from: PHONE }
     );
     none.insert(LOGIN, "".parse().unwrap());
     assert_eq!(
         arrival(loopback(), &none, BOUND, Some(&entry())),
-        Arrival::Tailnet { login: None },
+        Arrival::Tailnet { login: None, from: PHONE },
         "an empty login names no one"
     );
 }
@@ -182,21 +204,16 @@ fn tailnet_addresses_are_tailscales_ranges_only() {
 /// Tailscale named, exactly. Each refusal says what to do.
 #[test]
 fn the_identity_must_be_the_recorded_one_exactly() {
-    let sam = TailnetIdentity {
-        login: "sam@example.com".into(),
-    };
+    let sam = sam();
     let url = "https://studio.example.ts.net:8767/";
-    assert_eq!(
-        identity_refusal(Some(&sam), Some("sam@example.com"), url),
-        None
-    );
-    let (code, why) = identity_refusal(None, Some("sam@example.com"), url).unwrap();
+    assert_eq!(identity_checked(Some(&sam), Some("sam@example.com"), url), Ok(&sam));
+    let (code, why) = identity_checked(None, Some("sam@example.com"), url).unwrap_err();
     assert_eq!(code, ClientCode::NotPairedRemotely);
     assert!(
         why.contains("pair the device over the tailnet") && why.contains(url),
         "{why}"
     );
-    let (code, why) = identity_refusal(Some(&sam), None, url).unwrap();
+    let (code, why) = identity_checked(Some(&sam), None, url).unwrap_err();
     assert_eq!(code, ClientCode::RemoteIdentityMissing);
     assert!(
         why.contains("tag") && why.contains("log the device in"),
@@ -208,15 +225,176 @@ fn the_identity_must_be_the_recorded_one_exactly() {
         "sam@example.com ",
         "",
     ] {
-        let (code, why) = identity_refusal(Some(&sam), Some(other), url).unwrap();
+        let (code, why) = identity_checked(Some(&sam), Some(other), url).unwrap_err();
         assert_eq!(code, ClientCode::RemoteIdentityMismatch, "{other:?}");
         assert!(why.contains("log the device in"), "{why}");
     }
     assert_eq!(
-        identity_refusal(None, None, url).map(|r| r.0),
-        Some(ClientCode::NotPairedRemotely),
+        identity_checked(None, None, url).map_err(|r| r.0),
+        Err(ClientCode::NotPairedRemotely),
         "no identity recorded comes first"
     );
+}
+
+/// (#3560 review) A login that is not ASCII arrives as Tailscale's Go code
+/// writes it, `mime.QEncoding.Encode` (`=?utf-8?q?...?=`, `_` for a space,
+/// `=XX` for any other byte, words split by single spaces), and reads as the
+/// login itself; an ASCII one is the login as sent. Anything malformed names
+/// no one.
+#[test]
+fn a_login_header_reads_as_the_login_it_names() {
+    for (header, login) in [
+        ("sam@example.com", "sam@example.com"),
+        ("=?utf-8?q?j=C3=B6rg@example.com?=", "jörg@example.com"),
+        ("=?UTF-8?Q?j=C3=B6rg?=", "jörg"),
+        ("=?utf-8?q?a_b=C3=A9?= =?utf-8?q?=E6=97=A5@example.com?=", "a bé日@example.com"),
+    ] {
+        assert_eq!(decoded_login(header).as_deref(), Some(login), "{header}");
+    }
+    for bad in [
+        "=?utf-8?q?bad=ZZ?=",
+        "=?utf-8?q?bad=+1?=",
+        "=?utf-8?q?cut=C?=",
+        "=?utf-8?q?=FF=FE?=",
+        "=?iso-8859-1?q?j=F6rg?=",
+        "=?utf-8?b?am9yZw==?=",
+        "=?iso-8859-1?q?jorg?=",
+        "=?utf-8?b?jorg?=",
+        "=?utf-8?q?unclosed",
+        "=?utf-8?q??=",
+        "=?utf-8?q?a?=  =?utf-8?q?b?=",
+    ] {
+        assert_eq!(decoded_login(bad), None, "{bad}");
+    }
+}
+
+/// The login is decoded once, as the request arrives: everything after it
+/// compares the login itself.
+#[test]
+fn a_request_arrives_with_its_login_decoded() {
+    let mut h = forwarded();
+    h.insert(LOGIN, "=?utf-8?q?j=C3=B6rg@example.com?=".parse().unwrap());
+    assert_eq!(arrival(loopback(), &h, BOUND, Some(&entry())), Arrival::Tailnet { login: Some("jörg@example.com".into()), from: PHONE });
+    h.insert(LOGIN, "=?utf-8?q?bad=ZZ?=".parse().unwrap());
+    assert_eq!(arrival(loopback(), &h, BOUND, Some(&entry())), Arrival::Tailnet { login: None, from: PHONE }, "malformed is missing");
+}
+
+/// The status is kept for its time to live, and not past it.
+#[test]
+fn the_status_is_kept_for_its_time_to_live() {
+    let cache = StatusCache::new(std::time::Duration::from_secs(10));
+    let t0 = std::time::Instant::now();
+    assert_eq!(cache.get(t0), None);
+    let status = TailnetStatus { own_login: Some(SAM.into()), peers: vec![PHONE] };
+    cache.put(status.clone(), t0);
+    assert_eq!(cache.get(t0 + std::time::Duration::from_secs(9)), Some(status));
+    assert_eq!(cache.get(t0 + std::time::Duration::from_secs(10)), None);
+}
+
+/// A pairing route through the entry needs a tailnet user to record; with
+/// none (a tagged device) it is refused, naming the fix.
+#[test]
+fn a_pairing_needs_a_tailnet_user() {
+    assert_eq!(pairing_login(Some("sam@example.com")), Ok("sam@example.com".to_string()));
+    let (code, why) = pairing_login(None).unwrap_err();
+    assert_eq!(code, ClientCode::RemoteIdentityMissing);
+    assert!(why.contains("tag") && why.contains("pair"), "{why}");
+}
+
+/// The device `whois` names at the forwarded address: its stable id, name
+/// and host name, or, fail closed, a refusal when it named none or failed.
+#[test]
+fn whois_names_the_device_or_the_request_is_refused() {
+    assert_eq!(device_named(Ok(Some(phone_node())), SAM), Ok(phone()));
+    for found in [Ok(None), Err("tailscaled is not running".to_string())] {
+        let (code, why) = device_named(found.clone(), SAM).unwrap_err();
+        assert_eq!(code, ClientCode::RemoteDeviceUnknown, "{found:?}");
+        assert!(why.contains("tailscale status") && !why.contains("tailscaled is not running"), "{why}");
+    }
+}
+
+/// (#3560 review) The header's user must be the one Tailscale's own record
+/// gives the device at that address (`UserProfile.LoginName`), exactly: a
+/// local process can send any header and any address, but not change what
+/// `whois` says. A device whose record names no user is refused too.
+#[test]
+fn whois_must_confirm_the_headers_user() {
+    for header in ["alex@example.com", "Sam@example.com", "sam@example.com "] {
+        let (code, why) = device_named(Ok(Some(phone_node())), header).unwrap_err();
+        assert_eq!(code, ClientCode::RemoteIdentityUnconfirmed, "{header:?}");
+        assert!(why.contains("sam@example.com"), "names whose device it is: {why}");
+    }
+    let mut tagged = phone_node();
+    tagged.login = None;
+    assert_eq!(device_named(Ok(Some(tagged.clone())), SAM).map_err(|r| r.0), Err(ClientCode::RemoteIdentityUnconfirmed));
+    assert_eq!(device_refusal(&phone(), Ok(Some(tagged)), SAM).map(|r| r.0), Some(ClientCode::RemoteIdentityUnconfirmed));
+    assert_eq!(device_refusal(&phone(), Ok(Some(phone_node())), "alex@example.com").map(|r| r.0), Some(ClientCode::RemoteIdentityUnconfirmed));
+}
+
+/// (#3560 review) A pairing over the tailnet is open only to the tailnet
+/// user this Mac is logged in as; another is refused naming who may, and
+/// when Tailscale cannot say who that is, the pairing is refused for now.
+#[test]
+fn only_this_macs_own_tailnet_user_may_pair() {
+    assert_eq!(owner_refusal(SAM, &Ok(Some(SAM.to_string()))), None);
+    let (status, code, why) = owner_refusal("alex@example.com", &Ok(Some(SAM.to_string()))).unwrap();
+    assert_eq!((status, code), (StatusCode::FORBIDDEN, ClientCode::RemoteUserNotOwner));
+    assert!(why.contains(SAM) && why.contains("log the device in"), "{why}");
+    for own in [Ok(None), Err("tailscaled is not running".to_string())] {
+        let (status, code, why) = owner_refusal(SAM, &own).unwrap();
+        assert_eq!((status, code), (StatusCode::SERVICE_UNAVAILABLE, ClientCode::Unavailable), "{own:?}");
+        assert!(why.contains("tailscale status") && !why.contains("not running"), "{why}");
+    }
+}
+
+/// A token's pairing pins its device: only the same stable id passes. The
+/// name is the device's own to change, so it never decides.
+#[test]
+fn a_device_must_be_the_one_the_token_paired_from() {
+    assert_eq!(device_refusal(&phone(), Ok(Some(phone_node())), SAM), None);
+    let mut renamed = phone_node();
+    renamed.name = "sams-new-name".into();
+    assert_eq!(device_refusal(&phone(), Ok(Some(renamed)), SAM), None, "a rename is the same device");
+    let mut laptop = darkmux_fleet::test_node("nLAPTOP1CNTRL", "sams-iphone", "100.64.1.9");
+    laptop.login = Some(SAM.into());
+    let (code, why) = device_refusal(&phone(), Ok(Some(laptop)), SAM).unwrap();
+    assert_eq!(code, ClientCode::RemoteDeviceMismatch);
+    assert!(why.contains("sams-iphone") && why.contains("pair"), "{why}");
+    for found in [Ok(None), Err("timed out".to_string())] {
+        assert_eq!(device_refusal(&phone(), found, SAM).map(|r| r.0), Some(ClientCode::RemoteDeviceUnknown));
+    }
+}
+
+/// A pairing is collected the way it was asked for: from this Mac, or
+/// through the entry by the same user on the same device.
+#[test]
+fn a_poll_must_come_the_way_its_pairing_did() {
+    let sam = sam();
+    assert_eq!(poll_refusal(None, None), None);
+    assert_eq!(poll_refusal(Some(&sam), Some(&sam)), None);
+    assert_eq!(poll_refusal(Some(&sam), None), Some(PollRefusal::NotFound), "from this Mac");
+    let refused = |r: Option<PollRefusal>| match r {
+        Some(PollRefusal::Coded(code, _)) => Some(code),
+        _ => None,
+    };
+    assert_eq!(refused(poll_refusal(None, Some(&sam))), Some(ClientCode::NotPairedRemotely));
+    let alex = TailnetIdentity { login: "alex@example.com".into(), ..sam.clone() };
+    assert_eq!(refused(poll_refusal(Some(&sam), Some(&alex))), Some(ClientCode::RemoteIdentityMismatch));
+    let mut laptop = sam.clone();
+    laptop.device.id = "nLAPTOP1CNTRL".into();
+    assert_eq!(refused(poll_refusal(Some(&sam), Some(&laptop))), Some(ClientCode::RemoteDeviceMismatch));
+}
+
+/// What the operator is shown about a remote pairing: Tailscale's user and
+/// device, never with a character that could disguise them.
+#[test]
+fn a_remote_identity_is_described_safely() {
+    assert_eq!(described(&sam()), "tailnet user sam@example.com, device sams-iphone (Sam's iPhone)");
+    let mut sly = sam();
+    sly.login = "sam@example.com\u{202E}moc".into();
+    sly.device.host_name = None;
+    let shown = described(&sly);
+    assert!(!shown.contains('\u{202E}') && shown.ends_with("device sams-iphone"), "{shown}");
 }
 
 #[test]
@@ -236,10 +414,4 @@ fn a_request_from_neither_is_not_local_with_no_entry_and_not_forwarded_with_one(
             && why.contains("studio.example.ts.net:8767"),
         "{why}"
     );
-    let (status, code, why) = pairing_refusal();
-    assert_eq!(
-        (status, code),
-        (StatusCode::FORBIDDEN, ClientCode::RemotePairingUnavailable)
-    );
-    assert!(why.contains("only an app on this Mac can pair"), "{why}");
 }

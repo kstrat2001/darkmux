@@ -48,7 +48,7 @@
 //! running as this user, could run `client approve` anyway.
 
 use crate::client_pairing::{
-    approve_as, deny, peer_holders_of, Approval, ClientServerState, ClientStore, RememberedApp, SigningIdentity,
+    approve_as, deny, peer_holders_of, Approval, ClientServerState, ClientStore, RememberedApp, Requester, SigningIdentity,
     PAIR_REQUESTS_PER_PROCESS,
 };
 use darkmux_platform::{AllowAnswer, SignedApp};
@@ -66,6 +66,10 @@ pub const DIALOG_TIMEOUT_SECS: u64 = 120;
 
 /// Dialogs open at once on this machine, whoever asked.
 pub const MAX_OPEN_DIALOGS: usize = 4;
+
+/// (#3560) Of those, the most tailnet devices may hold between them, so the
+/// apps on this Mac always keep the rest.
+pub const MAX_REMOTE_DIALOGS: usize = 2;
 
 /// `clients.pairing.*` as it reads now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +117,10 @@ pub enum Sender {
     Signed(SignedApp),
     /// Nothing darkmux can name: the dialog asks, and Allow remembers nothing.
     Unverified(String),
+    /// (#3560) A device on the tailnet, as Tailscale names it: the dialog
+    /// asks, showing that, and Allow remembers nothing. Never judged by a
+    /// signature: the process holding its connection is Tailscale's.
+    Tailnet(crate::client_tailnet::TailnetIdentity),
 }
 
 /// What `signed` (the sender's signature, or why it has none) means under
@@ -150,6 +158,23 @@ pub fn dialog_message(code: &str, signed: Option<&SignedApp>) -> String {
     format!("An app wants to use darkmux on this computer. Code {}.\n\n{who}", safe(code))
 }
 
+/// (#3560) The dialog's text for a pairing through the tailnet entry: the
+/// tailnet user and device the request names (Tailscale confirmed that
+/// device is that user's, but a program on this computer can name any
+/// device), and the code to compare with what that device itself shows,
+/// each display-safe.
+pub fn tailnet_dialog_message(code: &str, identity: &crate::client_tailnet::TailnetIdentity) -> String {
+    let safe = darkmux_platform::display_safe;
+    format!(
+        "A device on your tailnet wants to use darkmux on this computer.\n\nThe request names {}. A program on this \
+         computer can send a request naming any device, so Allow only if {} shows code {}. If you are not pairing a \
+         device now, Deny.\nAllow pairs it now; the next device asks again.",
+        crate::client_tailnet::described(identity),
+        safe(&identity.device.name),
+        safe(code)
+    )
+}
+
 /// The notice once a trusted app is paired.
 pub fn paired_notice(app: &SignedApp, by: TrustedBy) -> String {
     match by {
@@ -158,22 +183,24 @@ pub fn paired_notice(app: &SignedApp, by: TrustedBy) -> String {
     }
 }
 
-/// The dialogs open now, by the process that asked (`None`: one darkmux
-/// could not tell, all counted together).
+/// The dialogs open now, by who asked (`None`: a process darkmux could not
+/// tell, all counted together).
 #[derive(Default)]
-pub struct DialogSlots(Mutex<HashMap<Option<u32>, usize>>);
+pub struct DialogSlots(Mutex<HashMap<Option<Requester>, usize>>);
 
 /// One open dialog's place; given back when dropped.
-pub struct DialogSlot(Arc<DialogSlots>, Option<u32>);
+pub struct DialogSlot(Arc<DialogSlots>, Option<Requester>);
 
 impl DialogSlots {
-    /// A place for a dialog `from` asked for, unless that process has
+    /// A place for a dialog `from` asked for, unless that sender has
     /// [`PAIR_REQUESTS_PER_PROCESS`] open or the machine [`MAX_OPEN_DIALOGS`].
-    pub fn take(self: &Arc<Self>, from: Option<u32>) -> Option<DialogSlot> {
+    pub fn take(self: &Arc<Self>, from: Option<Requester>) -> Option<DialogSlot> {
         let mut open = self.0.lock().unwrap();
         let total: usize = open.values().sum();
-        let mine = open.entry(from).or_default();
-        if *mine >= PAIR_REQUESTS_PER_PROCESS || total >= MAX_OPEN_DIALOGS {
+        let remote: usize = open.iter().filter(|(k, _)| matches!(k, Some(Requester::Device(_)))).map(|(_, n)| n).sum();
+        let full_remote = matches!(from, Some(Requester::Device(_))) && remote >= MAX_REMOTE_DIALOGS;
+        let mine = open.entry(from.clone()).or_default();
+        if *mine >= PAIR_REQUESTS_PER_PROCESS || total >= MAX_OPEN_DIALOGS || full_remote {
             return None;
         }
         *mine += 1;
@@ -230,7 +257,7 @@ pub async fn decide(
         other => other,
     };
     match policy.dialog {
-        true => offer_dialog(state, request_id, code, from, sender).into_iter().collect(),
+        true => offer_dialog(state, request_id, code, from.map(Requester::Process), sender).into_iter().collect(),
         false => Vec::new(),
     }
 }
@@ -252,6 +279,36 @@ async fn still_the_same_app(state: &ClientServerState, peer: Option<SocketAddr>,
     }
 }
 
+/// (#3560) The serve-log line for a pairing asked for through the tailnet
+/// entry: who Tailscale says asked, and how the operator approves it.
+pub fn remote_pairing_line(request_id: &str, code: &str, identity: &crate::client_tailnet::TailnetIdentity) -> String {
+    format!(
+        "darkmux client serve: pairing request {request_id} through the tailnet entry naming {}; it waits for the \
+         operator, who approves it only if that device shows code {}: `darkmux client approve --code {}`",
+        crate::client_tailnet::described(identity),
+        darkmux_platform::display_safe(code),
+        darkmux_platform::display_safe(code)
+    )
+}
+
+/// (#3560) What a newly stored pairing request through the tailnet entry
+/// gets: never an approval of its own, only the dialog (when the policy
+/// shows one) and the serve-log line naming `client approve`. Never waits
+/// on the operator.
+pub fn decide_remote(
+    state: &ClientServerState,
+    (request_id, code): (&str, &str),
+    from: Requester,
+    identity: &crate::client_tailnet::TailnetIdentity,
+) -> Vec<String> {
+    let policy = (state.pairing_policy)().unwrap_or_else(|_| PairingPolicy::fail_closed());
+    let mut lines = vec![remote_pairing_line(request_id, code, identity)];
+    if policy.dialog {
+        lines.extend(offer_dialog(state, request_id, code, Some(from), Sender::Tailnet(identity.clone())));
+    }
+    lines
+}
+
 /// Approves a trusted sender's request through the one approval path, with
 /// the notice. The serve-log line.
 fn approve_trusted(state: &ClientServerState, request_id: &str, app: &SignedApp, by: TrustedBy) -> String {
@@ -267,18 +324,14 @@ fn approve_trusted(state: &ClientServerState, request_id: &str, app: &SignedApp,
 
 /// Raises the dialog for a request on a thread of its own, when a slot is
 /// free; a line for the serve log when none is.
-fn offer_dialog(state: &ClientServerState, request_id: &str, code: &str, from: Option<u32>, sender: Sender) -> Option<String> {
+fn offer_dialog(state: &ClientServerState, request_id: &str, code: &str, from: Option<Requester>, sender: Sender) -> Option<String> {
     let Some(slot) = state.dialogs.take(from) else {
         return Some(format!(
-            "darkmux client serve: no dialog for pairing request {request_id}: its process has dialogs open already; \
-             `darkmux client approve --code {code}` approves it"
+            "darkmux client serve: no dialog for pairing request {request_id}: its sender (a process here, or a \
+             tailnet device) has dialogs open already; `darkmux client approve --code {code}` approves it"
         ));
     };
-    let remember = match &sender {
-        Sender::Signed(app) | Sender::Trusted(app, _) => Some(app.clone()),
-        Sender::Unverified(_) => None,
-    };
-    let message = dialog_message(code, remember.as_ref());
+    let (message, remember) = dialog_for(code, sender);
     // The app's own icon only for a signature that verified: an unverified
     // app's icon is its own choice, and could be Mux Bot's.
     let icon = remember.as_ref().and_then(|app| app.icon.clone());
@@ -290,6 +343,16 @@ fn offer_dialog(state: &ClientServerState, request_id: &str, code: &str, from: O
         eprintln!("{}", act_on_answer(&st.store, &id, (st.now)(), answer, remember));
     });
     None
+}
+
+/// A dialog's text for `sender`'s request showing `code`, and the signed
+/// app an Allow would remember (only one whose signature verified).
+fn dialog_for(code: &str, sender: Sender) -> (String, Option<SignedApp>) {
+    match sender {
+        Sender::Signed(app) | Sender::Trusted(app, _) => (dialog_message(code, Some(&app)), Some(app)),
+        Sender::Unverified(_) => (dialog_message(code, None), None),
+        Sender::Tailnet(identity) => (tailnet_dialog_message(code, &identity), None),
+    }
 }
 
 /// What an Allow says about the app it remembers: a container engine is

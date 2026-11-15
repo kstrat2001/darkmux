@@ -60,6 +60,10 @@ pub struct NodeIdentity {
     /// names it (a display name or login), when reported. Shown by
     /// `machine trust` so the operator can see WHOSE node they trusted.
     pub owner: Option<String>,
+    /// (#3560) The login name of the account that owns the node
+    /// (`UserProfile.LoginName`), exactly as the provider reports it, when it
+    /// names one: what `client serve` checks a tailnet request's user against.
+    pub login: Option<String>,
 }
 
 impl NodeIdentity {
@@ -254,10 +258,10 @@ pub(crate) fn parse_whois_json(raw: &[u8]) -> Result<NodeIdentity> {
         .map(|a| a.iter().filter_map(|x| x.as_str()).filter_map(parse_addr).collect())
         .unwrap_or_default();
     let host_name = node.get("Hostinfo").and_then(|h| str_field(h, "Hostname"));
-    let owner = v
-        .get("UserProfile")
-        .and_then(|u| str_field(u, "DisplayName").or_else(|| str_field(u, "LoginName")));
-    Ok(NodeIdentity { node_id, name, dns_name, host_name, addresses, online: None, owner })
+    let profile = v.get("UserProfile");
+    let owner = profile.and_then(|u| str_field(u, "DisplayName").or_else(|| str_field(u, "LoginName")));
+    let login = profile.and_then(|u| str_field(u, "LoginName"));
+    Ok(NodeIdentity { node_id, name, dns_name, host_name, addresses, online: None, owner, login })
 }
 
 fn status_node(v: &serde_json::Value, users: Option<&serde_json::Value>) -> Option<NodeIdentity> {
@@ -275,12 +279,13 @@ fn status_node(v: &serde_json::Value, users: Option<&serde_json::Value>) -> Opti
         .map(|a| a.iter().filter_map(|x| x.as_str()).filter_map(parse_addr).collect())
         .unwrap_or_default();
     let online = v.get("Online").and_then(|o| o.as_bool());
-    let owner = v
+    let user = v
         .get("UserID")
         .map(|id| id.to_string())
-        .and_then(|id| users.and_then(|u| u.get(id.as_str())))
-        .and_then(|u| str_field(u, "DisplayName").or_else(|| str_field(u, "LoginName")));
-    Some(NodeIdentity { node_id, name, dns_name, host_name, addresses, online, owner })
+        .and_then(|id| users.and_then(|u| u.get(id.as_str())));
+    let owner = user.and_then(|u| str_field(u, "DisplayName").or_else(|| str_field(u, "LoginName")));
+    let login = user.and_then(|u| str_field(u, "LoginName"));
+    Some(NodeIdentity { node_id, name, dns_name, host_name, addresses, online, owner, login })
 }
 
 /// Parse `status --json`: `{ "BackendState", "Self": {..}, "Peer": { k: {..} } }`,
@@ -383,6 +388,7 @@ pub fn test_node(node_id: &str, name: &str, addr: &str) -> NodeIdentity {
         addresses: vec![addr.parse().unwrap()],
         online: Some(true),
         owner: Some("operator".to_string()),
+        login: None,
     }
 }
 
@@ -456,6 +462,7 @@ mod tests {
         assert_eq!(n.host_name.as_deref(), Some("MacBook Pro"));
         assert!(n.addresses.contains(&"100.64.0.7".parse().unwrap()));
         assert!(n.addresses.contains(&"fd7a:115c:a1e0::7".parse().unwrap()));
+        assert_eq!(n.login.as_deref(), Some("x"), "(#3560) the account's login name, exactly");
     }
 
     #[test]
@@ -476,6 +483,8 @@ mod tests {
         assert!(mbp.answers_to("LAPTOP"), "case-insensitively");
         assert!(!mbp.answers_to("MacBook Pro"), "never the self-reported OS host name");
         assert_eq!(mbp.owner.as_deref(), Some("Op Erator"), "the owner from the status's User map");
+        assert_eq!(mbp.login.as_deref(), Some("op@example.com"), "(#3560) and its login name");
+        assert_eq!(me.login, None, "a node whose user the status does not name has no login");
         assert!(mbp.answers_to("laptop.tailnet-example.ts.net."));
         assert!(!mbp.answers_to("lap"));
     }

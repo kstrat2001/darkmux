@@ -17,6 +17,12 @@ one per line). Its `serve` changes follow Tailscale 1.102.4's own code
   once no handler is left, the web key, the port's TCP record and its Funnel
   go too (`RemoveWebHandler`); no handler to remove is an error.
 
+`whois --json <addr>` answers from `whois.json` (address -> the answer
+Tailscale 1.102.4's `apitype.WhoIsResponse` would be), and an address not in
+it the way the real tool refuses one no device holds; `whois_fails` makes
+every `whois` fail as it does with the daemon down. Read-only, like the
+real command.
+
 Switches, each a file beside it: `refuse` (every change fails), `record_path`
 (holds a path that must exist before a publish), `publish_as.json` (the
 handler a publish stores instead of `{"Proxy": <target>}`),
@@ -63,6 +69,14 @@ if args == ["version"]:
     sys.exit(0)
 if args == ["status", "--json"]:
     sys.stdout.write(open(path("status.json")).read())
+    sys.exit(0)
+if len(args) == 3 and args[:2] == ["whois", "--json"]:
+    if has("whois_fails"):
+        fail("failed to connect to local tailscaled; it doesn't appear to be running")
+    answers = load("whois.json") if has("whois.json") else {}
+    if args[2] not in answers:
+        fail("peer not found")
+    print(json.dumps(answers[args[2]]))
     sys.exit(0)
 if args == ["serve", "status", "--json"]:
     if has("status_fails"):

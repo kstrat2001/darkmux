@@ -232,7 +232,7 @@ pub(crate) fn client_table() -> Vec<ClientRoute> {
 
 /// (#3560) Whether a route at `path` takes no token (`auth = open` or
 /// `pair_secret`: the pairing routes). Through the tailnet entry such a
-/// route is refused, since pairing there is a later part.
+/// route needs a tailnet user and device to record, in place of a token.
 pub(crate) fn takes_no_token(path: &str) -> bool {
     static NO_TOKEN: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     NO_TOKEN
@@ -271,10 +271,11 @@ fn render_client_table() -> String {
     let mut out = String::new();
     for r in client_table() {
         // (#3560) A route that takes a token also answers a paired device
-        // through the tailnet entry; the pairing routes do not (yet).
+        // through the tailnet entry; the pairing routes, a device pairing
+        // through it.
         let who = match r.auth {
             ClientAuth::Bearer => "this machine's apps and paired devices through its tailnet entry",
-            ClientAuth::Open | ClientAuth::PairSecret => "this machine's apps only",
+            ClientAuth::Open | ClientAuth::PairSecret => "this machine's apps and devices pairing through its tailnet entry",
         };
         out.push_str(&format!(
             "{} {}  json {} (client listener: 127.0.0.1, {who}; not the viewer daemon)\n",

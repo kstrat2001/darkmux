@@ -66,11 +66,16 @@ pub enum ClientCapability {
     /// listed, a missing `code` means none fits; without it, the darkmux
     /// predates codes and an app reads only `reason`.
     AvailabilityCodes,
+    /// (#3560) A device on the tailnet pairs through `remote.url` (approved
+    /// on the Mac, never on its own) and is then answered there with its
+    /// token, from the tailnet user and device it paired as. What the build
+    /// can do: `remote.state` says whether this machine is on the tailnet.
+    RemoteRequests,
 }
 
 impl ClientCapability {
     /// Every capability, in declaration order: what `whoami` lists.
-    pub const ALL: [ClientCapability; 10] = [
+    pub const ALL: [ClientCapability; 11] = [
         ClientCapability::CleanPreview,
         ClientCapability::TemplateWorkspace,
         ClientCapability::Continues,
@@ -81,6 +86,7 @@ impl ClientCapability {
         ClientCapability::WorkspaceRemove,
         ClientCapability::RemoteTailscale,
         ClientCapability::AvailabilityCodes,
+        ClientCapability::RemoteRequests,
     ];
 }
 
@@ -113,6 +119,7 @@ mod tests {
                 "workspace_remove",
                 "remote_tailscale",
                 "availability_codes",
+                "remote_requests",
             ]
         );
         for c in ClientCapability::ALL {

@@ -845,7 +845,7 @@ jobs:
           # doc-only set missed.
           # Every CLAUDE.md in the repo is found, not listed, so adding one
           # never needs an edit here.
-          SCAN="README.md CONTRIBUTING.md DESIGN.md DISCLAIMER.md docs/ENVIRONMENT.md docs/ENGAGEMENTS.md docs/agents/ docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ templates/ $(git ls-files -- 'CLAUDE.md' '**/CLAUDE.md' | tr '\n' ' ')"
+          SCAN="README.md CONTRIBUTING.md DESIGN.md DISCLAIMER.md docs/ENVIRONMENT.md docs/ENGAGEMENTS.md docs/CLIENTS.md docs/agents/ docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ templates/ $(git ls-files -- 'CLAUDE.md' '**/CLAUDE.md' | tr '\n' ' ')"
           # (#2589) One mktemp'd stderr file per scan below, cleaned up on
           # exit regardless of which scan fires it — a runner is ephemeral so
           # a leaked /tmp/*.err here was harmless, but a fixed name is still
