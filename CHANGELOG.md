@@ -14,6 +14,15 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.11.0] - 2026-11-14
+
+**darkmux no longer needs Docker.** On a Mac it runs every sandbox in macOS's own (Seatbelt); on
+Linux in Landlock where the kernel allows it; Docker stays a selectable backend
+(`runtime.sandbox`). The agent runtime ships inside the darkmux binary, client previews run in the
+selected sandbox, and darkmux supplies a verified, pinned Node.js to sandboxes on the host, so a
+fresh Mac needs neither Docker nor Node of its own. Schema bumps: flow 2.8.0, config 2.9, preview
+recipe 1.1, resume origin 1.1, run manifest 1.4 (all additive).
+
 ### Added
 
 - **A workspace cloned from a repo URL can run a preview (#3571).** darkmux records the commit it
@@ -98,6 +107,11 @@ darkmux release.
   nothing and replies with its `path` and `url`. New reply type `ImageReply`.
 
 ### Changed
+
+- **The fleet card names what is running (#3554).** Its count line names the running model, and
+  its engine when that is not managed LM Studio ("1 running · qwen3.6-35b-a3b · flint"); idle, it
+  says how many darkmux models the machine holds ("0 running · 2 loaded"), only when the engine's
+  list is known.
 
 - **Every `darkmux client serve` route refuses a request whose body takes more than 30 seconds to
   arrive (#3545).** It answers 408 with code `bad_request`; before, a client could hold a request,
@@ -213,6 +227,10 @@ darkmux release.
   formula's caveats still say dispatches need Docker; they change with the next release.
 
 ### Fixed
+
+- **A `/bin/sh` that is a FIFO no longer hangs darkmux (#3568).** darkmux reads `/bin/sh` to learn a
+  Linux machine's C library; it now opens it without blocking, so a FIFO with no writer reads as
+  glibc instead of hanging every sandbox start and `darkmux doctor`.
 
 - **A dispatch under Landlock can start a server on the loopback (#3567).** With no ports named
   (every dispatch), Landlock refused every bind, so a test server or dev server on `127.0.0.1`
@@ -4965,6 +4983,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.11.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.11.0
 [5.10.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.10.0
 [5.9.3]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.3
 [5.9.2]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.2

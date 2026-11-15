@@ -5970,6 +5970,32 @@ fn on_host_named(sandbox: &darkmux_sandbox::SandboxHandle) -> String {
     format!("the `{}` sandbox `{}`", darkmux_sandbox::setting_value(sandbox.backend), sandbox.id)
 }
 
+/// One attempt of [`kill_container_persistently`]: the kill, or past the
+/// escalation the remove. `Ok(true)` when it proved the sandbox stopped,
+/// `Ok(false)` when it exited 0 having proved nothing, `Err` with the error
+/// the give-up message reports otherwise.
+///
+/// A successful `docker kill` is itself an observation: it only succeeds
+/// against a RUNNING container. A successful `docker rm -f` is not: it exits
+/// 0 for a container that never existed. What separates the two is stdout,
+/// which carries the removed container's name and is empty in the
+/// no-such-container case.
+fn kill_attempt(
+    backend: &dyn darkmux_sandbox::SandboxBackend,
+    sandbox: &darkmux_sandbox::SandboxHandle,
+    killing: bool,
+) -> Result<bool, String> {
+    let (verb, mut cmd) = if killing { (KillStep::Kill, backend.kill(sandbox)) } else { (KillStep::Remove, backend.remove(sandbox)) };
+    match cmd.output() {
+        Ok(o) if o.status.success() => Ok(killing || !String::from_utf8_lossy(&o.stdout).trim().is_empty()),
+        Ok(o) => {
+            let said = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            Err(if said.is_empty() { verb.exited_silently(sandbox, &o.status) } else { said })
+        }
+        Err(e) => Err(verb.could_not_run(sandbox, &e)),
+    }
+}
+
 /// (#2232) Stop `container_name` and keep trying until it is confirmed
 /// stopped or the attempts run out — the persistent replacement for the
 /// watchdog's single fire-and-forget `docker kill`.
@@ -6015,30 +6041,12 @@ fn kill_container_persistently(sandbox: &darkmux_sandbox::SandboxHandle, base_ba
     // we know nothing, so the outcome must stay `Unconfirmed` (fail closed).
     let mut probe_inconclusive = false;
     for attempt in 1..=CONTAINER_KILL_MAX_ATTEMPTS {
-        let killing = attempt <= CONTAINER_KILL_ESCALATE_AFTER;
-        let (verb, mut cmd) =
-            if killing { (KillStep::Kill, backend.kill(sandbox)) } else { (KillStep::Remove, backend.remove(sandbox)) };
-        match cmd.output() {
-            Ok(o) if o.status.success() => {
-                // A successful `docker kill` is itself an observation — it
-                // only succeeds against a RUNNING container. A successful
-                // `docker rm -f` is not: it exits 0 for a container that
-                // never existed. What separates the two is stdout, which
-                // carries the removed container's name and is empty in the
-                // no-such-container case.
-                if killing || !String::from_utf8_lossy(&o.stdout).trim().is_empty() {
-                    return KillOutcome::Confirmed { attempts: attempt };
-                }
-                // Exit 0 that proved nothing. Not an error, so `last_error`
-                // is left alone; fall through to the probe and keep watching.
-            }
-            Ok(o) => {
-                last_error = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                if last_error.is_empty() {
-                    last_error = verb.exited_silently(sandbox, &o.status);
-                }
-            }
-            Err(e) => last_error = verb.could_not_run(sandbox, &e),
+        match kill_attempt(backend, sandbox, attempt <= CONTAINER_KILL_ESCALATE_AFTER) {
+            Ok(true) => return KillOutcome::Confirmed { attempts: attempt },
+            // Exit 0 that proved nothing. Not an error, so `last_error` is
+            // left alone; fall through to the probe and keep watching.
+            Ok(false) => {}
+            Err(e) => last_error = e,
         }
         // The attempt settled nothing — and "already gone", "not created
         // yet" and "daemon trouble" all look identical from the exit code
