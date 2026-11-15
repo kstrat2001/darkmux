@@ -143,7 +143,23 @@ pub(crate) struct ClientRoute {
     /// The query the route reads, if any: its type's own schema, one
     /// parameter per property.
     pub(crate) query: Option<SchemaFn>,
+    /// What the route takes in place of a token, if anything
+    /// (`every_route_is_open_or_not_as_the_table_declares` holds the
+    /// handlers to it).
+    pub(crate) auth: ClientAuth,
     handler: MethodRouter<crate::client_pairing::ClientServerState>,
+}
+
+/// How a client route knows who is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientAuth {
+    /// `Authorization: Bearer <token>`, the token a pairing delivered.
+    Bearer,
+    /// Nothing: any app on this machine may ask (`POST /client/pair`).
+    Open,
+    /// The `X-Pair-Secret` header, the `pair_secret` the pairing request
+    /// sent (`GET /client/pair/{request_id}`), and no token.
+    PairSecret,
 }
 
 /// The JSON body a client route reads.
@@ -157,9 +173,11 @@ pub(crate) struct RequestBody {
 /// A client route: the reply type (and any body or query type) is checked
 /// to exist and to have a schema, and named in the goldens. A route that
 /// reads a JSON body names its type with `body = T` (`optional_body = T`
-/// when it may be absent), one that reads a query with `query = T`.
+/// when it may be absent), one that reads a query with `query = T`. A route
+/// that takes no token says what it takes instead: `auth = open` or `auth =
+/// pair_secret`.
 macro_rules! client_json {
-    ($method:ident, $ty:ty, $path:expr, $handler:expr $(, $key:ident = $arg:ty)*) => {{
+    ($method:ident, $ty:ty, $path:expr, $handler:expr $(, $key:ident = $arg:tt)*) => {{
         #[allow(unused_mut)]
         let mut route = ClientRoute {
             method: stringify!($method),
@@ -168,6 +186,7 @@ macro_rules! client_json {
             reply_schema: |g| g.subschema_for::<$ty>(),
             body: None,
             query: None,
+            auth: ClientAuth::Bearer,
             handler: axum::routing::$method($handler),
         };
         $( client_json!(@ route, $key, $arg); )*
@@ -176,6 +195,8 @@ macro_rules! client_json {
     (@ $r:ident, body, $t:ty) => { $r.body = Some(RequestBody { schema: |g| g.subschema_for::<$t>(), required: true }) };
     (@ $r:ident, optional_body, $t:ty) => { $r.body = Some(RequestBody { schema: |g| g.subschema_for::<$t>(), required: false }) };
     (@ $r:ident, query, $t:ty) => { $r.query = Some(|g| <$t as schemars::JsonSchema>::json_schema(g)) };
+    (@ $r:ident, auth, open) => { $r.auth = ClientAuth::Open };
+    (@ $r:ident, auth, pair_secret) => { $r.auth = ClientAuth::PairSecret };
 }
 
 /// Every route the client listener serves. Every refusal on any of them is
@@ -184,8 +205,8 @@ pub(crate) fn client_table() -> Vec<ClientRoute> {
     use crate::client_pairing::*;
     use crate::client_wire::*;
     vec![
-        client_json!(post, PairAccepted, "/client/pair", pair_handler, body = PairBody),
-        client_json!(get, PairPoll, "/client/pair/:request_id", poll_handler),
+        client_json!(post, PairAccepted, "/client/pair", pair_handler, body = PairBody, auth = open),
+        client_json!(get, PairPoll, "/client/pair/:request_id", poll_handler, auth = pair_secret),
         client_json!(get, Whoami, "/client/whoami", whoami_handler),
         client_json!(get, ClientOpenApi, "/client/openapi.json", openapi_handler),
         client_json!(get, ClientProfiles, "/client/profiles", profiles_handler, query = ProfilesQuery),

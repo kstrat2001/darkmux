@@ -2255,13 +2255,17 @@ pub(crate) struct ProfilesQuery {
 /// an app picks among these per run.
 pub(crate) async fn profiles_handler(
     State(state): State<ClientServerState>,
-    query: axum::extract::Query<ProfilesQuery>,
+    query: Result<axum::extract::Query<ProfilesQuery>, axum::extract::rejection::QueryRejection>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = authenticate(&state, &headers) {
         return *r;
     }
-    let role = query.role.clone().unwrap_or_else(|| "coder".to_string());
+    let query = match query {
+        Ok(axum::extract::Query(q)) => q,
+        Err(e) => return err(StatusCode::BAD_REQUEST, ClientCode::BadRequest, e.body_text()),
+    };
+    let role = query.role.unwrap_or_else(|| "coder".to_string());
     let names = match listable_profiles(&state, &role) {
         Ok(names) => names,
         Err(r) => return *r,
@@ -2914,7 +2918,8 @@ pub(crate) async fn recipe_handler(
     };
     let q = match query {
         Ok(axum::extract::Query(q)) if q.workdir.is_some() != q.workspace.is_some() => q,
-        _ => {
+        Err(e) => return err(StatusCode::BAD_REQUEST, ClientCode::BadRequest, e.body_text()),
+        Ok(_) => {
             return err(
                 StatusCode::BAD_REQUEST, ClientCode::BadRequest,
                 "one of the `workdir` or `workspace` query parameters is required",
