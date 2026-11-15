@@ -100,12 +100,26 @@ pub struct Whoami {
     /// (#3560) Whether this `client serve` is reached from other devices on
     /// the tailnet, decided at its start (`clients.remote`).
     pub remote: ClientRemote,
+    /// (#3560) How this request reached `client serve`: from an app on this
+    /// machine, or from a paired device through the tailnet entry.
+    pub via: RequestVia,
+}
+
+/// (#3560) `whoami.via`: how the request reached `client serve`.
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestVia {
+    /// From an app on this machine.
+    Local,
+    /// From a paired device on the tailnet, through `remote.url`: its token
+    /// checked, and its tailnet user the one it paired as.
+    Tailnet,
 }
 
 /// (#3560) Where `client serve` stands on the tailnet, as `whoami` reports
-/// it: what this process did at its start, from `clients.remote`. Reach is
-/// not access: until remote pairing ships, a request that arrives through
-/// `url` is refused like any request not from this machine.
+/// it: what this process did at its start, from `clients.remote`. A request
+/// through `url` is answered only for a paired device: its token, and the
+/// tailnet user it paired as (`RequestVia::Tailnet`).
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct ClientRemote {
     pub state: RemoteState,

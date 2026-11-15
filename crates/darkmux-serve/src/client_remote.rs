@@ -5,12 +5,12 @@
 //! darkmux adds no listener off loopback: the tailnet's own daemon terminates
 //! TLS and forwards to `127.0.0.1:<port>`.
 //!
-//! **Reach is not access.** This module only makes the port reachable. The
-//! request gate ([`crate::client_pairing`]'s `foreign_request`) still refuses
-//! every request that is not from this machine, and a request through
-//! `tailscale serve` is not (it carries the proxy's headers), so until remote
-//! pairing and the tailnet request path ship (#3560's later PRs), a device on
-//! the tailnet that opens the URL is refused like any other.
+//! **Reach, then access.** This module only makes the port reachable, and
+//! says which entry requests arrive through ([`Started::serving`]). The
+//! request gate ([`crate::client_pairing`]'s `admitted`) answers a request
+//! through that entry only from a paired device: its bearer token, and the
+//! tailnet user recorded for that token ([`crate::client_tailnet`]). With no
+//! entry served, every request not from this machine is refused.
 //!
 //! **Only darkmux's own entry is ever changed.** An entry is darkmux's when a
 //! record of it is on disk ([`overlay::PublishedRecord`], written before the
@@ -77,19 +77,22 @@ impl Rig {
     }
 }
 
-/// What a start did: what `whoami` reports, the entry this process must
-/// remove on shutdown (only one it published), and the serve-log lines.
+/// What a start did: what `whoami` reports, the entry paired devices'
+/// requests arrive through (the one published, or an identical one found),
+/// the entry this process must remove on shutdown (only one it published),
+/// and the serve-log lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Started {
     pub wire: ClientRemote,
+    pub serving: Option<ServeEntry>,
     pub owned: Option<ServeEntry>,
     pub log: Vec<String>,
 }
 
 const LOG: &str = "darkmux client serve:";
 
-/// The line that says the URL is reach only, for every published log line.
-const NOT_ACCESS: &str = "a request through it is still refused until remote pairing ships";
+/// The line that says who the URL answers, for every published log line.
+const NOT_ACCESS: &str = "a request through it needs a paired device's token and the tailnet user it paired as";
 
 /// The start, for the listener bound on loopback `port`.
 pub fn start(remote: ClientsRemote, port: u16, rig: &Rig) -> Started {
@@ -109,7 +112,7 @@ fn start_off(port: u16, rig: &Rig) -> Started {
         Some(rec) => reap_while_off(&rec, rig),
         None => Vec::new(),
     };
-    Started { wire: ClientRemote::off(), owned: None, log }
+    Started { wire: ClientRemote::off(), serving: None, owned: None, log }
 }
 
 /// [`start_off`]'s reap: nothing is removed unless both reads answer.
@@ -139,7 +142,7 @@ fn reap_while_off(rec: &PublishedRecord, rig: &Rig) -> Vec<String> {
 /// Not published: `reason` (which names the fix) for `whoami` and the log.
 fn unavailable(reason: String, mut log: Vec<String>) -> Started {
     log.push(format!("{LOG} clients.remote is tailscale, but {reason}; serving this machine only"));
-    Started { wire: ClientRemote::unavailable(reason), owned: None, log }
+    Started { wire: ClientRemote::unavailable(reason), serving: None, owned: None, log }
 }
 
 /// On: the network checked, a stale entry of darkmux's reaped, then the
@@ -163,7 +166,7 @@ fn start_tailnet(port: u16, rig: &Rig) -> Started {
                  shutdown ({NOT_ACCESS})",
                 entry.url()
             ));
-            Started { wire: ClientRemote::available(entry.url()), owned: None, log }
+            Started { wire: ClientRemote::available(entry.url()), serving: Some(entry), owned: None, log }
         }
         Ok(AtPort::Other) => unavailable(
             format!(
@@ -271,7 +274,7 @@ fn publish_owned(entry: ServeEntry, rig: &Rig, log: Vec<String>) -> Started {
     }
     let mut log = log;
     log.push(format!("{LOG} on the tailnet at {} (tailscale serve; {NOT_ACCESS})", entry.url()));
-    Started { wire: ClientRemote::available(entry.url()), owned: Some(entry), log }
+    Started { wire: ClientRemote::available(entry.url()), serving: Some(entry.clone()), owned: Some(entry), log }
 }
 
 /// After a publish that failed or did not show: an entry that is there

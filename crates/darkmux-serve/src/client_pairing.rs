@@ -4,12 +4,16 @@
 //! sharing nothing with either, that lets an app on this machine (the Mux Bot
 //! app) pair once and then run scoped work. It binds `127.0.0.1` ONLY
 //! ([`bind_addr`]): never `0.0.0.0`, never the tailnet address. Every route
-//! sits behind one gate ([`foreign_request`]): the request must be from this
+//! sits behind one gate ([`admitted`]): the request must be from this
 //! machine as the viewer daemon decides it (`is_local_request`: a loopback
 //! peer, no reverse-proxy header, a `Host` naming this listener), must carry
 //! no `Origin` (a web page sends one; a native app does not), and a POST with
 //! a body must be `Content-Type: application/json`. A browser page on any
-//! site therefore cannot drive it, whatever DNS it rebinds.
+//! site therefore cannot drive it, whatever DNS it rebinds. (#3560) With
+//! `clients.remote` on and its tailnet entry up, a request that entry
+//! forwards is let in too, on a route that takes a token, when it carries a
+//! paired device's token AND comes from the tailnet user recorded for it
+//! ([`crate::client_tailnet`]); the headers alone are never enough.
 //!
 //! **Pairing.** The app `POST`s `/client/pair` with a device name, a code it
 //! shows its user and a random `pair_secret` (a `scopes` field is accepted
@@ -169,7 +173,13 @@ const KEEP_WORK_SECS: u64 = 3600;
 /// and a client (the signing identity that approved it with no operator
 /// step) and `remembered_apps` (apps the operator allowed in the dialog,
 /// which then pair at once).
-pub const CLIENTS_SCHEMA_VERSION: &str = "1.2";
+///
+/// 1.3 (#3560): a client may carry `tailnet`, the tailnet identity it paired
+/// with ([`crate::client_tailnet::TailnetIdentity`]); a request through the
+/// tailnet entry needs it as well as the token. Additive: a 1.2 store reads
+/// as 1.3 with no client carrying one. A darkmux that reads 1.2 refuses a
+/// 1.3 store as written by a newer darkmux, rather than as an unknown key.
+pub const CLIENTS_SCHEMA_VERSION: &str = "1.3";
 
 // ─── Store ───────────────────────────────────────────────────────────────
 
@@ -230,6 +240,12 @@ pub struct ApprovedClient {
     /// (#3544) The signing identity that approved it with no operator step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_approved: Option<SigningIdentity>,
+    /// (#3560, 1.3) The tailnet identity the device paired with: a request
+    /// through the tailnet entry must come from it as well as carry the
+    /// token. `None` (a pairing made on this Mac): the token is answered on
+    /// this machine only, and refused remotely (`not_paired_remotely`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailnet: Option<crate::client_tailnet::TailnetIdentity>,
 }
 
 /// (#3544) An app as its code signature names it: the developer team and
@@ -466,6 +482,7 @@ fn parse_clients(path: &Path, text: &str) -> Result<(ClientsFile, bool)> {
     let migrated = doc.get("schema_version").and_then(Value::as_str) != Some(CLIENTS_SCHEMA_VERSION);
     migrate_1_0(&mut doc);
     migrate_1_1(&mut doc)?;
+    migrate_1_2(&mut doc);
     let issues = darkmux_types::user_files::key_issues::<ClientsFile>(
         &doc,
         &darkmux_types::user_files::no_retired,
@@ -512,8 +529,15 @@ fn migrate_1_1(doc: &mut Value) -> Result<()> {
     if let [only] = ids.as_slice() {
         doc["legacy_owner"] = only.clone();
     }
-    doc["schema_version"] = Value::from(CLIENTS_SCHEMA_VERSION);
+    doc["schema_version"] = Value::from("1.2");
     Ok(())
+}
+
+/// 1.3 added `tailnet` to a client, optional: a 1.2 store is read as it is.
+fn migrate_1_2(doc: &mut Value) {
+    if doc.get("schema_version").and_then(Value::as_str) == Some("1.2") {
+        doc["schema_version"] = Value::from(CLIENTS_SCHEMA_VERSION);
+    }
 }
 
 /// A new client id: `c-` and 16 random hex digits.
@@ -1108,6 +1132,11 @@ pub struct ClientServerState {
     /// (#3560) What this `client serve` did about the tailnet at its start
     /// (`clients.remote`, [`crate::client_remote`]), for `whoami`.
     pub remote: ClientRemote,
+    /// (#3560) The tailnet entry requests from paired devices arrive
+    /// through: the one this process published, or an identical one it
+    /// found. `None` (the setting off, or nothing published): every request
+    /// not from this machine is refused `not_local`, as before.
+    pub tailnet_entry: Option<darkmux_fleet::overlay::ServeEntry>,
 }
 
 /// How many large image bodies the listener reads at once (#3545). Each may
@@ -1183,6 +1212,7 @@ impl ClientServerState {
             body_limits: BodyLimits::default(),
             // Set by `run` once the listener is bound.
             remote: ClientRemote::off(),
+            tailnet_entry: None,
         })
     }
 }
@@ -1405,9 +1435,9 @@ pub fn run(port: u16) -> Result<()> {
             .await
             .with_context(|| format!("binding {}", bind_addr(port)))?;
         // (#3560) Reach from the tailnet, before the listening line (and the
-        // signal handlers): with `clients.remote` off this runs no tool.
-        // Reach is not access: the request gate still refuses every request
-        // that is not from this machine, tailnet ones included.
+        // signal handlers): with `clients.remote` off this runs no tool. A
+        // request through the entry is answered only for a paired device
+        // whose token and tailnet user both check (`remote_admitted`).
         let rig = crate::client_remote::Rig::production();
         let started = reach_from_the_tailnet(&listener, &rig).await?;
         eprintln!(
@@ -1421,6 +1451,7 @@ pub fn run(port: u16) -> Result<()> {
         let mut state = state;
         state.bound = Some(listener.local_addr()?);
         state.remote = started.wire;
+        state.tailnet_entry = started.serving.clone();
         log_lines(swept_partials(&state));
         // (#3456) Preview containers a `client serve` that died left behind.
         let reaper = state.previews.clone();
@@ -1759,21 +1790,26 @@ pub(crate) async fn method_not_allowed() -> Response {
     err(StatusCode::METHOD_NOT_ALLOWED, ClientCode::MethodNotAllowed, "method not allowed")
 }
 
-/// The gate in front of every route: the request must come from this machine
-/// the way the viewer daemon decides it ([`crate::is_local_at`]: a loopback
-/// peer, no reverse-proxy header, a `Host` naming this listener), must not
-/// come from a web page (it carries no `Origin`; a native app sends none,
-/// and every browser sends one on a cross-site POST), and a POST with a body
-/// must say `Content-Type: application/json` (a form post a page can send
-/// without asking is `text/plain` or `application/x-www-form-urlencoded`).
+/// The gate in front of every route. The request must come from this
+/// machine the way the viewer daemon decides it ([`crate::is_local_at`]: a
+/// loopback peer, no reverse-proxy header, a `Host` naming this listener),
+/// or (#3560) from a paired device through the tailnet entry this process
+/// published ([`remote_admitted`]). Either way it must not come from a web
+/// page (it carries no `Origin`; a native app sends none, and every browser
+/// sends one on a cross-site POST), and a POST with a body must say
+/// `Content-Type: application/json` (a form post a page can send without
+/// asking is `text/plain` or `application/x-www-form-urlencoded`). Which
+/// way it came rides on the request ([`RequestVia`]), for `whoami`.
 pub(crate) async fn only_this_machines_apps(
     State(state): State<ClientServerState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if let Some((status, code, why)) = foreign_request(&req, state.bound) {
-        return err(status, code, why);
-    }
+    let via = match admitted(&state, &req) {
+        Ok(via) => via,
+        Err(refused) => return *refused,
+    };
+    req.extensions_mut().insert(via);
     match refused_while_stopping(&state, req).await {
         Ok((req, turn)) => {
             let response = next.run(req).await;
@@ -1882,35 +1918,67 @@ fn stopping_refusal() -> Response {
     )
 }
 
-/// Why [`only_this_machines_apps`] refuses `req`, or `None` to let it in.
+/// Which way `req` came ([`crate::client_tailnet::arrival`]), once
+/// [`foreign_request`] lets it in and, through the tailnet entry,
+/// [`remote_admitted`] does too; otherwise the refusal.
+fn admitted(state: &ClientServerState, req: &axum::extract::Request) -> Result<RequestVia, Refused> {
+    use crate::client_tailnet::Arrival;
+    let peer = req.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>().map(|c| c.0);
+    let entry = state.tailnet_entry.as_ref();
+    let arrival = crate::client_tailnet::arrival(peer, req.headers(), state.bound, entry);
+    if let Some((status, code, why)) = foreign_request(req, &arrival, entry) {
+        return Err(refuse(status, code, why));
+    }
+    match arrival {
+        Arrival::Tailnet { login } => remote_admitted(state, req, login.as_deref()).map(|()| RequestVia::Tailnet),
+        _ => Ok(RequestVia::Local),
+    }
+}
+
+/// (#3560) A request through the tailnet entry is let in only on a route
+/// that takes a token (pairing over the tailnet is a later part), with a
+/// paired device's token ([`authenticate`], refused as on this machine), and
+/// from the tailnet user that device paired as
+/// ([`crate::client_tailnet::identity_refusal`]). The headers alone are
+/// never enough: any process here can send them to loopback.
+fn remote_admitted(state: &ClientServerState, req: &axum::extract::Request, login: Option<&str>) -> Result<(), Refused> {
+    let route = req.extensions().get::<axum::extract::MatchedPath>();
+    if route.is_some_and(|r| crate::routes::takes_no_token(r.as_str())) {
+        let (status, code, why) = crate::client_tailnet::pairing_refusal();
+        return Err(refuse(status, code, why));
+    }
+    let client = authenticate(state, req.headers())?;
+    let url = state.tailnet_entry.as_ref().map(darkmux_fleet::overlay::ServeEntry::url).unwrap_or_default();
+    match crate::client_tailnet::identity_refusal(client.tailnet.as_ref(), login, &url) {
+        Some((code, why)) => Err(refuse(StatusCode::FORBIDDEN, code, why)),
+        None => Ok(()),
+    }
+}
+
+/// Why [`only_this_machines_apps`] refuses a request that `arrival`
+/// describes, or `None` to let it in (`entry`: the tailnet entry this
+/// process serves through, if any).
 fn foreign_request(
     req: &axum::extract::Request,
-    bound: Option<SocketAddr>,
-) -> Option<(StatusCode, ClientCode, &'static str)> {
+    arrival: &crate::client_tailnet::Arrival,
+    entry: Option<&darkmux_fleet::overlay::ServeEntry>,
+) -> Option<(StatusCode, ClientCode, String)> {
     use axum::http::header::ORIGIN;
-    let peer = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<SocketAddr>>()
-        .map(|c| c.0);
-    if !crate::is_local_at(peer, req.headers(), bound) {
-        return Some((
-            StatusCode::FORBIDDEN,
-            ClientCode::NotLocal,
-            "darkmux client serve answers only apps on this machine (a loopback connection naming this listener, through no proxy)",
-        ));
+    if *arrival == crate::client_tailnet::Arrival::Foreign {
+        return Some(crate::client_tailnet::not_from_here(entry));
     }
     if req.headers().contains_key(ORIGIN) {
         return Some((
             StatusCode::FORBIDDEN,
             ClientCode::NotLocal,
-            "a request from a web page (it carries an Origin header) is refused: only an app on this machine may use darkmux client serve",
+            "a request from a web page (it carries an Origin header) is refused: only an app may use darkmux client serve".to_string(),
         ));
     }
     if req.method() == axum::http::Method::POST && has_body(req) && !is_json(req) {
         return Some((
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             ClientCode::UnsupportedMediaType,
-            "a request body must be Content-Type: application/json",
+            "a request body must be Content-Type: application/json".to_string(),
         ));
     }
     None
@@ -2198,6 +2266,7 @@ fn poll_pending(f: &mut ClientsFile, request_id: &str, secret: &str, now: u64) -
         created: now,
         token_hash: hash_hex(&token),
         auto_approved: p.auto_approved.clone(),
+        tailnet: None,
     });
     f.pending.remove(i);
     Ok(PollOutcome::Approved { client_name, token })
@@ -2389,7 +2458,11 @@ fn describe_listed(state: &ClientServerState, role: &str, names: &[String]) -> V
         .collect()
 }
 
-pub(crate) async fn whoami_handler(State(state): State<ClientServerState>, headers: HeaderMap) -> Response {
+pub(crate) async fn whoami_handler(
+    State(state): State<ClientServerState>,
+    via: Option<axum::Extension<RequestVia>>,
+    headers: HeaderMap,
+) -> Response {
     let client = match authenticate(&state, &headers) {
         Ok(c) => c,
         Err(r) => return *r,
@@ -2403,6 +2476,7 @@ pub(crate) async fn whoami_handler(State(state): State<ClientServerState>, heade
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 capabilities: ClientCapability::ALL.to_vec(),
                 remote: state.remote.clone(),
+                via: via.map_or(RequestVia::Local, |v| v.0),
             })
             .into_response()
         }
