@@ -115,7 +115,7 @@ darkmux release.
   over the tailnet asks `POST /client/workspaces/{name}/preview/link` (its token, from the tailnet user
   and device it paired as) for a one-time link to one of its ready previews. Its browser opens the link
   through the tailnet URL; darkmux checks the user and device are the ones the link was made for, sets
-  an HttpOnly, Secure, SameSite=Strict session cookie, clears the address's cache and storage and sends
+  an HttpOnly, Secure, SameSite=Strict session cookie, asks the browser to clear the address's cache and storage, and sends
   the browser to `/`. Every path outside `/client/` there is then the preview's, proxied to its
   loopback port, WebSocket upgrades included, so a dev server's live reload works when its reload
   socket is on the app port. The preview never sees the device's token, the session cookie or

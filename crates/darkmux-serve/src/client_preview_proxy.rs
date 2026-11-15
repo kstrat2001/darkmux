@@ -31,9 +31,10 @@
 //! repo. Everything else the browser sends passes: `Referer` and the
 //! `Sec-Fetch-*` headers name the tailnet address, and the browser's other
 //! cookies for this host (another preview's, a service's on another port of
-//! it) reach the preview's server. It cannot set darkmux's cookie (by name,
-//! or as a nameless cookie that would read as it), nor a cookie with a
-//! `Domain`, which would reach the tailnet's other hosts. The cookie is
+//! it) reach the preview's server. Its answers cannot set darkmux's cookie
+//! (by name, or as a nameless cookie that would read as it), nor a cookie
+//! with a `Domain`, which would reach the tailnet's other hosts; its scripts'
+//! `document.cookie` writes are beyond the proxy. The cookie is
 //! `HttpOnly`, so the preview's scripts in the browser cannot read it.
 //!
 //! **Previews share one origin.** Every preview is served at the same
