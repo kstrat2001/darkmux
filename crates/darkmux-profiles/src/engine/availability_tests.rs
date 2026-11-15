@@ -800,11 +800,50 @@ fn flint_answer(
     FlintAnswer {
         rec: crate::engine::flint::Rec::at("/opt/rec/rec", Some(dir.path().join("rec"))),
         version: version.map(str::to_string).map_err(str::to_string),
-        own_server: own.map(|o| o.map(str::to_string)).map_err(str::to_string),
+        own_server: own.map(|o| o.map(serving_nothing)).map_err(str::to_string),
         dirs: Dirs {
             records: dir.path().join("run"),
             logs: dir.path().join("logs"),
         },
+    }
+}
+
+/// rec's own server at `address`, ready, as `rec status` says when it names
+/// no revision or context: it serves nothing a profile could reuse.
+fn serving_nothing(address: &str) -> crate::engine::flint::OwnServer {
+    crate::engine::flint::OwnServer {
+        address: address.to_string(),
+        endpoint: Some(address.to_string()),
+        ready: true,
+        revision: None,
+        context: None,
+    }
+}
+
+/// (#3574, contract 4) rec's own server serving the profile's revision at
+/// its `n_ctx` or more reads `external`, as a dispatch reuses it: usable,
+/// and not darkmux's to manage. Another revision, or a smaller context,
+/// stays `unavailable` with `engine_in_use`, naming what does not match.
+#[test]
+fn recs_own_server_serving_the_model_is_external_and_otherwise_engine_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    rec_install(&dir.path().join("rec"), 1, &["flint-int4"]);
+    let rec_serving = |revision: &str, context: u64| {
+        let mut answer = flint_answer(&dir, Ok("0.1.0"), Ok(None));
+        answer.own_server = Ok(Some(crate::engine::flint::OwnServer {
+            revision: Some(revision.to_string()),
+            context: Some(context),
+            ..serving_nothing("http://127.0.0.1:11500/v1")
+        }));
+        answer.judge(&flint_model(free_port()))
+    };
+    assert_eq!(rec_serving("flint-int4", 8192), Availability::external());
+    assert_eq!(rec_serving("flint-int4", 262_144), Availability::external());
+    for (revision, context, says) in [("flint-int8", 8192, "`flint-int8`"), ("flint-int4", 4096, "4096")] {
+        let a = rec_serving(revision, context);
+        assert_eq!(a.state, AvailabilityState::Unavailable, "{a:?}");
+        assert_eq!(a.code.as_deref(), Some("engine_in_use"), "{a:?}");
+        assert!(a.reason.as_deref().unwrap().contains(says), "{a:?}");
     }
 }
 

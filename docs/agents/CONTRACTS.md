@@ -66,7 +66,24 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    and only such a server is evicted or stopped. Reusing one also needs it to run the
    profile's exact command, answer under the served name and be what listens on the port. A
    server darkmux did not start (rec's own, say) is user state: a dispatch is refused naming it
-   (`engine_in_use`, `port_in_use`), never stopped or adopted.
+   (`engine_in_use`, `port_in_use`), never stopped or adopted, with the one exception below.
+
+   **Amended by #3574 (operator, 2026-11-15): rec's own server is used when it already serves
+   the model.** This is the one server darkmux did not start that it dispatches to. It qualifies
+   only when `rec status` says `"ready": true`, its `revision` is the profile model's `id`, its
+   `context` is at least the model's `n_ctx`, and its `endpoint` is this machine's loopback.
+   darkmux then uses it as an external engine: it sends requests there with rec's local key,
+   read from `rec auth token` when the dispatch starts and never logged, printed, put in an
+   error, a flow record or a test fixture, and writes no lease, record or reservation for it. A
+   listing reads the model `external`: usable, and not managed by darkmux. darkmux never stops,
+   restarts, loads into, evicts or budgets that server. Anything else (no `revision`, another
+   one, a smaller `context`, a server still loading) is refused `engine_in_use` as before.
+   Accepted risk: rec's other launch flags are not visible in `rec status`. One decision serves
+   the dispatch, the listing and doctor, so they never disagree:
+   `darkmux_profiles::engine::flint::own_server_use`. Conformance: its tests in `flint.rs`,
+   `engine_dispatch`'s `recs_own_server_serving_the_model_is_reused_starting_and_leasing_nothing`,
+   `dispatch_internal`'s `a_flint_dispatch_goes_to_recs_own_server_when_it_serves_the_model`, and
+   the listing's `recs_own_server_serving_the_model_is_external_and_otherwise_engine_in_use`.
 5. **Schema versioning** — flow/rules/config/profiles data shapes change only through their
    documented semver rules. Flow-archive readers are lenient-on-read; user files follow
    contract 7.

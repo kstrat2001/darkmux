@@ -4,7 +4,7 @@
 //! profile registry declares a Tensorfold endpoint.
 
 use crate::{Check, Status};
-use darkmux_profiles::engine::flint::{Rec, VERIFIED_RELEASE};
+use darkmux_profiles::engine::flint::{OwnServer, OwnServerUse, Rec, VERIFIED_RELEASE};
 use darkmux_profiles::engine::tensorfold::{TensorfoldProbe, ServeFlags, Tensorfold, Version, VERIFIED_RELEASES};
 use darkmux_types::config_access::Source;
 use darkmux_types::{EndpointKind, ManagedBackend, ProfileRegistry};
@@ -144,22 +144,28 @@ pub(crate) struct FlintFacts {
     pub runtime: Result<(), String>,
     /// For each Flint profile model's `id`, whether rec's install holds it.
     pub models: Vec<Result<(), String>>,
-    /// The address of rec's own server, when it is up.
-    pub own_server: Result<Option<String>, String>,
+    /// What `rec status` says of rec's own server, when it is up.
+    pub own_server: Result<Option<OwnServer>, String>,
+    /// For each Flint profile model, darkmux's own live server on its
+    /// endpoint (which `rec status` may be naming).
+    pub darkmuxs: Vec<Option<darkmux_types::engine_record::EngineRecord>>,
 }
 
 impl FlintFacts {
-    fn probe(ids: &[&str]) -> Self {
+    fn probe(models: &[&darkmux_types::ProfileModel]) -> Self {
         let (bin, source) = darkmux_types::config_access::flint_bin_with_source();
         let rec = Rec::installed();
         let msg = |e: anyhow::Error| format!("{e:#}");
+        let dirs = darkmux_profiles::engine::server::Dirs::under_home();
+        let endpoint = |m: &darkmux_types::ProfileModel| m.endpoint.as_ref().and_then(|e| e.named_id()).unwrap_or_default().to_string();
         FlintFacts {
             bin,
             source,
             version: rec.version().map_err(msg),
             runtime: rec.runtime().map(|_| ()).map_err(msg),
-            models: ids.iter().map(|id| rec.model_dir(id).map(|_| ()).map_err(msg)).collect(),
+            models: models.iter().map(|m| rec.model_dir(&m.id).map(|_| ()).map_err(msg)).collect(),
             own_server: rec.own_server().map_err(msg),
+            darkmuxs: models.iter().map(|m| darkmux_profiles::engine::server::running_now(&dirs, &endpoint(m))).collect(),
         }
     }
 }
@@ -182,19 +188,21 @@ fn flint_row(status: Status, message: String, hint: Option<String>) -> Check {
 /// The row, from the registry and (only when it declares a Flint endpoint)
 /// what rec's install says. Asks only read-only questions: `rec --version`,
 /// `rec status`, and which runtime and model directories the install holds.
-pub(crate) fn flint_engine_status(registry: &ProfileRegistry, probe: impl FnOnce(&[&str]) -> FlintFacts) -> Check {
+pub(crate) fn flint_engine_status(
+    registry: &ProfileRegistry,
+    probe: impl FnOnce(&[&darkmux_types::ProfileModel]) -> FlintFacts,
+) -> Check {
     if !registry.endpoints.values().any(|ep| is_flint(ep.kind())) {
         return flint_row(Status::Pass, "not checked: no endpoint declares `\"managed\": \"flint\"`".into(), None);
     }
-    let models: Vec<(String, usize, &str)> = registry
+    let models: Vec<FlintModel<'_>> = registry
         .profiles
         .iter()
         .flat_map(|(p, prof)| prof.models.iter().enumerate().map(move |(i, m)| (p.clone(), i, m)))
         .filter(|(_, _, m)| is_flint(m.endpoint_kind()))
-        .map(|(p, i, m)| (p, i, m.id.as_str()))
         .collect();
-    let ids: Vec<&str> = models.iter().map(|(_, _, id)| *id).collect();
-    let facts = probe(&ids);
+    let declared: Vec<&darkmux_types::ProfileModel> = models.iter().map(|(_, _, m)| *m).collect();
+    let facts = probe(&declared);
     let via = match facts.source {
         Source::Env => " (via DARKMUX_FLINT_BIN)",
         Source::Config => " (via config.engines.flint.bin)",
@@ -215,8 +223,11 @@ pub(crate) fn flint_engine_status(registry: &ProfileRegistry, probe: impl FnOnce
                 .into()),
         );
     }
-    flint_server_row(&lead, &facts, models.len())
+    flint_server_row(&lead, &facts, &models)
 }
+
+/// A Flint profile model: its profile, its index there, and the model.
+type FlintModel<'a> = (String, usize, &'a darkmux_types::ProfileModel);
 
 /// rec's version when it is the verified release, else the failing row.
 fn flint_verified(facts: &FlintFacts, via: &str) -> Result<String, Check> {
@@ -238,7 +249,7 @@ fn flint_verified(facts: &FlintFacts, via: &str) -> Result<String, Check> {
 }
 
 /// A missing runtime, and every Flint model rec's install does not hold.
-fn flint_install_problems(models: &[(String, usize, &str)], facts: &FlintFacts) -> Vec<String> {
+fn flint_install_problems(models: &[FlintModel<'_>], facts: &FlintFacts) -> Vec<String> {
     let mut problems: Vec<String> = facts.runtime.as_ref().err().cloned().into_iter().collect();
     for ((p, i, _), held) in models.iter().zip(&facts.models) {
         if let Err(e) = held {
@@ -248,26 +259,67 @@ fn flint_install_problems(models: &[(String, usize, &str)], facts: &FlintFacts) 
     problems
 }
 
-/// The row once rec's install is good: a warning while rec's own server runs.
-fn flint_server_row(lead: &str, facts: &FlintFacts, models: usize) -> Check {
+/// The row once rec's install is good: a warning while rec's own server
+/// runs and does not serve every Flint model (#3574: each judged as a
+/// dispatch judges it, `flint::own_server_use`).
+fn flint_server_row(lead: &str, facts: &FlintFacts, models: &[FlintModel<'_>]) -> Check {
     match &facts.own_server {
-        Ok(Some(address)) => flint_row(
-            Status::Warn,
-            format!("{lead}: rec's own server is up or starting at {address}"),
-            Some("every Flint dispatch is refused (`engine_in_use`) while it runs: darkmux never stops or takes over \
-                  rec's server. Run `rec stop` to let darkmux start its own"
-                .into()),
-        ),
         Err(e) => flint_row(Status::Warn, format!("{lead}: `rec status` did not answer: {e}"), None),
-        Ok(None) => flint_row(
+        Ok(own) => own_server_row(lead, own.as_ref(), facts, models),
+    }
+}
+
+/// [`flint_server_row`] once `rec status` answered: each model's
+/// [`OwnServerUse`], read into one row.
+fn own_server_row(lead: &str, own: Option<&OwnServer>, facts: &FlintFacts, models: &[FlintModel<'_>]) -> Check {
+    let uses: Vec<(String, OwnServerUse)> = models
+        .iter()
+        .zip(facts.darkmuxs.iter().chain(std::iter::repeat(&None)))
+        .map(|((p, i, m), darkmuxs)| {
+            (format!("profiles.{p}.models[{i}]"), darkmux_profiles::engine::flint::own_server_use(own, m, darkmuxs.as_ref()))
+        })
+        .collect();
+    let address = own.map_or("", |o| o.address.as_str());
+    let refused: Vec<String> = uses
+        .iter()
+        .filter_map(|(at, u)| match u {
+            OwnServerUse::Refuse { why, .. } => Some(format!("{at}: {why}")),
+            _ => None,
+        })
+        .collect();
+    let reused = uses.iter().filter(|(_, u)| matches!(u, OwnServerUse::Reuse { .. })).count();
+    flint_own_server_check(lead, address, &refused, reused, models.len())
+}
+
+/// The row from what rec's own server means for the Flint models: any it
+/// does not serve warn, naming why; otherwise it passes, saying which go to
+/// rec's own server.
+fn flint_own_server_check(lead: &str, address: &str, refused: &[String], reused: usize, models: usize) -> Check {
+    if !refused.is_empty() {
+        return flint_row(
+            Status::Warn,
+            format!("{lead}: rec's own server is up or starting at {address} and does not serve {}", refused.join("; ")),
+            Some("those dispatches are refused (`engine_in_use`): darkmux never stops or takes over rec's server. Run \
+                  `rec stop` to let darkmux start its own, or point the profile model at the revision and context rec \
+                  serves"
+                .into()),
+        );
+    }
+    if reused > 0 {
+        return flint_row(
             Status::Pass,
             format!(
-                "{lead}: {models} model(s), each one rec's install holds; darkmux starts rec's server when a dispatch \
-                 needs it"
+                "{lead}: rec's own server at {address} serves {reused} of {models} Flint model(s); darkmux sends their \
+                 dispatches there and does not manage it"
             ),
             None,
-        ),
+        );
     }
+    flint_row(
+        Status::Pass,
+        format!("{lead}: {models} model(s), each one rec's install holds; darkmux starts rec's server when a dispatch needs it"),
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -291,7 +343,37 @@ mod flint_tests {
             runtime: Ok(()),
             models: vec![Ok(())],
             own_server: Ok(None),
+            darkmuxs: vec![None],
         }
+    }
+
+    /// rec's own server, ready, serving `revision` at `context`.
+    fn serving(revision: &str, context: u64) -> OwnServer {
+        OwnServer {
+            address: "http://127.0.0.1:11500/v1".into(),
+            endpoint: Some("http://127.0.0.1:11500/v1".into()),
+            ready: true,
+            revision: Some(revision.into()),
+            context: Some(context),
+        }
+    }
+
+    /// (#3574) rec's own server serving a Flint model as its profile
+    /// declares it passes, saying its dispatches go there; serving another
+    /// revision warns, naming the model and why, and `rec stop`.
+    #[test]
+    fn recs_own_server_serving_the_model_passes_and_serving_another_warns() {
+        let mut reused = facts("0.1.0");
+        reused.own_server = Ok(Some(serving("flint-int4", 8192)));
+        let c = flint_engine_status(&registry(REG), |_| reused);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.message.contains("serves 1 of 1") && c.message.contains("does not manage it"), "{}", c.message);
+        let mut other = facts("0.1.0");
+        other.own_server = Ok(Some(serving("flint-int8", 8192)));
+        let c = flint_engine_status(&registry(REG), |_| other);
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert!(c.message.contains("profiles.f.models[0]") && c.message.contains("`flint-int8`"), "{}", c.message);
+        assert!(c.hint.unwrap().contains("rec stop"));
     }
 
     /// (#3453) No Flint endpoint: rec is never asked.
@@ -306,14 +388,14 @@ mod flint_tests {
     /// passes; rec's own server running warns, naming `rec stop`.
     #[test]
     fn a_verified_rec_that_holds_the_model_passes_and_its_own_server_warns() {
-        let c = flint_engine_status(&registry(REG), |ids| {
-            assert_eq!(ids, ["flint-int4"]);
+        let c = flint_engine_status(&registry(REG), |models| {
+            assert_eq!(models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["flint-int4"]);
             facts("0.1.0")
         });
         assert_eq!(c.status, Status::Pass, "{}", c.message);
         assert!(c.message.contains("rec 0.1.0") && c.message.contains("1 model(s)"), "{}", c.message);
         let mut up = facts("0.1.0");
-        up.own_server = Ok(Some("http://127.0.0.1:11500/v1".into()));
+        up.own_server = Ok(Some(OwnServer { revision: None, context: None, ..serving("flint-int4", 8192) }));
         let c = flint_engine_status(&registry(REG), |_| up);
         assert_eq!(c.status, Status::Warn, "{}", c.message);
         assert!(c.hint.unwrap().contains("rec stop"));

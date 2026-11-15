@@ -203,7 +203,8 @@ fn unhurried() -> Patience<'static> {
     Patience::new(&real_sleep, &never_stopped, None)
 }
 
-/// [`prepare_with`] for an [`unhurried`] dispatch, its refusal as the error.
+/// [`prepare_with`] for an [`unhurried`] dispatch, its refusal as the error,
+/// expecting darkmux's own server.
 fn prepare_in(
     target: &crate::target::Target,
     dirs: &Dirs,
@@ -212,6 +213,28 @@ fn prepare_in(
     machine: &dyn Machine,
     note: &mut dyn FnMut(Note, DispatchModelPayload),
 ) -> Result<EngineReady, EngineRefusal> {
+    served_in(target, dirs, engine, bounds, machine, note).map(Served::ours)
+}
+
+impl Served {
+    /// darkmux's own server, which the test expects.
+    fn ours(self) -> EngineReady {
+        match self {
+            Served::Darkmux(ready) => ready,
+            Served::RecsOwn(own) => panic!("darkmux's own server was expected, not rec's at {}", own.chat_url),
+        }
+    }
+}
+
+/// [`prepare_with`] for an [`unhurried`] dispatch, its refusal as the error.
+fn served_in(
+    target: &crate::target::Target,
+    dirs: &Dirs,
+    engine: &dyn ServerEngine,
+    bounds: server::Bounds,
+    machine: &dyn Machine,
+    note: &mut dyn FnMut(Note, DispatchModelPayload),
+) -> Result<Served, EngineRefusal> {
     prepare_with(target, dirs, engine, bounds, machine, &unhurried(), note).map_err(|e| match e {
         NotResident::Refused(refusal) => refusal,
         NotResident::Stopped(why) => panic!("no stop was given: {why}"),
@@ -598,6 +621,7 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         req = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         open(requests, "ab").write(req + b"\n")
+        open(requests + ".auth", "ab").write(self.headers.get("Authorization", "").encode() + b"\n")
         self.reply({"choices": [{"message": {"content": "ok"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
     def log_message(self, *args): pass
 # HTTPServer's server_bind looks up the host's FQDN, which can stall for
@@ -638,7 +662,7 @@ pub(crate) fn fake_rec(dir: &std::path::Path, version: &str) -> darkmux_profiles
     std::fs::write(dir.join("version"), version).unwrap();
     let rec = stable_script(
         "rec",
-        "#!/bin/sh\nhere=$(dirname \"$0\")\ncase \"$1\" in\n  --version) echo \"rec $(cat \"$here/version\")\" ;;\n  status) cat \"$here/status.json\" 2>/dev/null ;;\nesac\n",
+        "#!/bin/sh\nhere=$(dirname \"$0\")\ncase \"$1\" in\n  --version) echo \"rec $(cat \"$here/version\")\" ;;\n  status) cat \"$here/status.json\" 2>/dev/null ;;\n  auth) echo 'placeholder-key-for-tests' ;;\nesac\n",
     );
     let bin = dir.join("rec");
     let _ = std::fs::remove_file(&bin);
@@ -698,6 +722,81 @@ fn recs_own_server_running_refuses_the_dispatch_naming_rec_stop() {
     assert_eq!(err.code, "engine_in_use");
     assert!(err.message.contains("rec stop") && err.message.contains("127.0.0.1:11500"), "{err}");
     assert!(engine_record::list_in(&r.dirs.records).0.is_empty(), "nothing started");
+}
+
+/// (#3574, contract 4) rec's own server, ready and serving the profile's
+/// revision at its `n_ctx` or more, is reused as an external engine: the
+/// dispatch goes to its chat URL with rec's key, and darkmux starts nothing,
+/// records nothing, notes nothing and leases nothing (it never budgets or
+/// evicts that server).
+#[test]
+#[serial_test::serial]
+fn recs_own_server_serving_the_model_is_reused_starting_and_leasing_nothing() {
+    let r = rig();
+    let rec = fake_rec(r.dir.path(), "0.1.0");
+    std::fs::write(
+        r.dir.path().join("status.json"),
+        r#"{"ready":true,"endpoint":"http://127.0.0.1:11500/v1","revision":"flint-int4","context":262144}"#,
+    )
+    .unwrap();
+    let machine = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    let mut notes = Vec::new();
+    let served = served_in(&flint_target("flint-int4", free_port()), &r.dirs, &rec, quick(), &machine, &mut |n, p| notes.push((n, p)))
+        .expect("reused");
+    let Served::RecsOwn(own) = &served else { panic!("rec's own server is reused") };
+    assert_eq!(own.chat_url, "http://127.0.0.1:11500/v1/chat/completions");
+    assert_eq!(own.auth_header(), ("Authorization".to_string(), "Bearer placeholder-key-for-tests".to_string()));
+    assert!(!format!("{served:?}").contains("placeholder-key-for-tests"), "the key never prints: {served:?}");
+    assert!(notes.is_empty(), "no `dispatch.model.*` record: {notes:?}");
+    assert!(engine_record::list_in(&r.dirs.records).0.is_empty(), "nothing started");
+    let sibling = LeaseGuard::acquire();
+    assert!(!sibling.all_live_leased_models().contains(&"flint".to_string()), "no lease on rec's server");
+}
+
+/// (#3574, contract 4) rec's own server serving another revision, or the
+/// profile's revision at a smaller context, is refused `engine_in_use`
+/// naming what does not match, and darkmux starts nothing.
+#[test]
+#[serial_test::serial]
+fn recs_own_server_serving_another_revision_or_a_smaller_context_is_refused() {
+    let r = rig();
+    let rec = fake_rec(r.dir.path(), "0.1.0");
+    let machine = FakeMachine { reclaimable: RefCell::new(Some(64 * GIB)), ..Default::default() };
+    for (revision, context, says) in [("flint-int8", 262_144, "`flint-int8`, not `flint-int4`"), ("flint-int4", 4096, "4096")] {
+        std::fs::write(
+            r.dir.path().join("status.json"),
+            format!(r#"{{"ready":true,"endpoint":"http://127.0.0.1:11500/v1","revision":"{revision}","context":{context}}}"#),
+        )
+        .unwrap();
+        let err = served_in(&flint_target("flint-int4", free_port()), &r.dirs, &rec, quick(), &machine, &mut |_, _| {})
+            .err()
+            .expect("refused");
+        assert_eq!(err.code, "engine_in_use", "{err}");
+        assert!(err.message.contains(says) && err.message.contains("rec stop"), "{err}");
+    }
+    assert!(engine_record::list_in(&r.dirs.records).0.is_empty(), "nothing started");
+}
+
+/// (#3574) Where a dispatch's requests go: rec's own server's chat URL and
+/// key when it is reused, the target's own URL and auth otherwise.
+#[test]
+fn a_reused_recs_server_is_where_requests_go_and_nothing_else_moves_them() {
+    let own = Served::RecsOwn(RecsOwnServer::new("http://127.0.0.1:11500/v1/chat/completions".into(), "k".into()));
+    let mine = || ("http://127.0.0.1:8092/v1/chat/completions".to_string(), None);
+    let (url, auth) = mine();
+    assert_eq!(
+        route(Some(&own), url, auth),
+        ("http://127.0.0.1:11500/v1/chat/completions".to_string(), Some(("Authorization".to_string(), "Bearer k".to_string())))
+    );
+    let (url, auth) = mine();
+    assert_eq!(route(None, url, auth), mine());
+    let mut t = flint_target("flint-int4", 8092);
+    let kept = route_target(Some(&mut t), Some(&own), None);
+    assert_eq!((t.chat_url.as_str(), kept), ("http://127.0.0.1:11500/v1/chat/completions", Some(("Authorization".into(), "Bearer k".into()))));
+    let mut t = flint_target("flint-int4", 8092);
+    assert_eq!(route_target(Some(&mut t), None, None), None);
+    assert_eq!(t.chat_url, "http://127.0.0.1:8092/v1/chat/completions");
+    assert_eq!(route_target(None, Some(&own), None), None, "no hosted brain, nothing to send");
 }
 
 /// When `rec status` reports the server darkmux itself started (same port),
@@ -1353,7 +1452,8 @@ fn a_queued_dispatch_starts_once_the_holders_lease_goes_never_evicting_it_while_
         &mut |patience, note| prepare_with(&b, &r.dirs, &tf, quick(), &machine, patience, note),
         &mut |n, _| notes.push(n),
     )
-    .unwrap();
+    .unwrap()
+    .ours();
     assert!(*machine.holder_alive_while_held.borrow(), "the held server was never touched while held");
     assert!(ready.started && !server::alive(&a_rec), "B replaced A's server once A's lease went");
     let kinds: Vec<Note> = notes.iter().copied().filter(|n| matches!(n, Note::Queued | Note::Resumed | Note::Start)).collect();
@@ -1417,7 +1517,8 @@ fn four_queued_dispatches_behind_one_holder_start_one_at_a_time() {
                     &mut |patience, note| prepare_with(&t, &dirs, &tf, quick(), &RealLeases, patience, note),
                     &mut |_, _| {},
                 )
-                .unwrap_or_else(|e| panic!("{m}: {}", e.message()));
+                .unwrap_or_else(|e| panic!("{m}: {}", e.message()))
+                .ours();
                 let began = std::time::Instant::now();
                 assert!(ready.started, "{m} started its own server");
                 std::thread::sleep(Duration::from_millis(150));

@@ -4,7 +4,9 @@
 //! rec serves one model per server process, so darkmux loads Flint by
 //! starting rec's own server, `<runtime>/rec-mlx serve flint`, and unloads it
 //! by stopping the one it started. It never runs `rec _supervise`, and never
-//! stops or adopts a server rec started itself (`rec serve`, `rec launch`).
+//! stops or manages a server rec started itself (`rec serve`, `rec launch`);
+//! (#3574) it sends a dispatch to one that already serves the model, as an
+//! external engine ([`own_server_use`], contract 4).
 //!
 //! Every path comes from rec's install, never the profile: rec 0.1.0 keeps its
 //! data in `$XDG_DATA_HOME/rec` (else `~/.local/share/rec`), with each runtime
@@ -60,30 +62,125 @@ pub fn parse_version(text: &str) -> Result<String> {
 /// window: a server so early in its start that it has not
 /// bound its port reads as free, and darkmux may start its own beside it;
 /// the memory check still applies to that start.
-pub fn parse_status(stdout: &str, listening: &dyn Fn(u16) -> bool) -> Option<String> {
+pub fn parse_status(stdout: &str, listening: &dyn Fn(u16) -> bool) -> Option<OwnServer> {
     let doc: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
     let obj = doc.as_object()?;
     let endpoint = obj.get("endpoint").and_then(|e| e.as_str());
     let ready = obj.get("ready").and_then(|r| r.as_bool()) == Some(true);
     let bound = endpoint.and_then(endpoint_port).is_some_and(listening);
-    (ready || bound).then(|| endpoint.unwrap_or("an endpoint it did not name").to_string())
+    (ready || bound).then(|| OwnServer {
+        address: endpoint.unwrap_or("an endpoint it did not name").to_string(),
+        endpoint: endpoint.map(str::to_string),
+        ready,
+        revision: obj.get("revision").and_then(|r| r.as_str()).map(str::to_string),
+        context: obj.get("context").and_then(|c| c.as_u64()),
+    })
+}
+
+/// What `rec status` says of rec's own server when it is up or starting
+/// ([`parse_status`]): the fields a reuse is judged on ([`own_server_use`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnServer {
+    /// Where it serves, as a message names it: its `endpoint`, or "an
+    /// endpoint it did not name".
+    pub address: String,
+    /// Its `endpoint`, when `rec status` names one.
+    pub endpoint: Option<String>,
+    /// `"ready": true`; a server still loading is not.
+    pub ready: bool,
+    /// The revision it serves (`flint-int4`), when `rec status` names one.
+    pub revision: Option<String>,
+    /// The context it was started with, in tokens.
+    pub context: Option<u64>,
+}
+
+/// (#3574, contract 4) What rec's own server means for a dispatch of a
+/// profile's Flint model: the one decision a dispatch
+/// (`darkmux_crew::engine_dispatch`), a listing (`availability`) and doctor
+/// read, so they never disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnServerUse {
+    /// No server of rec's own is up: none is, or the one `rec status` names
+    /// is darkmux's ([`own_server_is_darkmuxs`]).
+    Free,
+    /// rec's own server serves the model: dispatch to `chat_url` as an
+    /// external engine. darkmux never stops, restarts, loads into, evicts or
+    /// budgets it.
+    Reuse { chat_url: String },
+    /// rec's own server is up and does not serve the model, for `why`:
+    /// refused `engine_in_use` ([`own_server_refusal`]).
+    Refuse { address: String, why: String },
+}
+
+/// (#3574) [`OwnServerUse`] for `model`, from what `rec status` said and
+/// darkmux's recorded server on the model's endpoint.
+pub fn own_server_use(
+    own: Option<&OwnServer>,
+    model: &darkmux_types::ProfileModel,
+    darkmuxs: Option<&darkmux_types::engine_record::EngineRecord>,
+) -> OwnServerUse {
+    let Some(own) = own.filter(|o| !own_server_is_darkmuxs(&o.address, darkmuxs)) else { return OwnServerUse::Free };
+    match own.serves(model) {
+        Ok(chat_url) => OwnServerUse::Reuse { chat_url },
+        Err(why) => OwnServerUse::Refuse { address: own.address.clone(), why },
+    }
+}
+
+impl OwnServer {
+    /// The chat URL to send `model`'s requests to when this server serves
+    /// it (ready, on this machine's loopback, the model's revision, a
+    /// context of at least its `n_ctx`); otherwise what does not match.
+    fn serves(&self, model: &darkmux_types::ProfileModel) -> Result<String, String> {
+        let endpoint = self.local_endpoint()?;
+        self.mismatch(model).map_or_else(|| Ok(darkmux_types::endpoint::lmstudio_chat_url(endpoint)), Err)
+    }
+
+    /// Its endpoint, when it is ready on this machine's loopback.
+    fn local_endpoint(&self) -> Result<&str, String> {
+        if !self.ready {
+            return Err("it is not ready (`rec status` says `\"ready\": false`)".into());
+        }
+        let endpoint = self.endpoint.as_deref().ok_or("`rec status` names no endpoint")?;
+        if !darkmux_types::endpoint::url_names_this_machine(endpoint) {
+            return Err(format!("its endpoint {endpoint} is not this machine's loopback"));
+        }
+        Ok(endpoint)
+    }
+
+    /// How the revision or context it serves differs from `model`'s.
+    fn mismatch(&self, model: &darkmux_types::ProfileModel) -> Option<String> {
+        let Some(revision) = self.revision.as_deref() else {
+            return Some("`rec status` names no revision".into());
+        };
+        if revision != model.id {
+            return Some(format!("it serves `{revision}`, not `{}`", model.id));
+        }
+        let Some(n_ctx) = model.n_ctx else { return Some("the profile model declares no `n_ctx`".into()) };
+        match self.context {
+            None => Some("`rec status` names no context".into()),
+            Some(context) if context < u64::from(n_ctx) => {
+                Some(format!("its context is {context}, below the profile model's `n_ctx` of {n_ctx}"))
+            }
+            Some(_) => None,
+        }
+    }
 }
 
 /// (#3453) Whether the server rec reports at `address` is darkmux's own, not
 /// rec's: darkmux's recorded server on the endpoint has that port and is what
 /// listens there (`server::listens`). A name or a port alone proves nothing.
-/// Dispatch refuses `engine_in_use` when it is not; a listing reads
-/// `unavailable`.
 pub fn own_server_is_darkmuxs(address: &str, darkmuxs: Option<&darkmux_types::engine_record::EngineRecord>) -> bool {
     darkmuxs.is_some_and(|r| endpoint_port(address) == Some(r.port) && super::server::listens(r))
 }
 
 /// Why darkmux will not serve Flint while rec's own server at `address` is
-/// up: what a dispatch refuses with (`engine_in_use`) and a listing reads.
-pub fn own_server_refusal(address: &str) -> String {
+/// up and does not serve the model (`why`): what a dispatch refuses with
+/// (`engine_in_use`) and a listing reads.
+pub fn own_server_refusal(address: &str, why: &str) -> String {
     format!(
-        "rec's own server is up or starting (at {address}), and rec runs one server per machine; darkmux never stops or \
-         takes over a server it did not start. Run `rec stop`, then dispatch again"
+        "rec's own server is up or starting (at {address}) and does not serve this model: {why}. rec runs one server \
+         per machine, and darkmux never stops or takes over a server it did not start. Run `rec stop`, then dispatch \
+         again"
     )
 }
 
@@ -201,15 +298,28 @@ impl Rec {
         Ok(v)
     }
 
-    /// The endpoint rec's own server serves, when it is up or starting
-    /// (`rec status`, [`parse_status`]). A non-zero exit reads as no server.
-    /// An error only when `rec status` could not be run at all.
-    pub fn own_server(&self) -> Result<Option<String>> {
+    /// What `rec status` says of rec's own server, when it is up or
+    /// starting ([`parse_status`]). A non-zero exit reads as no server. An
+    /// error only when `rec status` could not be run at all.
+    pub fn own_server(&self) -> Result<Option<OwnServer>> {
         let run = self.call(&["status"])?;
         let host = darkmux_platform::current();
         // A host that cannot say who listens counts as someone listening.
         let listening = |port: u16| host.tcp_listeners(port).is_none_or(|pids| !pids.is_empty());
         Ok(if run.status.success() { parse_status(&run.stdout, &listening) } else { None })
+    }
+
+    /// (#3574) rec's local API key (`rec auth token`), which rec's own
+    /// server asks of every request. Read when a dispatch reuses that
+    /// server, and never logged, printed or put in an error: a failure
+    /// names the command and its exit, never what it printed.
+    pub fn auth_token(&self) -> Result<String> {
+        let run = self.call(&["auth", "token"])?;
+        let key = run.stdout.trim();
+        if !run.status.success() || key.is_empty() {
+            bail!("`{} auth token` printed no key (exit {})", self.label(), run.status);
+        }
+        Ok(key.to_string())
     }
 
     fn data(&self) -> Result<&Path> {
@@ -346,7 +456,9 @@ mod tests {
         let bin = root.join("rec");
         std::fs::write(
             &bin,
-            format!("#!/bin/sh\ncase \"$1\" in\n  --version) echo 'rec {version}' ;;\n  status) echo '{status}' ;;\nesac\n"),
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'rec {version}' ;;\n  status) echo '{status}' ;;\n  auth) echo 'placeholder-key-for-tests' ;;\nesac\n"
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -382,7 +494,7 @@ mod tests {
     fn rec_status_is_ready_true_or_a_listener_on_its_endpoint() {
         let listening = |port: u16| port == 11500;
         let nobody = |_: u16| false;
-        let parse = |out: &str, l: &dyn Fn(u16) -> bool| parse_status(out, l);
+        let parse = |out: &str, l: &dyn Fn(u16) -> bool| parse_status(out, l).map(|o| o.address);
         assert_eq!(parse(RUNNING, &nobody).as_deref(), Some("http://127.0.0.1:11500/v1"), "ready:true, whatever listens");
         assert_eq!(parse(r#"{"ready":true}"#, &nobody).as_deref(), Some("an endpoint it did not name"));
         let not_ready = r#"{"ready":false,"endpoint":"http://127.0.0.1:11500/v1"}"#;
@@ -395,7 +507,10 @@ mod tests {
         assert_eq!(endpoint_port("http://127.0.0.1:11500/v1"), Some(11500));
         assert_eq!(endpoint_port("http://127.0.0.1/v1"), None);
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(fake_install(dir.path(), "0.1.0", RUNNING).own_server().unwrap().as_deref(), Some("http://127.0.0.1:11500/v1"));
+        assert_eq!(
+            fake_install(dir.path(), "0.1.0", RUNNING).own_server().unwrap().map(|o| o.address).as_deref(),
+            Some("http://127.0.0.1:11500/v1")
+        );
         // A non-zero exit is no server, whatever it printed.
         let dir = tempfile::tempdir().unwrap();
         let failing = dir.path().join("rec-failing");
@@ -485,5 +600,96 @@ mod tests {
             }
         }
         assert!(conservative_commitment(22_600_000_000, 262_144) < 36_000_000_000, "and not far over");
+    }
+
+    /// What `rec status` printed, as [`parse_status`] reads it with nothing
+    /// listening.
+    fn status(json: &str) -> OwnServer {
+        parse_status(json, &|_| false).unwrap_or_else(|| panic!("a server: {json}"))
+    }
+
+    /// The Flint model `flint-int4` at `n_ctx` (none when `None`).
+    fn at_ctx(n_ctx: Option<u32>) -> darkmux_types::ProfileModel {
+        serde_json::from_value(serde_json::json!({"id": "flint-int4", "n_ctx": n_ctx})).unwrap()
+    }
+
+    /// (#3574) `rec status` names the revision rec's own server serves and
+    /// the context it was started with; darkmux reads both.
+    #[test]
+    fn rec_status_names_the_revision_and_context_its_server_serves() {
+        let own = status(RUNNING);
+        assert_eq!(own.endpoint.as_deref(), Some("http://127.0.0.1:11500/v1"));
+        assert_eq!((own.ready, own.revision.as_deref(), own.context), (true, Some("flint-int4"), Some(262_144)));
+        let bare = status(r#"{"ready":true}"#);
+        assert_eq!((bare.endpoint, bare.revision, bare.context), (None, None, None));
+    }
+
+    /// (#3574, contract 4) rec's own server, ready, serving the profile's
+    /// revision at the profile's `n_ctx` or more, is reused: the dispatch
+    /// goes to its endpoint's chat URL.
+    #[test]
+    fn recs_own_server_serving_the_model_at_its_context_is_reused() {
+        let chat_url = "http://127.0.0.1:11500/v1/chat/completions".to_string();
+        for n_ctx in [262_144, 8192] {
+            assert_eq!(
+                own_server_use(Some(&status(RUNNING)), &at_ctx(Some(n_ctx)), None),
+                OwnServerUse::Reuse { chat_url: chat_url.clone() },
+                "n_ctx {n_ctx}"
+            );
+        }
+        let localhost = RUNNING.replace("127.0.0.1", "localhost");
+        assert!(matches!(own_server_use(Some(&status(&localhost)), &at_ctx(Some(8192)), None), OwnServerUse::Reuse { .. }));
+    }
+
+    /// (#3574, contract 4) rec's own server that does not serve the model as
+    /// the profile declares it is refused, naming what does not match:
+    /// still loading, no revision or another one, a context below `n_ctx`
+    /// or none, no endpoint, or one that is not this machine's loopback.
+    #[test]
+    fn recs_own_server_that_does_not_serve_the_model_is_refused_naming_why() {
+        let case = |json: &str, model: darkmux_types::ProfileModel| own_server_use(Some(&status(json)), &model, None);
+        let starting = r#"{"ready":false,"endpoint":"http://127.0.0.1:11500/v1","revision":"flint-int4","context":262144}"#;
+        let refused = |json: &str, n_ctx: Option<u32>, says: &str| match case(json, at_ctx(n_ctx)) {
+            OwnServerUse::Refuse { address, why } => {
+                assert!(why.contains(says), "{json}: {why}");
+                let message = own_server_refusal(&address, &why);
+                assert!(message.contains("rec stop") && message.contains(&address), "{message}");
+            }
+            other => panic!("{json} at {n_ctx:?}: {other:?}"),
+        };
+        let listening = |_: u16| true;
+        match own_server_use(parse_status(starting, &listening).as_ref(), &at_ctx(Some(8192)), None) {
+            OwnServerUse::Refuse { why, .. } => assert!(why.contains("not ready"), "{why}"),
+            other => panic!("starting: {other:?}"),
+        }
+        refused(&RUNNING.replace(r#""revision":"flint-int4","#, ""), Some(8192), "names no revision");
+        refused(&RUNNING.replace("flint-int4", "flint-int8"), Some(8192), "`flint-int8`, not `flint-int4`");
+        refused(RUNNING, Some(262_145), "262144");
+        refused(&RUNNING.replace(r#","context":262144"#, ""), Some(8192), "names no context");
+        refused(RUNNING, None, "no `n_ctx`");
+        refused(&RUNNING.replace(r#""endpoint":"http://127.0.0.1:11500/v1","#, ""), Some(8192), "names no endpoint");
+        refused(&RUNNING.replace("127.0.0.1", "10.0.0.7"), Some(8192), "not this machine");
+    }
+
+    /// (#3574) No server of rec's own is free: nothing to reuse or refuse.
+    #[test]
+    fn no_server_of_recs_own_is_free() {
+        assert_eq!(own_server_use(None, &at_ctx(Some(8192)), None), OwnServerUse::Free);
+    }
+
+    /// (#3574) rec's key is what `rec auth token` printed, trimmed; a
+    /// failing or silent `rec auth token` is an error that never carries
+    /// what it printed.
+    #[test]
+    fn recs_key_is_what_rec_auth_token_prints_and_a_failure_never_carries_it() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(fake_install(dir.path(), "0.1.0", "").auth_token().unwrap(), "placeholder-key-for-tests");
+        for (name, body) in [("failing", "echo 'printed-on-failure'; exit 3"), ("silent", "exit 0")] {
+            let bin = dir.path().join(name);
+            std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let err = Rec::at(bin.to_string_lossy().into_owned(), None).auth_token().unwrap_err().to_string();
+            assert!(err.contains("auth token") && !err.contains("printed-on-failure"), "{name}: {err}");
+        }
     }
 }

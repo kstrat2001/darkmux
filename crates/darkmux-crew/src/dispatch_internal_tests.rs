@@ -4027,6 +4027,126 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(terminal["payload"]["code"], "engine_in_use", "{terminal}");
     }
 
+    /// (#3574, contract 4) The single-shot path end to end with rec's own
+    /// server up and serving the profile's revision at its `n_ctx`: the
+    /// request goes to rec's server, as `flint`, with rec's key; darkmux
+    /// starts nothing and writes no `dispatch.model.*` record, and the key
+    /// is in no flow record.
+    #[test]
+    #[serial]
+    fn a_flint_dispatch_goes_to_recs_own_server_when_it_serves_the_model() {
+        let home = TempDir::new().unwrap();
+        let flows = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let _rec = crate::engine_dispatch::tests::fake_rec(root.path(), "0.1.0");
+        let free = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (ours, recs) = (free(), free());
+        // rec's own server, which darkmux did not start.
+        let own_requests = root.path().join("own-requests.jsonl");
+        let py = crate::engine_dispatch::tests::stable_script("rec_mlx.py", crate::engine_dispatch::tests::REC_MLX_PY);
+        let own = std::process::Command::new("python3")
+            .arg("-u")
+            .arg(&py)
+            .arg(&own_requests)
+            .args(["serve", "flint", "--port", &recs.to_string()])
+            .spawn()
+            .unwrap();
+        struct Kill(std::process::Child);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let own_guard = Kill(own);
+        let up = (0..200).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            std::net::TcpStream::connect(("127.0.0.1", recs)).is_ok()
+        });
+        assert!(up, "rec's own server listens");
+        std::fs::write(
+            root.path().join("status.json"),
+            format!(r#"{{"ready":true,"endpoint":"http://127.0.0.1:{recs}/v1","revision":"flint-int4","context":8192}}"#),
+        )
+        .unwrap();
+        let pm: darkmux_types::ProfileModel = {
+            let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+                "profiles": {"p": {"models": [{"id": "flint-int4", "n_ctx": 8192, "endpoint": "fl"}]}},
+                "endpoints": {"fl": {"managed": "flint", "port": ours}}
+            }))
+            .unwrap();
+            reg.materialize_endpoints();
+            reg.profiles["p"].models[0].clone()
+        };
+        let target = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        let keys = ["DARKMUX_HOME", "DARKMUX_FLOWS_DIR", "DARKMUX_FLINT_BIN", "XDG_DATA_HOME"];
+        let saved: Vec<(&str, Option<String>)> = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", home.path());
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows.path());
+            std::env::set_var("DARKMUX_FLINT_BIN", root.path().join("rec"));
+            std::env::set_var("XDG_DATA_HOME", root.path().join("share"));
+        }
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = "pr-reviewer".to_string();
+        opts.session = crate::mission_test_session("m-3574", &format!("fl-recs-{}", std::process::id()));
+        opts.json = false;
+        let session = opts.session.wire();
+        let roomy = std::rc::Rc::new(crate::engine_dispatch::tests::RealLeases);
+        let result = crate::engine_dispatch::with_test_machine(roomy, || {
+            dispatch_unmanaged(&opts, &darkmux_types::execution_id::ExecutionId::mint(), "s", &Default::default(), &target, true)
+        });
+        unsafe {
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        drop(own_guard);
+        result.expect("the dispatch succeeds against rec's own server");
+        let sent: Vec<serde_json::Value> =
+            std::fs::read_to_string(&own_requests).unwrap().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        assert_eq!(sent.len(), 1, "one request, to rec's server");
+        assert_eq!(sent[0]["model"], "flint", "{sent:?}");
+        let auth = std::fs::read_to_string(own_requests.with_extension("jsonl.auth")).unwrap();
+        assert_eq!(auth.trim(), "Bearer placeholder-key-for-tests", "rec's key, as a bearer");
+        assert!(darkmux_types::engine_record::list_in(&home.path().join("run").join("engines")).0.is_empty(), "darkmux started nothing");
+        let mut records = String::new();
+        for entry in std::fs::read_dir(flows.path()).unwrap() {
+            records.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap_or_default());
+        }
+        let mine: Vec<serde_json::Value> = records
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["session_id"].as_str() == Some(session.as_str()))
+            .collect();
+        let actions: Vec<&str> = mine.iter().filter_map(|r| r["action"].as_str()).collect();
+        assert!(actions.contains(&"dispatch.complete"), "{actions:?}");
+        assert!(!actions.iter().any(|a| a.starts_with("dispatch.model.")), "{actions:?}");
+        assert!(!records.contains("placeholder-key-for-tests"), "the key is in no flow record");
+    }
+
+    /// (#3574) The container path sends a model rec's own server serves
+    /// there too: its body needs a sandbox to run, so this reads the source.
+    /// `run_container` moves the hosted brain with `route_target` after the
+    /// model is made resident and before the container launches, and the
+    /// container is handed the auth it returns.
+    #[test]
+    fn the_container_path_routes_to_recs_own_server_before_the_container() {
+        let src = include_str!("dispatch_internal.rs");
+        let start = src.find("fn run_container(").expect("run_container exists");
+        let body = &src[start..];
+        let run = &body[..body.find("\nfn ").unwrap_or(body.len())];
+        let resident = run.find("container_model_resident(").expect("the model is made resident");
+        let routed = run
+            .find("let remote_auth = crate::engine_dispatch::route_target(run.brain.agentic_pm.as_mut(), _engine.as_ref(),")
+            .expect("the brain is routed through route_target");
+        let launch = run.find("launch_container(opts, execution, &run, remote_auth)").expect("the routed auth is launched");
+        assert!(resident < routed && routed < launch, "resident, then routed, then launched");
+    }
+
     /// (#3453) The container path names a Flint model `flint`, the name
     /// rec's server answers to.
     #[test]

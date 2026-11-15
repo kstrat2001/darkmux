@@ -4851,6 +4851,8 @@ fn dispatch_unmanaged(
             return Err(refusal.into_error());
         }
     };
+    // (#3574) A model rec's own server serves goes there, with rec's key.
+    let (url, auth) = crate::engine_dispatch::route(_engine.as_ref(), url, auth);
 
     // (#3211) The turn's live evidence, as a container turn has it: the
     // opener now (PROMPT), coalesced heartbeats while a streamed reply
@@ -6700,16 +6702,19 @@ type HostedRoute = (crate::types::Role, String, crate::target::Target, crate::ro
 /// (#3448) Make `target`'s model resident when it runs on a server darkmux
 /// starts, recording each `dispatch.model.*` (and `dispatch.queue.*`) step
 /// through `record`; `None` for any other target. (#3504) A busy model
-/// waits as `wait` says.
+/// waits as `wait` says. (#3574) A model rec's own server already serves is
+/// sent there ([`crate::engine_dispatch::route`]), with a line saying so.
 fn engine_resident(
     target: &crate::target::Target,
     wait: &crate::engine_dispatch::BusyWait<'_>,
     mut record: impl FnMut(darkmux_flow::Payload),
-) -> Result<Option<crate::engine_dispatch::EngineReady>, crate::engine_dispatch::NotResident> {
+) -> Result<Option<crate::engine_dispatch::Served>, crate::engine_dispatch::NotResident> {
     if !crate::engine_dispatch::is_engine_server(target) {
         return Ok(None);
     }
-    crate::engine_dispatch::prepare(target, wait, &mut |n, p| record(model_record(n, p))).map(Some)
+    crate::engine_dispatch::prepare(target, wait, &mut |n, p| record(model_record(n, p)))
+        .inspect(crate::engine_dispatch::Served::announce)
+        .map(Some)
 }
 
 /// (#3448) The `dispatch.error` payload of a container dispatch whose model
@@ -8007,7 +8012,7 @@ fn container_model_resident(
     endpoint_label: Option<&str>,
     bookend: &mut DispatchBookendGuard<'_>,
     started: std::time::Instant,
-) -> Result<Option<crate::engine_dispatch::EngineReady>> {
+) -> Result<Option<crate::engine_dispatch::Served>> {
     let record = |level: darkmux_flow::Level, p: darkmux_flow::Payload| {
         crate::dispatch::build_dispatch_record(level, &opts.role_id, &opts.session, execution, Some(model), opts.phase_id.as_deref(), p)
     };
@@ -8161,7 +8166,8 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
         dispatch_start_instant,
     )?;
 
-    let remote_auth = run.remote_auth.take();
+    // (#3574) A model rec's own server serves goes there, with rec's key.
+    let remote_auth = crate::engine_dispatch::route_target(run.brain.agentic_pm.as_mut(), _engine.as_ref(), run.remote_auth.take());
     let launched = launch_container(opts, execution, &run, remote_auth).inspect_err(|e| {
         let wall_ms = dispatch_start_instant.elapsed().as_millis() as u64;
         let refused = refused_launch_terminal(e, wall_ms, run.unmanaged_endpoint_raw_label.as_deref(), opts.resume_from.as_deref());
