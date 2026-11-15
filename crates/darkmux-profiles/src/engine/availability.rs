@@ -44,11 +44,22 @@
 //! version it can read is `unavailable`: a dispatch refuses exactly that
 //! with `engine_unavailable`.
 //!
+//! (#3574) An `unavailable` carries the code a dispatch refusing for the same
+//! reason carries ([`Availability::refused`]), so an app branches on it, not
+//! on the reason's wording: `engine_unavailable` (an unverified or missing
+//! engine, an install rec's adapter cannot read, a model LM Studio has not
+//! downloaded), `model_start_failed` (`engine_args` the engine does not take,
+//! a model Tensorfold does not list), `port_in_use`, and `engine_in_use`
+//! (rec's own server). A registry problem a dispatch refuses before any
+//! engine is asked (no `n_ctx`, no `port`, an endpoint that does not
+//! resolve, a refused user file) carries none.
+//!
 //! Whether a model FITS in memory right now is not availability: that changes
 //! with every dispatch, and `dispatch --check`'s `fit` answers it.
 
 use super::server::{self, Dirs};
 use super::tensorfold::{Tensorfold, TensorfoldProbe, VERIFIED_RELEASES};
+use darkmux_types::client_code::ClientCode;
 use darkmux_types::{EndpointKind, LoadedModel, ManagedBackend, ProfileModel};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -100,6 +111,19 @@ pub enum AvailabilityState {
 pub struct Availability {
     pub state: AvailabilityState,
     pub reason: Option<String>,
+    /// (#3574) Why, for an app to branch on: the code a dispatch refusing
+    /// for the same reason carries (`dispatch.error`'s `payload.code`, the
+    /// client API's `ClientCode` spelling), so there is one vocabulary:
+    /// `engine_in_use` while rec's own server runs, `engine_unavailable`,
+    /// `port_in_use`, `model_start_failed`.
+    /// Absent when no dispatch refusal fits (a registry problem a dispatch
+    /// refuses before any engine is asked, a state that is not
+    /// `unavailable`). Additive (card schema 1.5): an older reader ignores
+    /// it, and a code a newer darkmux sends that this one does not know is
+    /// kept as its text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub code: Option<String>,
 }
 
 impl Availability {
@@ -107,12 +131,14 @@ impl Availability {
         Availability {
             state,
             reason: None,
+            code: None,
         }
     }
     fn because(state: AvailabilityState, reason: impl Into<String>) -> Self {
         Availability {
             state,
             reason: Some(reason.into()),
+            code: None,
         }
     }
     pub fn resident() -> Self {
@@ -129,6 +155,13 @@ impl Availability {
     }
     pub fn unknown(reason: impl Into<String>) -> Self {
         Self::because(AvailabilityState::Unknown, reason)
+    }
+    /// `unavailable` for `reason`, with the code a dispatch refusing for
+    /// the same reason carries.
+    pub fn refused(code: ClientCode, reason: impl Into<String>) -> Self {
+        let mut a = Self::unavailable(reason);
+        a.code = Some(code.as_str().to_string());
+        a
     }
 }
 
@@ -398,9 +431,11 @@ impl EngineAnswer for LmStudioAnswer {
                 Availability::unknown(format!("LM Studio did not list its downloaded models: {e}"))
             }
             Ok(models) if models.iter().any(|m| m.answers_to(&key)) => Availability::startable(),
-            Ok(_) => {
-                Availability::unavailable(format!("LM Studio has no downloaded model `{key}`"))
-            }
+            // The wave planner's `UnknownModelKey`: `engine_unavailable`.
+            Ok(_) => Availability::refused(
+                ClientCode::EngineUnavailable,
+                format!("LM Studio has no downloaded model `{key}`"),
+            ),
         }
     }
 
@@ -438,7 +473,10 @@ impl TensorfoldAnswer {
         }
         match self.facts.args_problem(model) {
             Err(e) => Some(Availability::unknown(format!("Tensorfold {e}"))),
-            Ok(Some(why)) => Some(Availability::unavailable(format!("engine_args: {why}"))),
+            Ok(Some(why)) => Some(Availability::refused(
+                ClientCode::ModelStartFailed,
+                format!("engine_args: {why}"),
+            )),
             Ok(None) => None,
         }
     }
@@ -449,11 +487,11 @@ impl TensorfoldAnswer {
     fn model_problem(&self, model: &ProfileModel) -> Option<Availability> {
         match self.facts.has_model(model) {
             Err(e) => Some(Availability::unknown(format!("Tensorfold {e}"))),
-            Ok(false) => Some(Availability::unavailable(format!(
-                "`{} models` does not list `{}`",
-                self.tf.label(),
-                model.id
-            ))),
+            // The start a dispatch makes fails: `model_start_failed`.
+            Ok(false) => Some(Availability::refused(
+                ClientCode::ModelStartFailed,
+                format!("`{} models` does not list `{}`", self.tf.label(), model.id),
+            )),
             Ok(true) => None,
         }
     }
@@ -467,12 +505,14 @@ impl TensorfoldAnswer {
             Err(e) if ran_out_of_time(e) => Some(Availability::unknown(format!(
                 "the Tensorfold binary did not answer in time: {e}"
             ))),
-            Err(e) => Some(Availability::unavailable(format!(
-                "the Tensorfold binary did not answer: {e}"
-            ))),
-            Ok(v) if !v.is_verified() => Some(Availability::unavailable(format!(
-                "Tensorfold {v} is installed; this darkmux supports Tensorfold {VERIFIED_RELEASES}"
-            ))),
+            Err(e) => Some(Availability::refused(
+                ClientCode::EngineUnavailable,
+                format!("the Tensorfold binary did not answer: {e}"),
+            )),
+            Ok(v) if !v.is_verified() => Some(Availability::refused(
+                ClientCode::EngineUnavailable,
+                format!("Tensorfold {v} is installed; this darkmux supports Tensorfold {VERIFIED_RELEASES}"),
+            )),
             Ok(_) => None,
         }
     }
@@ -509,12 +549,19 @@ impl EngineAnswer for TensorfoldAnswer {
             return problem;
         }
         if live.is_none() && foreign_on_port(&self.dirs, id, port) {
-            return Availability::unavailable(format!(
-                "something darkmux did not start answers on 127.0.0.1:{port}, the port of endpoint `{id}`"
-            ));
+            return foreign_port(port, id);
         }
         Availability::startable()
     }
+}
+
+/// A port something darkmux did not start holds: the server lifecycle's
+/// `port_in_use`.
+fn foreign_port(port: u16, id: &str) -> Availability {
+    Availability::refused(
+        ClientCode::PortInUse,
+        format!("something darkmux did not start answers on 127.0.0.1:{port}, the port of endpoint `{id}`"),
+    )
 }
 
 /// Whether something darkmux did not start answers on `port`, with no live
@@ -579,17 +626,29 @@ impl FlintAnswer {
         darkmuxs: Option<&darkmux_types::engine_record::EngineRecord>,
     ) -> Option<Availability> {
         match &self.version {
-            Err(e) if ran_out_of_time(e) => return Some(Availability::unknown(format!("rec did not answer in time: {e}"))),
-            Err(e) => return Some(Availability::unavailable(e.clone())),
+            Err(e) if ran_out_of_time(e) => {
+                return Some(Availability::unknown(format!(
+                    "rec did not answer in time: {e}"
+                )))
+            }
+            Err(e) => {
+                return Some(Availability::refused(
+                    ClientCode::EngineUnavailable,
+                    e.clone(),
+                ))
+            }
             Ok(_) => {}
         }
         match &self.own_server {
             Err(e) => Some(Availability::unknown(format!(
                 "rec could not say whether its own server runs: {e}"
             ))),
-            Ok(Some(address)) if !super::flint::own_server_is_darkmuxs(address, darkmuxs) => Some(
-                Availability::unavailable(super::flint::own_server_refusal(address)),
-            ),
+            Ok(Some(address)) if !super::flint::own_server_is_darkmuxs(address, darkmuxs) => {
+                Some(Availability::refused(
+                    ClientCode::EngineInUse,
+                    super::flint::own_server_refusal(address),
+                ))
+            }
             Ok(_) => None,
         }
     }
@@ -612,9 +671,12 @@ impl EngineAnswer for FlintAnswer {
             .version
             .as_deref()
             .unwrap_or(super::flint::VERIFIED_RELEASE);
+        // `Rec::plan` refuses an install it cannot read `engine_unavailable`.
         let spec = match self.rec.serve_spec(id, port, model, version) {
             Ok(spec) => spec,
-            Err(e) => return Availability::unavailable(format!("{e:#}")),
+            Err(e) => {
+                return Availability::refused(ClientCode::EngineUnavailable, format!("{e:#}"))
+            }
         };
         let live = server::running_now(&self.dirs, id);
         if let Some(problem) = self.rec_problem(live.as_ref()) {
@@ -627,9 +689,7 @@ impl EngineAnswer for FlintAnswer {
             return Availability::resident();
         }
         if live.is_none() && foreign_on_port(&self.dirs, id, port) {
-            return Availability::unavailable(format!(
-                "something darkmux did not start answers on 127.0.0.1:{port}, the port of endpoint `{id}`"
-            ));
+            return foreign_port(port, id);
         }
         Availability::startable()
     }

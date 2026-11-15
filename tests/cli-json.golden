@@ -55,6 +55,7 @@ Attribution = "per_process" | "estimated" | "unavailable" | "unknown"
 Availability
   state: AvailabilityState
   reason: string | null
+  code?: string | null
 AvailabilityState = "resident" | "startable" | "unavailable" | "external" | "unknown"
 AvailableProfile
   name: string
@@ -762,6 +763,7 @@ ModelAvailability
   engine: string | null
   state: AvailabilityState
   reason: string | null
+  code?: string | null
 ModelEndpoint
   url?: string | null
   api_version?: string | null

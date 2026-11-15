@@ -124,6 +124,28 @@ pub enum ClientCode {
 }
 
 impl ClientCode {
+    /// The one wire spelling, as serde writes it (`snake_case`), never
+    /// written out by hand: what every `code` field carries, a dispatch
+    /// refusal's (`EngineRefusal`, `ServerError`, the wave planner's) and a
+    /// model's `availability` alike (#3574), so the two cannot drift. Each
+    /// spelling is read from serde once and kept for the process.
+    pub fn as_str(self) -> &'static str {
+        static SPELLED: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<ClientCode, &'static str>>,
+        > = std::sync::OnceLock::new();
+        let mut spelled = SPELLED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        spelled.entry(self).or_insert_with(|| {
+            let wire = serde_json::to_value(self)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            Box::leak(wire.into_boxed_str())
+        })
+    }
+
     /// A failed run's code from its `dispatch.error` `code` (`None`: the
     /// record names none, or there is no record): the same spelling, read.
     /// A code this build does not know is [`ClientCode::DispatchFailed`].
@@ -194,6 +216,7 @@ mod tests {
             (RemotePairingUnavailable, "remote_pairing_unavailable"),
         ] {
             assert_eq!(wire(c), s);
+            assert_eq!(c.as_str(), s, "the method spells it as serde does");
             assert_eq!(
                 serde_json::from_value::<ClientCode>(serde_json::json!(s)).unwrap(),
                 c,

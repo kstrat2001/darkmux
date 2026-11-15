@@ -1155,6 +1155,11 @@
             "type": "string",
             "const": "remote_tailscale",
             "description": "(#3560) `GET /client/whoami` carries `remote`: whether this machine's\n`client serve` is published on its tailnet (`clients.remote\ntailscale`), at which HTTPS URL, or why not. What the build can do:\n`remote.state` says what this machine did."
+          },
+          {
+            "type": "string",
+            "const": "availability_codes",
+            "description": "(#3574) A model's `availability` (`GET /client/profiles`) carries a\n`code` whenever a dispatch refusal fits, the same code that refusal\ncarries (`engine_in_use`, `engine_unavailable`, ...). With this\nlisted, a missing `code` means none fits; without it, the darkmux\npredates codes and an app reads only `reason`."
           }
         ],
         "description": "One thing the client API can do that an app may need to check for."
@@ -1311,6 +1316,13 @@
               "string",
               "null"
             ]
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "(#3574) Why, for an app to branch on: the code a dispatch refusing\nfor the same reason carries (`dispatch.error`'s `payload.code`, the\nclient API's `ClientCode` spelling), so there is one vocabulary:\n`engine_in_use` while rec's own server runs, `engine_unavailable`,\n`port_in_use`, `model_start_failed`.\nAbsent when no dispatch refusal fits (a registry problem a dispatch\nrefuses before any engine is asked, a state that is not\n`unavailable`). Additive (card schema 1.5): an older reader ignores\nit, and a code a newer darkmux sends that this one does not know is\nkept as its text."
           }
         },
         "required": [

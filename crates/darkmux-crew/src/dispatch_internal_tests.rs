@@ -16638,7 +16638,8 @@ S(("127.0.0.1", port), H).serve_forever()
     /// that failed any other way is still only a warning.
     #[test]
     fn a_compactor_load_refused_for_memory_fails_the_dispatch_with_its_code() {
-        for code in ["busy", "memory_in_use", "wont_fit"] {
+        use darkmux_types::client_code::ClientCode;
+        for code in [ClientCode::Busy, ClientCode::MemoryInUse, ClientCode::WontFit] {
             let mut compaction = crate::dispatch::CompactionDispatchArgs {
                 compactor_model: Some("util-4b".to_string()),
                 ..Default::default()
@@ -16647,7 +16648,7 @@ S(("127.0.0.1", port), H).serve_forever()
                 Err(anyhow::Error::new(crate::engine_dispatch::refuse(code, "short of memory")).context("darkmux: loading `darkmux:util-4b` was refused"))
             });
             let err = refused.expect_err("a refusal fails the dispatch");
-            assert_eq!(crate::engine_dispatch::refusal_code(&err), Some(code), "{err:#}");
+            assert_eq!(crate::engine_dispatch::refusal_code(&err), Some(code.as_str()), "{err:#}");
             assert!(format!("{err:#}").contains("util-4b"), "{err:#}");
         }
         let mut compaction = crate::dispatch::CompactionDispatchArgs { compactor_model: Some("util-4b".to_string()), ..Default::default() };
@@ -16660,7 +16661,7 @@ S(("127.0.0.1", port), H).serve_forever()
     /// the code; any other launch failure is left to the bookend guard.
     #[test]
     fn a_launch_refused_for_memory_ends_with_the_refusal_code() {
-        let refused = anyhow::Error::new(crate::engine_dispatch::refuse("memory_in_use", "short")).context("compactor");
+        let refused = anyhow::Error::new(crate::engine_dispatch::refuse(darkmux_types::client_code::ClientCode::MemoryInUse, "short")).context("compactor");
         match super::refused_launch_terminal(&refused, 5, None, None) {
             Some(darkmux_flow::Payload::DispatchError(p)) => assert_eq!(p.code.as_deref(), Some("memory_in_use")),
             other => panic!("{other:?}"),

@@ -55,6 +55,7 @@ DELETE /client/workspaces/:name/preview  json StatusWord (client listener: 127.0
 PUT /client/workspaces/:name/recipe  json RecipeReply (client listener: 127.0.0.1, this machine's apps and paired devices through its tailnet entry; not the viewer daemon)
 
 # client listener response types: Type.field: type, from the JSON schema (every refusal is ClientError)
+Availability.code?: string | null
 Availability.reason?: string | null
 Availability.state: AvailabilityState
 AvailabilityState = "resident" | "startable" | "unavailable" | "external" | "unknown"
@@ -67,7 +68,7 @@ BranchFile.content?: string | null
 BranchFile.deleted?: boolean | null
 BranchFile.mode?: string | null
 BranchFile.path: string
-ClientCapability = "clean_preview" | "template_workspace" | "continues" | "clone_preview" | "recipe_set" | "workspace_image" | "workspace_edit" | "workspace_remove" | "remote_tailscale"
+ClientCapability = "clean_preview" | "template_workspace" | "continues" | "clone_preview" | "recipe_set" | "workspace_image" | "workspace_edit" | "workspace_remove" | "remote_tailscale" | "availability_codes"
 ClientCode = "unsupported_media_type" | "bad_request" | "payload_too_large" | "method_not_allowed" | "not_local" | "not_forwarded" | "not_paired_remotely" | "remote_identity_missing" | "remote_identity_mismatch" | "remote_pairing_unavailable" | "not_found" | "unauthorized" | "forbidden" | "conflict" | "unprocessable" | "too_many_requests" | "unavailable" | "internal" | "preview_disabled" | "no_source_checkout" | "template_no_recipe" | "no_recipe" | "recipe_invalid" | "filter_in_repo_config" | "network_key_in_repo_config" | "fetch_failed" | "clone_failed" | "no_own_branch" | "branch_failed" | "unsaved_commits" | "busy" | "wont_fit" | "memory_in_use" | "model_start_failed" | "model_stop_failed" | "port_in_use" | "engine_unavailable" | "engine_in_use" | "dispatch_failed"
 ClientError.code: ClientCode
 ClientError.error: string

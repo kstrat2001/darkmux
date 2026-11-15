@@ -15226,7 +15226,9 @@ fn ensure_utility_resident(
 /// A load darkmux refused for memory, by its code: retrying later can help,
 /// starting the run without the model cannot.
 fn refused_for_memory(e: &anyhow::Error) -> bool {
-    matches!(crate::engine_dispatch::refusal_code(e), Some("busy" | "memory_in_use" | "wont_fit"))
+    use darkmux_types::client_code::ClientCode;
+    let code = crate::engine_dispatch::refusal_code(e);
+    [ClientCode::Busy, ClientCode::MemoryInUse, ClientCode::WontFit].iter().any(|c| code == Some(c.as_str()))
 }
 
 /// (#2536) The wire `--compactor-model` id for a compactor darkmux actually

@@ -165,14 +165,24 @@ pub enum ServerError {
 }
 
 impl ServerError {
-    pub fn code(&self) -> &'static str {
+    /// The code an app branches on, as [`ClientCode`] (#3574: one
+    /// vocabulary with a listing's `availability`).
+    ///
+    /// [`ClientCode`]: darkmux_types::client_code::ClientCode
+    pub fn client_code(&self) -> darkmux_types::client_code::ClientCode {
+        use darkmux_types::client_code::ClientCode;
         match self {
-            ServerError::PortInUse { .. } => "port_in_use",
-            ServerError::Busy { .. } => "busy",
-            ServerError::StartFailed { .. } => "model_start_failed",
-            ServerError::StopFailed { .. } => "model_stop_failed",
-            ServerError::MemoryPressure { .. } => "memory_in_use",
+            ServerError::PortInUse { .. } => ClientCode::PortInUse,
+            ServerError::Busy { .. } => ClientCode::Busy,
+            ServerError::StartFailed { .. } => ClientCode::ModelStartFailed,
+            ServerError::StopFailed { .. } => ClientCode::ModelStopFailed,
+            ServerError::MemoryPressure { .. } => ClientCode::MemoryInUse,
         }
+    }
+
+    /// [`Self::client_code`]'s wire spelling.
+    pub fn code(&self) -> &'static str {
+        self.client_code().as_str()
     }
 }
 

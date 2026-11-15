@@ -60,11 +60,17 @@ pub enum ClientCapability {
     /// tailscale`), at which HTTPS URL, or why not. What the build can do:
     /// `remote.state` says what this machine did.
     RemoteTailscale,
+    /// (#3574) A model's `availability` (`GET /client/profiles`) carries a
+    /// `code` whenever a dispatch refusal fits, the same code that refusal
+    /// carries (`engine_in_use`, `engine_unavailable`, ...). With this
+    /// listed, a missing `code` means none fits; without it, the darkmux
+    /// predates codes and an app reads only `reason`.
+    AvailabilityCodes,
 }
 
 impl ClientCapability {
     /// Every capability, in declaration order: what `whoami` lists.
-    pub const ALL: [ClientCapability; 9] = [
+    pub const ALL: [ClientCapability; 10] = [
         ClientCapability::CleanPreview,
         ClientCapability::TemplateWorkspace,
         ClientCapability::Continues,
@@ -74,6 +80,7 @@ impl ClientCapability {
         ClientCapability::WorkspaceEdit,
         ClientCapability::WorkspaceRemove,
         ClientCapability::RemoteTailscale,
+        ClientCapability::AvailabilityCodes,
     ];
 }
 
@@ -105,6 +112,7 @@ mod tests {
                 "workspace_edit",
                 "workspace_remove",
                 "remote_tailscale",
+                "availability_codes",
             ]
         );
         for c in ClientCapability::ALL {

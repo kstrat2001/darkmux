@@ -370,7 +370,7 @@ fn a_missing_memory_figure_refuses_rather_than_starting_blind() {
 #[test]
 #[serial_test::serial]
 fn a_refusal_code_survives_the_error_chain() {
-    let e: anyhow::Error = refuse("busy", "x").into();
+    let e: anyhow::Error = refuse(ClientCode::Busy, "x").into();
     let e = e.context("darkmux dispatch: making the model resident");
     assert_eq!(refusal_code(&e), Some("busy"));
     assert_eq!(refusal_code(&anyhow::anyhow!("other")), None);
@@ -860,33 +860,41 @@ fn a_tensorfold_serve_spec_failure_is_model_start_failed() {
     assert_eq!(err.code, "model_start_failed", "{err}");
 }
 
-/// (#3468) Every code a dispatch can write to `dispatch.error` (engine
-/// dispatch's refusals, and the engine server's errors) is a client code an
-/// app can branch on: read as spelled, never `dispatch_failed`. A new code
-/// here that the client enum lacks fails this, before an app ever sees it.
+/// (#3468, #3574) Every code a dispatch can write to `dispatch.error` is a
+/// client code an app can branch on, by construction: [`refuse`] and
+/// `wave_error` take a `ClientCode`, and `ServerError::code` is
+/// `ClientCode::as_str`, so a dispatch and a listing's `availability` spell
+/// a code one way and a renamed variant breaks the build. This pins that no
+/// producer goes back to a hand-written string, and that each spelling is
+/// read back as itself.
 #[test]
 fn every_dispatch_refusal_code_is_a_client_code() {
+    use darkmux_types::client_code::ClientCode;
     let src = |p: &str| std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(p)).unwrap();
-    let dispatch = src("src/engine_dispatch.rs");
-    let server = src("../darkmux-profiles/src/engine/server.rs");
-    let mut codes: Vec<String> = Vec::new();
-    for (i, _) in dispatch.match_indices("refuse(") {
-        let rest = dispatch[i + "refuse(".len()..].trim_start();
-        if let Some(code) = rest.strip_prefix('"').and_then(|r| r.split('"').next()) {
-            codes.push(code.to_string());
+    for file in ["src/engine_dispatch.rs", "src/lms_room.rs", "src/concurrent_dispatch.rs"] {
+        let text = src(file);
+        for (i, _) in text.match_indices("refuse(").chain(text.match_indices("wave_error(Some(")) {
+            let rest = text[i..].split_once('(').unwrap().1.trim_start_matches("Some(").trim_start();
+            assert!(!rest.starts_with('"'), "{file}: a code spelled by hand at byte {i}: {}", &text[i..i + 40]);
         }
     }
-    let code_fn = &server[server.find("pub fn code(&self)").expect("ServerError::code")..];
+    assert!(!src("src/engine_dispatch.rs").contains("code: \""), "an EngineRefusal's code is spelled by ClientCode");
+    let server = src("../darkmux-profiles/src/engine/server.rs");
+    let code_fn = &server[server.find("pub fn client_code(&self)").expect("ServerError::client_code")..];
     let code_fn = &code_fn[..code_fn.find("\n    }\n").unwrap()];
-    for line in code_fn.lines().filter(|l| l.contains("=> \"")) {
-        codes.push(line.split('"').nth(1).unwrap().to_string());
-    }
-    codes.sort();
-    codes.dedup();
-    assert!(codes.len() >= 7, "the scan found the producers: {codes:?}");
-    for code in &codes {
-        let read = darkmux_types::client_code::ClientCode::of_dispatch(Some(code));
-        assert_ne!(read, darkmux_types::client_code::ClientCode::DispatchFailed, "`{code}` is no client code");
+    assert!(!code_fn.contains("=> \""), "ServerError's codes are ClientCode variants: {code_fn}");
+    for code in [
+        ClientCode::Busy,
+        ClientCode::WontFit,
+        ClientCode::MemoryInUse,
+        ClientCode::ModelStartFailed,
+        ClientCode::ModelStopFailed,
+        ClientCode::PortInUse,
+        ClientCode::EngineUnavailable,
+        ClientCode::EngineInUse,
+    ] {
+        assert_eq!(refuse(code, "x").code, code.as_str());
+        assert_eq!(ClientCode::of_dispatch(Some(code.as_str())), code, "{code:?} reads back as itself");
     }
 }
 
@@ -1252,7 +1260,8 @@ fn a_stop_ends_the_wait_without_trying_again() {
 /// refusal: one try, answered at once.
 #[test]
 fn only_busy_waits() {
-    for code in ["wont_fit", "memory_in_use", "model_start_failed", "port_in_use"] {
+    use darkmux_types::client_code::ClientCode;
+    for code in [ClientCode::WontFit, ClientCode::MemoryInUse, ClientCode::ModelStartFailed, ClientCode::PortInUse] {
         let env = FakeEnv::new(Vec::new());
         let tries = std::cell::Cell::new(0);
         let err = wait_while_busy(
@@ -1266,7 +1275,7 @@ fn only_busy_waits() {
             &mut |_, _| {},
         )
         .unwrap_err();
-        assert_eq!((err.code(), tries.get(), env.paused_total()), (Some(code), 1, 0), "{code}");
+        assert_eq!((err.code(), tries.get(), env.paused_total()), (Some(code.as_str()), 1, 0), "{code:?}");
     }
 }
 

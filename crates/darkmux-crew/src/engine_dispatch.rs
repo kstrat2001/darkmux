@@ -75,6 +75,7 @@ use std::time::Duration;
 
 use crate::budget::{BudgetCaller, BudgetEnv};
 use darkmux_flow::payload::DispatchModelPayload;
+use darkmux_types::client_code::ClientCode;
 use darkmux_types::config::BusyPolicy;
 use darkmux_profiles::engine::flint::{self, Rec};
 use darkmux_profiles::engine::server::{self, Dirs, Progress, ServerSpec};
@@ -115,14 +116,16 @@ impl std::fmt::Display for EngineRefusal {
 
 impl std::error::Error for EngineRefusal {}
 
-pub(crate) fn refuse(code: &'static str, message: impl Into<String>) -> EngineRefusal {
-    EngineRefusal { code, message: message.into(), waiting_on: None }
+/// A refusal with `code`, spelled by [`ClientCode`] (#3574): the one
+/// vocabulary a listing's `availability` carries too.
+pub(crate) fn refuse(code: ClientCode, message: impl Into<String>) -> EngineRefusal {
+    EngineRefusal { code: code.as_str(), message: message.into(), waiting_on: None }
 }
 
 /// `busy`: `waiting_on` is held by a running dispatch; the message ends with
 /// `advice`.
 fn busy(waiting_on: String, advice: &str) -> EngineRefusal {
-    EngineRefusal { code: "busy", message: format!("{waiting_on}; {advice}"), waiting_on: Some(waiting_on) }
+    EngineRefusal { code: ClientCode::Busy.as_str(), message: format!("{waiting_on}; {advice}"), waiting_on: Some(waiting_on) }
 }
 
 /// A server lifecycle failure as the refusal it is, its `busy` naming what
@@ -132,7 +135,7 @@ fn server_refusal(e: server::ServerError) -> EngineRefusal {
         server::ServerError::Busy { endpoint, model } => {
             busy(format!("endpoint `{endpoint}` is serving `{model}` for a running dispatch"), "retry when it finishes")
         }
-        other => refuse(other.code(), other.to_string()),
+        other => refuse(other.client_code(), other.to_string()),
     }
 }
 
@@ -310,7 +313,7 @@ pub(crate) trait ServerEngine {
 }
 
 fn unavailable(e: anyhow::Error) -> EngineRefusal {
-    refuse("engine_unavailable", format!("{e:#}"))
+    refuse(ClientCode::EngineUnavailable, format!("{e:#}"))
 }
 
 impl ServerEngine for Tensorfold {
@@ -320,9 +323,9 @@ impl ServerEngine for Tensorfold {
         // them: a flag it does not take would only fail the start later.
         if !model.engine_args.is_empty() {
             let flags = self.serve_flags().map_err(|e| unavailable(e.context("reading the flags its `serve` takes")))?;
-            flags.check(&model.engine_args).map_err(|why| refuse("model_start_failed", format!("engine_args: {why}")))?;
+            flags.check(&model.engine_args).map_err(|why| refuse(ClientCode::ModelStartFailed, format!("engine_args: {why}")))?;
         }
-        self.serve_spec(endpoint, port, model, version).map_err(|e| refuse("model_start_failed", format!("{e:#}")))
+        self.serve_spec(endpoint, port, model, version).map_err(|e| refuse(ClientCode::ModelStartFailed, format!("{e:#}")))
     }
     /// `info`'s weights and floor, priced with the KV cache Tensorfold
     /// reserves at start for the model's context, and its drafter
@@ -415,7 +418,7 @@ pub fn prepare(
         EndpointKind::Managed(ManagedBackend::Tensorfold) => Box::new(Tensorfold::installed()),
         EndpointKind::Managed(ManagedBackend::Flint) => Box::new(Rec::installed()),
         EndpointKind::Managed(_) | EndpointKind::Unmanaged => {
-            return Err(NotResident::Refused(refuse("model_start_failed", "darkmux starts no server for this model's endpoint")))
+            return Err(NotResident::Refused(refuse(ClientCode::ModelStartFailed, "darkmux starts no server for this model's endpoint")))
         }
     };
     let base = queue_payload(target);
@@ -721,7 +724,7 @@ impl Machine for ThisMachine<'_> {
 /// a refusal frees nothing for nobody.
 pub(crate) fn refuse_under_pressure(machine: &dyn Machine) -> Result<(), EngineRefusal> {
     match darkmux_types::memory_pressure::refuses_start(machine.pressure_gate(), machine.pressure().as_ref()) {
-        Some(why) => Err(refuse("memory_in_use", format!("{why}; retry once memory is free"))),
+        Some(why) => Err(refuse(ClientCode::MemoryInUse, format!("{why}; retry once memory is free"))),
         None => Ok(()),
     }
 }
@@ -945,7 +948,7 @@ impl Start<'_> {
 fn reserve(need: u64, served_name: &str) -> Result<Reserved, EngineRefusal> {
     Reserved::begin(need).map_err(|e| {
         refuse(
-            "model_start_failed",
+            ClientCode::ModelStartFailed,
             format!(
                 "could not record the memory `{served_name}` is about to take ({e:#}), so another start could be \
                  admitted beside it; check that darkmux's home is writable"
@@ -977,7 +980,7 @@ fn leave_settling(mut reserved: Reserved) {
 /// The machine-wide residency lock, or the refusal saying why not.
 fn residency_lock() -> Result<darkmux_types::residency_lock::ResidencyLock, EngineRefusal> {
     darkmux_types::residency_lock::acquire().map_err(|e| {
-        refuse("model_start_failed", format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
+        refuse(ClientCode::ModelStartFailed, format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
     })
 }
 
@@ -1001,7 +1004,7 @@ fn refuse_a_held_server(current: Option<&EngineRecord>, leased: &[String], endpo
 fn write_lease(lease: &LeaseGuard, served_name: &str) -> Result<(), EngineRefusal> {
     lease.write(&[served_name.to_string()]).map_err(|e| {
         refuse(
-            "model_start_failed",
+            ClientCode::ModelStartFailed,
             format!(
                 "could not record this dispatch's lease on `{served_name}` ({e:#}), so another darkmux process could \
                  stop its server mid-run; check that darkmux's home is writable"
@@ -1030,7 +1033,7 @@ fn refuse_engines_own_server(engine: &dyn ServerEngine, dirs: &Dirs, endpoint: &
     if flint::own_server_is_darkmuxs(&address, server::running(dirs, endpoint).as_ref()) {
         return Ok(());
     }
-    Err(refuse("engine_in_use", flint::own_server_refusal(&address)))
+    Err(refuse(ClientCode::EngineInUse, flint::own_server_refusal(&address)))
 }
 
 
@@ -1112,7 +1115,7 @@ fn make_room(room: &Room<'_>, dirs: &Dirs, bounds: server::Bounds, machine: &dyn
     // (#3510) A figure darkmux cannot read never lets a start through blind.
     let Some(need) = room.need else {
         return Err(refuse(
-            "model_start_failed",
+            ClientCode::ModelStartFailed,
             "the engine gave no memory figure for this model, so darkmux cannot tell whether it fits; it starts \
              nothing it cannot account for",
         ));
@@ -1121,7 +1124,7 @@ fn make_room(room: &Room<'_>, dirs: &Dirs, bounds: server::Bounds, machine: &dyn
     // first, so it holds whatever free memory reads.
     if let Some(total) = machine.capacity().filter(|t| need > *t) {
         return Err(refuse(
-            "wont_fit",
+            ClientCode::WontFit,
             format!("the model needs {:.1} GiB and this machine has {:.1} GiB in all. {ESTIMATED}", gib(need), gib(total)),
         ));
     }
@@ -1134,7 +1137,7 @@ fn make_room(room: &Room<'_>, dirs: &Dirs, bounds: server::Bounds, machine: &dyn
     let fits = |free: u64| usable(free) >= need;
     let unread = || {
         refuse(
-            "model_start_failed",
+            ClientCode::ModelStartFailed,
             format!(
                 "darkmux could not read this machine's free memory, so it cannot tell whether the model's {:.1} GiB \
                  fits; it starts nothing it cannot account for",
@@ -1193,7 +1196,7 @@ pub(crate) fn short_of_memory(need: u64, free: u64, held: &[String], reserved: u
     }
     if holders.is_empty() {
         return refuse(
-            "memory_in_use",
+            ClientCode::MemoryInUse,
             format!("{short}; programs darkmux did not start hold the rest, so retry once they free it"),
         );
     }
@@ -1246,7 +1249,7 @@ pub(crate) fn evict(resident: &Resident, dirs: &Dirs, bounds: server::Bounds, ma
             }
             machine
                 .lmstudio_unload(id)
-                .map_err(|e| refuse("model_start_failed", format!("could not unload `{id}` to make room: {e:#}")))?;
+                .map_err(|e| refuse(ClientCode::ModelStartFailed, format!("could not unload `{id}` to make room: {e:#}")))?;
             Ok(true)
         }
     }
