@@ -108,6 +108,7 @@ use darkmux_gestalt::{
     WaveMode, WaveSchedule,
 };
 use darkmux_profiles::gestalt_host::resolved_load_deadline;
+use darkmux_types::client_code::ClientCode;
 use darkmux_types::residency_lease;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1189,7 +1190,7 @@ impl WaveLoad<'_> {
     fn reserve(&self, plan: &Plan, facts: &Facts, pricing: &crate::lms_room::LoadPricing<'_>) -> Result<Option<Starting>> {
         let Some(need) = darkmux_gestalt::plan_room(plan, facts, &pricing.commitment()) else { return Ok(None) };
         let reserved = darkmux_types::residency_reservation::Reserved::begin(need.need_bytes).map_err(|e| {
-            wave_error(Some("model_start_failed"), format!("could not record this wave's reservation ({e:#}); check that darkmux's home is writable"))
+            wave_error(Some(ClientCode::ModelStartFailed), format!("could not record this wave's reservation ({e:#}); check that darkmux's home is writable"))
         })?;
         Ok(Some(Starting { reserved, workers_before: (self.room.workers)() }))
     }
@@ -1212,7 +1213,7 @@ impl WaveLoad<'_> {
             return Ok(Ok(None));
         }
         let unlocked = |e: anyhow::Error| {
-            wave_error(Some("model_start_failed"), format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
+            wave_error(Some(ClientCode::ModelStartFailed), format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
         };
         if let Some(lock) = darkmux_types::residency_lock::try_acquire().map_err(unlocked)? {
             return Ok(Ok(Some(lock)));
@@ -1290,7 +1291,7 @@ fn settle_attempt(outcome: PlanExecOutcome, attempt: u32, pinned: &[String], com
                 "could not load for this wave after {attempt} attempt(s): \"{identifier}\" was to be unloaded, but {why}{}",
                 partial_execution_note(committed)
             );
-            Err(wave_error(Some("busy"), message))
+            Err(wave_error(Some(ClientCode::Busy), message))
         }
         PlanExecOutcome::HostFailed { detail, host_error } => settle_host_failed(&detail, &host_error, attempt, pinned, committed),
     }
@@ -1337,12 +1338,12 @@ fn settle_host_failed(detail: &str, host_error: &HostError, attempt: u32, pinned
              retry once the other command frees its model{}",
             partial_execution_note(committed)
         );
-        return Err(wave_error(Some("busy"), message));
+        return Err(wave_error(Some(ClientCode::Busy), message));
     }
     let (code, why) = if insufficient {
-        ("memory_in_use", "no concurrent darkmux command has this RAM pinned: memory something other than darkmux holds")
+        (ClientCode::MemoryInUse, "no concurrent darkmux command has this RAM pinned: memory something other than darkmux holds")
     } else {
-        ("model_start_failed", "the load failed")
+        (ClientCode::ModelStartFailed, "the load failed")
     };
     Err(wave_error(Some(code), format!("could not load for this wave: {detail} ({why}){}", partial_execution_note(committed))))
 }
@@ -1363,7 +1364,7 @@ fn wave_failure(e: &anyhow::Error, model_key: &str) -> anyhow::Error {
 fn never_fits(model_key: &str, reason: &Reason) -> anyhow::Error {
     let text = format!("darkmux: \"{model_key}\" never fits a co-residency wave — {reason}");
     match block_code(reason) {
-        Some(code) => crate::engine_dispatch::RefusedRun { code, text: format!("{text} [{code}]") }.into(),
+        Some(code) => crate::engine_dispatch::RefusedRun { code: code.as_str(), text: format!("{text} [{}]", code.as_str()) }.into(),
         None => anyhow!(text),
     }
 }
@@ -1375,21 +1376,21 @@ fn never_fits(model_key: &str, reason: &Reason) -> anyhow::Error {
 /// Studio does not have
 /// (`engine_unavailable`). A same-plan collision is a staffing error, with
 /// no code.
-fn block_code(reason: &Reason) -> Option<&'static str> {
+fn block_code(reason: &Reason) -> Option<ClientCode> {
     match reason {
-        Reason::ClaimedResidentInsufficientCtx { clearable: true, .. } => Some("busy"),
-        Reason::ForeignDuplicateNoCapacity { .. } => Some("memory_in_use"),
-        Reason::BudgetRefuse { .. } => Some("wont_fit"),
+        Reason::ClaimedResidentInsufficientCtx { clearable: true, .. } => Some(ClientCode::Busy),
+        Reason::ForeignDuplicateNoCapacity { .. } => Some(ClientCode::MemoryInUse),
+        Reason::BudgetRefuse { .. } => Some(ClientCode::WontFit),
         // The utility binding frees when no dispatch needs it: retryable.
-        Reason::UtilityHeldResident { .. } => Some("busy"),
-        Reason::UnknownModelKey { .. } => Some("engine_unavailable"),
+        Reason::UtilityHeldResident { .. } => Some(ClientCode::Busy),
+        Reason::UnknownModelKey { .. } => Some(ClientCode::EngineUnavailable),
         _ => None,
     }
 }
 
 /// A wave's error: an `EngineRefusal` when it has a code, so
 /// `refusal_code` reads it as it reads the engine path's.
-fn wave_error(code: Option<&'static str>, message: String) -> anyhow::Error {
+fn wave_error(code: Option<ClientCode>, message: String) -> anyhow::Error {
     match code {
         Some(code) => anyhow::Error::new(crate::engine_dispatch::refuse(code, message)),
         None => anyhow!("darkmux: {message}"),

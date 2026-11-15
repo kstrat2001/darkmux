@@ -910,7 +910,8 @@ fn profile_list_names_each_defined_endpoint() {
 /// `startable`, a model on LM Studio while LM Studio does not answer is
 /// `unknown`, and an unmanaged endpoint is `external`. The registry is still
 /// printed as before. Fakes stand in for `lms` and `tensorfold-native`, and
-/// each logs its calls: the listing loads and starts nothing.
+/// each logs its calls: the listing loads and starts nothing. (#3574) A
+/// model the engine does not list is `unavailable` with its dispatch code.
 #[test]
 fn profile_list_json_reports_each_models_availability() {
     let tmp = TempDir::new().unwrap();
@@ -934,6 +935,7 @@ fn profile_list_json_reports_each_models_availability() {
          models) echo '{\"schema\":1,\"models\":[{\"repo\":\"TF/m\"}]}';;\n  *) exit 9;;\nesac\n",
     );
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let port2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let p = tmp.path().join("profiles.json");
     fs::write(
         &p,
@@ -941,8 +943,10 @@ fn profile_list_json_reports_each_models_availability() {
             r#"{{"profiles":{{
                 "a-lms":{{"models":[{{"id":"qwen","n_ctx":8192}}]}},
                 "b-tf":{{"models":[{{"id":"TF/m","n_ctx":8192,"endpoint":"tf"}}]}},
-                "c-api":{{"models":[{{"id":"gpt","endpoint":"api"}}]}}
-            }},"endpoints":{{"tf":{{"managed":"tensorfold","port":{port}}},"api":{{"url":"https://h.example/v1"}}}}}}"#
+                "c-api":{{"models":[{{"id":"gpt","endpoint":"api"}}]}},
+                "d-tf":{{"models":[{{"id":"TF/other","n_ctx":8192,"endpoint":"tf2"}}]}}
+            }},"endpoints":{{"tf":{{"managed":"tensorfold","port":{port}}},"tf2":{{"managed":"tensorfold","port":{port2}}},
+                "api":{{"url":"https://h.example/v1"}}}}}}"#
         ),
     )
     .unwrap();
@@ -966,6 +970,11 @@ fn profile_list_json_reports_each_models_availability() {
     assert_eq!(row("b-tf")["model"], "TF/m");
     assert_eq!(row("c-api")["state"], "external", "{v}");
     assert_eq!(row("c-api")["engine"], serde_json::Value::Null);
+    // (#3574) An `unavailable` carries its dispatch code; no other state does.
+    assert_eq!((row("d-tf")["state"].as_str(), row("d-tf")["code"].as_str()), (Some("unavailable"), Some("model_start_failed")), "{v}");
+    for profile in ["a-lms", "b-tf", "c-api"] {
+        assert!(row(profile).get("code").is_none(), "{profile}: {v}");
+    }
     let log = fs::read_to_string(&calls).unwrap();
     for line in log.lines() {
         let read_only = ["lms ps", "lms ls", "lms --version", "tensorfold-native --version", "tensorfold-native capabilities", "tensorfold-native models"];
@@ -2150,7 +2159,7 @@ fn machine_list_builds_this_machines_row_from_a_local_card_and_never_dials_its_a
     assert_eq!(row["is_this_machine"], true);
     assert_eq!(row["liveness"], "live");
     assert_eq!(row["card"]["state"], "available", "{row}");
-    assert_eq!(row["card"]["card"]["card_schema_version"], "1.4");
+    assert_eq!(row["card"]["card"]["card_schema_version"], "1.5");
     assert_eq!(v["cache_ttl_ms"], 0, "the CLI's gather is not cached");
 }
 
@@ -16112,6 +16121,58 @@ fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed
     );
     assert_eq!(config(), operator);
     assert!(!home.join("client-remote").join(format!("{port}.json")).exists(), "no record left");
+}
+
+/// (#3560) A signal that arrives while `client serve` is still starting
+/// (here, while `tailscale serve` is publishing its entry, held open by the
+/// fake) runs the normal stop once the start is done: exit 0, the entry
+/// removed, its record gone. The handlers are in place before `client
+/// serve` prints, reaps or publishes anything, so no point after its start
+/// is one where a signal kills it with its entry left up.
+#[test]
+fn a_signal_while_client_serve_is_starting_still_runs_its_cleanup() {
+    let tmp = TempDir::new().unwrap();
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let home = tmp.path().join("darkmux-home");
+    fs::create_dir_all(&home).unwrap();
+    let fake = fake_tailnet_tool(&tmp.path().join("fake"), &home, port);
+    fs::write(fake.join("hold_publish"), "").unwrap();
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let mut cmd = darkmux_std_cmd();
+    let path = cmd.get_envs().find(|(k, _)| *k == "PATH").and_then(|(_, v)| v).unwrap().to_owned();
+    let mut with_fake = std::ffi::OsString::from(fake.as_os_str());
+    with_fake.push(":");
+    with_fake.push(path);
+    cmd.args(["client", "serve", "--port", &port.to_string()])
+        .env("PATH", with_fake)
+        .env("DARKMUX_HOME", &home)
+        .env("DARKMUX_CLIENTS_REMOTE", "tailscale")
+        .stdout(std::process::Stdio::null())
+        .stderr(log.reopen().unwrap());
+    let mut child = DirectChildGuard(cmd.spawn().expect("spawning darkmux client serve"));
+    let said = || fs::read_to_string(log.path()).unwrap_or_default();
+    let deadline = std::time::Instant::now() + FLEET_TEST_HANG_BOUND;
+    while !fake.join("publishing").exists() {
+        assert!(child.try_wait().unwrap().is_none(), "client serve exited early: {}", said());
+        assert!(std::time::Instant::now() < deadline, "client serve never published: {}", said());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // SAFETY: signalling the child this test spawned.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    // Give a signal with no handler time to take its default action.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    fs::remove_file(fake.join("hold_publish")).unwrap();
+    let (_, status) = exits_within(&mut child, std::time::Duration::from_secs(20)).expect("client serve exits");
+    assert_eq!(status.code(), Some(0), "killed by the signal instead of stopping: {status:?}\n{}", said());
+    assert!(said().contains("stopping (SIGTERM)"), "{}", said());
+    assert!(said().contains(&format!("removed its tailnet entry (https://studio.example.ts.net:{port}/)")), "{}", said());
+    let operator: serde_json::Value = serde_json::from_str(FAKE_TAILNET_OPERATOR).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&fs::read_to_string(fake.join("serve.json")).unwrap()).unwrap();
+    assert_eq!(config, operator, "its entry is gone");
+    assert!(!home.join("client-remote").join(format!("{port}.json")).exists(), "and its record");
 }
 
 /// Spawns `client serve` on an isolated HOME and its own port; returns the

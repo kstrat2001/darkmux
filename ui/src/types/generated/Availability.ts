@@ -5,4 +5,17 @@ import type { AvailabilityState } from "./AvailabilityState";
  * A model's availability and, for every state but `resident`, `startable`
  * and `external`, a one-line reason.
  */
-export type Availability = { state: AvailabilityState, reason: string | null, };
+export type Availability = { state: AvailabilityState, reason: string | null, 
+/**
+ * (#3574) Why, for an app to branch on: the code a dispatch refusing
+ * for the same reason carries (`dispatch.error`'s `payload.code`, the
+ * client API's `ClientCode` spelling), so there is one vocabulary:
+ * `engine_in_use` while rec's own server runs, `engine_unavailable`,
+ * `port_in_use`, `model_start_failed`.
+ * Absent when no dispatch refusal fits (a registry problem a dispatch
+ * refuses before any engine is asked, a state that is not
+ * `unavailable`). Additive (card schema 1.5): an older reader ignores
+ * it, and a code a newer darkmux sends that this one does not know is
+ * kept as its text.
+ */
+code?: string, };

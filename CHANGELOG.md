@@ -16,11 +16,23 @@ darkmux release.
 
 ### Added
 
+- **A model's availability says why by code (#3574).** An `unavailable` availability in
+  `GET /client/profiles`, `darkmux profile list --json` and the machine card (card schema 1.5) now
+  carries an optional `code`, the one a dispatch refusing for the same reason carries:
+  `engine_in_use` while rec's own server runs, `engine_unavailable` (an unverified or missing engine, a
+  rec install darkmux cannot read, a model LM Studio has not downloaded), `model_start_failed`
+  (`engine_args` the engine does not take, a model Tensorfold does not list) and `port_in_use`. An app
+  branches on the code instead of the wording. It is absent when no dispatch refusal fits (a registry
+  problem, a refused user file, any state but `unavailable`). Additive: a 1.4 card reader ignores it,
+  and a code this darkmux does not know reads back as its text. `GET /client/whoami` lists the new
+  capability `availability_codes`, so an app tells a darkmux that predates codes from one where no code
+  fits. A dispatch refusal and a listing now spell every code through the one `ClientCode` enum. rec's
+  own server is still never stopped or used by darkmux.
 - **A paired app can ask what this darkmux's client API can do (#3494).** `GET /client/whoami` now
   carries `version` (darkmux's version, for display and diagnostics) and `capabilities`, every
   capability this build has, in a fixed order: `clean_preview`, `template_workspace`, `continues`,
   `clone_preview`, `recipe_set`, `workspace_image`, `workspace_edit`, `workspace_remove` (and, with
-  #3560 below, `remote_tailscale` and `remote_requests`). An app gates
+  #3560 below, `remote_tailscale` and `remote_requests`, and with #3574 above, `availability_codes`). An app gates
   a feature on its capability, never on the version or on how a handler happens to answer. A darkmux
   that lists capabilities supports exactly those; one with no `capabilities` field is 5.10 (which has
   `clean_preview`, `template_workspace`, `continues`, `workspace_edit`, `workspace_remove`) or 5.11

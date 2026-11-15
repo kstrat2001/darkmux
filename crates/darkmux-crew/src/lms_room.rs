@@ -62,6 +62,7 @@ use darkmux_gestalt::{
 };
 use darkmux_profiles::engine::server::{self, Dirs};
 use darkmux_profiles::model_ledger::{LoadFigures, LoadPricer};
+use darkmux_types::client_code::ClientCode;
 use darkmux_types::residency_lease::LeaseGuard;
 use darkmux_types::residency_reservation::Reserved;
 
@@ -346,7 +347,7 @@ fn room_for_loads(
     // waiting can never help.
     if let Some((c, total)) = commitment.zip(room.machine.capacity()).filter(|(c, t)| c.need_bytes > *t) {
         return Err(refuse(
-            "wont_fit",
+            ClientCode::WontFit,
             format!("the model needs {:.1} GiB and this machine has {:.1} GiB in all", gib(c.need_bytes), gib(total)),
         ));
     }
@@ -592,7 +593,7 @@ pub(crate) fn settle_load(
 pub(crate) fn unload_unless_held(gate: &dyn Preflight, identifier: &str, unload: &dyn Fn(&str) -> anyhow::Result<()>) -> anyhow::Result<()> {
     if gate.held_by_others().iter().any(|h| h == identifier) {
         return Err(refuse(
-            "busy",
+            ClientCode::Busy,
             format!("`{identifier}` is serving a running dispatch at its own context, so it is not reloaded under it; retry when it finishes"),
         )
         .into());
@@ -702,7 +703,7 @@ pub(crate) fn cut_for_pressure(
         }
     }
     let names = identifiers.iter().map(|id| format!("`{id}`")).collect::<Vec<_>>().join(", ");
-    refuse("memory_in_use", format!("this machine's memory pressure turned critical while {names} was loading ({reading}), {}", cut_note(&kept, &left)))
+    refuse(ClientCode::MemoryInUse, format!("this machine's memory pressure turned critical while {names} was loading ({reading}), {}", cut_note(&kept, &left)))
 }
 
 /// What [`cut_for_pressure`] did, for its refusal.
@@ -731,7 +732,7 @@ fn reserve_preflight(
     n_ctx: u32,
 ) -> anyhow::Result<(LeaseGuard, Option<Reserved>, Option<u64>)> {
     let _lock = gate.lock().map_err(|e| {
-        refuse("model_start_failed", format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
+        refuse(ClientCode::ModelStartFailed, format!("could not take darkmux's residency lock ({e:#}); check that darkmux's home is writable"))
     })?;
     let lease = LeaseGuard::acquire();
     let want = Placement { model_key: model_key.into(), identifier: identifier.into(), min_ctx: n_ctx, seat: String::new() };

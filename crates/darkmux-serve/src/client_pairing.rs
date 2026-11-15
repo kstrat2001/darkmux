@@ -1501,6 +1501,11 @@ pub fn run(port: u16) -> Result<()> {
         .enable_all()
         .build()?;
     let served = rt.block_on(async move {
+        // The stop's signal handlers first, before anything is printed,
+        // reaped or published: a signal from here on waits for the start
+        // to finish and then runs the normal stop and its cleanup, never
+        // the default action that would leave a tailnet entry up.
+        let mut signals = ShutdownSignals::install();
         let listener = bind_listener(port)
             .await
             .with_context(|| format!("binding {}", bind_addr(port)))?;
@@ -1548,7 +1553,7 @@ pub fn run(port: u16) -> Result<()> {
         let (previews, works) = (state.previews.clone(), state.works.clone());
         let stopped_at = Arc::new(std::sync::OnceLock::new());
         let (stopping, cancel_from, stop_began) = (previews.clone(), works.clone(), stopped_at.clone());
-        let served = serve_until_stopped(listener, router(state), move || {
+        let served = serve_until_stopped(listener, router(state), &mut signals, move || {
             let _ = stop_began.set(begin_stop(&stopping, &cancel_from));
         })
         .await;
@@ -1772,6 +1777,7 @@ const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 async fn serve_until_stopped(
     listener: tokio::net::TcpListener,
     app: Router,
+    signals: &mut ShutdownSignals,
     on_stop: impl FnOnce(),
 ) -> Result<()> {
     let stop = Arc::new(tokio::sync::Notify::new());
@@ -1781,7 +1787,7 @@ async fn serve_until_stopped(
     let mut serving = tokio::spawn(std::future::IntoFuture::into_future(server));
     let ended = tokio::select! {
         ended = &mut serving => Some(ended),
-        signal = shutdown_signal() => {
+        signal = signals.next() => {
             eprintln!("darkmux client serve: stopping ({signal})");
             None
         }
@@ -1803,7 +1809,7 @@ async fn serve_until_stopped(
                     serving.abort();
                     Ok(Ok(()))
                 }
-                signal = shutdown_signal() => {
+                signal = signals.next() => {
                     eprintln!("darkmux client serve: {signal} again; no longer waiting for open connections");
                     serving.abort();
                     Ok(Ok(()))
@@ -1814,33 +1820,65 @@ async fn serve_until_stopped(
     ended.context("the server task")?.context("serving")
 }
 
-/// The first of SIGINT (Ctrl-C), SIGTERM (launchd stopping the job, a
-/// plain `kill`) and SIGHUP (its terminal closed), by name. Caught through
-/// `tokio::signal` like the viewer daemon's own shutdown, so each reaches
-/// the cleanup after the server stops instead of ending the process where
-/// it stands.
-async fn shutdown_signal() -> &'static str {
+/// SIGINT (Ctrl-C), SIGTERM (launchd stopping the job, a plain `kill`) and
+/// SIGHUP (its terminal closed), caught through `tokio::signal` like the
+/// viewer daemon's own shutdown, so each reaches the cleanup after the
+/// server stops instead of ending the process where it stands. Installed
+/// once, at the start of `run` ([`ShutdownSignals::install`]): from then on
+/// the default action never runs, and a signal that arrives before
+/// [`ShutdownSignals::next`] is first awaited is kept until it is.
+struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let wait = |kind: SignalKind| async move {
-            match signal(kind) {
-                Ok(mut s) => {
-                    s.recv().await;
-                }
-                Err(_) => std::future::pending::<()>().await,
+    streams: [(Option<tokio::signal::unix::Signal>, &'static str); 3],
+}
+
+impl ShutdownSignals {
+    /// Registers the handlers now (inside the runtime). One that cannot be
+    /// registered is never waited for.
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let on = |kind: SignalKind, name| (signal(kind).ok(), name);
+            ShutdownSignals {
+                streams: [
+                    on(SignalKind::interrupt(), "SIGINT"),
+                    on(SignalKind::terminate(), "SIGTERM"),
+                    on(SignalKind::hangup(), "SIGHUP"),
+                ],
             }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => "SIGINT",
-            _ = wait(SignalKind::terminate()) => "SIGTERM",
-            _ = wait(SignalKind::hangup()) => "SIGHUP",
+        }
+        #[cfg(not(unix))]
+        ShutdownSignals {}
+    }
+
+    /// The next of them to arrive, by name.
+    async fn next(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            let [(int, a), (term, b), (hup, c)] = &mut self.streams;
+            tokio::select! {
+                _ = recv(int) => *a,
+                _ = recv(term) => *b,
+                _ = recv(hup) => *c,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "Ctrl-C"
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        "Ctrl-C"
+}
+
+/// One signal from `stream`; never, when it could not be registered.
+#[cfg(unix)]
+async fn recv(stream: &mut Option<tokio::signal::unix::Signal>) {
+    match stream {
+        Some(s) => {
+            s.recv().await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 

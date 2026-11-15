@@ -27,13 +27,16 @@ Switches, each a file beside it: `refuse` (every change fails), `record_path`
 (holds a path that must exist before a publish), `publish_as.json` (the
 handler a publish stores instead of `{"Proxy": <target>}`),
 `break_on_publish` (a publish leaves `serve.json` unreadable and fails),
-`status_fails` (`serve status` fails), and `race_mount.json` (handlers
+`status_fails` (`serve status` fails), `race_mount.json` (handlers
 merged into `<host>:<port>` just before a removal: an operator's mount
-added between darkmux's read and its remove).
+added between darkmux's read and its remove), and `hold_publish` (a publish
+writes `publishing` beside it, then waits, at most 20 s, until
+`hold_publish` is gone: a test can act while a publish is in flight).
 """
 import json
 import os
 import sys
+import time
 
 D = os.path.dirname(os.path.abspath(__file__))
 
@@ -123,6 +126,11 @@ if rest == ["off"]:
 if flags.get("bg") is True and len(rest) == 1:
     if has("record_path") and not os.path.exists(open(path("record_path")).read().strip()):
         fail("fake tailscale: published before darkmux recorded it", 3)
+    if has("hold_publish"):
+        open(path("publishing"), "w").close()
+        deadline = time.time() + 20
+        while has("hold_publish") and time.time() < deadline:
+            time.sleep(0.05)
     if has("break_on_publish"):
         with open(path("serve.json"), "w") as f:
             f.write("not json")

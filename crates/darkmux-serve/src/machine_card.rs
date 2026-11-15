@@ -74,7 +74,12 @@ use std::time::Duration;
 /// has answered yet, and `specs.engine_servers` lists the servers darkmux
 /// started that are running now (Tensorfold, rec's Flint), darkmux's own
 /// residents beside `specs.loaded_models`. A 1.3 reader ignores both.
-pub const CARD_SCHEMA_VERSION: &str = "1.4";
+///
+/// 1.5 (#3574): additive. An `availability` may carry a `code`, the code a
+/// dispatch refusing for the same reason carries (`engine_in_use` while
+/// rec's own server runs, `engine_unavailable`, `port_in_use`,
+/// `model_start_failed`), absent when none fits. A 1.4 reader ignores it.
+pub const CARD_SCHEMA_VERSION: &str = "1.5";
 
 /// What darkmux does at an endpoint (darkmux's own action, never a location
 /// or a cost), for a model, and for a profile as the sum of its models.
@@ -1162,7 +1167,7 @@ pub(crate) mod tests {
     }
 
     fn listing_of(state: AvailabilityState) -> impl Fn(&[ProfileModel]) -> Vec<Availability> + Send + Sync + 'static {
-        move |models: &[ProfileModel]| models.iter().map(|_| Availability { state, reason: None }).collect()
+        move |models: &[ProfileModel]| models.iter().map(|_| Availability { state, reason: None, code: None }).collect()
     }
 
     /// The promise: the card never waits on a listing. Inside the TTL the
@@ -1358,12 +1363,24 @@ pub(crate) mod tests {
                     description: Some("the big local model".into()),
                     is_default: true,
                     endpoint_kind: CardEndpointKind::Managed,
-                    models: vec![CardModel {
-                        id: "qwen".into(),
-                        n_ctx: Some(65536),
-                        endpoint_kind: CardEndpointKind::Managed,
-                        availability: Some(Availability::resident()),
-                    }],
+                    models: vec![
+                        CardModel {
+                            id: "qwen".into(),
+                            n_ctx: Some(65536),
+                            endpoint_kind: CardEndpointKind::Managed,
+                            availability: Some(Availability::resident()),
+                        },
+                        // (1.5) An `unavailable` carries its dispatch code.
+                        CardModel {
+                            id: "flint-int4".into(),
+                            n_ctx: Some(262_144),
+                            endpoint_kind: CardEndpointKind::Managed,
+                            availability: Some(Availability::refused(
+                                darkmux_types::client_code::ClientCode::EngineInUse,
+                                "rec's own server is up",
+                            )),
+                        },
+                    ],
                 },
                 CardProfile {
                     name: "cloud".into(),
