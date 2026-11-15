@@ -17,6 +17,25 @@ pub enum ClientCode {
     // ── The request itself ──
     /// Not from an app on this machine (a proxy, another host, a web page).
     NotLocal,
+    /// (#3560) Not from an app on this machine, and not through the tailnet
+    /// entry this `client serve` published either (another proxy, or a
+    /// `Host` other than the entry's name and port). Only answered while
+    /// the entry is up (`whoami.remote.state` `available`); otherwise such a
+    /// request is `not_local`.
+    NotForwarded,
+    /// (#3560) Through the tailnet entry with a valid token, but the token's
+    /// pairing recorded no tailnet identity (it was paired on the Mac): the
+    /// device must pair over the tailnet. The token still works on the Mac.
+    NotPairedRemotely,
+    /// (#3560) Through the tailnet entry with a valid token, but Tailscale
+    /// named no tailnet user for the request (a tagged device, or Funnel).
+    RemoteIdentityMissing,
+    /// (#3560) Through the tailnet entry with a valid token, from a tailnet
+    /// user other than the one the device paired as.
+    RemoteIdentityMismatch,
+    /// (#3560) A pairing route (`POST /client/pair`, its poll) through the
+    /// tailnet entry: pairing over the tailnet is not in this darkmux yet.
+    RemotePairingUnavailable,
     UnsupportedMediaType,
     BadRequest,
     PayloadTooLarge,
@@ -166,6 +185,11 @@ mod tests {
             (NoOwnBranch, "no_own_branch"),
             (BranchFailed, "branch_failed"),
             (UnsavedCommits, "unsaved_commits"),
+            (NotForwarded, "not_forwarded"),
+            (NotPairedRemotely, "not_paired_remotely"),
+            (RemoteIdentityMissing, "remote_identity_missing"),
+            (RemoteIdentityMismatch, "remote_identity_mismatch"),
+            (RemotePairingUnavailable, "remote_pairing_unavailable"),
         ] {
             assert_eq!(wire(c), s);
             assert_eq!(

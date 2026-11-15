@@ -114,7 +114,7 @@ fn ours() -> ServeEntry {
 fn off_never_runs_the_tool() {
     let f = Fake::new(RUNNING, OPERATOR);
     let s = start(ClientsRemote::Off, PORT, &f.rig());
-    assert_eq!(s, Started { wire: ClientRemote::off(), owned: None, log: vec![] });
+    assert_eq!(s, Started { wire: ClientRemote::off(), serving: None, owned: None, log: vec![] });
     assert!(f.calls().is_empty(), "{:?}", f.calls());
 }
 
@@ -190,7 +190,8 @@ fn on_publishes_then_stop_removes_only_its_own_entry() {
     let s = start(ClientsRemote::Tailscale, PORT, &f.rig());
     assert_eq!(s.wire, ClientRemote::available("https://studio.example.ts.net:8767/".into()), "{s:?}");
     assert_eq!(s.owned, Some(ours()));
-    assert!(s.log.iter().any(|l| l.contains("on the tailnet at https://studio.example.ts.net:8767/") && l.contains("refused")), "{:?}", s.log);
+    assert_eq!(s.serving, Some(ours()), "requests arrive through it");
+    assert!(s.log.iter().any(|l| l.contains("on the tailnet at https://studio.example.ts.net:8767/") && l.contains("token")), "{:?}", s.log);
     assert_eq!(f.record(), Some(PublishedRecord { entry: ours(), pid: 4242 }));
     assert_eq!(f.changes(), ["serve --bg --https=8767 http://127.0.0.1:8767"]);
     assert_eq!(f.calls()[..2], ["version".to_string(), "status --json".to_string()], "read-only calls first");
@@ -214,6 +215,7 @@ fn on_but_unusable_serves_locally_with_one_reason() {
         let f = Fake::new(status, OPERATOR);
         let s = start(ClientsRemote::Tailscale, PORT, &f.rig());
         assert_eq!(s.wire.state, crate::client_wire::RemoteState::Unavailable, "{why}: {s:?}");
+        assert_eq!(s.serving, None, "{why}: nothing to arrive through");
         let reason = s.wire.reason.clone().unwrap();
         assert!(reason.contains(why) && reason.contains('('), "{why}: the reason names the fix: {reason}");
         assert_eq!(s.owned, None);
@@ -237,6 +239,7 @@ fn an_operators_entry_on_the_port_is_left_alone() {
     let f = Fake::new(RUNNING, &theirs);
     let s = start(ClientsRemote::Tailscale, PORT, &f.rig());
     assert!(s.wire.reason.as_deref().is_some_and(|r| r.contains("already served by another tailnet entry")), "{s:?}");
+    assert_eq!(s.serving, None, "requests through the operator's entry are not darkmux's");
     assert!(f.changes().is_empty(), "{:?}", f.calls());
     assert_eq!(f.serve(), serde_json::from_str::<serde_json::Value>(&theirs).unwrap());
     assert_eq!(f.record(), None);
@@ -249,6 +252,7 @@ fn an_identical_entry_with_no_record_is_used_but_never_removed() {
     let f = Fake::new(RUNNING, &with_ours());
     let s = start(ClientsRemote::Tailscale, PORT, &f.rig());
     assert_eq!(s.wire, ClientRemote::available(ours().url()));
+    assert_eq!(s.serving, Some(ours()), "requests arrive through it");
     assert_eq!(s.owned, None, "not darkmux's to remove");
     assert!(f.changes().is_empty() && f.record().is_none(), "{:?}", f.calls());
 }

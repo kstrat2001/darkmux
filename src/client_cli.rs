@@ -584,6 +584,7 @@ mod tests {
                         created: 1,
                         token_hash: "00".repeat(32),
                         auto_approved: None,
+                        tailnet: None,
                     });
                 }
                 Ok(())
@@ -643,6 +644,7 @@ mod tests {
             created: 1,
             token_hash: "00".into(),
             auto_approved: auto.then(|| cp::SigningIdentity { team: "5LDXYW8B6T".into(), bundle: "com.darklyenergized.darkmuxapp".into() }),
+            tailnet: None,
         };
         let row = auto_approved_row(Ok(vec![client("mux-bot", true), client("phone", false)]));
         assert!(row.message.contains("mux-bot (signed by 5LDXYW8B6T/com.darklyenergized.darkmuxapp)"), "{}", row.message);

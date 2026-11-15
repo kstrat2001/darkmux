@@ -20,7 +20,7 @@ darkmux release.
   carries `version` (darkmux's version, for display and diagnostics) and `capabilities`, every
   capability this build has, in a fixed order: `clean_preview`, `template_workspace`, `continues`,
   `clone_preview`, `recipe_set`, `workspace_image`, `workspace_edit`, `workspace_remove` (and, with
-  #3560 below, `remote_tailscale`). An app gates
+  #3560 below, `remote_tailscale` and `remote_requests`). An app gates
   a feature on its capability, never on the version or on how a handler happens to answer. A darkmux
   that lists capabilities supports exactly those; one with no `capabilities` field is 5.10 (which has
   `clean_preview`, `template_workspace`, `continues`, `workspace_edit`, `workspace_remove`) or 5.11
@@ -46,9 +46,27 @@ darkmux release.
   `client serve` still runs on this machine and logs one reason with the fix. `GET /client/whoami`
   gains `remote` (`{"state": "off" | "available" | "unavailable", "url", "reason"}`), the capability
   list gains `remote_tailscale`, and `darkmux doctor` gains a `client serve on the tailnet` row.
-  **Reach is not access:** a request that arrives through the tailnet URL is still refused like any
-  request not from this machine, until remote pairing and the tailnet request path ship in the next
-  parts. An older darkmux refuses a config carrying `clients.remote`.
+  An older darkmux refuses a config carrying `clients.remote`.
+- **A paired device is answered through the tailnet entry (#3560, second of four parts).** With
+  `clients.remote` `tailscale` and the entry up, a request `tailscale serve` forwards is accepted, with
+  the same scopes as an app on the Mac, when it carries a paired device's bearer token AND comes from
+  the tailnet user recorded for that token (`Tailscale-User-Login`, which Tailscale deletes from what a
+  device sends and sets itself). The token is the authority: any process on the Mac can send those
+  headers to loopback, so they are only ever a check on top of it, and a request with them but no
+  token, or the wrong one, is refused `unauthorized` as on the Mac. A request counts as through the
+  entry only when it comes from loopback with everything Tailscale 1.102.4 sets: a `Host` and an
+  `X-Forwarded-Host` naming the entry's MagicDNS name and port, `X-Forwarded-Proto: https`, one
+  `X-Forwarded-For` in the tailnet's ranges, and no header Tailscale does not set (another proxy's, or
+  Funnel's). New refusal codes, each with what to do: `not_forwarded` (neither from the Mac nor through
+  the entry, answered only while the entry is up; otherwise such a request is `not_local` as before),
+  `not_paired_remotely` (the token's pairing recorded no tailnet identity: every pairing made on the Mac;
+  that token still works on the Mac), `remote_identity_missing` (Tailscale named no user: a tagged
+  device), `remote_identity_mismatch`, and `remote_pairing_unavailable` (pairing and its poll are refused
+  through the entry until remote pairing ships). `GET /client/whoami` gains `via` (`local` or
+  `tailnet`), the capability list gains `remote_requests`, and `clients.json` moves to schema 1.3: a
+  client may carry `tailnet` (`{"login": ...}`), the identity it paired with. A 1.2 store is read as
+  1.3 and rewritten as 1.3, which a darkmux that reads 1.2 refuses as written by a newer darkmux.
+  Nothing records an identity yet: pairing over the tailnet, which does, is the next part.
 - **`darkmux doctor` and `mission status` find `tailscale` where the fleet identity provider does
   (#3560).** The tailnet viewer URL used to run a bare `tailscale` from `PATH`; it now looks on `PATH`
   and then at the known install locations (on macOS `/usr/local/bin/tailscale`,
