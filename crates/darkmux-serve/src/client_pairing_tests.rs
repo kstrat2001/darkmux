@@ -8863,26 +8863,41 @@ async fn every_route_refuses_a_body_past_64_kb_before_its_handler() {
 }
 
 /// (#3494 review) What the table declares about a route's token is what its
-/// handler does: a token route refuses a request without one with the coded
-/// 401, the pairing request needs none, and the pairing poll answers a
-/// request without its `X-Pair-Secret` as an unknown one (404).
+/// handler does. Without a token: a token route is the coded 401; the
+/// pairing request (open) goes on to read its body, so an empty object is
+/// its `bad_request` for the missing fields; the pairing poll, asked about
+/// a real pending request, is an unknown one (404) without its
+/// `X-Pair-Secret` or with another, and answers (200) with it.
 #[tokio::test]
 async fn every_route_is_open_or_not_as_the_table_declares() {
     use crate::routes::ClientAuth;
     let h = harness();
     let _ = paired(&h).await;
     for r in crate::routes::client_table() {
-        let path = r.path.replace(":name", "site").replace(":work_id", "w-0").replace(":request_id", "r-0");
-        let (code, v) = call(&h, raw(r.method, &path, None, Body::from("{}"))).await;
-        let at = format!("{} {}: {code} {v}", r.method, r.path);
+        let path = r.path.replace(":name", "site").replace(":work_id", "w-0");
         match r.auth {
-            ClientAuth::Bearer => assert_eq!((code, v["code"].as_str()), (401, Some("unauthorized")), "{at}"),
-            ClientAuth::Open => assert_ne!(code, 401, "{at}"),
-            ClientAuth::PairSecret => assert_eq!((code, v["code"].as_str()), (404, Some("not_found")), "{at}"),
+            ClientAuth::Bearer => {
+                let (code, v) = call(&h, raw(r.method, &path, None, Body::from("{}"))).await;
+                assert_eq!((code, v["code"].as_str()), (401, Some("unauthorized")), "{} {}: {v}", r.method, r.path);
+            }
+            ClientAuth::Open => {
+                let (code, v) = call(&h, raw(r.method, &path, None, Body::from("{}"))).await;
+                let refused = (code, v["code"].as_str(), v["error"].as_str().unwrap_or_default().starts_with("bad JSON body"));
+                assert_eq!(refused, (400, Some("bad_request"), true), "{} {}: {v}", r.method, r.path);
+            }
+            ClientAuth::PairSecret => {
+                let pending = path.replace(":request_id", &request_pairing(&h).await);
+                for (secret, want) in [(None, 404), (Some("not-the-secret"), 404), (Some(SECRET), 200)] {
+                    let mut req = raw(r.method, &pending, None, Body::empty());
+                    if let Some(s) = secret {
+                        req.headers_mut().insert("x-pair-secret", s.parse().unwrap());
+                    }
+                    let (code, v) = call(&h, req).await;
+                    assert_eq!(code, want, "{} {} with secret {secret:?}: {v}", r.method, r.path);
+                }
+            }
         }
     }
-    let id = request_pairing(&h).await;
-    assert_eq!(poll(&h, &id, SECRET).await.0, 200, "with its secret the poll answers");
 }
 
 /// (#3494 review) The table's request bodies are the ones the handlers
