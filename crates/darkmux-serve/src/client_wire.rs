@@ -7,7 +7,9 @@
 //! does not exist), and `route-table.golden` pins every route and every
 //! field below, read from the type's JSON schema. A handler builds no `json!`
 //! object by hand. The viewer imports none of these, so no TypeScript twin is
-//! generated for them; the golden is their only record.
+//! generated for them; the goldens are their record: `route-table.golden`,
+//! and (#3494) `client-openapi.golden.json`, the OpenAPI document an app
+//! reads at `GET /client/openapi.json`.
 //!
 //! Fields the producer could not read are `null`; an optional field marked
 //! `skip_serializing_if` is absent instead.
@@ -92,6 +94,12 @@ pub struct Whoami {
     /// declaration order. None listed (an older darkmux): none of them.
     pub capabilities: Vec<darkmux_types::client_capability::ClientCapability>,
 }
+
+/// (#3494) `GET /client/openapi.json`: this API's OpenAPI 3.1 document,
+/// built from the route table (`client_openapi`).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct ClientOpenApi(pub serde_json::Value);
 
 /// `GET /client/profiles`.
 #[derive(Debug, Clone, Serialize, JsonSchema)]

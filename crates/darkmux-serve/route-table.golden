@@ -34,6 +34,7 @@ GET /fleet/card  json ListenerCard (fleet listener, not the viewer daemon; the c
 POST /client/pair  json PairAccepted (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 GET /client/pair/:request_id  json PairPoll (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 GET /client/whoami  json Whoami (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
+GET /client/openapi.json  json ClientOpenApi (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 GET /client/profiles  json ClientProfiles (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 POST /client/work  json WorkAccepted (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
 GET /client/work/:work_id  json WorkState (client listener: 127.0.0.1, this machine's apps only; not the viewer daemon)
@@ -72,6 +73,7 @@ ClientError.code: ClientCode
 ClientError.error: string
 ClientMachine.id: string
 ClientMachine.name: string
+ClientOpenApi = any
 ClientProfileInfo.availability: Availability
 ClientProfileInfo.description?: string | null
 ClientProfileInfo.endpoint: string

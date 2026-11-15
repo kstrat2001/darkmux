@@ -1059,6 +1059,23 @@ async fn whoami_without_or_with_a_wrong_token_is_401() {
     assert_eq!(code, 401);
 }
 
+/// (#3494) The OpenAPI document is authenticated as `whoami` is, and is
+/// the document built from the route table, naming this build's version.
+#[tokio::test]
+async fn openapi_is_the_route_tables_document_behind_the_token() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(&h, get("/client/openapi.json", &[])).await;
+    assert_eq!(code, 401, "{v}");
+    assert_eq!(v["code"], "unauthorized");
+    let (code, _) = call(&h, get("/client/openapi.json", &[("authorization", &bearer(&"0".repeat(64)))])).await;
+    assert_eq!(code, 401);
+    let (code, doc) = call(&h, get("/client/openapi.json", &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 200, "{doc}");
+    assert_eq!(doc, crate::client_openapi::document(env!("CARGO_PKG_VERSION")));
+    assert_eq!(doc["info"]["version"], env!("CARGO_PKG_VERSION"));
+}
+
 #[tokio::test]
 async fn a_revoked_client_is_401_everywhere() {
     let h = harness();

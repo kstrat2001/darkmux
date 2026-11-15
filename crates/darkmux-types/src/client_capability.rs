@@ -59,7 +59,11 @@ mod tests {
     use super::*;
 
     fn wire(c: ClientCapability) -> String {
-        serde_json::to_value(c).unwrap().as_str().unwrap().to_string()
+        serde_json::to_value(c)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     /// One wire spelling each, in the order `whoami` lists them (#3494).
@@ -80,7 +84,8 @@ mod tests {
             ]
         );
         for c in ClientCapability::ALL {
-            let back: ClientCapability = serde_json::from_value(serde_json::json!(wire(c))).unwrap();
+            let back: ClientCapability =
+                serde_json::from_value(serde_json::json!(wire(c))).unwrap();
             assert_eq!(back, c, "{} reads back", wire(c));
         }
     }

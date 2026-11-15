@@ -14,6 +14,20 @@ darkmux release.
 
 ## [Unreleased]
 
+### Added
+
+- **A paired app can ask what this darkmux's client API can do (#3494).** `GET /client/whoami` now
+  carries `version` (darkmux's version, for display and diagnostics) and `capabilities`, every
+  capability this build has, in a fixed order: `clean_preview`, `template_workspace`, `continues`,
+  `clone_preview`, `recipe_set`, `workspace_image`, `workspace_edit`, `workspace_remove`. An app gates
+  a feature on its capability, never on the version or on how a handler happens to answer; a darkmux
+  that lists none (older than this release) has none of them. Additive: no field changed.
+- **The client API describes itself as OpenAPI 3.1 (#3494).** `GET /client/openapi.json`
+  (authenticated as `whoami` is) answers a document built from the client route table: every route's
+  path parameters, query, request body and reply, each from its type's JSON schema, and every refusal
+  as the one `ClientError` response. `crates/darkmux-serve/client-openapi.golden.json` pins it, so a
+  route, reply or body that changes shows in the diff.
+
 ## [5.11.0] - 2026-11-14
 
 **darkmux no longer needs Docker.** On a Mac it runs every sandbox in macOS's own (Seatbelt); on

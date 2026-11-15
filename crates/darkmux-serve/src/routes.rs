@@ -117,28 +117,65 @@ pub(crate) fn table() -> Vec<Route> {
 
 // ─── The client listener (`darkmux client serve`) ─────────────────────────
 
-/// One route of `darkmux client serve`: its method, path, response type and
-/// handler. The client listener is its own listener (127.0.0.1 only, behind
-/// its own gate, `client_pairing::only_this_machines_apps`), so this table is
-/// never mounted on the daemon; it is a table so its routes are declared in
-/// one place and pinned by the same golden.
+/// Adds a type's JSON schema to a generator's definitions and answers the
+/// schema that names it (a `$ref`), or, for a query, the type's own schema.
+pub(crate) type SchemaFn = fn(&mut schemars::SchemaGenerator) -> schemars::Schema;
+
+/// One route of `darkmux client serve`: its method, path, response type,
+/// request body and query, and handler. The client listener is its own
+/// listener (127.0.0.1 only, behind its own gate,
+/// `client_pairing::only_this_machines_apps`), so this table is never
+/// mounted on the daemon; it is a table so its routes are declared in one
+/// place and pinned by the same golden, and (#3494) so the API's OpenAPI
+/// document (`client_openapi`) is built from it, never by hand.
 pub(crate) struct ClientRoute {
-    /// Read by the golden (the router takes the method from `handler`).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Read by the golden and the OpenAPI document (the router takes the
+    /// method from `handler`).
     pub(crate) method: &'static str,
     pub(crate) path: &'static str,
     /// The JSON body a success answers with (read by the golden).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) reply: &'static str,
+    /// That body's schema.
+    pub(crate) reply_schema: SchemaFn,
+    /// The JSON body the route reads, if any.
+    pub(crate) body: Option<RequestBody>,
+    /// The query the route reads, if any: its type's own schema, one
+    /// parameter per property.
+    pub(crate) query: Option<SchemaFn>,
     handler: MethodRouter<crate::client_pairing::ClientServerState>,
 }
 
-/// A client route: the type is checked to exist, and named in the golden.
+/// The JSON body a client route reads.
+#[derive(Clone, Copy)]
+pub(crate) struct RequestBody {
+    pub(crate) schema: SchemaFn,
+    /// False for a body the route reads only when one is sent.
+    pub(crate) required: bool,
+}
+
+/// A client route: the reply type (and any body or query type) is checked
+/// to exist and to have a schema, and named in the goldens. A route that
+/// reads a JSON body names its type with `body = T` (`optional_body = T`
+/// when it may be absent), one that reads a query with `query = T`.
 macro_rules! client_json {
-    ($method:ident, $ty:ty, $path:expr, $handler:expr) => {{
-        let _: Option<$ty> = None;
-        ClientRoute { method: stringify!($method), path: $path, reply: stringify!($ty), handler: axum::routing::$method($handler) }
+    ($method:ident, $ty:ty, $path:expr, $handler:expr $(, $key:ident = $arg:ty)*) => {{
+        #[allow(unused_mut)]
+        let mut route = ClientRoute {
+            method: stringify!($method),
+            path: $path,
+            reply: stringify!($ty),
+            reply_schema: |g| g.subschema_for::<$ty>(),
+            body: None,
+            query: None,
+            handler: axum::routing::$method($handler),
+        };
+        $( client_json!(@ route, $key, $arg); )*
+        route
     }};
+    (@ $r:ident, body, $t:ty) => { $r.body = Some(RequestBody { schema: |g| g.subschema_for::<$t>(), required: true }) };
+    (@ $r:ident, optional_body, $t:ty) => { $r.body = Some(RequestBody { schema: |g| g.subschema_for::<$t>(), required: false }) };
+    (@ $r:ident, query, $t:ty) => { $r.query = Some(|g| <$t as schemars::JsonSchema>::json_schema(g)) };
 }
 
 /// Every route the client listener serves. Every refusal on any of them is
@@ -147,27 +184,28 @@ pub(crate) fn client_table() -> Vec<ClientRoute> {
     use crate::client_pairing::*;
     use crate::client_wire::*;
     vec![
-        client_json!(post, PairAccepted, "/client/pair", pair_handler),
+        client_json!(post, PairAccepted, "/client/pair", pair_handler, body = PairBody),
         client_json!(get, PairPoll, "/client/pair/:request_id", poll_handler),
         client_json!(get, Whoami, "/client/whoami", whoami_handler),
-        client_json!(get, ClientProfiles, "/client/profiles", profiles_handler),
-        client_json!(post, WorkAccepted, "/client/work", work_handler),
+        client_json!(get, ClientOpenApi, "/client/openapi.json", openapi_handler),
+        client_json!(get, ClientProfiles, "/client/profiles", profiles_handler, query = ProfilesQuery),
+        client_json!(post, WorkAccepted, "/client/work", work_handler, body = WorkBody),
         client_json!(get, WorkState, "/client/work/:work_id", work_status_handler),
         client_json!(post, StatusWord, "/client/work/:work_id/cancel", cancel_handler),
         client_json!(post, KeepReply, "/client/work/:work_id/keep", keep_handler),
         client_json!(post, DiscardReply, "/client/work/:work_id/discard", discard_handler),
         client_json!(post, UndoReply, "/client/work/:work_id/undo", undo_handler),
-        client_json!(get, RecipeReply, "/client/recipe", recipe_handler),
-        client_json!(post, WorkspaceInfo, "/client/workspaces", workspace_create_handler),
+        client_json!(get, RecipeReply, "/client/recipe", recipe_handler, query = RecipeQuery),
+        client_json!(post, WorkspaceInfo, "/client/workspaces", workspace_create_handler, body = WorkspaceBody),
         client_json!(get, WorkspaceInfo, "/client/workspaces/:name", workspace_status_handler),
-        client_json!(delete, WorkspaceRemoved, "/client/workspaces/:name", workspace_remove_handler),
+        client_json!(delete, WorkspaceRemoved, "/client/workspaces/:name", workspace_remove_handler, optional_body = RemoveBody),
         client_json!(get, BranchChanges, "/client/workspaces/:name/changes", workspace_changes_handler),
-        client_json!(post, EditReply, "/client/workspaces/:name/edit", workspace_edit_handler),
-        client_json!(post, ImageReply, IMAGE_ROUTE, workspace_image_handler),
-        client_json!(post, PreviewState, "/client/workspaces/:name/preview", preview_start_handler),
+        client_json!(post, EditReply, "/client/workspaces/:name/edit", workspace_edit_handler, body = EditBody),
+        client_json!(post, ImageReply, IMAGE_ROUTE, workspace_image_handler, body = ImageBody),
+        client_json!(post, PreviewState, "/client/workspaces/:name/preview", preview_start_handler, optional_body = PreviewStartBody),
         client_json!(get, PreviewState, "/client/workspaces/:name/preview", preview_status_handler),
         client_json!(delete, StatusWord, "/client/workspaces/:name/preview", preview_stop_handler),
-        client_json!(put, RecipeReply, "/client/workspaces/:name/recipe", recipe_set_handler),
+        client_json!(put, RecipeReply, "/client/workspaces/:name/recipe", recipe_set_handler, body = RecipeSetBody),
     ]
 }
 
@@ -210,8 +248,8 @@ fn render_client_table() -> String {
     }
     out.push_str("\n# client listener response types: Type.field: type, from the JSON schema (every refusal is ClientError)\n");
     let mut lines = std::collections::BTreeSet::new();
-    for schema in client_schemas() {
-        schema_lines(&schema, &mut lines);
+    for (name, schema) in client_schemas() {
+        type_lines(&name, &schema, &mut lines);
     }
     for l in lines {
         out.push_str(&l);
@@ -220,31 +258,16 @@ fn render_client_table() -> String {
     out
 }
 
-/// The JSON schema of every client response type.
+/// The JSON schema of every client response type (and of `ClientError`):
+/// the generator's definitions once each route's reply schema is added.
 #[cfg(test)]
-fn client_schemas() -> Vec<serde_json::Value> {
-    use crate::client_wire::*;
-    fn of<T: schemars::JsonSchema>() -> serde_json::Value {
-        schemars::schema_for!(T).as_value().clone()
+fn client_schemas() -> Vec<(String, serde_json::Value)> {
+    let mut generator = schemars::SchemaGenerator::default();
+    generator.subschema_for::<crate::client_wire::ClientError>();
+    for r in client_table() {
+        (r.reply_schema)(&mut generator);
     }
-    vec![
-        of::<ClientError>(), of::<PairAccepted>(), of::<PairPoll>(), of::<Whoami>(), of::<ClientProfiles>(),
-        of::<WorkAccepted>(), of::<WorkState>(), of::<StatusWord>(), of::<KeepReply>(), of::<DiscardReply>(),
-        of::<UndoReply>(), of::<RecipeReply>(), of::<WorkspaceInfo>(), of::<WorkspaceRemoved>(), of::<BranchChanges>(), of::<PreviewState>(), of::<EditReply>(), of::<ImageReply>(),
-    ]
-}
-
-/// One `Type.field: type` line per field of a schema's root type and of
-/// every type it defines.
-#[cfg(test)]
-fn schema_lines(schema: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
-    let root = schema.get("title").and_then(|t| t.as_str()).unwrap_or("?");
-    type_lines(root, schema, out);
-    if let Some(defs) = schema.get("$defs").and_then(|d| d.as_object()) {
-        for (name, def) in defs {
-            type_lines(name, def, out);
-        }
-    }
+    generator.definitions().clone().into_iter().collect()
 }
 
 #[cfg(test)]
