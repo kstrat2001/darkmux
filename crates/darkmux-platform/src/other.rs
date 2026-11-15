@@ -136,6 +136,11 @@ impl Platform for OtherPlatform {
         crate::SecretStore::PrivateFile
     }
 
+    /// What darkmux tried here before the question existed (#3560).
+    fn overlay_tool_locations(&self) -> Vec<String> {
+        crate::MAC_OVERLAY_TOOL_LOCATIONS.iter().map(|p| p.to_string()).collect()
+    }
+
     fn signed_app(&self, _pid: u32) -> Result<crate::SignedApp, String> {
         Err("darkmux cannot check code signatures on this platform".to_string())
     }

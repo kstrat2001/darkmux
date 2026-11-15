@@ -21,11 +21,10 @@
 //! (the provider could not answer: its daemon is down, the tool is missing,
 //! the call timed out). The submission gate refuses on both of the last two.
 
+use crate::overlay::first_line;
 use anyhow::{anyhow, bail, Context, Result};
-use std::io::Read;
 use std::net::IpAddr;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The identity provider values this darkmux knows: the token list of
 /// `darkmux_types::config::IdentityProvider` (#2947), so `config set`, help,
@@ -120,7 +119,8 @@ pub fn provider_for(value: &str, bin: Option<&str>) -> Result<Box<dyn IdentityPr
         "tailscale" => {
             let bin = match bin {
                 Some(b) => b.to_string(),
-                None => default_tool_path("tailscale", TAILSCALE_TOOL_PATHS, std::env::var_os("PATH").as_deref()),
+                // (#3560) Found the way every caller of the tool finds it.
+                None => crate::overlay::tool_path(),
             };
             Ok(Box::new(WhoisCli::new("tailscale", &bin)))
         }
@@ -129,35 +129,6 @@ pub fn provider_for(value: &str, bin: Option<&str>) -> Result<Box<dyn IdentityPr
             KNOWN_IDENTITY_PROVIDERS.join(", ")
         ),
     }
-}
-
-/// Where the `tailscale` tool usually lives on macOS, tried in order when
-/// `fleet.identity.bin` is unset and the name is not on `PATH` (#2916
-/// review): a daemon started by launchd gets a short `PATH` without
-/// `/usr/local/bin`, while `darkmux doctor` from a shell finds the tool,
-/// so the two disagreed about whether the provider was up.
-const TAILSCALE_TOOL_PATHS: &[&str] = &[
-    "/usr/local/bin/tailscale",
-    "/opt/homebrew/bin/tailscale",
-    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-];
-
-/// `name` found on `path_var`, else the first of `known` that exists, else
-/// `name` (so the error names the tool).
-fn default_tool_path(name: &str, known: &[&str], path_var: Option<&std::ffi::OsStr>) -> String {
-    if let Some(p) = path_var {
-        for dir in std::env::split_paths(p) {
-            let cand = dir.join(name);
-            if cand.is_file() {
-                return cand.to_string_lossy().into_owned();
-            }
-        }
-    }
-    known
-        .iter()
-        .find(|k| std::path::Path::new(k).is_file())
-        .map(|k| k.to_string())
-        .unwrap_or_else(|| name.to_string())
 }
 
 /// The configured provider: `fleet.identity.provider` + `fleet.identity.bin`.
@@ -245,52 +216,9 @@ impl IdentityProvider for WhoisCli {
     }
 }
 
-fn first_line(s: &str) -> String {
-    let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("no output").trim();
-    // A timestamped log prefix (`2026/09/27 01:05:12 peer not found`) adds
-    // nothing for the reader.
-    line.to_string()
-}
-
-/// Run `bin args` with a wall-clock bound, reading stdout and stderr on
-/// their own threads (a large `status` document must not fill the pipe
-/// while we wait). Returns (exited successfully, stdout, stderr). A timeout
-/// kills the child and is an error.
+/// (#3560) Run the tool through the one bounded runner every caller shares.
 fn run_with_timeout(bin: &str, args: &[&str], timeout: Duration) -> Result<(bool, Vec<u8>, String)> {
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("`{bin}` could not be started (is it installed, and on PATH? `fleet.identity.bin` names it explicitly)"))?;
-    let mut out = child.stdout.take().expect("piped stdout");
-    let mut err = child.stderr.take().expect("piped stderr");
-    let out_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = out.read_to_end(&mut b);
-        b
-    });
-    let err_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = err.read_to_end(&mut b);
-        b
-    });
-    let start = Instant::now();
-    let status = loop {
-        if let Some(st) = child.try_wait()? {
-            break st;
-        }
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("`{bin}` did not answer within {}s", timeout.as_secs());
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    let stdout = out_t.join().unwrap_or_default();
-    let stderr = String::from_utf8_lossy(&err_t.join().unwrap_or_default()).into_owned();
-    Ok((status.success(), stdout, stderr))
+    crate::overlay::run_bounded(bin, args, timeout)
 }
 
 /// The short network name from a DNS name: first label, lowercased.
@@ -559,26 +487,7 @@ mod tests {
         assert!(err.to_string().contains("not running"), "{err}");
     }
 
-    /// With no `fleet.identity.bin`, the tool is found on PATH, else at a
-    /// known absolute path, else its bare name (the error then names it).
-    #[test]
-    fn the_tool_is_found_off_path_at_a_known_location() {
-        let d = tempfile::TempDir::new().unwrap();
-        let known = d.path().join("known-tailscale");
-        std::fs::write(&known, "").unwrap();
-        let known_s = known.to_string_lossy().into_owned();
-        let empty_path = d.path().join("empty");
-        std::fs::create_dir_all(&empty_path).unwrap();
-        assert_eq!(default_tool_path("tailscale", &[&known_s], Some(empty_path.as_os_str())), known_s);
-        let on_path = d.path().join("bin");
-        std::fs::create_dir_all(&on_path).unwrap();
-        std::fs::write(on_path.join("tailscale"), "").unwrap();
-        assert_eq!(
-            default_tool_path("tailscale", &[&known_s], Some(on_path.as_os_str())),
-            on_path.join("tailscale").to_string_lossy()
-        );
-        assert_eq!(default_tool_path("tailscale", &["/nonexistent/x"], Some(empty_path.as_os_str())), "tailscale");
-    }
+    // (#3560) Finding the tool is `overlay::find_tool`, tested there.
 
     #[test]
     fn an_unknown_provider_value_builds_nothing() {
@@ -620,7 +529,7 @@ mod tests {
         );
         // A hung tool is cut off and is an error.
         let hang = script("hang", "sleep 30");
-        let start = Instant::now();
+        let start = std::time::Instant::now();
         let r = run_with_timeout(&hang, &[], Duration::from_millis(300));
         assert!(r.is_err());
         assert!(start.elapsed() < Duration::from_secs(5));

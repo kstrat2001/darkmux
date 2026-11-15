@@ -55,11 +55,18 @@ pub enum ClientCapability {
     /// (#3520) `DELETE /client/workspaces/{name}`: a workspace removed, with
     /// what darkmux made for it.
     WorkspaceRemove,
+    /// (#3560) `GET /client/whoami` carries `remote`: whether this machine's
+    /// `client serve` is published on its tailnet (`clients.remote
+    /// tailscale`), at which HTTPS URL, or why not. What the build can do:
+    /// `remote.state` says what this machine did. Reach is not access: a
+    /// request that arrives through that URL is still refused until remote
+    /// pairing ships.
+    RemoteTailscale,
 }
 
 impl ClientCapability {
     /// Every capability, in declaration order: what `whoami` lists.
-    pub const ALL: [ClientCapability; 8] = [
+    pub const ALL: [ClientCapability; 9] = [
         ClientCapability::CleanPreview,
         ClientCapability::TemplateWorkspace,
         ClientCapability::Continues,
@@ -68,6 +75,7 @@ impl ClientCapability {
         ClientCapability::WorkspaceImage,
         ClientCapability::WorkspaceEdit,
         ClientCapability::WorkspaceRemove,
+        ClientCapability::RemoteTailscale,
     ];
 }
 
@@ -98,6 +106,7 @@ mod tests {
                 "workspace_image",
                 "workspace_edit",
                 "workspace_remove",
+                "remote_tailscale",
             ]
         );
         for c in ClientCapability::ALL {

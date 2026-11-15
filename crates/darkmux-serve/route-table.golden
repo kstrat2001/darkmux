@@ -67,7 +67,7 @@ BranchFile.content?: string | null
 BranchFile.deleted?: boolean | null
 BranchFile.mode?: string | null
 BranchFile.path: string
-ClientCapability = "clean_preview" | "template_workspace" | "continues" | "clone_preview" | "recipe_set" | "workspace_image" | "workspace_edit" | "workspace_remove"
+ClientCapability = "clean_preview" | "template_workspace" | "continues" | "clone_preview" | "recipe_set" | "workspace_image" | "workspace_edit" | "workspace_remove" | "remote_tailscale"
 ClientCode = "unsupported_media_type" | "bad_request" | "payload_too_large" | "method_not_allowed" | "not_local" | "not_found" | "unauthorized" | "forbidden" | "conflict" | "unprocessable" | "too_many_requests" | "unavailable" | "internal" | "preview_disabled" | "no_source_checkout" | "template_no_recipe" | "no_recipe" | "recipe_invalid" | "filter_in_repo_config" | "network_key_in_repo_config" | "fetch_failed" | "clone_failed" | "no_own_branch" | "branch_failed" | "unsaved_commits" | "busy" | "wont_fit" | "memory_in_use" | "model_start_failed" | "model_stop_failed" | "port_in_use" | "engine_unavailable" | "engine_in_use" | "dispatch_failed"
 ClientError.code: ClientCode
 ClientError.error: string
@@ -85,6 +85,9 @@ ClientProfileInfo.reachable: boolean
 ClientProfiles.machine: ClientMachine
 ClientProfiles.profiles: Array<ClientProfileInfo>
 ClientProfiles.role: string
+ClientRemote.reason?: string | null
+ClientRemote.state: RemoteState
+ClientRemote.url?: string | null
 ClientScopes.profiles: ProfilesGrant
 ClientScopes.workspace: boolean
 DiscardReply.removed: Array<string>
@@ -129,6 +132,7 @@ Recipe.install?: Install | null
 Recipe.ready?: Ready | null
 Recipe.schema_version: string
 RecipeReply.recipe: Recipe
+RemoteState = "off" | "available" | "unavailable"
 RunActivity = "starting_model" | "queued"
 RunChanges.diff: string
 RunChanges.files: Array<FileChange>
@@ -139,6 +143,7 @@ UndoReply.revert: string
 Whoami.capabilities: Array<ClientCapability>
 Whoami.client_name: string
 Whoami.machine: ClientMachine
+Whoami.remote: ClientRemote
 Whoami.scopes: ClientScopes
 Whoami.version: string
 WorkAccepted.profile: string

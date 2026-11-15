@@ -1105,6 +1105,9 @@ pub struct ClientServerState {
     /// (#3545) How long a body may take to arrive, and the turns for
     /// reading an image's large body.
     pub body_limits: BodyLimits,
+    /// (#3560) What this `client serve` did about the tailnet at its start
+    /// (`clients.remote`, [`crate::client_remote`]), for `whoami`.
+    pub remote: ClientRemote,
 }
 
 /// How many large image bodies the listener reads at once (#3545). Each may
@@ -1178,6 +1181,8 @@ impl ClientServerState {
             notify: Arc::new(|message| darkmux_platform::current().notify(message)),
             dialogs: Arc::new(crate::client_trust::DialogSlots::default()),
             body_limits: BodyLimits::default(),
+            // Set by `run` once the listener is bound.
+            remote: ClientRemote::off(),
         })
     }
 }
@@ -1278,6 +1283,20 @@ pub(crate) fn read_pairing_policy_at(path: &Path) -> Result<crate::client_trust:
 pub fn preflight() -> Result<()> {
     darkmux_types::config_enum::preflight(darkmux_types::config_enum::Scope::ClientServe)
         .map_err(|e| anyhow!("{e}"))
+}
+
+/// (#3560) `clients.remote` from `config.json` as it is at the start, env
+/// first. Read once: a change applies at the next `client serve`. The
+/// preflight has already refused a bad value; one written since is refused
+/// here too, never read as `off`.
+fn read_remote_setting() -> Result<darkmux_types::config::ClientsRemote> {
+    read_remote_setting_at(&darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config)
+}
+
+/// [`read_remote_setting`] against the config at `path`.
+pub(crate) fn read_remote_setting_at(path: &Path) -> Result<darkmux_types::config::ClientsRemote> {
+    let cfg = read_config_at(path).map_err(|e| anyhow!(e))?;
+    Ok(darkmux_types::config_access::clients_remote_with_source_in(&cfg)?.0)
 }
 
 /// [`read_profiles_policy`] against the config at `path`.
@@ -1385,6 +1404,12 @@ pub fn run(port: u16) -> Result<()> {
         let listener = bind_listener(port)
             .await
             .with_context(|| format!("binding {}", bind_addr(port)))?;
+        // (#3560) Reach from the tailnet, before the listening line (and the
+        // signal handlers): with `clients.remote` off this runs no tool.
+        // Reach is not access: the request gate still refuses every request
+        // that is not from this machine, tailnet ones included.
+        let rig = crate::client_remote::Rig::production();
+        let started = reach_from_the_tailnet(&listener, &rig).await?;
         eprintln!(
             "darkmux client serve: listening on http://{}",
             listener.local_addr()?
@@ -1395,6 +1420,7 @@ pub fn run(port: u16) -> Result<()> {
         );
         let mut state = state;
         state.bound = Some(listener.local_addr()?);
+        state.remote = started.wire;
         log_lines(swept_partials(&state));
         // (#3456) Preview containers a `client serve` that died left behind.
         let reaper = state.previews.clone();
@@ -1427,11 +1453,43 @@ pub fn run(port: u16) -> Result<()> {
         .await;
         idle_stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let began = stopped_at.get().copied().unwrap_or_else(std::time::Instant::now);
-        finish_stop(previews, works, began + SHUTDOWN_WORK_WAIT).await;
+        // (#3560) The tailnet entry this process published goes while the
+        // rest of the stop runs.
+        unpublish_during(started.owned, rig, finish_stop(previews, works, began + SHUTDOWN_WORK_WAIT)).await;
         served
     });
     end_runtime(rt, RUNTIME_EXIT_WAIT);
     served
+}
+
+/// (#3560) `clients.remote` read now, and the client port published on the
+/// tailnet when it says so ([`crate::client_remote::start`], run off the
+/// runtime: it waits on the tool); its lines logged. With the setting off
+/// no tool runs.
+async fn reach_from_the_tailnet(
+    listener: &tokio::net::TcpListener,
+    rig: &crate::client_remote::Rig,
+) -> Result<crate::client_remote::Started> {
+    let remote = read_remote_setting()?;
+    let port = listener.local_addr()?.port();
+    let rig = rig.clone();
+    let started = tokio::task::spawn_blocking(move || crate::client_remote::start(remote, port, &rig)).await?;
+    log_lines(started.log.clone());
+    Ok(started)
+}
+
+/// (#3560) Removes the tailnet entry this process published, `owned`, off
+/// the runtime while `rest` (the rest of the stop) runs; logs what it did.
+async fn unpublish_during(
+    owned: Option<darkmux_fleet::overlay::ServeEntry>,
+    rig: crate::client_remote::Rig,
+    rest: impl std::future::Future,
+) {
+    let unpublish = owned.map(|entry| tokio::task::spawn_blocking(move || crate::client_remote::stop(&entry, &rig)));
+    rest.await;
+    if let Some(unpublish) = unpublish {
+        log_lines(unpublish.await.unwrap_or_default());
+    }
 }
 
 /// Sweeps the clones a `client serve` stopped mid-clone left half done
@@ -2344,6 +2402,7 @@ pub(crate) async fn whoami_handler(State(state): State<ClientServerState>, heade
                 machine: state.machine.clone(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 capabilities: ClientCapability::ALL.to_vec(),
+                remote: state.remote.clone(),
             })
             .into_response()
         }

@@ -55,6 +55,8 @@ pub struct FakePlatform {
     pub node_release_platform: Option<&'static str>,
     /// What [`Platform::c_library`] answers.
     pub c_library: Option<crate::CLibrary>,
+    /// What [`Platform::overlay_tool_locations`] answers.
+    pub overlay_tool_locations: Vec<String>,
 }
 
 /// Every answer at its "nothing to report" value, so a test sets only the
@@ -91,6 +93,7 @@ impl Default for FakePlatform {
             allow_answer: crate::AllowAnswer::NoDialog("a fake platform shows no dialog".to_string()),
             node_release_platform: None,
             c_library: None,
+            overlay_tool_locations: Vec::new(),
         }
     }
 }
@@ -239,6 +242,10 @@ impl Platform for FakePlatform {
 
     fn secret_store(&self) -> crate::SecretStore {
         self.secret_store
+    }
+
+    fn overlay_tool_locations(&self) -> Vec<String> {
+        self.overlay_tool_locations.clone()
     }
 
     fn signed_app(&self, pid: u32) -> Result<crate::SignedApp, String> {
