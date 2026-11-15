@@ -33,17 +33,27 @@ darkmux release.
   `off`), read at `client serve`'s start. With `tailscale`, `client serve` publishes its port on this
   machine's tailnet over HTTPS (`tailscale serve --bg --https=<port> http://127.0.0.1:<port>`, so a
   phone reaches `https://<machine>.<tailnet>.ts.net:<port>/`) and removes that entry on shutdown,
-  Ctrl-C included; an entry a killed `client serve` left is removed by the next start on that port.
-  darkmux changes only an entry it recorded publishing (`~/.darkmux/client-remote/<port>.json`) that
-  the tailnet still shows exactly as published, never the operator's other serve entries, and never
-  runs `tailscale` at all with the setting off. It needs Tailscale 1.52 or later, running and logged
-  in, with MagicDNS and HTTPS certificates; otherwise `client serve` still runs on this machine and
-  logs one reason with the fix. `GET /client/whoami` gains `remote` (`{"state": "off" | "available" |
-  "unavailable", "url", "reason"}`), the capability list gains `remote_tailscale`, and `darkmux
-  doctor` gains a `client serve on the tailnet` row. **Reach is not access:** a request that arrives
-  through the tailnet URL is still refused like any request not from this machine, until remote
-  pairing and the tailnet request path ship in the next parts. An older darkmux refuses a config
-  carrying `clients.remote`.
+  Ctrl-C included, with `tailscale serve --https=<port> --set-path=/ off` (its own `/` handler only);
+  an entry a killed `client serve` left is removed by the next start on that port. darkmux changes
+  only an entry it recorded publishing (`~/.darkmux/client-remote/<port>.json`) that the tailnet still
+  shows exactly as published, never the operator's other serve entries. With `off`, `client serve`
+  never publishes, and runs `tailscale` only to remove an entry its own record proves it left (one
+  status read, then at most one removal); with no record it runs none. (`darkmux doctor`, viewer
+  links in fleet mode and the fleet identity provider run `tailscale` whatever the setting says.) An
+  entry left from before the machine was renamed cannot be removed by `tailscale serve`, which works
+  only under the current name, so it is reported with the remedies, never retried. It needs
+  Tailscale 1.52 or later, running and logged in, with MagicDNS and HTTPS certificates; otherwise
+  `client serve` still runs on this machine and logs one reason with the fix. `GET /client/whoami`
+  gains `remote` (`{"state": "off" | "available" | "unavailable", "url", "reason"}`), the capability
+  list gains `remote_tailscale`, and `darkmux doctor` gains a `client serve on the tailnet` row.
+  **Reach is not access:** a request that arrives through the tailnet URL is still refused like any
+  request not from this machine, until remote pairing and the tailnet request path ship in the next
+  parts. An older darkmux refuses a config carrying `clients.remote`.
+- **`darkmux doctor` and `mission status` find `tailscale` where the fleet identity provider does
+  (#3560).** The tailnet viewer URL used to run a bare `tailscale` from `PATH`; it now looks on `PATH`
+  and then at the known install locations (on macOS `/usr/local/bin/tailscale`,
+  `/opt/homebrew/bin/tailscale`, `/Applications/Tailscale.app/Contents/MacOS/Tailscale`), so under
+  launchd's short `PATH` it now runs the Mac app's binary, still bounded at 1.5 s.
 - **The client API describes itself as OpenAPI 3.1 (#3494).** `GET /client/openapi.json`
   (authenticated as `whoami` is) answers a document built from the client route table: every route's
   path parameters, query, request body and reply, each from its type's JSON schema, the bearer token

@@ -37,11 +37,11 @@ fn with_ours() -> String {
     )
 }
 
-/// A fake `tailscale` in a temp dir: `status.json` is its `status --json`,
-/// `serve.json` its serve configuration, `serve --bg ...` writes
-/// `published.json` into it, `serve --https=P off` writes `removed.json`,
-/// and a file `refuse` makes every change fail. Every call's arguments are
-/// appended to `args.log`.
+/// The fake `tailscale` (`tests/fixtures/fake_tailscale.py`), whose `serve`
+/// changes follow Tailscale 1.102.4's own code, in a temp dir of its own.
+const FAKE_TOOL: &str = include_str!("../tests/fixtures/fake_tailscale.py");
+
+/// One fake tool and its state.
 struct Fake {
     dir: tempfile::TempDir,
 }
@@ -52,37 +52,20 @@ impl Fake {
         let d = dir.path();
         std::fs::write(d.join("status.json"), status).unwrap();
         std::fs::write(d.join("serve.json"), serve).unwrap();
-        std::fs::write(d.join("published.json"), with_ours()).unwrap();
-        std::fs::write(d.join("removed.json"), OPERATOR).unwrap();
-        let script = format!(
-            r#"#!/bin/sh
-d="{d}"
-echo "$*" >> "$d/args.log"
-case "$1" in
-  version) echo 1.102.4; echo '  tailscale commit: fake' ;;
-  status) cat "$d/status.json" ;;
-  serve)
-    case "$2" in
-      status) cat "$d/serve.json" ;;
-      *) if [ -f "$d/refuse" ]; then echo 'Access denied: serve config denied' >&2; exit 1; fi
-         case "$*" in
-           "serve --bg --https={PORT} http://127.0.0.1:{PORT}")
-             [ -f "$d/records/{PORT}.json" ] || {{ echo 'fake: published before darkmux recorded it' >&2; exit 3; }}
-             cp "$d/published.json" "$d/serve.json" ;;
-           "serve --https={PORT} off") cp "$d/removed.json" "$d/serve.json" ;;
-           *) echo "unexpected: $*" >&2; exit 2 ;;
-         esac ;;
-    esac ;;
-  *) echo "unexpected: $*" >&2; exit 2 ;;
-esac
-"#,
-            d = d.display()
-        );
         let bin = d.join("tailscale");
-        std::fs::write(&bin, script).unwrap();
+        std::fs::write(&bin, FAKE_TOOL).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Fake { dir }
+        let _ = d;
+        let f = Fake { dir };
+        let d = f.dir.path();
+        std::fs::write(d.join("record_path"), f.rig().record(PORT).to_string_lossy().as_bytes()).unwrap();
+        f
+    }
+
+    /// Writes switch `name` (see the fixture's doc) with `body`.
+    fn switch(&self, name: &str, body: &str) {
+        std::fs::write(self.dir.path().join(name), body).unwrap();
     }
 
     fn rig(&self) -> Rig {
@@ -135,17 +118,36 @@ fn off_never_runs_the_tool() {
     assert!(f.calls().is_empty(), "{:?}", f.calls());
 }
 
-/// Off with a record left from an earlier run: still no call, one line
-/// naming the command that removes the entry by hand.
+/// (#3560 review) Off with a record left from an earlier run: one status
+/// read, one removal of exactly the entry the record proves, and the record
+/// goes. Off never publishes.
 #[test]
-fn off_reports_a_left_entry_without_touching_the_tailnet() {
+fn off_removes_only_the_entry_its_record_proves_it_left() {
     let f = Fake::new(RUNNING, &with_ours());
     f.plant_record(ours());
     let s = start(ClientsRemote::Off, PORT, &f.rig());
     assert_eq!(s.wire, ClientRemote::off());
-    assert!(f.calls().is_empty(), "{:?}", f.calls());
-    assert_eq!(s.log.len(), 1, "{:?}", s.log);
-    assert!(s.log[0].contains("tailscale serve --https=8767 off") && s.log[0].contains("leaves the tailnet alone"), "{:?}", s.log);
+    assert_eq!(s.owned, None);
+    assert_eq!(f.calls(), ["serve status --json", "serve --https=8767 --set-path=/ off"]);
+    assert_eq!(f.serve(), operator(), "only darkmux's entry went");
+    assert_eq!(f.record(), None);
+    assert!(s.log.iter().any(|l| l.contains("removed the tailnet entry") && l.contains("clients.remote is off")), "{:?}", s.log);
+}
+
+/// (#3560 review) Off with a record whose entry the operator has since
+/// changed: one status read, nothing removed, the record dropped.
+#[test]
+fn off_leaves_an_entry_that_changed_since_its_record() {
+    let changed = with(
+        serde_json::json!({ "8767": { "HTTPS": true } }),
+        serde_json::json!({ "studio.example.ts.net:8767": { "Handlers": {
+            "/": { "Proxy": "http://127.0.0.1:8767" }, "/api": { "Proxy": "http://127.0.0.1:9000" } } } }),
+    );
+    let f = Fake::new(RUNNING, &changed);
+    f.plant_record(ours());
+    let s = start(ClientsRemote::Off, PORT, &f.rig());
+    assert_eq!(f.calls(), ["serve status --json"], "{:?}", s.log);
+    assert_eq!(f.record(), None);
 }
 
 /// On and usable: the record is written, the entry published and checked,
@@ -163,7 +165,7 @@ fn on_publishes_then_stop_removes_only_its_own_entry() {
 
     let lines = stop(&ours(), &f.rig());
     assert_eq!(lines, ["darkmux client serve: removed its tailnet entry (https://studio.example.ts.net:8767/)"]);
-    assert_eq!(f.changes(), ["serve --bg --https=8767 http://127.0.0.1:8767", "serve --https=8767 off"]);
+    assert_eq!(f.changes(), ["serve --bg --https=8767 http://127.0.0.1:8767", "serve --https=8767 --set-path=/ off"]);
     assert_eq!(f.serve(), operator(), "the operator's entries are untouched");
     assert_eq!(f.record(), None, "the record goes with the entry");
 }
@@ -228,7 +230,7 @@ fn a_killed_serves_entry_is_reaped_then_published_again() {
     let s = start(ClientsRemote::Tailscale, PORT, &f.rig());
     assert_eq!(s.owned, Some(ours()), "{s:?}");
     assert!(s.log.iter().any(|l| l.contains("removed the tailnet entry a stopped client serve left")), "{:?}", s.log);
-    assert_eq!(f.changes(), ["serve --https=8767 off", "serve --bg --https=8767 http://127.0.0.1:8767"]);
+    assert_eq!(f.changes(), ["serve --https=8767 --set-path=/ off", "serve --bg --https=8767 http://127.0.0.1:8767"]);
     assert_eq!(f.record(), Some(PublishedRecord { entry: ours(), pid: 4242 }), "the new record");
 }
 
@@ -250,19 +252,65 @@ fn a_record_whose_entry_changed_is_dropped_and_the_entry_left() {
     assert_eq!(f.record(), None);
 }
 
-/// A record for a name this machine no longer has (renamed on the
-/// tailnet): that exact old entry is still darkmux's, and is removed.
+/// (#3560 review) A record for a name this machine no longer has (renamed
+/// on the tailnet): `tailscale serve` removes only under the current name,
+/// so darkmux runs no removal it knows cannot work, serves this machine
+/// only with the reason and a remedy that works, keeps the record, and the
+/// next start says the same without trying again. Once the entry is gone
+/// the record goes and the entry is published again.
 #[test]
-fn a_record_under_an_old_name_reaps_that_names_entry() {
+fn a_record_under_an_old_name_is_reported_not_retried() {
     let old = ServeEntry::for_port("mini.example.ts.net", PORT);
     let left = with(
         serde_json::json!({ "8767": { "HTTPS": true } }),
         serde_json::json!({ "mini.example.ts.net:8767": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:8767" } } } }),
     );
     let f = Fake::new(RUNNING, &left);
-    f.plant_record(old);
+    f.plant_record(old.clone());
+    for _ in 0..2 {
+        let s = start(ClientsRemote::Tailscale, PORT, &f.rig());
+        let reason = s.wire.reason.clone().unwrap_or_default();
+        assert!(reason.contains("renamed") && reason.contains("mini.example.ts.net") && reason.contains("tailscale serve reset"), "{reason}");
+        assert_eq!(s.owned, None);
+    }
+    assert!(f.changes().is_empty(), "no removal that cannot work: {:?}", f.calls());
+    assert_eq!(f.record().map(|r| r.entry), Some(old.clone()));
+    // The remedy really works in the fake: the CLI removes only under the
+    // current name, so a direct removal fails there.
+    assert!(overlay::remove(&f.rig().bin, &old, f.rig().timeout).is_err());
+    std::fs::write(f.dir.path().join("serve.json"), OPERATOR).unwrap();
     let s = start(ClientsRemote::Tailscale, PORT, &f.rig());
-    assert_eq!(f.changes(), ["serve --https=8767 off", "serve --bg --https=8767 http://127.0.0.1:8767"], "{s:?}");
+    assert_eq!(s.owned, Some(ours()), "{s:?}");
+}
+
+/// (#3560 review) The removal names its mount, `/`: an operator's mount
+/// added on the port between darkmux's read and its removal survives.
+/// Plain `off` would take every mount on the port.
+#[test]
+fn removal_takes_only_darkmuxs_mount_when_the_operator_adds_one_meanwhile() {
+    let f = Fake::new(RUNNING, OPERATOR);
+    let s = start(ClientsRemote::Tailscale, PORT, &f.rig());
+    f.switch("race_mount.json", r#"{"/api": {"Proxy": "http://127.0.0.1:9000"}}"#);
+    let lines = stop(&s.owned.unwrap(), &f.rig());
+    assert!(lines[0].contains("removed its tailnet entry"), "{lines:?}");
+    assert_eq!(
+        f.serve()["Web"]["studio.example.ts.net:8767"]["Handlers"],
+        serde_json::json!({ "/api": { "Proxy": "http://127.0.0.1:9000" } }),
+        "the operator's mount survives"
+    );
+    assert_eq!(f.serve()["TCP"]["8767"], serde_json::json!({ "HTTPS": true }));
+}
+
+/// (#3560 review) A publish that fails and leaves the serve configuration
+/// unreadable: the record stays, so the next start looks again (the publish
+/// may have landed).
+#[test]
+fn a_failed_publish_whose_aftermath_cannot_be_read_keeps_the_record() {
+    let f = Fake::new(RUNNING, OPERATOR);
+    f.switch("break_on_publish", "");
+    let s = start(ClientsRemote::Tailscale, PORT, &f.rig());
+    assert_eq!(s.owned, None, "{s:?}");
+    assert_eq!(f.record().map(|r| r.pid), Some(4242), "kept");
 }
 
 /// A publish the tool refuses: unavailable naming its reason, and no record
@@ -270,7 +318,7 @@ fn a_record_under_an_old_name_reaps_that_names_entry() {
 #[test]
 fn a_refused_publish_leaves_no_record() {
     let f = Fake::new(RUNNING, OPERATOR);
-    std::fs::write(f.dir.path().join("refuse"), "").unwrap();
+    f.switch("refuse", "");
     let s = start(ClientsRemote::Tailscale, PORT, &f.rig());
     assert!(s.wire.reason.as_deref().is_some_and(|r| r.contains("Access denied")), "{s:?}");
     assert_eq!(s.owned, None);
@@ -284,9 +332,9 @@ fn a_refused_publish_leaves_no_record() {
 fn stop_leaves_a_changed_entry_and_keeps_the_record_when_removal_fails() {
     let f = Fake::new(RUNNING, OPERATOR);
     let s = start(ClientsRemote::Tailscale, PORT, &f.rig());
-    std::fs::write(f.dir.path().join("refuse"), "").unwrap();
+    f.switch("refuse", "");
     let lines = stop(&s.owned.clone().unwrap(), &f.rig());
-    assert!(lines[0].contains("could not remove") && lines[0].contains("tailscale serve --https=8767 off"), "{lines:?}");
+    assert!(lines[0].contains("could not remove") && lines[0].contains("tailscale serve --https=8767 --set-path=/ off"), "{lines:?}");
     assert!(f.record().is_some(), "kept, so the next start removes it");
 
     let changed = Fake::new(RUNNING, OPERATOR);
@@ -326,9 +374,7 @@ fn an_unreadable_serve_status_changes_nothing_and_keeps_the_record() {
     assert!(broken.changes().is_empty());
 
     let failing = Fake::new(RUNNING, OPERATOR);
-    let script = std::fs::read_to_string(failing.dir.path().join("tailscale")).unwrap();
-    let script = script.replace(r#"      status) cat "$d/serve.json" ;;"#, r#"      status) echo 'serve status: permission denied' >&2; exit 1 ;;"#);
-    std::fs::write(failing.dir.path().join("tailscale"), script).unwrap();
+    failing.switch("status_fails", "");
     let s = start(ClientsRemote::Tailscale, PORT, &failing.rig());
     assert!(s.wire.reason.as_deref().is_some_and(|r| r.contains("permission denied")), "{s:?}");
     let lines = stop(&ours(), &failing.rig());
@@ -348,7 +394,7 @@ fn a_stale_record_with_nothing_left_or_a_failed_reap() {
 
     let stuck = Fake::new(RUNNING, &with_ours());
     stuck.plant_record(ours());
-    std::fs::write(stuck.dir.path().join("refuse"), "").unwrap();
+    stuck.switch("refuse", "");
     let s = start(ClientsRemote::Tailscale, PORT, &stuck.rig());
     assert!(s.log.iter().any(|l| l.contains("could not remove the tailnet entry a stopped client serve left")), "{:?}", s.log);
     assert_eq!(s.wire, ClientRemote::available(ours().url()));
@@ -382,15 +428,17 @@ fn stop_leaves_an_entry_the_operator_changed() {
 #[test]
 fn a_publish_the_tailnet_does_not_show_exactly_is_not_claimed() {
     let f = Fake::new(RUNNING, OPERATOR);
-    let odd = with(
-        serde_json::json!({ "8767": { "HTTPS": true } }),
-        serde_json::json!({ "studio.example.ts.net:8767": { "Handlers": { "/": { "Proxy": "http://localhost:8767" } } } }),
-    );
-    std::fs::write(f.dir.path().join("published.json"), odd).unwrap();
+    f.switch("publish_as.json", r#"{"Proxy": "http://localhost:8767"}"#);
     let s = start(ClientsRemote::Tailscale, PORT, &f.rig());
     assert_eq!(s.owned, None, "{s:?}");
     let reason = s.wire.reason.clone().unwrap_or_default();
     assert!(reason.contains("did not show the entry") && reason.contains("serve --bg --https=8767"), "{reason}");
     assert_eq!(f.changes(), ["serve --bg --https=8767 http://127.0.0.1:8767"], "what it cannot claim it does not remove");
     assert_eq!(f.record(), None);
+    // (#3560 review) Left up, but said: the entry and the exact command.
+    assert!(
+        s.log.iter().any(|l| l.contains("left in place") && l.contains("tailscale serve --https=8767 --set-path=/ off")),
+        "{:?}",
+        s.log
+    );
 }

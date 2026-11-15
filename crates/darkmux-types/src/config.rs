@@ -1908,7 +1908,9 @@ pub struct ClientsConfig {
     /// (#3544) How a pairing request is approved — see [`ClientsPairingConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")] pub pairing: Option<ClientsPairingConfig>,
     /// (CONFIG 2.10, #3560) How `client serve` is reached from another
-    /// device ([`ClientsRemote`]): absent or `off`, from this machine only;
+    /// device ([`ClientsRemote`]): absent or `off`, from this machine only
+    /// (`client serve` never publishes, and runs `tailscale` only to remove
+    /// an entry its own record proves an earlier run left);
     /// `tailscale`, its port is also published on this machine's tailnet over
     /// HTTPS (`tailscale serve`), and removed again on shutdown. Read at
     /// `client serve`'s start. Reach is not access: until remote pairing
@@ -2324,7 +2326,7 @@ pub enum ClientsRemote {
 }
 
 crate::config_enum!(ClientsRemote, "remote reach", [
-    Off = "off" => "client serve is reached from this machine only, and darkmux never touches the tailnet's configuration",
+    Off = "off" => "client serve is reached from this machine only: it never publishes, and runs `tailscale` only to remove an entry its own record proves an earlier client serve left",
     Tailscale = "tailscale" => "client serve also publishes its port on this machine's tailnet over HTTPS (`tailscale serve`), removed on shutdown; requests that arrive through it are still refused until remote pairing ships",
 ]);
 

@@ -119,7 +119,7 @@ pub struct ClientRemote {
 #[derive(Debug, Clone, Copy, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteState {
-    /// `clients.remote` is `off`: this machine only, and the tailnet untouched.
+    /// `clients.remote` is `off`: this machine only, never published.
     Off,
     /// Published on the tailnet at `url`.
     Available,

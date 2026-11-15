@@ -19,15 +19,27 @@
 //! ([`overlay::AtPort::Exactly`]: one HTTPS port, one handler at `/`, the
 //! loopback target, no Funnel). Anything else on the port, the operator's,
 //! is never removed or overwritten: darkmux then serves this machine only and
-//! says why. An identical entry with no record is used but never removed.
+//! says why. An identical entry with no record is used but never removed. A
+//! publish that lands in a shape darkmux did not ask for is left up, and the
+//! log names it and the command that removes it: darkmux cannot tell that
+//! shape from an operator's entry, so it does not remove it.
 //!
 //! **A killed `client serve` leaves its entry behind**, with its record. The
 //! next `client serve` on that port (which can only start once the killed
 //! one's listener is gone) removes it before publishing again.
 //!
-//! **Off means untouched.** With `clients.remote` off nothing here runs the
-//! tool at all. A record left from an earlier run is only reported, with the
-//! command that removes the entry by hand.
+//! **Off never publishes, and runs the tool only to remove an entry its own
+//! record proves it left.** With `clients.remote` off and no record, nothing
+//! here runs the tool. With a record, one `serve status` read, and one
+//! removal only when the tailnet shows that entry exactly; then the record
+//! goes. (This is `client serve` alone: `darkmux doctor`, viewer links in
+//! fleet mode and the fleet identity provider run the tool on their own.)
+//!
+//! **Removal names its mount** (`--set-path=/`, [`ServeEntry::remove_args`]):
+//! with none, Tailscale removes every handler on the port. And it always
+//! acts on the machine's current name, so an entry left under a name the
+//! machine had before a rename is reported with remedies that work
+//! ([`overlay::renamed_reason`]), never retried.
 
 use crate::client_wire::ClientRemote;
 use darkmux_fleet::overlay::{self, AtPort, PublishedRecord, ServeEntry};
@@ -87,20 +99,24 @@ pub fn start(remote: ClientsRemote, port: u16, rig: &Rig) -> Started {
     }
 }
 
-/// Off: the tool is never run. A record left from an earlier run is said,
-/// with the command that removes its entry.
+/// Off: never publishes. A record left from an earlier run gets one status
+/// read and, when the tailnet shows its entry exactly, one removal
+/// ([`reap`]). No record, no tool call.
 fn start_off(port: u16, rig: &Rig) -> Started {
-    let log = overlay::read_record(&rig.record(port))
-        .map(|rec| {
-            format!(
-                "{LOG} a tailnet entry an earlier client serve published ({}) may still be there; clients.remote is off, \
-                 so darkmux leaves the tailnet alone. `{}` removes it",
+    let mut log = Vec::new();
+    if let Some(rec) = overlay::read_record(&rig.record(port)) {
+        match overlay::serve_status(&rig.bin, rig.timeout) {
+            Ok(status) => {
+                reap(&rec, &status, None, rig, &mut log);
+            }
+            Err(e) => log.push(format!(
+                "{LOG} clients.remote is off; could not read the tailnet's serve entries ({e:#}) to remove the one an \
+                 earlier client serve left ({}); `{}` removes it",
                 rec.entry.url(),
                 rec.entry.remove_command()
-            )
-        })
-        .into_iter()
-        .collect();
+            )),
+        }
+    }
     Started { wire: ClientRemote::off(), owned: None, log }
 }
 
@@ -119,9 +135,9 @@ fn start_tailnet(port: u16, rig: &Rig) -> Started {
     }
     let entry = ServeEntry::for_port(net.dns_name.as_deref().unwrap_or_default(), port);
     let mut log = Vec::new();
-    let status = match overlay::serve_status(&rig.bin, rig.timeout) {
-        Ok(s) => reap_stale(port, rig, s, &mut log),
-        Err(e) => return unavailable(format!("{e:#}"), log),
+    let status = match serve_status_after_reap(port, &entry.host, rig, &mut log) {
+        Ok(s) => s,
+        Err(reason) => return unavailable(reason, log),
     };
     match overlay::at_port(&status, &entry) {
         Ok(AtPort::Free) => publish_owned(entry, rig, log),
@@ -145,38 +161,79 @@ fn start_tailnet(port: u16, rig: &Rig) -> Started {
     }
 }
 
-/// Removes the entry a killed `client serve` left on `port`, when its record
-/// is on disk and the tailnet still shows it exactly. Returns the serve
-/// configuration as it is now.
-fn reap_stale(port: u16, rig: &Rig, status: Vec<u8>, log: &mut Vec<String>) -> Vec<u8> {
-    let path = rig.record(port);
-    let Some(rec) = overlay::read_record(&path) else { return status };
-    match overlay::at_port(&status, &rec.entry) {
+/// The serve configuration, after the entry a killed `client serve` left on
+/// `port` (its record on disk) was dealt with ([`reap`]); `Err` with the
+/// reason when it cannot be read, or the left entry is under an earlier
+/// name of this machine (`host` is the current one).
+fn serve_status_after_reap(port: u16, host: &str, rig: &Rig, log: &mut Vec<String>) -> Result<Vec<u8>, String> {
+    let status = overlay::serve_status(&rig.bin, rig.timeout).map_err(|e| format!("{e:#}"))?;
+    let Some(rec) = overlay::read_record(&rig.record(port)) else { return Ok(status) };
+    match reap(&rec, &status, Some(host), rig, log) {
+        Reaped::Blocked(reason) => Err(reason),
+        Reaped::Removed => overlay::serve_status(&rig.bin, rig.timeout).map_err(|e| format!("{e:#}")),
+        Reaped::Untouched => Ok(status),
+    }
+}
+
+/// What [`reap`] did with a record's entry.
+enum Reaped {
+    /// Removed it.
+    Removed,
+    /// Changed nothing on the tailnet.
+    Untouched,
+    /// It is darkmux's, under an earlier name of this machine, and cannot be
+    /// removed: the reason, naming the remedies.
+    Blocked(String),
+}
+
+/// Deals with the entry `rec` says an earlier `client serve` published,
+/// against `status`: removed when the tailnet shows it exactly (the record
+/// then goes), left when it changed or is gone (the record goes too), and
+/// kept, with its record, when it cannot be read, the removal fails, or it
+/// is under a name other than `current` (when that is known).
+fn reap(rec: &PublishedRecord, status: &[u8], current: Option<&str>, rig: &Rig, log: &mut Vec<String>) -> Reaped {
+    let path = rig.record(rec.entry.port);
+    let url = rec.entry.url();
+    match overlay::at_port(status, &rec.entry) {
+        Ok(AtPort::Exactly) if current.is_some_and(|h| h != rec.entry.host) => {
+            Reaped::Blocked(overlay::renamed_reason(&rec.entry, current.unwrap_or_default()))
+        }
         Ok(AtPort::Exactly) => match overlay::remove(&rig.bin, &rec.entry, rig.timeout) {
             Ok(()) => {
-                log.push(format!("{LOG} removed the tailnet entry a stopped client serve left ({})", rec.entry.url()));
+                log.push(format!("{LOG} removed the tailnet entry a stopped client serve left ({url}){}", off_note(current)));
                 let _ = std::fs::remove_file(&path);
-                return overlay::serve_status(&rig.bin, rig.timeout).unwrap_or(status);
+                Reaped::Removed
             }
-            Err(e) => log.push(format!(
-                "{LOG} could not remove the tailnet entry a stopped client serve left ({}): {e:#}; `{}` removes it",
-                rec.entry.url(),
-                rec.entry.remove_command()
-            )),
+            Err(e) => {
+                log.push(format!(
+                    "{LOG} could not remove the tailnet entry a stopped client serve left ({url}): {e:#}; `{}` removes it",
+                    rec.entry.remove_command()
+                ));
+                Reaped::Untouched
+            }
         },
         Ok(AtPort::Other) => {
-            log.push(format!(
-                "{LOG} the tailnet entry a stopped client serve published ({}) has changed since; left in place",
-                rec.entry.url()
-            ));
+            log.push(format!("{LOG} the tailnet entry a stopped client serve published ({url}) has changed since; left in place"));
             let _ = std::fs::remove_file(&path);
+            Reaped::Untouched
         }
         Ok(AtPort::Free) => {
             let _ = std::fs::remove_file(&path);
+            Reaped::Untouched
         }
-        Err(_) => {}
+        Err(e) => {
+            log.push(format!("{LOG} could not read the tailnet's serve entries ({e:#}); `{}` removes ({url})", rec.entry.remove_command()));
+            Reaped::Untouched
+        }
     }
-    status
+}
+
+/// The note a removal made with `clients.remote` off carries.
+fn off_note(current: Option<&str>) -> &'static str {
+    match current {
+        None => " (clients.remote is off: darkmux runs the tool only to remove an entry its own record proves it left)",
+        Some(_) => "",
+    }
 }
 
 /// Records, publishes and checks the entry. The record goes first, so a
@@ -218,7 +275,17 @@ fn publish_owned(entry: ServeEntry, rig: &Rig, log: Vec<String>) -> Started {
 fn undo(entry: &ServeEntry, rig: &Rig) -> Vec<String> {
     match overlay::serve_status(&rig.bin, rig.timeout).ok().map(|s| overlay::at_port(&s, entry)) {
         Some(Ok(AtPort::Exactly)) => stop(entry, rig),
-        Some(Ok(_)) => {
+        Some(Ok(AtPort::Other)) => {
+            let _ = std::fs::remove_file(rig.record(entry.port));
+            vec![format!(
+                "{LOG} `{} serve` stored something other than darkmux's entry at {}; left in place, since darkmux cannot \
+                 tell it from an entry of the operator's. `{}` removes it",
+                overlay::TOOL,
+                entry.url(),
+                entry.remove_command()
+            )]
+        }
+        Some(Ok(AtPort::Free)) => {
             let _ = std::fs::remove_file(rig.record(entry.port));
             Vec::new()
         }

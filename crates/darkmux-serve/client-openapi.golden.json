@@ -1160,7 +1160,7 @@
           {
             "type": "string",
             "const": "off",
-            "description": "`clients.remote` is `off`: this machine only, and the tailnet untouched."
+            "description": "`clients.remote` is `off`: this machine only, never published."
           },
           {
             "type": "string",

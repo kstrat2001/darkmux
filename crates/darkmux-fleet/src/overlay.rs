@@ -16,8 +16,9 @@
 //! entry from anything else at the same port by its whole shape, so an
 //! operator's own entry (another handler, another target, Funnel on) is
 //! never darkmux's, and [`remove`] is only ever called on an entry that
-//! [`at_port`] answered [`AtPort::Exactly`] for. darkmux never runs the
-//! tool's `reset`, which clears every entry.
+//! [`at_port`] answered [`AtPort::Exactly`] for, naming its mount
+//! (`--set-path=/`). darkmux never runs the tool's `reset`, which clears
+//! every entry.
 
 use anyhow::{bail, Context, Result};
 use std::io::Read;
@@ -98,7 +99,7 @@ pub fn run_bounded(bin: &str, args: &[&str], timeout: Duration) -> Result<CallOu
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("`{bin}` did not answer within {:.1}s", timeout.as_secs_f64());
+            bail!("`{bin}` did not answer within {}s", timeout.as_secs());
         }
         std::thread::sleep(Duration::from_millis(5));
     };
@@ -300,16 +301,39 @@ impl ServeEntry {
         vec!["serve".into(), "--bg".into(), format!("--https={}", self.port), self.proxy.clone()]
     }
 
-    /// `serve --https=<port> off`: removes the handler at `/` on that port
-    /// (and the port, once it has no handler left). Nothing else.
+    /// `serve --https=<port> --set-path=/ off`: removes the handler at `/`
+    /// on this machine's CURRENT name and that port, and nothing else (the
+    /// port's web key, TCP record and Funnel go only once no handler is left
+    /// on it). The mount is named on purpose: with no `--set-path`, Tailscale
+    /// 1.102.4 removes EVERY handler on the port (`removeWebServe` in
+    /// `cmd/tailscale/cli/serve_v2.go`; it asks first, and with no terminal
+    /// the prompt answers yes), so an operator's mount added there between
+    /// darkmux's read and its removal would go too. The host is never an
+    /// argument: the CLI takes it from `Self.DNSName`, so an entry under an
+    /// earlier name cannot be removed this way ([`renamed_reason`]).
     pub fn remove_args(&self) -> Vec<String> {
-        vec!["serve".into(), format!("--https={}", self.port), "off".into()]
+        vec!["serve".into(), format!("--https={}", self.port), "--set-path=/".into(), "off".into()]
     }
 
     /// The command an operator runs to remove it by hand.
     pub fn remove_command(&self) -> String {
         format!("{TOOL} {}", self.remove_args().join(" "))
     }
+}
+
+/// (#3560 review) Why darkmux cannot remove `old`, an entry it published
+/// before this machine was renamed to `current`, and the remedies that work:
+/// `tailscale serve` removes only under the machine's current name.
+pub fn renamed_reason(old: &ServeEntry, current: &str) -> String {
+    format!(
+        "the tailnet entry darkmux published before this machine was renamed ({}) is still there, and `{TOOL} serve` \
+         removes entries only under the machine's current name ({current}); remove it with `{TOOL} serve reset` \
+         (which removes every serve entry on this machine, the operator's too), or rename the machine back to {}, run \
+         `{}`, and rename it again",
+        old.url(),
+        old.host,
+        old.remove_command()
+    )
 }
 
 /// What the serve configuration holds at an entry's port.
@@ -517,6 +541,9 @@ mod tests {
         let start = Instant::now();
         assert!(run_bounded(&hang, &[], Duration::from_millis(300)).is_err());
         assert!(start.elapsed() < Duration::from_secs(5));
+        // The identity provider's wording, whole seconds (`3s` at its bound).
+        let err = run_bounded(&hang, &[], Duration::from_secs(1)).unwrap_err().to_string();
+        assert!(err.ends_with("did not answer within 1s"), "{err}");
     }
 
     #[test]
@@ -586,8 +613,8 @@ mod tests {
         assert_eq!(e.url(), "https://laptop.example.ts.net:8767/");
         assert_eq!(ServeEntry::for_port("host.example.ts.net", 443).url(), "https://host.example.ts.net/");
         assert_eq!(e.publish_args(), ["serve", "--bg", "--https=8767", "http://127.0.0.1:8767"]);
-        assert_eq!(e.remove_args(), ["serve", "--https=8767", "off"]);
-        assert_eq!(e.remove_command(), "tailscale serve --https=8767 off");
+        assert_eq!(e.remove_args(), ["serve", "--https=8767", "--set-path=/", "off"]);
+        assert_eq!(e.remove_command(), "tailscale serve --https=8767 --set-path=/ off");
     }
 
     /// darkmux's entry is recognized only by its whole shape: anything an
@@ -643,7 +670,7 @@ mod tests {
         remove(&ok, &entry(), LONG).unwrap();
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
-            "serve --bg --https=8767 http://127.0.0.1:8767\nserve --https=8767 off\n"
+            "serve --bg --https=8767 http://127.0.0.1:8767\nserve --https=8767 --set-path=/ off\n"
         );
         let no = script(d.path(), "no", "echo 'Access denied: serve config denied' >&2; exit 1");
         assert!(publish(&no, &entry(), LONG).unwrap_err().to_string().contains("Access denied"));
