@@ -16,6 +16,12 @@ use serde_json::{json, Map, Value};
 use crate::client_wire::{ClientError, ClientOpenApi};
 use crate::routes::{client_table, ClientAuth, ClientRoute};
 
+/// (#3560) `docs/CLIENTS.md`: the order of calls and what to do on each
+/// outcome, which no schema expresses. The document's `info.description`,
+/// so it is written once and served with the spec; its drift test holds it
+/// to the route table and the names the document carries.
+pub(crate) const CLIENTS_GUIDE: &str = include_str!("../../../docs/CLIENTS.md");
+
 /// The document this build serves, built once.
 pub(crate) fn served() -> &'static ClientOpenApi {
     static DOC: std::sync::OnceLock<ClientOpenApi> = std::sync::OnceLock::new();
@@ -46,11 +52,7 @@ pub(crate) fn document(version: &str) -> Value {
         "info": {
             "title": "darkmux client API",
             "version": version,
-            "description": "`darkmux client serve`: listens on 127.0.0.1 only. With `clients.remote` set to \
-                `tailscale`, it is also reached through this machine's `tailscale serve` entry, where a \
-                request is answered only with a paired device's token and the tailnet login that device \
-                paired as. Every route but the pairing ones takes the token a pairing delivered. An app \
-                gates a feature on `GET /client/whoami`'s `capabilities`, never on `version`."
+            "description": CLIENTS_GUIDE
         },
         "security": [{"bearer": []}],
         "paths": paths,
@@ -516,5 +518,83 @@ mod tests {
              `DARKMUX_REGENERATE_FIXTURES=1 cargo test -p darkmux-serve client_openapi`, add the \
              route's or field's capability (`ClientCapability`) if it is a new one, and add a CHANGELOG line"
         );
+    }
+
+    // ─── docs/CLIENTS.md (#3560) ─────────────────────────────────────────
+
+    /// The call sequence the document opens with is `docs/CLIENTS.md`,
+    /// word for word: written once, served with the spec.
+    #[test]
+    fn the_description_is_the_clients_guide() {
+        assert_eq!(doc()["info"]["description"], CLIENTS_GUIDE);
+        assert!(CLIENTS_GUIDE.starts_with("# Using the darkmux client API"), "{CLIENTS_GUIDE}");
+    }
+
+    /// Every name the document carries: each property, each constant and
+    /// enum value (codes, capabilities, statuses), and each parameter.
+    fn spec_names(v: &Value, out: &mut std::collections::BTreeSet<String>) {
+        match v {
+            Value::Object(m) => {
+                if let Some(Value::String(c)) = m.get("const") {
+                    out.insert(c.clone());
+                }
+                if let (Some(Value::String(name)), Some(_)) = (m.get("name"), m.get("in")) {
+                    out.insert(name.clone());
+                }
+                if let Some(Value::Object(props)) = m.get("properties") {
+                    out.extend(props.keys().cloned());
+                }
+                for (k, x) in m {
+                    if k != "description" {
+                        spec_names(x, out);
+                    }
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|x| spec_names(x, out)),
+            _ => {}
+        }
+    }
+
+    /// Why `span` (a backticked span of the guide) names nothing this API
+    /// has, or `None`: a route (`METHOD /client/...`, or a bare path) must
+    /// be in the route table with that method; any other span must be one
+    /// name (`names`); a `darkmux ...` command is checked by the CLI's own
+    /// tests (`the_clients_guide_names_only_commands_that_exist`).
+    fn unknown(span: &str, names: &std::collections::BTreeSet<String>) -> Option<String> {
+        let routes: Vec<(String, String)> = client_table()
+            .into_iter()
+            .map(|r| (r.method.to_uppercase(), path_template(r.path).0))
+            .collect();
+        if span.starts_with("darkmux ") {
+            return None;
+        }
+        let (method, path) = match span.split_once(' ') {
+            Some((m, p)) if p.starts_with("/client/") => (Some(m), p),
+            _ => (None, span),
+        };
+        if path.starts_with("/client/") {
+            let known = routes.iter().any(|(m, p)| p == path && method.is_none_or(|want| want == m));
+            return (!known).then(|| format!("no route {span}"));
+        }
+        (!names.contains(span)).then(|| format!("`{span}` is no route, code, capability or name of this API"))
+    }
+
+    /// `docs/CLIENTS.md` names only routes, codes, capabilities and names
+    /// the API has: a route renamed or a code retired fails here, naming the
+    /// span. The checker itself is shown to refuse what does not exist.
+    #[test]
+    fn the_clients_guide_names_only_what_the_api_has() {
+        let mut names = std::collections::BTreeSet::new();
+        spec_names(&doc(), &mut names);
+        let spans: Vec<&str> = CLIENTS_GUIDE.split('`').skip(1).step_by(2).collect();
+        assert!(spans.len() > 40, "the guide's spans were read: {spans:?}");
+        let wrong: Vec<String> = spans.iter().filter_map(|s| unknown(s, &names)).collect();
+        assert!(wrong.is_empty(), "docs/CLIENTS.md names what the client API does not have: {wrong:#?}");
+        for bad in ["not_lokal", "remote_pairing", "GET /client/pair", "DELETE /client/work/{work_id}", "/client/nope", "Bearer token"] {
+            assert!(unknown(bad, &names).is_some(), "the check must refuse `{bad}`");
+        }
+        for good in ["not_local", "remote_requests", "GET /client/pair/{request_id}", "X-Pair-Secret", "darkmux client approve"] {
+            assert_eq!(unknown(good, &names), None, "`{good}`");
+        }
     }
 }

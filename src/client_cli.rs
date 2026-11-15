@@ -141,9 +141,17 @@ fn age(now: u64, then: u64) -> String {
     }
 }
 
+/// One request as `client approve` offers it: what the app says (its device
+/// name and code), its age, and (#3560) for one through the tailnet entry,
+/// what Tailscale says about the device.
 fn describe(p: &PendingRequest, now: u64) -> String {
+    let tailnet = p
+        .tailnet
+        .as_ref()
+        .map(|t| format!("\n  tailnet: {}", darkmux_serve::client_tailnet::described(t)))
+        .unwrap_or_default();
     format!(
-        "  device: {}\n  code:   {}\n  age:    {}",
+        "  device: {}\n  code:   {}\n  age:    {}{tailnet}",
         darkmux_platform::display_safe(&p.device_name),
         darkmux_platform::display_safe(&p.code),
         age(now, p.created)
@@ -271,14 +279,18 @@ fn act_on(store: &ClientStore, now: u64, p: &PendingRequest, reply: &str) -> Res
 fn client_lines(store: &ClientStore, now: u64) -> Result<Vec<String>> {
     let mut lines: Vec<String> = cp::list_clients(store)?
         .into_iter()
-        .map(|c| format!("{}  (paired {}{})", c.name, age(now, c.created), on_its_own(c.auto_approved.as_ref())))
+        .map(|c| {
+            let how = format!("{}{}", on_its_own(c.auto_approved.as_ref()), over_the_tailnet(c.tailnet.as_ref()));
+            format!("{}  (paired {}{how})", c.name, age(now, c.created))
+        })
         .collect();
     lines.extend(cp::list_uncollected(store, now)?.into_iter().map(|p| {
         let name = p.client_name.unwrap_or_default();
         format!(
-            "{name}  (approved {}{}; its app has not collected its token yet: `darkmux client revoke {name}` takes it back)",
+            "{name}  (approved {}{}{}; its app has not collected its token yet: `darkmux client revoke {name}` takes it back)",
             age(now, p.created),
-            on_its_own(p.auto_approved.as_ref())
+            on_its_own(p.auto_approved.as_ref()),
+            over_the_tailnet(p.tailnet.as_ref())
         )
     }));
     if lines.is_empty() {
@@ -294,6 +306,13 @@ fn client_lines(store: &ClientStore, now: u64) -> Result<Vec<String>> {
 /// What `client list` adds for a pairing approved with no operator step.
 fn on_its_own(auto: Option<&cp::SigningIdentity>) -> String {
     auto.map(|app| format!(", auto-approved: signed by {app}")).unwrap_or_default()
+}
+
+/// (#3560) What `client list` adds for a pairing made through the tailnet
+/// entry: the user and device it is answered from there.
+fn over_the_tailnet(t: Option<&darkmux_serve::client_tailnet::TailnetIdentity>) -> String {
+    let safe = darkmux_platform::display_safe;
+    t.map(|t| format!(", over the tailnet as {} from {}", safe(&t.login), safe(&t.device.name))).unwrap_or_default()
 }
 
 /// `darkmux doctor`'s row for client workspaces no paired client owns.
@@ -428,12 +447,52 @@ mod tests {
                         client_name: None,
                         client_id: None,
                         auto_approved: None,
+                        tailnet: None,
                     });
                 }
                 Ok(())
             })
             .unwrap();
         (dir, store, ids)
+    }
+
+    /// (#3560) Sam's phone, as a pairing through the tailnet entry records it.
+    fn sams_phone() -> darkmux_serve::client_tailnet::TailnetIdentity {
+        darkmux_serve::client_tailnet::TailnetIdentity {
+            login: "sam@example.com".into(),
+            device: darkmux_serve::client_tailnet::TailnetDevice {
+                id: "nPHONE1CNTRL".into(),
+                name: "sams-iphone".into(),
+                host_name: Some("Sam's iPhone".into()),
+            },
+        }
+    }
+
+    /// (#3560) `client approve` shows a request through the tailnet entry
+    /// with what Tailscale says about it, beside what the app says, so the
+    /// operator knows what they are approving; `client list` then shows the
+    /// client as paired over the tailnet. Neither shows the device's id.
+    #[test]
+    fn approve_and_list_show_what_tailscale_says_about_a_remote_device() {
+        let (_d, store, ids) = store_with(&["AAA", "BBB"]);
+        store.update(|f| { f.pending[0].tailnet = Some(sams_phone()); Ok(()) }).unwrap();
+        let pending = cp::list_pending(&store, 200).unwrap();
+        let shown = describe(&pending[0], 200);
+        assert!(shown.contains("  device: phone 0\n"), "{shown}");
+        assert!(shown.contains("  tailnet: tailnet user sam@example.com, device sams-iphone (Sam's iPhone)"), "{shown}");
+        assert!(!shown.contains("nPHONE1CNTRL"), "{shown}");
+        assert!(!describe(&pending[1], 200).contains("tailnet"), "a request from this Mac has no tailnet line");
+        let name = cp::approve(&store, &ids[0], 200).unwrap();
+        let shown = listed(&store, 200, "x");
+        assert!(shown.contains("over the tailnet as sam@example.com from sams-iphone"), "uncollected: {shown}");
+        store.update(|f| {
+            let p = f.pending.remove(0);
+            f.clients.push(cp::ApprovedClient { name: name.clone(), id: "c-1".into(), created: 200, token_hash: "00".into(), auto_approved: None, tailnet: p.tailnet });
+            Ok(())
+        }).unwrap();
+        let shown = listed(&store, 200, "x");
+        assert!(shown.contains(&format!("{name}  (paired 0s ago, over the tailnet as sam@example.com from sams-iphone)")), "{shown}");
+        assert!(!shown.contains("nPHONE1CNTRL"), "{shown}");
     }
 
     fn statuses(store: &ClientStore) -> Vec<cp::PendingStatus> {
@@ -517,6 +576,35 @@ mod tests {
         let mut argv = shown.clone();
         *argv.last_mut().unwrap() = "4F7-K2Q";
         assert!(crate::cli::Cli::try_parse_from(argv).is_ok(), "{APPROVE_COMMAND}");
+    }
+
+    /// Whether `span`, a `darkmux ...` command as a document writes it
+    /// (`<CODE>` and the like standing for a value), names a command this
+    /// binary has: it parses once each placeholder is a value, or fails only
+    /// for a missing argument (the guide names `client revoke` without one).
+    fn command_exists(span: &str) -> bool {
+        use clap::Parser;
+        let argv: Vec<&str> = span.split_whitespace().map(|w| if w.starts_with('<') { "X" } else { w }).collect();
+        match crate::cli::Cli::try_parse_from(argv) {
+            Ok(_) => true,
+            Err(e) => e.kind() == clap::error::ErrorKind::MissingRequiredArgument,
+        }
+    }
+
+    /// (#3560) Every `darkmux ...` command `docs/CLIENTS.md` names is one this
+    /// binary has (`darkmux-serve` checks its routes, codes and names). The
+    /// check refuses a command that does not exist.
+    #[test]
+    fn the_clients_guide_names_only_commands_that_exist() {
+        let guide = include_str!("../docs/CLIENTS.md");
+        let commands: Vec<&str> = guide.split('`').skip(1).step_by(2).filter(|s| s.starts_with("darkmux ")).collect();
+        assert!(commands.len() >= 3, "{commands:?}");
+        for c in &commands {
+            assert!(command_exists(c), "docs/CLIENTS.md names `{c}`, which this darkmux does not have");
+        }
+        for bad in ["darkmux client allow", "darkmux client approve --kode <CODE>", "darkmux clients serve"] {
+            assert!(!command_exists(bad), "the check must refuse `{bad}`");
+        }
     }
 
     fn listed(store: &ClientStore, now: u64, policy: &str) -> String {

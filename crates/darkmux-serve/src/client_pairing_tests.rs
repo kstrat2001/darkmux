@@ -49,7 +49,43 @@ struct Harness {
     /// (#3544) The pairing seams: who signed each pid, what the dialog
     /// answers, and what it and the notice were asked to show.
     trust: TrustSeams,
+    /// (#3560) What the tailnet's `whois` answers for each address (an
+    /// address not here: no device), and how many times it was asked.
+    devices: Devices,
     state: ClientServerState,
+}
+
+/// (#3560) What the harness's `whois` answers for one address.
+type WhoisAnswer = Result<Option<darkmux_fleet::NodeIdentity>, String>;
+
+/// (#3560) The harness's `whois`: an answer per address, and a call count.
+#[derive(Clone, Default)]
+struct Devices {
+    at: Arc<Mutex<HashMap<std::net::IpAddr, WhoisAnswer>>>,
+    asked: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Devices {
+    fn wire(&self, state: &mut ClientServerState) {
+        let (at, asked) = (self.at.clone(), self.asked.clone());
+        state.device_at = Arc::new(move |ip| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            at.lock().unwrap().get(&ip).cloned().unwrap_or(Ok(None))
+        });
+    }
+    /// `whois` of each of `addrs` names `node`.
+    fn place(&self, node: &darkmux_fleet::NodeIdentity, addrs: &[&str]) {
+        for a in addrs {
+            self.at.lock().unwrap().insert(a.parse().unwrap(), Ok(Some(node.clone())));
+        }
+    }
+    /// `whois` of `addr` fails (the daemon down, the tool missing).
+    fn fail(&self, addr: &str) {
+        self.at.lock().unwrap().insert(addr.parse().unwrap(), Err("tailscaled is not running".into()));
+    }
+    fn asked(&self) -> usize {
+        self.asked.load(Ordering::SeqCst)
+    }
 }
 
 /// pid -> the answers `signed_app` gives in turn.
@@ -386,12 +422,17 @@ fn harness() -> Harness {
         body_limits: BodyLimits::default(),
         remote: ClientRemote::off(),
         tailnet_entry: None,
+        device_at: Arc::new(|_| Err("wired below".to_string())),
+        device_cache: Arc::new(crate::fleet_listener::IdentityCache::new()),
     };
     let trust = TrustSeams::new();
+    let devices = Devices::default();
     let mut state = state;
     trust.wire(&mut state);
+    devices.wire(&mut state);
     Harness {
         trust,
+        devices,
         activity,
         preview_on,
         preview_idle,
@@ -674,7 +715,7 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
                            "version": env!("CARGO_PKG_VERSION"),
                            "capabilities": ["clean_preview", "template_workspace", "continues", "clone_preview",
                                             "recipe_set", "workspace_image", "workspace_edit", "workspace_remove",
-                                            "remote_tailscale"],
+                                            "remote_tailscale", "remote_requests"],
                            "remote": {"state": "off", "url": null, "reason": null},
                            "via": "local"})
     );
@@ -688,20 +729,48 @@ const TAILNET_HOST: &str = "studio.example.ts.net:8767";
 const SAM: &str = "sam@example.com";
 
 /// The harness with `client serve` published on the tailnet: `whoami.remote`
-/// available and the entry requests arrive through.
+/// available, the entry requests arrive through, and the tailnet's
+/// `whois` naming Sam's phone at its two addresses.
 fn on_the_tailnet(h: &mut Harness) {
     let entry = darkmux_fleet::overlay::ServeEntry::for_port("studio.example.ts.net", 8767);
     h.state.remote = ClientRemote::available(entry.url());
     h.state.tailnet_entry = Some(entry);
+    h.devices.place(&phone_node(), &[PHONE_V4, PHONE_V6]);
 }
 
-/// Records `login` as the tailnet identity of the client named `name`, as
-/// pairing over the tailnet will (#3560's next part).
+/// Sam's phone's tailnet addresses (`forwarded` comes from the first).
+const PHONE_V4: &str = "100.64.1.2";
+const PHONE_V6: &str = "fd7a:115c:a1e0::1234";
+/// Another device of Sam's, on the same tailnet.
+const LAPTOP_V4: &str = "100.64.1.9";
+
+/// Sam's phone as the tailnet's `whois` names it.
+fn phone_node() -> darkmux_fleet::NodeIdentity {
+    let mut n = darkmux_fleet::test_node("nPHONE1CNTRL", "sams-iphone", PHONE_V4);
+    n.addresses.push(PHONE_V6.parse().unwrap());
+    n.host_name = Some("Sam's iPhone".into());
+    n
+}
+
+/// The tailnet identity a pairing from Sam's phone as `login` records.
+fn phone_as(login: &str) -> crate::client_tailnet::TailnetIdentity {
+    crate::client_tailnet::TailnetIdentity {
+        login: login.to_string(),
+        device: crate::client_tailnet::TailnetDevice {
+            id: "nPHONE1CNTRL".into(),
+            name: "sams-iphone".into(),
+            host_name: Some("Sam's iPhone".into()),
+        },
+    }
+}
+
+/// Records Sam's phone, as `login`, as the tailnet identity of the client
+/// named `name`, as a pairing over the tailnet records it.
 fn paired_as(h: &Harness, name: &str, login: &str) {
     h.store
         .update(|f| {
             let c = f.clients.iter_mut().find(|c| c.name == name).unwrap();
-            c.tailnet = Some(crate::client_tailnet::TailnetIdentity { login: login.to_string() });
+            c.tailnet = Some(phone_as(login));
             Ok(())
         })
         .unwrap();
@@ -904,6 +973,7 @@ async fn an_entry_on_443_is_named_with_or_without_the_port() {
     let entry = darkmux_fleet::overlay::ServeEntry::for_port("studio.example.ts.net", 443);
     h.state.remote = ClientRemote::available(entry.url());
     h.state.tailnet_entry = Some(entry);
+    h.devices.place(&phone_node(), &[PHONE_V4]);
     let auth = bearer(&token);
     for host in ["studio.example.ts.net", "studio.example.ts.net:443", "Studio.Example.TS.net"] {
         let headers: Vec<(&str, &str)> = forwarded(Some(SAM))
@@ -935,30 +1005,329 @@ async fn with_no_entry_published_a_tailnet_request_is_refused_as_before() {
     }
 }
 
-/// Pairing over the tailnet is #3560's next part: through the entry, the
-/// pairing request and its poll (the routes that take no token) are refused
-/// with `remote_pairing_unavailable`, before anything is recorded, even with
-/// a paired device's token and identity.
+// ─── Pairing over the tailnet (#3560, part 3) ────────────────────────────
+
+/// `headers` (as `forwarded` builds them) as from the tailnet address `addr`.
+fn from_addr(headers: Vec<(&'static str, &'static str)>, addr: &'static str) -> Vec<(&'static str, &'static str)> {
+    headers.into_iter().map(|(k, v)| (k, if k == "x-forwarded-for" { addr } else { v })).collect()
+}
+
+/// A pairing request through the entry, from `headers`.
+async fn pair_through(h: &Harness, headers: &[(&str, &str)]) -> (u16, Value) {
+    call(h, adding(post("/client/pair", None, pair_body()), headers)).await
+}
+
+/// A poll of `id` with the pairing's secret, from `headers`.
+async fn poll_through(h: &Harness, id: &str, headers: &[(&str, &str)]) -> (u16, Value) {
+    let mut all = headers.to_vec();
+    all.push(("x-pair-secret", SECRET));
+    call(h, get(&format!("/client/pair/{id}"), &all)).await
+}
+
+/// The request id of a pairing Sam's phone asked for through the entry.
+async fn asked_remotely(h: &Harness) -> String {
+    let (status, v) = pair_through(h, &forwarded(Some(SAM))).await;
+    assert_eq!(status, 202, "{v}");
+    v["request_id"].as_str().unwrap().to_string()
+}
+
+/// Sam's phone paired over the tailnet: asked through the entry, approved on
+/// this Mac (`client approve`), collected through the entry. Its token.
+async fn paired_remotely(h: &Harness) -> String {
+    let id = asked_remotely(h).await;
+    approve(&h.store, &id, (h.state.now)()).unwrap();
+    let (status, v) = poll_through(h, &id, &forwarded(Some(SAM))).await;
+    assert_eq!(status, 200, "{v}");
+    v["token"].as_str().unwrap().to_string()
+}
+
+/// The pending request `id`, as stored.
+fn pending_record(h: &Harness, id: &str) -> PendingRequest {
+    h.store.read().unwrap().pending.into_iter().find(|p| p.request_id == id).unwrap()
+}
+
+/// A phone on the tailnet pairs through the entry; the operator approves it
+/// on this Mac; the approval records the identity the pairing request came
+/// with (Tailscale's user, `whois`'s device); the token then works through
+/// the entry, as `remote_requests` says it will.
 #[tokio::test]
-async fn pairing_through_the_tailnet_is_refused_for_now() {
+async fn a_device_pairs_over_the_tailnet_once_approved_on_this_mac() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    let id = asked_remotely(&h).await;
+    assert_eq!(pending_record(&h, &id).tailnet, Some(phone_as(SAM)));
+    let (status, v) = poll_through(&h, &id, &forwarded(Some(SAM))).await;
+    assert_eq!((status, v["status"].as_str()), (200, Some("pending")), "waits for the Mac: {v}");
+    approve(&h.store, &id, (h.state.now)()).unwrap();
+    let (status, v) = poll_through(&h, &id, &forwarded(Some(SAM))).await;
+    assert_eq!(status, 200, "{v}");
+    let token = v["token"].as_str().unwrap().to_string();
+    let clients = list_clients(&h.store).unwrap();
+    assert_eq!(clients.len(), 1);
+    assert_eq!(clients[0].tailnet, Some(phone_as(SAM)), "the approval recorded the request's identity");
+    let auth = bearer(&token);
+    let (status, v) = call(&h, get("/client/whoami", &with_token(&forwarded(Some(SAM)), Some(&auth)))).await;
+    assert_eq!((status, v["via"].as_str()), (200, Some("tailnet")), "{v}");
+    assert!(v["capabilities"].as_array().unwrap().contains(&serde_json::json!("remote_requests")), "{v}");
+    let req = adding(post("/client/work", Some(&token), work_body(Some("fast"), None)), &forwarded(Some(SAM)));
+    assert_eq!(call(&h, req).await.0, 202);
+}
+
+/// A forwarded pairing is never approved on its own: the process holding
+/// its loopback connection is Tailscale's, so no signature can speak for
+/// the device. Here that process even verifies as Mux Bot, which would
+/// pair a request from this Mac at once; through the entry it waits.
+#[tokio::test]
+async fn a_forwarded_pairing_is_never_approved_on_its_own() {
+    let mut h = harness();
+    h.app_signs_as(vec![Ok(mux_bot())]);
+    on_the_tailnet(&mut h);
+    let id = asked_remotely(&h).await;
+    let message = dialog_shown(&h, 1).await;
+    assert_eq!(h.status(&id), Some(PendingStatus::Pending), "never auto-approved");
+    assert_eq!(pending_record(&h, &id).auto_approved, None);
+    assert!(h.trust.notices.lock().unwrap().is_empty(), "no paired notice");
+    assert!(!message.contains("Signed by"), "no signature is shown for it: {message}");
+    let (status, v) = poll_through(&h, &id, &forwarded(Some(SAM))).await;
+    assert_eq!((status, v["status"].as_str()), (200, Some("pending")), "{v}");
+}
+
+/// The dialog shows what Tailscale says about the device (the code, the
+/// tailnet user, the device's name), never the body's claims, and an
+/// Allow approves without remembering anything: the next pairing asks again.
+#[tokio::test]
+async fn the_dialog_shows_the_tailnet_identity_and_allow_remembers_nothing() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    h.dialog_answers(darkmux_platform::AllowAnswer::Allow);
+    let id = asked_remotely(&h).await;
+    let message = dialog_shown(&h, 1).await;
+    for part in ["Code 4F7-K2Q.", SAM, "sams-iphone", "Sam's iPhone", "tailnet"] {
+        assert!(message.contains(part), "{part}: {message}");
+    }
+    assert!(!message.contains("Mac"), "names no one platform: {message}");
+    assert_eq!(h.status(&id), Some(PendingStatus::Approved));
+    assert!(remembered_apps(&h.store).unwrap().is_empty(), "nothing remembered");
+    asked_remotely(&h).await;
+    dialog_shown(&h, 2).await;
+}
+
+/// The identity is the request's own, from Tailscale, never the body's: a
+/// body naming another device leaves the recorded device `whois`'s, and a
+/// body that tries to carry an identity is refused as any unknown field is.
+#[tokio::test]
+async fn the_recorded_identity_is_the_requests_never_the_bodys() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    let mut body = pair_body();
+    body["device_name"] = serde_json::json!("alex@example.com's laptop");
+    let (status, v) = call(&h, adding(post("/client/pair", None, body), &forwarded(Some(SAM)))).await;
+    assert_eq!(status, 202, "{v}");
+    let id = v["request_id"].as_str().unwrap();
+    assert_eq!(pending_record(&h, id).tailnet, Some(phone_as(SAM)));
+    let mut body = pair_body();
+    body["tailnet"] = serde_json::json!({"login": "alex@example.com"});
+    let before = pending_count(&h);
+    let (status, v) = call(&h, adding(post("/client/pair", None, body), &forwarded(Some(SAM)))).await;
+    assert_eq!((status, v["code"].as_str()), (400, Some("bad_request")), "{v}");
+    assert_eq!(pending_count(&h), before);
+}
+
+/// A pairing through the entry that Tailscale names no user for (a tagged
+/// device) is refused with the code and its remedy, before `whois` runs
+/// and before anything is recorded.
+#[tokio::test]
+async fn a_forwarded_pairing_with_no_tailnet_user_is_refused() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    let (status, v) = pair_through(&h, &forwarded(None)).await;
+    assert_eq!((status, v["code"].as_str()), (403, Some("remote_identity_missing")), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("tag"), "{v}");
+    assert_eq!(pending_count(&h), 0);
+    assert_eq!(h.devices.asked(), 0);
+}
+
+/// Fail closed: when `whois` cannot say which device is at the forwarded
+/// address (it failed, or names none), a pairing is refused and nothing is
+/// recorded, and a paired device's request is refused and nothing runs.
+#[tokio::test]
+async fn when_whois_cannot_name_the_device_the_request_is_refused() {
     let mut h = harness();
     let token = paired(&h).await;
     paired_as(&h, "sam-s-iphone", SAM);
-    let pending = request_pairing(&h).await;
     on_the_tailnet(&mut h);
-    let before = pending_count(&h);
+    h.devices.fail(PHONE_V4);
     let auth = bearer(&token);
-    let pair = adding(post("/client/pair", Some(&token), pair_body()), &forwarded(Some(SAM)));
-    let (status, v) = call(&h, pair).await;
-    assert_eq!((status, v["code"].as_str()), (403, Some("remote_pairing_unavailable")), "{v}");
-    assert_eq!(pending_count(&h), before, "nothing recorded");
-    let mut headers = with_token(&forwarded(Some(SAM)), Some(&auth));
-    headers.push(("x-pair-secret", SECRET));
-    let (status, v) = call(&h, get(&format!("/client/pair/{pending}"), &headers)).await;
-    assert_eq!((status, v["code"].as_str()), (403, Some("remote_pairing_unavailable")), "{v}");
-    // Still pairs from this machine.
-    let (status, v) = poll(&h, &pending, SECRET).await;
+    for headers in [forwarded(Some(SAM)), from_addr(forwarded(Some(SAM)), "100.64.200.200")] {
+        let (status, v) = pair_through(&h, &headers).await;
+        assert_eq!((status, v["code"].as_str()), (403, Some("remote_device_unknown")), "{v}");
+        assert!(v["error"].as_str().unwrap().contains("tailscale status"), "the remedy: {v}");
+        assert_eq!(pending_count(&h), 0, "nothing recorded");
+        let (status, v) = call(&h, get("/client/whoami", &with_token(&headers, Some(&auth)))).await;
+        assert_eq!((status, v["code"].as_str()), (403, Some("remote_device_unknown")), "{v}");
+        let req = adding(post("/client/work", Some(&token), work_body(Some("fast"), None)), &headers);
+        assert_eq!(call(&h, req).await.1["code"], "remote_device_unknown");
+    }
+    assert!(h.ran.lock().unwrap().is_empty());
+}
+
+/// A token is pinned to the device it paired from: the same tailnet user on
+/// another of their devices is refused, naming that device.
+#[tokio::test]
+async fn a_token_used_from_another_device_of_the_same_user_is_refused() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    let token = paired_remotely(&h).await;
+    h.devices.place(&darkmux_fleet::test_node("nLAPTOP1CNTRL", "sams-laptop", LAPTOP_V4), &[LAPTOP_V4]);
+    let auth = bearer(&token);
+    let (status, v) = call(&h, get("/client/whoami", &with_token(&from_addr(forwarded(Some(SAM)), LAPTOP_V4), Some(&auth)))).await;
+    assert_eq!((status, v["code"].as_str()), (403, Some("remote_device_mismatch")), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("sams-laptop"), "{v}");
+    let (status, v) = call(&h, get("/client/whoami", &with_token(&forwarded(Some(SAM)), Some(&auth)))).await;
     assert_eq!(status, 200, "{v}");
+    let (status, v) = call(&h, get("/client/whoami", &with_token(&from_addr(forwarded(Some(SAM)), PHONE_V6), Some(&auth)))).await;
+    assert_eq!(status, 200, "the device's other address is the same device: {v}");
+}
+
+/// `whois` runs only for a request through darkmux's entry, and only once
+/// the cheap checks pass: never for a request from this Mac, never with no
+/// entry, never without a valid token or with the wrong user. An answer
+/// that named a device is kept briefly; a failure is asked again.
+#[tokio::test]
+async fn whois_runs_only_through_the_entry_and_only_after_the_token_and_user() {
+    let mut h = harness();
+    let token = paired(&h).await;
+    paired_as(&h, "sam-s-iphone", SAM);
+    let auth = bearer(&token);
+    let good = with_token(&forwarded(Some(SAM)), Some(&auth));
+    assert_eq!(call(&h, get("/client/whoami", &good)).await.1["code"], "not_local", "no entry");
+    on_the_tailnet(&mut h);
+    assert_eq!(call(&h, get("/client/whoami", &[("authorization", &auth)])).await.0, 200, "from this Mac");
+    assert_eq!(call(&h, get("/client/whoami", &forwarded(Some(SAM)))).await.0, 401, "no token");
+    let mut other = forwarded(None);
+    other.push(("tailscale-user-login", "alex@example.com"));
+    assert_eq!(call(&h, get("/client/whoami", &with_token(&other, Some(&auth)))).await.1["code"], "remote_identity_mismatch");
+    assert_eq!(h.devices.asked(), 0, "nothing asked yet");
+    assert_eq!(call(&h, get("/client/whoami", &good)).await.0, 200);
+    assert_eq!(call(&h, get("/client/whoami", &good)).await.0, 200);
+    assert_eq!(h.devices.asked(), 1, "a named device is kept");
+    h.devices.fail(LAPTOP_V4);
+    let laptop = with_token(&from_addr(forwarded(Some(SAM)), LAPTOP_V4), Some(&auth));
+    for _ in 0..2 {
+        assert_eq!(call(&h, get("/client/whoami", &laptop)).await.1["code"], "remote_device_unknown");
+    }
+    assert_eq!(h.devices.asked(), 3, "a failure is never kept");
+}
+
+/// The token goes only to the device and user that asked for the pairing:
+/// a poll from this Mac is a 404, one from another user or device is
+/// refused with its code, and none of them uses up the delivery. A pairing
+/// made on this Mac is not collected through the entry.
+#[tokio::test]
+async fn the_poll_must_come_the_way_the_pairing_did() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    h.devices.place(&darkmux_fleet::test_node("nLAPTOP1CNTRL", "sams-laptop", LAPTOP_V4), &[LAPTOP_V4]);
+    let id = asked_remotely(&h).await;
+    approve(&h.store, &id, (h.state.now)()).unwrap();
+    assert_eq!(poll(&h, &id, SECRET).await.0, 404, "from this Mac");
+    let mut alex = forwarded(None);
+    alex.push(("tailscale-user-login", "alex@example.com"));
+    assert_eq!(poll_through(&h, &id, &alex).await.1["code"], "remote_identity_mismatch");
+    assert_eq!(poll_through(&h, &id, &from_addr(forwarded(Some(SAM)), LAPTOP_V4)).await.1["code"], "remote_device_mismatch");
+    assert_eq!(poll_through(&h, &id, &forwarded(None)).await.1["code"], "remote_identity_missing");
+    let (status, v) = poll_through(&h, &id, &forwarded(Some(SAM))).await;
+    assert!(status == 200 && v["token"].is_string(), "still delivered once: {v}");
+    let local = request_pairing(&h).await;
+    approve(&h.store, &local, (h.state.now)()).unwrap();
+    assert_eq!(poll_through(&h, &local, &forwarded(Some(SAM))).await.1["code"], "not_paired_remotely");
+    assert_eq!(poll(&h, &local, SECRET).await.0, 200, "still collected on this Mac");
+}
+
+/// Revoking a device on this Mac stops it remotely at once: its token is
+/// unknown through the entry, and an approval it has not collected yet is
+/// taken back.
+#[tokio::test]
+async fn revoking_a_device_stops_it_through_the_entry_too() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    let token = paired_remotely(&h).await;
+    let auth = bearer(&token);
+    let headers = with_token(&forwarded(Some(SAM)), Some(&auth));
+    assert_eq!(call(&h, get("/client/whoami", &headers)).await.0, 200);
+    let name = list_clients(&h.store).unwrap()[0].name.clone();
+    assert!(revoke(&h.store, &name).unwrap());
+    let (status, v) = call(&h, get("/client/whoami", &headers)).await;
+    assert_eq!((status, v["code"].as_str()), (401, Some("unauthorized")), "{v}");
+    let id = asked_remotely(&h).await;
+    let name = approve(&h.store, &id, (h.state.now)()).unwrap();
+    assert!(revoke(&h.store, &name).unwrap());
+    assert_eq!(poll_through(&h, &id, &forwarded(Some(SAM))).await.1["status"], "denied");
+}
+
+/// A remote pairing nobody approves expires like a local one, and an
+/// expired one cannot then be approved.
+#[tokio::test]
+async fn a_remote_pairing_nobody_approves_expires() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    let id = asked_remotely(&h).await;
+    h.clock.fetch_add(PENDING_TTL_SECS + 1, Ordering::SeqCst);
+    assert_eq!(poll_through(&h, &id, &forwarded(Some(SAM))).await, (200, serde_json::json!({"status": "expired"})));
+    assert!(approve(&h.store, &id, (h.state.now)()).is_err());
+}
+
+/// One device on the tailnet holds at most two waiting requests, its next
+/// replacing its oldest, so it never crowds out another device or the app
+/// on this Mac, though every forwarded request comes from one process.
+#[tokio::test]
+async fn one_device_cannot_crowd_out_the_others() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    h.devices.place(&darkmux_fleet::test_node("nLAPTOP1CNTRL", "sams-laptop", LAPTOP_V4), &[LAPTOP_V4]);
+    let app = request_pairing(&h).await;
+    let (_, v) = pair_through(&h, &from_addr(forwarded(Some(SAM)), LAPTOP_V4)).await;
+    let laptop = v["request_id"].as_str().unwrap().to_string();
+    let mut phone = Vec::new();
+    for _ in 0..PAIR_REQUESTS_PER_PROCESS + 2 {
+        phone.push(asked_remotely(&h).await);
+    }
+    let live: Vec<String> = list_pending(&h.store, (h.state.now)()).unwrap().into_iter().map(|p| p.request_id).collect();
+    assert_eq!(live, [app, laptop, phone[2].clone(), phone[3].clone()], "only the phone's oldest went");
+}
+
+/// The pair secret is never kept or shown: the store holds its hash, and
+/// neither the dialog nor the serve log line carries it.
+#[tokio::test]
+async fn a_remote_pairings_secret_is_never_stored_or_shown() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    let id = asked_remotely(&h).await;
+    let message = dialog_shown(&h, 1).await;
+    let store = std::fs::read_to_string(h.dir.path().join("clients.json")).unwrap();
+    assert!(!store.contains(SECRET) && !message.contains(SECRET), "{store}\n{message}");
+    let p = pending_record(&h, &id);
+    let line = crate::client_trust::remote_pairing_line(&p.request_id, &p.code, p.tailnet.as_ref().unwrap());
+    assert!(line.contains(SAM) && line.contains("darkmux client approve --code 4F7-K2Q") && !line.contains(SECRET), "{line}");
+}
+
+/// A device that paired on this Mac and then pairs over the tailnet is a
+/// new client with the identity recorded; the first keeps working on this
+/// Mac until it is revoked.
+#[tokio::test]
+async fn pairing_again_over_the_tailnet_makes_a_new_client() {
+    let mut h = harness();
+    let local = paired(&h).await;
+    on_the_tailnet(&mut h);
+    let remote = paired_remotely(&h).await;
+    let clients = list_clients(&h.store).unwrap();
+    assert_eq!(clients.len(), 2);
+    assert_eq!((clients[0].tailnet.as_ref(), clients[1].tailnet.as_ref()), (None, Some(&phone_as(SAM))));
+    assert_ne!(clients[0].id, clients[1].id);
+    assert_eq!(call(&h, get("/client/whoami", &[("authorization", &bearer(&local))])).await.0, 200);
+    let (l, r) = (bearer(&local), bearer(&remote));
+    assert_eq!(call(&h, get("/client/whoami", &with_token(&forwarded(Some(SAM)), Some(&l)))).await.1["code"], "not_paired_remotely");
+    assert_eq!(call(&h, get("/client/whoami", &with_token(&forwarded(Some(SAM)), Some(&r)))).await.0, 200);
 }
 
 /// A web page reaches the entry too (a phone's browser): through the
@@ -1683,13 +2052,27 @@ fn a_1_2_store_reads_as_1_3_and_a_tailnet_identity_round_trips() {
     assert!(std::fs::read_to_string(&path).unwrap().contains(r#""schema_version": "1.3""#));
     store
         .update(|f| {
-            f.clients[0].tailnet = Some(crate::client_tailnet::TailnetIdentity { login: "sam@example.com".into() });
+            f.clients[0].tailnet = Some(phone_as("sam@example.com"));
+            f.pending.push(PendingRequest {
+                request_id: "r-1".into(),
+                device_name: "phone".into(),
+                code: "C".into(),
+                pair_secret_hash: "00".into(),
+                created: 1,
+                status: PendingStatus::Pending,
+                client_name: None,
+                client_id: None,
+                auto_approved: None,
+                tailnet: Some(phone_as("sam@example.com")),
+            });
             Ok(())
         })
         .unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains(r#""tailnet": {"#) && text.contains(r#""login": "sam@example.com""#), "{text}");
-    assert_eq!(store.read().unwrap().clients[0].tailnet.as_ref().map(|t| t.login.as_str()), Some("sam@example.com"));
+    let read = store.read().unwrap();
+    assert_eq!(read.clients[0].tailnet, Some(phone_as("sam@example.com")));
+    assert_eq!(read.pending[0].tailnet, Some(phone_as("sam@example.com")), "a request's identity round-trips");
     std::fs::write(&path, text.replace(r#""login": "sam@example.com""#, r#""login": "sam@example.com", "logn": "x""#)).unwrap();
     let e = store.read().unwrap_err().to_string();
     assert!(e.contains("clients[0].tailnet.logn"), "{e}");
@@ -10421,12 +10804,13 @@ async fn dialogs_never_block_the_listener_and_a_process_raises_at_most_its_bound
 fn open_dialogs_are_bounded_per_process_and_in_all() {
     use crate::client_trust::{DialogSlots, MAX_OPEN_DIALOGS};
     let slots = Arc::new(DialogSlots::default());
-    let mine: Vec<_> = (0..PAIR_REQUESTS_PER_PROCESS).map(|_| slots.take(Some(1)).unwrap()).collect();
-    assert!(slots.take(Some(1)).is_none(), "one process's bound");
-    let others: Vec<_> = (2..).take(MAX_OPEN_DIALOGS - mine.len()).map(|p| slots.take(Some(p)).unwrap()).collect();
-    assert!(slots.take(Some(99)).is_none(), "the machine's bound");
+    let p = Requester::Process;
+    let mine: Vec<_> = (0..PAIR_REQUESTS_PER_PROCESS).map(|_| slots.take(Some(p(1))).unwrap()).collect();
+    assert!(slots.take(Some(p(1))).is_none(), "one process's bound");
+    let others: Vec<_> = (2..).take(MAX_OPEN_DIALOGS - mine.len()).map(|n| slots.take(Some(p(n))).unwrap()).collect();
+    assert!(slots.take(Some(p(99))).is_none(), "the machine's bound");
     drop(mine);
-    assert!(slots.take(Some(1)).is_some(), "a closed dialog gives its place back");
+    assert!(slots.take(Some(p(1))).is_some(), "a closed dialog gives its place back");
     drop(others);
 }
 
@@ -10506,6 +10890,7 @@ fn an_allow_after_the_request_expired_approves_nothing() {
             client_name: None,
             client_id: None,
             auto_approved: None,
+            tailnet: None,
         });
         Ok(())
     }).unwrap();

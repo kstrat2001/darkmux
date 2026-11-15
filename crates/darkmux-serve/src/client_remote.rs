@@ -9,8 +9,9 @@
 //! says which entry requests arrive through ([`Started::serving`]). The
 //! request gate ([`crate::client_pairing`]'s `admitted`) answers a request
 //! through that entry only from a paired device: its bearer token, and the
-//! tailnet user recorded for that token ([`crate::client_tailnet`]). With no
-//! entry served, every request not from this machine is refused.
+//! tailnet user and device recorded for that token ([`crate::client_tailnet`]);
+//! a device pairs through it only with an approval on this Mac. With no entry
+//! served, every request not from this machine is refused.
 //!
 //! **Only darkmux's own entry is ever changed.** An entry is darkmux's when a
 //! record of it is on disk ([`overlay::PublishedRecord`], written before the
@@ -92,7 +93,8 @@ pub struct Started {
 const LOG: &str = "darkmux client serve:";
 
 /// The line that says who the URL answers, for every published log line.
-const NOT_ACCESS: &str = "a request through it needs a paired device's token and the tailnet user it paired as";
+const NOT_ACCESS: &str = "a device pairs through it only with an approval on this Mac, and is then answered with its \
+                          token, as the tailnet user and from the device it paired as";
 
 /// The start, for the listener bound on loopback `port`.
 pub fn start(remote: ClientsRemote, port: u16, rig: &Rig) -> Started {

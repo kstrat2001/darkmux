@@ -161,7 +161,8 @@ pub(crate) fn off_check(
 /// The remote row once the network can carry the entry.
 fn tailnet_ready_check(from: &str, seen: &RemoteLook) -> Check {
     const NOT_ACCESS: &str =
-        "a request through it is answered only for a paired device, with its token, from the tailnet user it paired as";
+        "a request through it is answered only for a paired device, with its token, as the tailnet user and from the \
+         device it paired as; a device pairs through it only with an approval on this Mac";
     let dns = seen.net.dns_name.as_deref().unwrap_or_default();
     if let Some(warn) = seen.published.iter().find_map(|(e, shown)| record_problem(from, dns, e, shown)) {
         return warn;

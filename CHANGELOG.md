@@ -20,7 +20,7 @@ darkmux release.
   carries `version` (darkmux's version, for display and diagnostics) and `capabilities`, every
   capability this build has, in a fixed order: `clean_preview`, `template_workspace`, `continues`,
   `clone_preview`, `recipe_set`, `workspace_image`, `workspace_edit`, `workspace_remove` (and, with
-  #3560 below, `remote_tailscale`). An app gates
+  #3560 below, `remote_tailscale` and `remote_requests`). An app gates
   a feature on its capability, never on the version or on how a handler happens to answer. A darkmux
   that lists capabilities supports exactly those; one with no `capabilities` field is 5.10 (which has
   `clean_preview`, `template_workspace`, `continues`, `workspace_edit`, `workspace_remove`) or 5.11
@@ -62,14 +62,35 @@ darkmux release.
   `not_paired_remotely` (the token's pairing recorded no tailnet identity: every pairing made on the Mac;
   that token still works on the Mac), `remote_identity_missing` (Tailscale named no user: a tagged
   device, or a login that is not valid UTF-8, which Tailscale sends empty; a Funnel request is
-  `not_forwarded`), `remote_identity_mismatch`, and `remote_pairing_unavailable` (pairing and its poll are refused
-  through the entry until remote pairing ships). `GET /client/whoami` gains `via` (`local` or
-  `tailnet`), and `clients.json` moves to schema 1.3: a client may carry `tailnet` (`{"login": ...}`),
-  the identity it paired with. Nothing records an identity yet: pairing over the tailnet, which does,
-  is the next part, so no capability is advertised for remote requests until it ships.
+  `not_forwarded`), and `remote_identity_mismatch` (`remote_pairing_unavailable` is in the code list
+  but never sent: the next part ships pairing over the tailnet in the same release). `GET
+  /client/whoami` gains `via` (`local` or `tailnet`), and `clients.json` moves to schema 1.3: a client
+  may carry `tailnet`, the identity it paired with (the next part records it).
   **Upgrade note:** the first change this darkmux makes to `clients.json` rewrites it as schema 1.3, and
   from then on an older darkmux refuses the whole store ("written by a newer darkmux ... Upgrade
   darkmux"), pairings included, until it is upgraded.
+- **A device pairs over the tailnet, approved on the Mac (#3560, third of four parts).** A phone on the
+  tailnet pairs through `client serve`'s tailnet URL with the same calls an app on the Mac makes. It is
+  never approved on its own (the process holding a forwarded connection is Tailscale's, so no code
+  signature can speak for the device): it waits for the operator, in the pairing dialog or with
+  `darkmux client approve`, both of which now show the tailnet user and device Tailscale names for the
+  request, and the dialog's Allow remembers nothing. The approval records that identity, the user from
+  `Tailscale-User-Login` and the device from a read-only `tailscale whois` of the forwarded address
+  (never anything the request's body claims), and the token is then answered through the tailnet URL
+  only as that user and from that device. The poll that collects the token must come from them too.
+  Every request through the entry now also checks the device: `whois` runs only for a request the
+  entry forwarded, after its token and user check out, and an answer that named a device is kept for
+  ten seconds per address (measured 27 ms a call). New refusal codes: `remote_device_unknown`
+  (Tailscale on the Mac could not say which device sent it; refused, never guessed) and
+  `remote_device_mismatch` (another device than the one it paired from, even the same user's). A
+  pairing request with no tailnet user (a tagged device) is refused `remote_identity_missing`. One
+  device may have two pairing requests waiting, as one app on the Mac may, and a remote request expires
+  after ten minutes like any. Pairing again over the tailnet makes a new client; `darkmux client
+  revoke` stops a device on the Mac and remotely at once. `darkmux client list` says which clients
+  paired over the tailnet, and as whom. The capability list gains `remote_requests`. `clients.json`
+  stays 1.3: its `tailnet` gains `device` (`{"id", "name", "host_name"?}`, required), and a pending
+  request may carry `tailnet` too. The client API's OpenAPI document now opens with
+  `docs/CLIENTS.md`, the order of calls and what an app does on each outcome.
 - **`darkmux doctor` and `mission status` find `tailscale` where the fleet identity provider does
   (#3560).** The tailnet viewer URL used to run a bare `tailscale` from `PATH`; it now looks on `PATH`
   and then at the known install locations (on macOS `/usr/local/bin/tailscale`,

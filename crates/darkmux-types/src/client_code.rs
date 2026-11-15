@@ -27,17 +27,29 @@ pub enum ClientCode {
     /// pairing recorded no tailnet identity (it was paired on the Mac): the
     /// device must pair over the tailnet. The token still works on the Mac.
     NotPairedRemotely,
-    /// (#3560) Through the tailnet entry with a valid token, but Tailscale
-    /// named no tailnet user for the request: a tagged device (Tailscale
-    /// sends no user for one), or a login that is not valid UTF-8 (sent
-    /// empty). A Funnel request never gets here: it is `not_forwarded`.
+    /// (#3560) Through the tailnet entry, a pairing, its poll, or a request
+    /// with a valid token, but Tailscale named no tailnet user for it: a
+    /// tagged device (Tailscale sends no user for one), or a login that is
+    /// not valid UTF-8 (sent empty). A Funnel request never gets here: it is
+    /// `not_forwarded`.
     RemoteIdentityMissing,
-    /// (#3560) Through the tailnet entry with a valid token, from a tailnet
-    /// user other than the one the device paired as.
+    /// (#3560) Through the tailnet entry with a valid token (or polling a
+    /// pairing), from a tailnet user other than the one the device paired as.
     RemoteIdentityMismatch,
-    /// (#3560) A pairing route (`POST /client/pair`, its poll) through the
-    /// tailnet entry: pairing over the tailnet is not in this darkmux yet.
+    /// (#3560) Not sent by this darkmux. Pairing over the tailnet shipped
+    /// in the same release as the code that once refused it, and the code
+    /// list only grows.
     RemotePairingUnavailable,
+    /// (#3560) Through the tailnet entry, but Tailscale on the Mac could
+    /// not say which tailnet device the request came from (its `whois`
+    /// failed, or named none), so it cannot be checked against the device a
+    /// token was paired from, or recorded for a pairing. Refused, never
+    /// guessed; try again once Tailscale answers on the Mac.
+    RemoteDeviceUnknown,
+    /// (#3560) Through the tailnet entry with a valid token (or polling a
+    /// pairing), from another tailnet device than the one it was paired
+    /// from, even one of the same user's.
+    RemoteDeviceMismatch,
     UnsupportedMediaType,
     BadRequest,
     PayloadTooLarge,
@@ -192,6 +204,8 @@ mod tests {
             (RemoteIdentityMissing, "remote_identity_missing"),
             (RemoteIdentityMismatch, "remote_identity_mismatch"),
             (RemotePairingUnavailable, "remote_pairing_unavailable"),
+            (RemoteDeviceUnknown, "remote_device_unknown"),
+            (RemoteDeviceMismatch, "remote_device_mismatch"),
         ] {
             assert_eq!(wire(c), s);
             assert_eq!(

@@ -1,0 +1,66 @@
+# Using the darkmux client API
+
+`darkmux client serve` is the API an app (Mux Bot, or your own) uses to pair with a Mac and run work on it. This page is the order of calls and what to do on each outcome. The routes, request bodies, replies and refusal codes themselves are in the OpenAPI document this page opens (`GET /client/openapi.json`), and this page does not repeat them.
+
+## Where an app reaches it
+
+- **On the Mac:** `darkmux client serve` listens on 127.0.0.1 only. An app on the same Mac connects there.
+- **From another device on the tailnet:** when the Mac's operator has turned remote use on, the same API is also at the Mac's tailnet address, through Tailscale. An app on the Mac learns it from `GET /client/whoami`: when `remote` says `available`, its `url` is the address to hand the other device (a QR code, a share sheet).
+- Anything else (another proxy, or a web page, which sends an Origin header) is refused `not_local`, or `not_forwarded` while the tailnet address is up.
+
+## Pair on the Mac
+
+1. Make a random pair secret and keep it in memory. Send `POST /client/pair` with a code your app shows its user and that secret. The reply names a request.
+2. Show the code. A Mux Bot signed by a verified team is approved at once. Any other app waits for the operator, who approves it in a dialog on the Mac or with `darkmux client approve --code <CODE>`.
+3. Poll `GET /client/pair/{request_id}` with the secret in `X-Pair-Secret`:
+   - `pending`: keep polling.
+   - `approved`: the reply carries the token, this once only. Store it (below) before anything else.
+   - `denied`: stop, and tell the user the Mac said no.
+   - `expired`: no one approved it in time. Start again from step 1.
+   - `not_found`: the request is gone (the wrong secret, a token already collected, or a request expired long ago). Start again.
+4. A pairing request answered `too_many_requests` found the queue full. Wait, then start again.
+
+## Pair from another device over the tailnet
+
+Gate this on the app on the Mac: offer it only when that app's `GET /client/whoami` lists `remote_requests` in `capabilities` and `remote` says `available`.
+
+The calls are the ones above, sent to `url`. What differs:
+
+- **It always waits for the operator.** Nothing on the device can approve it. The dialog and `darkmux client approve` show the operator the tailnet user and device as Tailscale names them, beside your code.
+- **Tailscale vouches for the device, not your app.** The user and device recorded are the ones Tailscale names for the request, whatever the body says. A device logged in to Tailscale with a tag has no user and is refused `remote_identity_missing`: log it in as a user. When Tailscale on the Mac cannot say which device sent the request, it is refused `remote_device_unknown`: try again later.
+- **Poll from the same device, as the same user.** A poll from another user is refused `remote_identity_mismatch`, from another device `remote_device_mismatch`, and neither uses up the token.
+
+## Keep the token
+
+- Store it in the platform's secure store (the Keychain on Apple platforms), never in a log, a file or a URL. Send it as an HTTP bearer token on every route but the two pairing ones.
+- A device paired over the tailnet is answered through `url` only as the tailnet user and from the device it paired as. From another of the user's devices it is refused `remote_device_mismatch`, as another user `remote_identity_mismatch`. Tell the user which, and do not discard the token.
+- `not_paired_remotely` means the token was paired on the Mac, so it works there only. Pair the device over the tailnet.
+- `unauthorized` means darkmux does not know the token: the operator revoked it (`darkmux client revoke`), on the Mac and remotely at once. Delete it and pair again.
+- Pairing again makes a new client with a new token. The old one keeps working until the operator revokes it.
+
+## Check what this darkmux can do
+
+After pairing, call `GET /client/whoami` and gate every feature on its `capabilities`, never on `version`. A darkmux with no `capabilities` at all predates the list. A capability says what the build can do, not what this Mac allows: a preview may still be refused `preview_disabled`, and remote use is on only while `remote` says `available`.
+
+## Read a refusal
+
+Every refusal carries a `code` and an `error`. Branch on the `code`; show the `error` to a person; never parse it. `unavailable` means not now (the Mac's settings could not be read, or `darkmux client serve` is stopping): send the request again later. `too_many_requests` means slow down. A code your app does not know comes from a newer darkmux: handle it by the HTTP status class.
+
+## Run work
+
+1. Optionally list what may run with `GET /client/profiles`.
+2. Make or reuse a workspace with `POST /client/workspaces`, and name it in the run.
+3. Start the run with `POST /client/work`. The reply names it.
+4. Poll `GET /client/work/{work_id}` until its `status` is `done`, `error` or `cancelled`. While it is `running`, `activity` may say `starting_model` or `queued`: show that rather than a stall.
+5. To stop it, `POST /client/work/{work_id}/cancel`, then poll on through `cancelling` until it ends.
+6. Whatever a run changed is committed when it ends, however it ends. To take a finished run's changes back, `POST /client/work/{work_id}/undo` reverts them in a new commit; it is refused while a later run changed the same files, or another run works in the same workspace. `POST /client/work/{work_id}/keep` and `POST /client/work/{work_id}/discard` are for older apps: keep only reports the commit, and discard is an Undo.
+7. A follow-up run in the same workspace names the run it `continues` from.
+8. Read the result while `darkmux client serve` still holds it: a run is forgotten an hour after it ends, and at once if `darkmux client serve` restarts. A `not_found` for a run you started means it was forgotten.
+
+## Workspaces and previews
+
+- Look at a workspace with `GET /client/workspaces/{name}` and at what its runs changed with `GET /client/workspaces/{name}/changes`. A hand edit goes in with `POST /client/workspaces/{name}/edit`, an image with `POST /client/workspaces/{name}/image`.
+- Remove one with `DELETE /client/workspaces/{name}`. It is refused while a run, an Undo or a preview holds it, and refused `unsaved_commits` when it holds commits kept nowhere else, until the user agrees to `force` it.
+- Start a preview with `POST /client/workspaces/{name}/preview`, poll `GET /client/workspaces/{name}/preview` until it is ready or has failed, and stop it with `DELETE /client/workspaces/{name}/preview`. A preview also stops when it sits idle, when the app is revoked and when `darkmux client serve` stops, so read its status instead of assuming it still runs.
+- A workspace with no preview recipe is refused `no_recipe`. For a cloned repository whose user approves one, `PUT /client/workspaces/{name}/recipe` sets it, when `recipe_set` is listed.
+- A preview's address is on the Mac's loopback, so a device on the tailnet cannot open it yet.

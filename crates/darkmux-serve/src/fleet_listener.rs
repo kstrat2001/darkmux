@@ -349,17 +349,22 @@ pub(crate) enum Purpose {
     Work,
 }
 
-/// Identity lookups kept per peer address, for card reads only. Only a lookup
-/// that named a node is kept: an outage or an unplaced address is asked again
-/// the next time, so a recovered provider is seen at once.
+/// Identity lookups kept per peer address: here for card reads only, and
+/// (#3560) for every request through `client serve`'s tailnet entry
+/// ([`crate::client_tailnet::device_at`]). Only a lookup that named a node is
+/// kept: an outage or an unplaced address is asked again the next time, so a
+/// recovered provider is seen at once.
 pub(crate) struct IdentityCache {
     slots: Mutex<std::collections::HashMap<std::net::IpAddr, (std::time::Instant, NodeIdentity)>>,
 }
 
 impl IdentityCache {
-    /// How long a lookup is served to card reads. A card read states a card
-    /// and a grant to a caller that already holds the fleet token; a job never
-    /// reads this cache.
+    /// How long a lookup is served. A card read states a card and a grant to
+    /// a caller that already holds the fleet token; a job never reads this
+    /// cache. (#3560) A tailnet request through `client serve`'s entry has
+    /// already shown its device's token and user, and what is kept (an
+    /// address's device) changes only if Tailscale gives that address to
+    /// another device, which it does not do while the device exists.
     pub(crate) const TTL: std::time::Duration = std::time::Duration::from_secs(10);
     /// The most addresses kept: a full table stops caching, it does not evict.
     const MAX: usize = 256;
@@ -368,12 +373,12 @@ impl IdentityCache {
         Self { slots: Mutex::new(Default::default()) }
     }
 
-    fn get(&self, ip: std::net::IpAddr, now: std::time::Instant) -> Option<NodeIdentity> {
+    pub(crate) fn get(&self, ip: std::net::IpAddr, now: std::time::Instant) -> Option<NodeIdentity> {
         let slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
         slots.get(&ip).filter(|(at, _)| now.duration_since(*at) < Self::TTL).map(|(_, n)| n.clone())
     }
 
-    fn put(&self, ip: std::net::IpAddr, node: NodeIdentity, now: std::time::Instant) {
+    pub(crate) fn put(&self, ip: std::net::IpAddr, node: NodeIdentity, now: std::time::Instant) {
         let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
         if slots.len() >= Self::MAX && !slots.contains_key(&ip) {
             slots.retain(|_, (at, _)| now.duration_since(*at) < Self::TTL);

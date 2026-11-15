@@ -1913,10 +1913,11 @@ pub struct ClientsConfig {
     /// an entry its own record proves an earlier run left);
     /// `tailscale`, its port is also published on this machine's tailnet over
     /// HTTPS (`tailscale serve`), and removed again on shutdown. Read at
-    /// `client serve`'s start. A request through the tailnet entry is
-    /// answered only for a paired device: its bearer token, from the tailnet
-    /// user recorded for it at pairing. `darkmux config set clients.remote
-    /// tailscale`.
+    /// `client serve`'s start. A device pairs through the tailnet entry only
+    /// with the operator's approval on this machine, and a request through it
+    /// is then answered only with that device's bearer token, as the tailnet
+    /// user and from the device recorded at pairing. `darkmux config set
+    /// clients.remote tailscale`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub remote: Option<String>,
     #[serde(flatten)] #[schemars(skip)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
