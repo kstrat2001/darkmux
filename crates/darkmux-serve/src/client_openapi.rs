@@ -145,18 +145,53 @@ fn takes_no_token(auth: ClientAuth, parameters: &mut Vec<Value>) -> bool {
 }
 
 /// Rewrites every `description` under `v` as plain text: a rustdoc link
-/// (`` [`x`] ``) becomes its code span.
+/// (`` [`x`] ``) becomes its code span ([`unlink`]).
 fn plain_descriptions(v: &mut Value) {
     match v {
         Value::Object(m) => {
             if let Some(Value::String(d)) = m.get_mut("description") {
-                *d = d.replace("[`", "`").replace("`]", "`");
+                *d = unlink(d);
             }
             m.values_mut().for_each(plain_descriptions);
         }
         Value::Array(a) => a.iter_mut().for_each(plain_descriptions),
         _ => {}
     }
+}
+
+/// `text` with each rustdoc link (`` [`x`] ``: brackets holding exactly
+/// one non-empty code span, not followed by `(` or `[`, so not a Markdown
+/// link) written as its code span; everything else as written.
+fn unlink(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("[`") {
+        out.push_str(&rest[..i]);
+        match rustdoc_link(&rest[i + 2..]) {
+            Some((span, tail)) => {
+                out.push('`');
+                out.push_str(span);
+                out.push('`');
+                rest = tail;
+            }
+            None => {
+                out.push('[');
+                rest = &rest[i + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// What follows a `` [` ``: the code span's text and what comes after its
+/// `` `] ``, when the bracket is a rustdoc link.
+fn rustdoc_link(after: &str) -> Option<(&str, &str)> {
+    let end = after.find('`')?;
+    let tail = after[end..].strip_prefix("`]")?;
+    let span = &after[..end];
+    let not_a_link = span.is_empty() || tail.starts_with('(') || tail.starts_with('[');
+    (!not_a_link).then_some((span, tail))
 }
 
 fn json_content(schema: schemars::Schema) -> Value {
@@ -400,8 +435,31 @@ mod tests {
             json!({"a": {"description": "see `x` and `crate::m::f`"}, "b": [{"description": "`Y`."}]})
         );
         let text = doc().to_string();
-        for leak in ["[`", "`]", "crate::", "darkmux_types::"] {
+        for leak in ["crate::", "darkmux_types::"] {
             assert!(!text.contains(leak), "the document carries {leak}");
+        }
+        let mut again = doc();
+        plain_descriptions(&mut again);
+        assert_eq!(again, doc(), "no rustdoc link is left to strip");
+    }
+
+    /// (#3494 re-review) Only a rustdoc link, a bracket holding exactly one
+    /// code span with no link target after it, loses its brackets: a code
+    /// span holding a bracket, a list ending in a code span and a Markdown
+    /// link are left as written.
+    #[test]
+    fn only_a_rustdoc_link_loses_its_brackets() {
+        for (text, plain) in [
+            ("[`x`]", "`x`"),
+            ("a [`x`], then [`y::z`].", "a `x`, then `y::z`."),
+            ("a `[` b", "a `[` b"),
+            ("one of [1, `null`]", "one of [1, `null`]"),
+            ("[`x`](https://example.com)", "[`x`](https://example.com)"),
+            ("[`x`][ref]", "[`x`][ref]"),
+            ("[``]", "[``]"),
+            ("[`unclosed", "[`unclosed"),
+        ] {
+            assert_eq!(unlink(text), plain, "{text}");
         }
     }
 
