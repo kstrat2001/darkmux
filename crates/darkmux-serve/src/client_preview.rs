@@ -1572,6 +1572,15 @@ impl Previews {
         (e.status == Status::Ready).then(|| Serving { run: e.run.clone(), port: e.port })
     }
 
+    /// (#3560) A device is viewing `name`'s preview through the tailnet
+    /// entry: that counts as an app asking about it, so the idle check
+    /// ([`Previews::stop_idle`]) never stops a preview someone is looking at.
+    pub fn viewed(&self, name: &str) {
+        if let Some(e) = self.entries.lock().unwrap().get(name) {
+            e.lock().unwrap().last_asked = (self.clock)();
+        }
+    }
+
     /// A test's ready preview of `name` on `port`, served by whatever the
     /// test listens there with: a new run, as a restart is.
     #[cfg(test)]
@@ -2396,7 +2405,7 @@ fn ready_path(recipe: &Recipe) -> String {
 }
 
 /// How long a started dev server may take to answer.
-const READY_WITHIN: Duration = Duration::from_secs(180);
+pub(crate) const READY_WITHIN: Duration = Duration::from_secs(180);
 
 /// Polls until the dev server answers on its published port; halts if the
 /// container exits, the preview is stopped, or the server stays silent for

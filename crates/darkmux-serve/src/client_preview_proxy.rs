@@ -25,26 +25,50 @@
 //! **What the preview sees.** Model-written code runs in the preview, and it
 //! can reach this listener on loopback, so it never sees what would let it
 //! act as the device: darkmux's cookie, `Authorization`, and the
-//! `Tailscale-*` and `X-Forwarded-*` headers are removed, and `Host` and
-//! `Origin` name the preview's loopback address (so a dev server's host
-//! check passes without editing anyone's repo). It cannot set darkmux's
-//! cookie either: a `Set-Cookie` of that name in its answer is dropped. The
-//! cookie is `HttpOnly`, so the preview's scripts in the browser cannot read
-//! it.
+//! `Tailscale-*` and `X-Forwarded-*` headers are removed, and `Host` (and
+//! `Origin`, which must be the entry's own) name the preview's loopback
+//! address, so a dev server's host check passes without editing anyone's
+//! repo. Everything else the browser sends passes: `Referer` and the
+//! `Sec-Fetch-*` headers name the tailnet address, and the browser's other
+//! cookies for this host (another preview's, a service's on another port of
+//! it) reach the preview's server. It cannot set darkmux's cookie (by name,
+//! or as a nameless cookie that would read as it), nor a cookie with a
+//! `Domain`, which would reach the tailnet's other hosts. The cookie is
+//! `HttpOnly`, so the preview's scripts in the browser cannot read it.
+//!
+//! **Previews share one origin.** Every preview is served at the same
+//! address, so what one leaves in the browser could act for the next: a
+//! request for a service worker script is refused, `Service-Worker-Allowed`
+//! is dropped and every answer is `Cache-Control: no-store`, and opening a
+//! link clears the address's cache and storage (`Clear-Site-Data`,
+//! [`CLEAR_SITE_DATA`]). A request whose `Origin` is not the entry's, or
+//! whose `Sec-Fetch-Site` is another site's, is refused ([`browser_refusal`]):
+//! every tailnet host is "same site" (`ts.net` is a public suffix), so the
+//! cookie's SameSite alone does not stop one. What stays open across
+//! previews is in `docs/CLIENTS.md`.
 //!
 //! **Lifetime.** In memory only. A session ends when its preview stops or
 //! restarts (a new run, [`crate::client_preview::Previews::serving`]), when
 //! its device is revoked (its client gone from the store, or recorded with
-//! another identity), and when `client serve` stops; a request on an ended
-//! session is refused. A browser keeps one darkmux cookie per address, so it
-//! shows one preview at a time; a new link replaces the client's earlier
-//! link and session for the same preview.
+//! another identity), when previews are turned off
+//! (`clients.preview.enabled`, read at most once a second), and when
+//! `client serve` stops. A request on an ended session is refused, and an
+//! open WebSocket closes: at once when the session is ended or replaced,
+//! within [`RECHECK_EVERY`] otherwise. A request a session sends counts as
+//! viewing its preview, so the idle check never stops a preview being
+//! looked at. A browser keeps one darkmux cookie per address, so it shows
+//! one preview at a time; a new link replaces the client's earlier link and
+//! session for the same preview. A session's requests and sockets at its
+//! preview are bounded ([`REQUESTS_PER_SESSION`], [`UPGRADES_PER_SESSION`],
+//! [`PREVIEW_HEAD_WITHIN`]).
 //!
 //! **What stays open.** Browsers send a cookie to every port of a host, so
-//! a service on another port of this Mac's tailnet name (one the operator
-//! publishes there) receives this cookie too. Such a service runs on this
-//! Mac and could replay it to loopback with forged headers, as it could
-//! any header. The session lives no longer than its preview.
+//! whatever the operator publishes on another port of this Mac's tailnet
+//! name receives this cookie too, and whatever is behind it (on this Mac
+//! or not) learns it. Used through the entry, the cookie still needs the
+//! device and user it was issued to; a process on this Mac can forge those
+//! headers to loopback, as it could for any request. The session lives no
+//! longer than its preview.
 
 use axum::extract::{Request, State};
 use axum::http::header::{
@@ -55,7 +79,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use darkmux_types::client_code::ClientCode;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::client_pairing::{
     authenticate, err, hash_hex, internal, owned_workspace, previews_allowed, random_hex, refuse,
@@ -80,6 +104,43 @@ pub const LINK_TTL_SECS: u64 = 60;
 
 /// The route a preview link opens.
 pub(crate) const LINK_ROUTE: &str = "/client/preview-link/:code";
+
+/// What opening a link clears in the browser for the entry's address: what
+/// the last preview it showed left there (its cached answers and its
+/// storage, service worker registrations included). Never `"cookies"`: a
+/// browser clears after it has stored the same answer's `Set-Cookie`, so
+/// that would clear the session the answer sets (and, for cookies, every
+/// host of the tailnet's registrable domain).
+pub(crate) const CLEAR_SITE_DATA: &str = r#""cache", "storage", "executionContexts""#;
+
+/// The requests one session has at the preview at once; more wait their
+/// turn. Six is what every browser opens to one host over HTTP/1.1 (Chrome,
+/// Firefox and Safari alike), so a dev server already serves a page at this
+/// pace from any browser. Over HTTP/2, which Tailscale's HTTPS front can
+/// speak, a page may send far more at once (a Vite page asks for each module
+/// it imports); without a bound each would hold a socket to the preview, and
+/// `client serve` under launchd has a soft limit of 256 open files
+/// (`launchctl limit maxfiles` on this Mac, 2026-11-16) for everything it does.
+pub const REQUESTS_PER_SESSION: usize = 6;
+
+/// The WebSockets one session holds open at once; one more is refused
+/// (`too_many_requests`). Vite's client opens one, for live reload, and a
+/// second covers its reconnect racing the close of the first.
+pub const UPGRADES_PER_SESSION: usize = 2;
+
+/// How long a proxied request waits for its turn and the preview's answer's
+/// head. A dev server may take as long to answer a later request as its
+/// first (Vite holds requests while it pre-bundles dependencies again after
+/// a run adds one), and darkmux already gives that first answer
+/// [`crate::client_preview::READY_WITHIN`] before it calls a preview ready.
+/// The body, once begun, may take as long as it takes.
+pub const PREVIEW_HEAD_WITHIN: std::time::Duration = crate::client_preview::READY_WITHIN;
+
+/// How often an open WebSocket's session is checked again: a revoke, a
+/// stopped or restarted preview, previews turned off or `client serve`
+/// stopping ends the socket within this, at one look at `clients.json` and
+/// one at the setting per open socket each time.
+pub const RECHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What a preview link, and the session opened with it, is bound to: the
 /// client that asked, which of its previews, the tailnet identity the
@@ -107,17 +168,60 @@ struct Link {
     issued: u64,
 }
 
-/// An open session: its cookie's hash, never the cookie.
+/// An open session: its cookie's hash, never the cookie. Dropping it (ended,
+/// replaced, or `client serve` gone) closes `alive`, which every WebSocket
+/// it holds open waits on.
 struct Session {
     cookie_hash: String,
     binding: Binding,
+    alive: tokio::sync::watch::Sender<()>,
+    turns: Arc<Turns>,
+}
+
+/// A session's turns at its preview ([`REQUESTS_PER_SESSION`],
+/// [`UPGRADES_PER_SESSION`]).
+pub(crate) struct Turns {
+    requests: Arc<tokio::sync::Semaphore>,
+    upgrades: Arc<tokio::sync::Semaphore>,
+}
+
+/// A session as a request found it.
+pub(crate) struct Found {
+    pub(crate) key: String,
+    pub(crate) binding: Binding,
+    /// Closed once the session ends.
+    alive: tokio::sync::watch::Receiver<()>,
+    turns: Arc<Turns>,
+}
+
+#[cfg(test)]
+impl Found {
+    /// What its sockets wait on.
+    pub(crate) fn alive_for_test(&self) -> tokio::sync::watch::Receiver<()> {
+        self.alive.clone()
+    }
 }
 
 /// The preview links waiting to be opened and the sessions they opened.
-#[derive(Default)]
 pub struct PreviewSessions {
     links: Mutex<Vec<Link>>,
     sessions: Mutex<Vec<Session>>,
+    /// `clients.preview.enabled` as last read, and the second of the clock
+    /// it was read in: read at most once a second, however many requests.
+    switch: Mutex<Option<(u64, bool)>>,
+    /// [`PREVIEW_HEAD_WITHIN`] (a test's shorter one).
+    head_within: std::time::Duration,
+}
+
+impl Default for PreviewSessions {
+    fn default() -> Self {
+        PreviewSessions {
+            links: Mutex::default(),
+            sessions: Mutex::default(),
+            switch: Mutex::default(),
+            head_within: PREVIEW_HEAD_WITHIN,
+        }
+    }
 }
 
 /// `m` locked, whatever a panicking holder left.
@@ -172,27 +276,68 @@ impl PreviewSessions {
         let cookie = random_hex(32)?;
         let mut sessions = lock(&self.sessions);
         sessions.retain(|s| !s.binding.same_preview(&binding));
+        let turns = Turns {
+            requests: Arc::new(tokio::sync::Semaphore::new(REQUESTS_PER_SESSION)),
+            upgrades: Arc::new(tokio::sync::Semaphore::new(UPGRADES_PER_SESSION)),
+        };
         sessions.push(Session {
             cookie_hash: hash_hex(&cookie),
             binding,
+            alive: tokio::sync::watch::channel(()).0,
+            turns: Arc::new(turns),
         });
         Ok(cookie)
     }
 
-    /// The session one of `presented` (cookie values) opens: its key (the
-    /// cookie's hash) and what it is bound to.
-    pub(crate) fn find(&self, presented: &[String]) -> Option<(String, Binding)> {
+    /// The session one of `presented` (cookie values) opens.
+    pub(crate) fn find(&self, presented: &[String]) -> Option<Found> {
         let sessions = lock(&self.sessions);
         let hit = presented
             .iter()
             .find_map(|p| matching(sessions.iter().map(|s| s.cookie_hash.as_str()), p))?;
         let s = &sessions[hit];
-        Some((s.cookie_hash.clone(), s.binding.clone()))
+        Some(Found {
+            key: s.cookie_hash.clone(),
+            binding: s.binding.clone(),
+            alive: s.alive.subscribe(),
+            turns: s.turns.clone(),
+        })
     }
 
-    /// Ends the session `key` names.
+    /// Ends the session `key` names, and every WebSocket it holds open.
     pub(crate) fn end(&self, key: &str) {
         lock(&self.sessions).retain(|s| s.cookie_hash != key);
+    }
+
+    /// Ends every session and link: `client serve` is stopping.
+    pub fn end_all(&self) {
+        lock(&self.sessions).clear();
+        lock(&self.links).clear();
+    }
+
+    /// `clients.preview.enabled` (`read`) at `now` (Unix seconds): read again
+    /// only in a later second. A failure is not kept.
+    pub(crate) fn previews_on(
+        &self,
+        read: &crate::client_pairing::PreviewSwitch,
+        now: u64,
+    ) -> Result<bool, String> {
+        let mut switch = lock(&self.switch);
+        if let Some((at, on)) = *switch {
+            if at == now {
+                return Ok(on);
+            }
+        }
+        let on = read()?;
+        *switch = Some((now, on));
+        Ok(on)
+    }
+
+    /// The same sessions, waiting `within` for a preview's answer's head.
+    #[cfg(test)]
+    pub(crate) fn with_head_within(mut self, within: std::time::Duration) -> Self {
+        self.head_within = within;
+        self
     }
 }
 
@@ -300,28 +445,103 @@ pub(crate) fn upstream_headers(headers: &HeaderMap, port: u16) -> HeaderMap {
     out
 }
 
-/// Whether a `Set-Cookie` value sets darkmux's cookie: its name is what
-/// comes before the first `=` of the part before the first `;`.
-fn sets_ours(value: &HeaderValue) -> bool {
-    let bytes = value.as_bytes();
-    let pair = bytes.split(|b| *b == b';').next().unwrap_or_default();
-    let name = pair.split(|b| *b == b'=').next().unwrap_or_default();
-    name.trim_ascii().eq_ignore_ascii_case(COOKIE.as_bytes())
+/// Whether a preview's `Set-Cookie` is dropped: one that sets darkmux's
+/// cookie (its name, before the first `=` of the part before the first `;`,
+/// or a nameless cookie, `=<value>`, whose value starts with it: a browser
+/// sends a nameless cookie as its bare value), and one with a `Domain`
+/// attribute, which would reach other hosts (every host of the tailnet's
+/// domain, whose name is a registrable domain: `ts.net` is a public suffix).
+fn cookie_refused(value: &HeaderValue) -> bool {
+    let text = String::from_utf8_lossy(value.as_bytes());
+    let mut parts = text.split(';');
+    let pair = parts.next().unwrap_or_default().trim();
+    let name = pair
+        .strip_prefix('=')
+        .unwrap_or(pair)
+        .split('=')
+        .next()
+        .unwrap_or_default();
+    is_ours(name)
+        || parts.any(|attr| {
+            attr.split('=')
+                .next()
+                .is_some_and(|a| a.trim().eq_ignore_ascii_case("domain"))
+        })
 }
 
-/// A preview's answer's headers with every `Set-Cookie` of darkmux's cookie
-/// dropped: the preview never sets the session.
-pub(crate) fn drop_our_cookie(headers: &mut HeaderMap) {
+/// A preview's answer's headers as the browser gets them: no `Set-Cookie`
+/// [`cookie_refused`] refuses, no `Service-Worker-Allowed` (a worker's scope
+/// is never widened), and `Cache-Control: no-store` in place of whatever the
+/// preview said, so nothing one preview served is taken from the browser's
+/// cache for the next one at this address.
+pub(crate) fn answer_headers(headers: &mut HeaderMap) {
     let kept: Vec<HeaderValue> = headers
         .get_all(SET_COOKIE)
         .iter()
-        .filter(|v| !sets_ours(v))
+        .filter(|v| !cookie_refused(v))
         .cloned()
         .collect();
     headers.remove(SET_COOKIE);
     for value in kept {
         headers.append(SET_COOKIE, value);
     }
+    headers.remove("service-worker-allowed");
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+}
+
+/// The entry's own origin, as a browser sends it in `Origin`.
+pub(crate) fn entry_origin(entry: &darkmux_fleet::overlay::ServeEntry) -> String {
+    entry.url().trim_end_matches('/').to_string()
+}
+
+/// Whether `headers` carry `name` with a value equal (in any case) to one
+/// of `values`.
+fn says(headers: &HeaderMap, name: &str, values: &[&str]) -> bool {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| {
+            values
+                .iter()
+                .any(|want| v.trim().eq_ignore_ascii_case(want))
+        })
+}
+
+/// Why a browser's request through the entry is refused before it reaches
+/// a preview, whatever its session, or `None`:
+/// - a service worker script (`Service-Worker: script`, `Sec-Fetch-Dest:
+///   serviceworker`): a worker outlives the preview that served it and would
+///   answer for the next one at this address;
+/// - an `Origin` other than the entry's own (`origin`): another tailnet
+///   host's page is "same site" here (`ts.net` is a public suffix), so the
+///   cookie's SameSite does not stop it;
+/// - a `Sec-Fetch-Site` other than `none` (typed, or opened by an app) or
+///   `same-origin`.
+pub(crate) fn browser_refusal(headers: &HeaderMap, origin: &str) -> Option<&'static str> {
+    if says(headers, "service-worker", &["script"])
+        || says(headers, "sec-fetch-dest", &["serviceworker"])
+    {
+        return Some("a preview may not register a service worker: it would outlive this preview");
+    }
+    let site_ok = |v: &HeaderValue| {
+        v.to_str().is_ok_and(|v| {
+            ["none", "same-origin"]
+                .iter()
+                .any(|ok| v.trim().eq_ignore_ascii_case(ok))
+        })
+    };
+    if !headers.get_all("sec-fetch-site").iter().all(site_ok) {
+        return Some("a request from another site never reaches a preview");
+    }
+    let foreign = headers
+        .get_all(ORIGIN)
+        .iter()
+        .any(|v| !v.to_str().is_ok_and(|o| o.eq_ignore_ascii_case(origin)));
+    foreign.then_some("a request from another origin never reaches a preview")
 }
 
 /// The `Set-Cookie` that opens session `cookie` in a browser.
@@ -358,19 +578,28 @@ pub(crate) fn still_stands(
     paired && serving == Some(&binding.serving)
 }
 
-/// Whether `binding` stands now, as the store and the previews say; `Err`
-/// when the store cannot be read.
+/// Whether `binding` stands now, as the store, the previews and
+/// `clients.preview.enabled` say (previews turned off end every session);
+/// `Err` when the store or the setting cannot be read. The store is
+/// peeked, never locked for writing.
 fn stands_now(state: &ClientServerState, binding: &Binding) -> Result<bool, Refused> {
+    let unreadable =
+        |e: String| refuse(StatusCode::SERVICE_UNAVAILABLE, ClientCode::Unavailable, e);
+    let on = state
+        .preview_sessions
+        .previews_on(&state.preview_enabled, (state.now)())
+        .map_err(unreadable)?;
     let clients = state
         .store
-        .read()
+        .peek()
         .map_err(|e| Box::new(internal(e)))?
         .clients;
-    Ok(still_stands(
-        binding,
-        &clients,
-        state.previews.serving(&binding.workspace).as_ref(),
-    ))
+    Ok(on
+        && still_stands(
+            binding,
+            &clients,
+            state.previews.serving(&binding.workspace).as_ref(),
+        ))
 }
 
 /// The request through the entry, as tailnet user `login` from the device
@@ -402,7 +631,7 @@ fn no_session() -> Refused {
         StatusCode::FORBIDDEN,
         ClientCode::NoPreviewSession,
         "no preview session in this browser, or it has ended (its preview stopped or restarted, its device was \
-         unpaired, or darkmux client serve restarted): open the preview from the app again",
+         unpaired, previews were turned off, or darkmux client serve restarted): open the preview from the app again",
     )
 }
 
@@ -602,6 +831,7 @@ fn see_other(cookie: &str) -> Response {
         axum::http::header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
+    headers.insert("clear-site-data", HeaderValue::from_static(CLEAR_SITE_DATA));
     res
 }
 
@@ -642,61 +872,138 @@ async fn proxied(
     req: Request,
     caller: (Option<&str>, IpAddr),
 ) -> Response {
-    match session_port(state, req.headers(), caller).await {
-        Ok(port) => forward(port, req).await,
+    match admitted(state, req.headers(), caller).await {
+        Ok(found) => forward(state, found, req).await,
         Err(r) => *r,
     }
 }
 
-/// The app port of the preview the request's session names, once that
-/// session still stands and the request comes from its user and device.
-/// The cookie is looked at first, so a request with none asks Tailscale
-/// nothing.
-async fn session_port(
+/// The session a request through the entry may use, once the browser's own
+/// headers pass ([`browser_refusal`]), the session still stands and the
+/// request comes from its user and device. The headers and the cookie are
+/// looked at first, so a request with neither asks Tailscale nothing. A
+/// request let through counts as viewing the preview.
+async fn admitted(
     state: &ClientServerState,
     headers: &HeaderMap,
     caller: (Option<&str>, IpAddr),
-) -> Result<u16, Refused> {
-    let binding = live_session(state, headers)?;
-    same_device(state, &binding, caller).await?;
+) -> Result<Found, Refused> {
+    let origin = state
+        .tailnet_entry
+        .as_ref()
+        .map(entry_origin)
+        .unwrap_or_default();
+    browser_refusal(headers, &origin).map_or(Ok(()), |why| {
+        Err(refuse(StatusCode::FORBIDDEN, ClientCode::Forbidden, why))
+    })?;
+    let found = live_session(state, headers)?;
+    same_device(state, &found.binding, caller).await?;
+    state.previews.viewed(&found.binding.workspace);
     (!state.previews.stopping())
-        .then_some(binding.serving.port)
+        .then_some(found)
         .ok_or_else(stopping)
 }
 
-/// What the session the request's cookie opens is bound to, while it still
-/// stands; one that no longer stands is ended.
-fn live_session(state: &ClientServerState, headers: &HeaderMap) -> Result<Binding, Refused> {
-    let (key, binding) = state
+/// The session the request's cookie opens, while it still stands; one that
+/// no longer stands is ended.
+fn live_session(state: &ClientServerState, headers: &HeaderMap) -> Result<Found, Refused> {
+    let found = state
         .preview_sessions
         .find(&session_cookies(headers))
         .ok_or_else(no_session)?;
-    let ended = || {
-        state.preview_sessions.end(&key);
+    let ended = |found: &Found| {
+        state.preview_sessions.end(&found.key);
         no_session()
     };
-    stands_now(state, &binding)?
-        .then_some(binding)
-        .ok_or_else(ended)
+    match stands_now(state, &found.binding)? {
+        true => Ok(found),
+        false => Err(ended(&found)),
+    }
 }
 
-/// `req` sent to the preview on `port`, with its headers as
-/// [`upstream_headers`] makes them, and the answer back with
-/// [`drop_our_cookie`]'s. A WebSocket upgrade the preview accepts is joined
-/// end to end.
-async fn forward(port: u16, mut req: Request) -> Response {
-    let from_browser = wants_upgrade(req.headers()).then(|| hyper::upgrade::on(&mut req));
-    match send(port, upstream_request(req, port)).await {
-        Ok(res) => answered(res, from_browser),
-        Err(why) => {
-            eprintln!("darkmux client serve: preview on 127.0.0.1:{port}: not answering ({why})");
-            err(
-                StatusCode::BAD_GATEWAY,
+/// Why a proxied request got no answer from the preview.
+#[derive(Debug)]
+enum Upstream {
+    /// The session holds [`UPGRADES_PER_SESSION`] WebSockets already.
+    Busy,
+    /// No answer's head within [`PREVIEW_HEAD_WITHIN`].
+    Late,
+    Unreachable(String),
+}
+
+impl Upstream {
+    fn refusal(self, port: u16) -> Response {
+        match self {
+            Upstream::Busy => err(
+                StatusCode::TOO_MANY_REQUESTS,
+                ClientCode::TooManyRequests,
+                format!("this preview session has {UPGRADES_PER_SESSION} WebSockets open already"),
+            ),
+            Upstream::Late => err(
+                StatusCode::GATEWAY_TIMEOUT,
                 ClientCode::Unavailable,
-                "the preview is not answering: check its status in the app",
-            )
+                "the preview did not begin to answer in time: check its status in the app",
+            ),
+            Upstream::Unreachable(why) => {
+                eprintln!(
+                    "darkmux client serve: preview on 127.0.0.1:{port}: not answering ({why})"
+                );
+                err(
+                    StatusCode::BAD_GATEWAY,
+                    ClientCode::Unavailable,
+                    "the preview is not answering: check its status in the app",
+                )
+            }
         }
     }
+}
+
+/// `req` sent to `found`'s preview in one of its turns, with its headers as
+/// [`upstream_headers`] makes them, and the answer back with
+/// [`answer_headers`]'s. A WebSocket upgrade the preview accepts is joined
+/// end to end for as long as the session stands.
+async fn forward(state: &ClientServerState, found: Found, mut req: Request) -> Response {
+    let port = found.binding.serving.port;
+    let browser = wants_upgrade(req.headers()).then(|| hyper::upgrade::on(&mut req));
+    let head = answer_head(&found.turns, browser.is_some(), port, req);
+    match tokio::time::timeout(state.preview_sessions.head_within, head).await {
+        Ok(Ok((res, turn))) => answered(state, found, res, browser, turn),
+        Ok(Err(why)) => why.refusal(port),
+        Err(_) => Upstream::Late.refusal(port),
+    }
+}
+
+/// A turn ([`Turns`]: an upgrade's at once or refused, a request's waited
+/// for), then the preview's answer's head.
+async fn answer_head(
+    turns: &Turns,
+    upgrade: bool,
+    port: u16,
+    req: Request,
+) -> Result<
+    (
+        axum::http::Response<hyper::body::Incoming>,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
+    Upstream,
+> {
+    let turn = match upgrade {
+        true => turns
+            .upgrades
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Upstream::Busy)?,
+        false => turns
+            .requests
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Upstream::Busy)?,
+    };
+    let res = send(port, upstream_request(req, port))
+        .await
+        .map_err(Upstream::Unreachable)?;
+    Ok((res, turn))
 }
 
 /// `req` as it goes to the preview on `port`: its method, path and query,
@@ -730,29 +1037,98 @@ async fn send(
     sender.send_request(req).await.map_err(|e| e.to_string())
 }
 
-/// The preview's answer as the browser gets it; a 101 to an upgrade the
-/// browser asked for is joined end to end once both sides switch.
+/// The preview's answer as the browser gets it, its turn held until its
+/// body is done; a 101 to an upgrade the browser asked for is joined end to
+/// end, holding the turn, while the session stands.
 fn answered(
+    state: &ClientServerState,
+    found: Found,
     mut res: axum::http::Response<hyper::body::Incoming>,
-    from_browser: Option<hyper::upgrade::OnUpgrade>,
+    browser: Option<hyper::upgrade::OnUpgrade>,
+    turn: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
-    if let (StatusCode::SWITCHING_PROTOCOLS, Some(browser)) = (res.status(), from_browser) {
-        tokio::spawn(joined(browser, hyper::upgrade::on(&mut res)));
+    answer_headers(res.headers_mut());
+    match (res.status(), browser) {
+        (StatusCode::SWITCHING_PROTOCOLS, Some(browser)) => {
+            let preview = hyper::upgrade::on(&mut res);
+            tokio::spawn(joined(state.clone(), found, (browser, preview), turn));
+            res.map(axum::body::Body::new)
+        }
+        _ => res.map(|body| axum::body::Body::new(Held { body, _turn: turn })),
     }
-    drop_our_cookie(res.headers_mut());
-    res.map(axum::body::Body::new)
+}
+
+/// A preview's answer's body, holding its session's turn until it is done.
+struct Held {
+    body: hyper::body::Incoming,
+    _turn: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl hyper::body::Body for Held {
+    type Data = <hyper::body::Incoming as hyper::body::Body>::Data;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
 }
 
 /// Copies bytes both ways between the browser's switched connection and the
-/// preview's until either ends.
-async fn joined(browser: hyper::upgrade::OnUpgrade, preview: hyper::upgrade::OnUpgrade) {
-    if let (Ok(b), Ok(p)) = tokio::join!(browser, preview) {
-        let (mut b, mut p) = (
-            hyper_util::rt::TokioIo::new(b),
-            hyper_util::rt::TokioIo::new(p),
-        );
-        let _ = tokio::io::copy_bidirectional(&mut b, &mut p).await;
+/// preview's until either ends or the session does ([`session_ended`]);
+/// both connections close then.
+async fn joined(
+    state: ClientServerState,
+    found: Found,
+    (browser, preview): (hyper::upgrade::OnUpgrade, hyper::upgrade::OnUpgrade),
+    _turn: tokio::sync::OwnedSemaphorePermit,
+) {
+    let (Ok(b), Ok(p)) = tokio::join!(browser, preview) else {
+        return;
+    };
+    let (mut b, mut p) = (
+        hyper_util::rt::TokioIo::new(b),
+        hyper_util::rt::TokioIo::new(p),
+    );
+    tokio::select! {
+        _ = tokio::io::copy_bidirectional(&mut b, &mut p) => {}
+        () = session_ended(&state, found) => {}
     }
+}
+
+/// Returns once `found`'s session ends: at once when it is ended (or
+/// replaced, or every session is), and within [`RECHECK_EVERY`] when it no
+/// longer stands or `client serve` stops ([`still_open`]).
+async fn session_ended(state: &ClientServerState, mut found: Found) {
+    let mut every = tokio::time::interval(RECHECK_EVERY);
+    loop {
+        tokio::select! {
+            changed = found.alive.changed() => if changed.is_err() { return },
+            _ = every.tick() => if !still_open(state, &found) { return },
+        }
+    }
+}
+
+/// Whether an open WebSocket's session still stands (an unreadable store or
+/// setting ends it: fail closed) and `client serve` is not stopping; one
+/// that does counts as viewing its preview, one that does not is ended.
+fn still_open(state: &ClientServerState, found: &Found) -> bool {
+    let open = stands_now(state, &found.binding).unwrap_or(false) && !state.previews.stopping();
+    match open {
+        true => state.previews.viewed(&found.binding.workspace),
+        false => state.preview_sessions.end(&found.key),
+    }
+    open
 }
 
 // Tests: `client_preview_proxy_tests.rs`, a module of `client_pairing`'s

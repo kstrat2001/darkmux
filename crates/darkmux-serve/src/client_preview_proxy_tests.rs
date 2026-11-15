@@ -145,26 +145,116 @@ fn the_session_is_read_from_darkmuxs_cookie_only() {
     .is_empty());
 }
 
-/// A preview never sets darkmux's cookie, under any case or spacing; the
-/// cookies it sets for itself reach the browser.
+/// A preview never sets darkmux's cookie, under any case or spacing, nor as
+/// a nameless cookie whose value would read as it, nor any cookie with a
+/// `Domain` (it would reach the tailnet's other hosts). The cookies it sets
+/// for its own host reach the browser.
 #[test]
-fn the_preview_cannot_set_darkmuxs_cookie() {
+fn the_preview_cannot_set_darkmuxs_cookie_or_one_for_other_hosts() {
     let mut h = headers(&[
         (
             "set-cookie",
             "__Host-darkmux_preview=planted; Path=/; Secure",
         ),
         ("set-cookie", "  __host-DARKMUX_preview =planted"),
+        ("set-cookie", "=__Host-darkmux_preview=nameless; Path=/"),
+        ("set-cookie", " = __Host-darkmux_preview=nameless"),
+        ("set-cookie", "wide=1; Path=/; Domain=example.ts.net"),
+        ("set-cookie", "wide=2; domain = .studio.example.ts.net"),
         ("set-cookie", "theirs=1; Path=/"),
         ("set-cookie", "x; __Host-darkmux_preview=not-a-name"),
+        ("set-cookie", "plain=1; Path=/domain"),
         ("content-type", "text/html"),
+        ("cache-control", "public, max-age=31536000, immutable"),
+        ("service-worker-allowed", "/"),
     ]);
-    drop_our_cookie(&mut h);
+    answer_headers(&mut h);
     assert_eq!(
         h.get_all("set-cookie").iter().collect::<Vec<_>>(),
-        ["theirs=1; Path=/", "x; __Host-darkmux_preview=not-a-name"]
+        [
+            "theirs=1; Path=/",
+            "x; __Host-darkmux_preview=not-a-name",
+            "plain=1; Path=/domain"
+        ]
     );
     assert_eq!(h["content-type"], "text/html");
+    assert_eq!(
+        h.get_all("cache-control").iter().collect::<Vec<_>>(),
+        ["no-store"]
+    );
+    assert!(!h.contains_key("service-worker-allowed"));
+}
+
+/// The browser's own headers decide first: a service worker, another
+/// origin, or another site is refused; the entry's own origin (any case),
+/// `none` and `same-origin` pass, and so does a request that names neither.
+#[test]
+fn a_browsers_request_from_another_origin_or_a_service_worker_is_refused() {
+    let origin = "https://studio.example.ts.net:8767";
+    for refused in [
+        vec![("service-worker", "script")],
+        vec![("sec-fetch-dest", "ServiceWorker")],
+        vec![("origin", "https://peer.example.ts.net:8767")],
+        vec![("origin", "null")],
+        vec![
+            ("origin", origin),
+            ("origin", "https://peer.example.ts.net:8767"),
+        ],
+        vec![("sec-fetch-site", "same-site")],
+        vec![("sec-fetch-site", "cross-site")],
+        vec![("sec-fetch-site", "a-future-value")],
+        vec![
+            ("sec-fetch-site", "same-origin"),
+            ("sec-fetch-site", "cross-site"),
+        ],
+    ] {
+        assert!(
+            browser_refusal(&headers(&refused), origin).is_some(),
+            "{refused:?}"
+        );
+    }
+    for allowed in [
+        vec![],
+        vec![("origin", "HTTPS://Studio.Example.ts.net:8767")],
+        vec![("sec-fetch-site", "none")],
+        vec![
+            ("sec-fetch-site", "same-origin"),
+            ("sec-fetch-dest", "script"),
+        ],
+    ] {
+        assert_eq!(
+            browser_refusal(&headers(&allowed), origin),
+            None,
+            "{allowed:?}"
+        );
+    }
+    let on_443 = darkmux_fleet::overlay::ServeEntry::for_port("studio.example.ts.net", 443);
+    assert_eq!(entry_origin(&on_443), "https://studio.example.ts.net");
+    let on_8767 = darkmux_fleet::overlay::ServeEntry::for_port("studio.example.ts.net", 8767);
+    assert_eq!(entry_origin(&on_8767), origin);
+}
+
+/// `clients.preview.enabled` is read at most once per second of the clock,
+/// and a failure to read it is never kept.
+#[test]
+fn the_preview_switch_is_read_once_a_second_and_failures_are_not_kept() {
+    let s = PreviewSessions::default();
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let answer: Arc<Mutex<Result<bool, String>>> = Arc::new(Mutex::new(Ok(true)));
+    let (r, a) = (reads.clone(), answer.clone());
+    let read: crate::client_pairing::PreviewSwitch = Arc::new(move || {
+        r.fetch_add(1, Ordering::SeqCst);
+        a.lock().unwrap().clone()
+    });
+    assert_eq!(s.previews_on(&read, 10), Ok(true));
+    *answer.lock().unwrap() = Ok(false);
+    assert_eq!(s.previews_on(&read, 10), Ok(true), "the same second");
+    assert_eq!(s.previews_on(&read, 11), Ok(false), "the next");
+    *answer.lock().unwrap() = Err("unreadable".into());
+    assert!(s.previews_on(&read, 12).is_err());
+    *answer.lock().unwrap() = Ok(true);
+    assert_eq!(s.previews_on(&read, 12), Ok(true), "a failure was not kept");
+    assert_eq!(reads.load(Ordering::SeqCst), 4);
 }
 
 #[test]
@@ -295,22 +385,21 @@ fn codes_open_once_and_sessions_are_found_by_their_cookie() {
 
     let cookie = s.open(a_binding()).unwrap();
     assert_ne!(cookie, code);
-    assert_eq!(s.find(&["nope".into()]), None);
-    let (key, found) = s.find(&["nope".into(), cookie.clone()]).unwrap();
-    assert_eq!(found, a_binding());
+    assert!(s.find(&["nope".into()]).is_none());
+    let found = s.find(&["nope".into(), cookie.clone()]).unwrap();
+    assert_eq!(found.binding, a_binding());
     assert_ne!(
-        key, cookie,
+        found.key, cookie,
         "the key is the cookie's hash, never the cookie"
     );
     let again = s.open(a_binding()).unwrap();
-    assert_eq!(
-        s.find(std::slice::from_ref(&cookie)),
-        None,
+    assert!(
+        s.find(std::slice::from_ref(&cookie)).is_none(),
         "replaced by the next session to the same preview"
     );
-    let (key, _) = s.find(std::slice::from_ref(&again)).unwrap();
+    let key = s.find(std::slice::from_ref(&again)).unwrap().key;
     s.end(&key);
-    assert_eq!(s.find(&[again]), None, "ended");
+    assert!(s.find(&[again]).is_none(), "ended");
 }
 
 // ─── Through the router ───────────────────────────────────────────────────
@@ -322,6 +411,11 @@ fn codes_open_once_and_sessions_are_found_by_their_cookie() {
 struct StandIn {
     port: u16,
     heads: Arc<Mutex<Vec<String>>>,
+    /// `/hold` requests wait for one of these each.
+    release: Arc<tokio::sync::Semaphore>,
+    /// `/hold` requests waiting now, and the most ever at once.
+    holding: Arc<std::sync::atomic::AtomicUsize>,
+    most: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl StandIn {
@@ -329,13 +423,27 @@ impl StandIn {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let heads = Arc::new(Mutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let holding = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let most = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hold = Hold {
+            release: release.clone(),
+            holding: holding.clone(),
+            most: most.clone(),
+        };
         let seen = heads.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(stand_in_answer(stream, seen.clone()));
+                tokio::spawn(stand_in_answer(stream, seen.clone(), hold.clone()));
             }
         });
-        StandIn { port, heads }
+        StandIn {
+            port,
+            heads,
+            release,
+            holding,
+            most,
+        }
     }
 
     fn last(&self) -> String {
@@ -352,7 +460,19 @@ impl StandIn {
     }
 }
 
-async fn stand_in_answer(mut stream: tokio::net::TcpStream, seen: Arc<Mutex<Vec<String>>>) {
+/// What a `/hold` request waits on, and the count of those waiting.
+#[derive(Clone)]
+struct Hold {
+    release: Arc<tokio::sync::Semaphore>,
+    holding: Arc<std::sync::atomic::AtomicUsize>,
+    most: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+async fn stand_in_answer(
+    mut stream: tokio::net::TcpStream,
+    seen: Arc<Mutex<Vec<String>>>,
+    hold: Hold,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
@@ -373,9 +493,31 @@ async fn stand_in_answer(mut stream: tokio::net::TcpStream, seen: Arc<Mutex<Vec<
         let _ = tokio::io::copy(&mut r, &mut w).await;
         return;
     }
+    if head.starts_with("GET /hold") {
+        let now = hold.holding.fetch_add(1, Ordering::SeqCst) + 1;
+        hold.most.fetch_max(now, Ordering::SeqCst);
+        hold.release.acquire().await.unwrap().forget();
+        hold.holding.fetch_sub(1, Ordering::SeqCst);
+    }
+    if head.starts_with("GET /slowbody") {
+        // The head at once, the body once released.
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\n")
+            .await;
+        hold.release.acquire().await.unwrap().forget();
+        let _ = stream.write_all(b"done").await;
+        return;
+    }
+    if head.starts_with("GET /hang") {
+        // A dev server that never answers: the connection stays open.
+        let _ = stream.read(&mut [0u8; 1]).await;
+        return;
+    }
     let answer = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nset-cookie: __Host-darkmux_preview=planted; Path=/; Secure\r\n\
-         set-cookie: theirs=1; Path=/\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{head}",
+         set-cookie: =__Host-darkmux_preview=nameless; Path=/\r\nset-cookie: wide=1; Domain=example.ts.net; Path=/\r\n\
+         set-cookie: theirs=1; Path=/\r\ncache-control: public, max-age=31536000, immutable\r\n\
+         service-worker-allowed: /\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{head}",
         head.len()
     );
     let _ = stream.write_all(answer.as_bytes()).await;
@@ -819,50 +961,91 @@ async fn off_the_tailnet_nothing_reaches_a_preview() {
     assert_eq!(preview.count(), 0);
 }
 
-/// A WebSocket upgrade (Vite's live reload) goes through to the preview and
-/// its bytes both ways, over a real listener.
-#[tokio::test]
-async fn a_websocket_upgrade_reaches_the_preview_and_echoes() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut h = harness();
-    let (token, preview) = a_previewing_phone(&mut h).await;
-    let cookie = session_of(&h, &token).await;
+/// `router` serving on a real loopback listener (an upgrade needs a real
+/// connection); its address.
+async fn listening(h: &Harness) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = router(h.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
     tokio::spawn(async move { axum::serve(listener, app).await });
+    addr
+}
+
+/// The phone's browser asks `addr` through the entry for a WebSocket on `/`,
+/// holding `cookie`, with `extra` header lines: the connection and the
+/// answer's head.
+async fn socket(addr: SocketAddr, cookie: &str, extra: &str) -> (tokio::net::TcpStream, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let mut head = String::from("GET /?token=vite HTTP/1.1\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n");
+    let mut head = String::from(
+        "GET /?token=vite HTTP/1.1\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-version: 13\r\n\
+         sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+    );
     for (k, v) in forwarded(Some(SAM)) {
         head.push_str(&format!("{k}: {v}\r\n"));
     }
-    head.push_str(&format!(
-        "cookie: {cookie}\r\norigin: https://studio.example.ts.net:8767\r\n\r\n"
-    ));
+    head.push_str(&format!("cookie: {cookie}\r\n{extra}\r\n"));
     s.write_all(head.as_bytes()).await.unwrap();
     let mut got = Vec::new();
     let mut byte = [0u8; 1];
     while !got.ends_with(b"\r\n\r\n") {
-        assert_eq!(
-            s.read(&mut byte).await.unwrap(),
-            1,
-            "closed: {}",
-            String::from_utf8_lossy(&got)
-        );
+        if s.read(&mut byte).await.unwrap_or(0) == 0 {
+            break;
+        }
         got.push(byte[0]);
     }
-    let answer = String::from_utf8_lossy(&got).to_string();
-    assert!(answer.starts_with("HTTP/1.1 101"), "{answer}");
-    s.write_all(b"hmr ping").await.unwrap();
+    (s, String::from_utf8_lossy(&got).to_string())
+}
+
+/// Whether `s` still echoes: `true` when the bytes come back, `false` when
+/// the connection is closed instead (within ten seconds either way).
+async fn still_echoes(s: &mut tokio::net::TcpStream) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if s.write_all(b"hmr ping").await.is_err() {
+        return false;
+    }
     let mut echoed = [0u8; 8];
-    tokio::time::timeout(
+    let read = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         s.read_exact(&mut echoed),
     )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(&echoed, b"hmr ping");
+    .await;
+    match read.expect("neither echoed nor closed within ten seconds") {
+        Ok(_) => {
+            assert_eq!(&echoed, b"hmr ping");
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Waits up to `within` for `s` to be closed by the other end; panics if it
+/// is not. Anything still in flight before the close is read and dropped.
+async fn closes_within(s: &mut tokio::net::TcpStream, within: std::time::Duration) {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 64];
+    let closed = tokio::time::timeout(within, async {
+        while s.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+    });
+    closed.await.expect("the socket was not closed");
+}
+
+/// A WebSocket upgrade (Vite's live reload) goes through to the preview and
+/// its bytes both ways, over a real listener.
+#[tokio::test]
+async fn a_websocket_upgrade_reaches_the_preview_and_echoes() {
+    let mut h = harness();
+    let (token, preview) = a_previewing_phone(&mut h).await;
+    let cookie = session_of(&h, &token).await;
+    let addr = listening(&h).await;
+    let (mut s, answer) = socket(
+        addr,
+        &cookie,
+        "origin: https://studio.example.ts.net:8767\r\n",
+    )
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 101"), "{answer}");
+    assert!(still_echoes(&mut s).await);
     let seen = preview.last().to_ascii_lowercase();
     assert!(
         seen.contains(&format!(
@@ -875,6 +1058,47 @@ async fn a_websocket_upgrade_reaches_the_preview_and_echoes() {
         seen.contains("\r\nupgrade: websocket\r\n") && !seen.contains("darkmux_preview"),
         "{seen}"
     );
+}
+
+/// (#3560 review) An open WebSocket ends with its session: when the device
+/// is revoked, its preview stops or restarts, previews are turned off, or
+/// `client serve` begins to stop: the socket closes within
+/// [`RECHECK_EVERY`] (it is checked again that often), and bytes written
+/// after are not echoed.
+#[tokio::test]
+async fn an_open_websocket_ends_when_its_session_does() {
+    type End = fn(&mut Harness, u16);
+    let ends: [(&str, End); 5] = [
+        ("revoked", |h, _| {
+            assert!(revoke(&h.store, FIRST_CLIENT).unwrap())
+        }),
+        ("stopped", |h, _| assert!(h.state.previews.stop("wt1"))),
+        ("restarted", |h, port| {
+            h.state.previews.ready_for_test("wt1", port);
+        }),
+        ("previews off", |h, _| {
+            *h.preview_on.lock().unwrap() = false;
+            h.clock.fetch_add(1, Ordering::SeqCst);
+        }),
+        ("client serve stopping", |h, _| {
+            h.state.previews.begin_shutdown()
+        }),
+    ];
+    for (why, end) in ends {
+        let mut h = harness();
+        let (token, preview) = a_previewing_phone(&mut h).await;
+        let cookie = session_of(&h, &token).await;
+        let addr = listening(&h).await;
+        let (mut s, answer) = socket(addr, &cookie, "").await;
+        assert!(answer.starts_with("HTTP/1.1 101"), "{why}: {answer}");
+        assert!(still_echoes(&mut s).await, "{why}: open");
+        end(&mut h, preview.port);
+        closes_within(&mut s, RECHECK_EVERY * 3).await;
+        assert!(
+            !still_echoes(&mut s).await,
+            "{why}: the socket outlived its session"
+        );
+    }
 }
 
 /// A link is issued only to a request through the entry from a client paired
@@ -965,4 +1189,390 @@ async fn a_preview_started_from_its_recipe_is_served_at_the_entrys_root() {
         coded(&browse(&h, "/", &cookie, &forwarded(Some(SAM))).await),
         (403, "no_preview_session".to_string())
     );
+}
+
+// ─── (#3560 review) One origin, many previews ─────────────────────────────
+
+/// A browser's request for a service worker script is refused, never sent
+/// to the preview: a worker would outlive this preview and serve the next.
+#[tokio::test]
+async fn a_service_worker_script_is_refused() {
+    let mut h = harness();
+    let (token, preview) = a_previewing_phone(&mut h).await;
+    let cookie = session_of(&h, &token).await;
+    for header in [
+        ("service-worker", "script"),
+        ("sec-fetch-dest", "serviceworker"),
+    ] {
+        let mut from = forwarded(Some(SAM));
+        from.push(header);
+        assert_eq!(
+            coded(&browse(&h, "/sw.js", &cookie, &from).await),
+            (403, "forbidden".to_string()),
+            "{header:?}"
+        );
+    }
+    assert_eq!(preview.count(), 0);
+}
+
+/// A preview's answer is never cached and never widens a service worker's
+/// scope, whatever it says.
+#[tokio::test]
+async fn a_previews_answer_is_never_cached_and_names_no_worker_scope() {
+    let mut h = harness();
+    let (token, _preview) = a_previewing_phone(&mut h).await;
+    let cookie = session_of(&h, &token).await;
+    let page = browse(&h, "/src/main.tsx", &cookie, &forwarded(Some(SAM))).await;
+    assert_eq!(page.0, 200);
+    assert_eq!(
+        page.1.get_all("cache-control").iter().collect::<Vec<_>>(),
+        ["no-store"]
+    );
+    assert!(
+        !page.1.contains_key("service-worker-allowed"),
+        "{:?}",
+        page.1
+    );
+}
+
+/// Opening a link clears what the last preview left in this browser for the
+/// address (its cache and storage, service workers included), never its
+/// cookies: that would clear the session it sets.
+#[tokio::test]
+async fn opening_a_link_clears_the_last_previews_cache_and_storage() {
+    let mut h = harness();
+    let (token, _preview) = a_previewing_phone(&mut h).await;
+    let opened = open_link(&h, &link_for(&h, &token).await, &forwarded(Some(SAM))).await;
+    assert_eq!(opened.0, 303);
+    assert_eq!(
+        opened.1["clear-site-data"],
+        r#""cache", "storage", "executionContexts""#
+    );
+    assert!(!opened.1["clear-site-data"]
+        .to_str()
+        .unwrap()
+        .contains("cookies"));
+}
+
+/// Only the entry's own origin reaches a preview, rewritten to the
+/// preview's: another tailnet host is "same site" (`ts.net` is a public
+/// suffix), so SameSite does not stop it. `Sec-Fetch-Site` must be `none` or
+/// `same-origin` when sent. A WebSocket is held to the same.
+#[tokio::test]
+async fn only_the_entrys_own_origin_reaches_a_preview() {
+    let mut h = harness();
+    let (token, preview) = a_previewing_phone(&mut h).await;
+    let cookie = session_of(&h, &token).await;
+    let with = |extra: &[(&'static str, &'static str)]| {
+        let mut from = forwarded(Some(SAM));
+        from.extend_from_slice(extra);
+        from
+    };
+    for refused in [
+        vec![("origin", "https://peer.example.ts.net:8767")],
+        vec![("origin", "http://studio.example.ts.net:8767")],
+        vec![("origin", "https://studio.example.ts.net:9999")],
+        vec![("origin", "null")],
+        vec![("sec-fetch-site", "same-site")],
+        vec![("sec-fetch-site", "cross-site")],
+        vec![
+            ("origin", "https://studio.example.ts.net:8767"),
+            ("sec-fetch-site", "same-site"),
+        ],
+    ] {
+        assert_eq!(
+            coded(&browse(&h, "/", &cookie, &with(&refused)).await),
+            (403, "forbidden".to_string()),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(preview.count(), 0, "nothing refused reached the preview");
+    for allowed in [
+        vec![
+            ("origin", "https://STUDIO.example.ts.net:8767"),
+            ("sec-fetch-site", "same-origin"),
+        ],
+        vec![("sec-fetch-site", "none")],
+        vec![],
+    ] {
+        assert_eq!(
+            browse(&h, "/", &cookie, &with(&allowed)).await.0,
+            200,
+            "{allowed:?}"
+        );
+    }
+    let addr = listening(&h).await;
+    let (_s, answer) = socket(
+        addr,
+        &cookie,
+        "origin: https://peer.example.ts.net:8767\r\n",
+    )
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+}
+
+/// Viewing a preview counts as asking about it: the idle check never stops
+/// a preview a device is looking at.
+#[tokio::test]
+async fn viewing_a_preview_keeps_it_from_idling() {
+    let mut h = harness();
+    let (token, _preview) = a_previewing_phone(&mut h).await;
+    let cookie = session_of(&h, &token).await;
+    h.clock.fetch_add(14 * 60, Ordering::SeqCst);
+    assert_eq!(browse(&h, "/", &cookie, &forwarded(Some(SAM))).await.0, 200);
+    h.clock.fetch_add(2 * 60, Ordering::SeqCst);
+    assert_eq!(
+        h.state.previews.stop_idle(15),
+        Vec::<String>::new(),
+        "asked two minutes ago, by the page"
+    );
+    h.clock.fetch_add(15 * 60, Ordering::SeqCst);
+    assert_eq!(
+        h.state.previews.stop_idle(15),
+        ["wt1"],
+        "unviewed, it idles as before"
+    );
+}
+
+/// Turning previews off ends a session and refuses its requests; turning
+/// them on again does not bring it back. The setting is read at most once
+/// per second of the clock.
+#[tokio::test]
+async fn turning_previews_off_ends_sessions() {
+    let mut h = harness();
+    let (token, preview) = a_previewing_phone(&mut h).await;
+    let cookie = session_of(&h, &token).await;
+    assert_eq!(browse(&h, "/", &cookie, &forwarded(Some(SAM))).await.0, 200);
+    *h.preview_on.lock().unwrap() = false;
+    h.clock.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(
+        coded(&browse(&h, "/", &cookie, &forwarded(Some(SAM))).await),
+        (403, "no_preview_session".to_string())
+    );
+    *h.preview_on.lock().unwrap() = true;
+    h.clock.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(
+        coded(&browse(&h, "/", &cookie, &forwarded(Some(SAM))).await),
+        (403, "no_preview_session".to_string())
+    );
+    assert_eq!(preview.count(), 1);
+}
+
+// ─── (#3560 review) Bounds ─────────────────────────────────────────────────
+
+/// Ending a session closes what its sockets wait on at once: ended,
+/// replaced by a new session to the same preview, or every session ended.
+#[tokio::test]
+async fn ending_a_session_closes_its_sockets_at_once() {
+    let s = PreviewSessions::default();
+    let within = std::time::Duration::from_secs(5);
+    for end in ["end", "replace", "end_all"] {
+        let cookie = s.open(a_binding()).unwrap();
+        let mut alive = s
+            .find(std::slice::from_ref(&cookie))
+            .unwrap()
+            .alive_for_test();
+        match end {
+            "end" => s.end(&s.find(std::slice::from_ref(&cookie)).unwrap().key),
+            "replace" => drop(s.open(a_binding()).unwrap()),
+            _ => s.end_all(),
+        }
+        let closed = tokio::time::timeout(within, alive.changed())
+            .await
+            .expect("never closed");
+        assert!(
+            closed.is_err(),
+            "{end}: the session's sockets were not told"
+        );
+    }
+}
+
+/// A session has its preview answer at most [`REQUESTS_PER_SESSION`]
+/// requests at once; the rest wait their turn and are answered once one
+/// frees, never refused.
+#[tokio::test]
+async fn a_session_has_six_requests_at_the_preview_at_once_and_the_rest_wait() {
+    let mut h = harness();
+    let (token, preview) = a_previewing_phone(&mut h).await;
+    let cookie = session_of(&h, &token).await;
+    let mut asked = Vec::new();
+    for _ in 0..REQUESTS_PER_SESSION + 3 {
+        let mut from = forwarded(Some(SAM));
+        from.push(("cookie", cookie.as_str()));
+        let mut req = get("/hold", &from);
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                [127, 0, 0, 1],
+                5555,
+            ))));
+        asked.push(tokio::spawn(router(h.state.clone()).oneshot(req)));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while preview.holding.load(Ordering::SeqCst) < REQUESTS_PER_SESSION
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        preview.holding.load(Ordering::SeqCst),
+        REQUESTS_PER_SESSION,
+        "the rest wait"
+    );
+    preview.release.add_permits(REQUESTS_PER_SESSION + 3);
+    for a in asked {
+        assert_eq!(a.await.unwrap().unwrap().status(), 200);
+    }
+    assert_eq!(preview.most.load(Ordering::SeqCst), REQUESTS_PER_SESSION);
+    assert_eq!(preview.count(), REQUESTS_PER_SESSION + 3);
+}
+
+/// A session holds at most [`UPGRADES_PER_SESSION`] WebSockets; the next is
+/// refused `too_many_requests`, and one closing frees its place.
+#[tokio::test]
+async fn a_session_holds_two_websockets_at_most() {
+    let mut h = harness();
+    let (token, _preview) = a_previewing_phone(&mut h).await;
+    let cookie = session_of(&h, &token).await;
+    let addr = listening(&h).await;
+    let mut open = Vec::new();
+    for _ in 0..UPGRADES_PER_SESSION {
+        let (s, answer) = socket(addr, &cookie, "").await;
+        assert!(answer.starts_with("HTTP/1.1 101"), "{answer}");
+        open.push(s);
+    }
+    let (mut refused, answer) = socket(addr, &cookie, "").await;
+    assert!(answer.starts_with("HTTP/1.1 429"), "{answer}");
+    let length = answer
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|n| n.trim().parse::<usize>().unwrap())
+        })
+        .expect("a refusal says its length");
+    let mut body = vec![0u8; length];
+    tokio::io::AsyncReadExt::read_exact(&mut refused, &mut body)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).contains(r#""code":"too_many_requests""#),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    drop(open.pop());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (_s, answer) = socket(addr, &cookie, "").await;
+        if answer.starts_with("HTTP/1.1 101") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the closed socket's place never freed: {answer}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// A preview that never begins to answer is a coded 504 once the wait for
+/// its answer's head is up, and the turn it held is free again.
+#[tokio::test]
+async fn a_preview_that_never_answers_times_out_and_frees_its_turn() {
+    let mut h = harness();
+    h.state.preview_sessions = Arc::new(
+        PreviewSessions::default().with_head_within(std::time::Duration::from_millis(300)),
+    );
+    let (token, _preview) = a_previewing_phone(&mut h).await;
+    let cookie = session_of(&h, &token).await;
+    let mut asked = Vec::new();
+    for _ in 0..REQUESTS_PER_SESSION + 1 {
+        let mut from = forwarded(Some(SAM));
+        from.push(("cookie", cookie.as_str()));
+        let mut req = get("/hang", &from);
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                [127, 0, 0, 1],
+                5555,
+            ))));
+        asked.push(tokio::spawn(router(h.state.clone()).oneshot(req)));
+    }
+    for a in asked {
+        let res = tokio::time::timeout(std::time::Duration::from_secs(10), a)
+            .await
+            .expect("never timed out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(res.status(), 504);
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["code"],
+            "unavailable"
+        );
+    }
+    assert_eq!(
+        browse(&h, "/", &cookie, &forwarded(Some(SAM))).await.0,
+        200,
+        "every turn was given back"
+    );
+}
+
+/// A new session to the same preview (the app opened another link) closes
+/// the old session's WebSockets at once, though the old binding still stands.
+#[tokio::test]
+async fn a_new_session_closes_the_old_ones_websockets() {
+    let mut h = harness();
+    let (token, _preview) = a_previewing_phone(&mut h).await;
+    let cookie = session_of(&h, &token).await;
+    let addr = listening(&h).await;
+    let (mut s, answer) = socket(addr, &cookie, "").await;
+    assert!(answer.starts_with("HTTP/1.1 101"), "{answer}");
+    assert!(still_echoes(&mut s).await);
+    let _newer = session_of(&h, &token).await;
+    closes_within(&mut s, RECHECK_EVERY * 3).await;
+}
+
+/// A request's turn is held until its answer's body is done, not only its
+/// head: six slow bodies hold all six, and the next request waits for one.
+#[tokio::test]
+async fn a_turn_is_held_until_the_answers_body_is_done() {
+    let mut h = harness();
+    let (token, preview) = a_previewing_phone(&mut h).await;
+    let cookie = session_of(&h, &token).await;
+    let ask = |path: &str| {
+        let mut from = forwarded(Some(SAM));
+        from.push(("cookie", cookie.as_str()));
+        let mut req = get(path, &from);
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                [127, 0, 0, 1],
+                5555,
+            ))));
+        router(h.state.clone()).oneshot(req)
+    };
+    let mut slow = Vec::new();
+    for _ in 0..REQUESTS_PER_SESSION {
+        let res = ask("/slowbody").await.unwrap();
+        assert_eq!(res.status(), 200, "its head came at once");
+        slow.push(res);
+    }
+    let next = tokio::spawn(ask("/"));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !next.is_finished(),
+        "a seventh request went ahead while six bodies were still coming"
+    );
+    preview.release.add_permits(REQUESTS_PER_SESSION);
+    for res in slow {
+        assert_eq!(
+            axum::body::to_bytes(res.into_body(), 64).await.unwrap(),
+            "done"
+        );
+    }
+    let next = tokio::time::timeout(std::time::Duration::from_secs(10), next)
+        .await
+        .expect("never answered");
+    assert_eq!(next.unwrap().unwrap().status(), 200);
 }

@@ -1558,7 +1558,11 @@ pub fn run(port: u16) -> Result<()> {
         let (previews, works) = (state.previews.clone(), state.works.clone());
         let stopped_at = Arc::new(std::sync::OnceLock::new());
         let (stopping, cancel_from, stop_began) = (previews.clone(), works.clone(), stopped_at.clone());
+        // (#3560) Every preview session, and the WebSockets they hold, ends
+        // as the stop begins.
+        let sessions = state.preview_sessions.clone();
         let served = serve_until_stopped(listener, router(state), &mut signals, move || {
+            sessions.end_all();
             let _ = stop_began.set(begin_stop(&stopping, &cancel_from));
         })
         .await;
