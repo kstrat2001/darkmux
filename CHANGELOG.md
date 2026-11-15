@@ -18,12 +18,16 @@ darkmux release.
 
 - **A Flint dispatch uses rec's own server when it already serves the model (#3574).** When rec's own
   server is up and `rec status` says it is ready, serving the profile model's revision at a context of
-  at least its `n_ctx`, on this machine's loopback, the dispatch goes to that server with rec's local
-  key instead of being refused, and darkmux starts, stops, evicts and budgets nothing there. The
-  listing reads such a model `external` (`reachable` and `loaded` in `GET /client/profiles`), and
-  doctor's `flint engine` row passes naming it. A server serving another revision or a smaller context
-  is still refused `engine_in_use`, naming what does not match. The rule is contract 4 in
-  `docs/agents/CONTRACTS.md`.
+  at least its `n_ctx`, on this machine's loopback, and the model declares no `engine_args`, the
+  dispatch goes to that server with rec's local key instead of being refused, and its records name
+  that server. darkmux starts, stops and evicts nothing there, and writes no engine record, lease or
+  reservation and no memory budget for it; flow records and the endpoint's token budget apply as
+  usual. A lab run never uses it. The listing reads such a model `external` (`reachable` and `loaded`
+  in `GET /client/profiles`) when `rec auth token` gives a key, and doctor's `flint engine` row passes
+  naming it. Anything else is still refused `engine_in_use`, naming what does not match, with the
+  remedy that fits (wait for rec's server to be ready, or `rec stop`). The server can change between
+  the check and the request, and a container run does not check again mid-run. The rule is contract 4
+  in `docs/agents/CONTRACTS.md`.
 - **A model's availability says why by code (#3574).** An `unavailable` availability in
   `GET /client/profiles`, `darkmux profile list --json` and the machine card (card schema 1.5) now
   carries an optional `code`, the one a dispatch refusing for the same reason carries:

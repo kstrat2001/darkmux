@@ -108,8 +108,42 @@ pub enum OwnServerUse {
     /// budgets it.
     Reuse { chat_url: String },
     /// rec's own server is up and does not serve the model, for `why`:
-    /// refused `engine_in_use` ([`own_server_refusal`]).
-    Refuse { address: String, why: String },
+    /// refused `engine_in_use` ([`own_server_refusal`]), with the remedy
+    /// that fits the why.
+    Refuse { address: String, why: String, remedy: Remedy },
+}
+
+/// (#3574) What the operator does about a refusal, following its why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Remedy {
+    /// rec's server serves something else, or something darkmux cannot
+    /// confirm: `rec stop`, then dispatch again.
+    StopRec,
+    /// rec's server would serve the model once ready: wait for it.
+    WaitReady,
+    /// rec's server came up after the dispatch began: dispatch again.
+    DispatchAgain,
+}
+
+/// Why a lab run never reuses rec's own server (#3574): "No blind runs"
+/// (DOCTRINE.md) needs every run's knobs on record.
+pub const LAB_NEVER_REUSES: &str = "a lab run never uses a server darkmux did not start: rec's other launch flags are \
+     not in `rec status`, so the run's knob snapshot could not describe what it measured";
+
+impl OwnServerUse {
+    /// (#3574) The decision for a lab run: a server darkmux would reuse is
+    /// refused ([`LAB_NEVER_REUSES`]), since a lab run must describe the
+    /// server it measures.
+    pub fn for_lab(self) -> Self {
+        match self {
+            OwnServerUse::Reuse { chat_url } => OwnServerUse::Refuse {
+                address: chat_url,
+                why: LAB_NEVER_REUSES.to_string(),
+                remedy: Remedy::StopRec,
+            },
+            other => other,
+        }
+    }
 }
 
 /// (#3574) [`OwnServerUse`] for `model`, from what `rec status` said and
@@ -122,24 +156,29 @@ pub fn own_server_use(
     let Some(own) = own.filter(|o| !own_server_is_darkmuxs(&o.address, darkmuxs)) else { return OwnServerUse::Free };
     match own.serves(model) {
         Ok(chat_url) => OwnServerUse::Reuse { chat_url },
-        Err(why) => OwnServerUse::Refuse { address: own.address.clone(), why },
+        Err((why, remedy)) => OwnServerUse::Refuse { address: own.address.clone(), why, remedy },
     }
 }
 
 impl OwnServer {
     /// The chat URL to send `model`'s requests to when this server serves
-    /// it (ready, on this machine's loopback, the model's revision, a
-    /// context of at least its `n_ctx`); otherwise what does not match.
-    fn serves(&self, model: &darkmux_types::ProfileModel) -> Result<String, String> {
-        let endpoint = self.local_endpoint()?;
-        self.mismatch(model).map_or_else(|| Ok(darkmux_types::endpoint::lmstudio_chat_url(endpoint)), Err)
+    /// it (on this machine's loopback, the model's revision, a context of at
+    /// least its `n_ctx`, no `engine_args` it cannot confirm, and ready);
+    /// otherwise what does not match and its remedy. A server that matches
+    /// in everything but being ready is waited for, not stopped.
+    fn serves(&self, model: &darkmux_types::ProfileModel) -> Result<String, (String, Remedy)> {
+        let endpoint = self.local_endpoint().map_err(|why| (why, Remedy::StopRec))?;
+        if let Some(why) = self.mismatch(model) {
+            return Err((why, Remedy::StopRec));
+        }
+        if !self.ready {
+            return Err(("it is still starting (`rec status` says `\"ready\": false`)".into(), Remedy::WaitReady));
+        }
+        Ok(darkmux_types::endpoint::lmstudio_chat_url(endpoint))
     }
 
-    /// Its endpoint, when it is ready on this machine's loopback.
+    /// Its endpoint, when it names one on this machine's loopback.
     fn local_endpoint(&self) -> Result<&str, String> {
-        if !self.ready {
-            return Err("it is not ready (`rec status` says `\"ready\": false`)".into());
-        }
         let endpoint = self.endpoint.as_deref().ok_or("`rec status` names no endpoint")?;
         if !darkmux_types::endpoint::url_names_this_machine(endpoint) {
             return Err(format!("its endpoint {endpoint} is not this machine's loopback"));
@@ -147,7 +186,8 @@ impl OwnServer {
         Ok(endpoint)
     }
 
-    /// How the revision or context it serves differs from `model`'s.
+    /// How the revision, context or launch flags it serves differ from
+    /// `model`'s, or cannot be confirmed to match.
     fn mismatch(&self, model: &darkmux_types::ProfileModel) -> Option<String> {
         let Some(revision) = self.revision.as_deref() else {
             return Some("`rec status` names no revision".into());
@@ -155,6 +195,20 @@ impl OwnServer {
         if revision != model.id {
             return Some(format!("it serves `{revision}`, not `{}`", model.id));
         }
+        // Contract 1: the model's flags are part of what the profile means,
+        // and `rec status` shows none of rec's.
+        if !model.engine_args.is_empty() {
+            return Some(format!(
+                "the profile model's `engine_args` ({}) are flags `rec status` does not show, so darkmux cannot \
+                 confirm rec's server runs with them",
+                model.engine_args.join(" ")
+            ));
+        }
+        self.context_mismatch(model)
+    }
+
+    /// How its context falls short of `model`'s `n_ctx`, or cannot be read.
+    fn context_mismatch(&self, model: &darkmux_types::ProfileModel) -> Option<String> {
         let Some(n_ctx) = model.n_ctx else { return Some("the profile model declares no `n_ctx`".into()) };
         match self.context {
             None => Some("`rec status` names no context".into()),
@@ -174,14 +228,22 @@ pub fn own_server_is_darkmuxs(address: &str, darkmuxs: Option<&darkmux_types::en
 }
 
 /// Why darkmux will not serve Flint while rec's own server at `address` is
-/// up and does not serve the model (`why`): what a dispatch refuses with
-/// (`engine_in_use`) and a listing reads.
-pub fn own_server_refusal(address: &str, why: &str) -> String {
-    format!(
-        "rec's own server is up or starting (at {address}) and does not serve this model: {why}. rec runs one server \
-         per machine, and darkmux never stops or takes over a server it did not start. Run `rec stop`, then dispatch \
-         again"
-    )
+/// up and does not serve the model (`why`), ending with the remedy that
+/// fits the why: what a dispatch refuses with (`engine_in_use`), a listing
+/// reads and doctor shows.
+pub fn own_server_refusal(address: &str, why: &str, remedy: Remedy) -> String {
+    match remedy {
+        Remedy::StopRec => format!(
+            "rec's own server is up or starting (at {address}), and this dispatch cannot use it: {why}. rec runs one \
+             server per machine, and darkmux never stops or takes over a server it did not start. Run `rec stop`, \
+             then dispatch again"
+        ),
+        Remedy::WaitReady => format!(
+            "rec's own server (at {address}) serves this model as the profile declares it, but {why}. Wait until \
+             `rec status` says it is ready, then dispatch again"
+        ),
+        Remedy::DispatchAgain => format!("rec's own server (at {address}) {why}. Dispatch again to use it"),
+    }
 }
 
 /// The port of `http://host:port/...`.
@@ -642,33 +704,74 @@ mod tests {
     }
 
     /// (#3574, contract 4) rec's own server that does not serve the model as
-    /// the profile declares it is refused, naming what does not match:
-    /// still loading, no revision or another one, a context below `n_ctx`
-    /// or none, no endpoint, or one that is not this machine's loopback.
+    /// the profile declares it is refused, naming what does not match and
+    /// `rec stop`: no revision or another one, a context below `n_ctx` or
+    /// none, `engine_args` it cannot confirm, no endpoint, or one that is not
+    /// this machine's loopback, whether or not it is ready yet.
     #[test]
     fn recs_own_server_that_does_not_serve_the_model_is_refused_naming_why() {
-        let case = |json: &str, model: darkmux_types::ProfileModel| own_server_use(Some(&status(json)), &model, None);
-        let starting = r#"{"ready":false,"endpoint":"http://127.0.0.1:11500/v1","revision":"flint-int4","context":262144}"#;
-        let refused = |json: &str, n_ctx: Option<u32>, says: &str| match case(json, at_ctx(n_ctx)) {
-            OwnServerUse::Refuse { address, why } => {
+        // Something listens on rec's port, so a server still starting counts.
+        let case = |json: &str, model: darkmux_types::ProfileModel| {
+            own_server_use(parse_status(json, &|_| true).as_ref(), &model, None)
+        };
+        let refused = |json: &str, model: darkmux_types::ProfileModel, says: &str| match case(json, model) {
+            OwnServerUse::Refuse { address, why, remedy } => {
                 assert!(why.contains(says), "{json}: {why}");
-                let message = own_server_refusal(&address, &why);
+                assert_eq!(remedy, Remedy::StopRec, "{json}: {why}");
+                let message = own_server_refusal(&address, &why, remedy);
                 assert!(message.contains("rec stop") && message.contains(&address), "{message}");
             }
-            other => panic!("{json} at {n_ctx:?}: {other:?}"),
+            other => panic!("{json}: {other:?}"),
         };
+        let at = |n: u32| at_ctx(Some(n));
+        refused(&RUNNING.replace(r#""revision":"flint-int4","#, ""), at(8192), "names no revision");
+        refused(&RUNNING.replace("flint-int4", "flint-int8"), at(8192), "`flint-int8`, not `flint-int4`");
+        refused(RUNNING, at(262_145), "262144");
+        refused(&RUNNING.replace(r#","context":262144"#, ""), at(8192), "names no context");
+        refused(RUNNING, at_ctx(None), "no `n_ctx`");
+        refused(&RUNNING.replace(r#""endpoint":"http://127.0.0.1:11500/v1","#, ""), at(8192), "names no endpoint");
+        refused(&RUNNING.replace("127.0.0.1", "10.0.0.7"), at(8192), "not this machine");
+        let mut flagged = at(8192);
+        flagged.engine_args = vec!["--enforce-tool-schemas".into()];
+        refused(RUNNING, flagged, "`engine_args` (--enforce-tool-schemas)");
+        // Still starting, and serving another revision: stopping is the fix.
+        let starting_other = RUNNING.replace(r#""ready":true"#, r#""ready":false"#).replace("flint-int4", "flint-int8");
+        refused(&starting_other, at(8192), "`flint-int8`");
+    }
+
+    /// (#3574) rec's own server that would serve the model but is still
+    /// starting is waited for, not stopped: the remedy is to wait until
+    /// `rec status` says it is ready, and it never names `rec stop`.
+    #[test]
+    fn recs_own_server_still_starting_on_the_model_says_wait_not_stop() {
+        let starting = RUNNING.replace(r#""ready":true"#, r#""ready":false"#);
         let listening = |_: u16| true;
-        match own_server_use(parse_status(starting, &listening).as_ref(), &at_ctx(Some(8192)), None) {
-            OwnServerUse::Refuse { why, .. } => assert!(why.contains("not ready"), "{why}"),
+        match own_server_use(parse_status(&starting, &listening).as_ref(), &at_ctx(Some(8192)), None) {
+            OwnServerUse::Refuse { address, why, remedy } => {
+                assert_eq!(remedy, Remedy::WaitReady, "{why}");
+                let message = own_server_refusal(&address, &why, remedy);
+                assert!(message.contains("Wait until `rec status` says it is ready"), "{message}");
+                assert!(!message.contains("rec stop"), "{message}");
+            }
             other => panic!("starting: {other:?}"),
         }
-        refused(&RUNNING.replace(r#""revision":"flint-int4","#, ""), Some(8192), "names no revision");
-        refused(&RUNNING.replace("flint-int4", "flint-int8"), Some(8192), "`flint-int8`, not `flint-int4`");
-        refused(RUNNING, Some(262_145), "262144");
-        refused(&RUNNING.replace(r#","context":262144"#, ""), Some(8192), "names no context");
-        refused(RUNNING, None, "no `n_ctx`");
-        refused(&RUNNING.replace(r#""endpoint":"http://127.0.0.1:11500/v1","#, ""), Some(8192), "names no endpoint");
-        refused(&RUNNING.replace("127.0.0.1", "10.0.0.7"), Some(8192), "not this machine");
+    }
+
+    /// (#3574, DOCTRINE "No blind runs") A lab run never reuses rec's own
+    /// server: a reuse becomes a refusal naming why and `rec stop`; every
+    /// other decision stands.
+    #[test]
+    fn a_lab_run_never_reuses_recs_own_server() {
+        let reuse = own_server_use(Some(&status(RUNNING)), &at_ctx(Some(8192)), None);
+        match reuse.clone().for_lab() {
+            OwnServerUse::Refuse { why, remedy, .. } => {
+                assert_eq!((why.as_str(), remedy), (LAB_NEVER_REUSES, Remedy::StopRec));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(OwnServerUse::Free.for_lab(), OwnServerUse::Free);
+        let refused = own_server_use(Some(&status(&RUNNING.replace("flint-int4", "x"))), &at_ctx(Some(8192)), None);
+        assert_eq!(refused.clone().for_lab(), refused);
     }
 
     /// (#3574) No server of rec's own is free: nothing to reuse or refuse.

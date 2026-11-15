@@ -8032,7 +8032,7 @@ fn a_flint_profile_recs_own_server_serves_is_external_reachable_and_loaded() {
         "rec",
         "case \"$1\" in\n  --version) echo 'rec 0.1.0';;\n  \
          status) echo '{\"ready\":true,\"endpoint\":\"http://127.0.0.1:11500/v1\",\"revision\":\"flint-int4\",\"context\":32000}';;\n  \
-         *) exit 9;;\nesac\n",
+         auth) echo placeholder-key-for-tests;;\n  *) exit 9;;\nesac\n",
     );
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let registry = tmp.path().join("profiles.json");

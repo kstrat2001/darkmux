@@ -71,19 +71,30 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    **Amended by #3574 (operator, 2026-11-15): rec's own server is used when it already serves
    the model.** This is the one server darkmux did not start that it dispatches to. It qualifies
    only when `rec status` says `"ready": true`, its `revision` is the profile model's `id`, its
-   `context` is at least the model's `n_ctx`, and its `endpoint` is this machine's loopback.
-   darkmux then uses it as an external engine: it sends requests there with rec's local key,
-   read from `rec auth token` when the dispatch starts and never logged, printed, put in an
-   error, a flow record or a test fixture, and writes no lease, record or reservation for it. A
-   listing reads the model `external`: usable, and not managed by darkmux. darkmux never stops,
-   restarts, loads into, evicts or budgets that server. Anything else (no `revision`, another
-   one, a smaller `context`, a server still loading) is refused `engine_in_use` as before.
-   Accepted risk: rec's other launch flags are not visible in `rec status`. One decision serves
-   the dispatch, the listing and doctor, so they never disagree:
-   `darkmux_profiles::engine::flint::own_server_use`. Conformance: its tests in `flint.rs`,
-   `engine_dispatch`'s `recs_own_server_serving_the_model_is_reused_starting_and_leasing_nothing`,
-   `dispatch_internal`'s `a_flint_dispatch_goes_to_recs_own_server_when_it_serves_the_model`, and
-   the listing's `recs_own_server_serving_the_model_is_external_and_otherwise_engine_in_use`.
+   `context` is at least the model's `n_ctx`, its `endpoint` is this machine's loopback, the
+   profile model declares no `engine_args` (`rec status` shows no launch flags, so they could not
+   be confirmed, and contract 1 forbids dropping them), and the dispatch is not a lab run's
+   ("No blind runs": a lab run must describe the server it measures). darkmux decides this once,
+   before the dispatch's `dispatch.start`, so the dispatch's records name rec's server as their
+   endpoint and its request goes there. It is used as an external engine: requests carry rec's
+   local key, read from `rec auth token` and never logged, printed, put in an error, a flow
+   record or a test fixture. darkmux writes no engine record, lease or reservation for it and
+   gives it no memory budget; the dispatch's flow records and its endpoint's token budget apply
+   as on any endpoint. A listing reads the model `external` (usable, not managed by darkmux)
+   only when `rec auth token` also gives a key, as a dispatch needs. darkmux never stops,
+   restarts or loads into that server. Anything else is refused `engine_in_use`, naming what
+   does not match, with the remedy that fits it: wait until `rec status` says ready when that
+   is the only gap, else `rec stop`. Accepted risks: rec's other launch flags are not visible in
+   `rec status`, and the server can change between that check and the request; a multi-turn
+   container run never checks again, so a `rec launch` of another revision mid-run would be
+   used. One decision serves the dispatch, the listing and doctor, so they never disagree:
+   `darkmux_profiles::engine::flint::own_server_use`, made once per dispatch by
+   `darkmux_crew::engine_dispatch::decide_own`. Conformance: its tests in `flint.rs`,
+   `engine_dispatch`'s `recs_own_server_serving_the_model_is_reused_starting_and_leasing_nothing`
+   and `decide_own_reuses_for_a_dispatch_and_refuses_for_a_lab_run`, `dispatch_internal`'s
+   `a_flint_dispatch_goes_to_recs_own_server_when_it_serves_the_model` and
+   `the_container_path_routes_its_brain_and_credential_to_recs_own_server`, and the listing's
+   `recs_own_server_serving_the_model_is_external_and_otherwise_engine_in_use`.
 5. **Schema versioning** — flow/rules/config/profiles data shapes change only through their
    documented semver rules. Flow-archive readers are lenient-on-read; user files follow
    contract 7.

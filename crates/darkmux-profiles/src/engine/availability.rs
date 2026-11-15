@@ -37,8 +37,10 @@
 //! checks), the port is free, and rec's own server is not running. rec runs
 //! one server per machine, so its own server decides as a dispatch decides
 //! (`flint::own_server_use`, contract 4): `external` when it serves the
-//! model, else `unavailable` with the dispatch's refusal (`engine_in_use`,
-//! naming `rec stop`).
+//! model and `rec auth token` gives the key a dispatch sends (asked only
+//! then, the key dropped at once), else `unavailable` with the dispatch's
+//! refusal (`engine_in_use` with the remedy that fits, or
+//! `engine_unavailable` for the key).
 //!
 //! `unknown` is a probe that could not run or ran out of time (LM Studio not
 //! running, a listing that failed once the engine answered). A Tensorfold
@@ -587,6 +589,10 @@ pub struct FlintAnswer {
     /// What `rec status` says of rec's own server, when it is up or
     /// starting.
     pub own_server: Result<Option<super::flint::OwnServer>, String>,
+    /// (#3574) Whether `rec auth token` gave a key, asked only while rec's
+    /// own server is up: a dispatch that would use that server needs it.
+    /// The key itself is dropped at once, never kept. `None`: not asked.
+    pub key: Option<Result<(), String>>,
     pub dirs: Dirs,
 }
 
@@ -615,10 +621,15 @@ impl FlintAnswer {
                     .unwrap_or_else(|_| Err("`rec status` panicked".into())),
             )
         });
+        // Asked after `rec status`, and only while rec's own server is up.
+        let key = matches!(own_server, Ok(Some(_))).then(|| {
+            crate::gestalt_host::lms_host::with_deadline_cap(cap, || rec.auth_token().map(drop).map_err(msg))
+        });
         FlintAnswer {
             rec,
             version,
             own_server,
+            key,
             dirs,
         }
     }
@@ -653,7 +664,9 @@ impl FlintAnswer {
 
     /// (#3574) rec's own server, judged as a dispatch judges it
     /// ([`super::flint::own_server_use`]): `external` when it serves the
-    /// model, `unavailable` (`engine_in_use`) when it is up and does not,
+    /// model and `rec auth token` gives the key a dispatch sends
+    /// (`engine_unavailable` when it does not), `unavailable`
+    /// (`engine_in_use`) when it is up and does not serve the model,
     /// `unknown` when `rec status` could not say, `None` when it is not up.
     fn own_server_verdict(
         &self,
@@ -670,11 +683,26 @@ impl FlintAnswer {
         };
         match super::flint::own_server_use(own, model, darkmuxs) {
             super::flint::OwnServerUse::Free => None,
-            super::flint::OwnServerUse::Reuse { .. } => Some(Availability::external()),
-            super::flint::OwnServerUse::Refuse { address, why } => Some(Availability::refused(
+            super::flint::OwnServerUse::Reuse { .. } => Some(self.key_verdict()),
+            super::flint::OwnServerUse::Refuse {
+                address,
+                why,
+                remedy,
+            } => Some(Availability::refused(
                 ClientCode::EngineInUse,
-                super::flint::own_server_refusal(&address, &why),
+                super::flint::own_server_refusal(&address, &why, remedy),
             )),
+        }
+    }
+}
+
+impl FlintAnswer {
+    /// A model rec's own server serves: `external`, unless `rec auth token`
+    /// failed, which a dispatch refuses `engine_unavailable`.
+    fn key_verdict(&self) -> Availability {
+        match &self.key {
+            Some(Err(e)) => Availability::refused(ClientCode::EngineUnavailable, e.clone()),
+            _ => Availability::external(),
         }
     }
 }

@@ -4,7 +4,7 @@
 //! profile registry declares a Tensorfold endpoint.
 
 use crate::{Check, Status};
-use darkmux_profiles::engine::flint::{OwnServer, OwnServerUse, Rec, VERIFIED_RELEASE};
+use darkmux_profiles::engine::flint::{OwnServer, OwnServerUse, Rec, Remedy, VERIFIED_RELEASE};
 use darkmux_profiles::engine::tensorfold::{TensorfoldProbe, ServeFlags, Tensorfold, Version, VERIFIED_RELEASES};
 use darkmux_types::config_access::Source;
 use darkmux_types::{EndpointKind, ManagedBackend, ProfileRegistry};
@@ -280,10 +280,10 @@ fn own_server_row(lead: &str, own: Option<&OwnServer>, facts: &FlintFacts, model
         })
         .collect();
     let address = own.map_or("", |o| o.address.as_str());
-    let refused: Vec<String> = uses
+    let refused: Vec<(String, Remedy)> = uses
         .iter()
         .filter_map(|(at, u)| match u {
-            OwnServerUse::Refuse { why, .. } => Some(format!("{at}: {why}")),
+            OwnServerUse::Refuse { why, remedy, .. } => Some((format!("{at}: {why}"), *remedy)),
             _ => None,
         })
         .collect();
@@ -291,18 +291,29 @@ fn own_server_row(lead: &str, own: Option<&OwnServer>, facts: &FlintFacts, model
     flint_own_server_check(lead, address, &refused, reused, models.len())
 }
 
+/// The hint for the models rec's own server does not serve, following
+/// their why (#3574): wait when every one only waits on rec's server being
+/// ready, else `rec stop`.
+fn own_server_hint(refused: &[(String, Remedy)]) -> String {
+    if refused.iter().all(|(_, r)| *r == Remedy::WaitReady) {
+        return "rec's own server is still starting and will serve them: wait until `rec status` says it is ready"
+            .into();
+    }
+    "those dispatches are refused (`engine_in_use`): darkmux never stops or takes over rec's server. Run `rec stop` \
+     to let darkmux start its own, or point the profile model at the revision and context rec serves"
+        .into()
+}
+
 /// The row from what rec's own server means for the Flint models: any it
 /// does not serve warn, naming why; otherwise it passes, saying which go to
 /// rec's own server.
-fn flint_own_server_check(lead: &str, address: &str, refused: &[String], reused: usize, models: usize) -> Check {
+fn flint_own_server_check(lead: &str, address: &str, refused: &[(String, Remedy)], reused: usize, models: usize) -> Check {
     if !refused.is_empty() {
+        let whys: Vec<&str> = refused.iter().map(|(why, _)| why.as_str()).collect();
         return flint_row(
             Status::Warn,
-            format!("{lead}: rec's own server is up or starting at {address} and does not serve {}", refused.join("; ")),
-            Some("those dispatches are refused (`engine_in_use`): darkmux never stops or takes over rec's server. Run \
-                  `rec stop` to let darkmux start its own, or point the profile model at the revision and context rec \
-                  serves"
-                .into()),
+            format!("{lead}: rec's own server is up or starting at {address}, and no dispatch can use it now for {}", whys.join("; ")),
+            Some(own_server_hint(refused)),
         );
     }
     if reused > 0 {
@@ -374,6 +385,13 @@ mod flint_tests {
         assert_eq!(c.status, Status::Warn, "{}", c.message);
         assert!(c.message.contains("profiles.f.models[0]") && c.message.contains("`flint-int8`"), "{}", c.message);
         assert!(c.hint.unwrap().contains("rec stop"));
+        // Still starting on the model: the hint is to wait, not to stop.
+        let mut starting = facts("0.1.0");
+        starting.own_server = Ok(Some(OwnServer { ready: false, ..serving("flint-int4", 8192) }));
+        let c = flint_engine_status(&registry(REG), |_| starting);
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        let hint = c.hint.unwrap();
+        assert!(hint.contains("wait until `rec status` says it is ready") && !hint.contains("rec stop"), "{hint}");
     }
 
     /// (#3453) No Flint endpoint: rec is never asked.

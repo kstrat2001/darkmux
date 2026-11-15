@@ -71,9 +71,12 @@ impl Target {
         match self.kind {
             EndpointKind::Unmanaged => Some(endpoint_route_label(&self.endpoint, &self.model.id)),
             // (#3448, #3453) A server darkmux starts is labeled by where it
-            // serves, never left to read as the LM Studio default.
+            // serves, never left to read as the LM Studio default: the host
+            // its `chat_url` dials, `127.0.0.1:<port>`, or (#3574) rec's own
+            // server's when the dispatch was routed there.
             EndpointKind::Managed(backend) if backend.starts_servers() => Some(darkmux_flow::unmanaged_route_label(
-                &format!("127.0.0.1:{}", self.endpoint.port.unwrap_or_default()),
+                &darkmux_types::endpoint::url_host(&self.chat_url)
+                    .unwrap_or_else(|| format!("127.0.0.1:{}", self.endpoint.port.unwrap_or_default())),
                 &self.model.id,
             )),
             EndpointKind::Managed(_) => None,
