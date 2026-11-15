@@ -15923,7 +15923,7 @@ fn fake_tailnet_tool(dir: &std::path::Path, home: &std::path::Path, port: u16) -
     fs::write(dir.join("serve.json"), FAKE_TAILNET_OPERATOR).unwrap();
     fs::write(
         dir.join("status.json"),
-        r#"{"BackendState":"Running","Self":{"DNSName":"studio.example.ts.net."},"CertDomains":["studio.example.ts.net"]}"#,
+        r#"{"BackendState":"Running","Self":{"ID":"nSTUDIO","DNSName":"studio.example.ts.net.","UserID":1},"User":{"1":{"LoginName":"sam@example.com"}},"CertDomains":["studio.example.ts.net"]}"#,
     )
     .unwrap();
     let record = home.join("client-remote").join(format!("{port}.json"));
@@ -16057,7 +16057,7 @@ fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed
     let request_id = reply_json(&reply)["request_id"].as_str().unwrap().to_string();
     let poll = || through("GET", &format!("/client/pair/{request_id}"), &format!("X-Pair-Secret: {secret}\r\n"), "");
     assert_eq!(reply_json(&poll())["status"], "pending", "never approved on its own");
-    assert!(said(&log).contains("through the tailnet entry from tailnet user sam@example.com, device peer (Sam's iPhone)"), "{}", said(&log));
+    assert!(said(&log).contains("through the tailnet entry naming tailnet user sam@example.com, device peer (Sam's iPhone)"), "{}", said(&log));
     assert!(!said(&log).contains(secret), "the pair secret is never logged");
     let mut approve = darkmux_std_cmd();
     approve.args(["client", "approve", "--code", "R3M-0TE"]).env("DARKMUX_HOME", &home).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
@@ -16065,7 +16065,7 @@ fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed
     std::io::Write::write_all(approving.stdin.as_mut().unwrap(), b"y\n").unwrap();
     let out = approving.wait_with_output().unwrap();
     let shown = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success() && shown.contains("tailnet: tailnet user sam@example.com, device peer"), "{shown}");
+    assert!(out.status.success() && shown.contains("tailnet: tailnet user sam@example.com, device peer") && shown.contains("approve only if peer itself shows code R3M-0TE"), "{shown}");
     let collected = reply_json(&poll());
     let phone_token = collected["token"].as_str().unwrap_or_else(|| panic!("{collected}")).to_string();
     let reply = whoami(Some(&phone_token));

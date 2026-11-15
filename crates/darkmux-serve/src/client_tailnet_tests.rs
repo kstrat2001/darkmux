@@ -36,8 +36,11 @@ const PHONE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 1, 2));
 fn phone_node() -> darkmux_fleet::NodeIdentity {
     let mut n = darkmux_fleet::test_node("nPHONE1CNTRL", "sams-iphone", "100.64.1.2");
     n.host_name = Some("Sam's iPhone".into());
+    n.login = Some("sam@example.com".into());
     n
 }
+
+const SAM: &str = "sam@example.com";
 
 fn phone() -> TailnetDevice {
     TailnetDevice { id: "nPHONE1CNTRL".into(), name: "sams-iphone".into(), host_name: Some("Sam's iPhone".into()) }
@@ -247,11 +250,45 @@ fn a_pairing_needs_a_tailnet_user() {
 /// and host name, or, fail closed, a refusal when it named none or failed.
 #[test]
 fn whois_names_the_device_or_the_request_is_refused() {
-    assert_eq!(device_named(Ok(Some(phone_node()))), Ok(phone()));
+    assert_eq!(device_named(Ok(Some(phone_node())), SAM), Ok(phone()));
     for found in [Ok(None), Err("tailscaled is not running".to_string())] {
-        let (code, why) = device_named(found.clone()).unwrap_err();
+        let (code, why) = device_named(found.clone(), SAM).unwrap_err();
         assert_eq!(code, ClientCode::RemoteDeviceUnknown, "{found:?}");
         assert!(why.contains("tailscale status") && !why.contains("tailscaled is not running"), "{why}");
+    }
+}
+
+/// (#3560 review) The header's user must be the one Tailscale's own record
+/// gives the device at that address (`UserProfile.LoginName`), exactly: a
+/// local process can send any header and any address, but not change what
+/// `whois` says. A device whose record names no user is refused too.
+#[test]
+fn whois_must_confirm_the_headers_user() {
+    for header in ["alex@example.com", "Sam@example.com", "sam@example.com "] {
+        let (code, why) = device_named(Ok(Some(phone_node())), header).unwrap_err();
+        assert_eq!(code, ClientCode::RemoteIdentityUnconfirmed, "{header:?}");
+        assert!(why.contains("sam@example.com"), "names whose device it is: {why}");
+    }
+    let mut tagged = phone_node();
+    tagged.login = None;
+    assert_eq!(device_named(Ok(Some(tagged.clone())), SAM).map_err(|r| r.0), Err(ClientCode::RemoteIdentityUnconfirmed));
+    assert_eq!(device_refusal(&phone(), Ok(Some(tagged)), SAM).map(|r| r.0), Some(ClientCode::RemoteIdentityUnconfirmed));
+    assert_eq!(device_refusal(&phone(), Ok(Some(phone_node())), "alex@example.com").map(|r| r.0), Some(ClientCode::RemoteIdentityUnconfirmed));
+}
+
+/// (#3560 review) A pairing over the tailnet is open only to the tailnet
+/// user this Mac is logged in as; another is refused naming who may, and
+/// when Tailscale cannot say who that is, the pairing is refused for now.
+#[test]
+fn only_this_macs_own_tailnet_user_may_pair() {
+    assert_eq!(owner_refusal(SAM, &Ok(Some(SAM.to_string()))), None);
+    let (status, code, why) = owner_refusal("alex@example.com", &Ok(Some(SAM.to_string()))).unwrap();
+    assert_eq!((status, code), (StatusCode::FORBIDDEN, ClientCode::RemoteUserNotOwner));
+    assert!(why.contains(SAM) && why.contains("log the device in"), "{why}");
+    for own in [Ok(None), Err("tailscaled is not running".to_string())] {
+        let (status, code, why) = owner_refusal(SAM, &own).unwrap();
+        assert_eq!((status, code), (StatusCode::SERVICE_UNAVAILABLE, ClientCode::Unavailable), "{own:?}");
+        assert!(why.contains("tailscale status") && !why.contains("not running"), "{why}");
     }
 }
 
@@ -259,16 +296,17 @@ fn whois_names_the_device_or_the_request_is_refused() {
 /// name is the device's own to change, so it never decides.
 #[test]
 fn a_device_must_be_the_one_the_token_paired_from() {
-    assert_eq!(device_refusal(&phone(), Ok(Some(phone_node()))), None);
+    assert_eq!(device_refusal(&phone(), Ok(Some(phone_node())), SAM), None);
     let mut renamed = phone_node();
     renamed.name = "sams-new-name".into();
-    assert_eq!(device_refusal(&phone(), Ok(Some(renamed))), None, "a rename is the same device");
-    let laptop = darkmux_fleet::test_node("nLAPTOP1CNTRL", "sams-iphone", "100.64.1.9");
-    let (code, why) = device_refusal(&phone(), Ok(Some(laptop))).unwrap();
+    assert_eq!(device_refusal(&phone(), Ok(Some(renamed)), SAM), None, "a rename is the same device");
+    let mut laptop = darkmux_fleet::test_node("nLAPTOP1CNTRL", "sams-iphone", "100.64.1.9");
+    laptop.login = Some(SAM.into());
+    let (code, why) = device_refusal(&phone(), Ok(Some(laptop)), SAM).unwrap();
     assert_eq!(code, ClientCode::RemoteDeviceMismatch);
     assert!(why.contains("sams-iphone") && why.contains("pair"), "{why}");
     for found in [Ok(None), Err("timed out".to_string())] {
-        assert_eq!(device_refusal(&phone(), found).map(|r| r.0), Some(ClientCode::RemoteDeviceUnknown));
+        assert_eq!(device_refusal(&phone(), found, SAM).map(|r| r.0), Some(ClientCode::RemoteDeviceUnknown));
     }
 }
 

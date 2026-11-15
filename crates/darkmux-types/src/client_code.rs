@@ -36,10 +36,18 @@ pub enum ClientCode {
     /// (#3560) Through the tailnet entry with a valid token (or polling a
     /// pairing), from a tailnet user other than the one the device paired as.
     RemoteIdentityMismatch,
-    /// (#3560) Not sent by this darkmux. Pairing over the tailnet shipped
-    /// in the same release as the code that once refused it, and the code
-    /// list only grows.
+    /// (#3560) Not sent by this darkmux: pairing over the tailnet shipped in
+    /// the same release as the code that once refused it.
     RemotePairingUnavailable,
+    /// (#3560) Through the tailnet entry, but Tailscale's own record of the
+    /// device at the forwarded address names another tailnet user than the
+    /// request's `Tailscale-User-Login` (or none): the request did not come
+    /// from that user through Tailscale as it says.
+    RemoteIdentityUnconfirmed,
+    /// (#3560) A pairing through the tailnet entry from a tailnet user other
+    /// than the one this Mac is logged in to Tailscale as: only that user's
+    /// devices may pair over the tailnet.
+    RemoteUserNotOwner,
     /// (#3560) Through the tailnet entry, but Tailscale on the Mac could
     /// not say which tailnet device the request came from (its `whois`
     /// failed, or named none), so it cannot be checked against the device a
@@ -204,6 +212,8 @@ mod tests {
             (RemoteIdentityMissing, "remote_identity_missing"),
             (RemoteIdentityMismatch, "remote_identity_mismatch"),
             (RemotePairingUnavailable, "remote_pairing_unavailable"),
+            (RemoteIdentityUnconfirmed, "remote_identity_unconfirmed"),
+            (RemoteUserNotOwner, "remote_user_not_owner"),
             (RemoteDeviceUnknown, "remote_device_unknown"),
             (RemoteDeviceMismatch, "remote_device_mismatch"),
         ] {

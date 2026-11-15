@@ -155,13 +155,19 @@ pub fn dialog_message(code: &str, signed: Option<&SignedApp>) -> String {
 }
 
 /// (#3560) The dialog's text for a pairing through the tailnet entry: the
-/// code the device shows, and its tailnet user and device as Tailscale
-/// names them (never the request's own claims), each display-safe.
+/// tailnet user and device the request names (Tailscale confirmed that
+/// device is that user's, but a program on this computer can name any
+/// device), and the code to compare with what that device itself shows,
+/// each display-safe.
 pub fn tailnet_dialog_message(code: &str, identity: &crate::client_tailnet::TailnetIdentity) -> String {
+    let safe = darkmux_platform::display_safe;
     format!(
-        "A device on your tailnet wants to use darkmux on this computer. Code {}.\n\nTailscale names it {}.\nAllow pairs it now; the next device asks again.",
-        darkmux_platform::display_safe(code),
-        crate::client_tailnet::described(identity)
+        "A device on your tailnet wants to use darkmux on this computer.\n\nThe request names {}. A program on this \
+         computer can send a request naming any device, so Allow only if {} shows code {}.\nAllow pairs it now; the \
+         next device asks again.",
+        crate::client_tailnet::described(identity),
+        safe(&identity.device.name),
+        safe(code)
     )
 }
 
@@ -271,9 +277,10 @@ async fn still_the_same_app(state: &ClientServerState, peer: Option<SocketAddr>,
 /// entry: who Tailscale says asked, and how the operator approves it.
 pub fn remote_pairing_line(request_id: &str, code: &str, identity: &crate::client_tailnet::TailnetIdentity) -> String {
     format!(
-        "darkmux client serve: pairing request {request_id} through the tailnet entry from {}; it waits for the \
-         operator: `darkmux client approve --code {}` approves it",
+        "darkmux client serve: pairing request {request_id} through the tailnet entry naming {}; it waits for the \
+         operator, who approves it only if that device shows code {}: `darkmux client approve --code {}`",
         crate::client_tailnet::described(identity),
+        darkmux_platform::display_safe(code),
         darkmux_platform::display_safe(code)
     )
 }
@@ -314,8 +321,8 @@ fn approve_trusted(state: &ClientServerState, request_id: &str, app: &SignedApp,
 fn offer_dialog(state: &ClientServerState, request_id: &str, code: &str, from: Option<Requester>, sender: Sender) -> Option<String> {
     let Some(slot) = state.dialogs.take(from) else {
         return Some(format!(
-            "darkmux client serve: no dialog for pairing request {request_id}: its process has dialogs open already; \
-             `darkmux client approve --code {code}` approves it"
+            "darkmux client serve: no dialog for pairing request {request_id}: its sender (a process here, or a \
+             tailnet device) has dialogs open already; `darkmux client approve --code {code}` approves it"
         ));
     };
     let (message, remember) = dialog_for(code, sender);

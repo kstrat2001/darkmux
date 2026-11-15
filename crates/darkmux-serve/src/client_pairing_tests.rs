@@ -58,19 +58,50 @@ struct Harness {
 /// (#3560) What the harness's `whois` answers for one address.
 type WhoisAnswer = Result<Option<darkmux_fleet::NodeIdentity>, String>;
 
-/// (#3560) The harness's `whois`: an answer per address, and a call count.
-#[derive(Clone, Default)]
+/// (#3560) The harness's tailnet: `whois`'s answer per address, the
+/// tailnet user this Mac is logged in as (default Sam), how many times each
+/// was asked, and the most `whois` calls ever running at once.
+#[derive(Clone)]
 struct Devices {
     at: Arc<Mutex<HashMap<std::net::IpAddr, WhoisAnswer>>>,
     asked: Arc<std::sync::atomic::AtomicUsize>,
+    own: Arc<Mutex<Result<Option<String>, String>>>,
+    own_asked: Arc<std::sync::atomic::AtomicUsize>,
+    /// Each `whois` takes this long (default: no time).
+    slow: Arc<Mutex<std::time::Duration>>,
+    running: Arc<std::sync::atomic::AtomicUsize>,
+    most_at_once: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Default for Devices {
+    fn default() -> Self {
+        Devices {
+            at: Default::default(),
+            asked: Default::default(),
+            own: Arc::new(Mutex::new(Ok(Some(SAM.to_string())))),
+            own_asked: Default::default(),
+            slow: Default::default(),
+            running: Default::default(),
+            most_at_once: Default::default(),
+        }
+    }
 }
 
 impl Devices {
     fn wire(&self, state: &mut ClientServerState) {
-        let (at, asked) = (self.at.clone(), self.asked.clone());
+        let this = self.clone();
         state.device_at = Arc::new(move |ip| {
-            asked.fetch_add(1, Ordering::SeqCst);
-            at.lock().unwrap().get(&ip).cloned().unwrap_or(Ok(None))
+            this.asked.fetch_add(1, Ordering::SeqCst);
+            let now = this.running.fetch_add(1, Ordering::SeqCst) + 1;
+            this.most_at_once.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(*this.slow.lock().unwrap());
+            this.running.fetch_sub(1, Ordering::SeqCst);
+            this.at.lock().unwrap().get(&ip).cloned().unwrap_or(Ok(None))
+        });
+        let this = self.clone();
+        state.own_login = Arc::new(move || {
+            this.own_asked.fetch_add(1, Ordering::SeqCst);
+            this.own.lock().unwrap().clone()
         });
     }
     /// `whois` of each of `addrs` names `node`.
@@ -424,6 +455,9 @@ fn harness() -> Harness {
         tailnet_entry: None,
         device_at: Arc::new(|_| Err("wired below".to_string())),
         device_cache: Arc::new(crate::fleet_listener::IdentityCache::new()),
+        own_login: Arc::new(|| Err("wired below".to_string())),
+        own_login_cache: Arc::new(crate::client_tailnet::OwnLoginCache::default()),
+        tailnet_calls: Arc::new(tokio::sync::Semaphore::new(1)),
     };
     let trust = TrustSeams::new();
     let devices = Devices::default();
@@ -749,8 +783,25 @@ fn phone_node() -> darkmux_fleet::NodeIdentity {
     let mut n = darkmux_fleet::test_node("nPHONE1CNTRL", "sams-iphone", PHONE_V4);
     n.addresses.push(PHONE_V6.parse().unwrap());
     n.host_name = Some("Sam's iPhone".into());
+    n.login = Some(SAM.into());
     n
 }
+
+/// A device at `addr` whose tailnet record names `login`.
+fn node_of(id: &str, name: &str, addr: &str, login: &str) -> darkmux_fleet::NodeIdentity {
+    let mut n = darkmux_fleet::test_node(id, name, addr);
+    n.login = Some(login.into());
+    n
+}
+
+/// Sam's laptop, on the same tailnet.
+fn laptop_node() -> darkmux_fleet::NodeIdentity {
+    node_of("nLAPTOP1CNTRL", "sams-laptop", LAPTOP_V4, SAM)
+}
+
+/// Alex's phone, another user of the tailnet.
+const ALEX: &str = "alex@example.com";
+const ALEX_V4: &str = "100.64.3.3";
 
 /// The tailnet identity a pairing from Sam's phone as `login` records.
 fn phone_as(login: &str) -> crate::client_tailnet::TailnetIdentity {
@@ -1071,6 +1122,10 @@ async fn a_device_pairs_over_the_tailnet_once_approved_on_this_mac() {
     assert!(v["capabilities"].as_array().unwrap().contains(&serde_json::json!("remote_requests")), "{v}");
     let req = adding(post("/client/work", Some(&token), work_body(Some("fast"), None)), &forwarded(Some(SAM)));
     assert_eq!(call(&h, req).await.0, 202);
+    // Kept on purpose, and said so in CLIENTS.md: the token is not usable only
+    // from the device. A process on this Mac holding it is answered as local.
+    let (status, v) = call(&h, get("/client/whoami", &[("authorization", &auth)])).await;
+    assert_eq!((status, v["via"].as_str()), (200, Some("local")), "{v}");
 }
 
 /// A forwarded pairing is never approved on its own: the process holding
@@ -1102,7 +1157,7 @@ async fn the_dialog_shows_the_tailnet_identity_and_allow_remembers_nothing() {
     h.dialog_answers(darkmux_platform::AllowAnswer::Allow);
     let id = asked_remotely(&h).await;
     let message = dialog_shown(&h, 1).await;
-    for part in ["Code 4F7-K2Q.", SAM, "sams-iphone", "Sam's iPhone", "tailnet"] {
+    for part in ["Allow only if sams-iphone shows code 4F7-K2Q", SAM, "Sam's iPhone", "tailnet"] {
         assert!(message.contains(part), "{part}: {message}");
     }
     assert!(!message.contains("Mac"), "names no one platform: {message}");
@@ -1178,7 +1233,7 @@ async fn a_token_used_from_another_device_of_the_same_user_is_refused() {
     let mut h = harness();
     on_the_tailnet(&mut h);
     let token = paired_remotely(&h).await;
-    h.devices.place(&darkmux_fleet::test_node("nLAPTOP1CNTRL", "sams-laptop", LAPTOP_V4), &[LAPTOP_V4]);
+    h.devices.place(&laptop_node(), &[LAPTOP_V4]);
     let auth = bearer(&token);
     let (status, v) = call(&h, get("/client/whoami", &with_token(&from_addr(forwarded(Some(SAM)), LAPTOP_V4), Some(&auth)))).await;
     assert_eq!((status, v["code"].as_str()), (403, Some("remote_device_mismatch")), "{v}");
@@ -1227,12 +1282,13 @@ async fn whois_runs_only_through_the_entry_and_only_after_the_token_and_user() {
 async fn the_poll_must_come_the_way_the_pairing_did() {
     let mut h = harness();
     on_the_tailnet(&mut h);
-    h.devices.place(&darkmux_fleet::test_node("nLAPTOP1CNTRL", "sams-laptop", LAPTOP_V4), &[LAPTOP_V4]);
+    h.devices.place(&laptop_node(), &[LAPTOP_V4]);
+    h.devices.place(&node_of("nALEX1CNTRL", "alexs-phone", ALEX_V4, ALEX), &[ALEX_V4]);
     let id = asked_remotely(&h).await;
     approve(&h.store, &id, (h.state.now)()).unwrap();
     assert_eq!(poll(&h, &id, SECRET).await.0, 404, "from this Mac");
-    let mut alex = forwarded(None);
-    alex.push(("tailscale-user-login", "alex@example.com"));
+    let mut alex = from_addr(forwarded(None), ALEX_V4);
+    alex.push(("tailscale-user-login", ALEX));
     assert_eq!(poll_through(&h, &id, &alex).await.1["code"], "remote_identity_mismatch");
     assert_eq!(poll_through(&h, &id, &from_addr(forwarded(Some(SAM)), LAPTOP_V4)).await.1["code"], "remote_device_mismatch");
     assert_eq!(poll_through(&h, &id, &forwarded(None)).await.1["code"], "remote_identity_missing");
@@ -1277,23 +1333,132 @@ async fn a_remote_pairing_nobody_approves_expires() {
     assert!(approve(&h.store, &id, (h.state.now)()).is_err());
 }
 
-/// One device on the tailnet holds at most two waiting requests, its next
-/// replacing its oldest, so it never crowds out another device or the app
-/// on this Mac, though every forwarded request comes from one process.
+/// (#3560 review) A remote request never evicts another: a device with two
+/// waiting is refused its third (a local process sending forged headers can
+/// name that device, so replacing its oldest would let it push out the real
+/// one's), and remote requests stop at their own cap, so they never fill the
+/// queue an app on this Mac pairs through.
 #[tokio::test]
-async fn one_device_cannot_crowd_out_the_others() {
+async fn remote_requests_never_evict_and_have_their_own_cap() {
     let mut h = harness();
     on_the_tailnet(&mut h);
-    h.devices.place(&darkmux_fleet::test_node("nLAPTOP1CNTRL", "sams-laptop", LAPTOP_V4), &[LAPTOP_V4]);
+    h.devices.place(&laptop_node(), &[LAPTOP_V4]);
     let app = request_pairing(&h).await;
     let (_, v) = pair_through(&h, &from_addr(forwarded(Some(SAM)), LAPTOP_V4)).await;
     let laptop = v["request_id"].as_str().unwrap().to_string();
-    let mut phone = Vec::new();
-    for _ in 0..PAIR_REQUESTS_PER_PROCESS + 2 {
-        phone.push(asked_remotely(&h).await);
-    }
+    let phone = [asked_remotely(&h).await, asked_remotely(&h).await];
+    let (status, v) = pair_through(&h, &forwarded(Some(SAM))).await;
+    assert_eq!((status, v["code"].as_str()), (429, Some("too_many_requests")), "{v}");
     let live: Vec<String> = list_pending(&h.store, (h.state.now)()).unwrap().into_iter().map(|p| p.request_id).collect();
-    assert_eq!(live, [app, laptop, phone[2].clone(), phone[3].clone()], "only the phone's oldest went");
+    assert_eq!(live, [app, laptop, phone[0].clone(), phone[1].clone()], "nothing evicted");
+    let addrs: Vec<&'static str> = (10..30).map(|i| &*Box::leak(format!("100.64.2.{i}").into_boxed_str())).collect();
+    let mut remote = 3;
+    for (i, a) in addrs.iter().enumerate() {
+        h.devices.place(&node_of(&format!("nDEV{i}"), &format!("dev-{i}"), a, SAM), &[a]);
+        let (status, _) = pair_through(&h, &from_addr(forwarded(Some(SAM)), a)).await;
+        if status != 202 {
+            assert_eq!(status, 429);
+            break;
+        }
+        remote += 1;
+    }
+    assert_eq!(remote, MAX_REMOTE_PENDING, "remote requests stop at their own cap");
+    for port in 0..(MAX_PENDING - MAX_REMOTE_PENDING - 1) as u16 {
+        let (status, v) = call(&h, pair_from(UNKNOWN_PEER_PORTS + port, "LOCAL")).await;
+        assert_eq!(status, 202, "an app on this Mac still pairs: {v}");
+    }
+}
+
+/// (#3560 review) A local process can send a pairing request with any
+/// tailnet user in its header and any tailnet address: Tailscale's record of
+/// the device at that address must name that same user, on a pairing and on
+/// every request with a token, or it is refused.
+#[tokio::test]
+async fn a_header_user_whois_does_not_confirm_is_refused() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    let token = paired_remotely(&h).await;
+    h.devices.place(&node_of("nALEX1CNTRL", "alexs-phone", ALEX_V4, ALEX), &[ALEX_V4]);
+    let before = pending_count(&h);
+    let (status, v) = pair_through(&h, &from_addr(forwarded(Some(SAM)), ALEX_V4)).await;
+    assert_eq!((status, v["code"].as_str()), (403, Some("remote_identity_unconfirmed")), "{v}");
+    assert_eq!(pending_count(&h), before, "nothing recorded");
+    h.devices.place(&node_of("nPHONE1CNTRL", "sams-iphone", PHONE_V4, ALEX), &[PHONE_V4]);
+    h.state.device_cache = Arc::new(crate::fleet_listener::IdentityCache::new());
+    let (status, v) = call(&h, get("/client/whoami", &with_token(&forwarded(Some(SAM)), Some(&bearer(&token))))).await;
+    assert_eq!((status, v["code"].as_str()), (403, Some("remote_identity_unconfirmed")), "a token route too: {v}");
+}
+
+/// (#3560 review) Only the tailnet user this Mac is logged in as may pair
+/// over the tailnet (a shared tailnet's other users are a later setting).
+/// Another is refused naming who may, before `whois` runs; when Tailscale
+/// cannot say who this Mac is, every remote pairing waits.
+#[tokio::test]
+async fn only_this_macs_own_tailnet_user_may_pair_remotely() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    h.devices.place(&node_of("nALEX1CNTRL", "alexs-phone", ALEX_V4, ALEX), &[ALEX_V4]);
+    let mut alex = from_addr(forwarded(None), ALEX_V4);
+    alex.push(("tailscale-user-login", ALEX));
+    let (status, v) = pair_through(&h, &alex).await;
+    assert_eq!((status, v["code"].as_str()), (403, Some("remote_user_not_owner")), "{v}");
+    assert!(v["error"].as_str().unwrap().contains(SAM), "{v}");
+    assert_eq!((pending_count(&h), h.devices.asked()), (0, 0), "nothing recorded, no whois");
+    *h.devices.own.lock().unwrap() = Err("tailscaled is not running".into());
+    h.state.own_login_cache = Arc::new(crate::client_tailnet::OwnLoginCache::default());
+    let (status, v) = pair_through(&h, &forwarded(Some(SAM))).await;
+    assert_eq!((status, v["code"].as_str()), (503, Some("unavailable")), "{v}");
+    assert_eq!(pending_count(&h), 0);
+}
+
+/// (#3560 review) A caller with nothing valid never makes the Mac ask
+/// Tailscale anything: a poll of an unknown request or with a wrong secret,
+/// from any forged address, and a pairing request while the queue is full,
+/// are answered from the store alone.
+#[tokio::test]
+async fn unauthenticated_pairing_calls_never_make_the_mac_ask_tailscale() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    let real = request_pairing(&h).await;
+    for (i, id) in ["r-made-up", "r-0", "r-00000000000000000000000000000000", real.as_str(), "r-x"].iter().enumerate() {
+        let addr = &*Box::leak(format!("100.64.9.{i}").into_boxed_str());
+        let mut headers = from_addr(forwarded(Some(SAM)), addr);
+        headers.push(("x-pair-secret", "wrong-secret-0123456789"));
+        let (status, _) = call(&h, get(&format!("/client/pair/{id}"), &headers)).await;
+        assert_eq!(status, 404, "{id}");
+    }
+    for port in 0..(MAX_PENDING - 1) as u16 {
+        assert_eq!(call(&h, pair_from(UNKNOWN_PEER_PORTS + port, "FILL")).await.0, 202);
+    }
+    let (status, v) = pair_through(&h, &forwarded(Some(SAM))).await;
+    assert_eq!((status, v["code"].as_str()), (429, Some("too_many_requests")), "{v}");
+    assert_eq!((h.devices.asked(), h.devices.own_asked.load(Ordering::SeqCst)), (0, 0));
+}
+
+/// (#3560 review) Tailscale is asked one call at a time, however many
+/// requests arrive together, as the pairing peer lookups are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tailscale_is_asked_one_call_at_a_time() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    let token = paired_remotely(&h).await;
+    *h.devices.slow.lock().unwrap() = std::time::Duration::from_millis(40);
+    let auth = bearer(&token);
+    let mut calls = Vec::new();
+    for i in 0..4 {
+        let addr = &*Box::leak(format!("100.64.8.{i}").into_boxed_str());
+        h.devices.place(&node_of(&format!("nX{i}"), "x", addr, SAM), &[addr]);
+        let req = get("/client/whoami", &with_token(&from_addr(forwarded(Some(SAM)), addr), Some(&auth)));
+        let router = router(h.state.clone());
+        let mut req = req;
+        req.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+        calls.push(tokio::spawn(async move { router.oneshot(req).await.unwrap().status() }));
+    }
+    for c in calls {
+        assert_eq!(c.await.unwrap(), 403, "another device than the token's");
+    }
+    assert_eq!(h.devices.asked(), 5);
+    assert_eq!(h.devices.most_at_once.load(Ordering::SeqCst), 1);
 }
 
 /// The pair secret is never kept or shown: the store holds its hash, and

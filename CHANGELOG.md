@@ -62,8 +62,7 @@ darkmux release.
   `not_paired_remotely` (the token's pairing recorded no tailnet identity: every pairing made on the Mac;
   that token still works on the Mac), `remote_identity_missing` (Tailscale named no user: a tagged
   device, or a login that is not valid UTF-8, which Tailscale sends empty; a Funnel request is
-  `not_forwarded`), and `remote_identity_mismatch` (`remote_pairing_unavailable` is in the code list
-  but never sent: the next part ships pairing over the tailnet in the same release). `GET
+  `not_forwarded`), and `remote_identity_mismatch`. `GET
   /client/whoami` gains `via` (`local` or `tailnet`), and `clients.json` moves to schema 1.3: a client
   may carry `tailnet`, the identity it paired with (the next part records it).
   **Upgrade note:** the first change this darkmux makes to `clients.json` rewrites it as schema 1.3, and
@@ -72,20 +71,27 @@ darkmux release.
 - **A device pairs over the tailnet, approved on the Mac (#3560, third of four parts).** A phone on the
   tailnet pairs through `client serve`'s tailnet URL with the same calls an app on the Mac makes. It is
   never approved on its own (the process holding a forwarded connection is Tailscale's, so no code
-  signature can speak for the device): it waits for the operator, in the pairing dialog or with
-  `darkmux client approve`, both of which now show the tailnet user and device Tailscale names for the
-  request, and the dialog's Allow remembers nothing. The approval records that identity, the user from
-  `Tailscale-User-Login` and the device from a read-only `tailscale whois` of the forwarded address
-  (never anything the request's body claims), and the token is then answered through the tailnet URL
-  only as that user and from that device. The poll that collects the token must come from them too.
-  Every request through the entry now also checks the device: `whois` runs only for a request the
-  entry forwarded, after its token and user check out, and an answer that named a device is kept for
-  ten seconds per address (measured 27 ms a call). New refusal codes: `remote_device_unknown`
-  (Tailscale on the Mac could not say which device sent it; refused, never guessed) and
-  `remote_device_mismatch` (another device than the one it paired from, even the same user's). A
-  pairing request with no tailnet user (a tagged device) is refused `remote_identity_missing`. One
-  device may have two pairing requests waiting, as one app on the Mac may, and a remote request expires
-  after ten minutes like any. Pairing again over the tailnet makes a new client; `darkmux client
+  signature can speak for the device), and only the tailnet user this Mac is logged in as may ask
+  (`remote_user_not_owner` otherwise). It waits for the operator, in the pairing dialog or with
+  `darkmux client approve`, both of which show the tailnet user and device the request names and say
+  to approve only if that device shows the request's code (a program on the Mac can send a request
+  naming any device; only the real device shows its code); the dialog's Allow remembers nothing. The
+  approval records that identity, the user from `Tailscale-User-Login` and the device from a read-only
+  `tailscale whois` of the forwarded address (never anything the request's body claims), and the token
+  is then answered through the tailnet URL only as that user and from that device. The poll that
+  collects the token must come from them too. Every request through the entry now also checks the
+  device and that Tailscale's record of it names the header's user (`remote_identity_unconfirmed`
+  otherwise). Tailscale is asked one call at a time, only once the token, or the stored request and
+  its secret, or room in the queue says there is something to ask about; an answer that named a device
+  is kept for ten seconds per address (measured 27 ms a call). New refusal codes:
+  `remote_device_unknown` (Tailscale on the Mac could not say which device sent it; refused, never
+  guessed), `remote_device_mismatch` (another device than the one it paired from, even the same
+  user's), `remote_identity_unconfirmed` and `remote_user_not_owner`. A pairing request with no
+  tailnet user (a tagged device) is refused `remote_identity_missing`. One device may have two pairing
+  requests waiting and its third is refused, never replacing one; remote requests have their own cap,
+  half the queue, so they never crowd out an app on the Mac; and a remote request expires after ten
+  minutes like any. A device's token is still a bearer token: from a program on the Mac it is answered
+  as local. Pairing again over the tailnet makes a new client; `darkmux client
   revoke` stops a device on the Mac and remotely at once. `darkmux client list` says which clients
   paired over the tailnet, and as whom. The capability list gains `remote_requests`. `clients.json`
   stays 1.3: its `tailnet` gains `device` (`{"id", "name", "host_name"?}`, required), and a pending

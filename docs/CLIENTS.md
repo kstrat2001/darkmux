@@ -26,17 +26,20 @@ Gate this on the app on the Mac: offer it only when that app's `GET /client/whoa
 
 The calls are the ones above, sent to `url`. What differs:
 
-- **It always waits for the operator.** Nothing on the device can approve it. The dialog and `darkmux client approve` show the operator the tailnet user and device as Tailscale names them, beside your code.
-- **Tailscale vouches for the device, not your app.** The user and device recorded are the ones Tailscale names for the request, whatever the body says. A device logged in to Tailscale with a tag has no user and is refused `remote_identity_missing`: log it in as a user. When Tailscale on the Mac cannot say which device sent the request, it is refused `remote_device_unknown`: try again later.
+- **It always waits for the operator, who compares your code.** Nothing on the device can approve it. The dialog and `darkmux client approve` show the tailnet user and device the request names, and tell the operator to approve only if that device shows your code. A program on the Mac can send a request that names any device, so the code on your screen is what tells the operator the request is yours: show it large, from the moment the pairing starts until it ends.
+- **Only the Mac's own tailnet user pairs.** A request from another user of a shared tailnet is refused `remote_user_not_owner`, naming the user who may. When Tailscale on the Mac cannot say who that is, the request answers `unavailable`: try again later.
+- **Tailscale must confirm the user.** The user and device recorded come from Tailscale, never from the body, and Tailscale's own record of the device must name the same user as the request: otherwise it is refused `remote_identity_unconfirmed`. A device logged in to Tailscale with a tag has no user and is refused `remote_identity_missing`: log it in as a user. When Tailscale on the Mac cannot say which device sent the request, it is refused `remote_device_unknown`: try again later.
+- **A device has at most two pairing requests waiting.** A third is refused `too_many_requests` (it never replaces an earlier one): wait for one to end.
 - **Poll from the same device, as the same user.** A poll from another user is refused `remote_identity_mismatch`, from another device `remote_device_mismatch`, and neither uses up the token.
 
 ## Keep the token
 
 - Store it in the platform's secure store (the Keychain on Apple platforms), never in a log, a file or a URL. Send it as an HTTP bearer token on every route but the two pairing ones.
 - A device paired over the tailnet is answered through `url` only as the tailnet user and from the device it paired as. From another of the user's devices it is refused `remote_device_mismatch`, as another user `remote_identity_mismatch`. Tell the user which, and do not discard the token.
+- The token is still a bearer token: it is not usable only from that device. Sent from a program on the Mac itself, it is answered as an app on the Mac. Guard it as you would a password.
 - `not_paired_remotely` means the token was paired on the Mac, so it works there only. Pair the device over the tailnet.
 - `unauthorized` means darkmux does not know the token: the operator revoked it (`darkmux client revoke`), on the Mac and remotely at once. Delete it and pair again.
-- Pairing again makes a new client with a new token. The old one keeps working until the operator revokes it.
+- Pairing again makes a new client with a new token. The old one keeps working until the operator revokes it, and its workspaces stay with it: the operator gives one to the new client with `darkmux client claim`.
 
 ## Check what this darkmux can do
 

@@ -28,10 +28,12 @@
 //! pairing records identity only. (#3560) A pairing through the tailnet entry
 //! is never approved on its own (the process holding its connection is
 //! Tailscale's, so no signature speaks for the device): it gets the dialog
-//! and `client approve`, which show the tailnet user and device Tailscale
-//! names, and the approval records them; its poll must come from them too.
-//! One device may have [`PAIR_REQUESTS_PER_PROCESS`] waiting, as one process
-//! may. The app polls `/client/pair/{id}` with
+//! and `client approve`, which show the tailnet user and device the request
+//! names and ask the operator to approve only if that device shows the code,
+//! and the approval records them; its poll must come from them too. Only
+//! this Mac's own tailnet user may ask. One device may have
+//! [`PAIR_REQUESTS_PER_PROCESS`] waiting and its next is refused, never
+//! replacing one; remote requests stop at [`MAX_REMOTE_PENDING`]. The app polls `/client/pair/{id}` with
 //! `X-Pair-Secret`; on the first poll after approval this listener mints the
 //! token (32 random bytes, hex), stores ONLY its BLAKE3 hash as an approved
 //! client, deletes the pending record and returns the token. A later poll is
@@ -160,8 +162,12 @@ const KEEP_FINISHED_SECS: u64 = 3600;
 /// Live (unexpired, undecided) requests at once; more is a 429.
 pub const MAX_PENDING: usize = 16;
 /// Live requests one process on this machine may have waiting at once; its
-/// next replaces its oldest.
+/// next replaces its oldest. (#3560) One tailnet device may have as many,
+/// and its next is refused instead (it evicts nothing).
 pub const PAIR_REQUESTS_PER_PROCESS: usize = 2;
+/// (#3560) Live requests through the tailnet entry at once, of
+/// [`MAX_PENDING`]: the rest are always free for apps on this Mac.
+pub const MAX_REMOTE_PENDING: usize = MAX_PENDING / 2;
 /// The largest request body any route reads.
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// Work a single client may have running at once.
@@ -1157,6 +1163,12 @@ pub struct ClientServerState {
     pub device_at: crate::client_tailnet::DeviceLookup,
     /// (#3560) Recent [`Self::device_at`] answers that named a device.
     pub(crate) device_cache: Arc<crate::fleet_listener::IdentityCache>,
+    /// (#3560) The tailnet user this Mac is logged in as (`tailscale status`).
+    pub own_login: crate::client_tailnet::OwnLogin,
+    /// (#3560) Its last answer that named one.
+    pub(crate) own_login_cache: Arc<crate::client_tailnet::OwnLoginCache>,
+    /// (#3560) One Tailscale call at a time, however many requests ask.
+    pub(crate) tailnet_calls: Arc<tokio::sync::Semaphore>,
 }
 
 /// Who sent a pairing request, for the bound on how many one sender may
@@ -1247,6 +1259,9 @@ impl ClientServerState {
             tailnet_entry: None,
             device_at: Arc::new(device_at_here),
             device_cache: Arc::new(crate::fleet_listener::IdentityCache::new()),
+            own_login: Arc::new(own_login_here),
+            own_login_cache: Arc::new(crate::client_tailnet::OwnLoginCache::default()),
+            tailnet_calls: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 }
@@ -1256,6 +1271,14 @@ impl ClientServerState {
 fn device_at_here(ip: std::net::IpAddr) -> Result<Option<darkmux_fleet::NodeIdentity>, String> {
     darkmux_fleet::provider_for("tailscale", None)
         .and_then(|p| p.identify(ip))
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// (#3560) The tailnet user this Mac is logged in as (`status --json` Self).
+fn own_login_here() -> Result<Option<String>, String> {
+    darkmux_fleet::provider_for("tailscale", None)
+        .and_then(|p| p.local_node())
+        .map(|n| n.login)
         .map_err(|e| format!("{e:#}"))
 }
 
@@ -1849,17 +1872,8 @@ pub(crate) async fn only_this_machines_apps(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let gate = match admitted(&state, &req) {
-        Ok(gate) => gate,
-        Err(refused) => return *refused,
-    };
-    let caller = match device_checked(&state, gate).await {
-        Ok(caller) => caller,
-        Err(refused) => return *refused,
-    };
-    req.extensions_mut().insert(if caller.is_some() { RequestVia::Tailnet } else { RequestVia::Local });
-    if let Some(identity) = caller {
-        req.extensions_mut().insert(identity);
+    if let Err(refused) = let_in(&state, &mut req).await {
+        return *refused;
     }
     match refused_while_stopping(&state, req).await {
         Ok((req, turn)) => {
@@ -1870,6 +1884,26 @@ pub(crate) async fn only_this_machines_apps(
         }
         Err(refused) => refused,
     }
+}
+
+/// [`only_this_machines_apps`]'s gate: `req` let in, with which way it came
+/// on it ([`RequestVia`]) and, for a pairing route through the tailnet
+/// entry, its unchecked caller ([`Forwarded`]): the pairing handlers ask
+/// Tailscale themselves, once the store says there is something to ask
+/// about. Otherwise the refusal.
+async fn let_in(state: &ClientServerState, req: &mut axum::extract::Request) -> Result<(), Refused> {
+    let via = match admitted(state, req)? {
+        Gate::Pairing(forwarded) => {
+            req.extensions_mut().insert(forwarded);
+            RequestVia::Tailnet
+        }
+        gate => match device_checked(state, gate).await? {
+            Some(()) => RequestVia::Tailnet,
+            None => RequestVia::Local,
+        },
+    };
+    req.extensions_mut().insert(via);
+    Ok(())
 }
 
 /// Once `client serve` has begun to stop, a request that could start or
@@ -1974,14 +2008,26 @@ fn stopping_refusal() -> Response {
 enum Gate {
     /// From an app on this machine: in.
     Local,
-    /// (#3560) Through the tailnet entry for the device at `from`, as tailnet
-    /// user `login`: in once `whois` names the device there, the one
-    /// `expect` says (a token's pairing), or any (a pairing route).
+    /// (#3560) A token's request through the tailnet entry for the device at
+    /// `from`, as tailnet user `login`: in once `whois` names the device the
+    /// token paired from (`expect`) there, as that user.
     Device {
         from: std::net::IpAddr,
         login: String,
-        expect: Option<crate::client_tailnet::TailnetDevice>,
+        expect: crate::client_tailnet::TailnetDevice,
     },
+    /// (#3560) A pairing route through the tailnet entry: on to its handler,
+    /// which checks the store before it asks Tailscale anything.
+    Pairing(Forwarded),
+}
+
+/// (#3560) A pairing route's request as the tailnet entry forwarded it: the
+/// address and user its headers name, neither checked yet (any process on
+/// this Mac can send them).
+#[derive(Debug, Clone)]
+pub(crate) struct Forwarded {
+    from: std::net::IpAddr,
+    login: String,
 }
 
 /// Which way `req` came ([`crate::client_tailnet::arrival`]), once
@@ -2018,31 +2064,43 @@ fn remote_admitted(
     let route = req.extensions().get::<axum::extract::MatchedPath>();
     if route.is_some_and(|r| crate::routes::takes_no_token(r.as_str())) {
         let login = crate::client_tailnet::pairing_login(login).map_err(forbidden)?;
-        return Ok(Gate::Device { from, login, expect: None });
+        return Ok(Gate::Pairing(Forwarded { from, login }));
     }
     let client = authenticate(state, req.headers())?;
     let url = state.tailnet_entry.as_ref().map(darkmux_fleet::overlay::ServeEntry::url).unwrap_or_default();
     let paired = crate::client_tailnet::identity_checked(client.tailnet.as_ref(), login, &url).map_err(forbidden)?;
-    Ok(Gate::Device { from, login: paired.login.clone(), expect: Some(paired.device.clone()) })
+    Ok(Gate::Device { from, login: paired.login.clone(), expect: paired.device.clone() })
 }
 
-/// (#3560) The caller's tailnet identity, once `whois` names the device at
-/// its forwarded address: the device its token paired from, or, on a
-/// pairing route, any device, which the pairing then records. Fail closed:
-/// a `whois` that fails or names no device refuses. `None` for a request
-/// from this machine, which asks nothing.
-async fn device_checked(state: &ClientServerState, gate: Gate) -> Result<Option<crate::client_tailnet::TailnetIdentity>, Refused> {
-    use crate::client_tailnet as tn;
+/// (#3560) A token's request through the tailnet entry is in once `whois`
+/// names, at its forwarded address, the device the token paired from, as
+/// the user it paired as. Fail closed: a `whois` that fails, names no
+/// device or another user refuses. `None` for a request from this machine,
+/// which asks nothing.
+async fn device_checked(state: &ClientServerState, gate: Gate) -> Result<Option<()>, Refused> {
     let Gate::Device { from, login, expect } = gate else {
         return Ok(None);
     };
-    let found = tn::device_at(&state.device_at, &state.device_cache, from).await;
-    let device = match expect {
-        Some(paired) => tn::device_refusal(&paired, found).map_or(Ok(paired), Err),
-        None => tn::device_named(found),
-    };
-    let device = device.map_err(|(code, why)| refuse(StatusCode::FORBIDDEN, code, why))?;
-    Ok(Some(tn::TailnetIdentity { login, device }))
+    let found = whois(state, from).await;
+    match crate::client_tailnet::device_refusal(&expect, found, &login) {
+        Some((code, why)) => Err(refuse(StatusCode::FORBIDDEN, code, why)),
+        None => Ok(Some(())),
+    }
+}
+
+/// (#3560) `whois` of `from`, through the cache and one call at a time.
+async fn whois(state: &ClientServerState, from: std::net::IpAddr) -> Result<Option<darkmux_fleet::NodeIdentity>, String> {
+    crate::client_tailnet::device_at(&state.device_at, &state.device_cache, &state.tailnet_calls, from).await
+}
+
+/// (#3560) The identity a pairing route's forwarded request has, once
+/// `whois` names the device at its address as its header's user; refused
+/// otherwise (fail closed).
+async fn forwarded_identity(state: &ClientServerState, f: &Forwarded) -> Result<crate::client_tailnet::TailnetIdentity, Refused> {
+    let found = whois(state, f.from).await;
+    let device = crate::client_tailnet::device_named(found, &f.login)
+        .map_err(|(code, why)| refuse(StatusCode::FORBIDDEN, code, why))?;
+    Ok(crate::client_tailnet::TailnetIdentity { login: f.login.clone(), device })
 }
 
 /// Why [`only_this_machines_apps`] refuses a request that `arrival`
@@ -2182,7 +2240,7 @@ pub(crate) struct PairBody {
 pub(crate) async fn pair_handler(
     State(state): State<ClientServerState>,
     peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
-    caller: Option<axum::Extension<crate::client_tailnet::TailnetIdentity>>,
+    caller: Option<axum::Extension<Forwarded>>,
     body: Body,
 ) -> Response {
     let req: PairBody = match json_body(body).await {
@@ -2199,7 +2257,7 @@ pub(crate) async fn pair_handler(
     }
     let now = (state.now)();
     match caller {
-        Some(axum::Extension(identity)) => remote_pair(&state, req, identity, now),
+        Some(axum::Extension(forwarded)) => remote_pair(&state, req, &forwarded, now).await,
         None => local_pair(&state, req, peer, now).await,
     }
 }
@@ -2233,29 +2291,78 @@ async fn local_pair(
     }
 }
 
-/// (#3560) A pairing request through the tailnet entry, as Tailscale named
-/// its user and `whois` its device (`identity`; never the body's claims).
-/// It is never approved on its own: the process holding its connection is
-/// Tailscale's, so no signature speaks for the device. It waits for the
-/// operator on the Mac, in the dialog or `client approve`
-/// ([`crate::client_trust::decide_remote`]). The device is its sender, for
-/// the bound on how many one sender may have waiting.
-fn remote_pair(state: &ClientServerState, req: PairBody, identity: crate::client_tailnet::TailnetIdentity, now: u64) -> Response {
-    let mut record = match pending_for(req, now) {
-        Ok(record) => record,
+/// (#3560) A pairing request through the tailnet entry. Cheapest first, so
+/// a request that cannot be stored never makes the Mac ask Tailscale: room
+/// for it ([`remote_room`]), then its user is this Mac's own tailnet user
+/// (`tailscale status`, cached), then `whois` names the device at its
+/// address as that user. It is stored with that identity (never the body's
+/// claims), never approved on its own (the process holding its connection is
+/// Tailscale's, so no signature speaks for the device), and waits for the
+/// operator on the Mac ([`crate::client_trust::decide_remote`]), who compares
+/// the code. It evicts no other request.
+async fn remote_pair(state: &ClientServerState, req: PairBody, f: &Forwarded, now: u64) -> Response {
+    let room = state.store.read().map(|file| remote_room(&file, None, now));
+    match room {
+        Ok(true) => {}
+        Ok(false) => return queue_full(),
         Err(e) => return internal(e),
+    }
+    let own = crate::client_tailnet::own_login(&state.own_login, &state.own_login_cache, &state.tailnet_calls).await;
+    if let Some((status, code, why)) = crate::client_tailnet::owner_refusal(&f.login, &own) {
+        return err(status, code, why);
+    }
+    let identity = match forwarded_identity(state, f).await {
+        Ok(identity) => identity,
+        Err(refused) => return *refused,
     };
-    record.tailnet = Some(identity.clone());
-    let (request_id, code) = (record.request_id.clone(), record.code.clone());
-    let from = Requester::Device(identity.device.id.clone());
-    match add_pending(state, record, Some(from.clone()), now) {
-        Ok(true) => {
+    store_remote(state, req, identity, now)
+}
+
+/// [`remote_pair`]'s write ([`stored_remote`]), then the dialog and the
+/// serve-log line once stored.
+fn store_remote(state: &ClientServerState, req: PairBody, identity: crate::client_tailnet::TailnetIdentity, now: u64) -> Response {
+    match stored_remote(state, req, &identity, now) {
+        Ok(Some((request_id, code))) => {
+            let from = Requester::Device(identity.device.id.clone());
             log_lines(crate::client_trust::decide_remote(state, (&request_id, &code), from, &identity));
             pair_accepted(request_id)
         }
-        Ok(false) => queue_full(),
+        Ok(None) => queue_full(),
         Err(e) => internal(e),
     }
+}
+
+/// The request with `identity` stored, when there is still room for it and
+/// its device under the store's lock: its id and code, or `None` (no room).
+fn stored_remote(
+    state: &ClientServerState,
+    req: PairBody,
+    identity: &crate::client_tailnet::TailnetIdentity,
+    now: u64,
+) -> Result<Option<(String, String)>> {
+    let mut record = pending_for(req, now)?;
+    record.tailnet = Some(identity.clone());
+    let ids = (record.request_id.clone(), record.code.clone());
+    state.store.update(|f| {
+        prune(f, now);
+        if !remote_room(f, Some(&identity.device.id), now) {
+            return Ok(None);
+        }
+        f.pending.push(record);
+        Ok(Some(ids))
+    })
+}
+
+/// (#3560) Whether a request through the tailnet entry (from `device`, when
+/// known) fits now: under [`MAX_PENDING`] in all, under [`MAX_REMOTE_PENDING`]
+/// through the entry, and under [`PAIR_REQUESTS_PER_PROCESS`] from that
+/// device. A remote request that does not fit is refused; it never makes
+/// room by dropping another (a local process can name any device).
+fn remote_room(f: &ClientsFile, device: Option<&str>, now: u64) -> bool {
+    let live: Vec<&PendingRequest> = f.pending.iter().filter(|p| p.live(now)).collect();
+    let remote: Vec<&crate::client_tailnet::TailnetIdentity> = live.iter().filter_map(|p| p.tailnet.as_ref()).collect();
+    let mine = remote.iter().filter(|t| Some(t.device.id.as_str()) == device).count();
+    live.len() < MAX_PENDING && remote.len() < MAX_REMOTE_PENDING && mine < PAIR_REQUESTS_PER_PROCESS
 }
 
 /// A stored pairing request's answer: its id, to poll.
@@ -2449,7 +2556,7 @@ fn policy_or_503(state: &ClientServerState) -> Result<Option<Vec<String>>, Refus
 pub(crate) async fn poll_handler(
     State(state): State<ClientServerState>,
     ClientPath(request_id): ClientPath<String>,
-    caller: Option<axum::Extension<crate::client_tailnet::TailnetIdentity>>,
+    caller: Option<axum::Extension<Forwarded>>,
     headers: HeaderMap,
 ) -> Response {
     let Some(secret) = headers.get("x-pair-secret").and_then(|v| v.to_str().ok()) else {
@@ -2462,8 +2569,19 @@ pub(crate) async fn poll_handler(
         Err(r) => return *r,
     };
     let now = (state.now)();
-    let polling = caller.as_ref().map(|axum::Extension(identity)| identity);
-    let outcome = state.store.update(|f| poll_pending(f, &request_id, secret, polling, now));
+    let polling = match caller {
+        Some(axum::Extension(f)) => match polled_identity(&state, &request_id, secret, &f).await {
+            Ok(identity) => Some(identity),
+            Err(refused) => return *refused,
+        },
+        None => None,
+    };
+    let outcome = state.store.update(|f| poll_pending(f, &request_id, secret, polling.as_ref(), now));
+    poll_answer(outcome, &policy)
+}
+
+/// What a poll answers for `outcome`, the token's scopes from `policy`.
+fn poll_answer(outcome: Result<PollOutcome>, policy: &Option<Vec<String>>) -> Response {
     match outcome {
         Ok(PollOutcome::NotFound) => not_found(),
         Ok(PollOutcome::Refused(code, why)) => err(StatusCode::FORBIDDEN, code, why),
@@ -2471,11 +2589,28 @@ pub(crate) async fn poll_handler(
         Ok(PollOutcome::Approved { client_name, token }) => Json(PairPoll::Approved {
             client_name,
             token,
-            scopes: ClientScopes::of(&policy),
+            scopes: ClientScopes::of(policy),
         })
         .into_response(),
         Err(e) => internal(e),
     }
+}
+
+/// (#3560) The identity a poll through the tailnet entry comes with, asked
+/// of Tailscale only once the store holds the request and the secret
+/// matches it: a made-up id or a wrong secret is a 404 that costs no call.
+async fn polled_identity(
+    state: &ClientServerState,
+    request_id: &str,
+    secret: &str,
+    f: &Forwarded,
+) -> Result<crate::client_tailnet::TailnetIdentity, Refused> {
+    let stored = state.store.read().map_err(|e| Box::new(internal(e)))?;
+    let known = stored.pending.iter().any(|p| p.request_id == request_id && secret_matches(&p.pair_secret_hash, secret));
+    if !known {
+        return Err(Box::new(not_found()));
+    }
+    forwarded_identity(state, f).await
 }
 
 /// The client the bearer token names. Every stored hash is compared (no early

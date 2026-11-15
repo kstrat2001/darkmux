@@ -26,12 +26,15 @@
 //! the connection Tailscale accepted, the same one it names the user from,
 //! so `tailscale whois` of it (read-only; [`device_at`]) names the device:
 //! its stable node id, which a pairing records and every later request
-//! through the entry must match ([`device_refusal`]). Behind a subnet router
-//! that rewrites source addresses, that address is the router's, so every
-//! device behind it is the router; the user check still applies. A `whois`
-//! that fails or names nothing refuses the request (`remote_device_unknown`):
-//! never guessed. It runs only for a request this process's entry forwarded,
-//! after the token and the user check out, and an answer that named a
+//! through the entry must match ([`device_refusal`]), and its user, which
+//! must be the header's ([`device_named`]): a local process can forge the
+//! header and the address, not Tailscale's record of that address. Behind a
+//! subnet router that rewrites source addresses, that address is the
+//! router's, so every device behind it is the router; the user check still
+//! applies. A `whois` that fails or names nothing refuses the request
+//! (`remote_device_unknown`): never guessed. It runs only for a request this
+//! process's entry forwarded, once the store or the token says there is
+//! something to ask about, one call at a time, and an answer that named a
 //! device is kept briefly per address (`fleet_listener::IdentityCache`).
 //!
 //! **Any process on this machine can send all of that to loopback.** So the
@@ -39,9 +42,11 @@
 //! through the entry needs a paired device's bearer token, the same as one
 //! from this machine, and then also the tailnet user and device recorded for
 //! that token ([`identity_checked`], [`device_refusal`]). A local process that
-//! forges the headers gains nothing it would not have without them. A
-//! pairing through the entry takes no token, so it is never approved on its
-//! own: it records the user and device and waits for the operator.
+//! forges the headers gains nothing on a route that takes a token. A
+//! pairing through the entry takes no token, and a forger can name any
+//! device, so it is never approved on its own: only this Mac's own tailnet
+//! user may ask ([`owner_refusal`]), and the operator approves only if the
+//! named device shows the request's code.
 
 use axum::http::{HeaderMap, StatusCode};
 use darkmux_fleet::overlay::ServeEntry;
@@ -249,9 +254,12 @@ pub(crate) fn pairing_login(login: Option<&str>) -> Result<String, (ClientCode, 
 
 /// The device `whois` named at a forwarded address, or (fail closed) the
 /// refusal when it named none or could not answer.
-pub(crate) fn device_named(found: Result<Option<NodeIdentity>, String>) -> Result<TailnetDevice, (ClientCode, String)> {
+pub(crate) fn device_named(found: Result<Option<NodeIdentity>, String>, login: &str) -> Result<TailnetDevice, (ClientCode, String)> {
     match found {
-        Ok(Some(node)) => Ok(TailnetDevice { id: node.node_id, name: node.name, host_name: node.host_name }),
+        Ok(Some(node)) if node.login.as_deref() == Some(login) => {
+            Ok(TailnetDevice { id: node.node_id, name: node.name, host_name: node.host_name })
+        }
+        Ok(Some(node)) => Err(unconfirmed(&node, login)),
         // Why `whois` failed names this Mac's tool and state, so it is not
         // sent to the device.
         Ok(None) | Err(_) => Err((
@@ -263,10 +271,27 @@ pub(crate) fn device_named(found: Result<Option<NodeIdentity>, String>) -> Resul
     }
 }
 
+/// The refusal of a request whose header names tailnet user `login` while
+/// Tailscale's record of the device at its address names another, or none:
+/// it did not come through Tailscale from that user. Any process on this Mac
+/// can send the header, and any address; only `whois` is Tailscale's word.
+fn unconfirmed(node: &NodeIdentity, login: &str) -> (ClientCode, String) {
+    let who = node.login.as_deref().unwrap_or("no user (a tagged device)");
+    (
+        ClientCode::RemoteIdentityUnconfirmed,
+        format!(
+            "Tailscale's record of the device at this request's address ({}) names {who}, not {login} as the request \
+             says, so it did not come through Tailscale from {login}: send it from a device logged in to Tailscale \
+             as {login}",
+            node.name
+        ),
+    )
+}
+
 /// Why a request whose token paired from `recorded` is refused, given what
 /// `whois` found at its forwarded address; `None` when it is that device.
-pub(crate) fn device_refusal(recorded: &TailnetDevice, found: Result<Option<NodeIdentity>, String>) -> Option<(ClientCode, String)> {
-    match device_named(found) {
+pub(crate) fn device_refusal(recorded: &TailnetDevice, found: Result<Option<NodeIdentity>, String>, login: &str) -> Option<(ClientCode, String)> {
+    match device_named(found, login) {
         Err(refused) => Some(refused),
         Ok(device) if device.id == recorded.id => None,
         Ok(device) => Some(device_mismatch(&device)),
@@ -285,6 +310,72 @@ fn device_mismatch(device: &TailnetDevice) -> (ClientCode, String) {
         ),
     )
 }
+
+/// Why a pairing through the entry from tailnet user `login` is refused,
+/// given the user this Mac is logged in to Tailscale as (`own`); `None`
+/// when it is that user.
+pub(crate) fn owner_refusal(login: &str, own: &Result<Option<String>, String>) -> Option<(StatusCode, ClientCode, String)> {
+    match own {
+        Ok(Some(own)) if own == login => None,
+        Ok(Some(own)) => Some((
+            StatusCode::FORBIDDEN,
+            ClientCode::RemoteUserNotOwner,
+            format!(
+                "only devices of {own}, the tailnet user this Mac is logged in to Tailscale as, may pair over the \
+                 tailnet, not {login}: log the device in to Tailscale as {own}"
+            ),
+        )),
+        // Why the read failed names this Mac's tool and state.
+        Ok(None) | Err(_) => Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            ClientCode::Unavailable,
+            "Tailscale on this Mac could not say which tailnet user it is logged in as, so no device can pair over \
+             the tailnet now: run `tailscale status` on the Mac, then try again"
+                .to_string(),
+        )),
+    }
+}
+
+/// This Mac's own tailnet login, from `cache` or from `lookup` (one
+/// Tailscale call at a time, `calls`; off the async workers). Only an answer
+/// that named a user is kept.
+pub(crate) async fn own_login(
+    lookup: &OwnLogin,
+    cache: &OwnLoginCache,
+    calls: &tokio::sync::Semaphore,
+) -> Result<Option<String>, String> {
+    if let Some(login) = cache.get(std::time::Instant::now()) {
+        return Ok(Some(login));
+    }
+    let _turn = calls.acquire().await.map_err(|e| e.to_string())?;
+    let ask = lookup.clone();
+    let answer = tokio::task::spawn_blocking(move || ask()).await.unwrap_or_else(|e| Err(e.to_string()));
+    if let Ok(Some(login)) = &answer {
+        cache.put(login.clone(), std::time::Instant::now());
+    }
+    answer
+}
+
+impl OwnLoginCache {
+    fn get(&self, now: std::time::Instant) -> Option<String> {
+        let slot = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        slot.as_ref()
+            .filter(|(at, _)| now.duration_since(*at) < crate::fleet_listener::IdentityCache::TTL)
+            .map(|(_, l)| l.clone())
+    }
+    fn put(&self, login: String, now: std::time::Instant) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some((now, login));
+    }
+}
+
+/// The tailnet user this Mac is logged in as, as Tailscale last said it:
+/// kept for [`crate::fleet_listener::IdentityCache::TTL`], only when it
+/// named one.
+#[derive(Default)]
+pub struct OwnLoginCache(std::sync::Mutex<Option<(std::time::Instant, String)>>);
+
+/// This Mac's own tailnet login (`tailscale status --json` Self).
+pub type OwnLogin = std::sync::Arc<dyn Fn() -> Result<Option<String>, String> + Send + Sync>;
 
 /// Why a poll is refused, when it does not come the way its pairing did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,12 +423,18 @@ pub fn described(identity: &TailnetIdentity) -> String {
 }
 
 /// The device at `ip`, from a recent answer in `cache` or from `lookup`
-/// (off the async workers). Only an answer that named a device is kept.
+/// (one Tailscale call at a time, `calls`; off the async workers). Only an
+/// answer that named a device is kept.
 pub(crate) async fn device_at(
     lookup: &DeviceLookup,
     cache: &crate::fleet_listener::IdentityCache,
+    calls: &tokio::sync::Semaphore,
     ip: IpAddr,
 ) -> Result<Option<NodeIdentity>, String> {
+    if let Some(node) = cache.get(ip, std::time::Instant::now()) {
+        return Ok(Some(node));
+    }
+    let _turn = calls.acquire().await.map_err(|e| e.to_string())?;
     let now = std::time::Instant::now();
     if let Some(node) = cache.get(ip, now) {
         return Ok(Some(node));
