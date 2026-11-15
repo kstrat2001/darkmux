@@ -2120,13 +2120,18 @@ fn a_command_in_a_session_of_its_own_cannot_join_another_sessions_group() {
     crate::in_a_session_of_its_own(&mut cmd);
     let mut child = cmd.spawn().unwrap();
     let pid = child.id() as i32;
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Wait for the child's verdict, not a fixed time: under a loaded coverage
+    // run a 200 ms sleep could end before perl printed anything. Both
+    // verdicts are at least six bytes, and the child sleeps after printing,
+    // so it is still alive for the queries below.
+    let mut verdict = [0u8; 6];
+    std::io::Read::read_exact(child.stdout.as_mut().unwrap(), &mut verdict).unwrap();
     // SAFETY: queries of the child this test started.
     let (sid, group) = unsafe { (libc::getsid(pid), libc::getpgid(pid)) };
     let _ = child.kill();
-    let out = child.wait_with_output().unwrap();
+    let _ = child.wait();
     assert_eq!((sid, group), (pid, pid), "it leads a session and a group of its own");
-    assert!(String::from_utf8_lossy(&out.stdout).starts_with("refused"), "{:?}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(&verdict, b"refuse", "{:?}", String::from_utf8_lossy(&verdict));
     let mut both = std::process::Command::new("/usr/bin/true");
     crate::in_a_session_of_its_own(&mut both);
     both.process_group(0);
