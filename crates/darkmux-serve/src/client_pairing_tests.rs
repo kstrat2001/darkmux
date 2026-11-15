@@ -461,6 +461,7 @@ fn harness() -> Harness {
         // Asked afresh each time here, so a test can place a device at any point.
         status_cache: Arc::new(crate::client_tailnet::StatusCache::new(std::time::Duration::ZERO)),
         tailnet_calls: Arc::new(tokio::sync::Semaphore::new(1)),
+        preview_sessions: Arc::new(crate::client_preview_proxy::PreviewSessions::default()),
     };
     let trust = TrustSeams::new();
     let devices = Devices::default();
@@ -753,7 +754,7 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
                            "capabilities": ["clean_preview", "template_workspace", "continues", "clone_preview",
                                             "recipe_set", "workspace_image", "workspace_edit", "workspace_remove",
                                              "remote_tailscale", "availability_codes",
-                                             "remote_requests"],
+                                             "remote_requests", "remote_preview"],
                             "remote": {"state": "off", "url": null, "reason": null},
                             "via": "local"})
     );
@@ -9898,6 +9899,12 @@ async fn every_route_is_open_or_not_as_the_table_declares() {
                 let refused = (code, v["code"].as_str(), v["error"].as_str().unwrap_or_default().starts_with("bad JSON body"));
                 assert_eq!(refused, (400, Some("bad_request"), true), "{} {}: {v}", r.method, r.path);
             }
+            // (#3560) A browser through the tailnet entry, with no token: from
+            // this Mac it is refused before the code is looked at.
+            ClientAuth::LinkCode => {
+                let (code, v) = call(&h, raw(r.method, &path, None, Body::empty())).await;
+                assert_eq!((code, v["code"].as_str()), (403, Some("tailnet_only")), "{} {}: {v}", r.method, r.path);
+            }
             ClientAuth::PairSecret => {
                 let pending = path.replace(":request_id", &request_pairing(&h).await);
                 for (secret, want) in [(None, 404), (Some("not-the-secret"), 404), (Some(SECRET), 200)] {
@@ -9965,7 +9972,9 @@ async fn every_declared_body_is_the_one_its_handler_reads() {
         }
     }
     assert_eq!(bodies, 8, "every route that declares a body was probed");
-    assert_eq!(reached, 14, "every route that declares none was probed past its lookups");
+    // (#3560) The two preview link routes answer this Mac's app
+    // `tailnet_only`, past the token, before any lookup.
+    assert_eq!(reached, 16, "every route that declares none was probed past its lookups");
 }
 
 /// (#3494 review) Each property a route's declared query has is a field its
@@ -11236,3 +11245,7 @@ async fn an_auto_approval_is_the_approval_client_approve_makes() {
     assert!(revoke(&h.store, p.client_name.as_deref().unwrap()).unwrap(), "revocable like any approval");
     assert_eq!(poll(&h, &id, SECRET).await.1["status"], "denied");
 }
+
+/// (#3560, part 4) The preview proxy's tests, on this harness.
+#[path = "client_preview_proxy_tests.rs"]
+mod preview_proxy;

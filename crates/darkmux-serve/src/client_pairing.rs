@@ -1170,6 +1170,10 @@ pub struct ClientServerState {
     pub(crate) status_cache: Arc<crate::client_tailnet::StatusCache>,
     /// (#3560) One Tailscale call at a time, however many requests ask.
     pub(crate) tailnet_calls: Arc<tokio::sync::Semaphore>,
+    /// (#3560) The preview links waiting to be opened and the preview
+    /// sessions they opened, in memory only: a restart ends every one
+    /// ([`crate::client_preview_proxy`]).
+    pub preview_sessions: Arc<crate::client_preview_proxy::PreviewSessions>,
 }
 
 /// Who sent a pairing request, for the bound on how many one sender may
@@ -1263,6 +1267,7 @@ impl ClientServerState {
             tailnet_status: Arc::new(tailnet_status_here),
             status_cache: Arc::new(crate::client_tailnet::StatusCache::new(crate::fleet_listener::IdentityCache::TTL)),
             tailnet_calls: Arc::new(tokio::sync::Semaphore::new(1)),
+            preview_sessions: Arc::new(crate::client_preview_proxy::PreviewSessions::default()),
         })
     }
 }
@@ -1930,8 +1935,8 @@ pub(crate) async fn only_this_machines_apps(
 }
 
 /// [`only_this_machines_apps`]'s gate: `req` let in, with which way it came
-/// on it ([`RequestVia`]) and, for a pairing route through the tailnet
-/// entry, its unchecked caller ([`Forwarded`]): the pairing handlers ask
+/// on it ([`RequestVia`]) and, for a route that takes no token through the
+/// tailnet entry, its unchecked caller ([`Forwarded`]): those handlers ask
 /// Tailscale themselves, once the store says there is something to ask
 /// about. Otherwise the refusal.
 async fn let_in(state: &ClientServerState, req: &mut axum::extract::Request) -> Result<(), Refused> {
@@ -2059,8 +2064,9 @@ enum Gate {
         login: String,
         expect: crate::client_tailnet::TailnetDevice,
     },
-    /// (#3560) A pairing route through the tailnet entry: on to its handler,
-    /// which checks the store before it asks Tailscale anything.
+    /// (#3560) A route that takes no token (a pairing route, or opening a
+    /// preview link) through the tailnet entry: on to its handler, which
+    /// checks the store (or the link) before it asks Tailscale anything.
     Pairing(Forwarded),
 }
 
@@ -2069,8 +2075,8 @@ enum Gate {
 /// this Mac can send them).
 #[derive(Debug, Clone)]
 pub(crate) struct Forwarded {
-    from: std::net::IpAddr,
-    login: String,
+    pub(crate) from: std::net::IpAddr,
+    pub(crate) login: String,
 }
 
 /// Which way `req` came ([`crate::client_tailnet::arrival`]), once
@@ -2140,7 +2146,7 @@ async fn status(state: &ClientServerState) -> Result<crate::client_tailnet::Tail
 /// and only for an address a device on the tailnet holds as the cached
 /// status lists them: a made-up address is no device (`Ok(None)`) and
 /// costs no call, and a status that cannot be read refuses (`Err`).
-async fn whois(state: &ClientServerState, from: std::net::IpAddr) -> Result<Option<darkmux_fleet::NodeIdentity>, String> {
+pub(crate) async fn whois(state: &ClientServerState, from: std::net::IpAddr) -> Result<Option<darkmux_fleet::NodeIdentity>, String> {
     if !status(state).await?.peers.contains(&from) {
         return Ok(None);
     }
@@ -2202,7 +2208,7 @@ fn is_json(req: &axum::extract::Request) -> bool {
         .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json"))
 }
 
-fn err(status: StatusCode, code: ClientCode, msg: impl Into<String>) -> Response {
+pub(crate) fn err(status: StatusCode, code: ClientCode, msg: impl Into<String>) -> Response {
     (status, Json(ClientError { error: msg.into(), code })).into_response()
 }
 
@@ -2241,9 +2247,9 @@ pub(crate) fn panic_response(_panic: Box<dyn std::any::Any + Send + 'static>) ->
 
 /// A refusal on its way back to a handler, boxed: a `Response` is large, and
 /// these travel through `Result`s.
-type Refused = Box<Response>;
+pub(crate) type Refused = Box<Response>;
 
-fn refuse(status: StatusCode, code: ClientCode, msg: impl Into<String>) -> Refused {
+pub(crate) fn refuse(status: StatusCode, code: ClientCode, msg: impl Into<String>) -> Refused {
     Box::new(err(status, code, msg))
 }
 
@@ -2251,7 +2257,7 @@ fn not_found() -> Response {
     err(StatusCode::NOT_FOUND, ClientCode::NotFound, "not found")
 }
 
-fn internal(e: anyhow::Error) -> Response {
+pub(crate) fn internal(e: anyhow::Error) -> Response {
     eprintln!("darkmux client serve: {e:#}");
     err(
         StatusCode::INTERNAL_SERVER_ERROR, ClientCode::Internal,
@@ -2669,7 +2675,7 @@ async fn polled_identity(
 
 /// The client the bearer token names. Every stored hash is compared (no early
 /// exit), each in constant time.
-fn authenticate(
+pub(crate) fn authenticate(
     state: &ClientServerState,
     headers: &HeaderMap,
 ) -> Result<ApprovedClient, Refused> {
@@ -3487,7 +3493,7 @@ fn workspace_dir(state: &ClientServerState, name: &str) -> Result<PathBuf, Refus
 /// made, by [`adopt_unowned`] or by `client claim`): a 403 for another app's
 /// workspace, a revoked client's, a mission's worktrees or any folder no app
 /// asked darkmux for.
-fn owned_workspace(state: &ClientServerState, client: &ApprovedClient, name: &str) -> Result<PathBuf, Refused> {
+pub(crate) fn owned_workspace(state: &ClientServerState, client: &ApprovedClient, name: &str) -> Result<PathBuf, Refused> {
     let dir = workspace_dir(state, name)?;
     let base = (state.worktrees_base)().map_err(|e| internal(anyhow!(e)))?;
     let owner = match crate::client_workspace::owner_of(&base, name) {
@@ -4448,7 +4454,7 @@ fn checked_approved_recipe(recipe: &serde_json::Value) -> Result<(String, crate:
 /// Why previews are refused on this machine right now, if they are: off
 /// unless `clients.preview.enabled` is true (a 403 that says what a preview
 /// does and how to turn it on), and refused when it cannot be read (503).
-fn previews_allowed(state: &ClientServerState) -> Result<(), Refused> {
+pub(crate) fn previews_allowed(state: &ClientServerState) -> Result<(), Refused> {
     match (state.preview_enabled)() {
         Ok(true) => Ok(()),
         Ok(false) => Err(refuse(

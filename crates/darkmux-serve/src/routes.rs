@@ -147,6 +147,9 @@ pub(crate) struct ClientRoute {
     /// (`every_route_is_open_or_not_as_the_table_declares` holds the
     /// handlers to it).
     pub(crate) auth: ClientAuth,
+    /// (#3560) The route answers `303 See Other` with no body (and its
+    /// `reply` is `()`): opening a preview link.
+    pub(crate) see_other: bool,
     handler: MethodRouter<crate::client_pairing::ClientServerState>,
 }
 
@@ -160,6 +163,9 @@ pub(crate) enum ClientAuth {
     /// The `X-Pair-Secret` header, the `pair_secret` the pairing request
     /// sent (`GET /client/pair/{request_id}`), and no token.
     PairSecret,
+    /// (#3560) The one-time code in the path, opened by a browser through
+    /// the tailnet entry (`GET /client/preview-link/{code}`), and no token.
+    LinkCode,
 }
 
 /// The JSON body a client route reads.
@@ -174,8 +180,9 @@ pub(crate) struct RequestBody {
 /// to exist and to have a schema, and named in the goldens. A route that
 /// reads a JSON body names its type with `body = T` (`optional_body = T`
 /// when it may be absent), one that reads a query with `query = T`. A route
-/// that takes no token says what it takes instead: `auth = open` or `auth =
-/// pair_secret`.
+/// that takes no token says what it takes instead: `auth = open`, `auth =
+/// pair_secret` or `auth = link_code`. One that answers a redirect says
+/// `answers = see_other`.
 macro_rules! client_json {
     ($method:ident, $ty:ty, $path:expr, $handler:expr $(, $key:ident = $arg:tt)*) => {{
         #[allow(unused_mut)]
@@ -187,6 +194,7 @@ macro_rules! client_json {
             body: None,
             query: None,
             auth: ClientAuth::Bearer,
+            see_other: false,
             handler: axum::routing::$method($handler),
         };
         $( client_json!(@ route, $key, $arg); )*
@@ -197,6 +205,8 @@ macro_rules! client_json {
     (@ $r:ident, query, $t:ty) => { $r.query = Some(|g| <$t as schemars::JsonSchema>::json_schema(g)) };
     (@ $r:ident, auth, open) => { $r.auth = ClientAuth::Open };
     (@ $r:ident, auth, pair_secret) => { $r.auth = ClientAuth::PairSecret };
+    (@ $r:ident, auth, link_code) => { $r.auth = ClientAuth::LinkCode };
+    (@ $r:ident, answers, see_other) => { $r.see_other = true };
 }
 
 /// Every route the client listener serves. Every refusal on any of them is
@@ -226,13 +236,16 @@ pub(crate) fn client_table() -> Vec<ClientRoute> {
         client_json!(post, PreviewState, "/client/workspaces/:name/preview", preview_start_handler, optional_body = PreviewStartBody),
         client_json!(get, PreviewState, "/client/workspaces/:name/preview", preview_status_handler),
         client_json!(delete, StatusWord, "/client/workspaces/:name/preview", preview_stop_handler),
+        client_json!(post, PreviewLink, "/client/workspaces/:name/preview/link", crate::client_preview_proxy::link_handler),
+        client_json!(get, (), crate::client_preview_proxy::LINK_ROUTE, crate::client_preview_proxy::open_handler, auth = link_code, answers = see_other),
         client_json!(put, RecipeReply, "/client/workspaces/:name/recipe", recipe_set_handler, body = RecipeSetBody),
     ]
 }
 
-/// (#3560) Whether a route at `path` takes no token (`auth = open` or
-/// `pair_secret`: the pairing routes). Through the tailnet entry such a
-/// route needs a tailnet user and device to record, in place of a token.
+/// (#3560) Whether a route at `path` takes no token (`auth = open`,
+/// `pair_secret` or `link_code`: the pairing routes and opening a preview
+/// link). Through the tailnet entry such a route needs a tailnet user, and
+/// its handler the device `whois` names, in place of a token.
 pub(crate) fn takes_no_token(path: &str) -> bool {
     static NO_TOKEN: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     NO_TOKEN
@@ -242,7 +255,10 @@ pub(crate) fn takes_no_token(path: &str) -> bool {
 
 /// The client listener's router: every table route (a path listed twice
 /// takes both methods), JSON for an unlisted path or method, and the
-/// listener's gate in front of all of it.
+/// listener's gate in front of all of it. (#3560) In front of the gate, a
+/// request through the tailnet entry on a path outside `/client/` goes to
+/// the preview its session cookie names, never to a route
+/// ([`crate::client_preview_proxy::front_door`]).
 pub(crate) fn client_router(state: crate::client_pairing::ClientServerState) -> Router {
     use crate::client_pairing as cp;
     let mut by_path: Vec<(&'static str, MethodRouter<cp::ClientServerState>)> = Vec::new();
@@ -258,6 +274,7 @@ pub(crate) fn client_router(state: crate::client_pairing::ClientServerState) -> 
         .fallback(cp::no_such_route)
         .method_not_allowed_fallback(cp::method_not_allowed)
         .layer(axum::middleware::from_fn_with_state(state.clone(), cp::only_this_machines_apps))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::client_preview_proxy::front_door))
         // (#3468) A panic in a handler answers a coded 500 (`ClientError`).
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(cp::panic_response))
         .with_state(state)
@@ -276,12 +293,16 @@ fn render_client_table() -> String {
         let who = match r.auth {
             ClientAuth::Bearer => "this machine's apps and paired devices through its tailnet entry",
             ClientAuth::Open | ClientAuth::PairSecret => "this machine's apps and devices pairing through its tailnet entry",
+            ClientAuth::LinkCode => "a paired device's browser through its tailnet entry",
+        };
+        let answer = match r.see_other {
+            true => "303 to /".to_string(),
+            false => format!("json {}", bare(r.reply)),
         };
         out.push_str(&format!(
-            "{} {}  json {} (client listener: 127.0.0.1, {who}; not the viewer daemon)\n",
+            "{} {}  {answer} (client listener: 127.0.0.1, {who}; not the viewer daemon)\n",
             r.method.to_uppercase(),
             r.path,
-            bare(r.reply)
         ));
     }
     out.push_str("\n# client listener response types: Type.field: type, from the JSON schema (every refusal is ClientError)\n");
@@ -302,7 +323,7 @@ fn render_client_table() -> String {
 fn client_schemas() -> Vec<(String, serde_json::Value)> {
     let mut generator = schemars::SchemaGenerator::default();
     generator.subschema_for::<crate::client_wire::ClientError>();
-    for r in client_table() {
+    for r in client_table().into_iter().filter(|r| !r.see_other) {
         (r.reply_schema)(&mut generator);
     }
     generator.definitions().clone().into_iter().collect()

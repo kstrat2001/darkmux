@@ -56,6 +56,7 @@ mod client_changes;
 mod client_openapi;
 pub mod client_pairing;
 pub mod client_preview;
+pub mod client_preview_proxy;
 pub mod client_profiles;
 pub mod client_remote;
 pub mod client_tailnet;

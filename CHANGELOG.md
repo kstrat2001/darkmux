@@ -111,6 +111,20 @@ darkmux release.
   stays 1.3: its `tailnet` gains `device` (`{"id", "name", "host_name"?}`, required), and a pending
   request may carry `tailnet` too. The client API's OpenAPI document now opens with
   `docs/CLIENTS.md`, the order of calls and what an app does on each outcome.
+- **A paired device sees its preview over the tailnet (#3560, last of four parts).** A device paired
+  over the tailnet asks `POST /client/workspaces/{name}/preview/link` (its token, from the tailnet user
+  and device it paired as) for a one-time link to one of its ready previews. Its browser opens the link
+  through the tailnet URL; darkmux checks the user and device are the ones the link was made for, sets
+  an HttpOnly, Secure, SameSite=Strict session cookie and sends the browser to `/`. Every path outside
+  `/client/` there is then the preview's, proxied to its loopback port, WebSocket upgrades included, so
+  a dev server's live reload works when its reload socket is on the app port. The preview never sees
+  the device's token, the session cookie or Tailscale's headers, its `Host` and `Origin` name its own
+  loopback address (so Vite's host check passes with no change to the repo), and it cannot set the
+  session cookie. A link opens once, within a minute; a session ends when its preview stops or
+  restarts, when the device is revoked, and when `darkmux client serve` stops. A browser shows one
+  preview at a time. New refusal codes: `tailnet_only` (a link asked for or opened from the Mac) and
+  `no_preview_session`. The capability list gains `remote_preview`. Previews still listen on loopback
+  only, and `client serve` adds no listener and no Tailscale entry for them.
 - **`darkmux doctor` and `mission status` find `tailscale` where the fleet identity provider does
   (#3560).** The tailnet viewer URL used to run a bare `tailscale` from `PATH`; it now looks on `PATH`
   and then at the known install locations (on macOS `/usr/local/bin/tailscale`,

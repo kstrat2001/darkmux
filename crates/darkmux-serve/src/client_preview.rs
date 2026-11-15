@@ -731,6 +731,10 @@ impl Status {
 }
 
 struct Entry {
+    /// (#3560) Which start of the preview this is ([`run_id`]): a restart,
+    /// even on the same ports, is another, so a preview session ends with
+    /// the run it was opened on ([`Previews::serving`]).
+    run: String,
     port: u16,
     hmr_port: u16,
     status: Status,
@@ -748,6 +752,15 @@ struct Entry {
     last_asked: u64,
     /// (#3561) The step of its start an app may show, while there is one.
     stage: Option<PreviewStage>,
+}
+
+/// (#3560) What a ready preview serves ([`Previews::serving`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Serving {
+    /// The start of the preview it is.
+    pub run: String,
+    /// Its app port on 127.0.0.1.
+    pub port: u16,
 }
 
 /// Seconds on a wall clock: Unix seconds in production. A wall clock, not
@@ -1471,7 +1484,9 @@ impl Previews {
         let log = self.dir.join(format!("{name}.log"));
         let _ = std::fs::write(&log, "");
         let containers = self.containers_for(kind)?;
+        let this_run = run_id();
         let entry = Arc::new(Mutex::new(Entry {
+            run: this_run.clone(),
             port,
             hmr_port,
             status: Status::Starting,
@@ -1488,7 +1503,7 @@ impl Previews {
 
         let at = RunIn {
             name: name.to_string(),
-            run: run_id(),
+            run: this_run,
             workdir: workdir.to_path_buf(),
             checkout: source.checkout().map(Path::to_path_buf),
             log,
@@ -1545,6 +1560,37 @@ impl Previews {
         let mut e = entries.get(name)?.lock().unwrap();
         e.last_asked = (self.clock)();
         Some(Self::snapshot(name, &e))
+    }
+
+    /// (#3560) What `name`'s preview serves while it is ready: the run and
+    /// its loopback app port, which a preview link and its session are bound
+    /// to ([`crate::client_preview_proxy`]). Not an app asking: the idle
+    /// count is left alone.
+    pub fn serving(&self, name: &str) -> Option<Serving> {
+        let entries = self.entries.lock().unwrap();
+        let e = entries.get(name)?.lock().unwrap();
+        (e.status == Status::Ready).then(|| Serving { run: e.run.clone(), port: e.port })
+    }
+
+    /// A test's ready preview of `name` on `port`, served by whatever the
+    /// test listens there with: a new run, as a restart is.
+    #[cfg(test)]
+    pub(crate) fn ready_for_test(&self, name: &str, port: u16) -> Serving {
+        let run = run_id();
+        let entry = Entry {
+            run: run.clone(),
+            port,
+            hmr_port: port,
+            status: Status::Ready,
+            containers: self.containers.clone(),
+            container: None,
+            heartbeat: None,
+            log: self.dir.join(format!("{name}.log")),
+            last_asked: (self.clock)(),
+            stage: None,
+        };
+        self.entries.lock().unwrap().insert(name.to_string(), Arc::new(Mutex::new(entry)));
+        Serving { run, port }
     }
 
     /// Stops it: its container gets TERM, then KILL after five seconds, and

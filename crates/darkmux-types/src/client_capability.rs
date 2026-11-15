@@ -71,11 +71,17 @@ pub enum ClientCapability {
     /// token, from the tailnet user and device it paired as. What the build
     /// can do: `remote.state` says whether this machine is on the tailnet.
     RemoteRequests,
+    /// (#3560) `POST /client/workspaces/{name}/preview/link`: a one-time link
+    /// a device paired over the tailnet opens in its browser, through
+    /// `remote.url`, to see that ready preview at the entry's root. What the
+    /// build can do: `remote.state` says whether this machine is on the
+    /// tailnet, and `preview_disabled` still answers when previews are off.
+    RemotePreview,
 }
 
 impl ClientCapability {
     /// Every capability, in declaration order: what `whoami` lists.
-    pub const ALL: [ClientCapability; 11] = [
+    pub const ALL: [ClientCapability; 12] = [
         ClientCapability::CleanPreview,
         ClientCapability::TemplateWorkspace,
         ClientCapability::Continues,
@@ -87,6 +93,7 @@ impl ClientCapability {
         ClientCapability::RemoteTailscale,
         ClientCapability::AvailabilityCodes,
         ClientCapability::RemoteRequests,
+        ClientCapability::RemotePreview,
     ];
 }
 
@@ -120,6 +127,7 @@ mod tests {
                 "remote_tailscale",
                 "availability_codes",
                 "remote_requests",
+                "remote_preview",
             ]
         );
         for c in ClientCapability::ALL {

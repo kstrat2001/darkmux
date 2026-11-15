@@ -59,6 +59,16 @@ pub enum ClientCode {
     /// pairing), from another tailnet device than the one it was paired
     /// from, even one of the same user's.
     RemoteDeviceMismatch,
+    /// (#3560) A route only a device paired over the tailnet uses through the
+    /// tailnet entry (asking for a preview link, or opening one), called
+    /// from this machine instead. An app on this Mac opens the preview's own
+    /// loopback address.
+    TailnetOnly,
+    /// (#3560) Through the tailnet entry, on a path outside `/client/` (a
+    /// preview's), with no preview session cookie, or one whose session has
+    /// ended: its preview stopped or restarted, its device was revoked, or
+    /// `client serve` restarted. Ask the app for a new preview link.
+    NoPreviewSession,
     UnsupportedMediaType,
     BadRequest,
     PayloadTooLarge,
@@ -239,6 +249,8 @@ mod tests {
             (RemoteUserNotOwner, "remote_user_not_owner"),
             (RemoteDeviceUnknown, "remote_device_unknown"),
             (RemoteDeviceMismatch, "remote_device_mismatch"),
+            (TailnetOnly, "tailnet_only"),
+            (NoPreviewSession, "no_preview_session"),
         ] {
             assert_eq!(wire(c), s);
             assert_eq!(c.as_str(), s, "the method spells it as serde does");
