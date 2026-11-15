@@ -3,8 +3,13 @@
   "info": {
     "title": "darkmux client API",
     "version": "<darkmux version>",
-    "description": "`darkmux client serve`: 127.0.0.1 only, for apps on this machine. Every route but the pairing ones takes `Authorization: Bearer <token>`. An app gates a feature on `GET /client/whoami`'s `capabilities`, never on `version`."
+    "description": "`darkmux client serve`: 127.0.0.1 only, for apps on this machine. Every route but the pairing ones takes the token a pairing delivered. An app gates a feature on `GET /client/whoami`'s `capabilities`, never on `version`."
   },
+  "security": [
+    {
+      "bearer": []
+    }
+  ],
   "paths": {
     "/client/pair": {
       "post": {
@@ -23,6 +28,7 @@
             "$ref": "#/components/responses/ClientError"
           }
         },
+        "security": [],
         "requestBody": {
           "required": true,
           "content": {
@@ -60,8 +66,18 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "X-Pair-Secret",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The `pair_secret` the pairing request sent. Without it, or with another, the request is unknown (404)."
           }
-        ]
+        ],
+        "security": []
       }
     },
     "/client/whoami": {
@@ -689,6 +705,12 @@
     }
   },
   "components": {
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
     "schemas": {
       "ClientError": {
         "type": "object",
@@ -1022,7 +1044,7 @@
             "items": {
               "$ref": "#/components/schemas/ClientCapability"
             },
-            "description": "(#3494) Every capability this darkmux's client API has, in\ndeclaration order. None listed (an older darkmux): none of them."
+            "description": "(#3494) Every capability this darkmux's client API has, in\ndeclaration order: exactly what it supports. A darkmux with no\n`capabilities` field is 5.10 or 5.11; `ClientCapability`'s docs say\nwhat each has and how to tell them apart. The preview ones are what\nthe build can do: `preview_disabled` still answers when this machine\nhas previews off."
           }
         },
         "required": [
@@ -1681,7 +1703,7 @@
         "properties": {
           "schema_version": {
             "type": "string",
-            "description": "The recipe format's version ([`PREVIEW_RECIPE_SCHEMA_VERSION`])."
+            "description": "The recipe format's version; one newer than this darkmux reads is\nrefused."
           },
           "command": {
             "type": "string"
@@ -2008,7 +2030,7 @@
           },
           "new": {
             "type": "string",
-            "description": "The text the page is to show instead: written as sent, except that\nin a markup file what would read as markup is written as text\n([`crate::client_edit::as_source`])."
+            "description": "The text the page is to show instead: written as sent, except that\nin a markup file what would read as markup is written as text,\nescaped."
           }
         },
         "required": [
@@ -2182,7 +2204,7 @@
         "properties": {
           "recipe": {
             "$ref": "#/components/schemas/Recipe",
-            "description": "A `.darkmux/preview.json`, checked as strictly as a checkout's."
+            "description": "A `.darkmux/preview.json`, checked as strictly as one in a checkout\nand refused (422 `recipe_invalid`) unless it holds: no key the\nrecipe format does not know, a `schema_version` this darkmux reads,\nno `env_from_source` (a clone has no checkout of yours to copy from),\nand at most 16 KB (16384 bytes) as JSON."
           }
         },
         "required": [

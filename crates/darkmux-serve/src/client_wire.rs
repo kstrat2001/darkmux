@@ -91,7 +91,11 @@ pub struct Whoami {
     /// gates a feature on `capabilities`, never on this.
     pub version: String,
     /// (#3494) Every capability this darkmux's client API has, in
-    /// declaration order. None listed (an older darkmux): none of them.
+    /// declaration order: exactly what it supports. A darkmux with no
+    /// `capabilities` field is 5.10 or 5.11; `ClientCapability`'s docs say
+    /// what each has and how to tell them apart. The preview ones are what
+    /// the build can do: `preview_disabled` still answers when this machine
+    /// has previews off.
     pub capabilities: Vec<darkmux_types::client_capability::ClientCapability>,
 }
 

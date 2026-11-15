@@ -1059,6 +1059,20 @@ async fn whoami_without_or_with_a_wrong_token_is_401() {
     assert_eq!(code, 401);
 }
 
+/// (#3494 review) How an app tells 5.11 from 5.10, neither of which lists
+/// `capabilities` (`ClientCapability`'s docs): the recipe path exists from
+/// 5.11, for `PUT` only, so another method is the router's 405; a path no
+/// release has is the router's 404, the answer 5.10 gives that path. No
+/// token needed for either.
+#[tokio::test]
+async fn an_older_darkmux_is_told_apart_by_its_route_table() {
+    let h = harness();
+    let (code, v) = call(&h, get("/client/workspaces/any/recipe", &[])).await;
+    assert_eq!((code, v["code"].as_str()), (405, Some("method_not_allowed")), "{v}");
+    let (code, v) = call(&h, get("/client/workspaces/any/no-such-thing", &[])).await;
+    assert_eq!((code, v["code"].as_str(), v["error"].as_str()), (404, Some("not_found"), Some("no such route")), "{v}");
+}
+
 /// (#3494) The OpenAPI document is authenticated as `whoami` is, and is
 /// the document built from the route table, naming this build's version.
 #[tokio::test]

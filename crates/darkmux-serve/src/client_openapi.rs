@@ -14,7 +14,7 @@ use schemars::SchemaGenerator;
 use serde_json::{json, Map, Value};
 
 use crate::client_wire::{ClientError, ClientOpenApi};
-use crate::routes::{client_table, ClientRoute};
+use crate::routes::{client_table, ClientAuth, ClientRoute};
 
 /// The document this build serves, built once.
 pub(crate) fn served() -> &'static ClientOpenApi {
@@ -39,18 +39,22 @@ pub(crate) fn document(version: &str) -> Value {
         let item = paths.entry(template).or_insert_with(|| json!({}));
         item[route.method] = operation(&route, parameters, &mut generator);
     }
+    let mut schemas = Value::Object(generator.take_definitions(true));
+    plain_descriptions(&mut schemas);
     json!({
         "openapi": "3.1.0",
         "info": {
             "title": "darkmux client API",
             "version": version,
             "description": "`darkmux client serve`: 127.0.0.1 only, for apps on this machine. Every route \
-                but the pairing ones takes `Authorization: Bearer <token>`. An app gates a feature on \
+                but the pairing ones takes the token a pairing delivered. An app gates a feature on \
                 `GET /client/whoami`'s `capabilities`, never on `version`."
         },
+        "security": [{"bearer": []}],
         "paths": paths,
         "components": {
-            "schemas": generator.take_definitions(true),
+            "securitySchemes": {"bearer": {"type": "http", "scheme": "bearer"}},
+            "schemas": schemas,
             "responses": {
                 "ClientError": {
                     "description": "Every refusal: the status says the class, `code` which refusal it is.",
@@ -88,6 +92,7 @@ fn operation(
     if let Some(query) = route.query {
         parameters.extend(query_parameters(&query(generator).to_value()));
     }
+    let open = takes_no_token(route.auth, &mut parameters);
     let reply = (route.reply_schema)(generator);
     let mut op = json!({
         "responses": {
@@ -97,6 +102,9 @@ fn operation(
     });
     if !parameters.is_empty() {
         op["parameters"] = Value::Array(parameters);
+    }
+    if open {
+        op["security"] = json!([]);
     }
     if let Some(body) = route.body {
         op["requestBody"] =
@@ -120,6 +128,35 @@ fn query_parameters(schema: &Value) -> Vec<Value> {
         .into_iter()
         .map(|(name, s)| json!({"name": name, "in": "query", "required": required(&name), "schema": s}))
         .collect()
+}
+
+/// Whether a route takes no token (the document's global `security` then
+/// does not apply to it); one that takes the pairing secret gets its
+/// header parameter.
+fn takes_no_token(auth: ClientAuth, parameters: &mut Vec<Value>) -> bool {
+    if auth == ClientAuth::PairSecret {
+        parameters.push(json!({
+            "name": "X-Pair-Secret", "in": "header", "required": true, "schema": {"type": "string"},
+            "description": "The `pair_secret` the pairing request sent. Without it, or with another, the \
+                request is unknown (404).",
+        }));
+    }
+    auth != ClientAuth::Bearer
+}
+
+/// Rewrites every `description` under `v` as plain text: a rustdoc link
+/// (`` [`x`] ``) becomes its code span.
+fn plain_descriptions(v: &mut Value) {
+    match v {
+        Value::Object(m) => {
+            if let Some(Value::String(d)) = m.get_mut("description") {
+                *d = d.replace("[`", "`").replace("`]", "`");
+            }
+            m.values_mut().for_each(plain_descriptions);
+        }
+        Value::Array(a) => a.iter_mut().for_each(plain_descriptions),
+        _ => {}
+    }
 }
 
 fn json_content(schema: schemars::Schema) -> Value {
@@ -189,8 +226,8 @@ mod tests {
     fn path_parameters_are_declared() {
         let d = doc();
         assert_eq!(
-            d["paths"]["/client/pair/{request_id}"]["get"]["parameters"],
-            json!([{"name": "request_id", "in": "path", "required": true, "schema": {"type": "string"}}])
+            d["paths"]["/client/pair/{request_id}"]["get"]["parameters"][0],
+            json!({"name": "request_id", "in": "path", "required": true, "schema": {"type": "string"}})
         );
         assert_eq!(
             d["paths"]["/client/workspaces/{name}/preview"]["post"]["parameters"][0]["name"],
@@ -301,6 +338,71 @@ mod tests {
             recipe["$ref"], "#/components/schemas/Recipe",
             "the recipe is checked as a Recipe"
         );
+    }
+
+    /// (#3494 review) The token is one bearer scheme, required everywhere
+    /// but on the routes the table declares take none.
+    #[test]
+    fn the_token_is_a_bearer_scheme_every_route_but_the_pairing_ones_needs() {
+        use crate::routes::ClientAuth;
+        let d = doc();
+        assert_eq!(
+            d["components"]["securitySchemes"],
+            json!({"bearer": {"type": "http", "scheme": "bearer"}})
+        );
+        assert_eq!(d["security"], json!([{"bearer": []}]));
+        for r in crate::routes::client_table() {
+            let (path, _) = path_template(r.path);
+            let op = &d["paths"][&path][r.method];
+            match r.auth {
+                ClientAuth::Bearer => assert!(
+                    op.get("security").is_none(),
+                    "{} {path}: the global one",
+                    r.method
+                ),
+                ClientAuth::Open | ClientAuth::PairSecret => {
+                    assert_eq!(op["security"], json!([]), "{} {path}", r.method)
+                }
+            }
+        }
+        assert_eq!(d["paths"]["/client/pair"]["post"]["security"], json!([]));
+    }
+
+    /// (#3494 review) The pairing poll takes its secret as a required
+    /// `X-Pair-Secret` header.
+    #[test]
+    fn the_pairing_poll_declares_its_secret_header() {
+        let d = doc();
+        let params = d["paths"]["/client/pair/{request_id}"]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let header: Vec<&Value> = params.iter().filter(|p| p["in"] == "header").collect();
+        assert_eq!(header.len(), 1, "{params:?}");
+        assert_eq!(header[0]["name"], "X-Pair-Secret");
+        assert_eq!(header[0]["required"], true);
+        assert_eq!(header[0]["schema"], json!({"type": "string"}));
+        let headers = operations(&d)
+            .iter()
+            .filter(|(_, _, op)| op.to_string().contains("X-Pair-Secret"))
+            .count();
+        assert_eq!(headers, 1, "only the poll takes it");
+    }
+
+    /// (#3494 review) A description reads as text: no rustdoc link brackets
+    /// and no Rust module paths reach the public document.
+    #[test]
+    fn descriptions_carry_no_rustdoc_links_or_module_paths() {
+        let mut v = json!({"a": {"description": "see [`x`] and [`crate::m::f`]"}, "b": [{"description": "[`Y`]."}]});
+        plain_descriptions(&mut v);
+        assert_eq!(
+            v,
+            json!({"a": {"description": "see `x` and `crate::m::f`"}, "b": [{"description": "`Y`."}]})
+        );
+        let text = doc().to_string();
+        for leak in ["[`", "`]", "crate::", "darkmux_types::"] {
+            assert!(!text.contains(leak), "the document carries {leak}");
+        }
     }
 
     /// Every `$ref` in the document names a component it holds.

@@ -4,9 +4,26 @@
 //!
 //! One wire spelling per value (`snake_case`, from serde), and a new value is
 //! additive: a PR that adds a client-visible route or request field adds its
-//! capability here in the same PR. A darkmux that lists no `capabilities`
-//! (older than #3494) has none of them. Registered with the enums that are no
+//! capability here in the same PR. Registered with the enums that are no
 //! setting (`config_enum`'s `NOT_SETTINGS`): it is a wire value.
+//!
+//! **What an app reads from the list.** A darkmux whose `whoami` has a
+//! `capabilities` field supports exactly the ones listed. One with no such
+//! field is 5.10 or 5.11, released before the list:
+//!
+//! - 5.10.0 has `clean_preview`, `template_workspace`, `continues`,
+//!   `workspace_edit` and `workspace_remove`;
+//! - 5.11.0 also has `clone_preview`, `recipe_set` and `workspace_image`.
+//!
+//! An app tells those two apart by the route table, not by how a handler
+//! answers: `GET /client/workspaces/{any}/recipe` is a 405
+//! `method_not_allowed` on 5.11 (the path exists, for `PUT`) and a 404
+//! `not_found` (`"no such route"`) on 5.10, neither needing a token
+//! (`an_older_darkmux_is_told_apart_by_its_route_table` pins this build's
+//! side). The preview capabilities (`clean_preview`, `clone_preview`,
+//! `recipe_set`) are what this build can do, not what this machine allows:
+//! an app still handles `preview_disabled` (403) when
+//! `clients.preview.enabled` is off.
 
 use serde::{Deserialize, Serialize};
 

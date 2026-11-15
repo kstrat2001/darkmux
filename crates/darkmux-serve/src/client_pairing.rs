@@ -3850,7 +3850,11 @@ pub(crate) async fn preview_start_handler(
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecipeSetBody {
-    /// A `.darkmux/preview.json`, checked as strictly as a checkout's.
+    /// A `.darkmux/preview.json`, checked as strictly as one in a checkout
+    /// and refused (422 `recipe_invalid`) unless it holds: no key the
+    /// recipe format does not know, a `schema_version` this darkmux reads,
+    /// no `env_from_source` (a clone has no checkout of yours to copy from),
+    /// and at most 16 KB (16384 bytes) as JSON.
     #[schemars(with = "crate::client_preview::Recipe")]
     recipe: serde_json::Value,
 }
@@ -4623,8 +4627,8 @@ pub(crate) struct EditBody {
     /// The text as the page shows it (whitespace is collapsed for the match).
     old: String,
     /// The text the page is to show instead: written as sent, except that
-    /// in a markup file what would read as markup is written as text
-    /// ([`crate::client_edit::as_source`]).
+    /// in a markup file what would read as markup is written as text,
+    /// escaped.
     new: String,
 }
 
