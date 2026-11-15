@@ -3,7 +3,7 @@
   "info": {
     "title": "darkmux client API",
     "version": "<darkmux version>",
-    "description": "`darkmux client serve`: 127.0.0.1 only, for apps on this machine. Every route but the pairing ones takes the token a pairing delivered. An app gates a feature on `GET /client/whoami`'s `capabilities`, never on `version`."
+    "description": "`darkmux client serve`: listens on 127.0.0.1 only. With `clients.remote` set to `tailscale`, it is also reached through this machine's `tailscale serve` entry, where a request is answered only with a paired device's token and the tailnet login that device paired as. Every route but the pairing ones takes the token a pairing delivered. An app gates a feature on `GET /client/whoami`'s `capabilities`, never on `version`."
   },
   "security": [
     {
