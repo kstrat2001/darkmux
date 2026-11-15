@@ -105,7 +105,8 @@ pub(crate) fn remote_check(
     };
     let from = tier(source, "DARKMUX_CLIENTS_REMOTE");
     if value == ClientsRemote::Off {
-        return off_check(&from, &recs);
+        let current = || darkmux_fleet::overlay::current_name(&darkmux_fleet::overlay::tool_path(), darkmux_fleet::overlay::CALL_TIMEOUT);
+        return off_check(&from, &recs, &current);
     }
     let seen = look(&recs);
     if let Some(u) = seen.net.unusable() {
@@ -119,9 +120,15 @@ fn remote_row(status: Status, message: String, hint: Option<String>) -> Check {
     Check { name: REMOTE_CHECK_NAME.into(), status, message, hint }
 }
 
-/// The row with `clients.remote` off: Pass, or a Warn for each entry a
-/// record says an earlier `client serve` left (read from the file only).
-fn off_check(from: &str, recs: &[darkmux_fleet::overlay::PublishedRecord]) -> Check {
+/// The row with `clients.remote` off: Pass with no record (no tool runs),
+/// else a Warn for the entry a record says an earlier `client serve` left,
+/// rename-aware: `current` (one read-only `status --json`) is asked only
+/// when there is a record.
+pub(crate) fn off_check(
+    from: &str,
+    recs: &[darkmux_fleet::overlay::PublishedRecord],
+    current: &dyn Fn() -> Result<String, String>,
+) -> Check {
     let Some(rec) = recs.first() else {
         return remote_row(
             Status::Pass,
@@ -129,13 +136,26 @@ fn off_check(from: &str, recs: &[darkmux_fleet::overlay::PublishedRecord]) -> Ch
             None,
         );
     };
-    let message = format!(
-        "off ({from}): a record says an earlier `client serve` published {} on the tailnet; the next `client serve` \
-         removes it if the tailnet still shows it exactly so (off never publishes, and runs `tailscale` only to remove \
-         an entry its own record proves it left)",
-        recs.iter().map(|r| r.entry.url()).collect::<Vec<_>>().join(", ")
-    );
-    remote_row(Status::Warn, message, Some(format!("`{}` removes it now", rec.entry.remove_command())))
+    let url = rec.entry.url();
+    let (message, hint) = match current() {
+        Ok(name) if name != rec.entry.host => (darkmux_fleet::overlay::renamed_reason(&rec.entry, &name), None),
+        Ok(_) => (
+            format!(
+                "a record says an earlier `client serve` published {url}; the next `client serve` removes it, if the \
+                 tailnet still shows it as published (off never publishes, and runs `tailscale` only to remove an entry \
+                 its own record proves it left)"
+            ),
+            Some(format!("`{}` removes it now", rec.entry.remove_command())),
+        ),
+        Err(why) => (
+            format!(
+                "a record says an earlier `client serve` published {url}, and darkmux could not read this machine's \
+                 tailnet name ({why}), so nothing removes it until it can"
+            ),
+            None,
+        ),
+    };
+    remote_row(Status::Warn, format!("off ({from}): {message}"), hint)
 }
 
 /// The remote row once the network can carry the entry.
@@ -310,13 +330,26 @@ mod tests {
         let never = |_: &[PublishedRecord]| -> RemoteLook { panic!("off must not look at the tailnet") };
         let entry = ServeEntry::for_port("laptop.example.ts.net", 8767);
         let rec = vec![PublishedRecord { entry: entry.clone(), pid: 1 }];
-        let off = remote_check(Ok((ClientsRemote::Off, Source::BuiltIn)), Vec::new(), never);
+        let no_name = || -> Result<String, String> { panic!("off with no record must not run the tool") };
+        let named = |n: &'static str| move || -> Result<String, String> { Ok(n.to_string()) };
+        let off_on = |recs: Vec<PublishedRecord>, name: &dyn Fn() -> Result<String, String>| off_check("default", &recs, name);
+        let off = off_on(Vec::new(), &no_name);
         assert_eq!((off.name.as_str(), off.status), (REMOTE_CHECK_NAME, Status::Pass));
         assert!(off.message.starts_with("off (default)") && off.message.contains("this machine only"), "{off:?}");
-        let left = remote_check(Ok((ClientsRemote::Off, Source::BuiltIn)), rec.clone(), never);
+        assert_eq!(remote_check(Ok((ClientsRemote::Off, Source::BuiltIn)), Vec::new(), never).status, Status::Pass);
+        let left = off_on(rec.clone(), &named("laptop.example.ts.net"));
         assert_eq!(left.status, Status::Warn, "{left:?}");
         assert!(left.message.contains("https://laptop.example.ts.net:8767/") && left.message.contains("next `client serve` removes"), "{left:?}");
         assert!(left.hint.as_deref().is_some_and(|h| h.contains("tailscale serve --https=8767 --set-path=/ off")), "{left:?}");
+        // (#3560 re-review) Under an old name: the renamed remedy, never the
+        // removal that cannot work.
+        let renamed_off = off_on(rec.clone(), &named("box.example.ts.net"));
+        assert_eq!(renamed_off.status, Status::Warn, "{renamed_off:?}");
+        assert!(renamed_off.message.contains("renamed") && renamed_off.message.contains("tailscale serve reset"), "{renamed_off:?}");
+        assert!(!renamed_off.message.contains("next `client serve` removes"), "{renamed_off:?}");
+        assert_eq!(renamed_off.hint, None, "{renamed_off:?}");
+        let unread = off_on(rec.clone(), &|| Err("tailscaled is down".to_string()));
+        assert!(unread.message.contains("could not read this machine's tailnet name") && unread.message.contains("tailscaled is down"), "{unread:?}");
 
         let on = Ok((ClientsRemote::Tailscale, Source::Config));
         let look = |published: Vec<(ServeEntry, Shown)>| move |_: &[PublishedRecord]| RemoteLook { net: net_ready(), published };

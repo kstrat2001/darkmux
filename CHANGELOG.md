@@ -37,8 +37,8 @@ darkmux release.
   an entry a killed `client serve` left is removed by the next start on that port. darkmux changes
   only an entry it recorded publishing (`~/.darkmux/client-remote/<port>.json`) that the tailnet still
   shows exactly as published, never the operator's other serve entries. With `off`, `client serve`
-  never publishes, and runs `tailscale` only to remove an entry its own record proves it left (one
-  status read, then at most one removal); with no record it runs none. (`darkmux doctor`, viewer
+  never publishes, and runs `tailscale` only to remove an entry its own record proves it left (two
+  read-only status reads, then at most one removal); with no record it runs none. (`darkmux doctor`, viewer
   links in fleet mode and the fleet identity provider run `tailscale` whatever the setting says.) An
   entry left from before the machine was renamed cannot be removed by `tailscale serve`, which works
   only under the current name, so it is reported with the remedies, never retried. It needs

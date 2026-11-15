@@ -128,10 +128,41 @@ fn off_removes_only_the_entry_its_record_proves_it_left() {
     let s = start(ClientsRemote::Off, PORT, &f.rig());
     assert_eq!(s.wire, ClientRemote::off());
     assert_eq!(s.owned, None);
-    assert_eq!(f.calls(), ["serve status --json", "serve --https=8767 --set-path=/ off"]);
+    assert_eq!(f.calls(), ["status --json", "serve status --json", "serve --https=8767 --set-path=/ off"]);
     assert_eq!(f.serve(), operator(), "only darkmux's entry went");
     assert_eq!(f.record(), None);
-    assert!(s.log.iter().any(|l| l.contains("removed the tailnet entry") && l.contains("clients.remote is off")), "{:?}", s.log);
+    assert!(s.log.iter().any(|l| l.contains("removed the tailnet entry a stopped client serve left")), "{:?}", s.log);
+}
+
+/// (#3560 re-review) Off with a record under the machine's old name: the
+/// current name is read first (`status --json`), no removal is attempted
+/// (it cannot work), the renamed remedy is logged, and the record kept.
+#[test]
+fn off_with_a_record_under_an_old_name_reports_it_and_removes_nothing() {
+    let old = ServeEntry::for_port("mini.example.ts.net", PORT);
+    let left = with(
+        serde_json::json!({ "8767": { "HTTPS": true } }),
+        serde_json::json!({ "mini.example.ts.net:8767": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:8767" } } } }),
+    );
+    let f = Fake::new(RUNNING, &left);
+    f.plant_record(old.clone());
+    let s = start(ClientsRemote::Off, PORT, &f.rig());
+    assert_eq!(s.wire, ClientRemote::off());
+    assert_eq!(f.calls(), ["status --json", "serve status --json"], "read-only: {:?}", s.log);
+    assert!(s.log.iter().any(|l| l.contains("renamed") && l.contains("tailscale serve reset")), "{:?}", s.log);
+    assert_eq!(f.record().map(|r| r.entry), Some(old));
+}
+
+/// (#3560 re-review) Off with a record and a machine name that cannot be
+/// read: nothing removed, the record kept, and why said.
+#[test]
+fn off_with_a_record_and_no_readable_name_removes_nothing() {
+    let f = Fake::new("not json", &with_ours());
+    f.plant_record(ours());
+    let s = start(ClientsRemote::Off, PORT, &f.rig());
+    assert!(f.changes().is_empty(), "{:?}", f.calls());
+    assert!(f.record().is_some());
+    assert!(s.log.iter().any(|l| l.contains("could not read this machine's tailnet name")), "{:?}", s.log);
 }
 
 /// (#3560 review) Off with a record whose entry the operator has since
@@ -146,7 +177,7 @@ fn off_leaves_an_entry_that_changed_since_its_record() {
     let f = Fake::new(RUNNING, &changed);
     f.plant_record(ours());
     let s = start(ClientsRemote::Off, PORT, &f.rig());
-    assert_eq!(f.calls(), ["serve status --json"], "{:?}", s.log);
+    assert_eq!(f.calls(), ["status --json", "serve status --json"], "{:?}", s.log);
     assert_eq!(f.record(), None);
 }
 

@@ -260,6 +260,22 @@ pub fn read_status_into(net: &mut LocalNetwork, raw: &[u8]) {
     };
 }
 
+/// (#3560 re-review) This machine's current DNS name on the network, from
+/// one read-only `status --json` call: what `serve ... off` acts on.
+pub fn current_name(bin: &str, timeout: Duration) -> Result<String, String> {
+    let (ok, out, err) = run_bounded(bin, &["status", "--json"], timeout).map_err(|e| format!("{e:#}"))?;
+    if !ok {
+        return Err(format!("`{TOOL} status` failed: {}", first_line(&err)));
+    }
+    let mut net = LocalNetwork { installed: true, ..Default::default() };
+    read_status_into(&mut net, &out);
+    match (net.status_error, net.dns_name) {
+        (Some(e), _) => Err(e),
+        (None, Some(name)) => Ok(name),
+        (None, None) => Err("this machine has no MagicDNS name".to_string()),
+    }
+}
+
 // ─── The one serve entry darkmux publishes ───────────────────────────────
 
 /// The serve entry darkmux publishes for `client serve`: HTTPS on `port` of

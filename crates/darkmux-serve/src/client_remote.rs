@@ -30,9 +30,9 @@
 //!
 //! **Off never publishes, and runs the tool only to remove an entry its own
 //! record proves it left.** With `clients.remote` off and no record, nothing
-//! here runs the tool. With a record, one `serve status` read, and one
-//! removal only when the tailnet shows that entry exactly; then the record
-//! goes. (This is `client serve` alone: `darkmux doctor`, viewer links in
+//! here runs the tool. With a record, a read of the machine's current name
+//! and one of `serve status`, and one removal only when the tailnet shows
+//! that entry exactly under that name; then the record goes. (This is `client serve` alone: `darkmux doctor`, viewer links in
 //! fleet mode and the fleet identity provider run the tool on their own.)
 //!
 //! **Removal names its mount** (`--set-path=/`, [`ServeEntry::remove_args`]):
@@ -99,25 +99,41 @@ pub fn start(remote: ClientsRemote, port: u16, rig: &Rig) -> Started {
     }
 }
 
-/// Off: never publishes. A record left from an earlier run gets one status
-/// read and, when the tailnet shows its entry exactly, one removal
-/// ([`reap`]). No record, no tool call.
+/// Off: never publishes. A record left from an earlier run gets one read of
+/// this machine's current name and one `serve status` read and, when the
+/// tailnet shows its entry exactly under that name, one removal ([`reap`]);
+/// an entry under an earlier name is reported, never removed. No record, no
+/// tool call.
 fn start_off(port: u16, rig: &Rig) -> Started {
-    let mut log = Vec::new();
-    if let Some(rec) = overlay::read_record(&rig.record(port)) {
-        match overlay::serve_status(&rig.bin, rig.timeout) {
-            Ok(status) => {
-                reap(&rec, &status, None, rig, &mut log);
-            }
-            Err(e) => log.push(format!(
-                "{LOG} clients.remote is off; could not read the tailnet's serve entries ({e:#}) to remove the one an \
-                 earlier client serve left ({}); `{}` removes it",
-                rec.entry.url(),
-                rec.entry.remove_command()
-            )),
-        }
-    }
+    let log = match overlay::read_record(&rig.record(port)) {
+        Some(rec) => reap_while_off(&rec, rig),
+        None => Vec::new(),
+    };
     Started { wire: ClientRemote::off(), owned: None, log }
+}
+
+/// [`start_off`]'s reap: nothing is removed unless both reads answer.
+fn reap_while_off(rec: &PublishedRecord, rig: &Rig) -> Vec<String> {
+    let cannot = |what: &str, e: String| {
+        vec![format!(
+            "{LOG} clients.remote is off; could not read {what} ({e}), so the tailnet entry an earlier client serve left \
+             ({}) stays, with its record, for the next start",
+            rec.entry.url()
+        )]
+    };
+    let current = match overlay::current_name(&rig.bin, rig.timeout) {
+        Ok(name) => name,
+        Err(e) => return cannot("this machine's tailnet name", e),
+    };
+    let status = match overlay::serve_status(&rig.bin, rig.timeout) {
+        Ok(s) => s,
+        Err(e) => return cannot("the tailnet's serve entries", format!("{e:#}")),
+    };
+    let mut log = Vec::new();
+    if let Reaped::Blocked(reason) = reap(rec, &status, &current, rig, &mut log) {
+        log.push(format!("{LOG} clients.remote is off, and {reason}"));
+    }
+    log
 }
 
 /// Not published: `reason` (which names the fix) for `whoami` and the log.
@@ -168,7 +184,7 @@ fn start_tailnet(port: u16, rig: &Rig) -> Started {
 fn serve_status_after_reap(port: u16, host: &str, rig: &Rig, log: &mut Vec<String>) -> Result<Vec<u8>, String> {
     let status = overlay::serve_status(&rig.bin, rig.timeout).map_err(|e| format!("{e:#}"))?;
     let Some(rec) = overlay::read_record(&rig.record(port)) else { return Ok(status) };
-    match reap(&rec, &status, Some(host), rig, log) {
+    match reap(&rec, &status, host, rig, log) {
         Reaped::Blocked(reason) => Err(reason),
         Reaped::Removed => overlay::serve_status(&rig.bin, rig.timeout).map_err(|e| format!("{e:#}")),
         Reaped::Untouched => Ok(status),
@@ -190,17 +206,15 @@ enum Reaped {
 /// against `status`: removed when the tailnet shows it exactly (the record
 /// then goes), left when it changed or is gone (the record goes too), and
 /// kept, with its record, when it cannot be read, the removal fails, or it
-/// is under a name other than `current` (when that is known).
-fn reap(rec: &PublishedRecord, status: &[u8], current: Option<&str>, rig: &Rig, log: &mut Vec<String>) -> Reaped {
+/// is under a name other than `current`, this machine's name now.
+fn reap(rec: &PublishedRecord, status: &[u8], current: &str, rig: &Rig, log: &mut Vec<String>) -> Reaped {
     let path = rig.record(rec.entry.port);
     let url = rec.entry.url();
     match overlay::at_port(status, &rec.entry) {
-        Ok(AtPort::Exactly) if current.is_some_and(|h| h != rec.entry.host) => {
-            Reaped::Blocked(overlay::renamed_reason(&rec.entry, current.unwrap_or_default()))
-        }
+        Ok(AtPort::Exactly) if current != rec.entry.host => Reaped::Blocked(overlay::renamed_reason(&rec.entry, current)),
         Ok(AtPort::Exactly) => match overlay::remove(&rig.bin, &rec.entry, rig.timeout) {
             Ok(()) => {
-                log.push(format!("{LOG} removed the tailnet entry a stopped client serve left ({url}){}", off_note(current)));
+                log.push(format!("{LOG} removed the tailnet entry a stopped client serve left ({url})"));
                 let _ = std::fs::remove_file(&path);
                 Reaped::Removed
             }
@@ -225,14 +239,6 @@ fn reap(rec: &PublishedRecord, status: &[u8], current: Option<&str>, rig: &Rig, 
             log.push(format!("{LOG} could not read the tailnet's serve entries ({e:#}); `{}` removes ({url})", rec.entry.remove_command()));
             Reaped::Untouched
         }
-    }
-}
-
-/// The note a removal made with `clients.remote` off carries.
-fn off_note(current: Option<&str>) -> &'static str {
-    match current {
-        None => " (clients.remote is off: darkmux runs the tool only to remove an entry its own record proves it left)",
-        Some(_) => "",
     }
 }
 
