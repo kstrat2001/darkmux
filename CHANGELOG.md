@@ -91,7 +91,9 @@ darkmux release.
   requests waiting and its third is refused, never replacing one; remote requests have their own cap,
   half the queue, so they never crowd out an app on the Mac; and a remote request expires after ten
   minutes like any. A device's token is still a bearer token: from a program on the Mac it is answered
-  as local. Pairing again over the tailnet makes a new client; `darkmux client
+  as local. A login that is not ASCII works (Tailscale's Q-encoded header is decoded); an
+  address no tailnet device holds is refused before any `whois`; tailnet devices hold at most two of
+  the four pairing dialogs. Pairing again over the tailnet makes a new client; `darkmux client
   revoke` stops a device on the Mac and remotely at once. `darkmux client list` says which clients
   paired over the tailnet, and as whom. The capability list gains `remote_requests`. `clients.json`
   stays 1.3: its `tailnet` gains `device` (`{"id", "name", "host_name"?}`, required), and a pending

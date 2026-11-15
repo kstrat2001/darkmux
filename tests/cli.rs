@@ -15923,7 +15923,7 @@ fn fake_tailnet_tool(dir: &std::path::Path, home: &std::path::Path, port: u16) -
     fs::write(dir.join("serve.json"), FAKE_TAILNET_OPERATOR).unwrap();
     fs::write(
         dir.join("status.json"),
-        r#"{"BackendState":"Running","Self":{"ID":"nSTUDIO","DNSName":"studio.example.ts.net.","UserID":1},"User":{"1":{"LoginName":"sam@example.com"}},"CertDomains":["studio.example.ts.net"]}"#,
+        r#"{"BackendState":"Running","Self":{"ID":"nSTUDIO","DNSName":"studio.example.ts.net.","UserID":1},"User":{"1":{"LoginName":"sam@example.com"}},"Peer":{"nodekey:phone":{"ID":"nPHONE1CNTRL","DNSName":"peer.example.ts.net.","TailscaleIPs":["100.64.1.2"],"UserID":1}},"CertDomains":["studio.example.ts.net"]}"#,
     )
     .unwrap();
     let record = home.join("client-remote").join(format!("{port}.json"));

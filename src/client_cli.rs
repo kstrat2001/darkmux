@@ -151,7 +151,8 @@ fn describe(p: &PendingRequest, now: u64) -> String {
         .map(|t| {
             let safe = darkmux_platform::display_safe;
             format!(
-                "\n  tailnet: {}\n  approve only if {} itself shows code {} (a program on this Mac can name any device)",
+                "\n  tailnet: {}\n  approve only if {} itself shows code {} (a program on this Mac can name any device). \
+                 If you are not pairing a device now, Deny.",
                 darkmux_serve::client_tailnet::described(t),
                 safe(&t.device.name),
                 safe(&p.code)
@@ -489,6 +490,7 @@ mod tests {
         assert!(shown.contains("  device: phone 0\n"), "{shown}");
         assert!(shown.contains("  tailnet: tailnet user sam@example.com, device sams-iphone (Sam's iPhone)"), "{shown}");
         assert!(shown.contains("  approve only if sams-iphone itself shows code AAA"), "(#3560 review) {shown}");
+        assert!(shown.contains("If you are not pairing a device now, Deny."), "{shown}");
         assert!(!shown.contains("nPHONE1CNTRL"), "{shown}");
         assert!(!describe(&pending[1], 200).contains("tailnet"), "a request from this Mac has no tailnet line");
         let name = cp::approve(&store, &ids[0], 200).unwrap();

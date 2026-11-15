@@ -67,6 +67,10 @@ pub const DIALOG_TIMEOUT_SECS: u64 = 120;
 /// Dialogs open at once on this machine, whoever asked.
 pub const MAX_OPEN_DIALOGS: usize = 4;
 
+/// (#3560) Of those, the most tailnet devices may hold between them, so the
+/// apps on this Mac always keep the rest.
+pub const MAX_REMOTE_DIALOGS: usize = 2;
+
 /// `clients.pairing.*` as it reads now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingPolicy {
@@ -163,8 +167,8 @@ pub fn tailnet_dialog_message(code: &str, identity: &crate::client_tailnet::Tail
     let safe = darkmux_platform::display_safe;
     format!(
         "A device on your tailnet wants to use darkmux on this computer.\n\nThe request names {}. A program on this \
-         computer can send a request naming any device, so Allow only if {} shows code {}.\nAllow pairs it now; the \
-         next device asks again.",
+         computer can send a request naming any device, so Allow only if {} shows code {}. If you are not pairing a \
+         device now, Deny.\nAllow pairs it now; the next device asks again.",
         crate::client_tailnet::described(identity),
         safe(&identity.device.name),
         safe(code)
@@ -193,8 +197,10 @@ impl DialogSlots {
     pub fn take(self: &Arc<Self>, from: Option<Requester>) -> Option<DialogSlot> {
         let mut open = self.0.lock().unwrap();
         let total: usize = open.values().sum();
+        let remote: usize = open.iter().filter(|(k, _)| matches!(k, Some(Requester::Device(_)))).map(|(_, n)| n).sum();
+        let full_remote = matches!(from, Some(Requester::Device(_))) && remote >= MAX_REMOTE_DIALOGS;
         let mine = open.entry(from.clone()).or_default();
-        if *mine >= PAIR_REQUESTS_PER_PROCESS || total >= MAX_OPEN_DIALOGS {
+        if *mine >= PAIR_REQUESTS_PER_PROCESS || total >= MAX_OPEN_DIALOGS || full_remote {
             return None;
         }
         *mine += 1;

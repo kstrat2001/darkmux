@@ -236,6 +236,61 @@ fn the_identity_must_be_the_recorded_one_exactly() {
     );
 }
 
+/// (#3560 review) A login that is not ASCII arrives as Tailscale's Go code
+/// writes it, `mime.QEncoding.Encode` (`=?utf-8?q?...?=`, `_` for a space,
+/// `=XX` for any other byte, words split by single spaces), and reads as the
+/// login itself; an ASCII one is the login as sent. Anything malformed names
+/// no one.
+#[test]
+fn a_login_header_reads_as_the_login_it_names() {
+    for (header, login) in [
+        ("sam@example.com", "sam@example.com"),
+        ("=?utf-8?q?j=C3=B6rg@example.com?=", "jörg@example.com"),
+        ("=?UTF-8?Q?j=C3=B6rg?=", "jörg"),
+        ("=?utf-8?q?a_b=C3=A9?= =?utf-8?q?=E6=97=A5@example.com?=", "a bé日@example.com"),
+    ] {
+        assert_eq!(decoded_login(header).as_deref(), Some(login), "{header}");
+    }
+    for bad in [
+        "=?utf-8?q?bad=ZZ?=",
+        "=?utf-8?q?bad=+1?=",
+        "=?utf-8?q?cut=C?=",
+        "=?utf-8?q?=FF=FE?=",
+        "=?iso-8859-1?q?j=F6rg?=",
+        "=?utf-8?b?am9yZw==?=",
+        "=?iso-8859-1?q?jorg?=",
+        "=?utf-8?b?jorg?=",
+        "=?utf-8?q?unclosed",
+        "=?utf-8?q??=",
+        "=?utf-8?q?a?=  =?utf-8?q?b?=",
+    ] {
+        assert_eq!(decoded_login(bad), None, "{bad}");
+    }
+}
+
+/// The login is decoded once, as the request arrives: everything after it
+/// compares the login itself.
+#[test]
+fn a_request_arrives_with_its_login_decoded() {
+    let mut h = forwarded();
+    h.insert(LOGIN, "=?utf-8?q?j=C3=B6rg@example.com?=".parse().unwrap());
+    assert_eq!(arrival(loopback(), &h, BOUND, Some(&entry())), Arrival::Tailnet { login: Some("jörg@example.com".into()), from: PHONE });
+    h.insert(LOGIN, "=?utf-8?q?bad=ZZ?=".parse().unwrap());
+    assert_eq!(arrival(loopback(), &h, BOUND, Some(&entry())), Arrival::Tailnet { login: None, from: PHONE }, "malformed is missing");
+}
+
+/// The status is kept for its time to live, and not past it.
+#[test]
+fn the_status_is_kept_for_its_time_to_live() {
+    let cache = StatusCache::new(std::time::Duration::from_secs(10));
+    let t0 = std::time::Instant::now();
+    assert_eq!(cache.get(t0), None);
+    let status = TailnetStatus { own_login: Some(SAM.into()), peers: vec![PHONE] };
+    cache.put(status.clone(), t0);
+    assert_eq!(cache.get(t0 + std::time::Duration::from_secs(9)), Some(status));
+    assert_eq!(cache.get(t0 + std::time::Duration::from_secs(10)), None);
+}
+
 /// A pairing route through the entry needs a tailnet user to record; with
 /// none (a tagged device) it is refused, naming the fix.
 #[test]

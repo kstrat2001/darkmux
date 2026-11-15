@@ -1163,10 +1163,11 @@ pub struct ClientServerState {
     pub device_at: crate::client_tailnet::DeviceLookup,
     /// (#3560) Recent [`Self::device_at`] answers that named a device.
     pub(crate) device_cache: Arc<crate::fleet_listener::IdentityCache>,
-    /// (#3560) The tailnet user this Mac is logged in as (`tailscale status`).
-    pub own_login: crate::client_tailnet::OwnLogin,
-    /// (#3560) Its last answer that named one.
-    pub(crate) own_login_cache: Arc<crate::client_tailnet::OwnLoginCache>,
+    /// (#3560) This Mac's tailnet as `tailscale status` says it: its own user
+    /// and every device address.
+    pub tailnet_status: crate::client_tailnet::StatusLookup,
+    /// (#3560) Its last answer.
+    pub(crate) status_cache: Arc<crate::client_tailnet::StatusCache>,
     /// (#3560) One Tailscale call at a time, however many requests ask.
     pub(crate) tailnet_calls: Arc<tokio::sync::Semaphore>,
 }
@@ -1259,8 +1260,8 @@ impl ClientServerState {
             tailnet_entry: None,
             device_at: Arc::new(device_at_here),
             device_cache: Arc::new(crate::fleet_listener::IdentityCache::new()),
-            own_login: Arc::new(own_login_here),
-            own_login_cache: Arc::new(crate::client_tailnet::OwnLoginCache::default()),
+            tailnet_status: Arc::new(tailnet_status_here),
+            status_cache: Arc::new(crate::client_tailnet::StatusCache::new(crate::fleet_listener::IdentityCache::TTL)),
             tailnet_calls: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
@@ -1274,12 +1275,16 @@ fn device_at_here(ip: std::net::IpAddr) -> Result<Option<darkmux_fleet::NodeIden
         .map_err(|e| format!("{e:#}"))
 }
 
-/// (#3560) The tailnet user this Mac is logged in as (`status --json` Self).
-fn own_login_here() -> Result<Option<String>, String> {
-    darkmux_fleet::provider_for("tailscale", None)
-        .and_then(|p| p.local_node())
-        .map(|n| n.login)
-        .map_err(|e| format!("{e:#}"))
+/// (#3560) This Mac's tailnet from `status --json`: Self's user, and every
+/// node's addresses.
+fn tailnet_status_here() -> Result<crate::client_tailnet::TailnetStatus, String> {
+    let nodes = darkmux_fleet::provider_for("tailscale", None)
+        .and_then(|p| p.nodes())
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(crate::client_tailnet::TailnetStatus {
+        own_login: nodes.first().and_then(|me| me.login.clone()),
+        peers: nodes.iter().flat_map(|n| n.addresses.iter().copied()).collect(),
+    })
 }
 
 /// Whether `role` is defined in this machine's role library.
@@ -2088,8 +2093,19 @@ async fn device_checked(state: &ClientServerState, gate: Gate) -> Result<Option<
     }
 }
 
-/// (#3560) `whois` of `from`, through the cache and one call at a time.
+/// (#3560) This Mac's tailnet status, through its cache and one call at a time.
+async fn status(state: &ClientServerState) -> Result<crate::client_tailnet::TailnetStatus, String> {
+    crate::client_tailnet::tailnet_status(&state.tailnet_status, &state.status_cache, &state.tailnet_calls).await
+}
+
+/// (#3560) `whois` of `from`, through the cache and one call at a time,
+/// and only for an address a device on the tailnet holds as the cached
+/// status lists them: a made-up address is no device (`Ok(None)`) and
+/// costs no call, and a status that cannot be read refuses (`Err`).
 async fn whois(state: &ClientServerState, from: std::net::IpAddr) -> Result<Option<darkmux_fleet::NodeIdentity>, String> {
+    if !status(state).await?.peers.contains(&from) {
+        return Ok(None);
+    }
     crate::client_tailnet::device_at(&state.device_at, &state.device_cache, &state.tailnet_calls, from).await
 }
 
@@ -2307,7 +2323,7 @@ async fn remote_pair(state: &ClientServerState, req: PairBody, f: &Forwarded, no
         Ok(false) => return queue_full(),
         Err(e) => return internal(e),
     }
-    let own = crate::client_tailnet::own_login(&state.own_login, &state.own_login_cache, &state.tailnet_calls).await;
+    let own = status(state).await.map(|s| s.own_login);
     if let Some((status, code, why)) = crate::client_tailnet::owner_refusal(&f.login, &own) {
         return err(status, code, why);
     }

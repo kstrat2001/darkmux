@@ -60,9 +60,9 @@ use std::net::{IpAddr, SocketAddr};
 /// and on the pairing request it came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TailnetIdentity {
-    /// The `Tailscale-User-Login` value exactly as Tailscale sent it at
-    /// pairing (the user's login name; RFC 2047 Q-encoded when it is not
-    /// ASCII), compared byte for byte.
+    /// The tailnet user's login name, as `whois` and `status` give it
+    /// (`Tailscale-User-Login` decoded once, as the request arrives: Tailscale
+    /// Q-encodes one that is not ASCII), compared byte for byte.
     pub login: String,
     /// The device the pairing came from, as Tailscale's `whois` named the
     /// forwarded address then.
@@ -134,9 +134,7 @@ pub(crate) fn arrival(
     let loopback = peer.is_some_and(|p| p.ip().to_canonical().is_loopback());
     match (entry, forwarded_for(headers)) {
         (Some(entry), Some(from)) if loopback && forwarded_by(headers, entry) => Arrival::Tailnet {
-            login: one(headers, LOGIN)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string),
+            login: one(headers, LOGIN).filter(|l| !l.is_empty()).and_then(decoded_login),
             from,
         },
         _ => Arrival::Foreign,
@@ -336,46 +334,107 @@ pub(crate) fn owner_refusal(login: &str, own: &Result<Option<String>, String>) -
     }
 }
 
-/// This Mac's own tailnet login, from `cache` or from `lookup` (one
-/// Tailscale call at a time, `calls`; off the async workers). Only an answer
-/// that named a user is kept.
-pub(crate) async fn own_login(
-    lookup: &OwnLogin,
-    cache: &OwnLoginCache,
+/// (#3560) What `tailscale status --json` says about this Mac's tailnet:
+/// the user this Mac is logged in as, and every address a device on the
+/// tailnet holds (this Mac's own among them).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TailnetStatus {
+    pub own_login: Option<String>,
+    pub peers: Vec<IpAddr>,
+}
+
+/// [`TailnetStatus`] as Tailscale says it now; `Err` when it cannot.
+pub type StatusLookup = std::sync::Arc<dyn Fn() -> Result<TailnetStatus, String> + Send + Sync>;
+
+/// The last [`TailnetStatus`] Tailscale gave, kept for `ttl`.
+pub struct StatusCache {
+    ttl: std::time::Duration,
+    slot: std::sync::Mutex<Option<(std::time::Instant, TailnetStatus)>>,
+}
+
+impl StatusCache {
+    /// Kept for `ttl` ([`crate::fleet_listener::IdentityCache::TTL`] in
+    /// production).
+    pub fn new(ttl: std::time::Duration) -> Self {
+        Self { ttl, slot: std::sync::Mutex::new(None) }
+    }
+    pub(crate) fn get(&self, now: std::time::Instant) -> Option<TailnetStatus> {
+        let slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        slot.as_ref().filter(|(at, _)| now.duration_since(*at) < self.ttl).map(|(_, s)| s.clone())
+    }
+    pub(crate) fn put(&self, status: TailnetStatus, now: std::time::Instant) {
+        *self.slot.lock().unwrap_or_else(|p| p.into_inner()) = Some((now, status));
+    }
+}
+
+/// This Mac's [`TailnetStatus`], from `cache` or from `lookup` (one
+/// Tailscale call at a time, `calls`; off the async workers). Only an
+/// answer is kept, never a failure.
+pub(crate) async fn tailnet_status(
+    lookup: &StatusLookup,
+    cache: &StatusCache,
     calls: &tokio::sync::Semaphore,
-) -> Result<Option<String>, String> {
-    if let Some(login) = cache.get(std::time::Instant::now()) {
-        return Ok(Some(login));
+) -> Result<TailnetStatus, String> {
+    if let Some(status) = cache.get(std::time::Instant::now()) {
+        return Ok(status);
     }
     let _turn = calls.acquire().await.map_err(|e| e.to_string())?;
     let ask = lookup.clone();
     let answer = tokio::task::spawn_blocking(move || ask()).await.unwrap_or_else(|e| Err(e.to_string()));
-    if let Ok(Some(login)) = &answer {
-        cache.put(login.clone(), std::time::Instant::now());
+    if let Ok(status) = &answer {
+        cache.put(status.clone(), std::time::Instant::now());
     }
     answer
 }
 
-impl OwnLoginCache {
-    fn get(&self, now: std::time::Instant) -> Option<String> {
-        let slot = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        slot.as_ref()
-            .filter(|(at, _)| now.duration_since(*at) < crate::fleet_listener::IdentityCache::TTL)
-            .map(|(_, l)| l.clone())
+/// A `Tailscale-User-Login` value as the login it names. Tailscale 1.102.4
+/// sends a login that is not ASCII as `mime.QEncoding.Encode` writes it
+/// (RFC 2047 encoded-words, `=?utf-8?q?...?=`, split by single spaces);
+/// `whois` and `status` give the login itself. `None` for a malformed one:
+/// no identity.
+pub(crate) fn decoded_login(header: &str) -> Option<String> {
+    if !header.starts_with("=?") {
+        return Some(header.to_string());
     }
-    fn put(&self, login: String, now: std::time::Instant) {
-        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some((now, login));
+    let mut bytes = Vec::new();
+    for word in header.split(' ') {
+        q_word(word, &mut bytes)?;
     }
+    String::from_utf8(bytes).ok().filter(|login| !login.is_empty())
 }
 
-/// The tailnet user this Mac is logged in as, as Tailscale last said it:
-/// kept for [`crate::fleet_listener::IdentityCache::TTL`], only when it
-/// named one.
-#[derive(Default)]
-pub struct OwnLoginCache(std::sync::Mutex<Option<(std::time::Instant, String)>>);
+/// One `=?utf-8?q?<text>?=` encoded-word's bytes, onto `out`; `None` for
+/// any other shape (another charset, `b` encoding, no text).
+fn q_word(word: &str, out: &mut Vec<u8>) -> Option<()> {
+    let body = word.strip_prefix("=?")?.strip_suffix("?=")?;
+    let (charset, rest) = body.split_once('?')?;
+    let (encoding, text) = rest.split_once('?')?;
+    let utf8_q = charset.eq_ignore_ascii_case("utf-8") && encoding.eq_ignore_ascii_case("q");
+    (utf8_q && !text.is_empty()).then_some(())?;
+    q_text(text.as_bytes(), out)
+}
 
-/// This Mac's own tailnet login (`tailscale status --json` Self).
-pub type OwnLogin = std::sync::Arc<dyn Fn() -> Result<Option<String>, String> + Send + Sync>;
+/// Q-encoded `text` decoded onto `out`: `_` is a space, `=XX` (two hex
+/// digits) the byte XX, anything else itself.
+fn q_text(text: &[u8], out: &mut Vec<u8>) -> Option<()> {
+    let mut i = 0;
+    while i < text.len() {
+        let (byte, used) = match text[i] {
+            b'_' => (b' ', 1),
+            b'=' => (hex_byte(text.get(i + 1..i + 3)?)?, 3),
+            b => (b, 1),
+        };
+        out.push(byte);
+        i += used;
+    }
+    Some(())
+}
+
+/// The byte two hex digits name.
+fn hex_byte(digits: &[u8]) -> Option<u8> {
+    let hex = |d: u8| (d as char).to_digit(16);
+    Some((hex(digits[0])? * 16 + hex(digits[1])?) as u8)
+}
 
 /// Why a poll is refused, when it does not come the way its pairing did.
 #[derive(Debug, Clone, PartialEq, Eq)]

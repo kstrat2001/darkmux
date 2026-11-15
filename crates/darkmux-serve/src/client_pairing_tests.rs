@@ -99,9 +99,11 @@ impl Devices {
             this.at.lock().unwrap().get(&ip).cloned().unwrap_or(Ok(None))
         });
         let this = self.clone();
-        state.own_login = Arc::new(move || {
+        state.tailnet_status = Arc::new(move || {
             this.own_asked.fetch_add(1, Ordering::SeqCst);
-            this.own.lock().unwrap().clone()
+            let own_login = this.own.lock().unwrap().clone()?;
+            // Every address `whois` has an answer for holds a device.
+            Ok(crate::client_tailnet::TailnetStatus { own_login, peers: this.at.lock().unwrap().keys().copied().collect() })
         });
     }
     /// `whois` of each of `addrs` names `node`.
@@ -455,8 +457,9 @@ fn harness() -> Harness {
         tailnet_entry: None,
         device_at: Arc::new(|_| Err("wired below".to_string())),
         device_cache: Arc::new(crate::fleet_listener::IdentityCache::new()),
-        own_login: Arc::new(|| Err("wired below".to_string())),
-        own_login_cache: Arc::new(crate::client_tailnet::OwnLoginCache::default()),
+        tailnet_status: Arc::new(|| Err("wired below".to_string())),
+        // Asked afresh each time here, so a test can place a device at any point.
+        status_cache: Arc::new(crate::client_tailnet::StatusCache::new(std::time::Duration::ZERO)),
         tailnet_calls: Arc::new(tokio::sync::Semaphore::new(1)),
     };
     let trust = TrustSeams::new();
@@ -1157,7 +1160,7 @@ async fn the_dialog_shows_the_tailnet_identity_and_allow_remembers_nothing() {
     h.dialog_answers(darkmux_platform::AllowAnswer::Allow);
     let id = asked_remotely(&h).await;
     let message = dialog_shown(&h, 1).await;
-    for part in ["Allow only if sams-iphone shows code 4F7-K2Q", SAM, "Sam's iPhone", "tailnet"] {
+    for part in ["Allow only if sams-iphone shows code 4F7-K2Q", SAM, "Sam's iPhone", "tailnet", "If you are not pairing a device now, Deny."] {
         assert!(message.contains(part), "{part}: {message}");
     }
     assert!(!message.contains("Mac"), "names no one platform: {message}");
@@ -1369,6 +1372,52 @@ async fn remote_requests_never_evict_and_have_their_own_cap() {
     }
 }
 
+/// (#3560 review) A login that is not ASCII pairs and is answered: Tailscale
+/// sends it Q-encoded in the header, `whois` and `status` give it as it is,
+/// and the identity recorded is the login itself.
+#[tokio::test]
+async fn a_login_that_is_not_ascii_pairs_and_is_answered() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    let jorg = "jörg@example.com";
+    *h.devices.own.lock().unwrap() = Ok(Some(jorg.into()));
+    h.devices.place(&node_of("nJORG1CNTRL", "jorgs-phone", ALEX_V4, jorg), &[ALEX_V4]);
+    let mut headers = from_addr(forwarded(None), ALEX_V4);
+    headers.push(("tailscale-user-login", "=?utf-8?q?j=C3=B6rg@example.com?="));
+    let (status, v) = pair_through(&h, &headers).await;
+    assert_eq!(status, 202, "{v}");
+    let id = v["request_id"].as_str().unwrap().to_string();
+    assert_eq!(pending_record(&h, &id).tailnet.unwrap().login, jorg, "the login itself is recorded");
+    approve(&h.store, &id, (h.state.now)()).unwrap();
+    let (status, v) = poll_through(&h, &id, &headers).await;
+    assert_eq!(status, 200, "{v}");
+    let auth = bearer(v["token"].as_str().unwrap());
+    let (status, v) = call(&h, get("/client/whoami", &with_token(&headers, Some(&auth)))).await;
+    assert_eq!((status, v["via"].as_str()), (200, Some("tailnet")), "{v}");
+}
+
+/// (#3560 review) An address no device on the tailnet holds (one a forger
+/// made up) is refused from the cached status, before `whois` runs, on a
+/// pairing and on a token route; when the status cannot be read, the
+/// request is refused and `whois` does not run either.
+#[tokio::test]
+async fn a_made_up_tailnet_address_costs_no_whois() {
+    let mut h = harness();
+    on_the_tailnet(&mut h);
+    let token = paired_remotely(&h).await;
+    let asked = h.devices.asked();
+    let made_up = from_addr(forwarded(Some(SAM)), "100.64.123.45");
+    let (status, v) = pair_through(&h, &made_up).await;
+    assert_eq!((status, v["code"].as_str()), (403, Some("remote_device_unknown")), "{v}");
+    let (status, v) = call(&h, get("/client/whoami", &with_token(&made_up, Some(&bearer(&token))))).await;
+    assert_eq!((status, v["code"].as_str()), (403, Some("remote_device_unknown")), "{v}");
+    *h.devices.own.lock().unwrap() = Err("tailscaled is not running".into());
+    h.state.device_cache = Arc::new(crate::fleet_listener::IdentityCache::new());
+    let (status, _) = call(&h, get("/client/whoami", &with_token(&forwarded(Some(SAM)), Some(&bearer(&token))))).await;
+    assert_eq!(status, 403, "fail closed");
+    assert_eq!(h.devices.asked(), asked, "no whois for any of them");
+}
+
 /// (#3560 review) A local process can send a pairing request with any
 /// tailnet user in its header and any tailnet address: Tailscale's record of
 /// the device at that address must name that same user, on a pairing and on
@@ -1405,7 +1454,6 @@ async fn only_this_macs_own_tailnet_user_may_pair_remotely() {
     assert!(v["error"].as_str().unwrap().contains(SAM), "{v}");
     assert_eq!((pending_count(&h), h.devices.asked()), (0, 0), "nothing recorded, no whois");
     *h.devices.own.lock().unwrap() = Err("tailscaled is not running".into());
-    h.state.own_login_cache = Arc::new(crate::client_tailnet::OwnLoginCache::default());
     let (status, v) = pair_through(&h, &forwarded(Some(SAM))).await;
     assert_eq!((status, v["code"].as_str()), (503, Some("unavailable")), "{v}");
     assert_eq!(pending_count(&h), 0);
@@ -10965,6 +11013,23 @@ async fn dialogs_never_block_the_listener_and_a_process_raises_at_most_its_bound
 }
 
 /// No more than MAX_OPEN_DIALOGS are open at once, whoever asks.
+/// (#3560 review) Tailnet devices hold at most two dialogs between them,
+/// so the apps on this Mac always keep the rest.
+#[test]
+fn remote_dialogs_never_take_every_slot() {
+    use crate::client_trust::{DialogSlots, MAX_OPEN_DIALOGS, MAX_REMOTE_DIALOGS};
+    let slots = Arc::new(DialogSlots::default());
+    let d = |n: u32| Some(Requester::Device(format!("nDEV{n}")));
+    let remote: Vec<_> = (0..MAX_REMOTE_DIALOGS as u32).map(|n| slots.take(d(n)).unwrap()).collect();
+    assert!(slots.take(d(99)).is_none(), "the remote bound, for another device too");
+    let local: Vec<_> = (0..(MAX_OPEN_DIALOGS - MAX_REMOTE_DIALOGS) as u32)
+        .map(|n| slots.take(Some(Requester::Process(n))).unwrap())
+        .collect();
+    assert_eq!(remote.len() + local.len(), MAX_OPEN_DIALOGS);
+    drop(remote);
+    assert!(slots.take(d(1)).is_some(), "a closed remote dialog gives its place back");
+}
+
 #[test]
 fn open_dialogs_are_bounded_per_process_and_in_all() {
     use crate::client_trust::{DialogSlots, MAX_OPEN_DIALOGS};
