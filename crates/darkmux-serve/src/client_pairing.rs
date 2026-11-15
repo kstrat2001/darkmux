@@ -128,6 +128,7 @@ use serde_json::Value;
 
 use crate::client_git::WorkCopy;
 use crate::client_wire::*;
+use darkmux_types::client_capability::ClientCapability;
 use darkmux_types::client_code::ClientCode;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -2336,6 +2337,8 @@ pub(crate) async fn whoami_handler(State(state): State<ClientServerState>, heade
                 client_name: client.name,
                 scopes: ClientScopes::of(&policy),
                 machine: state.machine.clone(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                capabilities: ClientCapability::ALL.to_vec(),
             })
             .into_response()
         }

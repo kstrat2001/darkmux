@@ -85,6 +85,12 @@ pub struct Whoami {
     pub client_name: String,
     pub scopes: ClientScopes,
     pub machine: ClientMachine,
+    /// (#3494) This darkmux's version, for display and diagnostics. An app
+    /// gates a feature on `capabilities`, never on this.
+    pub version: String,
+    /// (#3494) Every capability this darkmux's client API has, in
+    /// declaration order. None listed (an older darkmux): none of them.
+    pub capabilities: Vec<darkmux_types::client_capability::ClientCapability>,
 }
 
 /// `GET /client/profiles`.
