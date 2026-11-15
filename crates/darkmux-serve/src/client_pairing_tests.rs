@@ -8889,31 +8889,55 @@ async fn every_route_is_open_or_not_as_the_table_declares() {
 /// read. Every body type refuses an unknown key, naming the fields it has,
 /// so a probe key reads the handler's field list, which must be the
 /// declared type's properties, and an empty body is refused exactly where
-/// the body is declared required; a route that declares no body never
-/// answers a body with `bad JSON body`.
+/// the body is declared required. A route that declares no body is probed
+/// on real items (this app's finished run, its workspace with a running
+/// preview, a pending pairing with its secret), so its handler runs past
+/// every lookup (no 404, no 401), and it never answers the body with `bad
+/// JSON body`. This compares field names only: a handler reading a
+/// same-named type whose fields differ in type or optionality passes.
 #[tokio::test]
 async fn every_declared_body_is_the_one_its_handler_reads() {
     let h = harness();
     let token = paired(&h).await;
-    let mut checked = 0;
+    let (mine, name, _ws) = served_workspace(&h, &token).await;
+    recipe(&mine, serde_json::json!({"command": serve(), "env": {"PORT": "{port}"}, "ready": {"http": "/"}}));
+    let run = run_in(&h, &token, &name, "edit-readme").await;
+    let (code, v) = start_preview(&h, &token, &name).await;
+    assert_eq!(code, 202, "{v}");
+    assert_eq!(preview_until(&h, &token, &name, &["ready", "failed"]).await["status"], "ready");
+    let pairing = request_pairing(&h).await;
+    let real = |p: &str| {
+        let p = p.replace(":name", &name).replace(":work_id", &run).replace(":request_id", &pairing);
+        if p == "/client/recipe" { format!("{p}?workspace={name}") } else { p }
+    };
+    let (mut bodies, mut reached) = (0, 0);
     for r in crate::routes::client_table() {
-        let path = r.path.replace(":name", "site").replace(":work_id", "w-0").replace(":request_id", "r-0");
-        let (code, v) = call(&h, raw(r.method, &path, Some(&token), Body::from(r#"{"__probe__":1}"#))).await;
+        let mut req = raw(r.method, &real(r.path), Some(&token), Body::from(r#"{"__probe__":1}"#));
+        req.headers_mut().insert("x-pair-secret", SECRET.parse().unwrap());
+        let (code, v) = call(&h, req).await;
         let at = format!("{} {}: {code} {v}", r.method, r.path);
         let error = v["error"].as_str().unwrap_or_default();
         match r.body {
             Some(body) => {
                 assert_eq!(code, 400, "{at}");
                 assert_eq!(fields_serde_expected(error), declared_properties(body.schema), "{at}");
-                let (_, empty) = call(&h, raw(r.method, &path, Some(&token), Body::empty())).await;
+                // Empty, against no real item: an optional body must not
+                // start or remove anything here.
+                let nowhere = r.path.replace(":name", "nope").replace(":work_id", "w-0");
+                let (_, empty) = call(&h, raw(r.method, &nowhere, Some(&token), Body::empty())).await;
                 let refused = empty["error"].as_str().unwrap_or_default().starts_with("bad JSON body");
                 assert_eq!(refused, body.required, "an empty body is refused only where one is required: {at} / {empty}");
-                checked += 1;
+                bodies += 1;
             }
-            None => assert!(!error.starts_with("bad JSON body"), "reads a body it does not declare: {at}"),
+            None => {
+                assert!(!error.starts_with("bad JSON body"), "reads a body it does not declare: {at}");
+                assert!(code != 404 && code != 401, "never got past its lookups: {at}");
+                reached += 1;
+            }
         }
     }
-    assert_eq!(checked, 8, "every route that declares a body was probed");
+    assert_eq!(bodies, 8, "every route that declares a body was probed");
+    assert_eq!(reached, 14, "every route that declares none was probed past its lookups");
 }
 
 /// (#3494 review) Each property a route's declared query has is a field its
