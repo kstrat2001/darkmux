@@ -7045,6 +7045,10 @@ fn prepare_container_run(
     })
 }
 
+/// The container brain after [`container_brain_route`]: the brain, the route
+/// it was decided on, and the credential for the server it now names.
+type RoutedBrain = (ContainerBrain, crate::engine_dispatch::OwnRoute, Option<(String, String)>);
+
 /// (#3574) The container's hosted brain as the run sends to it, what rec's
 /// own server means for it, and the auth header it sends: decided before the
 /// run's records name the brain, so its route label, its `--chat-url` and
@@ -7064,7 +7068,7 @@ fn prepare_container_run(
 fn container_brain_route(
     opts: &DispatchOpts,
     brain: ContainerBrain,
-) -> Result<(ContainerBrain, crate::engine_dispatch::OwnRoute, Option<(String, String)>)> {
+) -> Result<RoutedBrain> {
     let own = brain.agentic_pm.as_ref().map_or_else(Default::default, |t| crate::engine_dispatch::decide_own(t, &opts.session));
     let agentic_pm = brain.agentic_pm.map(|t| own.routed(&t));
     let theirs = agentic_pm.as_ref().map(|t| remote_auth_header(&t.endpoint)).transpose()?.flatten();
