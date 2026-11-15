@@ -765,7 +765,8 @@ async fn a_paired_device_through_the_tailnet_entry_is_answered_with_the_local_sc
     let req = adding(post("/client/work", Some(&token), work_body(Some("fast"), None)), &forwarded(Some(SAM)));
     let (status, v) = call(&h, req).await;
     assert_eq!(status, 202, "{v}");
-    assert_eq!(h.ran.lock().unwrap().len(), 1, "the work ran");
+    // 202 answers before the runner records the run: wait for it.
+    assert_eq!(ran_reaches(&h, 1).await, 1, "the work ran");
 }
 
 /// The token is the authority: through the entry, no token, an unknown
@@ -8254,6 +8255,21 @@ async fn work_reaches(h: &Harness, id: &str, word: &str) -> bool {
     false
 }
 
+/// How many runs the executor has recorded once it has recorded `n`, or
+/// what it had after five seconds: `POST /client/work` answers 202 before
+/// its runner records the run. The lock is let go before the caller
+/// asserts, so a failed assertion never poisons it for the runner.
+async fn ran_reaches(h: &Harness, n: usize) -> usize {
+    for _ in 0..500 {
+        let got = h.ran.lock().unwrap().len();
+        if got >= n {
+            return got;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    h.ran.lock().unwrap().len()
+}
+
 /// An admission that takes `ms` (its role check reads the disk).
 fn slow_admission(h: &mut Harness, ms: u64) {
     h.state.role_known = Arc::new(move |_role| {
@@ -8287,11 +8303,18 @@ async fn a_disconnect_during_admission_never_leaves_a_run_with_no_runner() {
     std::io::Write::write_all(&mut socket, request.as_bytes()).unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     drop(socket);
-    // Admission ends at 400 ms; the run itself is instant.
-    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-    let ids: Vec<String> = h.state.works.lock().unwrap().keys().cloned().collect();
+    // Admission ends at 400 ms; the run itself is instant. Both are waited
+    // for, bounded, never assumed done after a fixed sleep.
+    let mut ids: Vec<String> = Vec::new();
+    for _ in 0..500 {
+        ids = h.state.works.lock().unwrap().keys().cloned().collect();
+        if !ids.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert_eq!(ids.len(), 1, "the request was admitted");
-    assert_eq!(h.ran.lock().unwrap().len(), 1, "its run has a runner");
+    assert_eq!(ran_reaches(&h, 1).await, 1, "its run has a runner");
     assert!(work_reaches(&h, &ids[0], "done").await, "it stands at {}", work_word(&h, &ids[0]));
     server.abort();
 }

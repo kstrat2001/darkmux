@@ -16084,6 +16084,58 @@ fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed
     assert!(!home.join("client-remote").join(format!("{port}.json")).exists(), "no record left");
 }
 
+/// (#3560) A signal that arrives while `client serve` is still starting
+/// (here, while `tailscale serve` is publishing its entry, held open by the
+/// fake) runs the normal stop once the start is done: exit 0, the entry
+/// removed, its record gone. The handlers are in place before `client
+/// serve` prints, reaps or publishes anything, so no point after its start
+/// is one where a signal kills it with its entry left up.
+#[test]
+fn a_signal_while_client_serve_is_starting_still_runs_its_cleanup() {
+    let tmp = TempDir::new().unwrap();
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let home = tmp.path().join("darkmux-home");
+    fs::create_dir_all(&home).unwrap();
+    let fake = fake_tailnet_tool(&tmp.path().join("fake"), &home, port);
+    fs::write(fake.join("hold_publish"), "").unwrap();
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let mut cmd = darkmux_std_cmd();
+    let path = cmd.get_envs().find(|(k, _)| *k == "PATH").and_then(|(_, v)| v).unwrap().to_owned();
+    let mut with_fake = std::ffi::OsString::from(fake.as_os_str());
+    with_fake.push(":");
+    with_fake.push(path);
+    cmd.args(["client", "serve", "--port", &port.to_string()])
+        .env("PATH", with_fake)
+        .env("DARKMUX_HOME", &home)
+        .env("DARKMUX_CLIENTS_REMOTE", "tailscale")
+        .stdout(std::process::Stdio::null())
+        .stderr(log.reopen().unwrap());
+    let mut child = DirectChildGuard(cmd.spawn().expect("spawning darkmux client serve"));
+    let said = || fs::read_to_string(log.path()).unwrap_or_default();
+    let deadline = std::time::Instant::now() + FLEET_TEST_HANG_BOUND;
+    while !fake.join("publishing").exists() {
+        assert!(child.try_wait().unwrap().is_none(), "client serve exited early: {}", said());
+        assert!(std::time::Instant::now() < deadline, "client serve never published: {}", said());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // SAFETY: signalling the child this test spawned.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    // Give a signal with no handler time to take its default action.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    fs::remove_file(fake.join("hold_publish")).unwrap();
+    let (_, status) = exits_within(&mut child, std::time::Duration::from_secs(20)).expect("client serve exits");
+    assert_eq!(status.code(), Some(0), "killed by the signal instead of stopping: {status:?}\n{}", said());
+    assert!(said().contains("stopping (SIGTERM)"), "{}", said());
+    assert!(said().contains(&format!("removed its tailnet entry (https://studio.example.ts.net:{port}/)")), "{}", said());
+    let operator: serde_json::Value = serde_json::from_str(FAKE_TAILNET_OPERATOR).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&fs::read_to_string(fake.join("serve.json")).unwrap()).unwrap();
+    assert_eq!(config, operator, "its entry is gone");
+    assert!(!home.join("client-remote").join(format!("{port}.json")).exists(), "and its record");
+}
+
 /// Spawns `client serve` on an isolated HOME and its own port; returns the
 /// child, its port and its stderr log once it listens.
 fn a_listening_client_serve() -> (DirectChildGuard, u16, tempfile::NamedTempFile) {
