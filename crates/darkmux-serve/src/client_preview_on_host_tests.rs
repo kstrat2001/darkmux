@@ -25,6 +25,7 @@ fn a_run_in(dir: &Path) -> RunIn {
         hmr_port: 4200,
         ready_within: READY_WITHIN,
         exposure_every: EXPOSURE_CHECK_EVERY,
+        look_every: LOOK_EVERY,
     }
 }
 
@@ -201,6 +202,9 @@ fn a_preview_on_the_host_that_listens_beyond_the_loopback_is_stopped() {
 
 /// (#3112) Once ready, a listener that appears beyond the loopback later
 /// (a second server the code starts) stops the preview at the next watch.
+/// (#3619) The second server starts once the test has seen the preview
+/// ready (it waits for a file the test writes then), never after a guessed
+/// time, so a slow start cannot let it appear first.
 #[test]
 fn a_listener_that_appears_after_ready_stops_the_preview() {
     if !host_lists_sockets() {
@@ -210,11 +214,12 @@ fn a_listener_that_appears_after_ready_stops_the_preview() {
     let (previews, _docker, _seatbelt) = two_backends(dir.path());
     let previews = previews.with_exposure_every(Duration::from_millis(200));
     // The second server takes the HMR port, which the kernel lets it bind.
-    let late = "(sleep 2; exec /usr/bin/python3 -c \"import os,socket,time;s=socket.socket();s.bind(('0.0.0.0',int(os.environ['DARKMUX_PREVIEW_HMR_PORT'])));s.listen();time.sleep(60)\") & ".to_string() + &serve_on(HOST_ENV);
+    let late = "(until [ -e listen ]; do sleep 0.05; done; exec /usr/bin/python3 -c \"import os,socket,time;s=socket.socket();s.bind(('0.0.0.0',int(os.environ['DARKMUX_PREVIEW_HMR_PORT'])));s.listen();time.sleep(60)\") & ".to_string() + &serve_on(HOST_ENV);
     let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.0", "command": late, "env": {"PORT": "{port}", "HOST": "0.0.0.0"}}));
     previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
     let ready = until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(20));
     assert_eq!(ready["status"], "ready", "{ready}");
+    std::fs::write(wt.join("listen"), "").unwrap();
     let v = until_status(&previews, "w", &["failed"], Duration::from_secs(20));
     assert_eq!(v["status"], "failed", "{v}");
     assert!(v["error"].as_str().unwrap().contains("beyond this Mac's loopback"), "{v}");
@@ -265,6 +270,9 @@ fn a_preview_is_stopped_in_the_backend_it_started_in() {
 fn a_backend_switch_reinstalls_saying_what_it_deleted() {
     let dir = tempfile::TempDir::new().unwrap();
     let (previews, _docker, seatbelt) = two_backends(dir.path());
+    // (#3619) Looked at once a second, as on a loaded machine: each start
+    // waits for the record, never for a guessed time.
+    let previews = previews.with_look_every(Duration::from_secs(1));
     let recipe = serde_json::json!({
         "schema_version": "1.0", "command": "sleep 30",
         "install": {"command": "mkdir -p node_modules && echo mac > node_modules/built && echo installed >> installs.txt", "unless_exists": "node_modules"}
@@ -282,15 +290,17 @@ fn a_backend_switch_reinstalls_saying_what_it_deleted() {
     let log = dir.path().join("p/w.log");
     let run_once = |want_spec: usize| {
         previews.start_in(BackendKind::Seatbelt, "w", &wt, &source).unwrap();
-        for _ in 0..400 {
-            if seatbelt.specs.lock().unwrap().len() >= want_spec && log_has(&log, SERVING_LINE) {
-                break;
+        // Serving once it has left `installing`: the install that ran is
+        // recorded before the preview reads as starting.
+        let serving = (0..400).any(|_| {
+            let created = seatbelt.specs.lock().unwrap().len() >= want_spec;
+            let serving = created && previews.status("w").unwrap().status != "installing" && log_has(&log, SERVING_LINE);
+            if !serving {
+                std::thread::sleep(Duration::from_millis(25));
             }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        // The start notices the dev server line (and records the install)
-        // on its next look, 300 ms apart.
-        std::thread::sleep(Duration::from_millis(800));
+            serving
+        });
+        assert!(serving, "never started serving: {:?}", previews.status("w"));
         let said = std::fs::read_to_string(&log).unwrap_or_default();
         previews.stop("w");
         said

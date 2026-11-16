@@ -798,6 +798,9 @@ pub struct Previews {
     /// How long a started dev server may take to answer ([`READY_WITHIN`];
     /// a test's shorter one).
     ready_within: Duration,
+    /// How often a starting preview is looked at ([`LOOK_EVERY`]; a test's
+    /// slower one plays a loaded machine).
+    look_every: Duration,
     /// (#3585) The deletes clean starts left running in the background.
     cleanings: Arc<Cleanings>,
     /// Writes a serve-log line (stderr in production; a test collects them).
@@ -995,6 +998,11 @@ const STALE_KILL_GRACE_SECS: &str = "5";
 /// core per running preview, and a server that binds every address on one
 /// of them is reachable for at most about 2 s before it is stopped.
 pub const EXPOSURE_CHECK_EVERY: Duration = Duration::from_secs(2);
+
+/// How often a starting preview is looked at: its sandbox's exit, the dev
+/// server line in its log (which records a successful install), and its
+/// port's answer.
+const LOOK_EVERY: Duration = Duration::from_millis(300);
 
 /// What the container's watchdog reads, and when it gives up.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1405,6 +1413,7 @@ impl Previews {
             ports: Arc::new(free_port),
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ready_within: READY_WITHIN,
+            look_every: LOOK_EVERY,
             cleanings: Arc::new(Cleanings::new(default_remover())),
             say: Arc::new(|line| eprintln!("{line}")),
         }
@@ -1494,6 +1503,13 @@ impl Previews {
     #[cfg(test)]
     pub(crate) fn with_ready_within(mut self, within: Duration) -> Self {
         self.ready_within = within;
+        self
+    }
+
+    /// The same previews looking at a starting preview every `every`.
+    #[cfg(test)]
+    pub(crate) fn with_look_every(mut self, every: Duration) -> Self {
+        self.look_every = every;
         self
     }
 
@@ -1656,6 +1672,7 @@ impl Previews {
             hmr_port,
             ready_within: self.ready_within,
             exposure_every: self.exposure_every,
+            look_every: self.look_every,
         };
         std::thread::spawn(move || {
             let _held = hold;
@@ -1975,6 +1992,8 @@ struct RunIn {
     ready_within: Duration,
     /// (#3112) How often a preview on the host has its listeners checked.
     exposure_every: Duration,
+    /// How often [`wait_ready`] looks at the preview while it starts.
+    look_every: Duration,
 }
 
 fn run(entry: Arc<Mutex<Entry>>, recipe: Recipe, at: RunIn) {
@@ -2706,7 +2725,7 @@ fn wait_ready(
         if serving_since.is_some_and(|t| t.elapsed() > at.ready_within) {
             return Err(Halt::Failed(containers.not_ready_reason(name, at.port)));
         }
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(at.look_every);
     }
 }
 
@@ -3078,6 +3097,7 @@ mod tests {
             hmr_port: 4200,
             ready_within: READY_WITHIN,
             exposure_every: EXPOSURE_CHECK_EVERY,
+            look_every: LOOK_EVERY,
         };
         let labels = vec!["darkmux.dispatch.host-pid=7".to_string()];
         spec_for(recipe, &at, true, ("sha256:runtime".into(), user), labels)
@@ -3645,22 +3665,26 @@ mod tests {
         wt
     }
 
-    /// Starts the preview, waits for the dev server line (the install, when
-    /// it ran, succeeded), stops it, and says whether the install ran.
+    /// Starts the preview, waits until it has its container and has left
+    /// `installing` (an install that ran succeeded and is recorded: the
+    /// preview reads as starting only after that), stops it, and says
+    /// whether the install ran.
     fn start_once(previews: &Previews, emu: &HostEmulator, wt: &Path, log: &Path) -> bool {
         let _ = std::fs::remove_file(log);
         let before = emu.specs.lock().unwrap().len();
         previews
             .start("w", wt, &RecipeSource::Checkout(wt.to_path_buf()))
             .unwrap();
-        for _ in 0..200 {
-            let started = emu.specs.lock().unwrap().len() > before;
-            if started && log_has(log, SERVING_LINE) {
-                break;
+        let serving = (0..200).any(|_| {
+            let created = emu.specs.lock().unwrap().len() > before;
+            let status = previews.status("w").unwrap().status;
+            let serving = created && status != "installing" && log_has(log, SERVING_LINE);
+            if !serving {
+                std::thread::sleep(Duration::from_millis(25));
             }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        std::thread::sleep(Duration::from_millis(400));
+            serving
+        });
+        assert!(serving, "never started serving: {:?}", previews.status("w"));
         previews.stop("w");
         let spec = emu.specs.lock().unwrap().last().unwrap().clone();
         spec.script.contains("installs.txt")
@@ -3700,6 +3724,23 @@ mod tests {
             record.trim(),
             install_fingerprint(&wt, "echo installed >> installs.txt", "sha256:node22")
         );
+    }
+
+    /// (#3619) On a loaded machine the watch looks at a starting preview
+    /// late (here once a second), so a successful install is recorded well
+    /// after its dev server line shows. The preview reads as starting only
+    /// once it is recorded, and a start that waits for that skips the next
+    /// install however late the look comes.
+    #[test]
+    fn a_late_look_still_records_the_install_before_the_preview_reads_as_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = an_installed_workspace(dir.path(), "echo installed >> installs.txt");
+        let (previews, emu) = emulated(dir.path());
+        let previews = previews.with_look_every(Duration::from_secs(1));
+        let log = dir.path().join("p/w.log");
+        assert!(start_once(&previews, &emu, &wt, &log), "no record yet: install");
+        assert!(dir.path().join("base/.w.install").exists(), "recorded");
+        assert!(!start_once(&previews, &emu, &wt, &log), "unchanged: skipped");
     }
 
     /// (#3484) `clean` forgets the install record and deletes the
