@@ -77,10 +77,11 @@ pub const BUSY_GPU_PCT: u64 = 20;
 /// background work does (window compositing, a browser, video), whatever
 /// its utilization read.
 ///
-/// Measured on an M5 Max over 83,047 telemetry samples (October and
-/// November 2026): samples at or above [`BUSY_GPU_PCT`] utilization fall in
-/// two groups, background use at 0 to 2 W (6,882 samples) and model
-/// generation from 5 W up, with 2.5 to 4.5 W nearly empty (78 samples).
+/// Measured on an M5 Max over 82,388 telemetry samples (2026-10-01 to
+/// 2026-11-15; the query is in #3613): samples at or above [`BUSY_GPU_PCT`]
+/// utilization fall in two groups, background use under 2 W (6,809 samples)
+/// and model generation from 5 W up (21,177), with 2.5 to 4.5 W nearly
+/// empty (78 samples).
 /// The line sits at the bottom of that gap. Another chip's generation draw
 /// was not measured; a smaller GPU's could sit lower.
 pub const IDLE_GPU_W: f64 = 2.5;

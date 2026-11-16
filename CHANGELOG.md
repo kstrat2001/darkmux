@@ -168,7 +168,7 @@ darkmux release.
   GPU "was busy" from utilization alone, so window compositing or video (0.6 W at 60.5% duty in
   one hosted run) tripped it. It now also needs the busy samples to draw more than 2.5 W on
   average, and says a this-machine run's GPU "stayed idle" only when no sample drew more than that.
-  The line is measured, not guessed: on an M5 Max, background use reads 0 to 2 W and model
+  The line is measured, not guessed: on an M5 Max, background use reads under 2 W and model
   generation 5 W and up. Still a note, never a refusal.
 - **`lab submit` takes `--weights-dir` (and `--engine`, `--quant` and the rest) beside a provider's
   run (#3402).** The flags that describe a model apply to the one model the runs not on a

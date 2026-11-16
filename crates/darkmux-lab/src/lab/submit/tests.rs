@@ -1073,6 +1073,8 @@ fn the_gpu_cross_check_needs_the_gpu_power_to_agree() {
     assert!(e.contains("60.5%") && e.contains("31.2 W"), "{e}");
     let drew = json!({"samples_busy": 0, "gpu_duty_pct": 0.0, "gpu_w_max": 6.0});
     assert_eq!(hardware_check(SubmittingMachine, &drew), None, "it drew power, so it was not idle");
+    let low_but_busy = json!({"samples_busy": 3, "gpu_duty_pct": 9.0, "gpu_w_busy": 1.8, "gpu_w_max": 2.1});
+    assert_eq!(hardware_check(SubmittingMachine, &low_but_busy), None, "a busy sample: not idle, whatever it drew");
     let e = hardware_check(SubmittingMachine, &json!({"samples_busy": 0, "gpu_duty_pct": 0.0, "gpu_w_max": 0.4})).expect("idle");
     assert!(e.contains("idle") && e.contains("W"), "{e}");
     assert_eq!(hardware_check(Unknown, &json!({"samples_busy": 30, "gpu_duty_pct": 60.5})), None, "no power reading, no claim");
