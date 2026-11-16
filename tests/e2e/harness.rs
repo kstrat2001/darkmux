@@ -1161,8 +1161,7 @@ mod fixture_port_tests {
             if handed_out == 1 {
                 return Ok(taken);
             }
-            let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-            Ok(l.local_addr().map_err(|e| e.to_string())?.port())
+            pick_fixture_port()
         };
         let result = spawn_redis_on(workdir.path(), &mut fixtures, &mut ports)
             .and_then(|(child, url)| {
