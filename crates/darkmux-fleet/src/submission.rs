@@ -1382,6 +1382,24 @@ fn send_job(mut job: WorkJob, wait: bool, pins: PinPolicy) -> Result<(u16, Submi
     // never binds loopback, so a real provider refuses it).
     let peer = crate::peer::peer_target(&target, &entry, None, port, false, provider.as_ref())?.at_listener(port);
     let peer = settle_pin(peer, &entry, &target, pins, provider.provider_name())?;
+    deliver(&peer, job, wait, &target, &send_submission)
+}
+
+/// How [`deliver`] sends: [`send_submission`], or a test's recorder.
+type SendSubmission<'a> =
+    &'a dyn Fn(&crate::peer::SettledTarget, &WorkSubmission, Duration, &mut dyn FnMut(&SubmissionReply)) -> Result<(u16, SubmissionReply)>;
+
+/// Send `job` to the settled `peer` (the machine `target`) with
+/// [`reply_wait`]'s read deadline, reporting a waited-on job's `queued`
+/// lines as they arrive, and naming the session to follow when the answer
+/// was lost.
+fn deliver(
+    peer: &crate::peer::SettledTarget,
+    job: WorkJob,
+    wait: bool,
+    target: &str,
+    send: SendSubmission<'_>,
+) -> Result<(u16, SubmissionReply)> {
     let read_timeout = reply_wait(&job, wait);
     let session_id = job.session_id.clone();
     let submission = WorkSubmission::new(job, wait);
@@ -1395,7 +1413,7 @@ fn send_job(mut job: WorkJob, wait: bool, pins: PinPolicy) -> Result<(u16, Submi
             }
         }
     };
-    send_submission(&peer, &submission, read_timeout, &mut on_progress).map_err(|e| match e.downcast::<AnswerLost>() {
+    send(peer, &submission, read_timeout, &mut on_progress).map_err(|e| match e.downcast::<AnswerLost>() {
         Ok(lost) => {
             // The receiver names the run after the allow-list entry it
             // trusts this machine under, normally this machine_id.
@@ -1436,7 +1454,11 @@ const fn longer(a: Duration, b: Duration) -> Duration {
 /// line is the acknowledgment, sent before anything runs. A waited-on job's
 /// last line comes after its run: the job's own timeout, then the answer's
 /// slack, and for an agentic job first the sandbox's first-use allowance
-/// ([`SANDBOX_FIRST_USE`]). A single-shot job starts no sandbox.
+/// ([`SANDBOX_FIRST_USE`]). A single-shot job starts no sandbox. The job's
+/// timeout bounds only a single-shot job's run: an agentic job runs on the
+/// receiver's own inactivity budget (`timeout_override_seconds` does not
+/// cross the wire), so it can outlast this wait, and the sender then reports
+/// the answer lost, naming the session to follow.
 pub fn reply_wait(job: &WorkJob, wait: bool) -> Duration {
     if !wait {
         return ACKNOWLEDGMENT_WAIT;
@@ -1741,6 +1763,29 @@ mod tests {
             assert!(wait >= own + PULL_TIMEOUT + ANSWER_SLACK, "a Docker target's pull outlasts {at}");
             assert!(wait >= own + FIRST_USE_BOUND + ANSWER_SLACK, "a host sandbox's toolchain fetch outlasts {at}");
             assert_eq!(wait, own + SANDBOX_FIRST_USE + ANSWER_SLACK, "--timeout {timeout_seconds}");
+        }
+    }
+
+    /// (#3429) The read deadline a job is actually sent with is
+    /// [`reply_wait`]'s, waited on or not.
+    #[test]
+    fn a_job_is_sent_with_reply_waits_deadline() {
+        let peer = crate::peer::unverified_target_for_test("http://127.0.0.1:1");
+        for (wait, single_shot) in [(true, false), (true, true), (false, false)] {
+            let single = crate::SingleShotJob {
+                humor: 0,
+                surface: darkmux_flow::payload::RadioSurface::Cli,
+                max_completion_tokens: 512,
+            };
+            let j = WorkJob { timeout_seconds: 300, single_shot: single_shot.then_some(single), ..job(None) };
+            let expected = reply_wait(&j, wait);
+            let sent = std::cell::Cell::new(None);
+            let record = |_: &crate::peer::SettledTarget, _: &WorkSubmission, t: Duration, _: &mut dyn FnMut(&SubmissionReply)| {
+                sent.set(Some(t));
+                Err(anyhow!("recorded"))
+            };
+            assert!(deliver(&peer, j, wait, "studio", &record).is_err());
+            assert_eq!(sent.get(), Some(expected), "wait {wait}, single-shot {single_shot}");
         }
     }
 

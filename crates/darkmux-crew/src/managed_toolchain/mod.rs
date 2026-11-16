@@ -115,8 +115,12 @@ pub const RUNTIMES: &[&Runtime] = &[&NODE];
 /// (#3429) The longest a sandbox on the host may wait, on first use, for
 /// every runtime in [`RUNTIMES`] to be fetched and unpacked, one after
 /// another. A fleet sender's wait allows for it.
-pub const FIRST_USE_BOUND: std::time::Duration =
-    std::time::Duration::from_secs(INSTALL_BOUND.as_secs() * RUNTIMES.len() as u64);
+pub const FIRST_USE_BOUND: std::time::Duration = first_use_bound(RUNTIMES.len());
+
+/// The first-use bound for `runtimes` runtimes, installed one after another.
+const fn first_use_bound(runtimes: usize) -> std::time::Duration {
+    std::time::Duration::from_secs(INSTALL_BOUND.as_secs() * runtimes as u64)
+}
 
 /// Which builds of a runtime may be installed.
 #[derive(Debug, Clone)]

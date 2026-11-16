@@ -54,13 +54,19 @@ const UNPACK_BOUND: Duration = Duration::from_secs(300);
 /// own before it is killed.
 const DOWNLOAD_GRACE: Duration = Duration::from_secs(30);
 
-/// (#3429) The longest one runtime's first-use install may take: the
-/// download, its grace, and the unpack.
-pub const INSTALL_BOUND: Duration =
-    Duration::from_secs(DOWNLOAD_BOUND.as_secs() + DOWNLOAD_GRACE.as_secs() + UNPACK_BOUND.as_secs());
+/// How long the download's process is waited for: [`DOWNLOAD_BOUND`] and
+/// its grace.
+pub(super) const DOWNLOAD_STEP: Duration = Duration::from_secs(DOWNLOAD_BOUND.as_secs() + DOWNLOAD_GRACE.as_secs());
+
+/// How long the unpack's process is waited for.
+pub(super) const UNPACK_STEP: Duration = UNPACK_BOUND;
+
+/// (#3429) The longest one runtime's first-use install may take: its
+/// download step, then its unpack step.
+pub const INSTALL_BOUND: Duration = Duration::from_secs(DOWNLOAD_STEP.as_secs() + UNPACK_STEP.as_secs());
 
 /// A staging folder older than this is a crashed install's, never a live
-/// one's (a live install ends within [`DOWNLOAD_BOUND`] plus the unpack).
+/// one's (a live install ends within [`INSTALL_BOUND`]).
 pub const STALE_PARTIAL: Duration = Duration::from_secs(24 * 3600);
 
 /// The file in an install whose modified time is its last use.
@@ -419,7 +425,7 @@ fn download(url: &str, to: &Path) -> Result<(), String> {
     let cmd = download_command(url, to);
     let fix = "Nothing was installed. Check that this machine reaches the download's host (behind a proxy, set \
                `https_proxy`) and run again";
-    match run_bounded(cmd, DOWNLOAD_BOUND + DOWNLOAD_GRACE) {
+    match run_bounded(cmd, DOWNLOAD_STEP) {
         Bounded::Finished { success: true, .. } => Ok(()),
         Bounded::Finished { stderr, .. } => Err(format!(
             "could not download {url}: {}. {fix}",
@@ -463,7 +469,7 @@ fn check_hash(runtime: &Runtime, pin: &Pin, archive: &Path) -> Result<(), String
 fn unpack(archive: &Path, into: &Path) -> Result<(), String> {
     let mut cmd = Command::new("tar");
     cmd.arg("-xzf").arg(archive).arg("-C").arg(into);
-    match run_bounded(cmd, UNPACK_BOUND) {
+    match run_bounded(cmd, UNPACK_STEP) {
         Bounded::Finished { success: true, .. } => Ok(()),
         Bounded::Finished { stderr, .. } => Err(format!(
             "unpacking {}: {}. Nothing was installed",
