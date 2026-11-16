@@ -253,6 +253,7 @@ fn spawn_and_poll(mut cmd: Command, timeout: Duration) -> Bounded {
                     // signal fails with ESRCH and reaches nothing — so the
                     // window is a no-op, not a mis-target.
                     kill_group(pid);
+                    sweep_group(pid);
                 }
                 break Bounded::Finished {
                     success: status.success(),
@@ -271,11 +272,13 @@ fn spawn_and_poll(mut cmd: Command, timeout: Duration) -> Bounded {
         if darkmux_types::interrupt::is_set() {
             kill_group(pid);
             let _ = child.wait();
+            sweep_group(pid);
             break Bounded::Interrupted;
         }
         if started.elapsed() >= timeout {
             kill_group(pid);
             let _ = child.wait();
+            sweep_group(pid);
             break Bounded::TimedOut { seconds: timeout.as_secs() };
         }
         std::thread::sleep(POLL);
@@ -300,6 +303,40 @@ fn kill_group(pid: u32) {
 
 #[cfg(not(unix))]
 fn kill_group(_pid: u32) {}
+
+/// How many times [`sweep_group`] looks for a member left in the group.
+const SWEEP_ROUNDS: u32 = 50;
+
+/// (#2823) After [`kill_group`] and the reap of its leader: SIGKILL the
+/// group again for as long as a member is left in it. A child the command
+/// was forking at the moment of the first kill is not yet a member that
+/// kill reaches, and lives on in the dead group (measured on macOS: 7 of
+/// 10 single kills against a shell forking in a loop left one). The group
+/// id stays reserved while any member is left (see `kill_group`'s F2 note
+/// in `run_bounded`), and each kill follows a look that found a member, so
+/// it never reaches another group. Bounded: a command that keeps forking
+/// faster than it is killed is left after [`SWEEP_ROUNDS`] looks.
+#[cfg(unix)]
+fn sweep_group(pid: u32) {
+    for _ in 0..SWEEP_ROUNDS {
+        if !group_has_members(pid) {
+            return;
+        }
+        kill_group(pid);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(unix))]
+fn sweep_group(_pid: u32) {}
+
+/// Whether process group `pid` has a member this process may signal.
+/// macOS answers `EPERM` for a group whose only members are zombies, which
+/// reads as empty here: there is nothing left to kill.
+#[cfg(unix)]
+fn group_has_members(pid: u32) -> bool {
+    unsafe { libc::kill(-(pid as libc::pid_t), 0) == 0 }
+}
 
 #[cfg(test)]
 mod tests {
@@ -434,6 +471,45 @@ mod tests {
         let left = survivors(&m);
         let _ = Command::new("pkill").args(["-f", &format!("sleep {m}")]).status();
         assert!(left.is_empty(), "a forked grandchild survived the group kill: {left}");
+    }
+
+    /// (#2823) A member left in the group after its leader is killed and
+    /// reaped is killed too. This is the state a group kill leaves when the
+    /// command was forking at that moment: the new child was not yet a
+    /// member the kill reached (measured on macOS: one `kill(-pgid)` against
+    /// a shell forking in a loop left a survivor in 7 of 10 tries, a second
+    /// kill after the reap in 0 of 10), and it lives on in the dead group.
+    /// Built here without the race: only the leader is killed.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn a_member_left_after_the_leader_is_reaped_is_swept() {
+        use std::os::unix::process::CommandExt as _;
+        let m = marker(8);
+        let mut cmd = sh(&format!("sleep {m} & wait"));
+        // SAFETY: as in `run_bounded`: only the forked child's own group.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+        let mut leader = cmd.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let member_running = || {
+            let found = Command::new("pgrep").args(["-f", &format!("^sleep {m}")]).output().unwrap();
+            !found.stdout.is_empty()
+        };
+        while !member_running() {
+            assert!(Instant::now() < deadline, "the member `sleep {m}` never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        unsafe { libc::kill(leader.id() as libc::pid_t, libc::SIGKILL) };
+        let _ = leader.wait();
+        sweep_group(leader.id());
+        let left = survivors(&m);
+        let _ = Command::new("pkill").args(["-f", &format!("sleep {m}")]).status();
+        assert!(left.is_empty(), "a member left in the group outlived the sweep: {left}");
     }
 
     /// (#2361, S4-4) A caught SIGTERM/SIGINT reaches the command: the run
