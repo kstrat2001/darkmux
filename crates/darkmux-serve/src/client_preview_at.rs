@@ -223,15 +223,16 @@ pub(crate) fn remove_while(root: &Path, rel: &str, go_on: &dyn Fn() -> bool) -> 
 }
 
 /// Moves `rel` inside `root` (a symlink there as the link itself, never
-/// followed) to the new name `to_name` in the folder `to`, in one rename:
-/// it is wholly at one place or the other, never half moved. Only within
-/// one filesystem. `false` when nothing is at `rel`.
-pub(crate) fn move_out(root: &Path, rel: &str, to: &Path, to_name: &str) -> io::Result<bool> {
+/// followed) to the new name `to_name` in the folder `to_dir` of `to`, in
+/// one rename: it is wholly at one place or the other, never half moved.
+/// `to_dir` is opened from `to`'s descriptor, so a link there is refused.
+/// Only within one filesystem. `false` when nothing is at `rel`.
+pub(crate) fn move_out(root: &Path, rel: &str, to: &Path, to_dir: &str, to_name: &str) -> io::Result<bool> {
     let (dir, name) = parent_of(root, rel)?;
     if lstat_at(dir.as_raw_fd(), &name)?.is_none() {
         return Ok(false);
     }
-    let into = open_root(to)?;
+    let into = open_at(open_root(to)?.as_raw_fd(), OsStr::new(to_dir), libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
     let (from, onto) = (cstr(&name)?, cstr(OsStr::new(to_name))?);
     // SAFETY: two valid NUL-terminated names, each in a folder we hold open.
     match unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), into.as_raw_fd(), onto.as_ptr()) } {
@@ -732,20 +733,35 @@ mod tests {
     #[test]
     fn move_out_moves_the_entry_itself_and_never_crosses_a_link() {
         let dir = tempfile::tempdir().unwrap();
-        let (root, to, outside) = (dir.path().join("w"), dir.path().join("aside"), dir.path().join("outside"));
+        let (root, base, outside) = (dir.path().join("w"), dir.path().join("base"), dir.path().join("outside"));
+        let to = base.join("aside");
         for d in [root.join("nm/deep"), to.clone(), outside.join("nm")] {
             std::fs::create_dir_all(d).unwrap();
         }
         std::fs::write(root.join("nm/deep/f"), "x").unwrap();
-        assert!(move_out(&root, "nm", &to, "one").unwrap());
+        assert!(move_out(&root, "nm", &base, "aside", "one").unwrap());
         assert!(!root.join("nm").exists() && to.join("one/deep/f").exists(), "moved whole");
         std::os::unix::fs::symlink(&outside, root.join("nm")).unwrap();
-        assert!(move_out(&root, "nm", &to, "two").unwrap());
+        assert!(move_out(&root, "nm", &base, "aside", "two").unwrap());
         assert!(std::fs::symlink_metadata(to.join("two")).unwrap().file_type().is_symlink(), "the link itself moved");
         assert!(outside.join("nm").exists(), "what it pointed at stays");
-        assert!(!move_out(&root, "nm", &to, "three").unwrap(), "absent");
+        assert!(!move_out(&root, "nm", &base, "aside", "three").unwrap(), "absent");
         std::os::unix::fs::symlink(&outside, root.join("web")).unwrap();
-        assert!(move_out(&root, "web/nm", &to, "four").is_err(), "a symlinked folder on the way");
+        assert!(move_out(&root, "web/nm", &base, "aside", "four").is_err(), "a symlinked folder on the way");
         assert!(outside.join("nm").exists());
+    }
+
+    /// (#3585 review) `move_out` never moves into a destination folder that
+    /// is a link: the entry stays where it was.
+    #[test]
+    fn move_out_never_moves_through_a_linked_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, base, outside) = (dir.path().join("w"), dir.path().join("base"), dir.path().join("outside"));
+        for d in [root.join("nm"), base.clone(), outside.clone()] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, base.join("aside")).unwrap();
+        assert!(move_out(&root, "nm", &base, "aside", "one").is_err(), "moved through the link");
+        assert!(root.join("nm").exists() && !outside.join("one").exists());
     }
 }

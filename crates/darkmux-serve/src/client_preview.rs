@@ -255,7 +255,11 @@ use std::time::{Duration, Instant};
 
 /// (#3585) The folder in the worktrees base that a clean start moves a
 /// workspace's install aside into, to be deleted in the background.
-const CLEANING_DIR: &str = ".cleaning";
+pub(crate) const CLEANING_DIR: &str = ".darkmux-moved-aside";
+/// (#3585) The file darkmux creates, exclusively, in [`CLEANING_DIR`] as it
+/// makes the folder: one without it (a folder of that name darkmux did not
+/// make) is never moved into or deleted from.
+pub(crate) const CLEANING_MARKER: &str = ".darkmux-made-this-folder";
 
 /// Where a repo keeps its recipe, relative to the checkout's top.
 pub const RECIPE_PATH: &str = ".darkmux/preview.json";
@@ -1419,15 +1423,17 @@ impl Previews {
         RecipeRefusal::Unreadable("darkmux client serve is stopping; start the preview again once it is back".to_string())
     }
 
-    /// (#3585) Deletes `names` in `folder` (trees clean starts moved aside)
-    /// on a thread of its own, which gives up between entries once
+    /// (#3585) Deletes the trees clean starts moved aside, each named by
+    /// `base`-relative `rels` (`<CLEANING_DIR>/<name>`, so the walk opens
+    /// the folder from the base's descriptor and refuses a link there), on
+    /// a thread of its own, which gives up between entries once
     /// `client serve` begins to stop; what it leaves is deleted at the next
     /// start ([`Previews::reap_cleanings`]). None starts once the stop
     /// began: judged under the count's lock, so [`Previews::wait_cleanings`]
     /// either counts it or it never runs.
-    fn delete_in_background(&self, folder: PathBuf, names: Vec<String>) {
+    fn delete_in_background(&self, base: PathBuf, rels: Vec<String>) {
         let mut running = self.cleanings.running.lock().unwrap();
-        if names.is_empty() || self.stopping() {
+        if rels.is_empty() || self.stopping() {
             return;
         }
         *running += 1;
@@ -1435,9 +1441,9 @@ impl Previews {
         let (deleting, stopping) = (Deleting(self.cleanings.clone()), self.stopping.clone());
         std::thread::spawn(move || {
             let go_on = || !stopping.load(std::sync::atomic::Ordering::SeqCst);
-            for name in &names {
-                if let Err(why) = (deleting.0.remover)(&folder, name, &go_on) {
-                    eprintln!("{}", undeleted_line(&folder.join(name), &why));
+            for rel in &rels {
+                if let Err(why) = (deleting.0.remover)(&base, rel, &go_on) {
+                    eprintln!("{}", undeleted_line(&base.join(rel), &why));
                 }
             }
         });
@@ -1445,14 +1451,21 @@ impl Previews {
 
     /// (#3585) Deletes, in the background, every tree a clean start moved
     /// aside under `base` that a `client serve` which stopped (or died)
-    /// left. Run as `client serve` starts. Returns their names.
+    /// left. Only from a [`CLEANING_DIR`] darkmux made ([`made_by_darkmux`]):
+    /// a folder of that name it did not make, or a link, is left alone. Run
+    /// as `client serve` starts. Returns their names.
     pub fn reap_cleanings(&self, base: &Path) -> Vec<String> {
-        let folder = base.join(CLEANING_DIR);
-        let mut names: Vec<String> = std::fs::read_dir(&folder)
-            .map(|d| d.filter_map(Result::ok).filter_map(|e| e.file_name().into_string().ok()).collect())
-            .unwrap_or_default();
+        if !made_by_darkmux(base) {
+            return Vec::new();
+        }
+        let mut names: Vec<String> = std::fs::read_dir(base.join(CLEANING_DIR))
+            .map(|d| d.filter_map(Result::ok).filter_map(|e| e.file_name().into_string().ok()).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| n != CLEANING_MARKER)
+            .collect();
         names.sort();
-        self.delete_in_background(folder, names.clone());
+        self.delete_in_background(base.to_path_buf(), names.iter().map(|n| format!("{CLEANING_DIR}/{n}")).collect());
         names
     }
 
@@ -1690,17 +1703,18 @@ impl Previews {
     /// [`CLEANING_DIR`] (where no run writes) and deleted in the
     /// background. The workspace holds all of it or none of it, never a
     /// half-deleted tree for an install to run against. Where it cannot be
-    /// moved (another filesystem), it is deleted in place while the request
-    /// waits, as before.
+    /// moved (another filesystem, or a [`CLEANING_DIR`] darkmux did not make
+    /// or that is a link: [`make_cleaning_folder`]), it is deleted in place
+    /// while the request waits, as before.
     fn clear_aside(&self, name: &str, workdir: &Path, rel: &str) -> Result<(), String> {
         check_removable(workdir, rel)?;
-        let Some(folder) = workdir.parent().map(|base| base.join(CLEANING_DIR)) else {
+        let Some(base) = workdir.parent() else {
             return remove_inside(workdir, rel);
         };
         let aside = aside_name(name);
-        match std::fs::create_dir_all(&folder).and_then(|()| move_out(workdir, rel, &folder, &aside)) {
+        match make_cleaning_folder(base).and_then(|()| move_out(workdir, rel, base, &aside)) {
             Ok(true) => {
-                self.delete_in_background(folder, vec![aside]);
+                self.delete_in_background(base.to_path_buf(), vec![format!("{CLEANING_DIR}/{aside}")]);
                 Ok(())
             }
             Ok(false) => Ok(()),
@@ -2139,21 +2153,49 @@ fn check_removable(workdir: &Path, rel: &str) -> Result<(), String> {
     check_unlinked_inside(workdir, rel, "install.unless_exists", "delete")
 }
 
-/// Moves `rel` in `workdir` to `to_name` in the folder `to` in one rename,
-/// a link moved as itself ([`at::move_out`]); `false` when it is absent.
+/// (#3585) Whether `base`'s [`CLEANING_DIR`] is one darkmux made: a real
+/// folder (not a link) holding the [`CLEANING_MARKER`] file it creates
+/// exclusively as it makes the folder. A folder of that name anything else
+/// made (a mission's repo folder) is never moved into or reaped.
+fn made_by_darkmux(base: &Path) -> bool {
+    let folder = base.join(CLEANING_DIR);
+    std::fs::symlink_metadata(&folder).is_ok_and(|m| m.is_dir())
+        && std::fs::symlink_metadata(folder.join(CLEANING_MARKER)).is_ok_and(|m| m.is_file())
+}
+
+/// (#3585) Makes `base`'s [`CLEANING_DIR`] with its marker, or finds the
+/// one darkmux made; refused when the name is taken by anything else.
+fn make_cleaning_folder(base: &Path) -> std::io::Result<()> {
+    let folder = base.join(CLEANING_DIR);
+    match std::fs::create_dir(&folder) {
+        Ok(()) => {
+            std::fs::OpenOptions::new().write(true).create_new(true).open(folder.join(CLEANING_MARKER))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    if made_by_darkmux(base) {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!("{} is not a folder darkmux made", folder.display())))
+}
+
+/// Moves `rel` in `workdir` to `to_name` in `base`'s [`CLEANING_DIR`] in
+/// one rename, a link moved as itself and a linked folder refused
+/// ([`at::move_out`]); `false` when it is absent.
 #[cfg(unix)]
-fn move_out(workdir: &Path, rel: &str, to: &Path, to_name: &str) -> std::io::Result<bool> {
-    at::move_out(workdir, rel, to, to_name)
+fn move_out(workdir: &Path, rel: &str, base: &Path, to_name: &str) -> std::io::Result<bool> {
+    at::move_out(workdir, rel, base, CLEANING_DIR, to_name)
 }
 
 /// [`move_out`] where no descriptor walk exists.
 #[cfg(not(unix))]
-fn move_out(workdir: &Path, rel: &str, to: &Path, to_name: &str) -> std::io::Result<bool> {
+fn move_out(workdir: &Path, rel: &str, base: &Path, to_name: &str) -> std::io::Result<bool> {
     let from = workdir.join(rel);
     if std::fs::symlink_metadata(&from).is_err() {
         return Ok(false);
     }
-    std::fs::rename(&from, to.join(to_name)).map(|()| true)
+    std::fs::rename(&from, base.join(CLEANING_DIR).join(to_name)).map(|()| true)
 }
 
 /// [`remove_inside`]'s delete where no descriptor walk exists.
@@ -3667,11 +3709,23 @@ mod tests {
         (remover, release)
     }
 
-    /// The entries in the worktrees base's `.cleaning` folder.
+    /// The trees moved aside in the worktrees base's [`CLEANING_DIR`] (its
+    /// marker left out).
     fn moved_aside(base: &Path) -> Vec<String> {
         std::fs::read_dir(base.join(CLEANING_DIR))
-            .map(|d| d.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().to_string()).collect())
+            .map(|d| d.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().to_string()).collect::<Vec<_>>())
             .unwrap_or_default()
+            .into_iter()
+            .filter(|n| n != CLEANING_MARKER)
+            .collect()
+    }
+
+    /// [`CLEANING_DIR`] under `base` as darkmux makes it: with its marker.
+    fn a_cleaning_folder(base: &Path) -> PathBuf {
+        let folder = base.join(CLEANING_DIR);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join(CLEANING_MARKER), "").unwrap();
+        folder
     }
 
     /// (#3585) A clean start answers without waiting on the delete: while
@@ -3735,8 +3789,9 @@ mod tests {
     fn a_stop_ends_the_background_deletes_and_the_next_start_finishes_them() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
-        std::fs::create_dir_all(base.join(CLEANING_DIR).join("w-old/a/b")).unwrap();
-        std::fs::write(base.join(CLEANING_DIR).join("w-old/a/b/f"), "x").unwrap();
+        let folder = a_cleaning_folder(&base);
+        std::fs::create_dir_all(folder.join("w-old/a/b")).unwrap();
+        std::fs::write(folder.join("w-old/a/b/f"), "x").unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (previews, _emu) = emulated(dir.path());
         let previews = previews.with_remover(a_remover_until_the_stop(calls.clone()));
@@ -3752,6 +3807,73 @@ mod tests {
         assert_eq!(next.reap_cleanings(&base), ["w-old"]);
         assert_eq!(next.wait_cleanings(Instant::now() + Duration::from_secs(5)), 0);
         assert!(moved_aside(&base).is_empty(), "the next start deleted it");
+    }
+
+    /// (#3585) The stop's wait returns as soon as the background deletes
+    /// end, not at its deadline.
+    #[test]
+    fn wait_cleanings_returns_as_soon_as_the_deletes_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(a_cleaning_folder(&base).join("w-old")).unwrap();
+        let quick: Remover = Arc::new(|_: &Path, _: &str, _: &dyn Fn() -> bool| {
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(())
+        });
+        let (previews, _emu) = emulated(dir.path());
+        let previews = previews.with_remover(quick);
+        assert_eq!(previews.reap_cleanings(&base), ["w-old"]);
+        let waited = Instant::now();
+        assert_eq!(previews.wait_cleanings(Instant::now() + Duration::from_secs(10)), 0);
+        assert!(waited.elapsed() < Duration::from_secs(2), "waited {:?} for a 100 ms delete", waited.elapsed());
+    }
+
+    /// (#3585 review) A link where the moved-aside folder belongs is never
+    /// followed: the start's reap deletes nothing it points at (even with a
+    /// marker there), and a clean start moves nothing out of the base
+    /// through it (it deletes in place instead).
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_moved_aside_folder_is_never_followed_by_the_reap_or_a_clean_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, outside) = (dir.path().join("base"), dir.path().join("outside"));
+        let wt = an_installed_workspace(dir.path(), "true");
+        std::fs::create_dir_all(outside.join("precious")).unwrap();
+        std::fs::write(outside.join("precious/f"), "mine").unwrap();
+        std::fs::write(outside.join(CLEANING_MARKER), "").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join(CLEANING_DIR)).unwrap();
+        let (previews, _emu) = emulated(dir.path());
+        previews.reap_cleanings(&base);
+        assert_eq!(previews.wait_cleanings(Instant::now() + Duration::from_secs(5)), 0);
+        assert!(outside.join("precious/f").exists(), "the reap deleted through the link");
+        let source = a_checkout_with_the_recipe_of(&wt, dir.path());
+        previews.clean("w", &wt, &source).unwrap();
+        assert_eq!(previews.wait_cleanings(Instant::now() + Duration::from_secs(5)), 0);
+        let mut there: Vec<String> = std::fs::read_dir(&outside).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        there.sort();
+        assert_eq!(there, [CLEANING_MARKER, "precious"], "a clean start moved its tree out of the base");
+        assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err(), "deleted in place");
+    }
+
+    /// (#3585 review) A folder named like the moved-aside one that darkmux
+    /// did not make (a mission's repo folder, its worktrees inside) is
+    /// never reaped and never moved into.
+    #[test]
+    fn a_moved_aside_folder_darkmux_did_not_make_is_never_reaped_or_moved_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let wt = an_installed_workspace(dir.path(), "true");
+        let theirs = base.join(CLEANING_DIR);
+        std::fs::create_dir_all(theirs.join("phase-1")).unwrap();
+        std::fs::write(theirs.join("phase-1/live.txt"), "work").unwrap();
+        let (previews, _emu) = emulated(dir.path());
+        assert!(previews.reap_cleanings(&base).is_empty(), "nothing of darkmux's to reap");
+        assert_eq!(previews.wait_cleanings(Instant::now() + Duration::from_secs(5)), 0);
+        assert!(theirs.join("phase-1/live.txt").exists(), "the reap deleted a folder it did not make");
+        let source = a_checkout_with_the_recipe_of(&wt, dir.path());
+        previews.clean("w", &wt, &source).unwrap();
+        assert_eq!(moved_aside(&base), ["phase-1"], "a clean start moved into a folder it did not make");
+        assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err(), "deleted in place");
     }
 
     /// (#3585) A clean start once `client serve` began to stop is refused

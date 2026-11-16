@@ -168,12 +168,14 @@ darkmux release.
 - **A clean preview start answers at once, whatever the size of `node_modules` (#3585).** `POST
   /client/workspaces/{name}/preview` with `{"clean": true}` deleted the `install.unless_exists` path
   while the request waited, so a large `node_modules` could outlast the app's request timeout. The
-  path is now moved out of the workspace in one rename, into `.cleaning` in the worktrees base, and
-  deleted in the background; the install never sees part of the old tree. The background delete gives
-  up when `client serve` stops, and what it left is deleted when `client serve` next starts. A clean
-  start is refused while `client serve` stops, as a start is. A tree that cannot be moved there
-  (another filesystem) is deleted in place as before. A moved tree deeper than 128 folders no longer
-  refuses the clean start: it stays in `.cleaning` and the serve log says so.
+  path is now moved out of the workspace in one rename, into `.darkmux-moved-aside` in the worktrees
+  base, and deleted in the background; the install never sees part of the old tree. The background
+  delete gives up when `client serve` stops, and what it left is deleted when `client serve` next
+  starts. A clean start is refused while `client serve` stops, as a start is. A tree that cannot be
+  moved there (another filesystem) is deleted in place as before. A moved tree deeper than 128
+  folders no longer refuses the clean start: it stays in `.darkmux-moved-aside` and the serve log
+  says so. darkmux moves into and deletes from that folder only when it made it (a marker file
+  inside), never through a link.
 
 ## [5.11.0] - 2026-11-14
 

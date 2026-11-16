@@ -9034,7 +9034,9 @@ async fn shutdown_ends_the_background_deletes_of_clean_preview_starts() {
     let emu: Arc<dyn crate::client_preview::PreviewContainers> = h.containers.clone();
     h.state.previews = Arc::new(crate::client_preview::Previews::new(h.dir.path().join("p"), emu).with_remover(slow));
     let base = (h.state.worktrees_base)().unwrap();
-    std::fs::create_dir_all(base.join(".cleaning/w-1-2-3-0/node_modules")).unwrap();
+    let folder = base.join(crate::client_preview::CLEANING_DIR);
+    std::fs::create_dir_all(folder.join("w-1-2-3-0/node_modules")).unwrap();
+    std::fs::write(folder.join(crate::client_preview::CLEANING_MARKER), "").unwrap();
     assert_eq!(reaped_cleanings(&h.state).len(), 1, "the start says it found one");
     let began = begin_stop(&h.state.previews, &h.state.works);
     finish_stop(h.state.previews.clone(), h.state.works.clone(), began + std::time::Duration::from_secs(5)).await;
