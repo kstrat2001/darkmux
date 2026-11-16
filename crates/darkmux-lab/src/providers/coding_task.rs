@@ -87,42 +87,7 @@ impl WorkloadProvider for CodingTaskProvider {
         //    on disk); re-applying setupContent gives every dispatch a
         //    deterministic starting point so re-runs don't measure
         //    cached agent edits as "instant fixes."
-        if !loaded.manifest.workload.setup_content.is_empty() {
-            for (rel_path, content) in &loaded.manifest.workload.setup_content {
-                // Path-traversal hardening: reject absolute paths, `..`
-                // components, and any key that would resolve outside
-                // sandbox_dir. Embedded workloads are trusted (compiled
-                // in), but `~/.darkmux/workloads/<id>.json` is operator-
-                // installed and may come from a gist / friend / future
-                // install verb. Validate at the receiver, not at install.
-                validate_setup_content_key(rel_path).with_context(|| {
-                    format!("setupContent key `{rel_path}` is unsafe")
-                })?;
-                let target = sandbox_dir.join(rel_path);
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent).with_context(|| {
-                        format!(
-                            "creating parent dir {} for setupContent file {}",
-                            parent.display(),
-                            rel_path
-                        )
-                    })?;
-                }
-                fs::write(&target, content).with_context(|| {
-                    format!("writing setupContent file {}", target.display())
-                })?;
-            }
-            // Operator-visible signal that the sandbox was reset before
-            // the agent ran. Without this, an operator looking at a
-            // mutated `~/.darkmux/sandboxes/<workload>/` couldn't tell
-            // whether the dispatch ran against fresh state or stale
-            // post-prior-edit state.
-            eprintln!(
-                "[lab] setupContent re-applied to {} ({} file(s))",
-                sandbox_dir.display(),
-                loaded.manifest.workload.setup_content.len()
-            );
-        }
+        apply_setup_content(loaded, sandbox_dir)?;
 
         // 3. Validate workload+role pairing. Coding-task workloads are
         //    editing-shaped; pairing with a role whose tool_palette
@@ -523,6 +488,38 @@ fn manifest_seed_path(loaded: &LoadedWorkload) -> Option<String> {
         return Some(s.clone());
     }
     Some("sandbox".to_string())
+}
+
+/// Write each inline `setupContent` (relative path, content) pair into the
+/// sandbox, creating folders as needed.
+///
+/// Path-traversal hardening: a key that is absolute or has a `..` component
+/// is refused before anything is written. Embedded workloads are trusted
+/// (compiled in), but `~/.darkmux/workloads/<id>.json` is operator-installed
+/// and may come from a gist, a friend or a community eval, so the receiver
+/// validates. (#3394) The sandbox is a clone of a fixture that may hold
+/// symlinks, so every write goes through `sandbox_write`, which refuses a
+/// link at any component instead of following it out of the sandbox.
+fn apply_setup_content(loaded: &LoadedWorkload, sandbox_dir: &Path) -> Result<()> {
+    let setup = &loaded.manifest.workload.setup_content;
+    if setup.is_empty() {
+        return Ok(());
+    }
+    for (rel_path, content) in setup {
+        validate_setup_content_key(rel_path).with_context(|| format!("setupContent key `{rel_path}` is unsafe"))?;
+        crate::lab::sandbox_write::write_file(sandbox_dir, Path::new(rel_path), content.as_bytes())
+            .with_context(|| format!("writing setupContent `{rel_path}`"))?;
+    }
+    // Operator-visible signal that the sandbox was reset before the agent
+    // ran. Without this, an operator looking at a mutated sandbox couldn't
+    // tell whether the dispatch ran against fresh state or stale
+    // post-prior-edit state.
+    eprintln!(
+        "[lab] setupContent re-applied to {} ({} file(s))",
+        sandbox_dir.display(),
+        setup.len()
+    );
+    Ok(())
 }
 
 /// True when `path` either doesn't exist, isn't a directory, or is an
@@ -1560,32 +1557,65 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     if !dst.exists() {
         fs::create_dir_all(dst)?;
     }
+    copy_seed_into(src, dst, Path::new(""))
+}
+
+/// Copy the seed folder `src` into `root/rel`. (#897) No-follow on the seed
+/// side: `file_type()` comes from the directory entry (lstat-like), so a
+/// symlink reports `is_symlink()` rather than its target's type, and is
+/// SKIPPED: copying or recreating a seed symlink (to /etc, ~/.ssh, ...) would
+/// pull host content into the agent-visible sandbox. Only real files and
+/// folders are seeded. (#3394) No-follow on the sandbox side too: the sandbox
+/// is a fixture clone that may already hold a link at a name the seed writes,
+/// so every write goes through `sandbox_write`, which refuses it.
+fn copy_seed_into(src: &Path, root: &Path, rel: &Path) -> Result<()> {
     for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        // (#897) No-follow: `file_type()` comes from the directory entry
-        // (lstat-like), so a symlink reports `is_symlink()` rather than its
-        // target's type. SKIP symlinks — copying or recreating a seed symlink
-        // (→ /etc, ~/.ssh, …) would pull host content into the agent-visible
-        // sandbox. Only real files/dirs are seeded.
-        let ft = entry.file_type()?;
-        if ft.is_symlink() {
-            continue;
-        }
-        let s = entry.path();
-        let d = dst.join(entry.file_name());
-        if ft.is_dir() {
-            copy_dir_recursive(&s, &d)?;
-        } else {
-            fs::copy(&s, &d)?;
-        }
+        seed_entry(&entry?, root, rel)?;
     }
     Ok(())
+}
+
+/// What the seed copy does with one entry of a seed folder.
+#[derive(Debug, PartialEq, Eq)]
+enum SeedStep {
+    Folder,
+    File,
+    /// A symlink (never followed, see [`copy_seed_into`]) or anything else
+    /// that is not a regular file or folder.
+    Skip,
+}
+
+/// The step for an entry of type `ft`, read from the directory entry (so a
+/// symlink is a symlink, not its target).
+fn seed_step(ft: fs::FileType) -> SeedStep {
+    if ft.is_dir() {
+        SeedStep::Folder
+    } else if ft.is_file() {
+        SeedStep::File
+    } else {
+        SeedStep::Skip
+    }
+}
+
+/// Seed one entry of a seed folder into `root/rel`.
+fn seed_entry(entry: &fs::DirEntry, root: &Path, rel: &Path) -> Result<()> {
+    let to = rel.join(entry.file_name());
+    match seed_step(entry.file_type()?) {
+        SeedStep::Folder => crate::lab::sandbox_write::make_folders(root, &to)
+            .and_then(|()| copy_seed_into(&entry.path(), root, &to)),
+        SeedStep::File => crate::lab::sandbox_write::copy_file(&entry.path(), root, &to),
+        SeedStep::Skip => Ok(()),
+    }
 }
 
 // Note: a small `pathdiff` mod used to live here for computing
 // relative paths in the manifest. Removed in #359 when the manifest
 // switched to always-absolute sandbox paths (the relative form was
 // the root cause of inspect resolving against the wrong cwd).
+
+#[cfg(test)]
+#[path = "coding_task_symlink_tests.rs"]
+mod symlink_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2017,6 +2047,38 @@ mod tests {
         copy_dir_recursive(&src, &dst).unwrap();
         assert!(dst.exists());
         assert_eq!(fs::read_to_string(dst.join("x.txt")).unwrap(), "x");
+    }
+
+    #[test]
+    fn seed_step_reads_the_entry_not_its_target() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("d")).unwrap();
+        fs::write(tmp.path().join("f"), "").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("d"), tmp.path().join("l")).unwrap();
+        let step = |n: &str| seed_step(fs::symlink_metadata(tmp.path().join(n)).unwrap().file_type());
+        assert_eq!((step("d"), step("f"), step("l")), (SeedStep::Folder, SeedStep::File, SeedStep::Skip));
+    }
+
+    #[test]
+    fn copy_dir_recursive_refuses_a_seed_that_is_not_a_folder() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("seed"), "a file").unwrap();
+        assert!(copy_dir_recursive(&tmp.path().join("seed"), &tmp.path().join("dst")).is_err());
+    }
+
+    #[test]
+    fn copy_dir_recursive_passes_up_an_error_from_a_nested_folder() {
+        // A link the sandbox holds two folders down still stops the copy.
+        let tmp = TempDir::new().unwrap();
+        let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+        fs::create_dir_all(src.join("a/b")).unwrap();
+        fs::write(src.join("a/b/x.txt"), "seeded").unwrap();
+        fs::create_dir_all(dst.join("a/b")).unwrap();
+        fs::write(tmp.path().join("outside.txt"), "keep").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("outside.txt"), dst.join("a/b/x.txt")).unwrap();
+        let err = format!("{:#}", copy_dir_recursive(&src, &dst).unwrap_err());
+        assert!(err.contains("`a/b/x.txt`") && err.contains("symlink"), "{err}");
+        assert_eq!(fs::read_to_string(tmp.path().join("outside.txt")).unwrap(), "keep");
     }
 
     #[test]

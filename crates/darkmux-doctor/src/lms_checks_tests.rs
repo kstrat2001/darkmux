@@ -33,12 +33,23 @@ fn exe(path: &Path, body: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// (#2976, #3444) Runs a no-op at `path` once, so the fake written there
+/// next pays macOS's first-exec scan here, outside every bounded call under
+/// test. Writing over it keeps the file (and its scanned state). It leaves
+/// `<path>.warm` behind as the trace that it ran.
+fn warm(path: &Path) {
+    exe(path, "#!/bin/sh\n: > \"$0.warm\"\n");
+    let ran = std::process::Command::new(path).status().expect("warming the fake lms");
+    assert!(ran.success(), "the warm-up no-op exits 0");
+}
+
 impl Fakes {
     fn new(profiles: Option<&str>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().display();
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
+        warm(&bin.join("lms"));
         exe(
             &bin.join("lms"),
             &format!(
@@ -252,6 +263,18 @@ fn projection_skips_when_free_memory_cannot_be_read() {
 }
 
 // ─── check_unpriceable_residents ────────────────────────────────────
+
+/// (#3444) The fake `lms` has run once before any test reads through it.
+/// macOS scans a freshly written executable on its first exec, which took
+/// 2.4 s to 32 s on a loaded host (#2976); the ledger gives `lms ps` 5 s,
+/// and a first exec inside that bound read as "residents unknown", so a row
+/// that should warn passed.
+#[serial_test::serial]
+#[test]
+fn the_fake_lms_has_run_once_before_a_test_reads_through_it() {
+    let f = Fakes::new(None);
+    assert!(f.dir.path().join("bin").join("lms.warm").exists(), "the first exec is left to the bounded call under test");
+}
 
 /// (#316 stage 3.6) The row reads the local engine's ledger: a resident with
 /// no catalog size and no readable weights is named as unpriceable.

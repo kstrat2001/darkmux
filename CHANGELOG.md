@@ -158,12 +158,40 @@ darkmux release.
   `crates/darkmux-serve/client-openapi.golden.json` pins the document, so a route, reply or body that
   changes shows in the diff.
 
+- **Run stats 2.4.0: the highest GPU draw of the run (#3402).** `run stats --json` adds
+  `gpu_w_max`, the highest GPU-rail watts any telemetry sample in the run window read, busy or
+  not. `None`, and listed in `host_unmeasured`, where no sample reads a GPU rail. Additive.
+
 ### Fixed
 
+- **`lab submit`'s GPU note no longer fires on background GPU use (#3402).** It said a hosted run's
+  GPU "was busy" from utilization alone, so window compositing or video (0.6 W at 60.5% duty in
+  one hosted run) tripped it. It now also needs the busy samples to draw more than 2.5 W on
+  average, and says a this-machine run's GPU "stayed idle" only when no sample drew more than that.
+  The line is measured, not guessed: on an M5 Max, background use reads under 2 W and model
+  generation 5 W and up. Still a note, never a refusal.
+- **`lab submit` takes `--weights-dir` (and `--engine`, `--quant` and the rest) beside a provider's
+  run (#3402).** The flags that describe a model apply to the one model the runs not on a
+  provider's host used; a provider's run takes none of them. Before, a submit with a hosted run
+  and one LM Studio run refused them ("describe one model; these runs used claude-haiku-5-5,
+  qwen/qwen3.8-27b"). A submit of provider runs alone still refuses them, naming each run.
 - **`GET /client/profiles` answers a query it cannot read with the coded `ClientError` (#3494).** A
   repeated `role` was axum's plain-text 400; it is now `{"error": "...", "code": "bad_request"}` like
   every other refusal. `GET /client/recipe` now names a query it cannot read the same way (still
   `bad_request`) instead of asking for `workdir` or `workspace`.
+
+- **A clean preview start answers at once, whatever the size of `node_modules` (#3585).** `POST
+  /client/workspaces/{name}/preview` with `{"clean": true}` deleted the `install.unless_exists` path
+  while the request waited, so a large `node_modules` could outlast the app's request timeout. The
+  path is now moved out of the workspace in one rename, into `.darkmux-moved-aside` in the worktrees
+  base, and deleted in the background; the install never sees part of the old tree. The background
+  delete gives up when `client serve` stops, and what it left is deleted when `client serve` next
+  starts. A clean start is refused while `client serve` stops, as a start is. A tree that cannot be
+  moved there (another filesystem) is deleted in place as before. A moved tree deeper than 128
+  folders no longer refuses the clean start: it stays in `.darkmux-moved-aside` and the serve log
+  says so. darkmux moves into and deletes from that folder only when it made it (a marker file
+  inside), never through a link; a clean start that has to delete in place says why in the serve
+  log.
 
 ## [5.11.0] - 2026-11-14
 

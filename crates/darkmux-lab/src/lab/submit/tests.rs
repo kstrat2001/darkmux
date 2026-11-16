@@ -1047,8 +1047,8 @@ fn hardware_precedence_is_registry_then_flag_then_snapshot() {
 /// when there is none.
 #[test]
 fn the_gpu_cross_check_flags_a_disagreeing_claim_and_is_silent_without_a_reading() {
-    let busy = json!({"samples_busy": 40, "gpu_duty_pct": 87.5});
-    let idle = json!({"samples_busy": 0, "samples_idle": 12, "gpu_duty_pct": 0.0});
+    let busy = json!({"samples_busy": 40, "gpu_duty_pct": 87.5, "gpu_w_busy": 24.95, "gpu_w_max": 41.0});
+    let idle = json!({"samples_busy": 0, "samples_idle": 12, "gpu_duty_pct": 0.0, "gpu_w_max": 0.04});
     let no_gpu = json!({"samples_busy": 3});
     let e = hardware_check(Unknown, &busy).expect("busy while stated elsewhere");
     assert!(e.contains("unknown") && e.contains("87.5%"), "{e}");
@@ -1058,6 +1058,48 @@ fn the_gpu_cross_check_flags_a_disagreeing_claim_and_is_silent_without_a_reading
     assert_eq!(hardware_check(Unknown, &idle), None);
     assert_eq!(hardware_check(Unknown, &no_gpu), None, "no GPU reading (Omarchy), no note");
     assert_eq!(hardware_check(SubmittingMachine, &json!({})), None, "no telemetry, no note");
+}
+
+/// (#3402) The cross-check says a GPU was busy or idle only when its power
+/// agrees with its utilization. A hosted run in the #3399 test read 60.5%
+/// GPU duty at 0.6 W: background use, not a model, so no note. A GPU that
+/// drew power under the utilization line did work, so it is not called idle.
+#[test]
+fn the_gpu_cross_check_needs_the_gpu_power_to_agree() {
+    let background = json!({"samples_busy": 30, "gpu_duty_pct": 60.5, "gpu_w_busy": 0.6, "gpu_w_max": 1.4});
+    assert_eq!(hardware_check(Unknown, &background), None, "background GPU use under the idle line");
+    let working = json!({"samples_busy": 30, "gpu_duty_pct": 60.5, "gpu_w_busy": 31.2, "gpu_w_max": 44.0});
+    let e = hardware_check(Unknown, &working).expect("a model's draw while stated elsewhere");
+    assert!(e.contains("60.5%") && e.contains("31.2 W"), "{e}");
+    let drew = json!({"samples_busy": 0, "gpu_duty_pct": 0.0, "gpu_w_max": 6.0});
+    assert_eq!(hardware_check(SubmittingMachine, &drew), None, "it drew power, so it was not idle");
+    let low_but_busy = json!({"samples_busy": 3, "gpu_duty_pct": 9.0, "gpu_w_busy": 1.8, "gpu_w_max": 2.1});
+    assert_eq!(hardware_check(SubmittingMachine, &low_but_busy), None, "a busy sample: not idle, whatever it drew");
+    let e = hardware_check(SubmittingMachine, &json!({"samples_busy": 0, "gpu_duty_pct": 0.0, "gpu_w_max": 0.4})).expect("idle");
+    assert!(e.contains("idle") && e.contains("W"), "{e}");
+    assert_eq!(hardware_check(Unknown, &json!({"samples_busy": 30, "gpu_duty_pct": 60.5})), None, "no power reading, no claim");
+    assert_eq!(hardware_check(SubmittingMachine, &json!({"samples_busy": 0, "gpu_duty_pct": 0.0})), None, "no power reading, no claim");
+}
+
+/// (#3402) The flags that describe a model apply to the one model this side
+/// served: a provider's run beside it takes none of them and is not refused.
+/// Two such models are still refused, naming only them.
+#[test]
+fn stated_model_flags_describe_the_one_model_beside_a_provider_run() {
+    let b = bench();
+    let haiku = b.run("haiku", "claude-haiku-4-5", json!({"model_hardware": [
+        {"model": "claude-haiku-4-5", "from": "provider", "hardware": "unknown", "provider": "Anthropic API"}]}));
+    let local = b.run("local", "darkmux:m1", json!({}));
+    let stated = Stated { engine: Some("rec".into()), quant: Some("q8".into()), weights_dir: Some(b.weights.clone()), ..Default::default() };
+    let machine = b.machine(None);
+    let (built, _) = b.gather(&machine, &[haiku.clone(), local.clone()], &stated).unwrap();
+    let (far, here) = (&built.bundle["runs"][0]["stack"], &built.bundle["runs"][1]["stack"]);
+    assert!(here["weightsHash"].is_string() && here["engine"] == "rec" && here["quant"] == "q8", "{here}");
+    assert!(far["weightsHash"].is_null() && far["quant"].is_null(), "{far}");
+    assert_eq!(far["engine"], "Anthropic API");
+    let m2 = b.run("m2", "darkmux:m2", json!({}));
+    let e = b.gather(&machine, &[haiku, local, m2], &stated).unwrap_err().to_string();
+    assert!(e.contains("describe one model; these runs used m1, m2") && !e.contains("claude-haiku"), "{e}");
 }
 
 /// Format 7 only when a run's hardware is unknown, and then every run says
