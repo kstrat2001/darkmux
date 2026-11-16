@@ -51,8 +51,10 @@ pub struct ClientEngines {
 }
 
 /// `POST /client/engines`: the engine to add, after the user confirmed.
-/// Only an app on this Mac may send it (a device on the tailnet is refused
-/// `forbidden`), and every add is recorded in the `client serve` log.
+/// Any paired client may send it: an app on this Mac, or a device paired
+/// over the tailnet through the entry (as every route takes it there: its
+/// token, from the tailnet user and device it paired as). Every add is
+/// recorded in the `client serve` log, naming which of the two it came by.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AddEngineBody {
@@ -127,12 +129,10 @@ pub(crate) async fn engines_handler(
     }
 }
 
-/// What an add refuses from a device on the tailnet: it writes this Mac's
-/// profile registry, so only an app on this Mac may ask for one.
-pub(crate) const ADD_ON_THIS_MAC_ONLY: &str =
-    "an engine is added only by an app on this Mac: adding one writes \
-    its profile registry. Ask from the app on the Mac, or run `darkmux init --add-engine` there";
-
+/// The add, from any paired client. The listener's gate already let the
+/// request in: from an app on this Mac, or (`RequestVia::Tailnet`) with a
+/// token paired over the tailnet, from the tailnet user and device it
+/// paired as. The handler takes the token again, as every route does.
 pub(crate) async fn engine_add_handler(
     State(state): State<ClientServerState>,
     via: Option<Extension<RequestVia>>,
@@ -143,13 +143,7 @@ pub(crate) async fn engine_add_handler(
         Ok(c) => c,
         Err(r) => return *r,
     };
-    if via.map_or(RequestVia::Local, |v| v.0) != RequestVia::Local {
-        return err(
-            StatusCode::FORBIDDEN,
-            ClientCode::Forbidden,
-            ADD_ON_THIS_MAC_ONLY,
-        );
-    }
+    let via = via.map_or(RequestVia::Local, |v| v.0);
     let req: AddEngineBody = match json_body(body).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -162,7 +156,7 @@ pub(crate) async fn engine_add_handler(
     };
     match tokio::task::spawn_blocking(move || add(&asked)).await {
         Ok(Ok(planned)) => {
-            (state.log_add)(&added_line(&client, &planned));
+            (state.log_add)(&added_line(&client, via, &planned));
             Json(EngineAdded::of(req.engine, &planned)).into_response()
         }
         Ok(Err(refused)) => refusal_response(&refused),
@@ -171,9 +165,9 @@ pub(crate) async fn engine_add_handler(
 }
 
 /// The serve log's record of an add: which client (and the signing
-/// identity that approved it, when one did) on this Mac, and what was
-/// written. No token, no path.
-pub(crate) fn added_line(client: &ApprovedClient, p: &Planned) -> String {
+/// identity that approved it, when one did), where the request came from
+/// ([`origin`]), and what was written. No token, no path.
+pub(crate) fn added_line(client: &ApprovedClient, via: RequestVia, p: &Planned) -> String {
     use darkmux_types::config_enum::ConfigEnum;
     let signed = client
         .auto_approved
@@ -181,9 +175,25 @@ pub(crate) fn added_line(client: &ApprovedClient, p: &Planned) -> String {
         .map(|s| format!(", signed {}/{}", s.team, s.bundle))
         .unwrap_or_default();
     darkmux_types::user_files::escape_text(&format!(
-        "darkmux client serve: client `{}` ({}{signed}, an app on this Mac) added engine `{}` to profiles.json: endpoint `{}` on port {}, profile `{}` running `{}` at {} tokens",
-        client.name, client.id, p.engine.token(), p.endpoint, p.port, p.profile, p.model, p.n_ctx
+        "darkmux client serve: client `{}` ({}{signed}, {}) added engine `{}` to profiles.json: endpoint `{}` on port {}, profile `{}` running `{}` at {} tokens",
+        client.name, client.id, origin(client, via), p.engine.token(), p.endpoint, p.port, p.profile, p.model, p.n_ctx
     ))
+}
+
+/// Where an add came from, as the serve log says it. Through the tailnet
+/// entry the gate let it in only from the tailnet user and device the
+/// client paired as, so that recorded identity is the one named.
+fn origin(client: &ApprovedClient, via: RequestVia) -> String {
+    match (via, &client.tailnet) {
+        (RequestVia::Local, _) => "an app on this Mac".to_string(),
+        (RequestVia::Tailnet, Some(id)) => {
+            format!(
+                "over the tailnet from {}",
+                crate::client_tailnet::described(id)
+            )
+        }
+        (RequestVia::Tailnet, None) => "over the tailnet".to_string(),
+    }
 }
 
 /// The production [`DetectEngines`]: this Mac's registry says which are

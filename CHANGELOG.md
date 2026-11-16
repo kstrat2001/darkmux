@@ -26,8 +26,8 @@ darkmux release.
   `profiles.json` only after you confirm on the terminal. A new doctor row, `installed engines`, names an
   engine found but not configured and the command that adds it (informational: it passes). The client API gains `GET
   /client/engines` (each engine found, and `usable` when any can run work) and `POST /client/engines`
-  (the add, once the app's user confirms; from an app on the Mac only, a tailnet device is refused
-  `forbidden`, and every add is recorded in the `client serve` log), under the new `engines`
+  (the add, once the app's user confirms; from an app on the Mac or a device paired over the tailnet,
+  and every add is recorded in the `client serve` log naming the client and where it came from), under the new `engines`
   capability. Every `profiles.json` write darkmux makes (`init`'s and the add) now goes through one
   path: a lock all writers share, a compare with what was read, and an atomic replace that keeps a
   symlinked registry a symlink and refuses one the operator made read-only. darkmux recommends no
