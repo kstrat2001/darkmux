@@ -134,6 +134,32 @@ export interface TimelinePhase {
    *  none), so the field is already present at runtime; this just types it. */
   phase: { id: string; label: string; status: GraphNodeStatus; description?: string; statusNote?: string; abandonedReason?: GraphNode["abandonedReason"] };
   tasks: TimelineTask[];
+  /** (#3195) How long the phase has run: see {@link phaseElapsed}. */
+  elapsed: PhaseElapsed | null;
+}
+
+/** A phase's running total, and whether it is still counting. */
+export interface PhaseElapsed {
+  ms: number;
+  running: boolean;
+}
+
+/** (#3195, operator 2026-10-10) A phase's running total: its first step's
+ *  start until now while any of its steps is running or waiting for its
+ *  slot, else until its last step ended. `null` before any step started. A
+ *  step's own row shows its work time; this is the phase's whole. */
+export function phaseElapsed(tasks: readonly GraphNode[], metrics: MetricsMap, now: number): PhaseElapsed | null {
+  let first = 0;
+  let last = 0;
+  let open = false;
+  for (const s of tasks.flatMap((t) => t.steps || [])) {
+    open ||= s.status === "running" || s.status === "waiting";
+    const st = stepStartMs(s, metrics[s.id]);
+    if (st) first = first ? Math.min(first, st) : st;
+    last = Math.max(last, stepEndMs(s, metrics[s.id]));
+  }
+  const end = open ? now : last;
+  return first && end ? { ms: Math.max(0, end - first), running: open } : null;
 }
 
 /** The phase→task grouping half of `renderMissionTimeline` — mission-graph.html.
@@ -186,6 +212,7 @@ export function groupTimeline(nodes: GraphNode[], edges: GraphEdge[], metrics: M
     const tasks = tasksByPhase[phase.id] || [];
     return {
       phase,
+      elapsed: phaseElapsed(tasks, metrics, now),
       tasks: tasks.map((task) => ({
         task,
         waitsOn: waitsOn[task.id] || [],

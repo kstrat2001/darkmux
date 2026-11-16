@@ -684,7 +684,8 @@ export function MissionGraphLens({
 
   const anyRunning = !!(
     graph &&
-    graph.nodes.some((n) => n.status === "running" || (n.steps || []).some((s) => s.status === "running"))
+    // (#3195) A step waiting for its slot keeps its phase's total counting.
+    graph.nodes.some((n) => n.status === "running" || (n.steps || []).some((s) => s.status === "running" || s.status === "waiting"))
   );
   const headerState = useMissionHeaderState(missionId, graph, daemonBacked);
   // (#2332 review) `active` is a mission's status from mint to finalize —

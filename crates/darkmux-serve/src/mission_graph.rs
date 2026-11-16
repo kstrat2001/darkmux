@@ -179,7 +179,10 @@ pub struct StepRow {
     /// step with no config-snapshot recovery — see `build_mission_graph`);
     /// the page then falls back to showing a meter only if metrics arrive.
     pub kind: String,
-    pub status: NodeStatus,
+    /// (#3195) The step's display status, decided by [`step_display_status`]:
+    /// `waiting` for a step admitted to its wave but not yet dispatching
+    /// (queued for a call slot), the scheduler's own word otherwise.
+    pub status: TaskDisplayStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(type = "number", optional))]
     pub started_ts: Option<u64>,
@@ -484,6 +487,14 @@ fn derive_task_status(steps: &[(NodeStatus, Option<u64>)]) -> TaskDisplayStatus 
         return TaskDisplayStatus::Waiting;
     }
     TaskDisplayStatus::Planned
+}
+
+/// (#3195) A step's DISPLAY status: the task rule for a task of one step.
+/// `Running` with no `started_ts` is a step admitted to its wave and still
+/// queued for its slot (`Step::started_ts`'s own doc), so it reads
+/// `Waiting`; the scheduler's word stands otherwise.
+pub(crate) fn step_display_status(status: NodeStatus, started_ts: Option<u64>) -> TaskDisplayStatus {
+    derive_task_status(&[(status, started_ts)])
 }
 
 /// (#2406, extended #2343) A phase's DISPLAY status — a superset of
@@ -1538,7 +1549,7 @@ pub fn build_mission_graph(
                             id: step.id.clone(),
                             label: resolve_step_label(&step.kind, &step.id),
                             kind: step.kind.clone(),
-                            status: step.status,
+                            status: step_display_status(step.status, step.started_ts),
                             started_ts: step.started_ts,
                             completed_ts: step.completed_ts,
                             tokens_final,
@@ -1563,7 +1574,7 @@ pub fn build_mission_graph(
                                 id: step_id.clone(),
                                 label: resolve_step_label(&kind, step_id),
                                 kind,
-                                status: NodeStatus::Planned,
+                                status: TaskDisplayStatus::Planned,
                                 started_ts: None,
                                 completed_ts: None,
                                 tokens_final,

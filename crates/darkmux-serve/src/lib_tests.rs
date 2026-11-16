@@ -7946,7 +7946,7 @@
             id: "s1".to_string(),
             label: "Dispatch".to_string(),
             kind: "dispatch.internal".to_string(),
-            status: darkmux_crew::types::NodeStatus::Running,
+            status: crate::mission_graph::TaskDisplayStatus::Running,
             started_ts: None,
             completed_ts: None,
             tokens_final: None,
@@ -7981,7 +7981,7 @@
             id: "review-probe-0-step".to_string(),
             label: "Probe".to_string(),
             kind: "dispatch.map".to_string(),
-            status: darkmux_crew::types::NodeStatus::Running,
+            status: crate::mission_graph::TaskDisplayStatus::Running,
             started_ts: None,
             completed_ts: None,
             tokens_final: None,
@@ -8481,6 +8481,13 @@
             "the phase's ONLY task is waiting, nothing is genuinely running — the phase must not \
              launder back to `running` on the persisted-status tie (#2343): {phase_node:?}"
         );
+
+        // (#3195) The step row says it too: the step waits for its slot, by
+        // the same rule as its task. The finished step keeps its own word.
+        let steps = task_node["steps"].as_array().unwrap();
+        let step_status = |id: &str| steps.iter().find(|s| s["id"] == id).map(|s| s["status"].clone());
+        assert_eq!(step_status("unit-0-collect"), Some(serde_json::json!("waiting")), "admitted, not dispatched: {steps:?}");
+        assert_eq!(step_status("unit-0-map"), Some(serde_json::json!("complete")));
     }
 
     /// (review-gate MF2a) The three production graph runners persist Step

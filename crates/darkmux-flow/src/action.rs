@@ -359,6 +359,13 @@ flow_actions! {
     RunError => Run, "run.error", Run Error;
     SessionEnd => Session, "session.end";
     StepStart => Step, "step.start";
+    /// (#3195) An admitted step waits its turn for a call slot (its
+    /// endpoint's `limits.concurrent_calls`, or its track's cap): written
+    /// when the wait starts. The step's work starts at its
+    /// `step.queue.resume`; until then it reads waiting, not running.
+    StepQueueWait => Step, "step.queue.wait";
+    /// (#3195) The waiting step took its slot: its work starts now.
+    StepQueueResume => Step, "step.queue.resume";
     StepComplete => Step, "step.complete";
     StepError => Step, "step.error";
     StepResult => Step, "step.result";

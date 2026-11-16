@@ -34,7 +34,7 @@ mod tests {
         EdgeKind, GraphEdge, GraphNode, GraphNodeStatus, MissionGraph, NodeKind, PhaseDisplayStatus, StepRow,
         TaskDisplayStatus,
     };
-    use darkmux_crew::types::{MissionStatus, NodeStatus};
+    use darkmux_crew::types::MissionStatus;
     use crate::runs::{Run, RunKind, RunStatus};
     use std::path::PathBuf;
 
@@ -241,7 +241,7 @@ mod tests {
                             id: "judge-cloud".to_string(),
                             label: "Judge".to_string(),
                             kind: "dispatch.map".to_string(),
-                            status: NodeStatus::Complete,
+                            status: TaskDisplayStatus::Complete,
                             started_ts: Some(1_785_404_428),
                             completed_ts: Some(1_785_404_600),
                             tokens_final: Some(5_000),
@@ -255,7 +255,7 @@ mod tests {
                             id: "judge-local".to_string(),
                             label: "Judge".to_string(),
                             kind: "dispatch.map".to_string(),
-                            status: NodeStatus::Complete,
+                            status: TaskDisplayStatus::Complete,
                             started_ts: Some(1_785_404_428),
                             completed_ts: Some(1_785_404_610),
                             tokens_final: Some(3_000),
@@ -272,7 +272,7 @@ mod tests {
                             id: "judge-unknown".to_string(),
                             label: "Judge".to_string(),
                             kind: "dispatch.map".to_string(),
-                            status: NodeStatus::Error,
+                            status: TaskDisplayStatus::Error,
                             started_ts: Some(1_785_404_428),
                             completed_ts: None,
                             tokens_final: Some(7_000),
@@ -287,7 +287,7 @@ mod tests {
                             id: "verify-planned".to_string(),
                             label: "Verify".to_string(),
                             kind: "dispatch.map".to_string(),
-                            status: NodeStatus::Planned,
+                            status: TaskDisplayStatus::Planned,
                             started_ts: None,
                             completed_ts: None,
                             tokens_final: None,

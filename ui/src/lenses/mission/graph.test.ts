@@ -782,6 +782,61 @@ describe("stepMeterFor wall time (#2269)", () => {
   });
 });
 
+// (#3195) A step admitted with its wave but queued for its endpoint's call
+// slot: the scheduler writes `step.queue.wait` when it is queued and
+// `step.queue.resume` when it takes the slot. It reads waiting until then,
+// and its work timer starts at the resume, not at its `step.start`.
+describe("a step queued for its call slot (#3195)", () => {
+  const T0 = Date.parse("2026-08-19T00:00:00Z");
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const at = (action: string, ms: number) => rec({ action, ts: iso(ms), handle: "b-step", session_id: "task-b", mission_id: "m1" });
+  const planned = (): MissionGraph => {
+    const g = baseGraph();
+    return { ...g, nodes: g.nodes.map((n) => (n.id === "b" ? { ...n, steps: [{ ...n.steps![0], status: "planned" as const }] } : n)) };
+  };
+  const stepStatus = (g: MissionGraph) => g.nodes.find((n) => n.id === "b")!.steps![0].status;
+  const fold = (records: NormRecord[]) => foldFlowRecords(planned(), records, indexGraph(planned()), "m1");
+  const queued = [at("step.start", T0), at("step.queue.wait", T0)];
+  const resumed = [...queued, at("step.queue.resume", T0 + 600_000), at("dispatch.start", T0 + 601_000)];
+
+  it("reads waiting from its wait until it takes the slot, then running, then its terminal", () => {
+    expect(stepStatus(fold(queued))).toBe("waiting");
+    expect(stepStatus(fold(resumed))).toBe("running");
+    expect(stepStatus(fold([...resumed, at("step.complete", T0 + 660_000)]))).toBe("complete");
+  });
+
+  it("a wait never reopens a step that already ended", () => {
+    expect(stepStatus(fold([at("step.start", T0), at("step.complete", T0 + 1_000), at("step.queue.wait", T0 + 2_000)]))).toBe("complete");
+  });
+
+  const meter = (records: NormRecord[], status: "waiting" | "running", now: number) => {
+    const idx = indexGraph(planned());
+    const metrics = records.reduce<MetricsMap>((m, r) => applyRecordToMetrics(m, r, idx, "m1"), {});
+    const step = { id: "b-step", label: "Dispatch", kind: "dispatch.single_shot", status };
+    return stepMeterFor(step, metrics, now, new Map([["b-step", "open"]]));
+  };
+
+  it("a waiting step has no start of its own until it takes the slot", () => {
+    const idx = indexGraph(planned());
+    const fold = (records: NormRecord[]) => records.reduce<MetricsMap>((m, r) => applyRecordToMetrics(m, r, idx, "m1"), {});
+    expect(fold(queued)["b-step"].startTs).toBe(0);
+    expect(fold(resumed)["b-step"].startTs).toBe(T0 + 600_000);
+  });
+
+  it("a waiting step shows no work timer, however long it has waited", () => {
+    const m = meter(queued, "waiting", T0 + 600_000);
+    expect(m.generating).toBe(false);
+    expect(m.elapsedMs).toBe(0);
+    expect(m.wallMs).toBe(0);
+  });
+
+  it("once it takes the slot, its timer counts from then, not from its admission", () => {
+    const m = meter(resumed, "running", T0 + 660_000);
+    expect(m.generating).toBe(true);
+    expect(m.elapsedMs).toBe(60_000);
+  });
+});
+
 // The meter is a projection of the step's run lifecycle (`stepPhasesAt`),
 // the rule every surface judges a run by, fed the records the graph
 // attributes to the step.
