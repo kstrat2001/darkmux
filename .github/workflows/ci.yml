@@ -419,7 +419,9 @@ jobs:
       # tail supervision, the flow status probe, the remote reader's redaction;
       # #3217's fleet window: the incremental read, the cursor check, head
       # trims and rewrites, a swapped hub, the stale arm, `/runs` from the
-      # window against a full read, and the memory budget). They skip silently
+      # window against a full read, and the memory budget; #3432's kept hub
+      # connections: connections per view refresh, a drop reopened, a failed
+      # read, another hub, a rotated password, a hub turned off). They skip silently
       # without redis, and the macOS job has none, so they run HERE with
       # DARKMUX_E2E_REQUIRED=1 (a missing redis fails them), and the step
       # fails unless every named test is reported `ok`: a filter that matches
@@ -448,6 +450,14 @@ jobs:
             a_url_with_credentials_and_a_database_still_connects
             runs_from_the_compact_window_equal_runs_from_a_full_read
             the_fleet_window_stays_inside_its_memory_budget
+            the_presence_readers_share_one_read_per_key_space
+            hub_view_refreshes_open_a_constant_number_of_connections
+            a_dropped_hub_connection_is_opened_again_and_the_read_answers
+            a_failed_read_gives_up_its_kept_connection
+            a_kept_connection_is_never_used_for_another_hub
+            a_rotated_password_stops_working_within_its_lifetime
+            a_reopened_connection_counts_its_age_from_the_reopening
+            a_hub_turned_off_closes_the_kept_connections
           )
           cargo test -p darkmux-serve -p darkmux-flow -- "${pins[@]}" 2>&1 | tee redis-pins.log
           for t in "${pins[@]}"; do
