@@ -100,16 +100,13 @@ impl Platform for LinuxPlatform {
         tiers_from_policies(read_policies_with_freq(), &online_cpus()).into_iter().map(|(_, mhz)| mhz).collect()
     }
 
-    /// The SMC's `Heatpipe Power` sensor (hwmon, Asahi's `macsmc_hwmon`):
-    /// it follows SoC load, ~2.6 W idle to ~20 W with every CPU busy on an
-    /// M2 (#3331), and there is no CPU, GPU or ANE split beside it.
-    fn package_power_mw(&self) -> Option<f64> {
-        package_mw_from_hwmon(&read_hwmon())
-    }
-
-    /// Every labeled hwmon temperature, and the fastest fan.
-    fn board_sensors(&self) -> Option<crate::BoardSensors> {
-        board_sensors_from_hwmon(&read_hwmon())
+    /// One hwmon read (#3621). Power is the SMC's `Heatpipe Power` sensor
+    /// (Asahi's `macsmc_hwmon`): it follows SoC load, ~2.6 W idle to ~20 W
+    /// with every CPU busy on an M2 (#3331), and there is no CPU, GPU or ANE
+    /// split beside it. Sensors are every labeled hwmon temperature, and the
+    /// fastest fan.
+    fn board_readings(&self) -> crate::BoardReadings {
+        board_readings_from(read_hwmon)
     }
 
     /// `/proc/<pid>/stat` field 22: the start time in clock ticks since
@@ -1018,6 +1015,22 @@ pub(crate) fn board_sensors_from_hwmon(inputs: &[HwmonInput]) -> Option<crate::B
     (!temps_c.is_empty() || fan_rpm.is_some()).then_some(crate::BoardSensors { temps_c, fan_rpm })
 }
 
+/// Power and board sensors from ONE hwmon read (#3621): `read` runs once,
+/// so a host sample pays each sensor read once, not once per answer.
+pub(crate) fn board_readings_from(read: impl FnOnce() -> Vec<HwmonInput>) -> crate::BoardReadings {
+    let inputs = read();
+    crate::BoardReadings { package_power_mw: package_mw_from_hwmon(&inputs), sensors: board_sensors_from_hwmon(&inputs) }
+}
+
+/// Whether an input is of a kind [`board_readings_from`]'s answers use:
+/// power, temperature or fan. Voltages, currents and the rest are never
+/// read: a sensor read can be a device round trip (an NVMe drive's
+/// temperature is a SMART log query), so a sample reads only what it keeps.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn hwmon_kind_is_read(sensor: &str) -> bool {
+    ["power", "temp", "fan"].iter().any(|kind| sensor.starts_with(kind))
+}
+
 /// Every `*_input` under `/sys/class/hwmon`. An input that can't be read or
 /// parsed is left out; that is what an absent sensor reads as.
 #[cfg(target_os = "linux")]
@@ -1030,7 +1043,7 @@ fn read_hwmon() -> Vec<HwmonInput> {
         let Ok(files) = std::fs::read_dir(&dir) else { continue };
         for f in files.flatten() {
             let file = f.file_name().to_string_lossy().into_owned();
-            let Some(sensor) = file.strip_suffix("_input") else { continue };
+            let Some(sensor) = file.strip_suffix("_input").filter(|s| hwmon_kind_is_read(s)) else { continue };
             let Some(value) = std::fs::read_to_string(f.path()).ok().and_then(|v| v.trim().parse().ok()) else { continue };
             let label = std::fs::read_to_string(dir.join(format!("{sensor}_label"))).ok().map(|l| l.trim().to_string());
             out.push(HwmonInput { chip: name.clone(), sensor: sensor.to_string(), label, value });

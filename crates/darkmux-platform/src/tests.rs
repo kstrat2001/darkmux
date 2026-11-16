@@ -727,17 +727,43 @@ fn a_label_two_chips_share_is_keyed_by_chip() {
     assert!(crate::linux::board_sensors_from_hwmon(&[hwmon("tas2764", "temp1", None, 31_000)]).is_none());
 }
 
+/// (#3621) One host sample reads hwmon once: power and sensors come from
+/// the same read.
+#[test]
+fn one_board_reading_reads_hwmon_once_for_power_and_sensors() {
+    let reads = std::cell::Cell::new(0);
+    let r = crate::linux::board_readings_from(|| {
+        reads.set(reads.get() + 1);
+        darkbook_hwmon()
+    });
+    assert_eq!(reads.get(), 1, "hwmon is read once per board reading");
+    assert_eq!(r.package_power_mw, Some(5001.028));
+    assert_eq!(r.sensors, crate::linux::board_sensors_from_hwmon(&darkbook_hwmon()));
+}
+
+/// (#3621) The kinds left unread are kinds no answer uses: the same inputs
+/// with every voltage and current dropped give the same board reading.
+#[test]
+fn the_hwmon_kinds_left_unread_change_no_board_reading() {
+    let mut all = darkbook_hwmon();
+    all.extend([hwmon("macsmc_hwmon", "in0", Some("Heatpipe Power"), 12_000), hwmon("macsmc_hwmon", "curr1", Some("Die"), 900)]);
+    let kept: Vec<_> = all.iter().filter(|i| crate::linux::hwmon_kind_is_read(&i.sensor)).cloned().collect();
+    assert_eq!(kept.len(), darkbook_hwmon().len(), "only the voltage and the current are left unread");
+    assert_eq!(crate::linux::board_readings_from(|| kept), crate::linux::board_readings_from(|| all));
+}
+
 #[test]
 fn this_linux_machine_reads_its_smc_power_and_sensors_if_it_has_them() {
     if std::env::consts::OS == "linux" && std::fs::read_dir("/sys/class/hwmon").is_ok_and(|d| {
         d.flatten().any(|c| std::fs::read_to_string(c.path().join("name")).is_ok_and(|n| n.trim() == "macsmc_hwmon"))
     }) {
-        let mw = LinuxPlatform.package_power_mw().expect("the SMC's heatpipe power");
+        let board = LinuxPlatform.board_readings();
+        let mw = board.package_power_mw.expect("the SMC's heatpipe power");
         assert!(mw > 0.0 && mw < 200_000.0, "{mw} mW");
-        assert!(!LinuxPlatform.board_sensors().expect("SMC sensors").temps_c.is_empty());
+        assert!(!board.sensors.expect("SMC sensors").temps_c.is_empty());
     }
-    assert!(MacPlatform.package_power_mw().is_none() && MacPlatform.board_sensors().is_none());
-    assert!(OtherPlatform.package_power_mw().is_none() && OtherPlatform.board_sensors().is_none());
+    assert_eq!(MacPlatform.board_readings(), BoardReadings::default());
+    assert_eq!(OtherPlatform.board_readings(), BoardReadings::default());
 }
 
 #[test]

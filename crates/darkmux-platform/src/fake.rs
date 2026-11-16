@@ -148,12 +148,8 @@ impl Platform for FakePlatform {
         Vec::new()
     }
 
-    fn package_power_mw(&self) -> Option<f64> {
-        None
-    }
-
-    fn board_sensors(&self) -> Option<crate::BoardSensors> {
-        None
+    fn board_readings(&self) -> crate::BoardReadings {
+        crate::BoardReadings::default()
     }
 
     fn reclaimable_memory_bytes(&self) -> Option<u64> {
