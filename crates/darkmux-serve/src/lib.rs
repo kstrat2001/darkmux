@@ -1724,6 +1724,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             darkmux_types::config_access::host_sampler_interval_ms(),
             host_sampler::ring().clone(),
             Arc::clone(&host_sampler_stop),
+            host_sampler::real_probe,
         );
         // (#3200) The dispatch-container reaper: same thread shape, and it
         // stops on the same flag.

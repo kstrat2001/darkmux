@@ -81,16 +81,10 @@ pub trait Platform: Send + Sync {
     /// [`Platform::cpu_clusters`]. Empty when the platform reports none here.
     fn cpu_cluster_mhz(&self) -> Vec<Option<u32>>;
 
-    /// (#3331) The SoC's power draw right now, in milliwatts, as one total
-    /// with no per-rail split. `None` when the platform has no such sensor,
-    /// or reads its power another way (macOS: IOReport's rails, in
-    /// darkmux-crew's probe).
-    fn package_power_mw(&self) -> Option<f64>;
-
-    /// (#3331) The board's labeled temperature sensors and its fan, for the
-    /// machine lens. Temperatures, not a thermal pressure level: a reader
-    /// must not map them onto one. `None` when the platform reports none.
-    fn board_sensors(&self) -> Option<BoardSensors>;
+    /// (#3331, #3621) The SoC's power draw and the board's labeled sensors,
+    /// for the machine lens, from one read of the board: a host sample asks
+    /// once, so a platform that answers both from one source reads it once.
+    fn board_readings(&self) -> BoardReadings;
 
     /// Bytes a model could be loaded into right now without swapping: what
     /// is free plus what the OS hands back on demand. The doctor's `RAM
@@ -463,6 +457,20 @@ pub struct BatteryReading {
     pub current_ma: Option<i64>,
     /// The OS's time-to-empty estimate; `None` when it has none.
     pub minutes_to_empty: Option<u32>,
+}
+
+/// One reading of the board's power and sensors ([`Platform::board_readings`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BoardReadings {
+    /// The SoC's power draw right now, in milliwatts, as one total with no
+    /// per-rail split. `None` when the platform has no such sensor, or reads
+    /// its power another way (macOS: IOReport's rails, in darkmux-crew's
+    /// probe).
+    pub package_power_mw: Option<f64>,
+    /// The board's labeled temperatures and its fan. Temperatures, not a
+    /// thermal pressure level: a reader must not map them onto one. `None`
+    /// when the platform reports none.
+    pub sensors: Option<BoardSensors>,
 }
 
 /// The board's sensors as the OS labels them.
