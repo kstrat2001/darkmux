@@ -1452,6 +1452,13 @@ pub struct MapItemResult {
     /// different from one that never needed to retry at all.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub retried: u32,
+    /// (#3445) The item's last attempt replied but stopped at the cap with no
+    /// answer, so the item failed though its call was made and its tokens
+    /// spent. Read by the item's terminal, which keeps that call's turn and
+    /// counts as a single-shot dispatch's cap failure does; never part of the
+    /// step's output.
+    #[serde(skip)]
+    pub stopped_at_cap: bool,
 }
 
 fn u32_is_zero(n: &u32) -> bool {
@@ -1649,7 +1656,9 @@ fn resolve_map_collection(
 ///
 /// **`retry_on_empty` (#1442, the generic port of the probe stage's
 /// retry-on-empty loop).** Default `0` (off) — a call whose trimmed content
-/// comes back empty is accepted as-is (`ok: true`, empty `content`). When set
+/// comes back empty is accepted as-is (`ok: true`, empty `content`), unless
+/// (#3445) it stopped at `max_tokens` with no answer, which fails the item
+/// (`ok: false`, an error naming the cap and `max_tokens`). When set
 /// to `N > 0`, an empty-content reply is RE-DISPATCHED up to `N` additional
 /// times (so `N = 1` matches the review probe's historical single retry: up
 /// to 2 attempts total), stopping early the moment a non-empty reply lands.
@@ -1752,8 +1761,9 @@ impl DispatchMapStepKind {
     }
 
     /// The terminal of one item's execution (see [`ExecutionBookends`]):
-    /// `dispatch.complete` for an item that produced a reply, `dispatch.error`
-    /// for one that did not.
+    /// `dispatch.complete` for an ok item, `dispatch.error` for a failed one
+    /// (no reply, or #3445 a last reply that stopped at the cap with no
+    /// answer).
     fn item_terminal(records: &ExecutionBookends<'_>, res: &MapItemResult) -> darkmux_flow::FlowRecord {
         let tokens = crate::dispatch_envelope::DirectTokens {
             prompt_tokens: res.prompt_tokens,
@@ -1762,9 +1772,15 @@ impl DispatchMapStepKind {
             reasoning_tokens: res.reasoning_tokens,
             cached_tokens: res.cached_tokens,
         };
-        // A reply is one turn with its own counts; an item that produced none took none.
+        // A reply is one turn with its own counts; an item that produced none
+        // took none. (#3445) A reply that stopped at the cap with no answer
+        // is a failed execution that still took its turn and spent its
+        // counts, with no exit code, as `close_answered_call`'s is.
+        let replied = crate::dispatch_internal::single_call_complete(&tokens, res.wall_ms, res.content.chars().count() as u64);
         let base = if res.ok {
-            crate::dispatch_internal::single_call_complete(&tokens, res.wall_ms, res.content.chars().count() as u64)
+            replied
+        } else if res.stopped_at_cap {
+            DispatchEndPayload { exit_code: None, ..replied }
         } else {
             DispatchEndPayload { wall_ms: Some(res.wall_ms), ..DispatchEndPayload::new(0) }
         };
@@ -2465,6 +2481,19 @@ fn map_item_token_payload(
 /// dispatch) never pay it.
 const RETRY_ON_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// (#3445) The failure of a map attempt that stopped at the item's
+/// `max_tokens` with no answer
+/// ([`SingleShotReply::hit_cap_with_no_answer`](crate::single_shot::SingleShotReply::hit_cap_with_no_answer)),
+/// naming the cap and the step's knob, as a single-shot dispatch names its
+/// own; `None` for any other reply. An item whose last attempt is this failed:
+/// it is not the "dispatched, said nothing" empty success.
+fn cap_hit_failure(reply: &crate::single_shot::SingleShotReply, max_tokens: u32) -> Option<String> {
+    reply.hit_cap_with_no_answer().then(|| {
+        let raise = "set `max_tokens` in the `dispatch.map` step's config";
+        format!("{:#}", crate::dispatch_internal::cap_hit_error(max_tokens, reply.counts.completion, raise))
+    })
+}
+
 /// (#1442) One LOCAL map item — dispatch, with the generic `retry_on_empty`
 /// loop (default 0/off) and the `retry_on_error` loop (#1605, default
 /// 0/off). Tokens accumulate across every attempt; the loop stops early on
@@ -2496,7 +2525,8 @@ fn map_local_item(
     let mut error_budget = retry_on_error;
     let mut error_retries_used = 0u32;
     let mut last_error: Option<String> = None;
-    loop {
+    // (#3445) The loop ends with the last attempt's cap failure, if it was one.
+    let capped = loop {
         // (#3035) A managed endpoint's window gate, then this item's dispatch
         // cap reservation, before every attempt. Only a run stopped during a
         // wait (or limits that cannot be used) ends the item, with nothing sent.
@@ -2563,7 +2593,7 @@ fn map_local_item(
                 }
                 // Empty content — retry (until the budget is spent).
                 if empty_budget == 0 {
-                    break;
+                    break cap_hit_failure(&reply, max_tokens);
                 }
                 empty_budget -= 1;
             }
@@ -2600,19 +2630,23 @@ fn map_local_item(
                 std::thread::sleep(RETRY_ON_ERROR_BACKOFF);
             }
         }
-    }
+    };
     // (#3074) Reaching here means no attempt produced content. When no
     // attempt errored, every one came back empty: the item DISPATCHED (ok),
-    // produced no usable content, and its whole spend is billed (the
-    // reasoning-guillotine case the probe stage's retry loop already
-    // handled). When an earlier attempt errored and the retry came back
+    // produced no usable content, and its whole spend is billed. (#3445)
+    // Unless the last attempt stopped at the cap with no answer (the
+    // reasoning model that spent the cap thinking): that item failed, naming
+    // the cap. When an earlier attempt errored and the retry came back
     // empty, `ok` is a claim about what happened, so the item reports that
     // error instead of an empty success (the hosted sibling's rule, #1605).
+    let stopped_at_cap = capped.is_some();
+    let error = capped.or(last_error);
     MapItemResult {
         index,
-        ok: last_error.is_none(),
+        ok: error.is_none(),
+        stopped_at_cap,
         content: String::new(),
-        error: last_error,
+        error,
         served_model: None,
         wall_ms,
         retried: error_retries_used,
@@ -2691,7 +2725,8 @@ fn map_hosted_item(
             };
         }
     };
-    loop {
+    // (#3445) The loop ends with the last attempt's cap failure, if it was one.
+    let capped = loop {
         // (#2902 step 5, #3035) The endpoint's window gate. It may warn or,
         // under `wait`, hold; only a run stopped during a wait (or limits
         // that cannot be used) returns here, and then nothing is sent.
@@ -2749,7 +2784,7 @@ fn map_hosted_item(
                 }
                 // Empty content: retry, when `retry_on_empty` allows.
                 if empty_budget == 0 {
-                    break;
+                    break cap_hit_failure(&reply, clamped);
                 }
                 empty_budget -= 1;
             }
@@ -2788,15 +2823,20 @@ fn map_hosted_item(
                 std::thread::sleep(RETRY_ON_ERROR_BACKOFF);
             }
         }
-    }
+    };
     // (#1605 QA finding) `ok` is a claim about what actually happened. An
     // item that reaches here after an errored attempt (an error retry that
-    // came back empty) must report that error, not an empty success.
+    // came back empty) must report that error, not an empty success, and
+    // (#3445) one whose last attempt stopped at the cap with no answer
+    // reports that.
+    let stopped_at_cap = capped.is_some();
+    let error = capped.or(last_error);
     MapItemResult {
         index,
-        ok: last_error.is_none(),
+        ok: error.is_none(),
+        stopped_at_cap,
         content: String::new(),
-        error: last_error,
+        error,
         served_model,
         wall_ms,
         retried: error_retries_used,
@@ -5331,6 +5371,166 @@ mod tests {
         assert_eq!(out.index, 3, "{out:?}");
     }
 
+    /// A reply that stopped at the item's cap: `finish_reason: "length"`,
+    /// `content` as given, `completion` tokens spent.
+    fn capped_reply(content: &str, completion: u64) -> crate::single_shot::SingleShotReply {
+        crate::single_shot::SingleShotReply {
+            content: content.to_string(),
+            model: None,
+            counts: darkmux_trajectory::UsageCounts { completion: Some(completion), ..Default::default() },
+            finish_reason: Some("length".to_string()),
+        }
+    }
+
+    /// (#3445) A LOCAL map item whose every attempt stopped at its
+    /// `max_tokens` with no answer failed: it is not the "dispatched, said
+    /// nothing" empty success, and its error names the cap and the step's
+    /// knob. `retry_on_empty` still retries it first.
+    #[test]
+    fn a_local_item_that_stops_at_its_cap_with_no_answer_fails_naming_max_tokens() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            *seen.lock().unwrap() += 1;
+            Ok(capped_reply("", 100))
+        });
+        let out = map_local_item(3, "m", "sys", "user", 0.0, 100, 5, 1, 0, Some(&ovr), &mut Vec::new(), None);
+        assert!(!out.ok && out.content.is_empty(), "{out:?}");
+        let error = out.error.as_deref().unwrap_or_default();
+        assert!(error.contains("output cap of 100") && error.contains("`max_tokens`"), "{error}");
+        assert_eq!(*calls.lock().unwrap(), 2, "retry_on_empty retried it once first");
+        assert_eq!(out.completion_tokens, Some(200), "both attempts' spend is kept");
+        assert!(out.stopped_at_cap, "its terminal keeps the spent call's turn and counts: {out:?}");
+    }
+
+    /// (#3445) The HOSTED sibling: the same failure, the same remedy.
+    #[test]
+    fn a_hosted_item_that_stops_at_its_cap_with_no_answer_fails_naming_max_tokens() {
+        let bucket = Arc::new(Mutex::new(DispatchBudget::new(None, darkmux_types::BudgetPolicy::Warn)));
+        // Not the 4096 default: the error names the cap this item was given.
+        let ovr: MapDispatchOverride = Arc::new(|_call: &OverrideDispatchCall<'_>| Ok(capped_reply(" \n", 2_048)));
+        let out = map_hosted_item(
+            0, &bucket, &map_ep(), "gpt-5.1", "sys", "user", 2_048, 1, 0, 0, Some(&ovr),
+            &mut Vec::new(), "s1", &crate::budget::tests::solo_caller(),
+        );
+        assert!(!out.ok, "{out:?}");
+        let error = out.error.as_deref().unwrap_or_default();
+        assert!(error.contains("output cap of 2048") && error.contains("`max_tokens`"), "{error}");
+        assert!(out.stopped_at_cap, "its terminal keeps the spent call's turn and counts: {out:?}");
+    }
+
+    /// An override whose first call errors and whose retry stops at the cap
+    /// of 300 with no answer.
+    fn errored_then_capped() -> MapDispatchOverride {
+        let calls = Arc::new(Mutex::new(0usize));
+        Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            let mut n = calls.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                anyhow::bail!("transport refused the draw")
+            }
+            Ok(capped_reply("", 300))
+        })
+    }
+
+    /// (#3445) An item whose first attempt errored and whose `retry_on_error`
+    /// retry stopped at the cap with no answer reports the cap, not the
+    /// earlier transport error: the cap is how its last attempt failed, and
+    /// raising `max_tokens` is what fixes it. Local and hosted alike.
+    #[test]
+    fn an_errored_then_capped_item_names_the_cap_not_the_earlier_error() {
+        let assert_names_the_cap = |out: &MapItemResult| {
+            assert!(!out.ok, "{out:?}");
+            let error = out.error.as_deref().unwrap_or_default();
+            assert!(error.contains("output cap of 300") && error.contains("`max_tokens`"), "{error}");
+            assert!(!error.contains("transport refused"), "{error}");
+        };
+        let ovr = errored_then_capped();
+        assert_names_the_cap(&map_local_item(0, "m", "sys", "user", 0.0, 300, 5, 0, 1, Some(&ovr), &mut Vec::new(), None));
+        let bucket = Arc::new(Mutex::new(DispatchBudget::new(None, darkmux_types::BudgetPolicy::Warn)));
+        let ovr = errored_then_capped();
+        assert_names_the_cap(&map_hosted_item(
+            0, &bucket, &map_ep(), "gpt-5.1", "sys", "user", 300, 1, 0, 1, Some(&ovr),
+            &mut Vec::new(), "s1", &crate::budget::tests::solo_caller(),
+        ));
+    }
+
+    /// (#3445) The inverted cases: a capped attempt whose retry answered is
+    /// an ok item, a reply cut off at the cap WITH an answer in it is ok, and
+    /// an empty reply the model ended itself (`stop`) stays the ok empty item.
+    #[test]
+    fn a_capped_item_that_answered_on_retry_or_partly_stays_ok() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            let mut n = seen.lock().unwrap();
+            *n += 1;
+            Ok(capped_reply(if *n == 1 { "" } else { "partial answer" }, 100))
+        });
+        let out = map_local_item(0, "m", "sys", "user", 0.0, 100, 5, 1, 0, Some(&ovr), &mut Vec::new(), None);
+        assert!(out.ok && out.error.is_none() && out.content == "partial answer", "{out:?}");
+
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            let mut n = seen.lock().unwrap();
+            *n += 1;
+            let mut reply = capped_reply("", 100);
+            if *n == 2 {
+                reply.finish_reason = Some("stop".to_string());
+            }
+            Ok(reply)
+        });
+        let out = map_local_item(0, "m", "sys", "user", 0.0, 100, 5, 1, 0, Some(&ovr), &mut Vec::new(), None);
+        assert!(out.ok && out.error.is_none() && out.content.is_empty(), "the last attempt decides: {out:?}");
+    }
+
+    /// (#3445) A map whose every item stopped at the cap with no answer is an
+    /// errored step, never a clean one: each item's terminal is
+    /// `dispatch.error` naming the cap, and no `dispatch.complete` is written.
+    #[test]
+    fn dispatch_map_whose_items_all_hit_the_cap_with_no_answer_errors_the_step() {
+        let ovr: MapDispatchOverride = Arc::new(|_call: &OverrideDispatchCall<'_>| Ok(capped_reply("", 64)));
+        let s = map_step(json!({
+            "model": "qwen3-4b",
+            "user_template": "check {item}",
+            "collection": ["a", "b"],
+            "max_tokens": 64,
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = StepRunCtx::new(crate::test_run(), Some(tx), Some(ovr), std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()));
+        let result = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx);
+        drop(ctx);
+        let msg = format!("{:#}", result.expect_err("no item answered, so the step errors"));
+        assert!(msg.contains("all 2 item(s) failed") && msg.contains("output cap of 64"), "{msg}");
+        let emitted: Vec<darkmux_flow::FlowRecord> = rx
+            .into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let count = |a: darkmux_flow::FlowAction| emitted.iter().filter(|r| r.action == a).count();
+        assert_eq!(count(darkmux_flow::FlowAction::DispatchComplete), 0, "{emitted:?}");
+        let errors: Vec<_> = emitted.iter().filter(|r| r.action == darkmux_flow::FlowAction::DispatchError).collect();
+        assert_eq!(errors.len(), 2, "{emitted:?}");
+        assert!(
+            errors.iter().all(|r| r.payload_json()["error"].as_str().is_some_and(|e| e.contains("output cap of 64"))),
+            "each terminal names the cap: {errors:?}"
+        );
+        // The call was made and its tokens spent: like a single-shot cap
+        // failure, the terminal keeps its one turn and its counts, and no
+        // exit code (a failed execution has none).
+        for r in &errors {
+            let p = r.payload_json();
+            assert_eq!(p["total_turns"], 1, "{p}");
+            assert_eq!(p["completion_tokens"], 64, "{p}");
+            assert_eq!(p["result_class"], "error", "{p}");
+            assert!(p.get("exit_code").is_none_or(|c| c.is_null()), "{p}");
+        }
+        assert_eq!(count(darkmux_flow::FlowAction::TelemetryTokens), 2, "each spent call keeps its usage record: {emitted:?}");
+    }
+
     /// A named endpoint with a 1-token daily budget under `policy`.
     fn budgeted_ep(policy: &str) -> darkmux_types::ModelEndpoint {
         let mut ep: darkmux_types::ModelEndpoint = serde_json::from_value(json!({
@@ -5896,6 +6096,7 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
         }];
         let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", false, &results);
         assert_eq!(
@@ -5965,6 +6166,7 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("a reply with usage emits a record")).unwrap();
         assert_eq!(payload["total_tokens"], 4547);
@@ -5992,6 +6194,7 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&local, "m", "ep").expect("emits")).unwrap();
         assert_eq!(payload["index"], 3, "which item of the fan-out this was");
@@ -6017,6 +6220,7 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
         };
         let execution = ExecutionId::mint();
         let rec = DispatchMapStepKind::item_record(&task_session(), &execution, &step, "m", false, &res);
@@ -6043,6 +6247,7 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
         };
         let tok = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("emits")).unwrap();
         let item = DispatchMapStepKind::item_record(&task_session(), &ExecutionId::mint(), &step, "m", false, &res);
@@ -6072,6 +6277,7 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("a reply with usage emits a record")).unwrap();
         assert_eq!(payload["reasoning_tokens"], 1024);
@@ -6101,6 +6307,7 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("emits")).unwrap();
         assert_eq!(payload["reasoning_tokens"], 300);
@@ -6180,6 +6387,7 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("a total alone still emits")).unwrap();
         assert_eq!(payload["total_tokens"], 1521);
@@ -6207,6 +6415,7 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("a split alone still emits")).unwrap();
         assert_eq!(payload["total_tokens"], 42, "arithmetic on reported parts, not fabrication");
@@ -6239,9 +6448,9 @@ mod tests {
         // mission graph's max-fold token meter reads as the step's true
         // spend (any per-item value is <= the sum).
         let results = vec![
-            MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(100), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
-            MapItemResult { index: 1, ok: false, content: String::new(), error: Some("boom".to_string()), total_tokens: None, prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
-            MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
+            MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(100), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false },
+            MapItemResult { index: 1, ok: false, content: String::new(), error: Some("boom".to_string()), total_tokens: None, prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false },
+            MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false },
         ];
         let s = map_step(json!({}));
         let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", true, &results);
@@ -6257,7 +6466,7 @@ mod tests {
             "any failed item raises the level"
         );
 
-        let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 }];
+        let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false }];
         let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", false, &clean);
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
         assert_eq!(rec.payload_json()["unmanaged"], false);
@@ -6277,6 +6486,7 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
         }
     }
 
