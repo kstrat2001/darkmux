@@ -1700,13 +1700,12 @@ mod tests {
 
             // Let the sampler land its first (idle, 10x-cadence) emission —
             // confirms it has settled into steady idle state — before the
-            // dispatch appears.
-            let _first = wait_for_n_machine_telemetry_records(flows_dir, 1, Duration::from_secs(5));
+            // dispatch appears. The deadline is only a hang guard.
+            let _first = wait_for_n_machine_telemetry_records(flows_dir, 1, Duration::from_secs(60));
 
             // A dispatch appears right after.
             let day_path = flows_dir.join(format!("{}.jsonl", darkmux_flow::day_utc_now()));
             let live_start = darkmux_flow::ts_utc_now();
-            let appeared_at = Instant::now();
             {
                 use std::io::Write;
                 let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&day_path).unwrap();
@@ -1721,47 +1720,51 @@ mod tests {
                 )
                 .unwrap();
             }
+            // Stamped once the line is written: a tick before this moment
+            // may not have seen the dispatch yet, so none is counted.
+            let appeared_at_ms = darkmux_crew::host_probe::epoch_ms_now();
 
-            // The next emission after the dispatch appears must land well
-            // under the OLD idle cadence (10x interval = 500ms) — with the
-            // per-tick re-probe it lands within roughly 1-2 ticks.
-            let deadline = Duration::from_secs(5);
-            let poll_start = Instant::now();
-            let mut waited = None;
-            loop {
-                if let Ok(text) = std::fs::read_to_string(&day_path) {
-                    let count = text
-                        .lines()
-                        .filter(|l| {
-                            serde_json::from_str::<serde_json::Value>(l)
-                                .ok()
-                                .and_then(|v| v.get("action").and_then(|a| a.as_str().map(str::to_string)))
-                                .as_deref()
-                                == Some("machine.telemetry")
-                        })
-                        .count();
-                    if count >= 2 {
-                        waited = Some(appeared_at.elapsed());
-                        break;
-                    }
+            // (#2823) The first emission sampled after the dispatch appeared.
+            // How soon it came is counted in the sampler's own TICKS (ring
+            // entries, each stamped on the same clock as the emission), not
+            // in wall-clock time, so a loaded host that slows every tick
+            // cannot fail it, and an observer starved for a while cannot
+            // either. The deadline is only a hang guard.
+            let hang_guard = Instant::now() + Duration::from_secs(60);
+            let emitted_at_ms = loop {
+                let after = emissions_sampled_after(&day_path, appeared_at_ms);
+                if let Some(&at) = after.first() {
+                    break at;
                 }
-                if poll_start.elapsed() > deadline {
-                    break;
-                }
+                assert!(Instant::now() < hang_guard, "no emission landed after the dispatch appeared");
                 std::thread::sleep(Duration::from_millis(5));
-            }
+            };
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap();
 
-            let waited = waited.expect("a second emission landed after the dispatch appeared");
-            // Generous slack for scheduler jitter, but well short of the
-            // pre-fix ~500ms (10x interval) an idle-cadence wait would take.
+            let ticks = ring.inner.lock().unwrap().iter().filter(|e| e.at_ms > appeared_at_ms && e.at_ms <= emitted_at_ms).count();
+            // Re-probed every tick, the first tick to start after the
+            // dispatch appeared emits. Probed only before an idle emission
+            // (the pre-fix scheme), it would wait out up to
+            // `IDLE_EMIT_MULTIPLIER` ticks.
             assert!(
-                waited <= Duration::from_millis(interval_ms * 6),
-                "expected the next emission within a few intervals of the dispatch appearing \
-                 (pre-fix this would wait out the whole idle 10x window, ~500ms), took {waited:?}"
+                ticks <= 2,
+                "expected the next emission within a couple of ticks of the dispatch appearing \
+                 (an idle-cadence wait takes up to {IDLE_EMIT_MULTIPLIER}), took {ticks}"
             );
         });
+    }
+
+    /// The `sampled_at_ms` of each `machine.telemetry` record in `day_path`
+    /// sampled after `after_ms`, in file order.
+    fn emissions_sampled_after(day_path: &std::path::Path, after_ms: u64) -> Vec<u64> {
+        let text = std::fs::read_to_string(day_path).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["action"] == "machine.telemetry")
+            .filter_map(|v| v["payload"]["sampled_at_ms"].as_u64())
+            .filter(|&at| at > after_ms)
+            .collect()
     }
 
     #[serial_test::serial]
