@@ -233,12 +233,8 @@ pub(crate) fn move_out(root: &Path, rel: &str, to: &Path, to_dir: &str, to_name:
         return Ok(false);
     }
     let into = open_at(open_root(to)?.as_raw_fd(), OsStr::new(to_dir), libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-    let (from, onto) = (cstr(&name)?, cstr(OsStr::new(to_name))?);
-    // SAFETY: two valid NUL-terminated names, each in a folder we hold open.
-    match unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), into.as_raw_fd(), onto.as_ptr()) } {
-        0 => Ok(true),
-        _ => Err(io::Error::last_os_error()),
-    }
+    rename_between(&dir, &name, &into, OsStr::new(to_name))?;
+    Ok(true)
 }
 
 /// Creates the new file `rel` inside `root` with permission bits `mode`;
@@ -456,9 +452,15 @@ fn regular_at(dir: &OwnedFd, name: &OsStr) -> io::Result<File> {
 
 /// `renameat(dir, from, dir, to)`: names in one folder, neither followed.
 fn rename_in(dir: &OwnedFd, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    rename_between(dir, from, dir, to)
+}
+
+/// `renameat(from_dir, from, to_dir, to)`: each name in a folder we hold
+/// open, neither followed.
+fn rename_between(from_dir: &OwnedFd, from: &OsStr, to_dir: &OwnedFd, to: &OsStr) -> io::Result<()> {
     let (from, to) = (cstr(from)?, cstr(to)?);
-    // SAFETY: valid NUL-terminated names and an fd we own.
-    match unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) } {
+    // SAFETY: valid NUL-terminated names and fds we own.
+    match unsafe { libc::renameat(from_dir.as_raw_fd(), from.as_ptr(), to_dir.as_raw_fd(), to.as_ptr()) } {
         0 => Ok(()),
         _ => Err(io::Error::last_os_error()),
     }
@@ -763,5 +765,24 @@ mod tests {
         std::os::unix::fs::symlink(&outside, base.join("aside")).unwrap();
         assert!(move_out(&root, "nm", &base, "aside", "one").is_err(), "moved through the link");
         assert!(root.join("nm").exists() && !outside.join("one").exists());
+    }
+
+    /// `move_out` fails, leaving the entry where it was, when the
+    /// destination base is missing (refused before any rename) or when the
+    /// rename itself is refused because the new name is a folder with files.
+    #[test]
+    fn move_out_fails_in_place_when_the_destination_cannot_take_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, base) = (dir.path().join("w"), dir.path().join("base"));
+        for d in [root.join("nm"), base.join("aside/taken")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(base.join("aside/taken/f"), "x").unwrap();
+        let missing = dir.path().join("missing");
+        assert!(move_out(&root, "nm", &missing, "aside", "one").is_err(), "no destination base");
+        let err = move_out(&root, "nm", &base, "aside", "taken").unwrap_err();
+        // POSIX lets rename onto a non-empty folder say either.
+        assert!(matches!(err.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST)), "{err}");
+        assert!(root.join("nm").is_dir() && base.join("aside/taken/f").exists());
     }
 }
