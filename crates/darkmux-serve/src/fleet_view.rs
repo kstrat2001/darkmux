@@ -803,9 +803,7 @@ impl FleetSources for ProcessSources {
     }
 
     fn hub_time_ms(&self) -> Option<u64> {
-        let url = darkmux_flow::redis_url()?;
-        let client = redis::Client::open(url.expose_for_probe()).ok()?;
-        darkmux_flow::presence::read_hub_time_ms(&client).ok()
+        crate::hub_time_ms(&darkmux_flow::redis_url()?)
     }
 
     fn local_card(&self) -> MachineCard {

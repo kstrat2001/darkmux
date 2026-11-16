@@ -461,6 +461,9 @@ struct StreamWindow {
 pub(crate) struct FleetCaches {
     windows: Mutex<FleetWindows>,
     settled: std::sync::Condvar,
+    /// (#3432) The connection its refreshes read the hub on, kept between
+    /// them.
+    conn: crate::hub_conn::KeptHubConnection,
 }
 
 #[derive(Default)]
@@ -582,6 +585,7 @@ pub(crate) fn read_fleet_cached(
     let settle = Settle(caches);
     let attempt = std::time::Instant::now();
     let result = refresh(
+        &caches.conn,
         url.expose_for_probe(),
         scope,
         now,
@@ -662,20 +666,22 @@ impl Drop for Settle<'_> {
 
 /// Bring the streams `scope` covers up to date, on the caller's copies.
 fn refresh(
+    kept: &crate::hub_conn::KeptHubConnection,
     url: &str,
     scope: FleetScope,
     now: SystemTime,
     work: &mut StreamWindow,
     telemetry: &mut StreamWindow,
 ) -> anyhow::Result<()> {
-    let mut conn = crate::bounded_redis_connection(url, "the fleet window")?;
-    let work_stream = darkmux_types::config_access::redis_stream(); // (#875)
-    refresh_stream(&mut conn, work, url, &work_stream, now)?;
-    if scope == FleetScope::WithSamples {
-        let telemetry_stream = darkmux_types::config_access::redis_telemetry_stream(); // (#2101)
-        refresh_stream(&mut conn, telemetry, url, &telemetry_stream, now)?;
-    }
-    Ok(())
+    kept.read(url, "the fleet window", |conn| {
+        let work_stream = darkmux_types::config_access::redis_stream(); // (#875)
+        refresh_stream(conn, work, url, &work_stream, now)?;
+        if scope == FleetScope::WithSamples {
+            let telemetry_stream = darkmux_types::config_access::redis_telemetry_stream(); // (#2101)
+            refresh_stream(conn, telemetry, url, &telemetry_stream, now)?;
+        }
+        Ok(())
+    })
 }
 
 impl FleetWindows {

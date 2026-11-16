@@ -79,6 +79,7 @@ mod redaction_stream;
 /// for the full attribution → roster → presence → fetch decision chain.
 mod peer_graph;
 mod fleet_window;
+mod hub_conn;
 mod flow_window;
 mod day_index;
 mod host_gate;
@@ -1011,20 +1012,11 @@ fn read_presence_beats<T, F>(
     read: F,
 ) -> (Vec<T>, source_state::SourceState)
 where
-    F: FnOnce(&redis::Client) -> Result<Vec<T>, anyhow::Error>,
+    F: FnOnce(&darkmux_flow::RawRedisUrl) -> Result<Vec<T>, anyhow::Error>,
 {
-    // Never interpolate the url into a log (#661 Slice 5) — it can carry an
+    // Never interpolate the url into a log (#661 Slice 5): it can carry an
     // inline password. `kind` is the non-secret context.
-    let client = match redis::Client::open(url.expose_for_probe()) {
-        Ok(c) => c,
-        Err(e) => {
-            if log {
-                eprintln!("darkmux serve: live-{kind} presence — opening the Redis client failed ({e})");
-            }
-            return (Vec::new(), source_state::SourceState::Unavailable { detail: PRESENCE_READ_FAILED });
-        }
-    };
-    match read(&client) {
+    match read(url) {
         Ok(beats) => (beats, source_state::SourceState::Ok),
         Err(e) => {
             if log {
@@ -1079,7 +1071,7 @@ fn shared_presence<T: Clone>(
     url: &darkmux_flow::RawRedisUrl,
     kind: &str,
     how: PresenceRead,
-    read: impl FnOnce(&redis::Client) -> Result<Vec<T>, anyhow::Error>,
+    read: impl FnOnce(&darkmux_flow::RawRedisUrl) -> Result<Vec<T>, anyhow::Error>,
 ) -> (Vec<T>, source_state::SourceState) {
     let hub = *blake3::hash(url.expose_for_probe().as_bytes()).as_bytes();
     let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
@@ -1106,13 +1098,32 @@ fn shared_presence<T: Clone>(
 /// The live machines' beats, shared ([`shared_presence`]).
 pub(crate) fn machine_beats(url: &darkmux_flow::RawRedisUrl, how: PresenceRead) -> (Vec<darkmux_flow::presence::PresenceBeat>, source_state::SourceState) {
     static SLOT: PresenceSlot<darkmux_flow::presence::PresenceBeat> = std::sync::Mutex::new(None);
-    shared_presence(&SLOT, url, "machines", how, darkmux_flow::presence::read_live)
+    shared_presence(&SLOT, url, "machines", how, |url| {
+        on_presence_connection(url, "live-machines presence", darkmux_flow::presence::read_live_on)
+    })
 }
 
 /// The live sessions' beats, shared ([`shared_presence`]).
 pub(crate) fn session_beats(url: &darkmux_flow::RawRedisUrl, how: PresenceRead) -> (Vec<darkmux_flow::session_presence::SessionBeat>, source_state::SourceState) {
     static SLOT: PresenceSlot<darkmux_flow::session_presence::SessionBeat> = std::sync::Mutex::new(None);
-    shared_presence(&SLOT, url, "sessions", how, darkmux_flow::session_presence::read_live_sessions)
+    shared_presence(&SLOT, url, "sessions", how, |url| {
+        on_presence_connection(url, "live-sessions presence", darkmux_flow::session_presence::read_live_sessions_on)
+    })
+}
+
+/// `read` on the connection the daemon's presence and hub-clock reads keep
+/// (#3432: each read opened its own).
+fn on_presence_connection<T>(
+    url: &darkmux_flow::RawRedisUrl,
+    what: &str,
+    read: impl FnMut(&mut redis::Connection) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    hub_conn::PRESENCE_READS.read(url.expose_for_probe(), what, read)
+}
+
+/// The hub's clock (`TIME`), for the fleet view's clock skews.
+pub(crate) fn hub_time_ms(url: &darkmux_flow::RawRedisUrl) -> Option<u64> {
+    on_presence_connection(url, "the hub clock", darkmux_flow::presence::hub_time_ms_on).ok()
 }
 
 /// The session and mission ids with a live beat right now (a mission's own
