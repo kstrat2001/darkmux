@@ -3678,7 +3678,7 @@ mod tests {
         let serving = (0..200).any(|_| {
             let created = emu.specs.lock().unwrap().len() > before;
             let status = previews.status("w").unwrap().status;
-            let serving = created && status != "installing" && log_has(log, SERVING_LINE);
+            let serving = created && matches!(status.as_str(), "starting" | "ready") && log_has(log, SERVING_LINE);
             if !serving {
                 std::thread::sleep(Duration::from_millis(25));
             }

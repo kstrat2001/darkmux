@@ -294,7 +294,7 @@ fn a_backend_switch_reinstalls_saying_what_it_deleted() {
         // recorded before the preview reads as starting.
         let serving = (0..400).any(|_| {
             let created = seatbelt.specs.lock().unwrap().len() >= want_spec;
-            let serving = created && previews.status("w").unwrap().status != "installing" && log_has(&log, SERVING_LINE);
+            let serving = created && matches!(previews.status("w").unwrap().status.as_str(), "starting" | "ready") && log_has(&log, SERVING_LINE);
             if !serving {
                 std::thread::sleep(Duration::from_millis(25));
             }
