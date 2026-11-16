@@ -1791,14 +1791,16 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let handle = spawn(50, ring.clone(), Arc::clone(&stop)).unwrap();
 
-            // Give the sampler well past the IDLE emission threshold
-            // (`IDLE_EMIT_MULTIPLIER` x the 50ms base interval = 500ms
-            // nominal — measured in practice as needing real headroom:
-            // each tick's own work pushes real per-tick wall-clock
-            // noticeably above the nominal 50ms, so far fewer than the
-            // nominal 10 ticks land in a short sleep). 3s is comfortably
-            // past the threshold either way, and still fast enough not to
-            // slow the suite.
+            // (#2786) The window is counted in TICKS, not wall-clock: the
+            // test waits until the sampler has finished
+            // `IDLE_EMIT_MULTIPLIER` ticks (each tick pushes one ring entry
+            // after its emit decision), the point by which a sampler that
+            // held the lock would have emitted. A fixed 3s sleep made both
+            // claims below hostage to scheduling: with ~10 sibling samplers
+            // starving the probe, no tick landed in the window, so the ring
+            // was empty (failing every first try under a full-crate run)
+            // and the no-emission check passed without the threshold ever
+            // being reached. The deadline is only a hang guard.
             //
             // (#2475) A real dispatch holder keeps this lock fresh by
             // heartbeating every tick. An earlier round of this fixture
@@ -1828,7 +1830,7 @@ mod tests {
             //
             //   * Freshness is STRUCTURAL, not maintained. The declared
             //     interval is 60s, so this holder's own staleness threshold
-            //     (3x = 180s) outlives the 3s window by 60x with no
+            //     (3x = 180s) outlives the ten 50ms ticks waited for with no
             //     refreshing whatsoever — which is what the `other_pid`
             //     comment above already said before the refresh loop was
             //     layered on top of it.
@@ -1843,7 +1845,11 @@ mod tests {
             // detect.
             let lock_path_at_acquire = darkmux_types::config_access::host_sampler_lock_path();
             let home_at_acquire = std::env::var("DARKMUX_HOME").ok();
-            std::thread::sleep(Duration::from_millis(3000));
+            let ticks = || ring.inner.lock().unwrap().len();
+            let hang_guard = Instant::now() + Duration::from_secs(60);
+            while ticks() < IDLE_EMIT_MULTIPLIER as usize && Instant::now() < hang_guard {
+                std::thread::sleep(Duration::from_millis(20));
+            }
 
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap();
@@ -1905,9 +1911,13 @@ mod tests {
                 same_path = darkmux_types::config_access::host_sampler_lock_path() == lock_path_at_acquire,
                 now_home = std::env::var("DARKMUX_HOME").ok(),
             );
-            // Still samples its OWN ring regardless (the ring is
-            // unconditional, per the issue's own rule).
-            assert!(ring.snapshot_json().is_some(), "the ring keeps sampling regardless of who holds the lock");
+            // The ring samples regardless of who holds the lock: every one
+            // of the ticks above pushed an entry while the lock was held.
+            assert!(
+                ticks() >= IDLE_EMIT_MULTIPLIER as usize,
+                "the ring keeps sampling regardless of who holds the lock: {} ticks in 60 s",
+                ticks()
+            );
         });
     }
 
