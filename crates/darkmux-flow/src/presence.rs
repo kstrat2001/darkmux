@@ -83,7 +83,12 @@ pub fn read_hub_time_ms(client: &redis::Client) -> Result<u64> {
     let mut conn = open_redis_connection_bounded(client, REDIS_CONNECT_TIMEOUT)
         .context("getting Redis connection for the hub clock")?;
     bound_redis_response(&conn);
-    let (secs, micros): (u64, u64) = redis::cmd("TIME").query(&mut conn).context("TIME")?;
+    hub_time_ms_on(&mut conn)
+}
+
+/// [`read_hub_time_ms`] on a connection the caller holds (#3432).
+pub fn hub_time_ms_on(conn: &mut redis::Connection) -> Result<u64> {
+    let (secs, micros): (u64, u64) = redis::cmd("TIME").query(conn).context("TIME")?;
     Ok(secs * 1000 + micros / 1000)
 }
 
@@ -199,7 +204,12 @@ pub fn read_live(client: &redis::Client) -> Result<Vec<PresenceBeat>> {
     // This read backs the machine topology view and the reconciler's tick — an
     // unbounded stall here wedges the reconcile loop, not just one request.
     bound_redis_response(&conn);
-    let values = scan_and_mget(&mut conn, &format!("{PRESENCE_KEY_PREFIX}*"), "presence")?;
+    read_live_on(&mut conn)
+}
+
+/// [`read_live`] on a connection the caller holds (#3432).
+pub fn read_live_on(conn: &mut redis::Connection) -> Result<Vec<PresenceBeat>> {
+    let values = scan_and_mget(conn, &format!("{PRESENCE_KEY_PREFIX}*"), "presence")?;
     Ok(values.iter().flatten().filter_map(|json| serde_json::from_str::<PresenceBeat>(json).ok()).collect())
 }
 

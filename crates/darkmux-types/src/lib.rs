@@ -47,6 +47,10 @@ pub mod size;
 /// `test-support` feature, absent from every release build.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_isolation;
+/// (#3488) The one port allocator every darkmux test process shares. Gated
+/// like `test_isolation`: absent from every release build.
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub mod test_ports;
 pub mod style;
 pub mod url_authority;
 pub mod user_files;
