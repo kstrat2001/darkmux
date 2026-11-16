@@ -36,6 +36,13 @@ pub struct InitOptions {
     /// (#316) `--engine-url`: the OpenAI-compatible server to record as this
     /// machine's engine, probed alone and chosen when it answers.
     pub engine_url: Option<String>,
+    /// (#3569) `--add-engine`: the detected engine to add to profiles.json,
+    /// after the operator confirms.
+    pub add_engine: Option<String>,
+    /// (#3569) `--engine-model`: which of its models to add.
+    pub engine_model: Option<String>,
+    /// (#3569) `--n-ctx`: the context to add it at.
+    pub n_ctx: Option<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -67,6 +74,10 @@ pub struct InitReport {
     pub engine: Option<Outcome>,
     /// (#316) Why the chosen engine could not be recorded, when it could not.
     pub engine_unrecorded: Option<String>,
+    /// (#3569) The engines darkmux starts servers for that are installed here.
+    pub detected: Option<darkmux_profiles::engine::detect::Detected>,
+    /// (#3569) What `--add-engine` did, and the registry it planned against.
+    pub engine_add: Option<(crate::init_detect::AddOutcome, PathBuf)>,
     pub config_path: Option<PathBuf>,
     pub config_created: bool,
     pub config_already_present: bool,
@@ -136,6 +147,9 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
         fill_models(&registry_path, &engine, &mut report);
     }
 
+    // 1f) (#3569) The engines installed here, and `--add-engine`.
+    detect_and_add(opts, &registry_path, &mut report);
+
     // 3)-6) Skills, and the optional hook and doc merges.
     install_integrations(opts, &mut report)?;
 
@@ -147,9 +161,7 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
 /// CLAUDE.md or AGENTS.md block under `--force`. The merges run as dry runs,
 /// so the check is the same code that refuses later.
 fn preflight(opts: &InitOptions) -> Result<()> {
-    if let Some(url) = opts.engine_url.as_deref() {
-        init_engine::engine_url(url).map_err(|e| anyhow!("--engine-url: {e}"))?;
-    }
+    preflight_engine_flags(opts)?;
     if opts.with_hook {
         ensure_session_start_hook(&claude_settings_path()?, true, opts.force)?;
     }
@@ -158,6 +170,17 @@ fn preflight(opts: &InitOptions) -> Result<()> {
     }
     if let Some(target) = opts.with_agents_md.as_ref() {
         ensure_agents_md_section(target, true, opts.force)?;
+    }
+    Ok(())
+}
+
+/// `--engine-url` and `--add-engine`, refused before anything is written.
+fn preflight_engine_flags(opts: &InitOptions) -> Result<()> {
+    if let Some(url) = opts.engine_url.as_deref() {
+        init_engine::engine_url(url).map_err(|e| anyhow!("--engine-url: {e}"))?;
+    }
+    if let Some(word) = opts.add_engine.as_deref() {
+        crate::init_detect::parse_engine(word)?;
     }
     Ok(())
 }
@@ -175,8 +198,7 @@ fn bootstrap_registry(dry_run: bool, report: &mut InitReport) -> Result<PathBuf>
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        fs::write(&registry_path, EXAMPLE_PROFILES_JSON)
-            .with_context(|| format!("writing {}", registry_path.display()))?;
+        write_registry(&registry_path, None, EXAMPLE_PROFILES_JSON).map_err(|e| anyhow!(e))?;
         report.profile_registry_created = true;
     } else {
         // dry-run: report what would happen without writing
@@ -291,21 +313,57 @@ fn record_engine(
     }
     let previous = fs::read_to_string(registry_path).ok();
     if let Some(t) = new_text.as_deref() {
-        fs::write(registry_path, t).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
+        write_registry(registry_path, previous.as_deref(), t)?;
     }
     let set = crate::config_cmd::set_at(config_path, darkmux_types::default_engine::KEY, id);
-    if let (Err(e), Some(_)) = (&set, new_text.as_deref()) {
-        return Err(format!("{e:#} ({})", put_back(registry_path, previous.as_deref())));
+    if let (Err(e), Some(written)) = (&set, new_text.as_deref()) {
+        return Err(format!("{e:#} ({})", put_back(registry_path, previous.as_deref(), written)));
     }
     set.map(|_| ()).map_err(|e| format!("{e:#}"))
 }
 
-/// Put the registry back as it was before `record_engine` wrote it (removed,
-/// when there was none), and say whether that worked.
-fn put_back(registry_path: &Path, previous: Option<&str>) -> &'static str {
+/// (#3569) Step 1f: detect the engines darkmux starts servers for that are
+/// installed here (LM Studio and a server are step 1c's), and add the one
+/// `--add-engine` names once the operator confirms. The add plans against
+/// the registry dispatch reads (`DARKMUX_PROFILES`, else the one `init`
+/// manages); a dry run on a machine with none yet plans against the one
+/// `init` would create.
+fn detect_and_add(opts: &InitOptions, registry_path: &Path, report: &mut InitReport) {
+    let target = darkmux_profiles::profiles::registry_path(None).unwrap_or_else(|| registry_path.to_path_buf());
+    let text = fs::read_to_string(&target).ok().or_else(|| opts.dry_run.then(|| EXAMPLE_PROFILES_JSON.to_string()));
+    let registry = text.as_deref().and_then(|t| darkmux_profiles::profiles::parse_registry_lenient(t).ok());
+    let found = engine::detect::Detected::of(engine::detect::detect_servers(registry.as_ref()));
+    if let Some(word) = opts.add_engine.as_deref() {
+        let outcome = match (crate::init_detect::parse_engine(word), text) {
+            (Err(e), _) => crate::init_detect::AddOutcome::Refused(format!("{e:#}")),
+            (Ok(_), None) => crate::init_detect::AddOutcome::Refused(format!(
+                "there is no profile registry at {} to add it to; run `darkmux init` first",
+                target.display()
+            )),
+            (Ok(kind), Some(text)) => {
+                let req = engine::add::AddRequest { engine: kind, model: opts.engine_model.clone(), n_ctx: opts.n_ctx };
+                crate::init_detect::add_engine(&req, &found, &target, &text, opts.dry_run, &mut crate::init_detect::TerminalConfirm)
+            }
+        };
+        report.engine_add = Some((outcome, target));
+    }
+    report.detected = Some(found);
+}
+
+/// (#3569) Write `text` to the registry through the one write path every
+/// `profiles.json` writer shares (`darkmux_profiles::registry_write`: its
+/// lock, a compare with `expected`, what this run read, and an atomic
+/// replace that keeps a symlink a symlink).
+fn write_registry(path: &Path, expected: Option<&str>, text: &str) -> std::result::Result<(), String> {
+    darkmux_profiles::registry_write::replace(path, expected, text).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// Put the registry back as it was before `record_engine` wrote `written`
+/// (removed, when there was none), and say whether that worked.
+fn put_back(registry_path: &Path, previous: Option<&str>, written: &str) -> &'static str {
     let restored = match previous {
-        Some(p) => fs::write(registry_path, p).is_ok(),
-        None => fs::remove_file(registry_path).is_ok(),
+        Some(p) => write_registry(registry_path, Some(written), p).is_ok(),
+        None => darkmux_profiles::registry_write::remove(registry_path, written).is_ok(),
     };
     if restored { "profiles.json was put back" } else { "profiles.json could NOT be put back" }
 }
@@ -459,7 +517,7 @@ fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Opt
         return Err(no_worker_model_reason(ram_gb));
     };
     let filled = fill_placeholder_models(&text, &id).expect("placeholder was present");
-    fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
+    write_registry(registry_path, Some(&text), &filled)?;
     Ok(Some(id))
 }
 
@@ -528,8 +586,8 @@ fn fill_models_on_server(
     if text == read {
         return;
     }
-    if let Err(e) = fs::write(registry_path, &text) {
-        report.worker_model_unfilled_reason = Some(format!("writing {}: {e}", registry_path.display()));
+    if let Err(e) = write_registry(registry_path, Some(&read), &text) {
+        report.worker_model_unfilled_reason = Some(e);
         report.worker_model_filled = None;
         report.utility_model_filled = None;
         report.utility_model_unregistered_reason = None;
@@ -939,7 +997,7 @@ fn fill_utility_model(registry_path: &std::path::Path) -> std::result::Result<Op
     let headroom = if window.is_some() { ai_headroom_bytes() } else { None };
     let plan = plan_utility_binding(&current, window, &available, headroom, worker_bytes, floor);
     if let Some(filled) = apply_utility_plan(&text, &current, &plan) {
-        fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
+        write_registry(registry_path, Some(&text), &filled)?;
     } else if !matches!(plan, UtilityPlan::Missing(_)) {
         return Ok(None);
     }
@@ -1357,13 +1415,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("profiles.json");
         fs::write(&path, "changed").unwrap();
-        assert_eq!(put_back(&path, Some("before")), "profiles.json was put back");
+        // (#3569) A registry someone else changed since is not ours to put back.
+        assert_eq!(put_back(&path, Some("before"), "what this run wrote"), "profiles.json could NOT be put back");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "changed");
+        assert_eq!(put_back(&path, Some("before"), "changed"), "profiles.json was put back");
         assert_eq!(fs::read_to_string(&path).unwrap(), "before");
-        assert_eq!(put_back(&path, None), "profiles.json was put back");
+        // (#3569) With no registry before, it is removed only while it holds
+        // what this run wrote: one another writer changed is kept.
+        assert_eq!(put_back(&path, None, "what this run wrote"), "profiles.json could NOT be put back");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before");
+        assert_eq!(put_back(&path, None, "before"), "profiles.json was put back");
         assert!(!path.exists(), "no registry before, none after");
-        assert_eq!(put_back(&path, None), "profiles.json could NOT be put back");
+        assert_eq!(put_back(&path, None, "before"), "profiles.json could NOT be put back");
         let unwritable = dir.path().join("no-such-dir").join("profiles.json");
-        assert_eq!(put_back(&unwritable, Some("before")), "profiles.json could NOT be put back");
+        assert_eq!(put_back(&unwritable, Some("before"), "x"), "profiles.json could NOT be put back");
     }
 
     #[test]

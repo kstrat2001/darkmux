@@ -212,6 +212,7 @@ macro_rules! client_json {
 /// Every route the client listener serves. Every refusal on any of them is
 /// a `ClientError`.
 pub(crate) fn client_table() -> Vec<ClientRoute> {
+    use crate::client_engines::*;
     use crate::client_pairing::*;
     use crate::client_wire::*;
     vec![
@@ -220,6 +221,8 @@ pub(crate) fn client_table() -> Vec<ClientRoute> {
         client_json!(get, Whoami, "/client/whoami", whoami_handler),
         client_json!(get, ClientOpenApi, "/client/openapi.json", openapi_handler),
         client_json!(get, ClientProfiles, "/client/profiles", profiles_handler, query = ProfilesQuery),
+        client_json!(get, ClientEngines, "/client/engines", engines_handler),
+        client_json!(post, EngineAdded, "/client/engines", engine_add_handler, body = AddEngineBody),
         client_json!(post, WorkAccepted, "/client/work", work_handler, body = WorkBody),
         client_json!(get, WorkState, "/client/work/:work_id", work_status_handler),
         client_json!(post, StatusWord, "/client/work/:work_id/cancel", cancel_handler),

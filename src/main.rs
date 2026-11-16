@@ -61,6 +61,7 @@ pub use darkmux_hardware as hardware;
 pub use darkmux_heuristics as heuristics;
 mod init;
 mod init_engine;
+mod init_detect;
 // #515 — lab harness extracted (lab + workloads + providers). Re-exports keep
 // crate::{lab,workloads,providers}::* resolving for main.
 pub use darkmux_lab::lab;
@@ -275,7 +276,20 @@ fn run(cmd: Cmd) -> Result<i32> {
             force,
             dry_run,
             engine_url,
-        } => cmd_init(init::InitOptions { with_hook, with_claude_md, with_agents_md, force, dry_run, engine_url }),
+            add_engine,
+            engine_model,
+            n_ctx,
+        } => cmd_init(init::InitOptions {
+            with_hook,
+            with_claude_md,
+            with_agents_md,
+            force,
+            dry_run,
+            engine_url,
+            add_engine,
+            engine_model,
+            n_ctx,
+        }),
         Cmd::Serve {
             port,
             bind,
@@ -1960,10 +1974,22 @@ fn print_init_engine(report: &init::InitReport, dry_run: bool) {
     }
 }
 
+/// (#3569) `cmd_init`'s lines for the engines darkmux starts servers for,
+/// and what `--add-engine` did. `true` when an add was refused.
+fn print_init_detected(report: &init::InitReport) -> bool {
+    if let Some(found) = report.detected.as_ref() {
+        init_detect::detected_lines(found).iter().for_each(|l| println!("{l}"));
+    }
+    let Some((outcome, path)) = report.engine_add.as_ref() else { return false };
+    println!("{}", init_detect::add_line(outcome, path));
+    matches!(outcome, init_detect::AddOutcome::Refused(_))
+}
+
 fn cmd_init(opts: init::InitOptions) -> Result<i32> {
     let dry_run = opts.dry_run;
     let report = init::init(&opts)?;
     print_init_engine(&report, dry_run);
+    let add_refused = print_init_detected(&report);
     if let Some(p) = report.profile_registry_path.as_ref() {
         if report.profile_registry_already_present {
             println!("profile registry: already present at {}", p.display());
@@ -2124,7 +2150,7 @@ fn cmd_init(opts: init::InitOptions) -> Result<i32> {
         }
         first_steps(darkmux_types::config_access::sandbox().ok(), darkmux_sandbox::selected().is_ok()).into_iter().for_each(&mut step);
     }
-    Ok(0)
+    Ok(i32::from(add_refused))
 }
 
 /// (#3112) `init`'s last three next steps. The first dispatch runs in the
