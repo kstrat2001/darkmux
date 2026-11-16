@@ -644,16 +644,28 @@ fn envelope_check(profile: &darkmux_types::Profile, profile_name: &str) -> Vec<S
     // (#3450) A model on a server darkmux starts is checked against its
     // record; `lms ps` is asked only when an LM Studio model needs it.
     let servers = engine::server::listed(&engine::server::Dirs::under_home());
+    let recs_own = recs_own_address(profile);
+    let recs_own = recs_own.as_deref();
     if !profile.models.iter().any(|m| m.is_managed() && !m.endpoint_kind().is_ok_and(|k| k.starts_servers())) {
-        return crate::lab::profile_check::envelope_warnings(profile, profile_name, &[], &servers);
+        return crate::lab::profile_check::envelope_warnings(profile, profile_name, &[], &servers, recs_own);
     }
     match engine::lmstudio().loaded() {
-        Ok(loaded) => crate::lab::profile_check::envelope_warnings(profile, profile_name, &loaded, &servers),
+        Ok(loaded) => crate::lab::profile_check::envelope_warnings(profile, profile_name, &loaded, &servers, recs_own),
         Err(e) => vec![format!(
             "could not verify profile-load match: `lms ps` failed ({e}); \
              this run's `profile={profile_name}` tag is unverified. (#365)"
         )],
     }
+}
+
+/// (#3574) Where rec's own server is up, from `rec status`, asked only for
+/// a profile with a Flint model.
+fn recs_own_address(profile: &darkmux_types::Profile) -> Option<String> {
+    let flint = |m: &darkmux_types::ProfileModel| {
+        m.endpoint_kind().is_ok_and(|k| k == darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Flint))
+    };
+    let own = profile.models.iter().any(flint).then(|| engine::flint::Rec::installed().own_server().ok().flatten());
+    own.flatten().map(|o| o.address)
 }
 
 fn warn(quiet: bool, msg: &str) {
