@@ -768,7 +768,8 @@ mod tests {
     }
 
     /// `move_out` fails, leaving the entry where it was, when the
-    /// destination base is missing or the new name is a folder with files.
+    /// destination base is missing (refused before any rename) or when the
+    /// rename itself is refused because the new name is a folder with files.
     #[test]
     fn move_out_fails_in_place_when_the_destination_cannot_take_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -780,7 +781,8 @@ mod tests {
         let missing = dir.path().join("missing");
         assert!(move_out(&root, "nm", &missing, "aside", "one").is_err(), "no destination base");
         let err = move_out(&root, "nm", &base, "aside", "taken").unwrap_err();
-        assert_eq!(err.raw_os_error(), Some(libc::ENOTEMPTY), "{err}");
+        // POSIX lets rename onto a non-empty folder say either.
+        assert!(matches!(err.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST)), "{err}");
         assert!(root.join("nm").is_dir() && base.join("aside/taken/f").exists());
     }
 }
