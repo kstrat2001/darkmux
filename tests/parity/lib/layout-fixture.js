@@ -23,6 +23,8 @@ const MACHINE = { machine_id: "layout-mac", machine_uid: UID };
 const MID = "layout-mission";
 
 const at = (d, hms) => `${d}T${hms}Z`;
+/** "12:MM:SS" for `s` seconds past 12:00:00 (under an hour). */
+const hmsAfterNoon = (s) => `12:${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 const msOf = (d, hms) => Date.parse(at(d, hms));
 
 function build(sid) {
@@ -67,9 +69,11 @@ function build(sid) {
     ].map((r) => ({ ...r, ...extra }));
   const opener = (d) => beat(d, "12:00:08", 2, 0, 0, { prompt_chars: 20000 });
   const complete = (d) => rec(at(d, "12:00:09"), "dispatch.complete", { completion_tokens: 350, prompt_tokens: 4000 });
-  const writing = (d, name) => {
+  // The model writes a tool call from 12:00:12 until `until` seconds past
+  // 12:00 (a heartbeat every 2s, so it never reads as stalled).
+  const writing = (d, name, until = 30) => {
     const out = [opener(d), beat(d, "12:00:10", 2, 500, 500)];
-    for (let s = 12; s <= 30; s += 2) out.push(beat(d, `12:00:${String(s).padStart(2, "0")}`, 2, 800, 500, { phase: "writing_tool_call", ...(name ? { tool_name: name } : {}) }));
+    for (let s = 12; s <= until; s += 2) out.push(beat(d, hmsAfterNoon(s), 2, 800, 500, { phase: "writing_tool_call", ...(name ? { tool_name: name } : {}) }));
     return out;
   };
   return { sid, rec, usage, beat, prefix, opener, complete, writing };
@@ -396,13 +400,28 @@ const HEROES = [
   ],
 }));
 
-for (const s of [...STATES, ...HEROES, MULTI]) {
+/** (#2971) TOOL GEN with a long tool name and a three-digit count, which a
+ *  phone card's status line must still fit. Not in `STATES`: the run page's
+ *  size groups do not need them, and the fleet card's suite reads them by
+ *  name. */
+const TOOLGEN_LONG = [
+  { id: "toolgen-finding", date: "2026-07-12", tool: "create_finding" },
+  { id: "toolgen-long-name", date: "2026-07-14", tool: "mcp__github__create_pull_request_review" },
+].map((s) => ({
+  ...s,
+  now: hmsAfterNoon(140),
+  rateText: "tool gen",
+  seconds: "128s",
+  recs: (b, d) => [...b.prefix(d), ...b.writing(d, s.tool, 140)],
+}));
+
+for (const s of [...STATES, ...HEROES, MULTI, ...TOOLGEN_LONG]) {
   s.sid = `layout-exec-${s.id}`;
   s.records = s.recs(build(s.sid), s.date);
   s.nowMs = Date.parse(at(s.date, s.now)) + 500;
 }
 
-const ALL = [...STATES, ...HEROES, MULTI];
+const ALL = [...STATES, ...HEROES, MULTI, ...TOOLGEN_LONG];
 // Each state owns its day: two states on one date would merge into one day's
 // records and measure neither (#2902 step 5: a rebase once put two there).
 {
@@ -585,4 +604,4 @@ const VIEWPORTS = {
   phone: { width: 390, height: 844 },
 };
 
-module.exports = { STATES, HEROES, MULTI, ALL, PLAYBACK_NOW, VIEWPORTS, SELF_ROW, PEER_ROW, ONE_ICON_ROW, NO_ICON_ROW, OFFLINE_ROW, viewRow, installLayoutRoutes, measure };
+module.exports = { STATES, HEROES, MULTI, TOOLGEN_LONG, ALL, PLAYBACK_NOW, VIEWPORTS, SELF_ROW, PEER_ROW, ONE_ICON_ROW, NO_ICON_ROW, OFFLINE_ROW, viewRow, installLayoutRoutes, measure };

@@ -11,39 +11,70 @@ import type { ExecutionTokenReading, LiveState } from "../../lib/tokenRate";
 /** The line's text. `byWidth` carries a long and a short form, because the
  *  card shows one by the viewport's width (the line keeps its one-line
  *  height): a rest's reason, and (#3210) a prefill's progress. */
-export type ReadingLabel = { kind: "text"; text: string } | { kind: "byWidth"; full: string; word: string };
+export type ReadingLabel =
+  | { kind: "text"; text: string }
+  | { kind: "byWidth"; full: string; word: string }
+  /** (#2971) TOOL GEN of a named tool, in parts: the card drops "tool gen ·"
+   *  on a phone (the tube says TOOL GEN) and trims a long name, never the
+   *  seconds. */
+  | { kind: "toolGen"; tool: string; seconds: string };
 
 /** The reading for an execution in `state` (never the disconnection downgrade,
  *  where the line says `disconnected` instead). */
 export function readingLabel(exec: ExecutionTokenReading, state: LiveState): ReadingLabel {
   if (state === "generating") return { kind: "text", text: generatingText(exec) };
+  return (
+    detailedReading(exec, state) ?? {
+      kind: "text",
+      text: liveStateLabel({
+        state,
+        restSecondsLeft: exec.restSecondsLeft,
+        toolName: exec.toolName,
+        writing: exec.writing,
+        writingSeconds: exec.writingSeconds,
+        compacting: exec.compacting,
+        compactingSeconds: exec.compactingSeconds,
+      }),
+    }
+  );
+}
+
+/** The readings the card words its own way rather than with the shared
+ *  state words; `null` for the rest. */
+function detailedReading(exec: ExecutionTokenReading, state: LiveState): ReadingLabel | null {
+  if (state === "prompt") return promptReading(exec);
+  // (#2950) Why it rests, in place of "rest Ns": the tube's center counts the seconds.
+  if (state === "rest" && exec.restReason) return { kind: "byWidth", full: reasonForLine(exec.restReason), word: exec.restReasonWord ?? exec.restReason };
+  if (isNamedToolGen(exec, state)) return { kind: "toolGen", tool: exec.toolName ?? "", seconds: `${exec.writingSeconds ?? 0}s` };
+  return null;
+}
+
+/** PROMPT's line, when the execution says how far or how big. */
+function promptReading(exec: ExecutionTokenReading): ReadingLabel | null {
   // (#3210) How far the engine has read the prompt, when it reports it, ahead
   // of the size estimate it makes redundant (the hover still says how much).
   // With a time left the line is "40% · ~23s left" alone: "processing" in
   // front ellipsized the time away on a three-card desktop row, and the
   // brain over its bar already says it. Before there is a rate, "processing
   // 20%".
-  if (state === "prompt" && exec.promptProgress) {
+  if (exec.promptProgress) {
     const progress = promptProgressLabel(exec.promptProgress);
     return { kind: "text", text: exec.promptProgress.secondsLeft !== undefined ? progress : `processing ${progress}` };
   }
   // (#2890) "processing ~36k", not "processing prompt · ~36k": the long form
   // ellipsized the size away on a phone.
-  if (state === "prompt" && exec.promptLabel) return { kind: "text", text: `processing ${exec.promptLabel}` };
-  // (#2950) Why it rests, in place of "rest Ns": the tube's center counts the seconds.
-  if (state === "rest" && exec.restReason) return { kind: "byWidth", full: reasonForLine(exec.restReason), word: exec.restReasonWord ?? exec.restReason };
-  return {
-    kind: "text",
-    text: liveStateLabel({
-      state,
-      restSecondsLeft: exec.restSecondsLeft,
-      toolName: exec.toolName,
-      writing: exec.writing,
-      writingSeconds: exec.writingSeconds,
-      compacting: exec.compacting,
-      compactingSeconds: exec.compactingSeconds,
-    }),
-  };
+  if (exec.promptLabel) return { kind: "text", text: `processing ${exec.promptLabel}` };
+  return null;
+}
+
+/** The model is generating the arguments of a call whose tool is named. */
+function isNamedToolGen(exec: ExecutionTokenReading, state: LiveState): boolean {
+  return state === "tools" && exec.writing === true && !!exec.toolName;
+}
+
+/** The line's whole words, for the hover when a narrow card trims them. */
+function toolGenTitle(exec: ExecutionTokenReading): string {
+  return liveStateLabel({ state: "tools", toolName: exec.toolName, writing: true, writingSeconds: exec.writingSeconds });
 }
 
 /** A GEN lamp with no reading yet is "not yet measured", never a confident
@@ -64,5 +95,6 @@ export function readingTitle(exec: ExecutionTokenReading, state: LiveState): str
   }
   if (state === "prompt" && exec.promptLabel) return `estimated prompt size: ${exec.promptLabel} tokens`;
   if (state === "rest" && exec.restReason) return `resting: ${exec.restReason}`;
+  if (isNamedToolGen(exec, state)) return toolGenTitle(exec);
   return undefined;
 }

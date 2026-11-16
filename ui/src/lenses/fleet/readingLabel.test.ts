@@ -43,7 +43,13 @@ describe("readingLabel: the status line while an execution runs", () => {
   });
   it("stalled and tool generation use the shared state words", () => {
     expect(readingLabel(exec({ state: "stalled" }), "stalled")).toEqual({ kind: "text", text: "stalled" });
-    expect(readingLabel(exec({ state: "tools", writing: true, toolName: "write", writingSeconds: 18 }), "tools")).toEqual({ kind: "text", text: "tool gen · write · 18s" });
+    expect(readingLabel(exec({ state: "tools", writing: true, writingSeconds: 3 }), "tools")).toEqual({ kind: "text", text: "tool gen · 3s" });
+    expect(readingLabel(exec({ state: "tools" }), "tools")).toEqual({ kind: "text", text: "tools" });
+  });
+  it("(#2971) tool generation of a named tool parts its words, so a narrow card can drop the state and trim the name, never the seconds", () => {
+    expect(readingLabel(exec({ state: "tools", writing: true, toolName: "write", writingSeconds: 18 }), "tools")).toEqual({ kind: "toolGen", tool: "write", seconds: "18s" });
+    expect(readingLabel(exec({ state: "tools", writing: true, toolName: "create_finding" }), "tools")).toEqual({ kind: "toolGen", tool: "create_finding", seconds: "0s" });
+    expect(readingTitle(exec({ state: "tools", writing: true, toolName: "write", writingSeconds: 18 }), "tools")).toBe("tool gen · write · 18s");
   });
 });
 
