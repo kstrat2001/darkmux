@@ -16,6 +16,23 @@ darkmux release.
 
 ### Added
 
+- **Setup finds the engines darkmux can start, adds one on request, and says when none is usable (#3569).**
+  darkmux now looks for installed engines it can run work on: rec's Flint (rec 0.1.0 with a runtime and
+  a pulled revision), Tensorfold (a 1.2.x release that lists a model), LM Studio with a downloaded model,
+  and the default engine's server. It asks each only read-only questions (its version and its model
+  listing) and starts, loads and pulls nothing. `darkmux init` lists the Flint and Tensorfold installs it
+  finds; `darkmux init --add-engine flint` (or `tensorfold`, with `--engine-model` and `--n-ctx` where
+  darkmux cannot fill them in) adds an endpoint and a profile running the model, and writes
+  `profiles.json` only after you confirm on the terminal. A new doctor row, `installed engines`, names an
+  engine found but not configured and the command that adds it (informational: it passes). The client API gains `GET
+  /client/engines` (each engine found, and `usable` when any can run work) and `POST /client/engines`
+  (the add, once the app's user confirms; from an app on the Mac only, a tailnet device is refused
+  `forbidden`, and every add is recorded in the `client serve` log), under the new `engines`
+  capability. Every `profiles.json` write darkmux makes (`init`'s and the add) now goes through one
+  path: a lock all writers share, a compare with what was read, and an atomic replace that keeps a
+  symlinked registry a symlink and refuses one the operator made read-only. darkmux recommends no
+  engine or model: it adds the model the request names (or the engine's only one) at the context named
+  (or the one the engine states).
 - **A Flint dispatch uses rec's own server when it already serves the model (#3574).** When rec's own
   server is up and `rec status` says it is ready, serving the profile model's revision at a context of
   at least its `n_ctx`, on this machine's loopback, and the model declares no `engine_args`, the

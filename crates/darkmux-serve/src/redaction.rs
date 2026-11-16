@@ -977,6 +977,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn fleet_view_shows_a_remote_reader_no_address_or_home_path() {
+        darkmux_types::run_in_own_process!();
         let _facts = HostFacts::set();
         let (status, body) = get(leaky_view_router(), "/fleet/view", REMOTE).await;
         assert_eq!(status, 200, "{body}");
@@ -990,6 +991,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn fleet_view_shows_a_local_reader_the_full_values() {
+        darkmux_types::run_in_own_process!();
         let _facts = HostFacts::set();
         let (_, body) = get(leaky_view_router(), "/fleet/view", LOCAL).await;
         for shown in [PEER_IP, HUB_IP, HOME] {
@@ -1025,6 +1027,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn no_json_route_shows_a_remote_reader_a_host_fact() {
+        darkmux_types::run_in_own_process!();
         let _facts = HostFacts::set();
         unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
         let flows = seed_flows();
@@ -1057,6 +1060,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn the_seeded_flow_day_carries_the_facts_for_this_machine() {
+        darkmux_types::run_in_own_process!();
         let _facts = HostFacts::set();
         unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
         let flows = seed_flows();
@@ -1069,6 +1073,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn roster_addresses_read_in_full_on_this_machine_and_hidden_remotely() {
+        darkmux_types::run_in_own_process!();
         let _facts = HostFacts::set();
         let (_, local) = get(crate::build_router(PathBuf::new()), "/fleet/roster", LOCAL).await;
         assert!(local.contains(PEER_IP) && local.contains(TAILNET_NAME), "{local}");
@@ -1080,6 +1085,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn machine_specs_states_a_hub_is_configured_and_never_where() {
+        darkmux_types::run_in_own_process!();
         let _facts = HostFacts::set();
         for from in [LOCAL, REMOTE] {
             let (_, body) = get(crate::build_router(PathBuf::new()), "/machine/specs", from).await;
@@ -1097,6 +1103,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_machine_card_carries_no_redis_url_or_address() {
+        darkmux_types::run_in_own_process!();
         let _facts = HostFacts::set();
         let mut card = serde_json::to_value(sample_card()).unwrap();
         card["specs"] = serde_json::to_value(crate::gather_specs()).unwrap();
@@ -1124,6 +1131,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_plain_name_hub_host_is_hidden_where_it_addresses() {
+        darkmux_types::run_in_own_process!();
         let _facts = HostFacts::set();
         unsafe { std::env::set_var("DARKMUX_REDIS_URL", "redis://u:p@hubname:6379") };
         let r = Redaction::derive();
@@ -1249,6 +1257,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn panel_withheld_reads_every_location_and_spares_public_names() {
+        darkmux_types::run_in_own_process!();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("dm");
         std::fs::create_dir_all(&root).unwrap();
@@ -1323,6 +1332,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn every_table_route_is_layered_or_declared() {
+        darkmux_types::run_in_own_process!();
         use crate::routes::RouteRedaction::*;
         let _facts = HostFacts::set();
         unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
@@ -1604,6 +1614,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn the_flow_stream_redacts_each_line_for_a_remote_reader_and_not_for_this_machine() {
+        darkmux_types::run_in_own_process!();
         let _facts = HostFacts::set();
         unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
         for (from, hidden) in [(REMOTE, true), (LOCAL, false)] {
@@ -1621,6 +1632,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn the_live_channel_redacts_each_sample_for_a_remote_reader() {
+        darkmux_types::run_in_own_process!();
         let _facts = HostFacts::set();
         unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
         for (from, hidden) in [(REMOTE, true), (LOCAL, false)] {
@@ -1640,6 +1652,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn lines_from_any_source_are_redacted_at_the_one_join_point() {
+        darkmux_types::run_in_own_process!();
         use futures::StreamExt;
         let _facts = HostFacts::set();
         let lines = futures::stream::iter(vec![LEAKY_LINE.to_string()]).boxed();

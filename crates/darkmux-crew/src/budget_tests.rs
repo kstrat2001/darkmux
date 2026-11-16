@@ -936,6 +936,102 @@ fn the_pacer_reloads_from_the_commands_registry() {
     assert_eq!(*env.reloaded_from.borrow(), vec![Some("/x/profiles.json".to_string())]);
 }
 
+/// A holding pacer that reloads a raised budget judges the window by it at
+/// once: the window now has room, so the hold is released on that tick.
+#[test]
+fn the_pacer_judges_the_window_by_a_reloaded_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = FakeEnv::new(vec![(T0 - 10, 1_000)]);
+    let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
+    let (c, free) = (solo_caller(), OtherPacing::default());
+    assert!(matches!(p.on_tick(0, dir.path(), &free, &c, &env), Some(PacerEvent::Paused { .. })));
+    *env.reload_to.borrow_mut() = Some(Some(budget(BudgetPolicy::Wait, Some(5_000), None, None)));
+    assert_eq!(p.on_tick(2_000, dir.path(), &free, &c, &env), None, "no reload before PACER_RELOAD_MS");
+    let ev = p.on_tick(PACER_RELOAD_MS, dir.path(), &free, &c, &env);
+    assert!(matches!(ev, Some(PacerEvent::Resumed { .. })), "{ev:?}");
+    assert_eq!(pace(dir.path())["pause"], false);
+}
+
+/// A holding pacer whose endpoint's budget was removed from the registry
+/// releases the hold on the reload, without judging the window again.
+#[test]
+fn the_pacer_releases_when_a_reload_finds_no_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = FakeEnv::new(vec![(T0 - 10, 1_000)]);
+    let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
+    let (c, free) = (solo_caller(), OtherPacing::default());
+    assert!(matches!(p.on_tick(0, dir.path(), &free, &c, &env), Some(PacerEvent::Paused { .. })));
+    *env.reload_to.borrow_mut() = Some(None);
+    let ev = p.on_tick(PACER_RELOAD_MS, dir.path(), &free, &c, &env);
+    assert!(matches!(ev, Some(PacerEvent::Resumed { .. })), "{ev:?}");
+    assert_eq!(pace(dir.path())["pause"], false);
+    assert!(!p.is_pausing());
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWait, darkmux_flow::FlowAction::BudgetResume]);
+}
+
+/// A pacer that is not holding re-reads the window only every
+/// [`PACER_CHECK_MS`]: a window that fills between checks is noticed at
+/// the next check, not on the next tick.
+#[test]
+fn a_pacer_not_holding_rereads_the_window_only_every_check_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = FakeEnv::new(vec![]);
+    let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
+    let (c, free) = (solo_caller(), OtherPacing::default());
+    assert_eq!(p.on_tick(0, dir.path(), &free, &c, &env), None, "an empty window proceeds");
+    env.records.borrow_mut().push((T0 - 10, Spend::full(1_000)));
+    assert_eq!(p.on_tick(PACER_CHECK_MS - 1, dir.path(), &free, &c, &env), None, "not due yet");
+    assert!(!crate::pace_file::path(dir.path()).exists(), "nothing written before the check");
+    let ev = p.on_tick(1, dir.path(), &free, &c, &env);
+    assert!(matches!(ev, Some(PacerEvent::Paused { .. })), "due at PACER_CHECK_MS: {ev:?}");
+}
+
+/// A stopped run the pacer holds stays held, but never over another
+/// governor's pause: the pacer writes nothing while thermal or battery
+/// pauses.
+#[test]
+fn a_stopped_hold_never_writes_over_another_governors_pause() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = FakeEnv::new(vec![(T0 - 10, 1_000)]);
+    let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
+    let c = solo_caller();
+    let held = OtherPacing { pausing: true, duty_cycle: None };
+    assert!(matches!(p.on_tick(0, dir.path(), &OtherPacing::default(), &c, &env), Some(PacerEvent::Paused { .. })));
+    *env.stop.borrow_mut() = Some((0, "the run was interrupted".into()));
+    assert!(matches!(p.on_tick(2_000, dir.path(), &held, &c, &env), Some(PacerEvent::Stopped { .. })));
+    crate::pace_file::write(dir.path(), true, "thermal", "serious");
+    assert_eq!(p.on_tick(2_000, dir.path(), &held, &c, &env), None);
+    assert_eq!(pace(dir.path())["reason"], "thermal", "the stopped hold wrote over thermal");
+}
+
+/// A stopped run whose window is full while another governor pauses is
+/// stopped without writing over that pause.
+#[test]
+fn a_stop_on_a_full_window_never_writes_over_another_governors_pause() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = FakeEnv::full_window().stopped("the run was interrupted");
+    let mut p = BudgetPacer::new(budget(BudgetPolicy::Wait, Some(1_000), None, None), None);
+    crate::pace_file::write(dir.path(), true, "thermal", "serious");
+    let held = OtherPacing { pausing: true, duty_cycle: None };
+    let ev = p.on_tick(0, dir.path(), &held, &solo_caller(), &env);
+    assert!(matches!(ev, Some(PacerEvent::Stopped { .. })), "{ev:?}");
+    assert!(p.is_pausing(), "a stopped run is held");
+    assert_eq!(pace(dir.path())["reason"], "thermal", "the stop wrote over thermal");
+}
+
+/// Under `warn` a breach the pacer has already surfaced is not surfaced
+/// again on the next check.
+#[test]
+fn the_pacer_under_warn_surfaces_a_breach_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = FakeEnv::new(vec![(T0 - 10, 5_000)]);
+    let mut p = BudgetPacer::new(budget(BudgetPolicy::Warn, Some(1_000), None, None), None);
+    let (c, free) = (solo_caller(), OtherPacing::default());
+    assert_eq!(p.on_tick(0, dir.path(), &free, &c, &env), None);
+    assert_eq!(p.on_tick(PACER_CHECK_MS, dir.path(), &free, &c, &env), None);
+    assert_eq!(env.actions(), vec![darkmux_flow::FlowAction::BudgetWarn], "warned once");
+}
+
 // ── The ledger ───────────────────────────────────────────────────────────
 
 fn usage_line(ts: i64, endpoint_id: Option<&str>, total: u64) -> String {

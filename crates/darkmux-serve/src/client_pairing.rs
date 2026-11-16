@@ -1090,6 +1090,12 @@ pub struct ClientServerState {
     pub profile_is_local: RoleProfileCheck,
     /// Every profile name in this machine's registry.
     pub registry_profiles: Lister,
+    /// (#3569) The engines installed on this machine (`GET /client/engines`).
+    pub detect_engines: crate::client_engines::DetectEngines,
+    /// (#3569) Add one to `profiles.json` (`POST /client/engines`).
+    pub add_engine: crate::client_engines::AddEngine,
+    /// (#3569) Where an add's record goes: the `client serve` log (stderr).
+    pub log_add: crate::client_engines::LogAdd,
     /// This machine, as a paired app keys its per-machine settings: a stable
     /// id (the same from the Mac app and the phone) and a display name.
     pub machine: ClientMachine,
@@ -1232,6 +1238,9 @@ impl ClientServerState {
             profile_info: Arc::new(crate::client_profiles::describe_profiles),
             profile_is_local: Arc::new(crate::client_profiles::work_stays_here),
             registry_profiles: Arc::new(registry_profiles_here),
+            detect_engines: Arc::new(crate::client_engines::detect_here),
+            add_engine: Arc::new(crate::client_engines::add_here),
+            log_add: Arc::new(|line| eprintln!("{line}")),
             machine: ClientMachine::this_one(),
             check_workdir: Arc::new(check_workdir_here),
             execute: Arc::new(move |spec, cancel| {
@@ -2301,7 +2310,7 @@ pub(crate) fn internal(e: anyhow::Error) -> Response {
 }
 
 /// Read and parse a capped JSON body; every refusal is JSON.
-async fn json_body<T: serde::de::DeserializeOwned>(body: Body) -> Result<T, Response> {
+pub(crate) async fn json_body<T: serde::de::DeserializeOwned>(body: Body) -> Result<T, Response> {
     let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| body_too_large())?;
     serde_json::from_slice(&bytes)
         .map_err(|e| err(StatusCode::BAD_REQUEST, ClientCode::BadRequest, format!("bad JSON body: {e}")))
