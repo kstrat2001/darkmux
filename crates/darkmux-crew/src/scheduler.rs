@@ -1931,6 +1931,12 @@ fn queue_hook<'a>(
 /// when it waited for its slot; `None` for a step that started at once, and
 /// for one whose run is being stopped (its job only ends it, abandoned or
 /// errored, without starting its work: the terminal closes the wait).
+///
+/// Known edge: the stop is read here, on the main thread, when the step's
+/// `StepDispatching` signal is handled, not when its job sent it. So a step
+/// whose dispatch began just before the stop but was handled after it, or a
+/// step kind that ignores the stop (a dispatch-free kind that runs to its
+/// end anyway), writes no resume and reads waiting until its terminal.
 fn queue_resume(waited: &Mutex<HashSet<usize>>, index: usize, run: &RunId, step: &Step) -> Option<FlowRecord> {
     let was_queued = waited.lock().unwrap_or_else(|p| p.into_inner()).remove(&index);
     let starts_work = !darkmux_types::interrupt::is_set();
