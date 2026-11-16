@@ -55,7 +55,7 @@ fn cmd_init_with(
     force: bool,
     dry_run: bool,
 ) -> Result<i32> {
-    crate::cmd_init(InitOptions { with_hook, with_claude_md, with_agents_md, force, dry_run, engine_url: None })
+    crate::cmd_init(InitOptions { with_hook, with_claude_md, with_agents_md, force, dry_run, ..Default::default() })
 }
 
 struct InitEnv {
@@ -99,6 +99,13 @@ impl InitEnv {
         // (#316) No server answers unless a test serves one, so a server this
         // machine runs (on 8080, or at a registry endpoint) cannot answer a test.
         env.set(crate::init_engine::TEST_SERVERS_HOOK, OsString::new());
+        // (#3569) No engine darkmux starts servers for is installed unless a
+        // test installs one: this machine's own rec or Tensorfold is never
+        // asked.
+        let (rec, tf) = (env.stub.path().join("no-such-rec"), env.stub.path().join("no-such-tensorfold"));
+        env.set("DARKMUX_FLINT_BIN", rec.into_os_string());
+        env.set("DARKMUX_TENSORFOLD_BIN", tf.into_os_string());
+        env.set("XDG_DATA_HOME", env.home.path().join("share").into_os_string());
         // A skills override would change which source `init` installs from;
         // the target is what matters here, and it is under HOME.
         env.unset("DARKMUX_SKILLS_DIR");
@@ -141,6 +148,29 @@ impl InitEnv {
     fn lms_missing(&mut self) {
         let missing = self.stub.path().join("no-such-lms");
         self.set("DARKMUX_LMS_BIN", missing.into_os_string());
+    }
+
+    /// (#3569) Install a fake rec 0.1.0 with one runtime and the revision
+    /// `flint-int4` pulled, read-only to darkmux.
+    fn install_rec(&mut self) {
+        let data = self.home.path().join("share").join("rec");
+        fs::create_dir_all(data.join("runtimes/0906aa")).unwrap();
+        fs::write(data.join("runtimes/0906aa/rec-mlx"), "").unwrap();
+        fs::create_dir_all(data.join("models/fdc852")).unwrap();
+        fs::write(data.join("models/fdc852/flint-int4.json"), r#"{"model_id":"flint-int4","max_context":262144}"#).unwrap();
+        let rec = self.stub.path().join("rec");
+        fs::write(&rec, "#!/bin/sh\n[ \"$1\" = --version ] && echo 'rec 0.1.0' || exit 9\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&rec, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // macOS checks a file on its first exec (measured: about 0.1 to 0.4 s
+        // for a new script, 0.02 s after), and on a loaded machine that check
+        // can outlast init's bounded probe. Run it once here, so the probe
+        // `init` makes times rec, not the first-exec check.
+        assert!(std::process::Command::new(&rec).arg("--version").status().unwrap().success());
+        self.set("DARKMUX_FLINT_BIN", rec.into_os_string());
     }
 
     /// Every `lms` invocation so far, one per line.
@@ -300,7 +330,7 @@ fn a_dry_run_reports_intent_writes_nothing_and_asks_lms_only_whether_it_answers(
         with_agents_md: Some(agents_md.clone()),
         force: false,
         dry_run: true,
-        engine_url: None,
+        ..opts()
     })
     .unwrap();
 
@@ -1393,4 +1423,38 @@ fn a_refused_input_fails_init_before_anything_is_written() {
         assert!(!p.exists(), "settings.json: {} was written before the refusal", p.display());
     }
     assert_eq!(fs::read_to_string(env.settings()).unwrap(), "[]\n");
+}
+
+/// (#3569) `init` lists an installed engine darkmux starts servers for, and
+/// `--add-engine` without a terminal to confirm on writes nothing.
+#[test]
+#[serial_test::serial]
+fn init_lists_an_installed_engine_and_adds_it_only_when_confirmed() {
+    darkmux_types::run_in_own_process!();
+    let mut env = InitEnv::new();
+    env.install_rec();
+    let mine = example_without_placeholder();
+    env.write_registry(&mine);
+
+    let r = init(&opts()).unwrap();
+    let found = r.detected.expect("detection ran");
+    assert_eq!(found.detected.len(), 1, "{found:?}");
+    assert!(found.detected[0].can_add, "{found:?}");
+    assert!(r.engine_add.is_none());
+
+    let r = init(&InitOptions { add_engine: Some("flint".into()), ..opts() }).unwrap();
+    let (outcome, path) = r.engine_add.expect("an add was asked for");
+    assert_eq!(path, env.registry());
+    match outcome {
+        crate::init_detect::AddOutcome::NotWritten { planned, why } => {
+            assert!(why.contains("no terminal"), "{why}");
+            assert_eq!((planned.endpoint.as_str(), planned.model.as_str()), ("flint", "flint-int4"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(env.read_registry(), mine, "nothing written without a confirmation");
+
+    let r = init(&InitOptions { add_engine: Some("tensorfold".into()), ..opts() }).unwrap();
+    assert!(matches!(r.engine_add, Some((crate::init_detect::AddOutcome::Refused(ref m), _)) if m.contains("not installed")));
+    assert!(init(&InitOptions { add_engine: Some("ollama".into()), ..opts() }).is_err(), "refused before any write");
 }

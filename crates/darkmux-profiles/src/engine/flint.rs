@@ -468,6 +468,48 @@ impl Rec {
             engine_version: format!("rec {version}"),
         })
     }
+
+    /// (#3569) The revisions rec's install holds: each `models/<hash>/` file
+    /// that is a revision manifest ([`pulled_revision`]), sorted and without
+    /// repeats. Read-only: a directory listing and the manifests' text.
+    pub fn pulled(&self) -> Result<Vec<Pulled>> {
+        let models = self.data()?.join("models");
+        let mut out: Vec<Pulled> = subdirs(&models)
+            .iter()
+            .flat_map(|d| manifests(d).into_iter().map(move |name| d.join(name)))
+            .filter_map(|path| {
+                let stem = path.file_stem()?.to_str()?.to_string();
+                pulled_revision(&stem, &std::fs::read_to_string(&path).ok()?)
+            })
+            .collect();
+        out.sort_by(|a, b| a.revision.cmp(&b.revision));
+        out.dedup_by(|a, b| a.revision == b.revision);
+        Ok(out)
+    }
+}
+
+/// (#3569) A revision rec's install holds, with the context its manifest
+/// states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pulled {
+    /// The manifest's name (`flint-int4`), which a profile model's `id` names.
+    pub revision: String,
+    /// The manifest's `max_context`, in tokens, when it states one.
+    pub max_context: Option<u32>,
+}
+
+/// The revision a model directory's `<stem>.json` describes, when it is a
+/// revision manifest: a JSON object whose `model_id` is its own file name
+/// (rec 0.1.0 writes `{"model_id": "flint-int4", "max_context": 262144,
+/// ...}` as `flint-int4.json`). The tokenizer and template files beside it
+/// name no `model_id`, so they are not revisions.
+pub fn pulled_revision(stem: &str, text: &str) -> Option<Pulled> {
+    let doc: serde_json::Value = serde_json::from_str(text).ok()?;
+    if doc.get("model_id")?.as_str()? != stem {
+        return None;
+    }
+    let max_context = doc.get("max_context").and_then(|c| c.as_u64()).and_then(|c| u32::try_from(c).ok());
+    Some(Pulled { revision: stem.to_string(), max_context })
 }
 
 /// The directories directly under `dir`, sorted; none when it is missing.
@@ -511,8 +553,9 @@ mod tests {
         std::fs::write(runtime.join("rec-mlx"), "#!/bin/sh\nexit 0\n").unwrap();
         let model = data.join("models").join("fdc852");
         std::fs::create_dir_all(&model).unwrap();
-        std::fs::write(model.join("flint-int4.json"), "{}").unwrap();
+        std::fs::write(model.join("flint-int4.json"), r#"{"model_id":"flint-int4","max_context":262144}"#).unwrap();
         std::fs::write(model.join("config.json"), "{}").unwrap();
+        std::fs::write(model.join("tokenizer_config.json"), r#"{"model_max_length":1}"#).unwrap();
         std::fs::write(model.join("model-00000.safetensors"), vec![0u8; 1000]).unwrap();
         std::fs::write(model.join("model-00001.safetensors"), vec![0u8; 24]).unwrap();
         let bin = root.join("rec");
@@ -794,5 +837,40 @@ mod tests {
             let err = Rec::at(bin.to_string_lossy().into_owned(), None).auth_token().unwrap_err().to_string();
             assert!(err.contains("auth token") && !err.contains("printed-on-failure"), "{name}: {err}");
         }
+    }
+
+    /// (#3569) The revisions rec holds are the manifests whose `model_id`
+    /// is their own name, with the context each states; a tokenizer file or
+    /// a manifest naming another id is not one, and a missing data
+    /// directory holds none.
+    #[test]
+    fn the_revisions_rec_holds_are_manifests_naming_themselves() {
+        assert_eq!(
+            pulled_revision("flint-int4", r#"{"model_id":"flint-int4","max_context":262144,"kv_format":"bf16"}"#),
+            Some(Pulled { revision: "flint-int4".into(), max_context: Some(262_144) })
+        );
+        assert_eq!(
+            pulled_revision("flint-int8", r#"{"model_id":"flint-int8"}"#),
+            Some(Pulled { revision: "flint-int8".into(), max_context: None })
+        );
+        for (stem, text) in [
+            ("tokenizer_config", r#"{"model_max_length":1}"#),
+            ("flint-int4", r#"{"model_id":"flint-int8"}"#),
+            ("flint-int4", "not json"),
+            ("flint-int4", "[]"),
+        ] {
+            assert_eq!(pulled_revision(stem, text), None, "{stem}: {text}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let rec = fake_install(dir.path(), "0.1.0", "");
+        assert_eq!(rec.pulled().unwrap(), vec![Pulled { revision: "flint-int4".into(), max_context: Some(262_144) }]);
+        let copy = dir.path().join("share/rec/models/aa11");
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(copy.join("flint-int4.json"), r#"{"model_id":"flint-int4","max_context":262144}"#).unwrap();
+        std::fs::write(copy.join("flint-int8.json"), r#"{"model_id":"flint-int8"}"#).unwrap();
+        let ids: Vec<String> = rec.pulled().unwrap().into_iter().map(|p| p.revision).collect();
+        assert_eq!(ids, ["flint-int4", "flint-int8"], "sorted, without repeats");
+        assert!(Rec::at("rec", Some(dir.path().join("nothing"))).pulled().unwrap().is_empty());
+        assert!(Rec::at("rec", None).pulled().is_err(), "no home directory to look in");
     }
 }

@@ -18,7 +18,9 @@
 //! `darkmux:` namespace (contract 4) stays the LM Studio backend's mechanism,
 //! in `crate::ownership`.
 
+pub mod add;
 pub mod availability;
+pub mod detect;
 mod lmstudio;
 mod openai_compat;
 pub mod flint;

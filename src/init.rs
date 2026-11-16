@@ -36,6 +36,13 @@ pub struct InitOptions {
     /// (#316) `--engine-url`: the OpenAI-compatible server to record as this
     /// machine's engine, probed alone and chosen when it answers.
     pub engine_url: Option<String>,
+    /// (#3569) `--add-engine`: the detected engine to add to profiles.json,
+    /// after the operator confirms.
+    pub add_engine: Option<String>,
+    /// (#3569) `--engine-model`: which of its models to add.
+    pub engine_model: Option<String>,
+    /// (#3569) `--n-ctx`: the context to add it at.
+    pub n_ctx: Option<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -67,6 +74,10 @@ pub struct InitReport {
     pub engine: Option<Outcome>,
     /// (#316) Why the chosen engine could not be recorded, when it could not.
     pub engine_unrecorded: Option<String>,
+    /// (#3569) The engines darkmux starts servers for that are installed here.
+    pub detected: Option<darkmux_profiles::engine::detect::Detected>,
+    /// (#3569) What `--add-engine` did, and the registry it planned against.
+    pub engine_add: Option<(crate::init_detect::AddOutcome, PathBuf)>,
     pub config_path: Option<PathBuf>,
     pub config_created: bool,
     pub config_already_present: bool,
@@ -136,6 +147,9 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
         fill_models(&registry_path, &engine, &mut report);
     }
 
+    // 1f) (#3569) The engines installed here, and `--add-engine`.
+    detect_and_add(opts, &registry_path, &mut report);
+
     // 3)-6) Skills, and the optional hook and doc merges.
     install_integrations(opts, &mut report)?;
 
@@ -147,9 +161,7 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
 /// CLAUDE.md or AGENTS.md block under `--force`. The merges run as dry runs,
 /// so the check is the same code that refuses later.
 fn preflight(opts: &InitOptions) -> Result<()> {
-    if let Some(url) = opts.engine_url.as_deref() {
-        init_engine::engine_url(url).map_err(|e| anyhow!("--engine-url: {e}"))?;
-    }
+    preflight_engine_flags(opts)?;
     if opts.with_hook {
         ensure_session_start_hook(&claude_settings_path()?, true, opts.force)?;
     }
@@ -158,6 +170,17 @@ fn preflight(opts: &InitOptions) -> Result<()> {
     }
     if let Some(target) = opts.with_agents_md.as_ref() {
         ensure_agents_md_section(target, true, opts.force)?;
+    }
+    Ok(())
+}
+
+/// `--engine-url` and `--add-engine`, refused before anything is written.
+fn preflight_engine_flags(opts: &InitOptions) -> Result<()> {
+    if let Some(url) = opts.engine_url.as_deref() {
+        init_engine::engine_url(url).map_err(|e| anyhow!("--engine-url: {e}"))?;
+    }
+    if let Some(word) = opts.add_engine.as_deref() {
+        crate::init_detect::parse_engine(word)?;
     }
     Ok(())
 }
@@ -298,6 +321,34 @@ fn record_engine(
         return Err(format!("{e:#} ({})", put_back(registry_path, previous.as_deref())));
     }
     set.map(|_| ()).map_err(|e| format!("{e:#}"))
+}
+
+/// (#3569) Step 1f: detect the engines darkmux starts servers for that are
+/// installed here (LM Studio and a server are step 1c's), and add the one
+/// `--add-engine` names once the operator confirms. The add plans against
+/// the registry dispatch reads (`DARKMUX_PROFILES`, else the one `init`
+/// manages); a dry run on a machine with none yet plans against the one
+/// `init` would create.
+fn detect_and_add(opts: &InitOptions, registry_path: &Path, report: &mut InitReport) {
+    let target = darkmux_profiles::profiles::registry_path(None).unwrap_or_else(|| registry_path.to_path_buf());
+    let text = fs::read_to_string(&target).ok().or_else(|| opts.dry_run.then(|| EXAMPLE_PROFILES_JSON.to_string()));
+    let registry = text.as_deref().and_then(|t| darkmux_profiles::profiles::parse_registry_lenient(t).ok());
+    let found = engine::detect::Detected::of(engine::detect::detect_servers(registry.as_ref()));
+    if let Some(word) = opts.add_engine.as_deref() {
+        let outcome = match (crate::init_detect::parse_engine(word), text) {
+            (Err(e), _) => crate::init_detect::AddOutcome::Refused(format!("{e:#}")),
+            (Ok(_), None) => crate::init_detect::AddOutcome::Refused(format!(
+                "there is no profile registry at {} to add it to; run `darkmux init` first",
+                target.display()
+            )),
+            (Ok(kind), Some(text)) => {
+                let req = engine::add::AddRequest { engine: kind, model: opts.engine_model.clone(), n_ctx: opts.n_ctx };
+                crate::init_detect::add_engine(&req, &found, &target, &text, opts.dry_run, &mut crate::init_detect::TerminalConfirm)
+            }
+        };
+        report.engine_add = Some((outcome, target));
+    }
+    report.detected = Some(found);
 }
 
 /// Put the registry back as it was before `record_engine` wrote it (removed,

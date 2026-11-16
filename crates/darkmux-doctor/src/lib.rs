@@ -24,6 +24,7 @@ mod checks_power;
 // (#2093) The flow-record hook sink's rows — see the module doc.
 mod checks_hooks;
 mod checks_engines;
+mod checks_installed;
 mod checks_clients;
 // (#3112) The configured sandbox, and the Docker rows that apply only under it.
 mod checks_sandbox;
@@ -185,6 +186,8 @@ fn run_on(
         checks_engines::check_tensorfold_engine(),
         // (#3453) Only asks rec when an endpoint declares Flint.
         checks_engines::check_flint_engine(),
+        // (#3569) An installed engine no endpoint declares, and how to add it.
+        checks_installed::check_installed_engines(),
         sandbox_row,
         docker_runtime,
         check_models_loaded(),
@@ -12966,8 +12969,11 @@ mod tests {
         //
         // (#3560) 83: `checks_clients::check_clients_remote`, the
         // `clients.remote` row (what `client serve` does on the tailnet).
+        //
+        // (#3569) 84: `checks_installed::check_installed_engines` joined
+        // beside the Flint row.
         let expected =
-            83 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            84 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

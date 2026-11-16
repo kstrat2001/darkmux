@@ -77,11 +77,15 @@ pub enum ClientCapability {
     /// build can do: `remote.state` says whether this machine is on the
     /// tailnet, and `preview_disabled` still answers when previews are off.
     RemotePreview,
+    /// (#3569) `GET /client/engines`: the engines installed on this Mac,
+    /// whether any is `usable`, and `POST /client/engines`, which adds one
+    /// darkmux starts servers for once the app's user confirms.
+    Engines,
 }
 
 impl ClientCapability {
     /// Every capability, in declaration order: what `whoami` lists.
-    pub const ALL: [ClientCapability; 12] = [
+    pub const ALL: [ClientCapability; 13] = [
         ClientCapability::CleanPreview,
         ClientCapability::TemplateWorkspace,
         ClientCapability::Continues,
@@ -94,6 +98,7 @@ impl ClientCapability {
         ClientCapability::AvailabilityCodes,
         ClientCapability::RemoteRequests,
         ClientCapability::RemotePreview,
+        ClientCapability::Engines,
     ];
 }
 
@@ -128,6 +133,7 @@ mod tests {
                 "availability_codes",
                 "remote_requests",
                 "remote_preview",
+                "engines",
             ]
         );
         for c in ClientCapability::ALL {

@@ -273,6 +273,17 @@ fn harness() -> Harness {
             name: "studio".into(),
         },
         profile_info: Arc::new(|_role, names| names.iter().map(|n| test_profile_info(n)).collect()),
+        detect_engines: Arc::new(test_engines),
+        add_engine: {
+            let registry = dir.path().join("profiles.json");
+            std::fs::write(&registry, TEST_REGISTRY).unwrap();
+            Arc::new(move |req| {
+                let found = |reg: Option<&darkmux_types::ProfileRegistry>| {
+                    vec![test_flint(darkmux_profiles::engine::detect::declaring(reg, darkmux_types::ManagedBackend::Flint))]
+                };
+                crate::client_engines::add_in(Some(&registry), req, &found, &|_| true)
+            })
+        },
         check_workdir: Arc::new(move |p| {
             darkmux_types::workdir::validate_remote_workdir_in(p, &canon_base)
                 .map_err(|e| format!("{e:#}"))
@@ -680,6 +691,8 @@ async fn every_route_refuses_a_browser_and_a_bodyless_post_needs_no_type() {
     for (method, path) in [
         ("GET", "/client/whoami"),
         ("GET", "/client/profiles"),
+        ("GET", "/client/engines"),
+        ("POST", "/client/engines"),
         ("POST", "/client/work"),
         ("GET", "/client/work/w-1"),
         ("POST", "/client/work/w-1/cancel"),
@@ -754,7 +767,7 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
                            "capabilities": ["clean_preview", "template_workspace", "continues", "clone_preview",
                                             "recipe_set", "workspace_image", "workspace_edit", "workspace_remove",
                                              "remote_tailscale", "availability_codes",
-                                             "remote_requests", "remote_preview"],
+                                             "remote_requests", "remote_preview", "engines"],
                             "remote": {"state": "off", "url": null, "reason": null},
                             "via": "local"})
     );
@@ -10018,10 +10031,10 @@ async fn every_declared_body_is_the_one_its_handler_reads() {
             }
         }
     }
-    assert_eq!(bodies, 8, "every route that declares a body was probed");
+    assert_eq!(bodies, 9, "every route that declares a body was probed");
     // (#3560) The two preview link routes answer this Mac's app
     // `tailnet_only`, past the token, before any lookup.
-    assert_eq!(reached, 16, "every route that declares none was probed past its lookups");
+    assert_eq!(reached, 17, "every route that declares none was probed past its lookups");
 }
 
 /// (#3494 review) Each property a route's declared query has is a field its
@@ -11291,6 +11304,116 @@ async fn an_auto_approval_is_the_approval_client_approve_makes() {
     assert!(p.auto_approved.is_some());
     assert!(revoke(&h.store, p.client_name.as_deref().unwrap()).unwrap(), "revocable like any approval");
     assert_eq!(poll(&h, &id, SECRET).await.1["status"], "denied");
+}
+
+// ─── (#3569) Engines ────────────────────────────────────────────────────
+
+/// The registry the harness's engine add writes.
+const TEST_REGISTRY: &str = "{\n  \"profiles\": {\n    \"fast\": { \"models\": [ { \"id\": \"qwen\", \"n_ctx\": 8192 } ] }\n  }\n}\n";
+
+/// rec 0.1.0 with `flint-int4` pulled, declared by `endpoints`.
+fn test_flint(endpoints: Vec<String>) -> darkmux_profiles::engine::detect::DetectedEngine {
+    use darkmux_profiles::engine::detect::{judge_flint, FlintFacts};
+    let pulled = vec![darkmux_profiles::engine::flint::Pulled { revision: "flint-int4".into(), max_context: Some(262_144) }];
+    judge_flint(FlintFacts { version: Ok("0.1.0".into()), runtime: Ok(()), pulled: Ok(pulled) }, endpoints)
+}
+
+/// What the harness's detection finds: LM Studio with nothing downloaded,
+/// and rec's Flint, usable and not configured.
+fn test_engines() -> darkmux_profiles::engine::detect::Detected {
+    let lms = darkmux_profiles::engine::detect::judge_lmstudio(None, Ok(Vec::new()));
+    darkmux_profiles::engine::detect::Detected::of(vec![lms, test_flint(Vec::new())])
+}
+
+/// `GET /client/engines` lists what detection found, whether any is
+/// usable, and this machine; it takes a token like every route.
+#[tokio::test]
+async fn the_engines_route_lists_what_was_found_and_whether_any_is_usable() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(&h, get("/client/engines", &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["usable"], true);
+    assert_eq!(v["machine"]["name"], "studio");
+    assert_eq!(v["detected"][0]["engine"], "lmstudio");
+    assert_eq!(v["detected"][0]["state"], "unusable");
+    assert_eq!(v["detected"][1]["engine"], "flint");
+    assert_eq!(v["detected"][1]["can_add"], true);
+    assert_eq!(v["detected"][1]["models"][0], serde_json::json!({"id": "flint-int4", "max_context": 262144}));
+    let (code, v) = call(&h, get("/client/engines", &[])).await;
+    assert_eq!((code, v["code"].as_str()), (401, Some("unauthorized")));
+}
+
+/// `POST /client/engines` adds the engine the confirmed request names and
+/// says what it wrote; a second add is refused `conflict`, LM Studio
+/// `bad_request`, and an engine word darkmux does not know `bad_request`.
+#[tokio::test]
+async fn the_engine_add_writes_what_was_asked_and_refuses_what_it_cannot() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(&h, post("/client/engines", Some(&token), serde_json::json!({"engine": "flint"}))).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(
+        v,
+        serde_json::json!({"engine": "flint", "endpoint": "flint", "port": 8091, "profile": "flint", "model": "flint-int4", "n_ctx": 262144})
+    );
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(h.dir.path().join("profiles.json")).unwrap()).unwrap();
+    assert_eq!(written["endpoints"]["flint"], serde_json::json!({"managed": "flint", "port": 8091}));
+    for (body, status, code) in [
+        (serde_json::json!({"engine": "flint"}), 409, "conflict"),
+        (serde_json::json!({"engine": "lmstudio"}), 400, "bad_request"),
+        (serde_json::json!({"engine": "ollama"}), 400, "bad_request"),
+        (serde_json::json!({}), 400, "bad_request"),
+    ] {
+        let (got, v) = call(&h, post("/client/engines", Some(&token), body.clone())).await;
+        assert_eq!((got, v["code"].as_str()), (status, Some(code)), "{body}: {v}");
+    }
+    let (code, _) = call(&h, post("/client/engines", None, serde_json::json!({"engine": "flint"}))).await;
+    assert_eq!(code, 401);
+}
+
+/// Each refusal of an add carries the code an app branches on.
+#[test]
+fn an_add_refusal_carries_its_code() {
+    use darkmux_profiles::engine::add::Refusal;
+    for (r, status, code) in [
+        (Refusal::Unavailable("x".into()), 409, "engine_unavailable"),
+        (Refusal::Configured("x".into()), 409, "conflict"),
+        (Refusal::Changed("x".into()), 409, "conflict"),
+        (Refusal::BadRequest("x".into()), 400, "bad_request"),
+        (Refusal::Registry("x".into()), 422, "unprocessable"),
+    ] {
+        let resp = crate::client_engines::refusal_response(&r);
+        assert_eq!(resp.status().as_u16(), status, "{r:?}");
+        let body = futures_body(resp);
+        assert_eq!(body["code"], code, "{r:?}");
+    }
+}
+
+/// Without a registry there is nothing to add to, and an unreadable one is
+/// refused `unprocessable` too; neither asks the engines.
+#[test]
+fn an_add_without_a_registry_to_write_is_refused_and_asks_nothing() {
+    use darkmux_profiles::engine::add::{AddRequest, Refusal};
+    use darkmux_profiles::engine::detect::DetectedKind;
+    let req = AddRequest { engine: DetectedKind::Flint, model: None, n_ctx: None };
+    let asked = std::cell::Cell::new(false);
+    let found = |_: Option<&darkmux_types::ProfileRegistry>| {
+        asked.set(true);
+        Vec::new()
+    };
+    let none = crate::client_engines::add_in(None, &req, &found, &|_| true).unwrap_err();
+    assert!(matches!(&none, Refusal::Registry(m) if m.contains("run `darkmux init`")), "{none:?}");
+    let dir = tempfile::tempdir().unwrap();
+    let gone = crate::client_engines::add_in(Some(&dir.path().join("profiles.json")), &req, &found, &|_| true).unwrap_err();
+    assert!(matches!(&gone, Refusal::Registry(m) if m.contains("reading profiles.json")), "{gone:?}");
+    assert!(!asked.get());
+}
+
+fn futures_body(resp: axum::response::Response) -> Value {
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let bytes = rt.block_on(axum::body::to_bytes(resp.into_body(), 1 << 16)).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
 }
 
 /// (#3560, part 4) The preview proxy's tests, on this harness.
