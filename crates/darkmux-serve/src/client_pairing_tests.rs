@@ -11446,8 +11446,8 @@ async fn an_engine_add_from_a_device_paired_over_the_tailnet_is_written_and_reco
 /// Through the tailnet entry, an add from anything but an approved device
 /// paired over the tailnet, as the user it paired as, is refused as every
 /// route refuses it (no token, an unknown one, a pairing made on the Mac,
-/// another tailnet user, a revoked device), and nothing is written or
-/// recorded.
+/// another tailnet user, another of the user's devices, a revoked device),
+/// and nothing is written or recorded.
 #[tokio::test]
 async fn an_engine_add_through_the_tailnet_from_no_approved_device_is_refused_and_writes_nothing() {
     let mut h = harness();
@@ -11467,6 +11467,9 @@ async fn an_engine_add_through_the_tailnet_from_no_approved_device_is_refused_an
     alex.push(("tailscale-user-login", ALEX));
     let (status, v) = call(&h, add(&with_token(&alex, Some(&auth)))).await;
     assert_eq!((status, v["code"].as_str()), (403, Some("remote_identity_mismatch")), "another user: {v}");
+    h.devices.place(&laptop_node(), &[LAPTOP_V4]);
+    let (status, v) = call(&h, add(&with_token(&from_addr(forwarded(Some(SAM)), LAPTOP_V4), Some(&auth)))).await;
+    assert_eq!((status, v["code"].as_str()), (403, Some("remote_device_mismatch")), "another of the user's devices: {v}");
     assert!(revoke(&h.store, "sam-s-iphone").unwrap());
     let (status, v) = call(&h, add(&with_token(&forwarded(Some(SAM)), Some(&auth)))).await;
     assert_eq!((status, v["code"].as_str()), (401, Some("unauthorized")), "revoked: {v}");
