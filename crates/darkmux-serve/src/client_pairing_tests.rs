@@ -11412,46 +11412,115 @@ async fn the_engine_add_writes_what_was_asked_and_refuses_what_it_cannot() {
     assert_eq!(code, 401);
 }
 
-/// (#3569 review) An add writes this Mac's profile registry, so it is
-/// refused `forbidden` from a device on the tailnet, and nothing is
-/// written; listing what is installed stays open to it.
+/// An approved device paired over the tailnet adds an engine through the
+/// entry as an app on this Mac does: the same reply, the registry written,
+/// and the serve log naming the client, that it came over the tailnet, and
+/// the tailnet user and device it paired as. Listing stays open to it too.
 #[tokio::test]
-async fn an_engine_add_from_the_tailnet_is_refused_and_listing_is_not() {
+async fn an_engine_add_from_a_device_paired_over_the_tailnet_is_written_and_recorded() {
     let mut h = harness();
     let token = paired(&h).await;
     paired_as(&h, "sam-s-iphone", SAM);
     on_the_tailnet(&mut h);
     let auth = bearer(&token);
-    let req = adding(post("/client/engines", Some(&token), serde_json::json!({"engine": "flint"})), &forwarded(Some(SAM)));
-    let (status, v) = call(&h, req).await;
-    assert_eq!((status, v["code"].as_str()), (403, Some("forbidden")), "{v}");
-    assert!(v["error"].as_str().unwrap().contains("only by an app on this Mac"), "{v}");
-    let registry = std::fs::read_to_string(h.dir.path().join("profiles.json")).unwrap();
-    assert_eq!(registry, TEST_REGISTRY, "nothing written");
     let (status, v) = call(&h, get("/client/engines", &with_token(&forwarded(Some(SAM)), Some(&auth)))).await;
     assert_eq!(status, 200, "{v}");
-    let (status, v) = call(&h, post("/client/engines", Some(&token), serde_json::json!({"engine": "flint"}))).await;
-    assert_eq!(status, 200, "from this Mac it is added: {v}");
-    // The refused tailnet add left no record; the add from this Mac did.
+    let req = adding(post("/client/engines", Some(&token), serde_json::json!({"engine": "flint"})), &forwarded(Some(SAM)));
+    let (status, v) = call(&h, req).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(
+        v,
+        serde_json::json!({"engine": "flint", "endpoint": "flint", "port": 8091, "profile": "flint", "model": "flint-int4", "n_ctx": 262144})
+    );
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(h.dir.path().join("profiles.json")).unwrap()).unwrap();
+    assert_eq!(written["endpoints"]["flint"], serde_json::json!({"managed": "flint", "port": 8091}));
     let log = std::fs::read_to_string(h.dir.path().join("serve.log")).unwrap();
     assert_eq!(log.lines().count(), 1, "{log}");
-    assert!(log.contains("added engine `flint`") && log.contains("an app on this Mac") && log.contains("port 8091"), "{log}");
+    for part in ["client `sam-s-iphone`", "over the tailnet", "tailnet user sam@example.com", "device sams-iphone", "added engine `flint`", "port 8091"] {
+        assert!(log.contains(part), "{part}: {log}");
+    }
+    assert!(!log.contains("this Mac"), "not from this Mac: {log}");
+    assert!(!log.contains(&token), "no token: {log}");
+}
+
+/// Through the tailnet entry, an add from anything but an approved device
+/// paired over the tailnet, as the user it paired as, is refused as every
+/// route refuses it (no token, an unknown one, a pairing made on the Mac,
+/// another tailnet user, another of the user's devices, a revoked device),
+/// and nothing is written or recorded.
+#[tokio::test]
+async fn an_engine_add_through_the_tailnet_from_no_approved_device_is_refused_and_writes_nothing() {
+    let mut h = harness();
+    let token = paired(&h).await;
+    on_the_tailnet(&mut h);
+    let auth = bearer(&token);
+    let add = |headers: &[(&str, &str)]| adding(post("/client/engines", None, serde_json::json!({"engine": "flint"})), headers);
+    let (status, v) = call(&h, add(&with_token(&forwarded(Some(SAM)), Some(&auth)))).await;
+    assert_eq!((status, v["code"].as_str()), (403, Some("not_paired_remotely")), "paired on the Mac: {v}");
+    paired_as(&h, "sam-s-iphone", SAM);
+    let wrong = bearer(&"0".repeat(64));
+    for token in [None, Some(wrong.as_str())] {
+        let (status, v) = call(&h, add(&with_token(&forwarded(Some(SAM)), token))).await;
+        assert_eq!((status, v["code"].as_str()), (401, Some("unauthorized")), "{token:?}: {v}");
+    }
+    let mut alex = forwarded(None);
+    alex.push(("tailscale-user-login", ALEX));
+    let (status, v) = call(&h, add(&with_token(&alex, Some(&auth)))).await;
+    assert_eq!((status, v["code"].as_str()), (403, Some("remote_identity_mismatch")), "another user: {v}");
+    h.devices.place(&laptop_node(), &[LAPTOP_V4]);
+    let (status, v) = call(&h, add(&with_token(&from_addr(forwarded(Some(SAM)), LAPTOP_V4), Some(&auth)))).await;
+    assert_eq!((status, v["code"].as_str()), (403, Some("remote_device_mismatch")), "another of the user's devices: {v}");
+    assert!(revoke(&h.store, "sam-s-iphone").unwrap());
+    let (status, v) = call(&h, add(&with_token(&forwarded(Some(SAM)), Some(&auth)))).await;
+    assert_eq!((status, v["code"].as_str()), (401, Some("unauthorized")), "revoked: {v}");
+    let registry = std::fs::read_to_string(h.dir.path().join("profiles.json")).unwrap();
+    assert_eq!(registry, TEST_REGISTRY, "nothing written");
+    assert!(!h.dir.path().join("serve.log").exists(), "nothing recorded");
 }
 
 /// (#3569 review) Every add is recorded in the serve log: the client, the
 /// engine and what was written; never the token.
 #[test]
 fn an_add_is_recorded_naming_the_client_and_what_was_written() {
-    use darkmux_profiles::engine::add::{ContextFrom, Planned};
-    let client = ApprovedClient {
+    let line = crate::client_engines::added_line(&adding_client(), RequestVia::Local, &flint_planned());
+    for part in ["`mux-bot`", "c-0123456789abcdef", "TEAM123/com.example.muxbot", "an app on this Mac", "engine `flint`", "port 8091", "profile `flint`", "`flint-int4`", "262144"] {
+        assert!(line.contains(part), "{part}: {line}");
+    }
+    assert!(!line.contains("tailnet"), "from this Mac: {line}");
+    assert!(!line.contains(&"f".repeat(64)), "no token hash: {line}");
+}
+
+/// An add through the tailnet entry is recorded as over the tailnet, from
+/// the tailnet user and device the client paired as, never as this Mac.
+#[test]
+fn an_add_over_the_tailnet_is_recorded_naming_the_device_it_came_from() {
+    let mut client = adding_client();
+    client.tailnet = Some(phone_as(SAM));
+    let line = crate::client_engines::added_line(&client, RequestVia::Tailnet, &flint_planned());
+    for part in ["`mux-bot`", "c-0123456789abcdef", "over the tailnet from tailnet user sam@example.com, device sams-iphone (Sam's iPhone)", "engine `flint`"] {
+        assert!(line.contains(part), "{part}: {line}");
+    }
+    assert!(!line.contains("this Mac"), "{line}");
+    assert!(!line.contains("nPHONE1CNTRL"), "the node id is never shown: {line}");
+    assert!(!line.contains(&"f".repeat(64)), "no token hash: {line}");
+}
+
+/// A client the add-line tests record: auto-approved, paired on the Mac.
+fn adding_client() -> ApprovedClient {
+    ApprovedClient {
         name: "mux-bot".into(),
         id: "c-0123456789abcdef".into(),
         created: 0,
         token_hash: "f".repeat(64),
         auto_approved: SigningIdentity::parse("TEAM123/com.example.muxbot"),
         tailnet: None,
-    };
-    let planned = Planned {
+    }
+}
+
+/// The add of rec's Flint the harness's engine add plans.
+fn flint_planned() -> darkmux_profiles::engine::add::Planned {
+    use darkmux_profiles::engine::add::{ContextFrom, Planned};
+    Planned {
         engine: darkmux_types::ManagedBackend::Flint,
         endpoint: "flint".into(),
         port: 8091,
@@ -11460,12 +11529,7 @@ fn an_add_is_recorded_naming_the_client_and_what_was_written() {
         n_ctx: 262_144,
         n_ctx_from: ContextFrom::EngineStated,
         text: String::new(),
-    };
-    let line = crate::client_engines::added_line(&client, &planned);
-    for part in ["`mux-bot`", "c-0123456789abcdef", "TEAM123/com.example.muxbot", "this Mac", "engine `flint`", "port 8091", "profile `flint`", "`flint-int4`", "262144"] {
-        assert!(line.contains(part), "{part}: {line}");
     }
-    assert!(!line.contains(&"f".repeat(64)), "no token hash: {line}");
 }
 
 /// (#3569 review) Two adds racing through the API: one lands, the other is
