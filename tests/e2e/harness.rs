@@ -75,6 +75,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::e2e::fixture_port::{listener_pids, pick_fixture_port};
 use crate::e2e::fixture_reaper::FixtureGroup;
 use crate::e2e::mock_lmstudio::MockLmStudio;
 
@@ -86,45 +87,6 @@ const REDIS_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// lost port (see [`pick_fixture_port`]); a fixture that is genuinely broken
 /// dies every time and still fails boot, naming each attempt's exit.
 const FIXTURE_START_ATTEMPTS: usize = 4;
-
-/// (#2898) Fixture ports come from 20000-32767, below every OS ephemeral
-/// range (Linux assigns 32768-60999, macOS 49152-65535). The old way, bind
-/// port 0, read it, drop the listener, spawn, handed out a port FROM the
-/// ephemeral range and freed it; in the gap, an outgoing connection (this
-/// process polls redis and the daemons connect to it, all the time) could
-/// take it as its source port, and the fixture then failed to bind and
-/// exited at once. Boot reported that as "fixture pid N was already gone
-/// when it was registered". Ports in this range are never assigned as a
-/// source port, so only another fixture choosing the same number can
-/// collide: within a process `pick_fixture_port` never hands a port out
-/// twice, and across processes `start_fixture` only accepts the answer of
-/// its OWN child, so the loser exits and retries (`FIXTURE_START_ATTEMPTS`).
-const FIXTURE_PORT_RANGE: std::ops::Range<u16> = 20_000..32_768;
-
-fn pick_fixture_port() -> Result<u16, String> {
-    use std::hash::{BuildHasher, Hasher};
-    // (#2898 review) Every port this PROCESS has handed out, never handed
-    // out again: libtest runs a binary's tests as threads, and two of them
-    // must not pick the same number at the same moment. Collisions across
-    // processes (nextest runs each test as its own) are caught by
-    // `start_fixture`'s identity check instead.
-    static HANDED_OUT: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
-    let span = u64::from(FIXTURE_PORT_RANGE.end - FIXTURE_PORT_RANGE.start);
-    let mut handed_out = HANDED_OUT.lock().unwrap_or_else(|e| e.into_inner());
-    let handed_out = handed_out.get_or_insert_with(Default::default);
-    for _ in 0..64 {
-        // `RandomState` is freshly keyed per instance, which is all the
-        // randomness a port choice needs, with no new dependency.
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u32(std::process::id());
-        let port = FIXTURE_PORT_RANGE.start + (h.finish() % span) as u16;
-        if !handed_out.contains(&port) && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            handed_out.insert(port);
-            return Ok(port);
-        }
-    }
-    Err(format!("no free fixture port in {FIXTURE_PORT_RANGE:?} after 64 tries"))
-}
 
 /// (#2898) Why a fixture did not come up.
 enum StartFailure {
@@ -186,18 +148,6 @@ fn start_fixture(
         Some(why) => died(child, why),
         None => StartFailure::Other(format!("did not answer within {timeout:?}; {}", log_tail(log))),
     })
-}
-
-/// (#2898 review) The pids with a TCP listener on `port`, from the OS
-/// (`lsof`, present on macOS and on GitHub's ubuntu runners). Readiness uses
-/// it to confirm the process answering is the fixture it just spawned: an
-/// answer alone can come from ANOTHER fixture that took the same port.
-fn listener_pids(port: u16) -> Vec<u32> {
-    Command::new("lsof")
-        .args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect())
-        .unwrap_or_default()
 }
 
 /// The last few lines of a fixture's log, for an error message.
@@ -1141,20 +1091,6 @@ mod fixture_port_tests {
             panic!("redis-server is not on PATH, but DARKMUX_E2E_REQUIRED is set");
         }
         ok
-    }
-
-    /// (#2898) Fixture ports never come from an OS ephemeral range, where an
-    /// outgoing connection could take one as its source port before the
-    /// fixture binds it.
-    #[test]
-    fn fixture_ports_stay_below_every_ephemeral_range() {
-        for _ in 0..200 {
-            let port = pick_fixture_port().expect("a free fixture port");
-            assert!(
-                FIXTURE_PORT_RANGE.contains(&port) && port < 32_768,
-                "port {port} is outside {FIXTURE_PORT_RANGE:?} or inside Linux's ephemeral range"
-            );
-        }
     }
 
     /// (#2898 review) Readiness must confirm WHO answered. Two fixtures
