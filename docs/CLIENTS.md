@@ -66,4 +66,26 @@ Every refusal carries a `code` and an `error`. Branch on the `code`; show the `e
 - Remove one with `DELETE /client/workspaces/{name}`. It is refused while a run, an Undo or a preview holds it, and refused `unsaved_commits` when it holds commits kept nowhere else, until the user agrees to `force` it.
 - Start a preview with `POST /client/workspaces/{name}/preview`, poll `GET /client/workspaces/{name}/preview` until it is ready or has failed, and stop it with `DELETE /client/workspaces/{name}/preview`. A preview also stops when it sits idle, when the app is revoked and when `darkmux client serve` stops, so read its status instead of assuming it still runs.
 - A workspace with no preview recipe is refused `no_recipe`. For a cloned repository whose user approves one, `PUT /client/workspaces/{name}/recipe` sets it, when `recipe_set` is listed.
-- A preview's address is on the Mac's loopback, so a device on the tailnet cannot open it yet.
+- A preview's address is on the Mac's loopback. A device on the tailnet opens it through a link instead (below).
+
+## See a preview from another device over the tailnet
+
+Gate this on `remote_preview` in `capabilities`, with `remote` `available`. A device paired over the tailnet sees one of its previews in its browser, through `url`:
+
+1. Start the preview and poll it until it is ready, as above.
+2. Send `POST /client/workspaces/{name}/preview/link` through `url`, with the device's token. The reply's `url` is a link to that preview for this device: it opens once, within `expires_in_secs`. Open it in the device's browser at once, and never keep or log it. From an app on the Mac it is refused `tailnet_only` (the preview's own address serves it), and for a preview that is not ready, `conflict`.
+3. The browser opens the link (`GET /client/preview-link/{code}`). darkmux checks the request comes from the tailnet user and device the link was made for, sets a session cookie in that browser and sends it on to the root of `url`, where the preview is. Every path outside /client/ there is the preview's, its WebSocket upgrades included, so live reload works when the preview's reload socket uses the app port.
+4. A link opened a second time, or too late, answers `not_found`; one whose preview stopped or restarted since it was made, or whose device was revoked, `conflict`. From another device or user it answers as a token would (`remote_device_mismatch`, `remote_identity_mismatch`), and is used up all the same. Ask for a new link.
+5. The session lasts while its preview runs. It ends when the preview stops or restarts, when the device is revoked, when previews are turned off on the Mac, and when `darkmux client serve` stops: the preview's pages then answer `no_preview_session`, and an open WebSocket closes within a second. Ask for a new link and open it.
+
+What that means for a preview:
+
+- A browser holds one session for the Mac's address, so it shows one preview at a time: opening a link to another preview replaces it.
+- The preview's own paths under /client/ answer as darkmux's routes, not the preview's.
+- Its server gets requests with its own loopback address as their host and origin, without the device's token, the session cookie or Tailscale's headers. The rest of what the browser sends reaches it as sent: the referrer and fetch metadata name the tailnet address, and the browser's other cookies for the Mac's address (another preview's, or a service's on another port of that address) go with every request.
+- Its answers cannot set the session cookie, nor a cookie for other hosts (one with a Domain). The proxy cannot see cookies the preview's own scripts set in the browser (document.cookie). Its answers are never cached (each is sent no-store, whatever the preview says), and it cannot register a service worker (refused `forbidden`).
+- Only the browser's own requests to the Mac's address reach it: one from another origin or another site, a WebSocket included, is refused `forbidden`. Every tailnet address is the same site to a browser, so this, not the cookie, is what keeps another tailnet page out.
+- A page of the preview counts as asking about it, so the idle check does not stop a preview while it is open.
+- At most six of a page's requests reach the preview at once (the rest wait their turn, as a browser's own connection limit makes them), and at most two WebSockets stay open (another answers `too_many_requests`). A request the preview does not begin to answer within three minutes answers `unavailable`.
+
+**Previews share one origin.** Every preview is served at the same address, so the browser treats them as one site. Opening a link asks the browser to clear that address's cache and storage (the Clear-Site-Data header, which browsers support unevenly), but a tab still open on preview A, or storage the browser keeps for the address, can still reach preview B once B's session is set: A's page would then be talking to B. Show each preview in a web view of its own, with a data store of its own (on Apple platforms, a web view whose data store is made for that preview with WKWebsiteDataStore(forIdentifier:)), and close a preview's web view before opening another's link.

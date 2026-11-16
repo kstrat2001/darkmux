@@ -425,6 +425,19 @@ pub struct PreviewState {
     pub stage: Option<PreviewStage>,
 }
 
+/// (#3560) `POST /client/workspaces/{name}/preview/link`: a link for this
+/// device's browser to that preview, through the tailnet entry.
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
+pub struct PreviewLink {
+    /// Open it in the device's browser at once: it opens once, within
+    /// `expires_in_secs`, from the tailnet user and device that asked for
+    /// it. It sets that browser's preview session and goes on to the
+    /// entry's root, where the preview is.
+    pub url: String,
+    /// How long the link waits to be opened, in seconds.
+    pub expires_in_secs: u64,
+}
+
 /// (#3561) A step of a preview's start that an app may show.
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
 pub struct PreviewStage {

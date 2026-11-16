@@ -97,10 +97,13 @@ fn operation(
         parameters.extend(query_parameters(&query(generator).to_value()));
     }
     let open = takes_no_token(route.auth, &mut parameters);
-    let reply = (route.reply_schema)(generator);
+    let (status, success) = match route.see_other {
+        true => ("303", see_other()),
+        false => ("2XX", json!({"description": route.reply, "content": json_content((route.reply_schema)(generator))})),
+    };
     let mut op = json!({
         "responses": {
-            "2XX": {"description": route.reply, "content": json_content(reply)},
+            status: success,
             "default": {"$ref": "#/components/responses/ClientError"},
         }
     });
@@ -115,6 +118,21 @@ fn operation(
             json!({"required": body.required, "content": json_content((body.schema)(generator))});
     }
     op
+}
+
+/// (#3560) The answer to opening a preview link: on to the entry's root,
+/// with the preview session set in the browser.
+fn see_other() -> Value {
+    json!({
+        "description": "The preview session is set in this browser: on to the root, where the preview is.",
+        "headers": {
+            "Location": {"schema": {"type": "string", "const": "/"}},
+            "Set-Cookie": {
+                "description": "The preview session cookie: HttpOnly, Secure, SameSite=Strict, Path=/.",
+                "schema": {"type": "string"},
+            },
+        },
+    })
 }
 
 /// A query type's properties as `in: query` parameters.
@@ -325,7 +343,7 @@ mod tests {
     #[test]
     fn a_success_names_the_reply_type() {
         let d = doc();
-        for r in crate::routes::client_table() {
+        for r in crate::routes::client_table().into_iter().filter(|r| !r.see_other) {
             let path = r
                 .path
                 .replace(":request_id", "{request_id}")
@@ -342,6 +360,22 @@ mod tests {
         }
         let whoami = &d["components"]["schemas"]["Whoami"];
         assert!(whoami["properties"]["capabilities"].is_object(), "{whoami}");
+    }
+
+    /// (#3560) Opening a preview link answers a 303 to the root that sets
+    /// the session cookie, and no JSON success; it takes no token.
+    #[test]
+    fn opening_a_preview_link_is_a_303_with_the_session_cookie() {
+        let d = doc();
+        let op = &d["paths"]["/client/preview-link/{code}"]["get"];
+        let responses = op["responses"].as_object().unwrap();
+        assert_eq!(responses.keys().collect::<Vec<_>>(), ["303", "default"], "{op}");
+        assert_eq!(op["responses"]["303"]["headers"]["Location"]["schema"]["const"], "/");
+        assert!(op["responses"]["303"]["headers"]["Set-Cookie"].is_object(), "{op}");
+        assert_eq!(op["security"], json!([]));
+        let see_other: Vec<&str> = crate::routes::client_table().into_iter().filter(|r| r.see_other).map(|r| r.path).collect();
+        assert_eq!(see_other, ["/client/preview-link/:code"], "the only redirect");
+        assert!(d["components"]["schemas"].get("()").is_none(), "no schema for a body it never sends");
     }
 
     /// A route that reads a body names its type, required unless the route
@@ -399,7 +433,7 @@ mod tests {
                     "{} {path}: the global one",
                     r.method
                 ),
-                ClientAuth::Open | ClientAuth::PairSecret => {
+                ClientAuth::Open | ClientAuth::PairSecret | ClientAuth::LinkCode => {
                     assert_eq!(op["security"], json!([]), "{} {path}", r.method)
                 }
             }
