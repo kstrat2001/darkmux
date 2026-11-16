@@ -628,7 +628,7 @@ impl<'a> AgentLoop<'a> {
         // compact meets a thread big enough to trigger — and killing the
         // dispatch there discards the work the checkpoint existed to
         // preserve.
-        let installed = self.attempt_compaction(self.limits.answer_max_tokens, "resume catch-up compaction");
+        let installed = self.attempt_compaction("resume catch-up compaction");
         if let Some(summary) = installed {
             self.record_resume_compaction(summary, before_count, resume_estimate_tokens);
         }
@@ -1776,7 +1776,7 @@ impl<'a> AgentLoop<'a> {
         }
         self.dispatch_calls(calls);
         // Loop back and call chat() again, unless compaction ends the dispatch.
-        self.compact_if_needed(call.bound.wire_max_tokens)
+        self.compact_if_needed()
     }
 
     fn refuse_invalid_calls(&mut self, calls: &[ToolCall], reason: MalformedReason) {
@@ -2127,7 +2127,7 @@ impl<'a> AgentLoop<'a> {
     }
 
     /// The context check after a tool turn. `Some` ends the dispatch.
-    fn compact_if_needed(&mut self, wire_max_tokens: u32) -> Option<LoopOutcome> {
+    fn compact_if_needed(&mut self) -> Option<LoopOutcome> {
         // (#854) When the endpoint's reported count is stale (frozen
         // across turns while the thread grew), it can't gate compaction
         // — it silently suppressed it into a degenerate cycle. A local
@@ -2201,7 +2201,7 @@ impl<'a> AgentLoop<'a> {
             self.unproductive_compactions.end_episode();
             return None;
         }
-        self.compact_thread(wire_max_tokens, effective_prompt_tokens)
+        self.compact_thread(effective_prompt_tokens)
     }
 
     fn report_stale_prompt_count(&mut self) {
@@ -2224,9 +2224,9 @@ impl<'a> AgentLoop<'a> {
         );
     }
 
-    fn compact_thread(&mut self, wire_max_tokens: u32, effective_prompt_tokens: u32) -> Option<LoopOutcome> {
+    fn compact_thread(&mut self, effective_prompt_tokens: u32) -> Option<LoopOutcome> {
         let before_count = self.messages.len();
-        let installed_summary_chars = self.attempt_compaction(wire_max_tokens, "compaction");
+        let installed_summary_chars = self.attempt_compaction("compaction");
         // (#2792 merge-gate) Everything in this block describes a
         // compaction that ACTUALLY INSTALLED — the trajectory record,
         // the staleness-counter reset, the post-compaction nudge. A
@@ -2273,7 +2273,7 @@ impl<'a> AgentLoop<'a> {
     /// catch-up. Returns the installed summary's `(chars, lexically_repaired)`,
     /// or `None` when the compactor's result was refused and skipped.
     /// `label` names the site in the refusal line.
-    fn attempt_compaction(&mut self, max_tokens_per_call: u32, label: &str) -> Option<(usize, bool)> {
+    fn attempt_compaction(&mut self, label: &str) -> Option<(usize, bool)> {
         // (#2792 merge-gate) `compactions` is incremented only
         // AFTER a compaction actually installs. It used to be
         // bumped here, before the attempt, so a refused
@@ -2304,7 +2304,7 @@ impl<'a> AgentLoop<'a> {
             )
             .map(|chars| (chars, false)),
             compaction::CompactionStrategy::StructuredSlot => {
-                self.structured_compaction(attempted_generation, max_tokens_per_call, &mut compactor_calls)
+                self.structured_compaction(attempted_generation, &mut compactor_calls)
             }
         };
         for call in &compactor_calls {
@@ -2368,7 +2368,6 @@ impl<'a> AgentLoop<'a> {
     fn structured_compaction(
         &mut self,
         attempted_generation: u32,
-        max_tokens_per_call: u32,
         compactor_calls: &mut Vec<compaction::CompactorCall>,
     ) -> Result<(usize, bool)> {
         // (#439) Build budget snapshot so the
@@ -2385,7 +2384,11 @@ impl<'a> AgentLoop<'a> {
             max_turns: self.limits.max_turns,
             cumulative_completion_tokens_used: self.state.total_completion_tokens,
             max_cumulative_completion_tokens: self.limits.max_cumulative_tokens,
-            max_tokens_per_call,
+            // (#3142) The answer ceiling, on every path: the rendered line
+            // names a per-turn emission ceiling. A non-streamed call's wire
+            // `max_tokens` is the check-in interval, which the turn continues
+            // past, so passing it told the model a cap it does not have.
+            max_tokens_per_call: self.limits.answer_max_tokens,
         };
         compaction::structured_compact(
             self.compactor_client,
