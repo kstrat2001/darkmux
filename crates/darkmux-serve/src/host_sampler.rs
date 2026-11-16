@@ -1706,7 +1706,6 @@ mod tests {
             // A dispatch appears right after.
             let day_path = flows_dir.join(format!("{}.jsonl", darkmux_flow::day_utc_now()));
             let live_start = darkmux_flow::ts_utc_now();
-            let appeared_at_ms = darkmux_crew::host_probe::epoch_ms_now();
             {
                 use std::io::Write;
                 let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&day_path).unwrap();
@@ -1721,6 +1720,9 @@ mod tests {
                 )
                 .unwrap();
             }
+            // Stamped once the line is written: a tick before this moment
+            // may not have seen the dispatch yet, so none is counted.
+            let appeared_at_ms = darkmux_crew::host_probe::epoch_ms_now();
 
             // (#2823) The first emission sampled after the dispatch appeared.
             // How soon it came is counted in the sampler's own TICKS (ring

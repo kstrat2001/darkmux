@@ -316,14 +316,26 @@ const SWEEP_ROUNDS: u32 = 50;
 /// in `run_bounded`), and each kill follows a look that found a member, so
 /// it never reaches another group. Bounded: a command that keeps forking
 /// faster than it is killed is left after [`SWEEP_ROUNDS`] looks.
+///
+/// On Linux a group kill does reach a child forked during it, so the sweep
+/// finds nothing left to kill there. Linux does count a group whose only
+/// members are zombies (exited, not yet reaped by init) as having members,
+/// so the sweep can look again for up to [`SWEEP_ROUNDS`] x 10 ms (about
+/// 0.5 s) while they are reaped: a bounded delay, never a leak.
 #[cfg(unix)]
 fn sweep_group(pid: u32) {
+    sweep_group_with(|| group_has_members(pid), || kill_group(pid), Duration::from_millis(10));
+}
+
+/// [`sweep_group`]'s loop: `kill` only after `has_members` said yes, and
+/// `nap` between rounds.
+fn sweep_group_with(mut has_members: impl FnMut() -> bool, mut kill: impl FnMut(), nap: Duration) {
     for _ in 0..SWEEP_ROUNDS {
-        if !group_has_members(pid) {
+        if !has_members() {
             return;
         }
-        kill_group(pid);
-        std::thread::sleep(Duration::from_millis(10));
+        kill();
+        std::thread::sleep(nap);
     }
 }
 
@@ -473,6 +485,63 @@ mod tests {
         assert!(left.is_empty(), "a forked grandchild survived the group kill: {left}");
     }
 
+    /// (#2823) Every `run_bounded` kill path sweeps the group: a command
+    /// forking in a loop when its bound runs out leaves nothing running.
+    /// On macOS one group kill misses a child forked during it (this test
+    /// finds survivors with the sweeps removed); Linux's kill reaches such a
+    /// child, so there it holds either way. Its forks are bounded by the
+    /// 300 ms run.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn a_command_forking_when_its_bound_runs_out_leaves_nothing_running() {
+        let m = marker(9);
+        let out = run_bounded(sh(&format!("while :; do sleep {m} & done")), Duration::from_millis(300));
+        assert!(matches!(out, Bounded::TimedOut { .. }), "got {out:?}");
+        std::thread::sleep(Duration::from_millis(500));
+        let left = survivors_now(&m);
+        let _ = Command::new("pkill").args(["-f", &format!("sleep {m}")]).status();
+        assert!(left.is_empty(), "children of a killed command were left running: {left}");
+    }
+
+    /// (#2823) The sweep kills only after a look found a member, and stops
+    /// at the first look that finds none, so it never signals a group that
+    /// has emptied (whose id could be reused).
+    #[test]
+    fn the_sweep_kills_only_after_a_look_finds_a_member() {
+        for (members, kills) in [(vec![false], 0), (vec![true, true, false], 2), (vec![true; 60], SWEEP_ROUNDS as usize)] {
+            let looks = std::cell::RefCell::new(members.clone().into_iter());
+            let log = std::cell::RefCell::new(Vec::new());
+            sweep_group_with(
+                || {
+                    log.borrow_mut().push("look");
+                    looks.borrow_mut().next().unwrap_or(false)
+                },
+                || log.borrow_mut().push("kill"),
+                Duration::ZERO,
+            );
+            let log = log.into_inner();
+            assert_eq!(log.iter().filter(|e| **e == "kill").count(), kills, "{members:?}: {log:?}");
+            assert!(log.windows(2).all(|w| w != ["kill", "kill"]) && log.first() != Some(&"kill"), "a kill with no look before it: {log:?}");
+        }
+    }
+
+    /// (#2823) A live group has members; once its only member is killed and
+    /// reaped it has none.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn a_group_has_members_until_its_last_one_is_reaped() {
+        use std::os::unix::process::CommandExt as _;
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        assert!(group_has_members(child.id()), "a running group leader is a member");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!group_has_members(child.id()), "a reaped group with no one left has no members");
+    }
+
     /// (#2823) A member left in the group after its leader is killed and
     /// reaped is killed too. This is the state a group kill leaves when the
     /// command was forking at that moment: the new child was not yet a
@@ -525,9 +594,12 @@ mod tests {
     /// survivors check had nothing to find, and the poll loop's own
     /// interrupt branch ran only when some other test's timing happened to
     /// reach it (a CRAP wobble on `spawn_and_poll`, 12.1 to 12.3). The
-    /// raiser waits until `pgrep` sees the command (its `sh -c` or its
-    /// `sleep`), which can only exist after `spawn`, so the pre-spawn guard
-    /// is already behind it and the poll loop is the one that sees the flag.
+    /// raiser waits until the command has written a file, which can only
+    /// happen after `spawn`, so the pre-spawn guard is already behind it and
+    /// the poll loop is the one that sees the flag. A file, not `pgrep`:
+    /// a process listing that stalls on a busy host left the flag unraised
+    /// and the test waiting out its bound. That bound is 60 s, so a raiser
+    /// that never raises fails the test rather than hanging it.
     #[test]
     #[serial_test::serial] // the interrupt flag is process-wide
     #[cfg(unix)]
@@ -535,20 +607,23 @@ mod tests {
         // (#3100) It raises the process-wide interrupt flag.
         darkmux_types::run_in_own_process!();
         let m = marker(4);
+        let dir = tempfile::tempdir().unwrap();
+        let started_file = dir.path().join("started");
         darkmux_types::interrupt::reset_for_test();
         let raiser = {
-            let m = m.clone();
+            let started_file = started_file.clone();
             std::thread::spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(10);
-                while survivors_now(&m).is_empty() {
-                    assert!(Instant::now() < deadline, "the command `sleep {m} & wait` never started");
+                while !started_file.exists() {
+                    assert!(Instant::now() < deadline, "the command never started");
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 darkmux_types::interrupt::simulate_sigterm_for_test();
             })
         };
         let started = Instant::now();
-        let out = run_bounded(sh(&format!("sleep {m} & wait")), Duration::from_secs(600));
+        let command = format!(": > '{}'; sleep {m} & wait", started_file.display());
+        let out = run_bounded(sh(&command), Duration::from_secs(60));
         let elapsed = started.elapsed();
         let raised = raiser.join();
         darkmux_types::interrupt::reset_for_test();
