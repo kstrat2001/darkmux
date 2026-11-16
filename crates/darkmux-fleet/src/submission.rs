@@ -1820,6 +1820,102 @@ mod tests {
         assert_eq!(reply_wait(&j, false), Duration::from_secs(60));
     }
 
+    /// What [`send_job`] reads from this machine, for one test: a roster
+    /// file holding `roster`, the fleet token (or none), a fleet port
+    /// nothing listens on, and the identity provider the sender verifies
+    /// with. Restored on drop.
+    struct SenderEnv {
+        _dir: tempfile::TempDir,
+        prev: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl SenderEnv {
+        fn new(roster: &str, token: Option<&str>) -> Self {
+            let keys = ["DARKMUX_FLEET_FILE", "DARKMUX_SERVE_TOKEN", "DARKMUX_FLEET_LISTENER_PORT"];
+            let prev = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+            let dir = tempfile::TempDir::new().unwrap();
+            let file = dir.path().join("fleet.json");
+            std::fs::write(&file, roster).unwrap();
+            unsafe {
+                std::env::set_var("DARKMUX_FLEET_FILE", &file);
+                std::env::set_var("DARKMUX_FLEET_LISTENER_PORT", "1");
+                match token {
+                    Some(t) => std::env::set_var("DARKMUX_SERVE_TOKEN", t),
+                    None => std::env::remove_var("DARKMUX_SERVE_TOKEN"),
+                }
+            }
+            test_sender_provider::set(Box::new(crate::identity::StaticIdentityProvider {
+                local: test_node("nLOCAL", "macbook-pro", "100.64.0.1"),
+                peers: vec![],
+                down: None,
+            }));
+            SenderEnv { _dir: dir, prev }
+        }
+    }
+
+    impl Drop for SenderEnv {
+        fn drop(&mut self) {
+            test_sender_provider::take();
+            unsafe {
+                for (k, v) in &self.prev {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    const STUDIO_ROSTER: &str =
+        r#"{"version":"2","machines":{"studio":{"id":"studio","address":"127.0.0.1","added_unix_ms":1}}}"#;
+
+    /// Why [`send_job`] sent `job` nowhere, every cause in the chain, with
+    /// [`SenderEnv`] holding `roster` and `token`.
+    fn unsent(roster: &str, token: Option<&str>, job: WorkJob) -> String {
+        let _env = SenderEnv::new(roster, token);
+        format!("{:#}", send_job(job, false, PinPolicy::RequirePinned).unwrap_err())
+    }
+
+    /// Each reason a job cannot leave is named, and nothing is sent: an
+    /// invalid job, an unreadable roster, a machine the roster lacks or
+    /// holds twice, no fleet token, and a target whose address does not
+    /// verify.
+    #[test]
+    #[serial_test::serial]
+    fn a_job_that_cannot_leave_names_why() {
+        let said = unsent(STUDIO_ROSTER, Some("t"), WorkJob { timeout_seconds: 0, ..job(None) });
+        assert!(said.starts_with("validating the job before it leaves"), "{said}");
+
+        let said = unsent("not json", Some("t"), job(None));
+        assert!(said.starts_with("reading the fleet roster"), "{said}");
+
+        let said = unsent(r#"{"version":"2","machines":{}}"#, Some("t"), job(None));
+        assert!(
+            said.contains("machine `studio` is not in this machine's roster")
+                && said.contains("darkmux machine add studio --address"),
+            "{said}"
+        );
+
+        let twice = r#"{"version":"2","machines":{
+            "Studio":{"id":"Studio","address":"127.0.0.1","added_unix_ms":1},
+            "STUDIO":{"id":"STUDIO","address":"127.0.0.1","added_unix_ms":1}}}"#;
+        let said = unsent(twice, Some("t"), job(None));
+        assert!(said.contains("several entries for `studio`"), "{said}");
+
+        let said = unsent(STUDIO_ROSTER, None, job(None));
+        assert!(said.starts_with("no fleet token on this machine: submitting work to studio"), "{said}");
+
+        // The token is there and the roster names the machine; the provider
+        // knows no node at its address, so it is never contacted.
+        let _env = SenderEnv::new(STUDIO_ROSTER, Some("t"));
+        let err = send_job(job(None), false, PinPolicy::RequirePinned).unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<crate::peer::TargetError>(), Some(crate::peer::TargetError::NotOnOverlay { .. })),
+            "{err:#}"
+        );
+    }
+
     fn job(profile: Option<&str>) -> WorkJob {
         WorkJob {
             target_machine: "studio".into(),

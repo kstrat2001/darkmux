@@ -336,6 +336,35 @@ mod tests {
         assert!(remove(&link, "{}").is_err());
     }
 
+    /// A read that fails for any reason but a missing file is an error
+    /// naming the path, never "no file": a writer must not plan from it.
+    #[test]
+    fn a_read_that_fails_is_an_error_not_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("profiles.json");
+        assert_eq!(read_now(&file), Ok(None), "no file");
+        std::fs::create_dir(&file).unwrap();
+        let refused = read_now(&file).unwrap_err();
+        assert!(
+            matches!(&refused, WriteError::Failed(m) if m.starts_with("reading ") && m.contains("profiles.json")),
+            "{refused:?}"
+        );
+    }
+
+    /// Reading through a dangling link is refused the way writing through
+    /// one is, naming the link.
+    #[test]
+    fn reading_through_a_dangling_link_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("profiles.json");
+        std::os::unix::fs::symlink(dir.path().join("missing.json"), &link).unwrap();
+        let refused = read_now(&link).unwrap_err();
+        assert!(
+            matches!(&refused, WriteError::Failed(m) if m.contains("is a symlink to") && m.contains("missing.json")),
+            "{refused:?}"
+        );
+    }
+
     /// A removal takes the lock and removes only the file that still holds
     /// what the remover wrote; one another writer changed is kept.
     #[test]

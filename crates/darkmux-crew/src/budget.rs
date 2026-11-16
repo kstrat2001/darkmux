@@ -67,6 +67,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -1246,45 +1247,91 @@ impl BudgetPacer {
         self.since_check_ms = self.since_check_ms.saturating_add(elapsed_ms);
         if self.stopped {
             // Reported already; keep holding (the sampler is ending the run).
-            if self.pausing && !others.pausing {
-                crate::pace_file::write(host_out, true, PACE_REASON, &self.state());
+            if self.pausing {
+                self.hold(host_out, others);
             }
             return None;
         }
         if self.pausing {
-            // (review MF1) Every tick while holding: a stopped run is never
-            // released, and ends here.
-            if let Some(reason) = env.stop_reason(caller) {
-                return Some(self.stop(reason, caller, env));
-            }
-            self.waited_ms = self.waited_ms.saturating_add(elapsed_ms);
-            env.paused(elapsed_ms);
-            self.since_reload_ms = self.since_reload_ms.saturating_add(elapsed_ms);
-            if self.since_reload_ms >= PACER_RELOAD_MS {
-                self.since_reload_ms = 0;
-                match env.reload(&self.budget.endpoint_id, self.profiles_file.as_deref()) {
-                    Some(Some(fresh)) => self.budget = fresh,
-                    Some(None) => return self.release(host_out, others, caller, env),
-                    None => {}
-                }
+            if let ControlFlow::Break(event) = self.while_holding(elapsed_ms, host_out, others, caller, env) {
+                return event;
             }
         }
-        if !self.pausing && self.checked_once && self.since_check_ms < PACER_CHECK_MS {
+        if !self.check_due() {
             return None;
         }
         self.checked_once = true;
         self.since_check_ms = 0;
         let now = env.now();
         let entries = env.window(&self.budget, now);
+        let verdict = evaluate(&self.budget, &entries, now);
+        self.act_on(verdict, now, host_out, others, caller, env)
+    }
+
+    /// A held tick, before the window is judged. (review MF1) A stopped run
+    /// is never released, and ends here. Otherwise the time held counts as
+    /// pause, and every [`PACER_RELOAD_MS`] the endpoint's limits are re-read
+    /// from the registry: a raised budget is judged from this tick on, a
+    /// removed one releases the hold.
+    fn while_holding(
+        &mut self,
+        elapsed_ms: u64,
+        host_out: &Path,
+        others: &OtherPacing,
+        caller: &BudgetCaller<'_>,
+        env: &dyn BudgetEnv,
+    ) -> ControlFlow<Option<PacerEvent>> {
+        if let Some(reason) = env.stop_reason(caller) {
+            return ControlFlow::Break(Some(self.stop(reason, caller, env)));
+        }
+        self.waited_ms = self.waited_ms.saturating_add(elapsed_ms);
+        env.paused(elapsed_ms);
+        self.since_reload_ms = self.since_reload_ms.saturating_add(elapsed_ms);
+        if self.since_reload_ms < PACER_RELOAD_MS {
+            return ControlFlow::Continue(());
+        }
+        self.since_reload_ms = 0;
+        match env.reload(&self.budget.endpoint_id, self.profiles_file.as_deref()) {
+            Some(Some(fresh)) => self.budget = fresh,
+            Some(None) => return ControlFlow::Break(self.release(host_out, others, caller, env)),
+            None => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Whether this tick judges the window: every tick while holding, the
+    /// first tick, then every [`PACER_CHECK_MS`].
+    fn check_due(&self) -> bool {
+        self.pausing || !self.checked_once || self.since_check_ms >= PACER_CHECK_MS
+    }
+
+    /// The pacer's hold on the pace file, written unless another governor
+    /// is pausing (theirs is the stronger reason to hold).
+    fn hold(&self, host_out: &Path, others: &OtherPacing) {
+        if !others.pausing {
+            crate::pace_file::write(host_out, true, PACE_REASON, &self.state());
+        }
+    }
+
+    /// What the window's `verdict` asks of the pacer: under `wait` a full
+    /// window holds the runtime (a stopped run is held and ended), a `warn`
+    /// breach is surfaced once, and otherwise a hold is released.
+    fn act_on(
+        &mut self,
+        verdict: Verdict,
+        now: i64,
+        host_out: &Path,
+        others: &OtherPacing,
+        caller: &BudgetCaller<'_>,
+        env: &dyn BudgetEnv,
+    ) -> Option<PacerEvent> {
         let key = format!("endpoint:{}", self.budget.endpoint_id);
-        match evaluate(&self.budget, &entries, now) {
+        match verdict {
             Verdict::Wait { breach, resume_at } => {
                 if let Some(reason) = env.stop_reason(caller) {
                     // A stopped run whose window is full: hold it (never let
                     // another turn go out) and end it.
-                    if !others.pausing {
-                        crate::pace_file::write(host_out, true, PACE_REASON, &self.state());
-                    }
+                    self.hold(host_out, others);
                     self.pausing = true;
                     return Some(self.stop(reason, caller, env));
                 }
@@ -1293,15 +1340,12 @@ impl BudgetPacer {
                     self.announced = Some(resume_at);
                 }
                 env.set_surfaced(&key, Some(Surfaced::of(&breach)));
-                let state = self.state();
-                if !others.pausing {
-                    crate::pace_file::write(host_out, true, PACE_REASON, &state);
+                self.hold(host_out, others);
+                if self.pausing {
+                    return None;
                 }
-                if !self.pausing {
-                    self.pausing = true;
-                    return Some(PacerEvent::Paused { state });
-                }
-                None
+                self.pausing = true;
+                Some(PacerEvent::Paused { state: self.state() })
             }
             Verdict::Warn(br) => {
                 if Surfaced::of(&br).is_news_after(env.last_surfaced(&key)) {
