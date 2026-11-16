@@ -17,15 +17,32 @@
 //! it makes.
 
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// The connection the daemon's presence and hub-clock reads share.
 pub(crate) static PRESENCE_READS: KeptHubConnection = KeptHubConnection::new();
 
+/// How long a password rotated on the hub keeps working for a kept
+/// connection: past this age it is opened again, authenticating anew, so a
+/// revoked password stops the daemon's reads within it. Five minutes: a
+/// reopen costs one connect (its `CLIENT SETINFO` pair and `AUTH`), so the
+/// daemon's two kept connections add about 0.007 connects/s (the hub took
+/// 5.85/s before #3432), while a rotation reaches the daemon in minutes,
+/// well inside the time it takes to roll a password across a fleet.
+pub(crate) const ROTATED_PASSWORD_LIFETIME: Duration = Duration::from_secs(5 * 60);
+
 /// One kept connection: the hub it is to (a digest, as the URL can carry a
-/// password) and the connection.
+/// password), when it was opened, and the connection.
+struct Kept {
+    hub: [u8; 32],
+    opened: Instant,
+    conn: redis::Connection,
+}
+
+/// At most one kept connection to the hub ([module docs](self)).
 #[derive(Default)]
 pub(crate) struct KeptHubConnection {
-    slot: Mutex<Option<([u8; 32], redis::Connection)>>,
+    slot: Mutex<Option<Kept>>,
 }
 
 impl KeptHubConnection {
@@ -36,13 +53,24 @@ impl KeptHubConnection {
     }
 
     /// Run `read` on the kept connection to `url`'s hub, opening one when
-    /// there is none (or it is to another hub). `what` names the read in a
-    /// connect error. The lock is held across the read, which is bounded.
-    /// Blocking.
+    /// there is none, it is to another hub, or it is
+    /// [`ROTATED_PASSWORD_LIFETIME`] old. `what` names the read in a connect
+    /// error. The lock is held across the read, which is bounded. Blocking.
     pub(crate) fn read<T>(
         &self,
         url: &str,
         what: &str,
+        read: impl FnMut(&mut redis::Connection) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.read_at(url, what, Instant::now(), read)
+    }
+
+    /// [`Self::read`] at `now`.
+    pub(crate) fn read_at<T>(
+        &self,
+        url: &str,
+        what: &str,
+        now: Instant,
         mut read: impl FnMut(&mut redis::Connection) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         let hub = *blake3::hash(url.as_bytes()).as_bytes();
@@ -50,21 +78,29 @@ impl KeptHubConnection {
             .slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let kept = slot.take().filter(|(h, _)| *h == hub).map(|(_, conn)| conn);
+        let kept = slot.take().filter(|k| still_good(k, hub, now));
         let reused = kept.is_some();
-        let mut conn = match kept {
-            Some(conn) => conn,
-            None => crate::bounded_redis_connection(url, what)?,
+        let (mut opened, mut conn) = match kept {
+            Some(k) => (k.opened, k.conn),
+            None => (now, crate::bounded_redis_connection(url, what)?),
         };
         let mut result = read(&mut conn);
         if reused && result.as_ref().err().is_some_and(was_dropped) {
-            conn = crate::bounded_redis_connection(url, what)?;
+            (opened, conn) = (now, crate::bounded_redis_connection(url, what)?);
             result = read(&mut conn);
         }
         if result.is_ok() {
-            *slot = Some((hub, conn));
+            *slot = Some(Kept { hub, opened, conn });
         }
         result
+    }
+
+    /// Close the kept connection, if any: the hub is no longer configured.
+    pub(crate) fn forget(&self) {
+        *self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Whether a connection is kept (tests).
@@ -77,12 +113,37 @@ impl KeptHubConnection {
     }
 }
 
-/// Whether a read failed because the hub dropped the connection (closed or
-/// reset it), not because it stopped answering in time.
+/// Whether `kept` may serve a read of `hub` at `now`: it is to that hub,
+/// and younger than [`ROTATED_PASSWORD_LIFETIME`].
+fn still_good(kept: &Kept, hub: [u8; 32], now: Instant) -> bool {
+    kept.hub == hub && now.saturating_duration_since(kept.opened) < ROTATED_PASSWORD_LIFETIME
+}
+
+/// `url` as given; when it is `None` (no hub configured now) `kept` is
+/// closed, so a hub turned off in config holds no connection.
+pub(crate) fn url_or_forget(
+    url: Option<darkmux_flow::RawRedisUrl>,
+    kept: &KeptHubConnection,
+) -> Option<darkmux_flow::RawRedisUrl> {
+    if url.is_none() {
+        kept.forget();
+    }
+    url
+}
+
+/// Whether a read failed because the hub (or the path to it) dropped the
+/// connection: a broken pipe, or a connection reset, aborted, not connected
+/// or ended mid-reply, the I/O failures redis-rs says need a new connection
+/// (bar a refused connect, which is no kept connection's). A read deadline
+/// is not one: the hub stopped answering in time. `RedisError` does not hand
+/// out its I/O error, so this asks its own classifiers; the test pins which
+/// kinds they mean.
 fn was_dropped(e: &anyhow::Error) -> bool {
     e.chain()
         .find_map(|c| c.downcast_ref::<redis::RedisError>())
-        .is_some_and(redis::RedisError::is_connection_dropped)
+        .is_some_and(|r| {
+            r.is_io_error() && r.is_unrecoverable_error() && !r.is_connection_refusal()
+        })
 }
 
 #[cfg(test)]
@@ -96,21 +157,31 @@ mod tests {
         e.context("MGET presence keys").unwrap_err()
     }
 
-    /// A closed or reset connection is a drop; a read deadline (which a
-    /// socket reports as `WouldBlock` or `TimedOut`) and a reply the hub
-    /// refused are not.
+    /// A closed, reset, aborted or unconnected connection is a drop; a read
+    /// deadline (which a socket reports as `WouldBlock` or `TimedOut`), a
+    /// refused connect, a refused password and a reply the hub refused are
+    /// not.
     #[test]
     fn only_a_dropped_connection_is_retried() {
         use std::io::ErrorKind::*;
-        for kind in [BrokenPipe, ConnectionReset, UnexpectedEof] {
+        for kind in [
+            BrokenPipe,
+            ConnectionReset,
+            ConnectionAborted,
+            NotConnected,
+            UnexpectedEof,
+        ] {
             assert!(was_dropped(&io_failure(kind)), "{kind:?}");
         }
-        for kind in [WouldBlock, TimedOut] {
+        for kind in [WouldBlock, TimedOut, ConnectionRefused] {
             assert!(!was_dropped(&io_failure(kind)), "{kind:?}");
         }
         let refused: redis::RedisResult<()> =
             Err((redis::ErrorKind::TypeError, "wrong type").into());
         assert!(!was_dropped(&refused.context("MGET").unwrap_err()));
+        let auth: redis::RedisResult<()> =
+            Err((redis::ErrorKind::AuthenticationFailed, "WRONGPASS").into());
+        assert!(!was_dropped(&auth.context("AUTH").unwrap_err()));
         assert!(!was_dropped(&anyhow::anyhow!("not a Redis error")));
     }
 

@@ -833,7 +833,7 @@ serve token ({TOKEN_REMEDY}), or bind to 127.0.0.1 (the default) and reach it th
 /// per [`source_state`]; `machines` holds the beats as before.
 async fn fleet_machines_live_handler() -> axum::Json<wire::FleetMachinesLiveResponse> {
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
-    let redis_url = darkmux_flow::redis_url();
+    let redis_url = presence_hub_url();
     let (beats, state) = match redis_url {
         Some(url) => tokio::task::spawn_blocking(move || machine_beats(&url, PresenceRead::ROUTE))
             .await
@@ -1111,6 +1111,12 @@ pub(crate) fn session_beats(url: &darkmux_flow::RawRedisUrl, how: PresenceRead) 
     })
 }
 
+/// The hub URL for a presence or hub-clock read; with none configured, the
+/// connection those reads keep is closed (#3432).
+pub(crate) fn presence_hub_url() -> Option<darkmux_flow::RawRedisUrl> {
+    hub_conn::url_or_forget(darkmux_flow::redis_url(), &hub_conn::PRESENCE_READS)
+}
+
 /// `read` on the connection the daemon's presence and hub-clock reads keep
 /// (#3432: each read opened its own).
 fn on_presence_connection<T>(
@@ -1138,7 +1144,7 @@ pub fn live_session_ids() -> Option<std::collections::HashSet<String>> {
 
 /// [`live_session_ids`] from the shared read (`QUIET`) or a new one (`FRESH`).
 fn live_session_ids_read(how: PresenceRead) -> Option<std::collections::HashSet<String>> {
-    let Some(url) = darkmux_flow::redis_url() else { return Some(Default::default()) };
+    let Some(url) = presence_hub_url() else { return Some(Default::default()) };
     let (beats, state) = session_beats(&url, how);
     matches!(state, source_state::SourceState::Ok)
         .then(|| beats.into_iter().flat_map(|b| [Some(b.session_id), b.mission_id]).flatten().collect())
@@ -1205,7 +1211,7 @@ pub fn apply_not_reporting(
 /// are distinguishable by the client.
 async fn fleet_dispatches_live_handler() -> axum::Json<wire::FleetDispatchesLiveResponse> {
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
-    let redis_url = darkmux_flow::redis_url();
+    let redis_url = presence_hub_url();
     let (beats, state) = match redis_url {
         Some(url) => tokio::task::spawn_blocking(move || session_beats(&url, PresenceRead::ROUTE))
         .await

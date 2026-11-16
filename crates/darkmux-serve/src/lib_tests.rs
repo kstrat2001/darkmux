@@ -5833,6 +5833,86 @@
             assert_eq!(kept.read(&a.url, "a probe", which).unwrap(), "a");
         }
 
+        /// (#3432 review) A password rotated on the hub stops working for a
+        /// kept connection once it is [`ROTATED_PASSWORD_LIFETIME`] old: the
+        /// connection is opened again and authenticates anew, and the hub
+        /// refuses it. Younger, it keeps reading (Redis does not drop an
+        /// authenticated connection when the password changes).
+        #[test]
+        #[serial]
+        fn a_rotated_password_stops_working_within_its_lifetime() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            use crate::hub_conn::{KeptHubConnection, ROTATED_PASSWORD_LIFETIME};
+            let redis = spawn_redis();
+            let mut admin = redis::Client::open(redis.url.as_str()).unwrap().get_connection().unwrap();
+            let _: () = redis::cmd("CONFIG").arg("SET").arg("requirepass").arg("old-pass").query(&mut admin).unwrap();
+            let url = redis.url.replacen("redis://", "redis://:old-pass@", 1);
+            let kept = KeptHubConnection::new();
+            let ping = |c: &mut redis::Connection| anyhow::Ok(redis::cmd("PING").query::<String>(c)?);
+            let t0 = std::time::Instant::now();
+            kept.read_at(&url, "a probe", t0, ping).expect("the old password reads");
+            let _: () = redis::cmd("CONFIG").arg("SET").arg("requirepass").arg("new-pass").query(&mut admin).unwrap();
+            let young = t0 + ROTATED_PASSWORD_LIFETIME - Duration::from_secs(1);
+            kept.read_at(&url, "a probe", young, ping).expect("a younger kept connection still reads");
+            let refused = kept.read_at(&url, "a probe", t0 + ROTATED_PASSWORD_LIFETIME, ping);
+            assert!(refused.is_err(), "the rotated password still worked past its lifetime");
+            assert!(!kept.is_kept());
+        }
+
+        /// (#3432 review) A connection opened again after a drop is as young
+        /// as its reopening: its [`ROTATED_PASSWORD_LIFETIME`] counts from then.
+        #[test]
+        #[serial]
+        fn a_reopened_connection_counts_its_age_from_the_reopening() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            use crate::hub_conn::{KeptHubConnection, ROTATED_PASSWORD_LIFETIME};
+            let (redis, mut conn) = seeded_hub();
+            let kept = KeptHubConnection::new();
+            let ping = |c: &mut redis::Connection| anyhow::Ok(redis::cmd("PING").query::<String>(c)?);
+            let t0 = std::time::Instant::now();
+            kept.read_at(&redis.url, "a probe", t0, ping).unwrap();
+            let _: u64 = redis::cmd("CLIENT").arg("KILL").arg("TYPE").arg("normal").arg("SKIPME").arg("yes").query(&mut conn).unwrap();
+            let reopened = t0 + ROTATED_PASSWORD_LIFETIME - Duration::from_secs(1);
+            kept.read_at(&redis.url, "a probe", reopened, ping).unwrap();
+            let connects0 = hub_stat(&mut conn, "total_connections_received");
+            kept.read_at(&redis.url, "a probe", t0 + ROTATED_PASSWORD_LIFETIME + Duration::from_secs(1), ping).unwrap();
+            assert_eq!(hub_stat(&mut conn, "total_connections_received") - connects0, 0, "the reopened connection was aged from the first open");
+        }
+
+        /// (#3432 review) A hub turned off in config closes the kept
+        /// connections, at the hub, not only in the daemon's slot.
+        #[test]
+        #[serial]
+        fn a_hub_turned_off_closes_the_kept_connections() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let (redis, mut conn) = seeded_hub();
+            let url = darkmux_flow::RawRedisUrl::new(redis.url.clone());
+            let caches = crate::fleet_window::FleetCaches::default();
+            let clients = |conn: &mut redis::Connection| hub_stat(conn, "connected_clients");
+            let before = clients(&mut conn);
+            refresh_hub_view(&url, &caches, std::time::SystemTime::now());
+            assert_eq!(clients(&mut conn), before + 2, "presence and the window each keep one");
+            assert!(crate::hub_conn::url_or_forget(None, &crate::hub_conn::PRESENCE_READS).is_none());
+            let off = crate::fleet_window::read_fleet_cached(&caches, FleetScope::WithSamples, std::time::SystemTime::now(), || None);
+            assert!(matches!(off.state, source_state::SourceState::Off));
+            assert!(!crate::hub_conn::PRESENCE_READS.is_kept() && !caches.keeps_a_connection());
+            // The hub sees the close a moment later.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while clients(&mut conn) != before && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(clients(&mut conn), before, "the hub still holds the daemon's connections");
+        }
+
         /// (#3432 review) The shared presence read is the last one from THIS
         /// hub: another hub URL reads afresh, and so does a `FRESH` read (it
         /// sees a beat written after the snapshot, which a shared read inside

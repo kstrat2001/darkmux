@@ -544,7 +544,7 @@ pub(crate) fn read_fleet_cached(
     now: SystemTime,
     redis_url: impl FnOnce() -> Option<darkmux_flow::RawRedisUrl>,
 ) -> crate::FleetRead {
-    let Some(url) = redis_url() else {
+    let Some(url) = crate::hub_conn::url_or_forget(redis_url(), &caches.conn) else {
         // Not a degradation: a single-machine install has no fleet substrate
         // by design, and warning about it would be the bug.
         return crate::FleetRead {
@@ -682,6 +682,14 @@ fn refresh(
         }
         Ok(())
     })
+}
+
+impl FleetCaches {
+    /// Whether the window keeps a hub connection (tests).
+    #[cfg(test)]
+    pub(crate) fn keeps_a_connection(&self) -> bool {
+        self.conn.is_kept()
+    }
 }
 
 impl FleetWindows {

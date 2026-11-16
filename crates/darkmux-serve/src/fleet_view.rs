@@ -796,14 +796,14 @@ impl FleetSources for ProcessSources {
     }
 
     fn presence(&self) -> (Vec<PresenceBeat>, SourceState) {
-        match darkmux_flow::redis_url() {
+        match crate::presence_hub_url() {
             Some(url) => crate::machine_beats(&url, crate::PresenceRead::ROUTE),
             None => (Vec::new(), SourceState::Off),
         }
     }
 
     fn hub_time_ms(&self) -> Option<u64> {
-        crate::hub_time_ms(&darkmux_flow::redis_url()?)
+        crate::hub_time_ms(&crate::presence_hub_url()?)
     }
 
     fn local_card(&self) -> MachineCard {
