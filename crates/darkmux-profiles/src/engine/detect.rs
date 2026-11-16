@@ -397,12 +397,30 @@ fn url_entry() -> DetectedEngine {
     judge_url(local.name(), served)
 }
 
-/// One question to ask: the engine, how long to wait, and the asking.
-type Question = (
-    DetectedKind,
-    Duration,
-    Box<dyn FnOnce() -> DetectedEngine + Send>,
-);
+/// One question to ask: the engine, how long to wait, the endpoints that
+/// declare it (kept when it does not answer in time), and the asking.
+pub struct Question {
+    pub kind: DetectedKind,
+    pub bound: Duration,
+    pub endpoints: Vec<String>,
+    pub ask: Box<dyn FnOnce() -> DetectedEngine + Send>,
+}
+
+impl Question {
+    fn new(
+        kind: DetectedKind,
+        bound: Duration,
+        endpoints: Vec<String>,
+        ask: impl FnOnce() -> DetectedEngine + Send + 'static,
+    ) -> Self {
+        Question {
+            kind,
+            bound,
+            endpoints,
+            ask: Box::new(ask),
+        }
+    }
+}
 
 /// How long to wait for an engine's answer.
 type Bound<'a> = &'a dyn Fn(ManagedBackend) -> Duration;
@@ -420,35 +438,44 @@ fn questions(
     let mut out: Vec<Question> = Vec::new();
     let lms_here = installed(&darkmux_types::config_access::lms_bin());
     if !servers_only && lms_here {
-        out.push((
+        out.push(Question::new(
             DetectedKind::Lmstudio,
             listing_bound(ManagedBackend::Lmstudio),
-            Box::new(lmstudio_entry),
+            Vec::new(),
+            lmstudio_entry,
         ));
     }
     if installed(&darkmux_types::config_access::tensorfold_bin()) {
         let endpoints = declaring(registry, ManagedBackend::Tensorfold);
-        let ask = move || judge_tensorfold(tensorfold_facts(&Tensorfold::installed()), endpoints);
-        out.push((
+        let theirs = endpoints.clone();
+        let ask = move || judge_tensorfold(tensorfold_facts(&Tensorfold::installed()), theirs);
+        out.push(Question::new(
             DetectedKind::Tensorfold,
             listing_bound(ManagedBackend::Tensorfold),
-            Box::new(ask),
+            endpoints,
+            ask,
         ));
     }
     if installed(&darkmux_types::config_access::flint_bin()) {
         let endpoints = declaring(registry, ManagedBackend::Flint);
-        let ask = move || judge_flint(flint_facts(&Rec::installed()), endpoints);
-        out.push((
+        let theirs = endpoints.clone();
+        let ask = move || judge_flint(flint_facts(&Rec::installed()), theirs);
+        out.push(Question::new(
             DetectedKind::Flint,
             listing_bound(ManagedBackend::Flint),
-            Box::new(ask),
+            endpoints,
+            ask,
         ));
     }
     if !servers_only && default_engine_is_a_server() {
-        out.push((
+        let endpoint = vec![darkmux_types::config_access::default_engine()
+            .trim()
+            .to_string()];
+        out.push(Question::new(
             DetectedKind::Url,
             super::MODELS_PROBE_BOUND,
-            Box::new(url_entry),
+            endpoint,
+            url_entry,
         ));
     }
     out
@@ -470,15 +497,18 @@ const REAP_GRACE: Duration = Duration::from_secs(1);
 pub fn ask_all(questions: Vec<Question>) -> Vec<DetectedEngine> {
     let start = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel();
-    let asked: Vec<(DetectedKind, Duration)> = questions.iter().map(|(k, b, _)| (*k, *b)).collect();
-    for (i, (_, bound, ask)) in questions.into_iter().enumerate() {
-        let tx = tx.clone();
+    let mut asked: Vec<(DetectedKind, Duration, Vec<String>)> = Vec::new();
+    for (i, q) in questions.into_iter().enumerate() {
+        asked.push((q.kind, q.bound, q.endpoints));
+        let (tx, deadline, ask) = (tx.clone(), start + q.bound, q.ask);
         std::thread::spawn(move || {
-            let answer = crate::gestalt_host::lms_host::with_deadline_cap(Some(start + bound), ask);
+            // Every probe the engine runs ends by its bound, so none
+            // outlives the listing that stopped waiting for it.
+            let answer = crate::gestalt_host::lms_host::with_deadline_cap(Some(deadline), ask);
             let _ = tx.send((i, answer));
         });
     }
-    let last = start + asked.iter().map(|(_, b)| *b).max().unwrap_or_default() + REAP_GRACE;
+    let last = start + asked.iter().map(|(_, b, _)| *b).max().unwrap_or_default() + REAP_GRACE;
     let mut answers: Vec<Option<DetectedEngine>> = asked.iter().map(|_| None).collect();
     for _ in 0..asked.len() {
         let Ok((i, answer)) = rx.recv_timeout(last.saturating_duration_since(Instant::now()))
@@ -490,11 +520,13 @@ pub fn ask_all(questions: Vec<Question>) -> Vec<DetectedEngine> {
     answers
         .into_iter()
         .zip(asked)
-        .map(|(a, (kind, bound))| a.unwrap_or_else(|| timed_out(kind, bound)))
+        .map(|(a, (kind, bound, endpoints))| a.unwrap_or_else(|| timed_out(kind, bound, endpoints)))
         .collect()
 }
 
-fn timed_out(engine: DetectedKind, bound: Duration) -> DetectedEngine {
+/// An engine that did not answer in time: `unknown`, still configured when
+/// an endpoint declares it.
+fn timed_out(engine: DetectedKind, bound: Duration, endpoints: Vec<String>) -> DetectedEngine {
     let why = format!(
         "{} did not answer within {} s",
         engine.label(),
@@ -503,7 +535,7 @@ fn timed_out(engine: DetectedKind, bound: Duration) -> DetectedEngine {
     entry(
         engine,
         None,
-        Vec::new(),
+        endpoints,
         (DetectedState::Unknown, Some(why), Vec::new()),
     )
 }

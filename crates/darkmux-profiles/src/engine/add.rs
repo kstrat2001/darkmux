@@ -123,11 +123,12 @@ pub fn plan(
     port_free: &dyn Fn(u16) -> bool,
 ) -> Result<Planned, Refusal> {
     let backend = addable_kind(req.engine)?;
-    let engine = usable_unconfigured(found, req.engine)?;
-    let (model, n_ctx, n_ctx_from) = chosen_model(engine, req)?;
-    let original = clean_registry(text, path)?;
     let registry = crate::profiles::parse_registry_lenient(text)
         .map_err(|e| Refusal::Registry(format!("{e:#}")))?;
+    let declared = super::detect::declaring(Some(&registry), backend);
+    let engine = usable_unconfigured(found, req.engine, &declared)?;
+    let (model, n_ctx, n_ctx_from) = chosen_model(engine, req)?;
+    let original = clean_registry(text, path)?;
     let endpoint = free_name(
         backend.token(),
         &registry.endpoints.keys().cloned().collect::<Vec<_>>(),
@@ -164,22 +165,26 @@ fn addable_kind(kind: DetectedKind) -> Result<ManagedBackend, Refusal> {
 }
 
 /// The detected engine of `kind`, when it is usable and not configured.
-fn usable_unconfigured(
-    found: &[DetectedEngine],
+/// The detected engine of `kind`, when it is usable and no endpoint of the
+/// registry being edited (`declared`) declares it: the registry, not what
+/// detection read earlier, says whether it is configured, so an add that
+/// another one beat is refused as configured.
+fn usable_unconfigured<'a>(
+    found: &'a [DetectedEngine],
     kind: DetectedKind,
-) -> Result<&DetectedEngine, Refusal> {
+    declared: &[String],
+) -> Result<&'a DetectedEngine, Refusal> {
     let Some(engine) = found.iter().find(|d| d.engine == kind) else {
         return Err(Refusal::Unavailable(format!(
             "{} is not installed on this machine",
             kind.label()
         )));
     };
-    if engine.configured {
+    if !declared.is_empty() {
         return Err(Refusal::Configured(format!(
             "{} is configured already, as endpoint {}; edit profiles.json to change it",
             kind.label(),
-            engine
-                .endpoints
+            declared
                 .iter()
                 .map(|e| format!("`{e}`"))
                 .collect::<Vec<_>>()
@@ -248,6 +253,10 @@ fn context(
             kind.label()
         ))),
         (Some(n), _) => Ok((n, ContextFrom::Requested)),
+        (None, Some(0)) => Err(Refusal::BadRequest(format!(
+            "{} states a context of 0 tokens for `{id}`; name the context to run it at (`n_ctx`)",
+            kind.label()
+        ))),
         (None, Some(max)) => Ok((max, ContextFrom::EngineStated)),
         (None, None) => Err(Refusal::BadRequest(format!(
             "{} states no context for `{id}`; name the context to run it at (`n_ctx`)",
@@ -285,7 +294,11 @@ fn free_port(
     registry: &darkmux_types::ProfileRegistry,
     port_free: &dyn Fn(u16) -> bool,
 ) -> Result<u16, Refusal> {
-    let declared: Vec<u16> = registry.endpoints.values().filter_map(|e| e.port).collect();
+    let declared: Vec<u16> = registry
+        .endpoints
+        .values()
+        .filter_map(endpoint_port_here)
+        .collect();
     (FIRST_PORT..=LAST_PORT)
         .find(|p| !declared.contains(p) && port_free(*p))
         .ok_or_else(|| {
@@ -293,6 +306,16 @@ fn free_port(
                 "no port from {FIRST_PORT} to {LAST_PORT} is free for the engine's server"
             ))
         })
+}
+
+/// The port an endpoint takes on this machine: a server darkmux starts
+/// (`port`), or a `url` on this machine's loopback.
+fn endpoint_port_here(e: &darkmux_types::ModelEndpoint) -> Option<u16> {
+    let url = e
+        .url
+        .as_deref()
+        .filter(|u| darkmux_types::endpoint::url_names_this_machine(u));
+    e.port.or_else(|| url.and_then(super::flint::endpoint_port))
 }
 
 /// The two entries an add writes.
@@ -406,28 +429,46 @@ impl Entries {
 }
 
 /// Write the planned registry to `path`, when the file still holds
-/// `original` (what the plan was made from): into a file beside it, with
-/// its permissions, then renamed over it.
+/// `original` (what the plan was made from), through the one registry
+/// write path (`crate::registry_write`: the shared lock, a file of its own
+/// beside the target renamed over it, a symlink kept).
 pub fn write(path: &Path, original: &str, planned: &Planned) -> Result<(), Refusal> {
-    let io = |what: &str, e: std::io::Error| {
-        Refusal::Registry(format!("{what} {}: {e}", path.display()))
-    };
-    let now = std::fs::read_to_string(path).map_err(|e| io("reading", e))?;
-    if now != original {
-        return Err(Refusal::Changed(format!(
+    crate::registry_write::replace(path, Some(original), &planned.text)
+        .map_err(|e| written(path, e))
+}
+
+/// Plan and write in one hold of the registry's lock: read the file, plan
+/// against it, and write the plan before any other writer can change it.
+/// An engine another add configured first is refused as configured.
+pub fn apply(
+    path: &Path,
+    found: &[DetectedEngine],
+    req: &AddRequest,
+    port_free: &dyn Fn(u16) -> bool,
+) -> Result<Planned, Refusal> {
+    let _held = crate::registry_write::lock(path).map_err(|e| written(path, e))?;
+    let text = crate::registry_write::read_now(path)
+        .map_err(|e| written(path, e))?
+        .ok_or_else(|| {
+            Refusal::Registry(
+                "there is no profile registry to add it to; run `darkmux init` first".into(),
+            )
+        })?;
+    let planned = plan(&text, path, found, req, port_free)?;
+    crate::registry_write::replace_locked(path, Some(&text), &planned.text)
+        .map_err(|e| written(path, e))?;
+    Ok(planned)
+}
+
+/// A registry write that did not happen, as a refusal.
+fn written(path: &Path, e: crate::registry_write::WriteError) -> Refusal {
+    match e {
+        crate::registry_write::WriteError::Changed => Refusal::Changed(format!(
             "{} changed since it was read; nothing was written. Ask again",
             path.display()
-        )));
+        )),
+        crate::registry_write::WriteError::Failed(why) => Refusal::Registry(why),
     }
-    let next = path.with_extension("json.darkmux-add");
-    std::fs::write(&next, &planned.text).map_err(|e| io("writing beside", e))?;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&next, meta.permissions());
-    }
-    std::fs::rename(&next, path).map_err(|e| {
-        let _ = std::fs::remove_file(&next);
-        io("replacing", e)
-    })
 }
 
 // ─── A member added to a top-level map, as text ─────────────────────────────

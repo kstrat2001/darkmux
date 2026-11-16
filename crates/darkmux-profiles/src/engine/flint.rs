@@ -408,8 +408,11 @@ impl Rec {
     /// The model directory holding `<revision>.json`: exactly one under
     /// `models/`. None, or several, is refused naming what was found.
     pub fn model_dir(&self, revision: &str) -> Result<PathBuf> {
-        if revision.is_empty() || revision.contains('/') || revision.contains('\\') || revision.starts_with('.') {
-            bail!("the profile model's `id` `{revision}` is not a rec revision (a manifest name such as `flint-int4`)");
+        if !is_revision_name(revision) {
+            bail!(
+                "the profile model's `id` `{}` is not a rec revision (a manifest name such as `flint-int4`)",
+                darkmux_types::user_files::escape_text(revision)
+            );
         }
         let models = self.data()?.join("models");
         let dirs = subdirs(&models);
@@ -469,9 +472,12 @@ impl Rec {
         })
     }
 
-    /// (#3569) The revisions rec's install holds: each `models/<hash>/` file
-    /// that is a revision manifest ([`pulled_revision`]), sorted and without
-    /// repeats. Read-only: a directory listing and the manifests' text.
+    /// (#3569) The revisions rec's install holds that a dispatch would
+    /// serve: each `models/<hash>/` file that is a revision manifest
+    /// ([`pulled_revision`]) and that [`Rec::model_dir`] accepts (a revision
+    /// name, in exactly one model directory), so detection never offers one
+    /// a dispatch refuses. Sorted. Read-only: a directory listing and the
+    /// manifests' text.
     pub fn pulled(&self) -> Result<Vec<Pulled>> {
         let models = self.data()?.join("models");
         let mut out: Vec<Pulled> = subdirs(&models)
@@ -484,6 +490,7 @@ impl Rec {
             .collect();
         out.sort_by(|a, b| a.revision.cmp(&b.revision));
         out.dedup_by(|a, b| a.revision == b.revision);
+        out.retain(|p| self.model_dir(&p.revision).is_ok());
         Ok(out)
     }
 }
@@ -510,6 +517,17 @@ pub fn pulled_revision(stem: &str, text: &str) -> Option<Pulled> {
     }
     let max_context = doc.get("max_context").and_then(|c| c.as_u64()).and_then(|c| u32::try_from(c).ok());
     Some(Pulled { revision: stem.to_string(), max_context })
+}
+
+/// Whether `revision` can name a rec revision: not empty, no path
+/// separator, not hidden, and (#3569 review) no control character, which a
+/// message would otherwise carry to a terminal.
+fn is_revision_name(revision: &str) -> bool {
+    !(revision.is_empty()
+        || revision.contains('/')
+        || revision.contains('\\')
+        || revision.starts_with('.')
+        || revision.chars().any(char::is_control))
 }
 
 /// The directories directly under `dir`, sorted; none when it is missing.
@@ -868,8 +886,17 @@ mod tests {
         std::fs::create_dir_all(&copy).unwrap();
         std::fs::write(copy.join("flint-int4.json"), r#"{"model_id":"flint-int4","max_context":262144}"#).unwrap();
         std::fs::write(copy.join("flint-int8.json"), r#"{"model_id":"flint-int8"}"#).unwrap();
+        // (#3569 review) A revision in two model directories, a hidden name,
+        // and a name with a control character are each refused by
+        // `model_dir`, so a dispatch would refuse them: they are not pulled.
+        std::fs::write(copy.join(".flint-hidden.json"), r#"{"model_id":".flint-hidden"}"#).unwrap();
+        std::fs::write(copy.join("flint\u{1b}[31m.json"), r#"{"model_id":"flint\u001b[31m"}"#).unwrap();
         let ids: Vec<String> = rec.pulled().unwrap().into_iter().map(|p| p.revision).collect();
-        assert_eq!(ids, ["flint-int4", "flint-int8"], "sorted, without repeats");
+        assert_eq!(ids, ["flint-int8"], "only what a dispatch would serve");
+        for refused in ["flint-int4", ".flint-hidden", "flint\u{1b}[31m"] {
+            assert!(rec.model_dir(refused).is_err(), "{refused:?}: pulled and model_dir agree");
+        }
+        assert!(rec.model_dir("flint-int8").is_ok());
         assert!(Rec::at("rec", Some(dir.path().join("nothing"))).pulled().unwrap().is_empty());
         assert!(Rec::at("rec", None).pulled().is_err(), "no home directory to look in");
     }

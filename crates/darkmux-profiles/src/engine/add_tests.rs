@@ -269,10 +269,16 @@ fn only_an_installed_usable_unconfigured_server_engine_is_added() {
         matches!(&empty, Refusal::Unavailable(m) if m.contains("rec pull")),
         "{empty:?}"
     );
+    // Configured is what the registry being edited declares, whatever
+    // detection read before.
+    let declares = REGISTRY.replace(
+        r#""api": {"#,
+        r#""fl": { "managed": "flint", "port": 8092 }, "api": {"#,
+    );
     let configured = plan(
-        REGISTRY,
+        &declares,
         path(),
-        &[flint(vec![int4()], vec!["fl".into()])],
+        &[flint(vec![int4()], Vec::new())],
         &req,
         &all_free,
     )
@@ -425,15 +431,19 @@ fn the_write_lands_only_on_the_file_the_plan_was_read_from() {
     std::fs::write(&file, REGISTRY).unwrap();
     write(&file, REGISTRY, &planned).unwrap();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), planned.text);
-    let left: Vec<_> = std::fs::read_dir(dir.path())
+    let mut left: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
         .flatten()
         .map(|e| e.file_name())
         .collect();
+    left.sort();
     assert_eq!(
         left,
-        [std::ffi::OsString::from("profiles.json")],
-        "nothing beside it"
+        [
+            std::ffi::OsString::from("profiles.json"),
+            std::ffi::OsString::from("profiles.json.lock")
+        ],
+        "nothing beside it but the writers' lock"
     );
     let loaded = crate::profiles::load_registry_quiet(Some(&file.to_string_lossy())).unwrap();
     assert!(loaded.registry.profiles.contains_key("flint"));
@@ -508,4 +518,172 @@ fn an_edit_that_is_not_exactly_the_two_entries_is_refused() {
         .classifies(&wrong_kind)
         .unwrap_err()
         .contains("would not read as `flint`"));
+}
+
+/// (#3569 review) Two adds racing on one file: exactly one lands, the
+/// file is always whole JSON holding one add, and the other is told the
+/// file changed (an app reads that as `conflict`).
+#[test]
+fn racing_adds_never_corrupt_the_registry_and_the_loser_is_told() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("profiles.json");
+    let found = [flint(vec![int4()], Vec::new())];
+    let planned = plan(
+        REGISTRY,
+        &file,
+        &found,
+        &ask(DetectedKind::Flint, None, None),
+        &all_free,
+    )
+    .unwrap();
+    for round in 0..300 {
+        std::fs::write(&file, REGISTRY).unwrap();
+        let outcomes: Vec<Result<(), Refusal>> = std::thread::scope(|s| {
+            let racers: Vec<_> = (0..2)
+                .map(|_| s.spawn(|| write(&file, REGISTRY, &planned)))
+                .collect();
+            racers.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&text).is_ok(),
+            "round {round}: corrupt registry:\n{text}"
+        );
+        assert_eq!(
+            outcomes.iter().filter(|o| o.is_ok()).count(),
+            1,
+            "round {round}: {outcomes:?}"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, Err(Refusal::Changed(_)))),
+            "round {round}: {outcomes:?}"
+        );
+    }
+}
+
+/// (#3569 review) `apply` plans and writes under one hold of the lock: of
+/// two adds racing from scratch, one lands and the other is refused as
+/// configured, which an app reads as `conflict`.
+#[test]
+fn of_two_racing_applies_the_loser_is_told_it_is_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("profiles.json");
+    let found = [flint(vec![int4()], Vec::new())];
+    for round in 0..100 {
+        std::fs::write(&file, REGISTRY).unwrap();
+        let outcomes: Vec<Result<Planned, Refusal>> = std::thread::scope(|s| {
+            let racers: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        apply(
+                            &file,
+                            &found,
+                            &ask(DetectedKind::Flint, None, None),
+                            &all_free,
+                        )
+                    })
+                })
+                .collect();
+            racers.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        assert_eq!(
+            outcomes.iter().filter(|o| o.is_ok()).count(),
+            1,
+            "round {round}: {outcomes:?}"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, Err(Refusal::Configured(_)))),
+            "round {round}: {outcomes:?}"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(
+            doc["endpoints"].as_object().unwrap().len(),
+            2,
+            "round {round}: one add, not two"
+        );
+    }
+    let missing = apply(
+        &dir.path().join("none.json"),
+        &found,
+        &ask(DetectedKind::Flint, None, None),
+        &all_free,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&missing, Refusal::Registry(m) if m.contains("run `darkmux init`")),
+        "{missing:?}"
+    );
+}
+
+/// (#3569 review) A port a `url` endpoint on this machine's loopback uses
+/// is skipped like a declared `port`; a remote one is not.
+#[test]
+fn a_loopback_url_endpoints_port_is_not_offered() {
+    let with_url = REGISTRY.replace(
+        r#""api": {"#,
+        &format!(r#""mlx": {{ "url": "http://127.0.0.1:{FIRST_PORT}/v1" }}, "far": {{ "url": "http://10.0.0.9:{}/v1" }}, "api": {{"#, FIRST_PORT + 1),
+    );
+    let planned = plan(
+        &with_url,
+        path(),
+        &[flint(vec![int4()], Vec::new())],
+        &ask(DetectedKind::Flint, None, None),
+        &all_free,
+    )
+    .unwrap();
+    assert_eq!(planned.port, FIRST_PORT + 1);
+}
+
+/// (#3569 review) A manifest that states a context of 0 is refused like a
+/// requested 0, never written as `n_ctx: 0`.
+#[test]
+fn a_stated_context_of_zero_is_refused() {
+    let zero = flint(
+        vec![Pulled {
+            revision: "flint-int4".into(),
+            max_context: Some(0),
+        }],
+        Vec::new(),
+    );
+    let refused = plan(
+        REGISTRY,
+        path(),
+        &[zero],
+        &ask(DetectedKind::Flint, None, None),
+        &all_free,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&refused, Refusal::BadRequest(m) if m.contains("context of 0")),
+        "{refused:?}"
+    );
+}
+
+/// (#3569 review) The edit is refused when its profile would not run on
+/// the endpoint it adds, though it reads back as written.
+#[test]
+fn an_edit_whose_profile_runs_elsewhere_is_refused() {
+    let engine = flint(vec![int4()], Vec::new());
+    let mut entries = Entries::new(
+        ManagedBackend::Flint,
+        "flint",
+        FIRST_PORT,
+        "flint",
+        "flint-int4",
+        8192,
+        &engine,
+    );
+    entries.profile.1["models"][0]["endpoint"] = serde_json::json!("api");
+    let original: serde_json::Value = serde_json::from_str(REGISTRY).unwrap();
+    let edited = entries.insert(REGISTRY).unwrap();
+    let refused = entries.verify(&original, &edited, path()).unwrap_err();
+    assert!(
+        matches!(&refused, Refusal::Registry(m) if m.contains("would not run on endpoint `flint`")),
+        "{refused:?}"
+    );
 }

@@ -24,6 +24,7 @@ pub mod model_ledger;
 pub mod ownership;
 pub mod process;
 pub mod profiles;
+pub mod registry_write;
 
 /// (#2902 step 5) THE preflight for an entry point that starts work: every
 /// registered `config.json` enum setting its scope consumes and `config.json`'s

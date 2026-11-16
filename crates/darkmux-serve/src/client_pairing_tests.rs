@@ -11372,6 +11372,79 @@ async fn the_engine_add_writes_what_was_asked_and_refuses_what_it_cannot() {
     assert_eq!(code, 401);
 }
 
+/// (#3569 review) An add writes this Mac's profile registry, so it is
+/// refused `forbidden` from a device on the tailnet, and nothing is
+/// written; listing what is installed stays open to it.
+#[tokio::test]
+async fn an_engine_add_from_the_tailnet_is_refused_and_listing_is_not() {
+    let mut h = harness();
+    let token = paired(&h).await;
+    paired_as(&h, "sam-s-iphone", SAM);
+    on_the_tailnet(&mut h);
+    let auth = bearer(&token);
+    let req = adding(post("/client/engines", Some(&token), serde_json::json!({"engine": "flint"})), &forwarded(Some(SAM)));
+    let (status, v) = call(&h, req).await;
+    assert_eq!((status, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("only by an app on this Mac"), "{v}");
+    let registry = std::fs::read_to_string(h.dir.path().join("profiles.json")).unwrap();
+    assert_eq!(registry, TEST_REGISTRY, "nothing written");
+    let (status, v) = call(&h, get("/client/engines", &with_token(&forwarded(Some(SAM)), Some(&auth)))).await;
+    assert_eq!(status, 200, "{v}");
+    let (status, v) = call(&h, post("/client/engines", Some(&token), serde_json::json!({"engine": "flint"}))).await;
+    assert_eq!(status, 200, "from this Mac it is added: {v}");
+}
+
+/// (#3569 review) Every add is recorded in the serve log: the client, the
+/// engine and what was written; never the token.
+#[test]
+fn an_add_is_recorded_naming_the_client_and_what_was_written() {
+    use darkmux_profiles::engine::add::{ContextFrom, Planned};
+    let client = ApprovedClient {
+        name: "mux-bot".into(),
+        id: "c-0123456789abcdef".into(),
+        created: 0,
+        token_hash: "f".repeat(64),
+        auto_approved: SigningIdentity::parse("TEAM123/com.example.muxbot"),
+        tailnet: None,
+    };
+    let planned = Planned {
+        engine: darkmux_types::ManagedBackend::Flint,
+        endpoint: "flint".into(),
+        port: 8091,
+        profile: "flint".into(),
+        model: "flint-int4".into(),
+        n_ctx: 262_144,
+        n_ctx_from: ContextFrom::EngineStated,
+        text: String::new(),
+    };
+    let line = crate::client_engines::added_line(&client, &planned);
+    for part in ["`mux-bot`", "c-0123456789abcdef", "TEAM123/com.example.muxbot", "this Mac", "engine `flint`", "port 8091", "profile `flint`", "`flint-int4`", "262144"] {
+        assert!(line.contains(part), "{part}: {line}");
+    }
+    assert!(!line.contains(&"f".repeat(64)), "no token hash: {line}");
+}
+
+/// (#3569 review) Two adds racing through the API: one lands, the other is
+/// told `conflict` (configured already), and the registry stays whole.
+#[tokio::test]
+async fn of_two_racing_api_adds_the_loser_is_told_conflict() {
+    let h = harness();
+    let token = paired(&h).await;
+    let body = || serde_json::json!({"engine": "flint"});
+    let (a, b) = tokio::join!(
+        call(&h, post("/client/engines", Some(&token), body())),
+        call(&h, post("/client/engines", Some(&token), body()))
+    );
+    let mut codes = vec![a.0, b.0];
+    codes.sort();
+    assert_eq!(codes, [200, 409], "{a:?} {b:?}");
+    let loser = if a.0 == 409 { a.1 } else { b.1 };
+    assert_eq!(loser["code"], "conflict", "{loser}");
+    assert!(loser["error"].as_str().unwrap().contains("configured already"), "{loser}");
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(h.dir.path().join("profiles.json")).unwrap()).unwrap();
+    assert_eq!(written["endpoints"].as_object().unwrap().len(), 1);
+}
+
 /// Each refusal of an add carries the code an app branches on.
 #[test]
 fn an_add_refusal_carries_its_code() {
@@ -11390,8 +11463,8 @@ fn an_add_refusal_carries_its_code() {
     }
 }
 
-/// Without a registry there is nothing to add to, and an unreadable one is
-/// refused `unprocessable` too; neither asks the engines.
+/// Without a registry there is nothing to add to, named or on disk: both
+/// are refused `unprocessable` naming `darkmux init`, and neither asks the engines.
 #[test]
 fn an_add_without_a_registry_to_write_is_refused_and_asks_nothing() {
     use darkmux_profiles::engine::add::{AddRequest, Refusal};
@@ -11406,7 +11479,7 @@ fn an_add_without_a_registry_to_write_is_refused_and_asks_nothing() {
     assert!(matches!(&none, Refusal::Registry(m) if m.contains("run `darkmux init`")), "{none:?}");
     let dir = tempfile::tempdir().unwrap();
     let gone = crate::client_engines::add_in(Some(&dir.path().join("profiles.json")), &req, &found, &|_| true).unwrap_err();
-    assert!(matches!(&gone, Refusal::Registry(m) if m.contains("reading profiles.json")), "{gone:?}");
+    assert!(matches!(&gone, Refusal::Registry(m) if m.contains("run `darkmux init`")), "{gone:?}");
     assert!(!asked.get());
 }
 

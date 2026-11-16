@@ -292,23 +292,23 @@ fn installed_is_a_file_at_the_path_or_on_path() {
 /// bound, and does not hold up the rest.
 #[test]
 fn an_engine_that_does_not_answer_in_time_is_unknown_and_holds_up_nothing() {
-    let quick = |kind| -> Question {
-        (
-            kind,
-            Duration::from_millis(200),
-            Box::new(move || judge_lmstudio(None, Ok(vec!["m".into()]))),
-        )
-    };
-    let slow: Question = (
+    let quick = Question::new(
+        DetectedKind::Lmstudio,
+        Duration::from_millis(200),
+        Vec::new(),
+        || judge_lmstudio(None, Ok(vec!["m".into()])),
+    );
+    let slow = Question::new(
         DetectedKind::Flint,
         Duration::from_millis(100),
-        Box::new(|| {
+        vec!["fl".into()],
+        || {
             std::thread::sleep(Duration::from_secs(5));
             judge_flint(rec("0.1.0", Ok(()), Ok(Vec::new())), Vec::new())
-        }),
+        },
     );
     let start = Instant::now();
-    let answers = ask_all(vec![quick(DetectedKind::Lmstudio), slow]);
+    let answers = ask_all(vec![quick, slow]);
     assert!(
         start.elapsed() < Duration::from_secs(3),
         "waited {:?}",
@@ -327,6 +327,47 @@ fn an_engine_that_does_not_answer_in_time_is_unknown_and_holds_up_nothing() {
             .contains("did not answer within 0 s"),
         "{:?}",
         answers[1]
+    );
+    // (#3569 review) An engine an endpoint declares stays configured when
+    // it does not answer in time, and is never offered to add.
+    assert_eq!(
+        (answers[1].configured, answers[1].can_add),
+        (true, false),
+        "{:?}",
+        answers[1]
+    );
+    assert_eq!(answers[1].endpoints, ["fl"]);
+}
+
+/// (#3569 review) Each engine's probes run under its bound: a binary that
+/// hangs is killed there, and its own probe says it timed out (a listing
+/// that only stopped waiting would say "did not answer" instead).
+#[test]
+fn a_hanging_engine_binary_is_killed_at_its_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let hang = script(dir.path(), "tensorfold-hang", "exec sleep 30");
+    // Run once before the timed probe, so macOS's first-exec check is not
+    // what is timed (see the init tests' `install_rec`).
+    let _ = std::process::Command::new(&hang)
+        .arg("--warm")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|mut c| c.kill().and_then(|_| c.wait()));
+    let tf = Tensorfold::at(hang.to_string_lossy().into_owned());
+    let q = Question::new(
+        DetectedKind::Tensorfold,
+        Duration::from_millis(1500),
+        Vec::new(),
+        move || judge_tensorfold(tensorfold_facts(&tf), Vec::new()),
+    );
+    let answer = ask_all(vec![q]).remove(0);
+    assert_eq!(answer.state, DetectedState::Unknown, "{answer:?}");
+    let why = answer.reason.unwrap();
+    assert!(
+        why.contains(darkmux_gestalt::HostError::TIMED_OUT),
+        "the probe itself was cut at the bound: {why}"
     );
 }
 
@@ -531,11 +572,20 @@ esac"#,
 #[test]
 fn every_engine_darkmux_starts_servers_for_is_detected_and_addable() {
     use darkmux_types::config_enum::ConfigEnum;
-    let kinds = [DetectedKind::Lmstudio, DetectedKind::Tensorfold, DetectedKind::Flint, DetectedKind::Url];
+    let kinds = [
+        DetectedKind::Lmstudio,
+        DetectedKind::Tensorfold,
+        DetectedKind::Flint,
+        DetectedKind::Url,
+    ];
     for token in ManagedBackend::TOKENS {
         let backend = ManagedBackend::from_token(token).unwrap();
         let detected = kinds.iter().find(|k| k.startable() == Some(backend));
         let starts = darkmux_types::EndpointKind::Managed(backend).starts_servers();
-        assert_eq!(detected.is_some(), starts, "`{token}`: detected and addable exactly when darkmux starts its servers");
+        assert_eq!(
+            detected.is_some(),
+            starts,
+            "`{token}`: detected and addable exactly when darkmux starts its servers"
+        );
     }
 }

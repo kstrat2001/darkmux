@@ -15,13 +15,15 @@
 //! the one the engine states), and nothing darkmux chose.
 
 use crate::client_pairing::{
-    authenticate, err, internal, json_body, ClientMachine, ClientServerState,
+    authenticate, err, internal, json_body, ApprovedClient, ClientMachine, ClientServerState,
 };
+use crate::client_wire::RequestVia;
 use anyhow::anyhow;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Extension;
 use axum::Json;
 use darkmux_profiles::engine::add::{AddRequest, Planned, Refusal};
 use darkmux_profiles::engine::detect::{Detected, DetectedEngine, DetectedKind};
@@ -47,6 +49,8 @@ pub struct ClientEngines {
 }
 
 /// `POST /client/engines`: the engine to add, after the user confirmed.
+/// Only an app on this Mac may send it (a device on the tailnet is refused
+/// `forbidden`), and every add is recorded in the `client serve` log.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AddEngineBody {
@@ -121,13 +125,28 @@ pub(crate) async fn engines_handler(
     }
 }
 
+/// What an add refuses from a device on the tailnet: it writes this Mac's
+/// profile registry, so only an app on this Mac may ask for one.
+pub(crate) const ADD_ON_THIS_MAC_ONLY: &str =
+    "an engine is added only by an app on this Mac: adding one writes \
+    its profile registry. Ask from the app on the Mac, or run `darkmux init --add-engine` there";
+
 pub(crate) async fn engine_add_handler(
     State(state): State<ClientServerState>,
+    via: Option<Extension<RequestVia>>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    if let Err(r) = authenticate(&state, &headers) {
-        return *r;
+    let client = match authenticate(&state, &headers) {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    if via.map_or(RequestVia::Local, |v| v.0) != RequestVia::Local {
+        return err(
+            StatusCode::FORBIDDEN,
+            ClientCode::Forbidden,
+            ADD_ON_THIS_MAC_ONLY,
+        );
     }
     let req: AddEngineBody = match json_body(body).await {
         Ok(b) => b,
@@ -140,10 +159,29 @@ pub(crate) async fn engine_add_handler(
         n_ctx: req.n_ctx,
     };
     match tokio::task::spawn_blocking(move || add(&asked)).await {
-        Ok(Ok(planned)) => Json(EngineAdded::of(req.engine, &planned)).into_response(),
+        Ok(Ok(planned)) => {
+            eprintln!("{}", added_line(&client, &planned));
+            Json(EngineAdded::of(req.engine, &planned)).into_response()
+        }
         Ok(Err(refused)) => refusal_response(&refused),
         Err(e) => internal(anyhow!("engine add panicked: {e}")),
     }
+}
+
+/// The serve log's record of an add: which client (and the signing
+/// identity that approved it, when one did) on this Mac, and what was
+/// written. No token, no path.
+pub(crate) fn added_line(client: &ApprovedClient, p: &Planned) -> String {
+    use darkmux_types::config_enum::ConfigEnum;
+    let signed = client
+        .auto_approved
+        .as_ref()
+        .map(|s| format!(", signed {}/{}", s.team, s.bundle))
+        .unwrap_or_default();
+    darkmux_types::user_files::escape_text(&format!(
+        "darkmux client serve: client `{}` ({}{signed}, an app on this Mac) added engine `{}` to profiles.json: endpoint `{}` on port {}, profile `{}` running `{}` at {} tokens",
+        client.name, client.id, p.engine.token(), p.endpoint, p.port, p.profile, p.model, p.n_ctx
+    ))
 }
 
 /// The production [`DetectEngines`]: this Mac's registry says which are
@@ -181,13 +219,15 @@ pub fn add_in(
     let path = path.ok_or_else(|| {
         Refusal::Registry("this Mac has no profile registry; run `darkmux init` first".into())
     })?;
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| Refusal::Registry(format!("reading profiles.json: {e}")))?;
-    let registry = darkmux_profiles::profiles::parse_registry_lenient(&text).ok();
-    let found = detect(registry.as_ref());
-    let planned = darkmux_profiles::engine::add::plan(&text, path, &found, req, port_free)?;
-    darkmux_profiles::engine::add::write(path, &text, &planned)?;
-    Ok(planned)
+    if !path.exists() {
+        return Err(Refusal::Registry(
+            "this Mac has no profile registry; run `darkmux init` first".into(),
+        ));
+    }
+    // Which engines are installed does not depend on the registry; whether
+    // one is configured is read from the registry under the lock (`apply`).
+    let found = detect(None);
+    darkmux_profiles::engine::add::apply(path, &found, req, port_free)
 }
 
 /// Nothing listens on `port` (a host that cannot say counts as busy).

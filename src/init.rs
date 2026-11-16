@@ -198,8 +198,7 @@ fn bootstrap_registry(dry_run: bool, report: &mut InitReport) -> Result<PathBuf>
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        fs::write(&registry_path, EXAMPLE_PROFILES_JSON)
-            .with_context(|| format!("writing {}", registry_path.display()))?;
+        write_registry(&registry_path, None, EXAMPLE_PROFILES_JSON).map_err(|e| anyhow!(e))?;
         report.profile_registry_created = true;
     } else {
         // dry-run: report what would happen without writing
@@ -314,11 +313,11 @@ fn record_engine(
     }
     let previous = fs::read_to_string(registry_path).ok();
     if let Some(t) = new_text.as_deref() {
-        fs::write(registry_path, t).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
+        write_registry(registry_path, previous.as_deref(), t)?;
     }
     let set = crate::config_cmd::set_at(config_path, darkmux_types::default_engine::KEY, id);
-    if let (Err(e), Some(_)) = (&set, new_text.as_deref()) {
-        return Err(format!("{e:#} ({})", put_back(registry_path, previous.as_deref())));
+    if let (Err(e), Some(written)) = (&set, new_text.as_deref()) {
+        return Err(format!("{e:#} ({})", put_back(registry_path, previous.as_deref(), written)));
     }
     set.map(|_| ()).map_err(|e| format!("{e:#}"))
 }
@@ -351,11 +350,19 @@ fn detect_and_add(opts: &InitOptions, registry_path: &Path, report: &mut InitRep
     report.detected = Some(found);
 }
 
-/// Put the registry back as it was before `record_engine` wrote it (removed,
-/// when there was none), and say whether that worked.
-fn put_back(registry_path: &Path, previous: Option<&str>) -> &'static str {
+/// (#3569) Write `text` to the registry through the one write path every
+/// `profiles.json` writer shares (`darkmux_profiles::registry_write`: its
+/// lock, a compare with `expected`, what this run read, and an atomic
+/// replace that keeps a symlink a symlink).
+fn write_registry(path: &Path, expected: Option<&str>, text: &str) -> std::result::Result<(), String> {
+    darkmux_profiles::registry_write::replace(path, expected, text).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// Put the registry back as it was before `record_engine` wrote `written`
+/// (removed, when there was none), and say whether that worked.
+fn put_back(registry_path: &Path, previous: Option<&str>, written: &str) -> &'static str {
     let restored = match previous {
-        Some(p) => fs::write(registry_path, p).is_ok(),
+        Some(p) => write_registry(registry_path, Some(written), p).is_ok(),
         None => fs::remove_file(registry_path).is_ok(),
     };
     if restored { "profiles.json was put back" } else { "profiles.json could NOT be put back" }
@@ -510,7 +517,7 @@ fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Opt
         return Err(no_worker_model_reason(ram_gb));
     };
     let filled = fill_placeholder_models(&text, &id).expect("placeholder was present");
-    fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
+    write_registry(registry_path, Some(&text), &filled)?;
     Ok(Some(id))
 }
 
@@ -579,8 +586,8 @@ fn fill_models_on_server(
     if text == read {
         return;
     }
-    if let Err(e) = fs::write(registry_path, &text) {
-        report.worker_model_unfilled_reason = Some(format!("writing {}: {e}", registry_path.display()));
+    if let Err(e) = write_registry(registry_path, Some(&read), &text) {
+        report.worker_model_unfilled_reason = Some(e);
         report.worker_model_filled = None;
         report.utility_model_filled = None;
         report.utility_model_unregistered_reason = None;
@@ -990,7 +997,7 @@ fn fill_utility_model(registry_path: &std::path::Path) -> std::result::Result<Op
     let headroom = if window.is_some() { ai_headroom_bytes() } else { None };
     let plan = plan_utility_binding(&current, window, &available, headroom, worker_bytes, floor);
     if let Some(filled) = apply_utility_plan(&text, &current, &plan) {
-        fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
+        write_registry(registry_path, Some(&text), &filled)?;
     } else if !matches!(plan, UtilityPlan::Missing(_)) {
         return Ok(None);
     }
@@ -1408,13 +1415,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("profiles.json");
         fs::write(&path, "changed").unwrap();
-        assert_eq!(put_back(&path, Some("before")), "profiles.json was put back");
+        // (#3569) A registry someone else changed since is not ours to put back.
+        assert_eq!(put_back(&path, Some("before"), "what this run wrote"), "profiles.json could NOT be put back");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "changed");
+        assert_eq!(put_back(&path, Some("before"), "changed"), "profiles.json was put back");
         assert_eq!(fs::read_to_string(&path).unwrap(), "before");
-        assert_eq!(put_back(&path, None), "profiles.json was put back");
+        assert_eq!(put_back(&path, None, "before"), "profiles.json was put back");
         assert!(!path.exists(), "no registry before, none after");
-        assert_eq!(put_back(&path, None), "profiles.json could NOT be put back");
+        assert_eq!(put_back(&path, None, "before"), "profiles.json could NOT be put back");
         let unwritable = dir.path().join("no-such-dir").join("profiles.json");
-        assert_eq!(put_back(&unwritable, Some("before")), "profiles.json could NOT be put back");
+        assert_eq!(put_back(&unwritable, Some("before"), "x"), "profiles.json could NOT be put back");
     }
 
     #[test]

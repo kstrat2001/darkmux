@@ -1,6 +1,6 @@
 //! (#3569) The `installed engines` row: an engine darkmux starts servers for
 //! (Tensorfold, rec's Flint) that is installed, usable and declared by no
-//! endpoint, with the command that adds it. Read-only: detection asks each
+//! endpoint, with the command that adds it. Informational: it passes. Read-only: detection asks each
 //! installed binary its version and models
 //! (`darkmux_profiles::engine::detect`), and starts, loads and pulls
 //! nothing. LM Studio and the default engine have rows of their own.
@@ -23,12 +23,15 @@ pub(crate) fn check_installed_engines() -> Check {
     }
 }
 
+/// The row, its text safe on a terminal: a model id or reason an engine
+/// supplied may hold a control character, which is shown escaped.
 fn row(status: Status, message: String, hint: Option<String>) -> Check {
+    let shown = |t: &str| darkmux_types::user_files::escape_text(t);
     Check {
         name: NAME.into(),
         status,
-        message,
-        hint,
+        message: shown(&message),
+        hint: hint.as_deref().map(shown),
     }
 }
 
@@ -36,10 +39,13 @@ fn row(status: Status, message: String, hint: Option<String>) -> Check {
 /// was found and why it needs nothing.
 pub(crate) fn installed_engines_row(found: &[DetectedEngine]) -> Check {
     let addable: Vec<&DetectedEngine> = found.iter().filter(|d| d.can_add).collect();
+    // Informational, never a warning: an engine installed and left out of
+    // profiles.json may be left out on purpose, and a row the operator
+    // cannot silence would only teach them to skip doctor's warnings.
     if !addable.is_empty() {
         return row(
-            Status::Warn,
-            addable.iter().map(|d| waiting(d)).collect::<Vec<_>>().join("; "),
+            Status::Pass,
+            addable.iter().map(|d| format!("{}; {} adds it", waiting(d), d.add_command())).collect::<Vec<_>>().join("; "),
             Some(format!(
                 "{} adds it to profiles.json after you confirm (an endpoint and a profile running the model)",
                 addable.iter().map(|d| d.add_command()).collect::<Vec<_>>().join(", or ")
@@ -140,7 +146,17 @@ mod tests {
     #[test]
     fn an_installed_engine_no_endpoint_declares_is_named_with_the_command_that_adds_it() {
         let c = installed_engines_row(&[flint(&[("flint-int4", Some(262_144))], &[])]);
-        assert_eq!(c.status, Status::Warn, "{c:?}");
+        assert_eq!(
+            c.status,
+            Status::Pass,
+            "informational, never a warning: {c:?}"
+        );
+        assert!(
+            c.message
+                .contains("`darkmux init --add-engine flint` adds it"),
+            "{}",
+            c.message
+        );
         assert!(
             c.message
                 .contains("rec's Flint 0.1.0 is installed with `flint-int4`"),
@@ -221,6 +237,30 @@ mod tests {
                 .contains("cannot be used: Tensorfold 1.3.0 is installed"),
             "{}",
             old.message
+        );
+    }
+
+    /// (#3569 review) A model id an engine lists with a control character
+    /// is shown escaped, never written to the terminal as is.
+    #[test]
+    fn an_engines_control_characters_are_shown_escaped() {
+        let tf = judge_tensorfold(
+            TensorfoldFacts {
+                version: Ok(Version {
+                    major: 1,
+                    minor: 2,
+                    patch: 5,
+                }),
+                models: Ok(vec!["evil\u{1b}]0;pwned\u{7}".into()]),
+            },
+            Vec::new(),
+        );
+        let c = installed_engines_row(&[tf]);
+        assert!(!c.message.chars().any(char::is_control), "{:?}", c.message);
+        assert!(
+            c.message.contains("evil\\u{1b}]0;pwned\\u{7}"),
+            "{}",
+            c.message
         );
     }
 }

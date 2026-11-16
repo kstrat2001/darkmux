@@ -1458,3 +1458,24 @@ fn init_lists_an_installed_engine_and_adds_it_only_when_confirmed() {
     assert!(matches!(r.engine_add, Some((crate::init_detect::AddOutcome::Refused(ref m), _)) if m.contains("not installed")));
     assert!(init(&InitOptions { add_engine: Some("ollama".into()), ..opts() }).is_err(), "refused before any write");
 }
+
+/// (#3569 review) `init`'s registry writes go through the shared write
+/// path: a symlinked registry stays a link, and the file it names gets the
+/// fill.
+#[test]
+#[serial_test::serial]
+fn a_symlinked_registry_stays_a_link_when_init_fills_it() {
+    darkmux_types::run_in_own_process!();
+    let env = InitEnv::new();
+    let real = env.home.path().join("dotfiles-profiles.json");
+    fs::write(&real, EXAMPLE_PROFILES_JSON).unwrap();
+    fs::create_dir_all(env.registry().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, env.registry()).unwrap();
+    env.lms(&[model("tiny-llm", TINY, "llm")], &[]);
+
+    let r = init(&opts()).unwrap();
+
+    assert_eq!(r.worker_model_filled.as_deref(), Some("tiny-llm"));
+    assert!(fs::symlink_metadata(env.registry()).unwrap().file_type().is_symlink(), "still a link");
+    assert!(fs::read_to_string(&real).unwrap().contains("tiny-llm"));
+}

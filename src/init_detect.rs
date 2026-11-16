@@ -54,6 +54,7 @@ pub fn detected_lines(d: &Detected) -> Vec<String> {
     };
     std::iter::once(head.to_string())
         .chain(d.detected.iter().map(engine_line))
+        .map(|line| shown(&line))
         .collect()
 }
 
@@ -101,6 +102,16 @@ fn configured_as(e: &DetectedEngine) -> String {
 
 /// The report line for an add.
 pub fn add_line(outcome: &AddOutcome, path: &Path) -> String {
+    shown(&add_line_text(outcome, path))
+}
+
+/// Text an engine supplied (a model id, a reason), safe on a terminal: a
+/// control or invisible character is written as an escape, never acted on.
+fn shown(text: &str) -> String {
+    darkmux_types::user_files::escape_text(text)
+}
+
+fn add_line_text(outcome: &AddOutcome, path: &Path) -> String {
     match outcome {
         AddOutcome::Added(p) => format!("add engine: added {} to {}", p.summary(), path.display()),
         AddOutcome::NotWritten { planned, why } => {
@@ -176,11 +187,11 @@ pub fn add_engine(
             why: "a dry run",
         };
     }
-    let question = format!(
+    let question = shown(&format!(
         "darkmux init: add {} to {}?",
         planned.summary(),
         path.display()
-    );
+    ));
     match confirm.confirm(&question) {
         None => AddOutcome::NotWritten {
             planned,
@@ -347,11 +358,16 @@ mod tests {
             n_ctx: None,
         };
         let mut says = Says(Some(true), Vec::new());
+        // The registry being edited, not detection, says it is configured.
+        let declares = REGISTRY.replace(
+            "\n  }\n}\n",
+            "\n  },\n  \"endpoints\": { \"fl\": { \"managed\": \"flint\", \"port\": 8092 } }\n}\n",
+        );
         let out = add_engine(
             &req,
             &found,
             Path::new("/nowhere/profiles.json"),
-            REGISTRY,
+            &declares,
             false,
             &mut says,
         );
@@ -375,5 +391,31 @@ mod tests {
         assert_eq!(ask(true, "\n"), Some(false));
         assert_eq!(ask(true, "n\n"), Some(false));
         assert_eq!(ask(false, "y\n"), None);
+    }
+
+    /// (#3569 review) What an engine supplied is shown escaped on the
+    /// terminal: a control character in a model id never reaches it as is.
+    #[test]
+    fn an_engines_control_characters_are_shown_escaped() {
+        use darkmux_profiles::engine::detect::{judge_tensorfold, TensorfoldFacts};
+        use darkmux_profiles::engine::tensorfold::Version;
+        let tf = judge_tensorfold(
+            TensorfoldFacts {
+                version: Ok(Version {
+                    major: 1,
+                    minor: 2,
+                    patch: 5,
+                }),
+                models: Ok(vec!["evil\u{1b}[2J".into()]),
+            },
+            Vec::new(),
+        );
+        for line in detected_lines(&Detected::of(vec![tf])) {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+        }
+        let refused = AddOutcome::Refused("no model `x\u{1b}[2J`".into());
+        assert!(!add_line(&refused, Path::new("/p"))
+            .chars()
+            .any(char::is_control));
     }
 }
