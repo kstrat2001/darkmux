@@ -25,6 +25,7 @@ import {
   phaseOrderEdges,
   recordInMission,
   seedMetricsFromGraph,
+  shownGraph,
   statusFromRecord,
   statusRank,
   stepDisplayMetrics,
@@ -806,9 +807,29 @@ describe("a step queued for its call slot (#3195)", () => {
     expect(stepStatus(fold([...resumed, at("step.complete", T0 + 660_000)]))).toBe("complete");
   });
 
-  it("a page loaded during the wait (the snapshot says waiting) reads running at the step's resume", () => {
+  // The server's snapshot of a step admitted but not yet dispatching:
+  // `running` by the scheduler's word, marked `waiting`.
+  type WireGraph = Parameters<typeof shownGraph>[0];
+  const wire = (waiting: boolean): WireGraph => {
     const g = planned();
-    const snap: MissionGraph = { ...g, generated_at_ms: T0 + 1_000, nodes: g.nodes.map((n) => (n.id === "b" ? { ...n, steps: [{ ...n.steps![0], status: "waiting" as const }] } : n)) };
+    const step = { id: "b-step", label: "Dispatch", kind: "dispatch.single_shot", status: "running" as const, waiting };
+    // The fixture's other rows carry no `waiting`, so they are wire rows too.
+    return { ...g, generated_at_ms: T0 + 1_000, nodes: g.nodes.map((n) => (n.id === "b" ? { ...n, steps: [step] } : n)) } as WireGraph;
+  };
+  const wireWaiting = () => wire(true);
+
+  it("a step the server marks waiting reads waiting; the server's word stands for the rest", () => {
+    const shown = shownGraph(wireWaiting());
+    expect(stepStatus(shown)).toBe("waiting");
+    expect(shown.nodes.find((n) => n.id === "a")!.steps![0].status).toBe("complete");
+    // A server that marks nothing (older than #3195) reads as it did.
+    const unmarked = wire(false);
+    expect(shownGraph(unmarked)).toBe(unmarked);
+    expect(stepStatus(shownGraph(unmarked))).toBe("running");
+  });
+
+  it("a page loaded during the wait (the snapshot says waiting) reads running at the step's resume", () => {
+    const snap = shownGraph(wireWaiting());
     const folded = foldFlowRecords(snap, resumed, indexGraph(snap), "m1");
     expect(stepStatus(folded)).toBe("running");
   });

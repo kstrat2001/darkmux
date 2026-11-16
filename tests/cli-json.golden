@@ -1184,6 +1184,7 @@ StepRow
   label: string
   kind: string
   status: NodeStatus
+  waiting?: boolean
   startedTs?: uint64 | null
   completedTs?: uint64 | null
   tokensFinal?: uint64 | null

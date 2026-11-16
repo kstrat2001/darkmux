@@ -29,9 +29,9 @@ import { ACTION, CATEGORY, SOURCE, byTime, byTimeNewestFirst, isAfter, isAsOf, e
 import { lifecycleAt, type LifecyclePhase, type LifecyclePolicy } from "../../lib/lifecycle";
 import { currentRun, groupOfRecords } from "../../lib/runRef";
 import type { GraphEdge } from "../../types/generated/GraphEdge";
-import type { GraphNode } from "../../types/generated/GraphNode";
+import type { GraphNode as WireGraphNode } from "../../types/generated/GraphNode";
 import type { GraphNodeStatus } from "../../types/generated/GraphNodeStatus";
-import type { MissionGraph } from "../../types/generated/MissionGraph";
+import type { MissionGraph as WireMissionGraph } from "../../types/generated/MissionGraph";
 import type { MissionStatus } from "../../types/generated/MissionStatus";
 import type { StepRow } from "../../types/generated/StepRow";
 
@@ -39,10 +39,26 @@ import type { StepRow } from "../../types/generated/StepRow";
 //
 // Generated from the server's own structs (`bun run types:regen`). `GraphStep`
 // is the server's `StepRow`, renamed here because this lens has a `StepRow`
-// component of its own.
+// component of its own. (#3195) Its `status` may also read `waiting`: the
+// lens shows a step the server marks `waiting` (see {@link shownGraph}), or
+// whose `step.queue.wait` it folded, as waiting rather than running.
 
-export type { GraphEdge, GraphNode, MissionGraph };
-export type GraphStep = StepRow;
+export type { GraphEdge };
+export type GraphStep = Omit<StepRow, "status"> & { status: StepRow["status"] | "waiting" };
+export type GraphNode = Omit<WireGraphNode, "steps"> & { steps?: GraphStep[] };
+export type MissionGraph = Omit<WireMissionGraph, "nodes"> & { nodes: GraphNode[] };
+
+/** (#3195) The server's snapshot as the lens shows it: a step it marks
+ *  `waiting` (running by the scheduler's word, but admitted and not yet
+ *  dispatching) reads `waiting`. Every other step keeps the server's word. */
+export function shownGraph(g: WireMissionGraph): MissionGraph {
+  if (!g.nodes.some((n) => (n.steps || []).some((s) => s.waiting))) return g;
+  return { ...g, nodes: g.nodes.map((n) => (n.steps ? { ...n, steps: n.steps.map(shownStep) } : n)) };
+}
+
+function shownStep(s: StepRow): GraphStep {
+  return s.waiting && s.status === "running" ? { ...s, status: "waiting" } : s;
+}
 
 export const COL_W = 260;
 /** (#2104) A task card that carries step rows. Measured on the real

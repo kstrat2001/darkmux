@@ -340,6 +340,7 @@ mod tests {
             label: "Plan".into(),
             kind: "plan.sites".into(),
             status,
+            waiting: false,
             started_ts: None,
             completed_ts: None,
             tokens_final: None,

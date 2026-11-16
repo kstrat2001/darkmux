@@ -166,8 +166,8 @@ darkmux release.
   their `step.start`, each with a timer counting the whole wait. The scheduler now writes
   `step.queue.wait` on a step's task session when it is queued and `step.queue.resume` when its work
   starts (none when the run is stopped first: its terminal closes the wait), and the mission graph's
-  step row (`graph.json` `status`) reads `waiting` for a step admitted but not yet dispatching, by the
-  rule its task already used (`unknown` stays `unknown`). The viewer shows such a step and its task as
+  step row (`graph.json`, and `mission show --json`) gains `waiting: true` for a step admitted but not
+  yet dispatching, by the rule its task already used; its `status` keeps the scheduler's word. The viewer shows such a step and its task as
   waiting with no timer, takes a step's start from when its work began, and gives each phase heading
   its own running total beside the mission's. `FLOW_SCHEMA_VERSION` 2.8.0 -> 2.9.0, additive: a step
   that started at once writes neither record.

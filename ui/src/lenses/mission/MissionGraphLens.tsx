@@ -87,6 +87,7 @@ import {
   type MetricsMap,
   type StepHeaderField,
   missionSpan,
+  shownGraph,
 } from "./graph";
 import { initMinimap, isNarrowViewport, persistMinimap, timelineActive } from "./timeline";
 import { byReceiveOrder, byTime, ingest, stepIdOf, type NormRecord } from "../../lib/ingest";
@@ -557,7 +558,9 @@ export function MissionGraphLens({
   // resolve one from), and a static build never reads `graphQuery` (it's
   // `enabled: false`, so `graphQuery.data` stays `undefined` forever).
   const staticGraph = staticGraphsQuery.data?.ok ? (staticGraphsQuery.data.data[missionId] ?? null) : null;
-  const baseGraph = daemonBacked ? (graphQuery.data?.ok ? graphQuery.data.data : null) : staticGraph;
+  const wireGraph = daemonBacked ? (graphQuery.data?.ok ? graphQuery.data.data : null) : staticGraph;
+  // (#3195) A step the server marks `waiting` reads waiting.
+  const baseGraph = useMemo(() => (wireGraph ? shownGraph(wireGraph) : null), [wireGraph]);
 
   // All three record sources, deduped — see this module's own doc.
   const allRecords = useMemo(() => {
