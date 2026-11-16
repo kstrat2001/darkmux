@@ -25,6 +25,8 @@ struct Func {
     callee: String,
     line: usize,
     body: String,
+    /// Declared `pub` in any form: callable from other files.
+    visible: bool,
 }
 
 impl Func {
@@ -32,8 +34,34 @@ impl Func {
         self.body.contains("env::set_var(") || self.body.contains("env::remove_var(")
     }
 
+    /// Whether a line of the body invokes the macro: a statement of its
+    /// own, so a comment or a string naming it does not count.
     fn own_process(&self) -> bool {
-        self.body.contains("run_in_own_process!")
+        self.body.lines().map(str::trim).any(|l| {
+            matches!(
+                l,
+                "darkmux_types::run_in_own_process!();" | "run_in_own_process!();"
+            )
+        })
+    }
+
+    /// Whether it sets or removes a variable whose name it is handed (not a
+    /// `"…"` literal): which one is up to callers it may not see.
+    fn sets_env_by_argument(&self) -> bool {
+        ["env::set_var(", "env::remove_var("].iter().any(|call| {
+            self.body
+                .match_indices(call)
+                .any(|(at, _)| !self.body[at + call.len()..].trim_start().starts_with('"'))
+        })
+    }
+
+    /// Whether other files' callers decide if it reaches a child-read
+    /// variable: callable from them, and setting one or a handed-in name.
+    fn is_a_shared_env_helper(&self) -> bool {
+        self.visible
+            && self.sets_env()
+            && !self.own_process()
+            && (self.names_a_child_read_var() || self.sets_env_by_argument())
     }
 
     fn names_a_child_read_var(&self) -> bool {
@@ -70,13 +98,21 @@ fn is_a_call_at(body: &str, at: usize) -> bool {
     !joined && !before.ends_with("fn ")
 }
 
+/// `line` (already trimmed) without its `pub`, `pub(crate)`, `pub(super)`
+/// or `pub(in …)` prefix; `None` when it has none.
+fn strip_visibility(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("pub")?;
+    let rest = match rest.strip_prefix('(') {
+        Some(scoped) => scoped.split_once(')')?.1,
+        None => rest,
+    };
+    rest.strip_prefix(' ')
+}
+
 /// The name in a `fn` line, if the line starts one.
 fn fn_name(line: &str) -> Option<&str> {
     let rest = line.trim_start();
-    let rest = rest
-        .strip_prefix("pub(crate) ")
-        .or_else(|| rest.strip_prefix("pub "))
-        .unwrap_or(rest);
+    let rest = strip_visibility(rest).unwrap_or(rest);
     let rest = rest.strip_prefix("async ").unwrap_or(rest);
     let rest = rest.strip_prefix("fn ")?;
     let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
@@ -138,6 +174,7 @@ fn functions(source: &str) -> Vec<Func> {
             callee,
             line: i + 1,
             body,
+            visible: strip_visibility(line.trim_start()).is_some(),
         });
     }
     out
@@ -157,8 +194,20 @@ fn offenders(file: &str, funcs: &[Func]) -> Vec<String> {
             .iter()
             .filter(|f| f.names_a_child_read_var() && calls_an_env_helper(f, funcs)),
     );
+    // A helper other files can call has callers this file cannot see: it
+    // must be private to its file, or run in its own process itself.
+    out.extend(
+        funcs
+            .iter()
+            .filter(|f| f.is_a_shared_env_helper())
+            .map(|f| format!("{file}:{} {}", f.line, f.callee)),
+    );
     while let Some(f) = todo.pop() {
-        if f.own_process() || is_a_restore(f) || !seen.insert((f.line, f.callee.clone())) {
+        if f.own_process()
+            || is_a_restore(f)
+            || f.visible
+            || !seen.insert((f.line, f.callee.clone()))
+        {
             continue;
         }
         let callers: Vec<&Func> = funcs
@@ -240,12 +289,57 @@ fn a_test_setting_a_child_read_variable_is_flagged_unless_in_its_own_process() {
 }
 
 #[test]
+fn only_the_macro_invoked_counts_as_its_own_process() {
+    let own = |body: &str| {
+        Func {
+            callee: "t".into(),
+            line: 1,
+            body: body.into(),
+            visible: false,
+        }
+        .own_process()
+    };
+    assert!(own(
+        "fn t() {\n    darkmux_types::run_in_own_process!();\n}"
+    ));
+    assert!(own("fn t() {\n    run_in_own_process!();\n}"));
+    assert!(!own(
+        "fn t() {\n    // run_in_own_process! (comment only)\n}"
+    ));
+    assert!(!own(
+        "fn t() {\n    // darkmux_types::run_in_own_process!();\n}"
+    ));
+    assert!(!own(
+        "fn t() {\n    let s = \"darkmux_types::run_in_own_process!();\";\n}"
+    ));
+}
+
+#[test]
+fn an_env_setting_helper_seen_outside_its_file_is_flagged_where_it_is() {
+    // Its callers in other files are out of this file's sight, so even an
+    // own-process caller here does not clear it.
+    let source =
+        "pub(crate) fn with_path() {\n    unsafe { std::env::set_var(\"PATH\", \"x\") };\n}\n\
+                  fn own() {\n    darkmux_types::run_in_own_process!();\n    with_path();\n}\n";
+    assert_eq!(offenders_in(source), ["f.rs:1 with_path"]);
+    let generic =
+        "pub(super) fn with_env(k: &str) {\n    unsafe { std::env::set_var(k, \"x\") };\n}\n";
+    assert_eq!(offenders_in(generic), ["f.rs:1 with_env"]);
+    let darkmux_only = "pub(crate) fn with_secret() {\n    unsafe { std::env::set_var(\"DARKMUX_TEST_SECRET\", \"x\") };\n}\n";
+    assert!(
+        offenders_in(darkmux_only).is_empty(),
+        "a darkmux variable is left to the env audit"
+    );
+}
+
+#[test]
 fn only_a_whole_literal_names_a_variable() {
     let named = |body: &str| {
         Func {
             callee: "f".into(),
             line: 1,
             body: body.into(),
+            visible: false,
         }
         .names_a_child_read_var()
     };
