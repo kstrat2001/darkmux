@@ -4132,9 +4132,16 @@ mod tests {
         let b = wait_container(&emu, 2);
         assert_ne!(a.heartbeat, b.heartbeat, "a heartbeat folder per run");
         assert_ne!(a.name, b.name, "a container name per run");
-        // Run A's thread ends after its container does, and cleans up.
-        std::thread::sleep(Duration::from_millis(1500));
-        assert!(!a.heartbeat.exists(), "A's folder is removed");
+        // Run A's thread ends after its container does, and cleans up: wait
+        // for that removal itself; the bound only guards against a hang.
+        let gone = (0..3000).any(|_| {
+            let gone = !a.heartbeat.exists();
+            if !gone {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            gone
+        });
+        assert!(gone, "A's folder is removed");
         let beat = b.heartbeat.join(HEARTBEAT_FILE);
         assert!(beat.exists(), "B's folder survives A's end");
         age(&beat, 600);
