@@ -46,7 +46,7 @@ What you're looking for in the manifest:
 
 ## Step 2 — Read what the local tier accomplished
 
-When the escalated turn had banked text at a checkpoint, the dispatch's final message (`final_assistant` in the `--json` envelope) carries it, on every `escalation_*` result. Read it as that turn's work in progress, not a finished answer.
+When the escalated turn had banked text at a checkpoint, the dispatch's final message (`final_assistant` in the `--json` envelope) usually carries it. Read it as that turn's work in progress, not a finished answer. It can be missing: a dispatch resumed from a checkpoint written during that turn's tool calls does not restore the banked text, so treat an empty final message as "not recorded", not as "no work".
 
 Three durable signals:
 

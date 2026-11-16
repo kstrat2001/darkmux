@@ -765,6 +765,37 @@ fn a_reread_loop_escalation_carries_a_salvaged_turns_banked_answer() {
     );
 }
 
+/// A budget stop runs before the next call, so the salvaged turn's banked
+/// text is still pending when the cumulative cap ends the run. (`max_turns`
+/// cannot reach this point: it is checked before the salvaged continuation,
+/// while the prefill is still live.) The checkpoint and the salvage spend 500
+/// tokens each, so a 1,000-token cap is reached after the salvage only.
+#[test]
+#[serial_test::serial]
+fn a_budget_stop_after_a_salvage_carries_the_banked_answer() {
+    let mut s = banked_turn_scenario("banked_budget_stop", 0, SUMMARY, compaction::CompactionConfig::never_compact());
+    s.replies.pop(); // no compaction, so no compactor reply
+    s.max_cumulative_tokens = Some(1_000);
+    assert_escalates_with_the_banked_answer(s, EscalationReason::CumulativeTokensExceeded);
+}
+
+/// The malformed-call escalation fires on the salvaged call itself: two
+/// turns of ungranted names, then a turn that checkpoints and whose salvaged
+/// call is ungranted too.
+#[test]
+#[serial_test::serial]
+fn a_malformed_call_escalation_after_a_salvage_carries_the_banked_answer() {
+    let bogus = || calls(&[("not_a_tool", READ_X)]);
+    let mut replies: Vec<Reply> =
+        (0..MAX_CONSECUTIVE_MALFORMED_TURNS - 1).map(|i| reply(None, Some(bogus()), "tool_calls", 100 + i, 50)).collect();
+    replies.push(reply(Some(BANKED), None, "length", 200, 500));
+    replies.push(reply(Some("cut mid-sentence while calling"), Some(bogus()), "length", 200, 500));
+    let mut s = Scenario::new("banked_malformed", replies);
+    s.tools = vec![Tool::Read];
+    s.max_tokens_per_call = Some(500);
+    assert_escalates_with_the_banked_answer(s, EscalationReason::MalformedToolCallsExhausted);
+}
+
 // ─── the structured compactor's budget ───────────────────────────────────
 //
 // A structured-slot compaction renders a budget block into the SYSTEM
