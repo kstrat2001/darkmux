@@ -1094,6 +1094,8 @@ pub struct ClientServerState {
     pub detect_engines: crate::client_engines::DetectEngines,
     /// (#3569) Add one to `profiles.json` (`POST /client/engines`).
     pub add_engine: crate::client_engines::AddEngine,
+    /// (#3569) Where an add's record goes: the `client serve` log (stderr).
+    pub log_add: crate::client_engines::LogAdd,
     /// This machine, as a paired app keys its per-machine settings: a stable
     /// id (the same from the Mac app and the phone) and a display name.
     pub machine: ClientMachine,
@@ -1238,6 +1240,7 @@ impl ClientServerState {
             registry_profiles: Arc::new(registry_profiles_here),
             detect_engines: Arc::new(crate::client_engines::detect_here),
             add_engine: Arc::new(crate::client_engines::add_here),
+            log_add: Arc::new(|line| eprintln!("{line}")),
             machine: ClientMachine::this_one(),
             check_workdir: Arc::new(check_workdir_here),
             execute: Arc::new(move |spec, cancel| {

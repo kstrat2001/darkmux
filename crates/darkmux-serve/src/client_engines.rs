@@ -34,6 +34,8 @@ use std::sync::Arc;
 
 /// Every engine found on this Mac, read-only and bounded.
 pub type DetectEngines = Arc<dyn Fn() -> Detected + Send + Sync>;
+/// Record one line in the `client serve` log.
+pub type LogAdd = Arc<dyn Fn(&str) + Send + Sync>;
 /// Add one, writing `profiles.json`.
 pub type AddEngine = Arc<dyn Fn(&AddRequest) -> Result<Planned, Refusal> + Send + Sync>;
 
@@ -160,7 +162,7 @@ pub(crate) async fn engine_add_handler(
     };
     match tokio::task::spawn_blocking(move || add(&asked)).await {
         Ok(Ok(planned)) => {
-            eprintln!("{}", added_line(&client, &planned));
+            (state.log_add)(&added_line(&client, &planned));
             Json(EngineAdded::of(req.engine, &planned)).into_response()
         }
         Ok(Err(refused)) => refusal_response(&refused),

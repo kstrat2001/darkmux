@@ -37,15 +37,30 @@ impl std::fmt::Display for WriteError {
     }
 }
 
-/// The file `path` names: the file a symlink points to, else `path`.
-pub fn target(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+/// The file `path` names: the file a symlink points to, else `path` (which
+/// may not exist yet). A link whose target does not exist is refused,
+/// naming both: replacing it would put a plain file where the link was.
+pub fn target(path: &Path) -> Result<PathBuf, WriteError> {
+    let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    match std::fs::canonicalize(path) {
+        Ok(real) => Ok(real),
+        Err(_) if is_link => {
+            let points_to = std::fs::read_link(path)
+                .map(|t| t.display().to_string())
+                .unwrap_or_else(|_| "?".into());
+            Err(WriteError::Failed(format!(
+                "{} is a symlink to {points_to}, which does not exist; restore that file or remove the link",
+                path.display()
+            )))
+        }
+        Err(_) => Ok(path.to_path_buf()),
+    }
 }
 
 /// The lock every `profiles.json` writer takes: `<file>.lock` beside the
 /// file `path` names. Held until the guard drops.
 pub fn lock(path: &Path) -> Result<darkmux_types::flock::FlockGuard, WriteError> {
-    let target = target(path);
+    let target = target(path)?;
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -56,7 +71,7 @@ pub fn lock(path: &Path) -> Result<darkmux_types::flock::FlockGuard, WriteError>
 
 /// What the file `path` names holds now: `None` when there is no file.
 pub fn read_now(path: &Path) -> Result<Option<String>, WriteError> {
-    match std::fs::read_to_string(target(path)) {
+    match std::fs::read_to_string(target(path)?) {
         Ok(text) => Ok(Some(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(WriteError::Failed(format!(
@@ -73,12 +88,24 @@ pub fn replace(path: &Path, expected: Option<&str>, text: &str) -> Result<(), Wr
     replace_locked(path, expected, text)
 }
 
+/// Remove the file `path` names when it still holds `expected` (what the
+/// remover wrote), under the lock: a file another writer changed is kept.
+pub fn remove(path: &Path, expected: &str) -> Result<(), WriteError> {
+    let _held = lock(path)?;
+    if read_now(path)?.as_deref() != Some(expected) {
+        return Err(WriteError::Changed);
+    }
+    let target = target(path)?;
+    std::fs::remove_file(&target)
+        .map_err(|e| WriteError::Failed(format!("removing {}: {e}", target.display())))
+}
+
 /// [`replace`] for a caller that already holds [`lock`].
 pub fn replace_locked(path: &Path, expected: Option<&str>, text: &str) -> Result<(), WriteError> {
     if read_now(path)?.as_deref() != expected {
         return Err(WriteError::Changed);
     }
-    write_atomic(&target(path), text)
+    write_atomic(&target(path)?, text)
 }
 
 /// A name for a file beside the target that no other writer, in this
@@ -279,7 +306,51 @@ mod tests {
         for t in [&a, &b] {
             assert_eq!(t.parent(), target.parent());
             let name = t.file_name().unwrap().to_string_lossy();
-            assert!(name.starts_with(".profiles.json.") && name.ends_with(".tmp"), "{name}");
+            assert!(
+                name.starts_with(".profiles.json.") && name.ends_with(".tmp"),
+                "{name}"
+            );
         }
+    }
+
+    /// A `profiles.json` that is a link to a file that does not exist is
+    /// refused naming both, never replaced by a plain file.
+    #[test]
+    fn a_dangling_link_is_refused_naming_it_and_its_missing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("profiles.json");
+        std::os::unix::fs::symlink(dir.path().join("missing").join("real.json"), &link).unwrap();
+        let refused = replace(&link, None, "{}").unwrap_err();
+        assert!(
+            matches!(&refused, WriteError::Failed(m) if m.contains("profiles.json") && m.contains("missing/real.json")),
+            "{refused:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "still a link"
+        );
+        assert!(!dir.path().join("missing").exists());
+        assert!(remove(&link, "{}").is_err());
+    }
+
+    /// A removal takes the lock and removes only the file that still holds
+    /// what the remover wrote; one another writer changed is kept.
+    #[test]
+    fn a_removal_removes_only_what_the_remover_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("profiles.json");
+        std::fs::write(&file, "theirs").unwrap();
+        assert_eq!(remove(&file, "mine"), Err(WriteError::Changed));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs");
+        assert_eq!(remove(&file, "theirs"), Ok(()));
+        assert!(!file.exists());
+        assert_eq!(
+            remove(&file, "theirs"),
+            Err(WriteError::Changed),
+            "nothing there to remove"
+        );
     }
 }

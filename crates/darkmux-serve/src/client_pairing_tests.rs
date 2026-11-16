@@ -274,6 +274,14 @@ fn harness() -> Harness {
         },
         profile_info: Arc::new(|_role, names| names.iter().map(|n| test_profile_info(n)).collect()),
         detect_engines: Arc::new(test_engines),
+        log_add: {
+            let log = dir.path().join("serve.log");
+            Arc::new(move |line| {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&log).unwrap();
+                writeln!(f, "{line}").unwrap();
+            })
+        },
         add_engine: {
             let registry = dir.path().join("profiles.json");
             std::fs::write(&registry, TEST_REGISTRY).unwrap();
@@ -11392,6 +11400,10 @@ async fn an_engine_add_from_the_tailnet_is_refused_and_listing_is_not() {
     assert_eq!(status, 200, "{v}");
     let (status, v) = call(&h, post("/client/engines", Some(&token), serde_json::json!({"engine": "flint"}))).await;
     assert_eq!(status, 200, "from this Mac it is added: {v}");
+    // The refused tailnet add left no record; the add from this Mac did.
+    let log = std::fs::read_to_string(h.dir.path().join("serve.log")).unwrap();
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(log.contains("added engine `flint`") && log.contains("an app on this Mac") && log.contains("port 8091"), "{log}");
 }
 
 /// (#3569 review) Every add is recorded in the serve log: the client, the

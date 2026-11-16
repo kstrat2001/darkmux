@@ -363,7 +363,7 @@ fn write_registry(path: &Path, expected: Option<&str>, text: &str) -> std::resul
 fn put_back(registry_path: &Path, previous: Option<&str>, written: &str) -> &'static str {
     let restored = match previous {
         Some(p) => write_registry(registry_path, Some(written), p).is_ok(),
-        None => fs::remove_file(registry_path).is_ok(),
+        None => darkmux_profiles::registry_write::remove(registry_path, written).is_ok(),
     };
     if restored { "profiles.json was put back" } else { "profiles.json could NOT be put back" }
 }
@@ -1419,6 +1419,10 @@ mod tests {
         assert_eq!(put_back(&path, Some("before"), "what this run wrote"), "profiles.json could NOT be put back");
         assert_eq!(fs::read_to_string(&path).unwrap(), "changed");
         assert_eq!(put_back(&path, Some("before"), "changed"), "profiles.json was put back");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before");
+        // (#3569) With no registry before, it is removed only while it holds
+        // what this run wrote: one another writer changed is kept.
+        assert_eq!(put_back(&path, None, "what this run wrote"), "profiles.json could NOT be put back");
         assert_eq!(fs::read_to_string(&path).unwrap(), "before");
         assert_eq!(put_back(&path, None, "before"), "profiles.json was put back");
         assert!(!path.exists(), "no registry before, none after");
