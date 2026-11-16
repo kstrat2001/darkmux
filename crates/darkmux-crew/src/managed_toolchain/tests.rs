@@ -1683,3 +1683,15 @@ fn the_package_json_notice_names_the_nearest_unreadable_one() {
         "{said}"
     );
 }
+
+/// (#3429) A runtime's install bound is the sum of the bounds its steps
+/// are waited for (the download's process, then the unpack's), and the
+/// first-use bound counts one install per runtime.
+#[test]
+fn the_first_use_bound_is_every_runtimes_install_steps() {
+    use install::{DOWNLOAD_STEP, UNPACK_STEP};
+    assert_eq!(INSTALL_BOUND, DOWNLOAD_STEP + UNPACK_STEP);
+    assert!(DOWNLOAD_STEP > DOWNLOAD_BOUND, "the download's process gets a grace past curl's own bound");
+    assert_eq!(first_use_bound(2), INSTALL_BOUND * 2);
+    assert_eq!(FIRST_USE_BOUND, first_use_bound(RUNTIMES.len()));
+}

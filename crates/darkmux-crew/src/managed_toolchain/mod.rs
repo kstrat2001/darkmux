@@ -57,8 +57,8 @@ pub mod fixture;
 mod tests;
 
 pub use install::{
-    ensure, installed, remove_unpinned, Installed, Note, DOWNLOAD_BOUND, MARKER, STALE_PARTIAL,
-    UNUSED_FOR, USED, USE_STAMP_EVERY,
+    ensure, installed, remove_unpinned, Installed, Note, DOWNLOAD_BOUND, INSTALL_BOUND, MARKER,
+    STALE_PARTIAL, UNUSED_FOR, USED, USE_STAMP_EVERY,
 };
 pub use node::NODE;
 pub use node_version::{choose, declared_in, unread_package_json, Declared, Request};
@@ -111,6 +111,16 @@ impl std::fmt::Debug for Runtime {
 
 /// Every runtime darkmux supplies to a sandbox on the host.
 pub const RUNTIMES: &[&Runtime] = &[&NODE];
+
+/// (#3429) The longest a sandbox on the host may wait, on first use, for
+/// every runtime in [`RUNTIMES`] to be fetched and unpacked, one after
+/// another. A fleet sender's wait allows for it.
+pub const FIRST_USE_BOUND: std::time::Duration = first_use_bound(RUNTIMES.len());
+
+/// The first-use bound for `runtimes` runtimes, installed one after another.
+const fn first_use_bound(runtimes: usize) -> std::time::Duration {
+    std::time::Duration::from_secs(INSTALL_BOUND.as_secs() * runtimes as u64)
+}
 
 /// Which builds of a runtime may be installed.
 #[derive(Debug, Clone)]

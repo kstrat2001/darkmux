@@ -1382,11 +1382,25 @@ fn send_job(mut job: WorkJob, wait: bool, pins: PinPolicy) -> Result<(u16, Submi
     // never binds loopback, so a real provider refuses it).
     let peer = crate::peer::peer_target(&target, &entry, None, port, false, provider.as_ref())?.at_listener(port);
     let peer = settle_pin(peer, &entry, &target, pins, provider.provider_name())?;
-    let read_timeout = if wait {
-        Duration::from_secs(u64::from(job.timeout_seconds).saturating_add(120))
-    } else {
-        Duration::from_secs(60)
-    };
+    deliver(&peer, job, wait, &target, &send_submission)
+}
+
+/// How [`deliver`] sends: [`send_submission`], or a test's recorder.
+type SendSubmission<'a> =
+    &'a dyn Fn(&crate::peer::SettledTarget, &WorkSubmission, Duration, &mut dyn FnMut(&SubmissionReply)) -> Result<(u16, SubmissionReply)>;
+
+/// Send `job` to the settled `peer` (the machine `target`) with
+/// [`reply_wait`]'s read deadline, reporting a waited-on job's `queued`
+/// lines as they arrive, and naming the session to follow when the answer
+/// was lost.
+fn deliver(
+    peer: &crate::peer::SettledTarget,
+    job: WorkJob,
+    wait: bool,
+    target: &str,
+    send: SendSubmission<'_>,
+) -> Result<(u16, SubmissionReply)> {
+    let read_timeout = reply_wait(&job, wait);
     let session_id = job.session_id.clone();
     let submission = WorkSubmission::new(job, wait);
     // (#2916 stage 2) A waited-on job the receiver queued says so as it
@@ -1399,7 +1413,7 @@ fn send_job(mut job: WorkJob, wait: bool, pins: PinPolicy) -> Result<(u16, Submi
             }
         }
     };
-    send_submission(&peer, &submission, read_timeout, &mut on_progress).map_err(|e| match e.downcast::<AnswerLost>() {
+    send(peer, &submission, read_timeout, &mut on_progress).map_err(|e| match e.downcast::<AnswerLost>() {
         Ok(lost) => {
             // The receiver names the run after the allow-list entry it
             // trusts this machine under, normally this machine_id.
@@ -1413,6 +1427,48 @@ fn send_job(mut job: WorkJob, wait: bool, pins: PinPolicy) -> Result<(u16, Submi
         Err(other) => other,
     })
 }
+
+/// (#3429) What a waited-on job's answer gets past the job's own run: the
+/// receiver's bookkeeping and the answer's trip back.
+pub const ANSWER_SLACK: Duration = Duration::from_secs(120);
+
+/// (#3429) The longest a target may spend, before an agentic job's work
+/// begins, getting what its sandbox needs on first use: a Docker target
+/// pulls the runtime image (bounded by `darkmux_crew::runtime_image::PULL_TIMEOUT`),
+/// and a sandbox on the host fetches its managed toolchain (bounded by
+/// `darkmux_crew::managed_toolchain::FIRST_USE_BOUND`). The sender cannot
+/// see which sandbox the target runs, so it allows the longer.
+pub const SANDBOX_FIRST_USE: Duration =
+    longer(darkmux_crew::runtime_image::PULL_TIMEOUT, darkmux_crew::managed_toolchain::FIRST_USE_BOUND);
+
+const fn longer(a: Duration, b: Duration) -> Duration {
+    if a.as_nanos() >= b.as_nanos() {
+        a
+    } else {
+        b
+    }
+}
+
+/// (#3429) How long a sender waits for the next line of a job's reply (a
+/// read deadline, so each `queued` line restarts it). An unwaited job's one
+/// line is the acknowledgment, sent before anything runs. A waited-on job's
+/// last line comes after its run: the job's own timeout, then the answer's
+/// slack, and for an agentic job first the sandbox's first-use allowance
+/// ([`SANDBOX_FIRST_USE`]). A single-shot job starts no sandbox. The job's
+/// timeout bounds only a single-shot job's run: an agentic job runs on the
+/// receiver's own inactivity budget (`timeout_override_seconds` does not
+/// cross the wire), so it can outlast this wait, and the sender then reports
+/// the answer lost, naming the session to follow.
+pub fn reply_wait(job: &WorkJob, wait: bool) -> Duration {
+    if !wait {
+        return ACKNOWLEDGMENT_WAIT;
+    }
+    let first_use = if job.single_shot.is_some() { Duration::ZERO } else { SANDBOX_FIRST_USE };
+    Duration::from_secs(u64::from(job.timeout_seconds)) + first_use + ANSWER_SLACK
+}
+
+/// How long a sender waits for an unwaited job's acknowledgment.
+const ACKNOWLEDGMENT_WAIT: Duration = Duration::from_secs(60);
 
 /// Submit `job` to the machine it is addressed to ([`send_job`]). A refusal
 /// comes back as `Err` carrying a [`SubmitRefused`] (the receiver's reason,
@@ -1689,6 +1745,79 @@ mod tests {
             check_scope("studio", None, &a, &j, work("host")),
             Err(Refusal::OutOfScope { item: OutOfScope::Workspace, .. })
         ));
+    }
+
+    /// (#3429) A waited-on agentic job may first wait on its target getting
+    /// what its sandbox needs: a Docker target pulls the runtime image, a
+    /// sandbox on the host fetches its managed toolchain. The sender cannot
+    /// see which, so its wait outlasts either, with the answer's slack after.
+    #[test]
+    fn a_waited_job_outlasts_the_longest_first_use_on_any_sandbox() {
+        use darkmux_crew::managed_toolchain::FIRST_USE_BOUND;
+        use darkmux_crew::runtime_image::PULL_TIMEOUT;
+        for timeout_seconds in [1, 60, 300, 600, crate::job::MAX_WORK_TIMEOUT_SECONDS] {
+            let j = WorkJob { timeout_seconds, ..job(None) };
+            let own = Duration::from_secs(u64::from(timeout_seconds));
+            let wait = reply_wait(&j, true);
+            let at = format!("{wait:?} at --timeout {timeout_seconds}");
+            assert!(wait >= own + PULL_TIMEOUT + ANSWER_SLACK, "a Docker target's pull outlasts {at}");
+            assert!(wait >= own + FIRST_USE_BOUND + ANSWER_SLACK, "a host sandbox's toolchain fetch outlasts {at}");
+            assert_eq!(wait, own + SANDBOX_FIRST_USE + ANSWER_SLACK, "--timeout {timeout_seconds}");
+        }
+    }
+
+    /// (#3429) The read deadline a job is actually sent with is
+    /// [`reply_wait`]'s, waited on or not.
+    #[test]
+    fn a_job_is_sent_with_reply_waits_deadline() {
+        let peer = crate::peer::unverified_target_for_test("http://127.0.0.1:1");
+        for (wait, single_shot) in [(true, false), (true, true), (false, false)] {
+            let single = crate::SingleShotJob {
+                humor: 0,
+                surface: darkmux_flow::payload::RadioSurface::Cli,
+                max_completion_tokens: 512,
+            };
+            let j = WorkJob { timeout_seconds: 300, single_shot: single_shot.then_some(single), ..job(None) };
+            let expected = reply_wait(&j, wait);
+            let sent = std::cell::Cell::new(None);
+            let record = |_: &crate::peer::SettledTarget, _: &WorkSubmission, t: Duration, _: &mut dyn FnMut(&SubmissionReply)| {
+                sent.set(Some(t));
+                Err(anyhow!("recorded"))
+            };
+            assert!(deliver(&peer, j, wait, "studio", &record).is_err());
+            assert_eq!(sent.get(), Some(expected), "wait {wait}, single-shot {single_shot}");
+        }
+    }
+
+    /// (#3429) The one place the sender's allowance comes from: the longer
+    /// of the two first-use bounds, read from where each is enforced.
+    #[test]
+    fn the_first_use_allowance_is_the_longer_enforced_bound() {
+        use darkmux_crew::managed_toolchain::FIRST_USE_BOUND;
+        use darkmux_crew::runtime_image::PULL_TIMEOUT;
+        assert_eq!(SANDBOX_FIRST_USE, PULL_TIMEOUT.max(FIRST_USE_BOUND));
+    }
+
+    /// (#3429) A single-shot job is one tool-less exchange: no sandbox
+    /// starts, so nothing is pulled or fetched, and its wait adds no
+    /// allowance for it.
+    #[test]
+    fn a_single_shot_job_waits_its_own_timeout_and_the_slack() {
+        let single = crate::SingleShotJob {
+            humor: 0,
+            surface: darkmux_flow::payload::RadioSurface::Cli,
+            max_completion_tokens: 512,
+        };
+        let j = WorkJob { timeout_seconds: 300, single_shot: Some(single), ..job(None) };
+        assert_eq!(reply_wait(&j, true), Duration::from_secs(300) + ANSWER_SLACK);
+    }
+
+    /// An unwaited job's one reply is the receiver's acknowledgment: it
+    /// comes before anything runs, so its wait does not grow with the job.
+    #[test]
+    fn an_unwaited_job_waits_only_for_the_acknowledgment() {
+        let j = WorkJob { timeout_seconds: 3600, ..job(None) };
+        assert_eq!(reply_wait(&j, false), Duration::from_secs(60));
     }
 
     fn job(profile: Option<&str>) -> WorkJob {
