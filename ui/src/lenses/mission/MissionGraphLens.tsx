@@ -86,6 +86,7 @@ import {
   type GraphStep,
   type MetricsMap,
   type StepHeaderField,
+  missionSpan,
 } from "./graph";
 import { initMinimap, isNarrowViewport, persistMinimap, timelineActive } from "./timeline";
 import { byReceiveOrder, byTime, ingest, stepIdOf, type NormRecord } from "../../lib/ingest";
@@ -346,16 +347,6 @@ const PENDING_CHIP: MissionHeaderChip = { status: undefined, label: "\u2026", ti
 
 /** Mission-wide span from the per-step metrics the fold already keeps:
  * earliest step start, latest step end (0 when unknown). */
-function missionSpan(metrics: MetricsMap): { start: number; end: number } {
-  let start = 0;
-  let end = 0;
-  for (const k of Object.keys(metrics)) {
-    const m = metrics[k];
-    if (m.startTs) start = start ? Math.min(start, m.startTs) : m.startTs;
-    if (m.endTs) end = Math.max(end, m.endTs);
-  }
-  return { start, end };
-}
 function HelpGlyph() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true">

@@ -339,6 +339,9 @@ export interface StepMetrics {
    *  ends only on its `step.complete`/`step.error`: a dispatch terminal is
    *  one execution's end (a map step holds one per item), not the step's. */
   stepBookended?: boolean;
+  /** (#3195) When a step that waited for its slot was admitted: its own
+   *  span starts when it takes the slot, the mission's clock from here. */
+  waitFromTs?: number;
   /** (#3017) The receive key ({@link receiveKey}) of the newest terminal
    *  folded: what tells a retry (a start received AFTER the step ended) from
    *  a sibling start of the same attempt. */
@@ -463,7 +466,7 @@ function attemptBeats(t: { n: number; lastKey: number; ours: boolean }, best: { 
 
 const METRIC_KEYS: readonly (keyof StepMetrics)[] = [
   "tokRun", "tokUtilityRun", "tokFinal", "tokUtilityFinal", "turnRun", "turnFinal", "turnsEnded", "toolRun", "toolFinal",
-  "startTs", "endTs", "endKey", "endFailed", "lastTs", "stepBookended",
+  "startTs", "endTs", "endKey", "endFailed", "lastTs", "stepBookended", "waitFromTs",
 ];
 
 function sameMetrics(a: StepMetrics, b: StepMetrics): boolean {
@@ -517,8 +520,10 @@ function foldSpan(
 /** (#3195) A step queued for its call slot has not started its work: its
  *  span has no start while it waits, and starts when it takes the slot. */
 function foldQueue(next: StepMetrics, action: NormAction | undefined, recMs: number): void {
-  if (action === ACTION.StepQueueWait) next.startTs = 0;
-  else if (action === ACTION.StepQueueResume && recMs) next.startTs = recMs;
+  if (action === ACTION.StepQueueWait) {
+    next.waitFromTs = next.startTs || recMs;
+    next.startTs = 0;
+  } else if (action === ACTION.StepQueueResume && recMs) next.startTs = recMs;
 }
 
 /** (#3067) Fold one usage record's tokens into a step's running figures: the
@@ -570,6 +575,21 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
 
   if (sameMetrics(next, cur)) return metrics;
   return { ...metrics, [sid]: next };
+}
+
+/** The mission's span from its steps' metrics: the earliest start to the
+ *  latest end. (#3195) A step that waited for its slot counts from its
+ *  admission here: the mission's clock shows the whole, waits included,
+ *  while the step's own row shows only its work. */
+export function missionSpan(metrics: MetricsMap): { start: number; end: number } {
+  let start = 0;
+  let end = 0;
+  for (const m of Object.values(metrics)) {
+    const st = m.waitFromTs || m.startTs;
+    if (st) start = start ? Math.min(start, st) : st;
+    if (m.endTs) end = Math.max(end, m.endTs);
+  }
+  return { start, end };
 }
 
 /** `hasNoMetricsData` — the "this step reports no measurements yet" guard
@@ -890,9 +910,13 @@ export function hhmmss(ts: string | number): string {
 
 // ─── step meter (mission-graph.html: stepStartMs, stepMeterFor) ────────────
 
+/** (#3195) When the step's work began: the later of its records' start and
+ *  the snapshot's `startedTs`, the instant the scheduler saw its dispatch
+ *  begin. A record start can be the step's admission (a wait its records do
+ *  not name); the snapshot's can be stale behind a retry the records
+ *  restarted on. Either alone when it is the only one. */
 export function stepStartMs(step: GraphStep, m: StepMetrics | undefined): number {
-  if (m && m.startTs) return m.startTs;
-  return tsToMs(step.startedTs);
+  return Math.max(m?.startTs || 0, tsToMs(step.startedTs) || 0);
 }
 
 /** (#2269) The step's end, same precedence as {@link stepStartMs}: the

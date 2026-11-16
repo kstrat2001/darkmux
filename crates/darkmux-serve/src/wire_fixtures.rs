@@ -31,7 +31,7 @@
 #[cfg(test)]
 mod tests {
     use crate::mission_graph::{
-        EdgeKind, GraphEdge, GraphNode, GraphNodeStatus, MissionGraph, NodeKind, PhaseDisplayStatus, StepRow,
+        EdgeKind, GraphEdge, GraphNode, GraphNodeStatus, MissionGraph, NodeKind, PhaseDisplayStatus, StepDisplayStatus, StepRow,
         TaskDisplayStatus,
     };
     use darkmux_crew::types::MissionStatus;
@@ -241,7 +241,7 @@ mod tests {
                             id: "judge-cloud".to_string(),
                             label: "Judge".to_string(),
                             kind: "dispatch.map".to_string(),
-                            status: TaskDisplayStatus::Complete,
+                            status: StepDisplayStatus::Shown(TaskDisplayStatus::Complete),
                             started_ts: Some(1_785_404_428),
                             completed_ts: Some(1_785_404_600),
                             tokens_final: Some(5_000),
@@ -255,7 +255,7 @@ mod tests {
                             id: "judge-local".to_string(),
                             label: "Judge".to_string(),
                             kind: "dispatch.map".to_string(),
-                            status: TaskDisplayStatus::Complete,
+                            status: StepDisplayStatus::Shown(TaskDisplayStatus::Complete),
                             started_ts: Some(1_785_404_428),
                             completed_ts: Some(1_785_404_610),
                             tokens_final: Some(3_000),
@@ -272,7 +272,7 @@ mod tests {
                             id: "judge-unknown".to_string(),
                             label: "Judge".to_string(),
                             kind: "dispatch.map".to_string(),
-                            status: TaskDisplayStatus::Error,
+                            status: StepDisplayStatus::Shown(TaskDisplayStatus::Error),
                             started_ts: Some(1_785_404_428),
                             completed_ts: None,
                             tokens_final: Some(7_000),
@@ -287,7 +287,7 @@ mod tests {
                             id: "verify-planned".to_string(),
                             label: "Verify".to_string(),
                             kind: "dispatch.map".to_string(),
-                            status: TaskDisplayStatus::Planned,
+                            status: StepDisplayStatus::Shown(TaskDisplayStatus::Planned),
                             started_ts: None,
                             completed_ts: None,
                             tokens_final: None,

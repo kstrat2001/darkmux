@@ -20,6 +20,7 @@ import {
   isUnknownStatus,
   keepPageStatus,
   mergeGraphs,
+  missionSpan,
   missionTotals,
   phaseOrderEdges,
   recordInMission,
@@ -805,6 +806,13 @@ describe("a step queued for its call slot (#3195)", () => {
     expect(stepStatus(fold([...resumed, at("step.complete", T0 + 660_000)]))).toBe("complete");
   });
 
+  it("a page loaded during the wait (the snapshot says waiting) reads running at the step's resume", () => {
+    const g = planned();
+    const snap: MissionGraph = { ...g, generated_at_ms: T0 + 1_000, nodes: g.nodes.map((n) => (n.id === "b" ? { ...n, steps: [{ ...n.steps![0], status: "waiting" as const }] } : n)) };
+    const folded = foldFlowRecords(snap, resumed, indexGraph(snap), "m1");
+    expect(stepStatus(folded)).toBe("running");
+  });
+
   it("a wait never reopens a step that already ended", () => {
     expect(stepStatus(fold([at("step.start", T0), at("step.complete", T0 + 1_000), at("step.queue.wait", T0 + 2_000)]))).toBe("complete");
   });
@@ -823,11 +831,34 @@ describe("a step queued for its call slot (#3195)", () => {
     expect(fold(resumed)["b-step"].startTs).toBe(T0 + 600_000);
   });
 
+  it("the mission's span still counts from its first step's admission, waits included", () => {
+    // Every step waited (a local wave loading its model): the mission
+    // header shows the whole, from the admission, not from the first work.
+    const idx = indexGraph(planned());
+    const metrics = resumed.reduce<MetricsMap>((m, r) => applyRecordToMetrics(m, r, idx, "m1"), {});
+    expect(missionSpan(metrics).start).toBe(T0);
+  });
+
   it("a waiting step shows no work timer, however long it has waited", () => {
     const m = meter(queued, "waiting", T0 + 600_000);
     expect(m.generating).toBe(false);
     expect(m.elapsedMs).toBe(0);
     expect(m.wallMs).toBe(0);
+  });
+
+  it("the meter says a waiting step waits", () => {
+    expect(meter(queued, "waiting", T0 + 600_000).waiting).toBe(true);
+    expect(meter(resumed, "running", T0 + 660_000).waiting).toBe(false);
+  });
+
+  it("a step whose records name no wait still counts from its true start, the snapshot's", () => {
+    // A step whose wait no record names (its start record is its admission)
+    // but whose snapshot carries the instant its dispatch began.
+    const idx = indexGraph(planned());
+    const metrics = [at("step.start", T0)].reduce<MetricsMap>((m, r) => applyRecordToMetrics(m, r, idx, "m1"), {});
+    const step = { id: "b-step", label: "Dispatch", kind: "dispatch.single_shot", status: "running" as const, startedTs: (T0 + 600_000) / 1000 };
+    const seeded = seedMetricsFromGraph(metrics, { nodes: [{ ...TASK_B, steps: [step] }] });
+    expect(stepMeterFor(step, seeded, T0 + 660_000, new Map([["b-step", "open"]])).elapsedMs).toBe(60_000);
   });
 
   it("once it takes the slot, its timer counts from then, not from its admission", () => {

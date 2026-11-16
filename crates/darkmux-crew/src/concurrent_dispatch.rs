@@ -369,11 +369,17 @@ pub fn lms_host_factory() -> Box<dyn ModelHost> {
 /// in that job's own `Result` slot in the returned `Vec`, never surfaced
 /// here.
 ///
-/// (#3195) `on_queued` is told the index of each job its track queues
-/// behind the jobs ahead of it: a job past its endpoint's
-/// `limits.concurrent_calls`, its model's parallel slots, or the
-/// dispatch-free cap. Called once per such job, from its track's thread,
-/// before any job of that track runs; a job never told started at once.
+/// (#3195) `on_queued` is told the index of each job that waits before it
+/// can run, once, from its track's thread, before any job of that track
+/// runs:
+///
+/// - an endpoint's or the dispatch-free track's job past the first batch
+///   (its endpoint's `limits.concurrent_calls`, or `dispatch_free_cap`);
+/// - every local job that can run, whatever its wave: a later wave waits
+///   for the earlier ones, and the first waits for its own model's load.
+///   A local placement no wave can ever fit is never told (it never runs).
+///
+/// A job never told started at once.
 pub(crate) fn run_bounded<T: Send + 'static>(
     jobs: Vec<QueuedJob<T>>,
     facts: &Facts,
@@ -599,6 +605,14 @@ fn run_local_waves<T: Send + 'static>(
             ));
         }
     }
+    // (#3195) Every job left waits for its wave's model before it can run
+    // (a later wave behind the earlier ones, the first behind its own
+    // load): say so now, once, before any wave loads. The waves' own
+    // batches below then tell no one again.
+    for (index, _) in by_seat.values() {
+        (out.on_queued)(*index);
+    }
+    let out = &TrackOut { results: out.results, on_queued: &|_| {} };
     for wave in &schedule.waves {
         if let Err(e) = ensure_wave_loaded(wave, est, host.as_mut(), &lease_guard, utility_binding, room) {
             for placement in wave {
@@ -3708,6 +3722,46 @@ mod tests {
         for (_, r) in &results {
             assert!(r.is_ok(), "no job should fail in this fixture");
         }
+    }
+
+    /// (#3195) Every local job waits for its wave's model before it can
+    /// run (a later wave behind the earlier ones, the first behind its own
+    /// load), so each is told it is queued, once, before any local job
+    /// runs. A placement that can never fit never runs, so it is not told.
+    #[serial_test::serial]
+    #[test]
+    fn on_queued_names_every_local_job_before_its_wave_loads() {
+        let _env = LeaseTestEnv::new();
+        let est = FixedEstimator(BTreeMap::from([
+            ("small-a".to_string(), 10_000_000_000),
+            ("small-b".to_string(), 10_000_000_000),
+            ("big-c".to_string(), 10_000_000_000),
+            ("too-big".to_string(), 50_000_000_000),
+        ]));
+        // Two of the three fit at once (20 GB), so they run in two waves.
+        let facts = Facts { budget: Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
+        let marker = Arc::new(AtomicU32::new(0));
+        let jobs = vec![
+            QueuedJob { index: 0, seat: SeatClaim::LocalModel(placement("small-a", 8_000)), job: ok_job(0, marker.clone()) },
+            QueuedJob { index: 1, seat: SeatClaim::LocalModel(placement("small-b", 8_000)), job: ok_job(1, marker.clone()) },
+            QueuedJob { index: 2, seat: SeatClaim::LocalModel(placement("big-c", 8_000)), job: ok_job(2, marker.clone()) },
+            QueuedJob { index: 3, seat: SeatClaim::LocalModel(placement("too-big", 8_000)), job: ok_job(3, marker.clone()) },
+            // A second job on `small-a`'s one slot, queued behind index 0
+            // within its wave too: still told only once.
+            QueuedJob { index: 4, seat: SeatClaim::LocalModel(placement("small-a", 8_000)), job: ok_job(4, marker.clone()) },
+        ];
+        let told = Mutex::new(Vec::new());
+        let ran_before_told = AtomicU32::new(0);
+        let on_queued = |i: usize| {
+            ran_before_told.fetch_max(marker.load(Ordering::SeqCst), Ordering::SeqCst);
+            told.lock().unwrap().push(i);
+        };
+        let results = super::run_bounded(jobs, &facts, &est, 4, &mock_host_factory, Some(&crate::lms_room::ServerRoom::without_machine()), &on_queued).expect("planned");
+        assert_eq!(results.len(), 5);
+        let mut told = told.into_inner().unwrap();
+        told.sort_unstable();
+        assert_eq!(told, vec![0, 1, 2, 4], "every local job that runs waits for its wave, told once; the refused one is not");
+        assert_eq!(ran_before_told.load(Ordering::SeqCst), 0, "told before any local job ran");
     }
 
     /// A local job whose placement can never fit ANY wave (its estimate

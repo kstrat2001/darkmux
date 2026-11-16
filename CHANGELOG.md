@@ -160,15 +160,17 @@ darkmux release.
 
 ### Fixed
 
-- **A mission step queued for its endpoint's call slot reads waiting, not running (#3195).** Steps
-  admitted together behind one slot (an endpoint with no `limits.concurrent_calls` runs its calls one
-  at a time) all read running from their `step.start`, each with a timer counting the whole queue.
-  The scheduler now writes `step.queue.wait` on a step's task session when it is queued and
-  `step.queue.resume` when it takes the slot, and the mission graph's step row (`graph.json`
-  `status`) reads `waiting` for a step admitted but not yet dispatching, by the rule its task already
-  used. The viewer shows such a step as waiting with no timer, starts its time when it takes the
-  slot, and gives each phase heading its own running total beside the mission's. `FLOW_SCHEMA_VERSION`
-  2.8.0 -> 2.9.0, additive: a step that started at once writes neither record.
+- **A mission step waiting its turn reads waiting, not running (#3195).** Steps admitted together
+  behind one slot (an endpoint with no `limits.concurrent_calls` runs its calls one at a time), or a
+  local step waiting for its wave's model (a later wave, or its own wave's load), all read running from
+  their `step.start`, each with a timer counting the whole wait. The scheduler now writes
+  `step.queue.wait` on a step's task session when it is queued and `step.queue.resume` when its work
+  starts (none when the run is stopped first: its terminal closes the wait), and the mission graph's
+  step row (`graph.json` `status`) reads `waiting` for a step admitted but not yet dispatching, by the
+  rule its task already used (`unknown` stays `unknown`). The viewer shows such a step and its task as
+  waiting with no timer, takes a step's start from when its work began, and gives each phase heading
+  its own running total beside the mission's. `FLOW_SCHEMA_VERSION` 2.8.0 -> 2.9.0, additive: a step
+  that started at once writes neither record.
 
 - **`GET /client/profiles` answers a query it cannot read with the coded `ClientError` (#3494).** A
   repeated `role` was axum's plain-text 400; it is now `{"error": "...", "code": "bad_request"}` like

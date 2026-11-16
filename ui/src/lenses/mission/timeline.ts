@@ -5,7 +5,7 @@
  * `MissionTimelineView.tsx` renders the grouped shape this module produces;
  * this module owns none of the DOM.
  */
-import type { GraphEdge, GraphNode, MetricsMap, StepMeter } from "./graph";
+import type { GraphEdge, GraphNode, GraphStep, MetricsMap, StepMeter, StepMetrics } from "./graph";
 import type { GraphNodeStatus } from "../../types/generated/GraphNodeStatus";
 import { NO_STEP_PHASES, isAiKind, stepDisplayMetrics, stepEndMs, stepMeterFor, stepStartMs, type StepPhases } from "./graph";
 
@@ -71,6 +71,15 @@ export interface TaskAggMetrics {
   /** (#2269) What the shared meter renders once nothing runs: the task
    * span. Same field the per-step meter uses, so one renderer serves both. */
   wallMs: number;
+  /** (#3195) Nothing generating and a step waiting for its call slot. */
+  waiting: boolean;
+}
+
+/** (#3195) A task with nothing generating and a step waiting for its slot
+ *  says so on its own row, as the step's row does. */
+function taskWaiting(task: GraphNode, generating: boolean): boolean {
+  if (generating) return false;
+  return (task.steps || []).some((s) => s.status === "waiting");
 }
 
 /** `taskAggMetrics` — mission-graph.html. Aggregate a task's step metrics
@@ -113,7 +122,7 @@ export function taskAggMetrics(task: GraphNode, metrics: MetricsMap, now: number
   const ai = (task.steps || []).some((s) => isAiKind(s.kind));
   const spanMs = firstStartMs && lastEndMs ? Math.max(0, lastEndMs - firstStartMs) : 0;
   const elapsedMs = generating ? spanMs : 0;
-  return { show: ai || tokens > 0 || turns > 0 || generating, tokens, turns, generating, elapsedMs, spanMs, sumMs, wallMs: spanMs };
+  return { show: ai || tokens > 0 || turns > 0 || generating, tokens, turns, generating, elapsedMs, spanMs, sumMs, wallMs: spanMs, waiting: taskWaiting(task, generating) };
 }
 
 interface TimelineStep {
@@ -144,9 +153,17 @@ export interface PhaseElapsed {
   running: boolean;
 }
 
+/** When a step began counting for its phase: its admission when it waited
+ *  for its slot (the mission's clock counts the wait the same way,
+ *  `missionSpan`), else its start. */
+function phaseStartOf(s: GraphStep, m: StepMetrics | undefined): number {
+  return m?.waitFromTs || stepStartMs(s, m);
+}
+
 /** (#3195, operator 2026-10-10) A phase's running total: its first step's
- *  start until now while any of its steps is running or waiting for its
- *  slot, else until its last step ended. `null` before any step started. A
+ *  start (its admission, for a step that waited for its slot) until now
+ *  while any of its steps is running or waiting, else until its last step
+ *  ended. `null` before any step started. A
  *  step's own row shows its work time; this is the phase's whole. */
 export function phaseElapsed(tasks: readonly GraphNode[], metrics: MetricsMap, now: number): PhaseElapsed | null {
   let first = 0;
@@ -154,7 +171,7 @@ export function phaseElapsed(tasks: readonly GraphNode[], metrics: MetricsMap, n
   let open = false;
   for (const s of tasks.flatMap((t) => t.steps || [])) {
     open ||= s.status === "running" || s.status === "waiting";
-    const st = stepStartMs(s, metrics[s.id]);
+    const st = phaseStartOf(s, metrics[s.id]);
     if (st) first = first ? Math.min(first, st) : st;
     last = Math.max(last, stepEndMs(s, metrics[s.id]));
   }

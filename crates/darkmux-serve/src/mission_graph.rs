@@ -181,8 +181,9 @@ pub struct StepRow {
     pub kind: String,
     /// (#3195) The step's display status, decided by [`step_display_status`]:
     /// `waiting` for a step admitted to its wave but not yet dispatching
-    /// (queued for a call slot), the scheduler's own word otherwise.
-    pub status: TaskDisplayStatus,
+    /// (queued for a call slot or its wave's model), the scheduler's own
+    /// word otherwise.
+    pub status: StepDisplayStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(type = "number", optional))]
     pub started_ts: Option<u64>,
@@ -489,12 +490,30 @@ fn derive_task_status(steps: &[(NodeStatus, Option<u64>)]) -> TaskDisplayStatus 
     TaskDisplayStatus::Planned
 }
 
-/// (#3195) A step's DISPLAY status: the task rule for a task of one step.
+/// (#3195) A step row's DISPLAY status: the scheduler's own word
+/// ([`NodeStatus`]), or `waiting` for a step admitted to its wave and still
+/// queued for its slot. Each variant serializes as its bare status word,
+/// like [`GraphNodeStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+#[serde(untagged)]
+pub enum StepDisplayStatus {
+    Shown(TaskDisplayStatus),
+    /// A word this build does not know (`NodeStatus::Unknown`), kept as
+    /// `unknown` on the wire (contract 5).
+    Node(NodeStatus),
+}
+
+/// (#3195) A step's display status: the task rule for a task of one step.
 /// `Running` with no `started_ts` is a step admitted to its wave and still
 /// queued for its slot (`Step::started_ts`'s own doc), so it reads
-/// `Waiting`; the scheduler's word stands otherwise.
-pub(crate) fn step_display_status(status: NodeStatus, started_ts: Option<u64>) -> TaskDisplayStatus {
-    derive_task_status(&[(status, started_ts)])
+/// `waiting`; the scheduler's word stands otherwise, `unknown` included.
+pub(crate) fn step_display_status(status: NodeStatus, started_ts: Option<u64>) -> StepDisplayStatus {
+    match status {
+        NodeStatus::Unknown => StepDisplayStatus::Node(status),
+        _ => StepDisplayStatus::Shown(derive_task_status(&[(status, started_ts)])),
+    }
 }
 
 /// (#2406, extended #2343) A phase's DISPLAY status — a superset of
@@ -1574,7 +1593,7 @@ pub fn build_mission_graph(
                                 id: step_id.clone(),
                                 label: resolve_step_label(&kind, step_id),
                                 kind,
-                                status: TaskDisplayStatus::Planned,
+                                status: StepDisplayStatus::Shown(TaskDisplayStatus::Planned),
                                 started_ts: None,
                                 completed_ts: None,
                                 tokens_final,
@@ -2313,6 +2332,21 @@ mod tests {
     }
 
     // ─── derive_task_status ────────────────────────────────────────────
+
+    /// (#3195) A step row's wire word: `waiting` for a step admitted but
+    /// not dispatching, the scheduler's own word otherwise, and a word this
+    /// build does not know stays `unknown` (contract 5), never `planned`.
+    #[test]
+    fn step_display_status_words() {
+        let word = |status, started| serde_json::to_value(step_display_status(status, started)).unwrap();
+        assert_eq!(word(NodeStatus::Running, None), "waiting");
+        assert_eq!(word(NodeStatus::Running, Some(1)), "running");
+        assert_eq!(word(NodeStatus::Planned, None), "planned");
+        assert_eq!(word(NodeStatus::Complete, Some(1)), "complete");
+        assert_eq!(word(NodeStatus::Error, Some(1)), "error");
+        assert_eq!(word(NodeStatus::Abandoned, None), "abandoned");
+        assert_eq!(word(NodeStatus::Unknown, None), "unknown");
+    }
 
     #[test]
     fn derive_task_status_error_wins_over_everything() {
