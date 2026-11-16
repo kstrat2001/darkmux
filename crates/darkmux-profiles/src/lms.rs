@@ -296,6 +296,9 @@ fn ls_json() -> Result<Vec<serde_json::Value>> {
 /// does not list the model.
 pub fn provenance(model_key: &str) -> Result<Option<ModelProvenance>> {
     let rows = ls_json()?;
+    // (#3401) A hub model's row names its hub key, not a folder; its
+    // variants' listing says where each variant's files are.
+    let variants = if lists_variants(&rows, model_key) { variants_json() } else { Vec::new() };
     let models_root = dirs::home_dir().map(|h| h.join(".lmstudio").join("models"));
     let runtimes = {
         let mut cmd = Command::new(lms_bin());
@@ -307,21 +310,22 @@ pub fn provenance(model_key: &str) -> Result<Option<ModelProvenance>> {
             .unwrap_or_default()
     };
     let backends = dirs::home_dir().map(|h| h.join(".lmstudio").join("extensions").join("backends"));
-    Ok(provenance_from(&rows, model_key, models_root.as_deref(), &runtimes, backends.as_deref()))
+    Ok(provenance_from(&rows, &variants, model_key, models_root.as_deref(), &runtimes, backends.as_deref()))
 }
 
 /// [`provenance`] over what it read: the test seam.
 pub(crate) fn provenance_from(
     rows: &[serde_json::Value],
+    variants: &[serde_json::Value],
     model_key: &str,
     models_root: Option<&std::path::Path>,
     runtimes: &str,
     backends_dir: Option<&std::path::Path>,
 ) -> Option<ModelProvenance> {
-    let row = rows.iter().find(|r| {
-        r.get("modelKey").and_then(|v| v.as_str()) == Some(model_key)
-            || r.get("path").and_then(|v| v.as_str()) == Some(model_key)
-    })?;
+    let listed = find_row(rows, model_key)?;
+    // The variant that runs for this key: the one it names, else the selected one.
+    let variant = variant_row(variants, chosen_variant(listed, model_key));
+    let row = variant.unwrap_or(listed);
     let format = row.get("format").and_then(|v| v.as_str()).unwrap_or_default();
     let backend = if format.to_ascii_lowercase().contains("safetensors") || format.to_ascii_lowercase().contains("mlx") {
         Some("MLX")
@@ -339,9 +343,9 @@ pub(crate) fn provenance_from(
             .or_else(|| q.get("bits").and_then(|b| b.as_u64()).map(|b| format!("{b}bit"))),
         _ => None,
     };
-    let weights_path = row
-        .get("path")
-        .and_then(|v| v.as_str())
+    let weights_path = variant
+        .and_then(variant_folder)
+        .or_else(|| listed.get("path").and_then(|v| v.as_str()))
         .zip(models_root)
         .map(|(p, root)| root.join(p));
     let runtime = backend.and_then(|b| selected_runtime(runtimes, b));
@@ -353,6 +357,66 @@ pub(crate) fn provenance_from(
         runtime,
         runtime_installed_at_ms,
     })
+}
+
+/// The `lms ls --json` row a key names: by its key, its path, or one of its
+/// variants' keys (`qwen/qwen3.8-27b@8bit`).
+fn find_row<'a>(rows: &'a [serde_json::Value], model_key: &str) -> Option<&'a serde_json::Value> {
+    rows.iter().find(|r| {
+        r.get("modelKey").and_then(|v| v.as_str()) == Some(model_key)
+            || r.get("path").and_then(|v| v.as_str()) == Some(model_key)
+            || variant_keys(r).any(|v| v == model_key)
+    })
+}
+
+fn variant_keys(row: &serde_json::Value) -> impl Iterator<Item = &str> {
+    row.get("variants").and_then(|a| a.as_array()).into_iter().flatten().filter_map(|v| v.as_str())
+}
+
+/// (#3401) Whether the key's row is a hub model with variants, whose files
+/// only `lms ls --variants --json` locates. A plain model needs no second listing.
+pub(crate) fn lists_variants(rows: &[serde_json::Value], model_key: &str) -> bool {
+    find_row(rows, model_key).is_some_and(|r| variant_keys(r).next().is_some())
+}
+
+/// The variant key that runs for `model_key`: the key itself when it names
+/// one of the row's variants, else the row's selected variant.
+fn chosen_variant<'a>(row: &'a serde_json::Value, model_key: &'a str) -> Option<&'a str> {
+    if variant_keys(row).any(|v| v == model_key) {
+        return Some(model_key);
+    }
+    row.get("selectedVariant").and_then(|v| v.as_str())
+}
+
+/// A variant's row in `lms ls --variants --json` (`[{model, variants: [..]}]`).
+fn variant_row<'a>(listing: &'a [serde_json::Value], key: Option<&str>) -> Option<&'a serde_json::Value> {
+    let key = key?;
+    listing
+        .iter()
+        .filter_map(|e| e.get("variants").and_then(|a| a.as_array()))
+        .flatten()
+        .find(|v| v.get("modelKey").and_then(|k| k.as_str()) == Some(key))
+}
+
+/// A variant's folder (or file) under the models root: its
+/// `indexedModelIdentifier` after the `@` (`qwen/qwen3.8-27b@lmstudio-community/Qwen3.8-27B-MLX-4bit`).
+fn variant_folder(variant: &serde_json::Value) -> Option<&str> {
+    let (_, folder) = variant.get("indexedModelIdentifier")?.as_str()?.split_once('@')?;
+    (!folder.is_empty()).then_some(folder)
+}
+
+/// `lms ls --variants --json`: every hub model with its variants. A failed
+/// or unreadable listing is empty: the weights then fall back to the row's
+/// path, where `lab submit` finds nothing and refuses naming `--weights-dir`.
+fn variants_json() -> Vec<serde_json::Value> {
+    let mut cmd = Command::new(lms_bin());
+    cmd.args(["ls", "--variants", "--json"]);
+    run_bounded(cmd, "ls --variants", Deadline(DEFAULT_LIST_BOUND), StdoutMode::Capture)
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| serde_json::from_str::<serde_json::Value>(&o.stdout).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
 }
 
 /// The selected runtime for a backend from `lms runtime ls`: the line that
@@ -478,17 +542,91 @@ mod tests {
             "format": "safetensors", "quantization": {"name": "4bit", "bits": 4}
         })];
         let runtimes = "LLM ENGINE                SELECTED\nmlx-llm-mac-arm64-apple-metal-advsimd@1.12.0\nmlx-llm-mac-arm64-apple-metal-advsimd@1.13.1   \u{2713}\nllama.cpp-mac-arm64-apple-metal-advsimd@1.50.0  \u{2713}\n";
-        let p = provenance_from(&rows, "qwen3-coder-30b", Some(std::path::Path::new("/m")), runtimes, Some(tmp.path())).unwrap();
+        let p = provenance_from(&rows, &[], "qwen3-coder-30b", Some(std::path::Path::new("/m")), runtimes, Some(tmp.path())).unwrap();
         assert_eq!(p.backend.as_deref(), Some("MLX"));
         assert_eq!(p.quant.as_deref(), Some("4bit"));
         assert_eq!(p.weights_path.unwrap(), std::path::Path::new("/m/lmstudio-community/Qwen3-Coder-30B-MLX-4bit"));
         assert_eq!(p.runtime.as_deref(), Some("mlx-llm 1.13.1"));
         assert!(p.runtime_installed_at_ms.is_some());
-        assert!(provenance_from(&rows, "other", None, "", None).is_none());
+        assert!(provenance_from(&rows, &[], "other", None, "", None).is_none());
         assert_eq!(selected_runtime(runtimes, "llama.cpp").as_deref(), Some("llama.cpp 1.50.0"));
         assert_eq!(selected_runtime("mlx-llm-x@1.2.0\n", "MLX"), None, "nothing selected");
         assert_eq!(selected_runtime("mlx-llm-x@1.2.0 unselected\n", "MLX"), None);
         assert_eq!(selected_runtime("mlx-llm-x@1.13.1-beta (selected)\n", "MLX").as_deref(), Some("mlx-llm 1.13.1"));
+    }
+
+    /// `lms ls --json`'s row for an LM Studio hub model and `lms ls
+    /// --variants --json`'s entry for it, shaped as a live `lms` printed them (#3401):
+    /// the row's `path` is the hub key, not a folder; each variant's
+    /// `indexedModelIdentifier` names its folder (or file) after the `@`.
+    fn hub_listing() -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        let hub = serde_json::json!({
+            "modelKey": "qwen/qwen3.8-27b", "path": "qwen/qwen3.8-27b", "indexedModelIdentifier": "qwen/qwen3.8-27b",
+            "format": "safetensors", "quantization": {"name": "4bit", "bits": 4},
+            "variants": ["qwen/qwen3.8-27b@4bit", "qwen/qwen3.8-27b@8bit"], "selectedVariant": "qwen/qwen3.8-27b@4bit"
+        });
+        let phi = serde_json::json!({
+            "modelKey": "microsoft/phi-4", "path": "microsoft/phi-4", "indexedModelIdentifier": "microsoft/phi-4",
+            "format": "gguf", "quantization": {"name": "Q4_K_M", "bits": 4},
+            "variants": ["microsoft/phi-4@q4_k_m"], "selectedVariant": "microsoft/phi-4@q4_k_m"
+        });
+        let plain = serde_json::json!({
+            "modelKey": "qwen3-0.6b", "path": "mlx-community/Qwen3-0.6B-4bit", "indexedModelIdentifier": "mlx-community/Qwen3-0.6B-4bit",
+            "format": "safetensors", "quantization": {"name": "4bit", "bits": 4}
+        });
+        let variants = vec![
+            serde_json::json!({"model": hub, "variants": [
+                {"modelKey": "qwen/qwen3.8-27b@4bit", "path": "qwen/qwen3.8-27b", "format": "safetensors",
+                 "indexedModelIdentifier": "qwen/qwen3.8-27b@lmstudio-community/Qwen3.8-27B-MLX-4bit", "quantization": {"name": "4bit", "bits": 4}},
+                {"modelKey": "qwen/qwen3.8-27b@8bit", "path": "qwen/qwen3.8-27b", "format": "safetensors",
+                 "indexedModelIdentifier": "qwen/qwen3.8-27b@lmstudio-community/Qwen3.8-27B-MLX-8bit", "quantization": {"name": "8bit", "bits": 8}}
+            ]}),
+            serde_json::json!({"model": phi, "variants": [
+                {"modelKey": "microsoft/phi-4@q4_k_m", "path": "microsoft/phi-4", "format": "gguf",
+                 "indexedModelIdentifier": "microsoft/phi-4@lmstudio-community/phi-4-GGUF/phi-4-Q4_K_M.gguf", "quantization": {"name": "Q4_K_M", "bits": 4}}
+            ]}),
+        ];
+        (vec![plain, hub, phi], variants)
+    }
+
+    /// (#3401) Every key shape LM Studio reports finds the folder its
+    /// weights are in: a plain key, a hub key (its selected variant's
+    /// folder), a variant key, and a hub model whose one variant is a file.
+    #[test]
+    fn provenance_finds_the_weights_for_every_key_shape() {
+        let (rows, variants) = hub_listing();
+        let root = std::path::Path::new("/m");
+        let at = |key: &str| provenance_from(&rows, &variants, key, Some(root), "", None).unwrap();
+        let plain = at("qwen3-0.6b");
+        assert_eq!(plain.weights_path.unwrap(), root.join("mlx-community/Qwen3-0.6B-4bit"));
+        let hub = at("qwen/qwen3.8-27b");
+        assert_eq!(hub.weights_path.unwrap(), root.join("lmstudio-community/Qwen3.8-27B-MLX-4bit"), "the selected variant's folder");
+        assert_eq!(hub.quant.as_deref(), Some("4bit"));
+        let eight = at("qwen/qwen3.8-27b@8bit");
+        assert_eq!(eight.weights_path.unwrap(), root.join("lmstudio-community/Qwen3.8-27B-MLX-8bit"), "the named variant's folder");
+        assert_eq!((eight.backend.as_deref(), eight.quant.as_deref()), (Some("MLX"), Some("8bit")), "the named variant's quant");
+        let phi = at("microsoft/phi-4");
+        assert_eq!(phi.weights_path.unwrap(), root.join("lmstudio-community/phi-4-GGUF/phi-4-Q4_K_M.gguf"));
+        assert_eq!(phi.backend.as_deref(), Some("llama.cpp"));
+    }
+
+    /// (#3401) Without a variants listing (an `lms` that has no `--variants`),
+    /// a hub key keeps the row's own path: no folder is there, so `lab
+    /// submit` refuses naming the model and `--weights-dir`. Only a row with
+    /// variants asks for the listing.
+    #[test]
+    fn a_hub_key_without_a_variants_listing_keeps_the_rows_path() {
+        let (rows, _) = hub_listing();
+        let p = provenance_from(&rows, &[], "qwen/qwen3.8-27b", Some(std::path::Path::new("/m")), "", None).unwrap();
+        assert_eq!(p.weights_path.unwrap(), std::path::Path::new("/m/qwen/qwen3.8-27b"));
+        assert!(lists_variants(&rows, "qwen/qwen3.8-27b"));
+        assert!(lists_variants(&rows, "qwen/qwen3.8-27b@8bit"));
+        assert!(!lists_variants(&rows, "qwen3-0.6b"), "a plain model needs no second listing");
+        assert!(!lists_variants(&rows, "absent"));
+        // A variant naming no folder never resolves to the models root itself.
+        let empty = vec![serde_json::json!({"variants": [{"modelKey": "qwen/qwen3.8-27b@4bit", "indexedModelIdentifier": "qwen/qwen3.8-27b@"}]})];
+        let p = provenance_from(&rows, &empty, "qwen/qwen3.8-27b", Some(std::path::Path::new("/m")), "", None).unwrap();
+        assert_eq!(p.weights_path.unwrap(), std::path::Path::new("/m/qwen/qwen3.8-27b"));
     }
 
     #[test]
@@ -498,12 +636,12 @@ mod tests {
             serde_json::json!({"modelKey": "b", "format": "MLX", "quantization": {"bits": 8}}),
             serde_json::json!({"modelKey": "c", "format": "onnx", "quantization": ""}),
         ];
-        let a = provenance_from(&rows, "x/a.gguf", None, "", None).unwrap();
+        let a = provenance_from(&rows, &[], "x/a.gguf", None, "", None).unwrap();
         assert_eq!((a.backend.as_deref(), a.quant.as_deref()), (Some("llama.cpp"), Some("Q4_K_M")), "a row is found by its path too");
         assert_eq!(a.weights_path, None, "no models root, no weights path");
-        let b = provenance_from(&rows, "b", Some(std::path::Path::new("/m")), "", None).unwrap();
+        let b = provenance_from(&rows, &[], "b", Some(std::path::Path::new("/m")), "", None).unwrap();
         assert_eq!((b.backend.as_deref(), b.quant.as_deref(), b.weights_path), (Some("MLX"), Some("8bit"), None));
-        let c = provenance_from(&rows, "c", None, "", None).unwrap();
+        let c = provenance_from(&rows, &[], "c", None, "", None).unwrap();
         assert_eq!((c.backend, c.quant, c.runtime), (None, None, None));
     }
 
