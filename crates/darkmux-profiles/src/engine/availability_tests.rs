@@ -26,14 +26,8 @@ fn tf_model(port: u16, engine_args: &str) -> ProfileModel {
     .remove(0)
 }
 
-/// A port nothing listens on.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+// A port nothing listens on, held for this test alone (#3488).
+use darkmux_types::test_ports::fixture_port as free_port;
 
 fn facts(version: &str, models: &[&str]) -> TensorfoldProbe {
     TensorfoldProbe {
