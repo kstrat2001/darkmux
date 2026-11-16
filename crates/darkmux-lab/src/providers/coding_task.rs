@@ -1570,17 +1570,42 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 /// so every write goes through `sandbox_write`, which refuses it.
 fn copy_seed_into(src: &Path, root: &Path, rel: &Path) -> Result<()> {
     for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        let to = rel.join(entry.file_name());
-        if ft.is_dir() {
-            crate::lab::sandbox_write::make_folders(root, &to)?;
-            copy_seed_into(&entry.path(), root, &to)?;
-        } else if ft.is_file() {
-            crate::lab::sandbox_write::copy_file(&entry.path(), root, &to)?;
-        }
+        seed_entry(&entry?, root, rel)?;
     }
     Ok(())
+}
+
+/// What the seed copy does with one entry of a seed folder.
+#[derive(Debug, PartialEq, Eq)]
+enum SeedStep {
+    Folder,
+    File,
+    /// A symlink (never followed, see [`copy_seed_into`]) or anything else
+    /// that is not a regular file or folder.
+    Skip,
+}
+
+/// The step for an entry of type `ft`, read from the directory entry (so a
+/// symlink is a symlink, not its target).
+fn seed_step(ft: fs::FileType) -> SeedStep {
+    if ft.is_dir() {
+        SeedStep::Folder
+    } else if ft.is_file() {
+        SeedStep::File
+    } else {
+        SeedStep::Skip
+    }
+}
+
+/// Seed one entry of a seed folder into `root/rel`.
+fn seed_entry(entry: &fs::DirEntry, root: &Path, rel: &Path) -> Result<()> {
+    let to = rel.join(entry.file_name());
+    match seed_step(entry.file_type()?) {
+        SeedStep::Folder => crate::lab::sandbox_write::make_folders(root, &to)
+            .and_then(|()| copy_seed_into(&entry.path(), root, &to)),
+        SeedStep::File => crate::lab::sandbox_write::copy_file(&entry.path(), root, &to),
+        SeedStep::Skip => Ok(()),
+    }
 }
 
 // Note: a small `pathdiff` mod used to live here for computing
@@ -2022,6 +2047,38 @@ mod tests {
         copy_dir_recursive(&src, &dst).unwrap();
         assert!(dst.exists());
         assert_eq!(fs::read_to_string(dst.join("x.txt")).unwrap(), "x");
+    }
+
+    #[test]
+    fn seed_step_reads_the_entry_not_its_target() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("d")).unwrap();
+        fs::write(tmp.path().join("f"), "").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("d"), tmp.path().join("l")).unwrap();
+        let step = |n: &str| seed_step(fs::symlink_metadata(tmp.path().join(n)).unwrap().file_type());
+        assert_eq!((step("d"), step("f"), step("l")), (SeedStep::Folder, SeedStep::File, SeedStep::Skip));
+    }
+
+    #[test]
+    fn copy_dir_recursive_refuses_a_seed_that_is_not_a_folder() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("seed"), "a file").unwrap();
+        assert!(copy_dir_recursive(&tmp.path().join("seed"), &tmp.path().join("dst")).is_err());
+    }
+
+    #[test]
+    fn copy_dir_recursive_passes_up_an_error_from_a_nested_folder() {
+        // A link the sandbox holds two folders down still stops the copy.
+        let tmp = TempDir::new().unwrap();
+        let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+        fs::create_dir_all(src.join("a/b")).unwrap();
+        fs::write(src.join("a/b/x.txt"), "seeded").unwrap();
+        fs::create_dir_all(dst.join("a/b")).unwrap();
+        fs::write(tmp.path().join("outside.txt"), "keep").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("outside.txt"), dst.join("a/b/x.txt")).unwrap();
+        let err = format!("{:#}", copy_dir_recursive(&src, &dst).unwrap_err());
+        assert!(err.contains("`a/b/x.txt`") && err.contains("symlink"), "{err}");
+        assert_eq!(fs::read_to_string(tmp.path().join("outside.txt")).unwrap(), "keep");
     }
 
     #[test]
