@@ -158,8 +158,23 @@ darkmux release.
   `crates/darkmux-serve/client-openapi.golden.json` pins the document, so a route, reply or body that
   changes shows in the diff.
 
+- **Run stats 2.4.0: the highest GPU draw of the run (#3402).** `run stats --json` adds
+  `gpu_w_max`, the highest GPU-rail watts any telemetry sample in the run window read, busy or
+  not. `None`, and listed in `host_unmeasured`, where no sample reads a GPU rail. Additive.
+
 ### Fixed
 
+- **`lab submit`'s GPU note no longer fires on background GPU use (#3402).** It said a hosted run's
+  GPU "was busy" from utilization alone, so window compositing or video (0.6 W at 60.5% duty in
+  one hosted run) tripped it. It now also needs the busy samples to draw more than 2.5 W on
+  average, and says a this-machine run's GPU "stayed idle" only when no sample drew more than that.
+  The line is measured, not guessed: on an M5 Max, background use reads under 2 W and model
+  generation 5 W and up. Still a note, never a refusal.
+- **`lab submit` takes `--weights-dir` (and `--engine`, `--quant` and the rest) beside a provider's
+  run (#3402).** The flags that describe a model apply to the one model the runs not on a
+  provider's host used; a provider's run takes none of them. Before, a submit with a hosted run
+  and one LM Studio run refused them ("describe one model; these runs used claude-haiku-5-5,
+  qwen/qwen3.8-27b"). A submit of provider runs alone still refuses them, naming each run.
 - **`GET /client/profiles` answers a query it cannot read with the coded `ClientError` (#3494).** A
   repeated `role` was axum's plain-text 400; it is now `{"error": "...", "code": "bad_request"}` like
   every other refusal. `GET /client/recipe` now names a query it cannot read the same way (still

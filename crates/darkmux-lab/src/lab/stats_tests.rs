@@ -474,6 +474,7 @@ fn power_is_averaged_over_busy_samples_only_with_a_duty_cycle() {
     assert_eq!(s.samples_busy, 2);
     assert_eq!(s.samples_idle, 2);
     assert_eq!(s.gpu_w_busy, Some(42.0), "a flat mean would read 21.0");
+    assert_eq!(s.gpu_w_max, Some(44.0), "the highest GPU draw of any sample");
     assert_eq!(s.gpu_duty_pct, Some(50.0));
     assert!(s.checks.telemetry_covers_run);
     assert_eq!(s.busy_ms, Some(50_000));
@@ -498,6 +499,31 @@ fn omarchy_telem(ts: u64, pkg_mw: u64, nand_c: f64) -> String {
             "sensors": {"temps_c": {"NAND Flash Temperature": nand_c, "Battery Hotspot": 36.8}, "fan_rpm": 1558}
         }
     }))
+}
+
+/// (#3402) The highest GPU draw counts every sample in the window, busy or
+/// not: a GPU that drew power on samples under the utilization line did
+/// work, which the busy-only mean cannot say.
+#[test]
+fn the_highest_gpu_draw_counts_samples_that_were_not_busy() {
+    let from = 1_000_000;
+    let at = |off: u64, gpu: u64, w: f64| {
+        line(serde_json::json!({
+            "action": "machine.telemetry",
+            "payload": {
+                "sampled_at_ms": from + off, "sampler_cost_ms": 1, "interval_ms": 25_000, "gpu_pct": gpu, "mem_pct": 62,
+                "thermal": {"state": "nominal", "cpu_speed_limit_pct": 100},
+                "power_mw": {"gpu": (w * 1000.0) as u64, "cpu": 5_000, "ane": 0, "total": (w * 1000.0) as u64 + 5_000}
+            }
+        }))
+    };
+    let raw = format!("{}{}", at(25_000, 12, 6.04), at(50_000, 0, 0.02));
+    let mut flows = FlowFacts::default();
+    scan_flow_lines(raw.as_bytes(), from, from + 50_000, None, &mut flows);
+    let s = derive_stats("t".into(), &run_fold("", 50_000), flows, None, None);
+    assert_eq!((s.samples_busy, s.gpu_w_busy), (0, None));
+    assert_eq!(s.gpu_w_max, Some(6.0));
+    assert!(!s.host_unmeasured.contains_key("gpu_w_max"), "{:?}", s.host_unmeasured);
 }
 
 /// (#3331) With no GPU utilization, a sample is busy when it was taken
@@ -532,7 +558,8 @@ fn a_host_with_no_gpu_figure_is_busy_inside_its_model_streams() {
     assert!(s.thermal_states_busy.is_empty());
     assert_eq!(s.board_temp_c_max_busy, Some(54.4));
     assert_eq!(s.fan_rpm_max_busy, Some(1558));
-    for field in ["gpu_duty_pct", "gpu_w_busy", "cpu_w_busy", "thermal_states_busy", "cpu_speed_limit_min"] {
+    assert_eq!(s.gpu_w_max, None);
+    for field in ["gpu_duty_pct", "gpu_w_busy", "gpu_w_max", "cpu_w_busy", "thermal_states_busy", "cpu_speed_limit_min"] {
         assert!(s.host_unmeasured.get(field).is_some_and(|r| r.starts_with("no telemetry sample")), "{field}: {:?}", s.host_unmeasured);
     }
     assert!(!s.host_unmeasured.contains_key("board_temp_c_max_busy"));

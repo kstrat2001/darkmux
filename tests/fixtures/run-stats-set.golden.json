@@ -1,7 +1,7 @@
 {
   "runs": [
     {
-      "schema_version": "2.3.0",
+      "schema_version": "2.4.0",
       "run": "run-a",
       "model": "m",
       "result": "stop",
@@ -62,6 +62,7 @@
       },
       "bounds": {},
       "gpu_w_busy": null,
+      "gpu_w_max": null,
       "cpu_w_busy": null,
       "pkg_w_busy": null,
       "gpu_duty_pct": null,
@@ -104,7 +105,7 @@
       }
     },
     {
-      "schema_version": "2.3.0",
+      "schema_version": "2.4.0",
       "run": "run-b",
       "model": "m",
       "result": "stop",
@@ -165,6 +166,7 @@
       },
       "bounds": {},
       "gpu_w_busy": null,
+      "gpu_w_max": null,
       "cpu_w_busy": null,
       "pkg_w_busy": null,
       "gpu_duty_pct": null,
@@ -295,7 +297,7 @@
   "baseline": {
     "runs": [
       {
-        "schema_version": "2.3.0",
+        "schema_version": "2.4.0",
         "run": "run-b",
         "model": "m",
         "result": "stop",
@@ -356,6 +358,7 @@
         },
         "bounds": {},
         "gpu_w_busy": null,
+        "gpu_w_max": null,
         "cpu_w_busy": null,
         "pkg_w_busy": null,
         "gpu_duty_pct": null,
