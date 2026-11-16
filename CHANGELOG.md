@@ -175,7 +175,8 @@ darkmux release.
   moved there (another filesystem) is deleted in place as before. A moved tree deeper than 128
   folders no longer refuses the clean start: it stays in `.darkmux-moved-aside` and the serve log
   says so. darkmux moves into and deletes from that folder only when it made it (a marker file
-  inside), never through a link.
+  inside), never through a link; a clean start that has to delete in place says why in the serve
+  log.
 
 ## [5.11.0] - 2026-11-14
 

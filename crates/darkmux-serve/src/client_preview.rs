@@ -800,7 +800,12 @@ pub struct Previews {
     ready_within: Duration,
     /// (#3585) The deletes clean starts left running in the background.
     cleanings: Arc<Cleanings>,
+    /// Writes a serve-log line (stderr in production; a test collects them).
+    say: Say,
 }
+
+/// Writes one serve-log line.
+pub(crate) type Say = Arc<dyn Fn(String) + Send + Sync>;
 
 /// Deletes `rel` inside the folder `root`, no link followed, giving up
 /// between entries once `go_on` says no.
@@ -1401,6 +1406,7 @@ impl Previews {
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ready_within: READY_WITHIN,
             cleanings: Arc::new(Cleanings::new(default_remover())),
+            say: Arc::new(|line| eprintln!("{line}")),
         }
     }
 
@@ -1438,12 +1444,12 @@ impl Previews {
         }
         *running += 1;
         drop(running);
-        let (deleting, stopping) = (Deleting(self.cleanings.clone()), self.stopping.clone());
+        let (deleting, stopping, say) = (Deleting(self.cleanings.clone()), self.stopping.clone(), self.say.clone());
         std::thread::spawn(move || {
             let go_on = || !stopping.load(std::sync::atomic::Ordering::SeqCst);
             for rel in &rels {
                 if let Err(why) = (deleting.0.remover)(&base, rel, &go_on) {
-                    eprintln!("{}", undeleted_line(&base.join(rel), &why));
+                    say(undeleted_line(&base.join(rel), &why));
                 }
             }
         });
@@ -1718,8 +1724,19 @@ impl Previews {
                 Ok(())
             }
             Ok(false) => Ok(()),
-            Err(_) => remove_inside(workdir, rel),
+            Err(why) => {
+                (self.say)(in_place_line(name, rel, &why));
+                remove_inside(workdir, rel)
+            }
         }
+    }
+
+    /// The same previews writing serve-log lines with `say` (a test's
+    /// collector).
+    #[cfg(test)]
+    pub(crate) fn with_say(mut self, say: Say) -> Self {
+        self.say = say;
+        self
     }
 
     /// The same previews deleting with `remover` (a test's slow one).
@@ -2163,21 +2180,46 @@ fn made_by_darkmux(base: &Path) -> bool {
         && std::fs::symlink_metadata(folder.join(CLEANING_MARKER)).is_ok_and(|m| m.is_file())
 }
 
-/// (#3585) Makes `base`'s [`CLEANING_DIR`] with its marker, or finds the
-/// one darkmux made; refused when the name is taken by anything else.
+/// (#3585) Finds the [`CLEANING_DIR`] darkmux made in `base`, or makes it
+/// with its marker. An EMPTY folder of that name without the marker (a stop
+/// between making the folder and marking it) is removed and made again;
+/// `remove_dir` never follows a link and never removes a folder holding
+/// anything, so a link, a file or a non-empty folder of that name (a
+/// mission's repo folder) is refused and left as it is. One at a time in
+/// this process, so two clean starts never remake each other's folder.
 fn make_cleaning_folder(base: &Path) -> std::io::Result<()> {
-    let folder = base.join(CLEANING_DIR);
-    match std::fs::create_dir(&folder) {
-        Ok(()) => {
-            std::fs::OpenOptions::new().write(true).create_new(true).open(folder.join(CLEANING_MARKER))?;
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e),
-    }
+    static MAKING: Mutex<()> = Mutex::new(());
+    let _one_at_a_time = MAKING.lock().unwrap_or_else(|e| e.into_inner());
     if made_by_darkmux(base) {
         return Ok(());
     }
-    Err(std::io::Error::other(format!("{} is not a folder darkmux made", folder.display())))
+    let folder = base.join(CLEANING_DIR);
+    match std::fs::remove_dir(&folder) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(std::io::Error::other(format!("{} is not a folder darkmux made ({e})", folder.display()))),
+    }
+    std::fs::create_dir(&folder)?;
+    mark_or_unmake(&folder, |f| {
+        std::fs::OpenOptions::new().write(true).create_new(true).open(f.join(CLEANING_MARKER)).map(drop)
+    })
+}
+
+/// Marks the folder darkmux just made with `mark`; when that fails the
+/// (still empty) folder is removed again, so no unmarked one is left.
+fn mark_or_unmake(folder: &Path, mark: impl FnOnce(&Path) -> std::io::Result<()>) -> std::io::Result<()> {
+    mark(folder).inspect_err(|_| {
+        let _ = std::fs::remove_dir(folder);
+    })
+}
+
+/// The serve-log line for a clean start that deletes in place (waiting in
+/// the request) because its tree could not be moved aside.
+fn in_place_line(workspace: &str, rel: &str, why: &std::io::Error) -> String {
+    format!(
+        "darkmux client serve: preview {workspace}: deleting {rel} in place, inside the clean start's request, \
+         because it could not be moved aside: {why}"
+    )
 }
 
 /// Moves `rel` in `workdir` to `to_name` in `base`'s [`CLEANING_DIR`] in
@@ -3866,14 +3908,64 @@ mod tests {
         let theirs = base.join(CLEANING_DIR);
         std::fs::create_dir_all(theirs.join("phase-1")).unwrap();
         std::fs::write(theirs.join("phase-1/live.txt"), "work").unwrap();
+        let (lines, say) = collected();
         let (previews, _emu) = emulated(dir.path());
+        let previews = previews.with_say(say);
         assert!(previews.reap_cleanings(&base).is_empty(), "nothing of darkmux's to reap");
         assert_eq!(previews.wait_cleanings(Instant::now() + Duration::from_secs(5)), 0);
         assert!(theirs.join("phase-1/live.txt").exists(), "the reap deleted a folder it did not make");
         let source = a_checkout_with_the_recipe_of(&wt, dir.path());
         previews.clean("w", &wt, &source).unwrap();
         assert_eq!(moved_aside(&base), ["phase-1"], "a clean start moved into a folder it did not make");
+        assert!(theirs.join("phase-1/live.txt").exists(), "a folder it did not make was touched");
         assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err(), "deleted in place");
+        let said = lines.lock().unwrap().clone();
+        assert!(
+            said.len() == 1 && said[0].contains("in place") && said[0].contains("not a folder darkmux made"),
+            "the in-place delete is said, with why: {said:?}"
+        );
+    }
+
+    /// A serve-log collector: the lines and the `say` that fills them.
+    fn collected() -> (Arc<Mutex<Vec<String>>>, Say) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let into = lines.clone();
+        (lines, Arc::new(move |line| into.lock().unwrap().push(line)))
+    }
+
+    /// (#3585 re-review) An empty moved-aside folder without its marker (a
+    /// stop between making the folder and marking it) is made again: the
+    /// next clean start moves its tree aside instead of deleting it in the
+    /// request.
+    #[test]
+    fn an_empty_unmarked_moved_aside_folder_is_made_again_and_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let wt = an_installed_workspace(dir.path(), "true");
+        std::fs::create_dir_all(base.join(CLEANING_DIR)).unwrap();
+        let source = a_checkout_with_the_recipe_of(&wt, dir.path());
+        let (remover, release) = a_held_remover();
+        let (lines, say) = collected();
+        let (previews, _emu) = emulated(dir.path());
+        let previews = previews.with_remover(remover).with_say(say);
+        previews.clean("w", &wt, &source).unwrap();
+        assert_eq!(moved_aside(&base).len(), 1, "deleted in the request instead: {:?}", lines.lock().unwrap());
+        assert!(made_by_darkmux(&base), "marked");
+        assert!(lines.lock().unwrap().is_empty(), "{:?}", lines.lock().unwrap());
+        drop(release);
+        assert_eq!(previews.wait_cleanings(Instant::now() + Duration::from_secs(5)), 0);
+    }
+
+    /// (#3585 re-review) A folder darkmux made but could not mark is
+    /// removed again, so no unmarked folder is left behind.
+    #[test]
+    fn a_folder_that_could_not_be_marked_is_removed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join(CLEANING_DIR);
+        std::fs::create_dir(&folder).unwrap();
+        let out = mark_or_unmake(&folder, |_| Err(std::io::Error::other("disk full")));
+        assert!(out.is_err());
+        assert!(std::fs::symlink_metadata(&folder).is_err(), "the unmarked folder was left");
     }
 
     /// (#3585) A clean start once `client serve` began to stop is refused
