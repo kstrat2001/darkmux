@@ -50,6 +50,15 @@ pub const CONNECT_BOUND: Duration = Duration::from_secs(10);
 /// How long unpacking may take.
 const UNPACK_BOUND: Duration = Duration::from_secs(300);
 
+/// What the download's process gets past [`DOWNLOAD_BOUND`] to end on its
+/// own before it is killed.
+const DOWNLOAD_GRACE: Duration = Duration::from_secs(30);
+
+/// (#3429) The longest one runtime's first-use install may take: the
+/// download, its grace, and the unpack.
+pub const INSTALL_BOUND: Duration =
+    Duration::from_secs(DOWNLOAD_BOUND.as_secs() + DOWNLOAD_GRACE.as_secs() + UNPACK_BOUND.as_secs());
+
 /// A staging folder older than this is a crashed install's, never a live
 /// one's (a live install ends within [`DOWNLOAD_BOUND`] plus the unpack).
 pub const STALE_PARTIAL: Duration = Duration::from_secs(24 * 3600);
@@ -410,7 +419,7 @@ fn download(url: &str, to: &Path) -> Result<(), String> {
     let cmd = download_command(url, to);
     let fix = "Nothing was installed. Check that this machine reaches the download's host (behind a proxy, set \
                `https_proxy`) and run again";
-    match run_bounded(cmd, DOWNLOAD_BOUND + Duration::from_secs(30)) {
+    match run_bounded(cmd, DOWNLOAD_BOUND + DOWNLOAD_GRACE) {
         Bounded::Finished { success: true, .. } => Ok(()),
         Bounded::Finished { stderr, .. } => Err(format!(
             "could not download {url}: {}. {fix}",
