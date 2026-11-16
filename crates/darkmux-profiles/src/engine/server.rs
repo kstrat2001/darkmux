@@ -1168,7 +1168,7 @@ S(("127.0.0.1", port), H).serve_forever()
     }
 
     // A port held for this test alone (#3488).
-    use crate::test_ports::free_port;
+    use darkmux_types::test_ports::fixture_port as free_port;
 
     fn spec(f: &Fixture, endpoint: &str, model: &str, port: u16, extra: &[&str]) -> ServerSpec {
         let served_name = format!("darkmux:{model}");

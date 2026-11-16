@@ -27,7 +27,7 @@ fn tf_model(port: u16, engine_args: &str) -> ProfileModel {
 }
 
 // A port nothing listens on, held for this test alone (#3488).
-use crate::test_ports::free_port;
+use darkmux_types::test_ports::fixture_port as free_port;
 
 fn facts(version: &str, models: &[&str]) -> TensorfoldProbe {
     TensorfoldProbe {
