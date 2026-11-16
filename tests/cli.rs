@@ -12,6 +12,30 @@ use std::collections::BTreeMap;
 use std::fs;
 use tempfile::TempDir;
 
+#[path = "e2e/fixture_port.rs"]
+mod fixture_port;
+
+/// (#2898) A port for a daemon this file spawns (`serve`, `client serve`)
+/// to bind. Chosen here and bound by the child a moment later, so it must
+/// not be an OS ephemeral port: in that gap any `bind(0)` or outgoing
+/// connection's source port can take one, and the child then exits with
+/// "Address already in use". From the fleet harness's allocator.
+fn daemon_port() -> u16 {
+    fixture_port::pick_fixture_port().expect("a free fixture port")
+}
+
+#[test]
+fn every_port_handed_to_a_spawned_daemon_is_outside_the_os_ephemeral_range() {
+    let ephemeral = fixture_port::os_ephemeral_range().expect("reading the OS ephemeral port range");
+    for _ in 0..8 {
+        let port = daemon_port();
+        assert!(
+            !ephemeral.contains(&port),
+            "port {port} is in the OS ephemeral range {ephemeral:?}: a bind(0) or an outgoing connection can take it before the daemon binds"
+        );
+    }
+}
+
 // ===== DARKMUX-SPAWN-HELPERS: BEGIN (#2184) ==========================
 //
 // The only place this file names the darkmux binary. Every child process
@@ -4846,12 +4870,8 @@ fn spawn_fleet_daemon(profiles_json: &str, nofile: Option<u64>) -> Option<FleetD
         docker_shim_dir().display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let free_port = || {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port");
-        l.local_addr().unwrap().port()
-    };
-    let serve_port = free_port();
-    let fleet_port = free_port();
+    let serve_port = daemon_port();
+    let fleet_port = daemon_port();
     let mut cmd = darkmux_std_cmd();
     cmd.env("HOME", &home)
         .env("DARKMUX_HOME", &darkmux_home)
@@ -4907,10 +4927,7 @@ fn serve_raises_its_open_file_soft_limit_at_start() {
         return;
     }
     let (home, darkmux_home) = isolated_roots();
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     let mut cmd = darkmux_std_cmd();
     cmd.env("HOME", &home)
         .env("DARKMUX_HOME", &darkmux_home)
@@ -4946,10 +4963,7 @@ fn serve_raises_its_open_file_soft_limit_at_start() {
 /// its environment only) and passes, and a clean shutdown removes the record.
 #[test]
 fn a_daemon_started_with_a_port_flag_is_found_by_doctor_and_unrecorded_on_exit() {
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     assert_ne!(port, 8765, "the test needs a port the built-in default does not name");
     let mut cmd = darkmux_std_cmd();
     let env_of = |cmd: &std::process::Command, key: &str| {
@@ -15260,10 +15274,7 @@ fn flow_status_withholds_its_directories_from_a_remote_viewer() {
 /// pointer is spelled the same.
 #[test]
 fn every_console_panel_serves_a_remote_viewer_redacted_and_this_machine_in_full() {
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     let mut cmd = darkmux_std_cmd();
     console_env(&mut cmd);
     let home = spawn_env(&cmd, "HOME");
@@ -15886,10 +15897,7 @@ fn profile_list_machine_names_an_unknown_peer() {
 #[test]
 fn client_serve_shuts_down_cleanly_on_sigterm_sighup_and_sigint() {
     for (signal, name) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGHUP, "SIGHUP"), (libc::SIGINT, "SIGINT")] {
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
+        let port = daemon_port();
         let log = tempfile::NamedTempFile::new().unwrap();
         let mut cmd = darkmux_std_cmd();
         cmd.args(["client", "serve", "--port", &port.to_string()])
@@ -15964,10 +15972,7 @@ const FAKE_TAILNET_OPERATOR: &str =
 #[test]
 fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed_ones() {
     let tmp = TempDir::new().unwrap();
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     let home = tmp.path().join("darkmux-home");
     fs::create_dir_all(&home).unwrap();
     let fake = fake_tailnet_tool(&tmp.path().join("fake"), &home, port);
@@ -16132,10 +16137,7 @@ fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed
 #[test]
 fn a_signal_while_client_serve_is_starting_still_runs_its_cleanup() {
     let tmp = TempDir::new().unwrap();
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     let home = tmp.path().join("darkmux-home");
     fs::create_dir_all(&home).unwrap();
     let fake = fake_tailnet_tool(&tmp.path().join("fake"), &home, port);
@@ -16178,10 +16180,7 @@ fn a_signal_while_client_serve_is_starting_still_runs_its_cleanup() {
 /// Spawns `client serve` on an isolated HOME and its own port; returns the
 /// child, its port and its stderr log once it listens.
 fn a_listening_client_serve() -> (DirectChildGuard, u16, tempfile::NamedTempFile) {
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     let log = tempfile::NamedTempFile::new().unwrap();
     let mut cmd = darkmux_std_cmd();
     cmd.args(["client", "serve", "--port", &port.to_string()])
