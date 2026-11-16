@@ -523,7 +523,8 @@ pub fn tensorfold_bin() -> String {
 const TENSORFOLD_BIN: &str = "tensorfold-native";
 
 /// (#3453) rec, the command darkmux asks about the Flint engine it starts
-/// servers for (`rec --version`, `rec status`),
+/// servers for (`rec --version`, `rec status`, and `rec auth token` when a
+/// dispatch uses rec's own server, #3574),
 /// `env(DARKMUX_FLINT_BIN) > config.engines.flint.bin > "rec"` (a `PATH`
 /// lookup), and which tier resolved it. Anchored like
 /// [`tensorfold_bin_with_source`]. The server darkmux runs is rec's own

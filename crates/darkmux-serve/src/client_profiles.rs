@@ -32,9 +32,10 @@ pub struct ClientProfileInfo {
     /// `url` (an unmanaged server darkmux only sends to) or the managed
     /// backend's name (`lmstudio`, `tensorfold`, `flint`).
     pub endpoint: String,
-    /// For a managed model (LM Studio, a server darkmux starts), darkmux can
-    /// make it resident now: its `availability` is `resident` or
-    /// `startable`. For a URL server, it answered just now.
+    /// For a managed model (LM Studio, a server darkmux starts), a dispatch
+    /// can run on it now: its `availability` is `resident` or `startable`,
+    /// or `external` for a Flint model rec's own server already serves
+    /// (#3574). For a URL server, it answered just now.
     pub reachable: bool,
     /// The model is loaded and serving (`None`: couldn't tell).
     pub loaded: Option<bool>,
@@ -169,20 +170,25 @@ fn describe(
     lmstudio_loaded: Option<&Vec<darkmux_types::LoadedModel>>,
     availability: Availability,
 ) -> ClientProfileInfo {
-    // A managed model is reachable only when darkmux can make it resident
-    // now, one rule for every engine: an app that picks the first profile
-    // that answers must not pick one a dispatch would refuse (an engine
-    // that answered but lacks the model, an unverified engine).
+    // A managed model is reachable only when a dispatch can run on it now,
+    // one rule for every engine: an app that picks the first profile that
+    // answers must not pick one a dispatch would refuse (an engine that
+    // answered but lacks the model, an unverified engine). (#3574) A managed
+    // model reads `external` only when rec's own server serves it, where a
+    // dispatch goes.
     let can_run = matches!(
         availability.state,
-        AvailabilityState::Resident | AvailabilityState::Startable
+        AvailabilityState::Resident | AvailabilityState::Startable | AvailabilityState::External
     );
     let (endpoint, reachable, loaded) = match (s.managed, &s.url) {
-        // An engine server darkmux starts: `loaded` is its availability.
+        // An engine server darkmux starts: `loaded` is its availability,
+        // served now by darkmux's server or (#3574) rec's own.
         (Some(backend), _) if EndpointKind::Managed(backend).starts_servers() => {
             let state = availability.state;
-            let here = (state != AvailabilityState::Unknown)
-                .then_some(state == AvailabilityState::Resident);
+            let here = (state != AvailabilityState::Unknown).then_some(matches!(
+                state,
+                AvailabilityState::Resident | AvailabilityState::External
+            ));
             (backend.token(), can_run, here)
         }
         // The managed backend that reports its residents (LM Studio): its

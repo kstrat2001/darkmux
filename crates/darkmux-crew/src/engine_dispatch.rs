@@ -7,8 +7,13 @@
 //!
 //! 1. The engine is installed at a release darkmux was verified against, or
 //!    the dispatch fails `engine_unavailable`. A server the engine started
-//!    itself (rec's own, which holds rec's single-instance lock) fails it
-//!    `engine_in_use`: darkmux never stops or takes over one.
+//!    itself (rec's own, which holds rec's single-instance lock) is used as
+//!    an external engine when it already serves the model, and nothing below
+//!    happens; otherwise it fails the dispatch `engine_in_use`. darkmux never
+//!    stops or takes over one. That is decided once, before the dispatch's
+//!    `dispatch.start` ([`decide_own`], contract 4 in
+//!    `docs/agents/CONTRACTS.md`), so its records, its request and its
+//!    refusal all name the same server.
 //!    A Tensorfold model's `engine_args` are checked against the installed
 //!    engine's own flags first, as doctor and a listing check them, and
 //!    refused `model_start_failed` before anything starts.
@@ -285,6 +290,133 @@ pub const QUEUED_EVERY: Duration = Duration::from_secs(20);
 /// short), so it is not a tight loop.
 const QUEUE_RETRY: Duration = Duration::from_secs(5);
 
+/// (#3574) What rec's own server means for one dispatch, decided once by
+/// [`decide_own`] before its `dispatch.start`: the dispatch's records and
+/// request go where it says ([`OwnRoute::routed`], [`OwnRoute::auth`]), and
+/// [`prepare`] ends with it rather than asking again.
+#[derive(Debug, Default)]
+pub enum OwnRoute {
+    /// rec's own server has no bearing: darkmux's own server serves.
+    #[default]
+    Free,
+    /// rec's own server serves the model: an external engine, with no
+    /// engine record, lease or reservation, and no memory budget.
+    Reuse(RecsOwnServer),
+    /// The dispatch is refused, after its `dispatch.start`.
+    Refused(EngineRefusal),
+}
+
+/// (#3574) rec's own server as a dispatch sends to it: its chat URL and
+/// rec's local key. The key never prints (`Debug` leaves it out).
+pub struct RecsOwnServer {
+    pub chat_url: String,
+    key: String,
+}
+
+impl std::fmt::Debug for RecsOwnServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecsOwnServer").field("chat_url", &self.chat_url).finish_non_exhaustive()
+    }
+}
+
+impl RecsOwnServer {
+    pub(crate) fn new(chat_url: String, key: String) -> Self {
+        Self { chat_url, key }
+    }
+
+    /// The header rec's server asks of every request.
+    pub fn auth_header(&self) -> (String, String) {
+        ("Authorization".to_string(), format!("Bearer {}", self.key))
+    }
+}
+
+impl OwnRoute {
+    /// `target` as the dispatch sends to it: its `chat_url` rec's own
+    /// server's when that is reused, so the request and every record's route
+    /// label (`Target::route_label`) name that server.
+    pub fn routed(&self, target: &crate::target::Target) -> crate::target::Target {
+        let mut routed = target.clone();
+        if let OwnRoute::Reuse(own) = self {
+            routed.chat_url = own.chat_url.clone();
+        }
+        routed
+    }
+
+    /// The auth header the dispatch sends: rec's key when its server is
+    /// reused, else `theirs` (the endpoint's own).
+    pub fn auth(&self, theirs: Option<(String, String)>) -> Option<(String, String)> {
+        match self {
+            OwnRoute::Reuse(own) => Some(own.auth_header()),
+            _ => theirs,
+        }
+    }
+
+    /// How [`prepare`] ends when this decided it: nothing to make resident
+    /// for a reuse, the refusal for a refusal; `None` to go on.
+    fn settled(&self) -> Option<Result<(), NotResident>> {
+        match self {
+            OwnRoute::Free => None,
+            OwnRoute::Reuse(_) => Some(Ok(())),
+            OwnRoute::Refused(r) => Some(Err(NotResident::Refused(r.clone()))),
+        }
+    }
+
+    /// Say on the CLI where a reused dispatch goes.
+    fn announced(self) -> Self {
+        if let OwnRoute::Reuse(own) = &self {
+            darkmux_types::diag_eprintln!(
+                "darkmux dispatch: rec's own server already serves this model; sending to {} (darkmux does not manage it)",
+                own.chat_url
+            );
+        }
+        self
+    }
+}
+
+/// (#3574) What rec's own server means for a dispatch of `target` in
+/// `session`: [`OwnRoute::Free`] for any model not on Flint, else
+/// [`decide_own_with`] against rec's install, a lab session never reusing.
+pub fn decide_own(target: &crate::target::Target, session: &darkmux_types::session_id::SessionId) -> OwnRoute {
+    if target.kind != EndpointKind::Managed(ManagedBackend::Flint) {
+        return OwnRoute::Free;
+    }
+    let lab = darkmux_flow::is_lab_session(Some(&session.wire()));
+    decide_own_with(target, &Dirs::under_home(), &Rec::installed(), lab).announced()
+}
+
+/// [`decide_own`] against the directories and engine it is given. An
+/// engine darkmux cannot plan for is left `Free`, for [`prepare`] to refuse
+/// after `dispatch.start` as it always has. Otherwise the one decision
+/// ([`flint::own_server_use`], made a refusal for a lab run:
+/// [`flint::OwnServerUse::for_lab`]), with rec's key read for a reuse.
+pub(crate) fn decide_own_with(target: &crate::target::Target, dirs: &Dirs, engine: &dyn ServerEngine, lab: bool) -> OwnRoute {
+    let endpoint = target.endpoint.named_id().unwrap_or_default().to_string();
+    if engine.plan(&endpoint, target.endpoint.port.unwrap_or_default(), &target.model).is_err() {
+        return OwnRoute::Free;
+    }
+    let own = match engine.own_server() {
+        Ok(own) => own,
+        Err(refusal) => return OwnRoute::Refused(refusal),
+    };
+    let decided = flint::own_server_use(own.as_ref(), &target.model, server::running(dirs, &endpoint).as_ref());
+    own_route(if lab { decided.for_lab() } else { decided }, engine)
+}
+
+/// The route a decision gives, rec's key read for a reuse
+/// (`engine_unavailable` when it cannot be).
+fn own_route(decided: flint::OwnServerUse, engine: &dyn ServerEngine) -> OwnRoute {
+    match decided {
+        flint::OwnServerUse::Free => OwnRoute::Free,
+        flint::OwnServerUse::Reuse { chat_url } => match engine.own_server_key() {
+            Ok(key) => OwnRoute::Reuse(RecsOwnServer::new(chat_url, key)),
+            Err(refusal) => OwnRoute::Refused(refusal),
+        },
+        flint::OwnServerUse::Refuse { address, why, remedy } => {
+            OwnRoute::Refused(refuse(ClientCode::EngineInUse, flint::own_server_refusal(&address, &why, remedy)))
+        }
+    }
+}
+
 /// The model resident and answering; holds the dispatch's lease on it.
 pub struct EngineReady {
     pub record: EngineRecord,
@@ -307,9 +439,12 @@ pub(crate) trait ServerEngine {
     /// (the engine's own conservative figure), or `None` when the engine's
     /// install gives nothing to price it from.
     fn memory_need(&self, model: &darkmux_types::ProfileModel) -> Option<u64>;
-    /// The address of a server the engine started itself (not darkmux),
+    /// What the engine says of a server it started itself (not darkmux),
     /// when one is up and it allows only one.
-    fn own_server(&self) -> Result<Option<String>, EngineRefusal>;
+    fn own_server(&self) -> Result<Option<flint::OwnServer>, EngineRefusal>;
+    /// (#3574) The key that server asks of a request, read only when a
+    /// dispatch reuses it, and never logged.
+    fn own_server_key(&self) -> Result<String, EngineRefusal>;
 }
 
 fn unavailable(e: anyhow::Error) -> EngineRefusal {
@@ -335,8 +470,12 @@ impl ServerEngine for Tensorfold {
         Some(tensorfold::conservative_commitment(info, n_ctx, tensorfold::has_drafter(&model.engine_args)))
     }
     /// Tensorfold runs as many servers as it is asked for.
-    fn own_server(&self) -> Result<Option<String>, EngineRefusal> {
+    fn own_server(&self) -> Result<Option<flint::OwnServer>, EngineRefusal> {
         Ok(None)
+    }
+    /// Never asked: Tensorfold has no server of its own to reuse.
+    fn own_server_key(&self) -> Result<String, EngineRefusal> {
+        Err(refuse(ClientCode::EngineUnavailable, "Tensorfold has no server of its own"))
     }
 }
 
@@ -353,8 +492,12 @@ impl ServerEngine for Rec {
         let weights = self.model_dir(&model.id).ok().and_then(|d| flint::weights_bytes(&d))?;
         Some(flint::conservative_commitment(weights, model.require_n_ctx().ok()?))
     }
-    fn own_server(&self) -> Result<Option<String>, EngineRefusal> {
+    fn own_server(&self) -> Result<Option<flint::OwnServer>, EngineRefusal> {
         Rec::own_server(self).map_err(unavailable)
+    }
+    /// `rec auth token`; a failure names the command, never what it printed.
+    fn own_server_key(&self) -> Result<String, EngineRefusal> {
+        self.auth_token().map_err(unavailable)
     }
 }
 
@@ -407,12 +550,17 @@ pub(crate) fn take_refusal(session: &darkmux_types::session_id::SessionId) -> Op
 }
 
 /// Make `target`'s model resident on its engine server, a `busy` model
-/// waiting as `wait` says. See the module doc.
+/// waiting as `wait` says; `None` when rec's own server serves it, as `own`
+/// (decided before `dispatch.start`) says. See the module doc.
 pub fn prepare(
     target: &crate::target::Target,
+    own: &OwnRoute,
     wait: &BusyWait<'_>,
     note: &mut dyn FnMut(Note, DispatchModelPayload),
-) -> Result<EngineReady, NotResident> {
+) -> Result<Option<EngineReady>, NotResident> {
+    if let Some(settled) = own.settled() {
+        return settled.map(|()| None);
+    }
     let (dirs, bounds) = (Dirs::under_home(), server::Bounds::default());
     let engine: Box<dyn ServerEngine> = match target.kind {
         EndpointKind::Managed(ManagedBackend::Tensorfold) => Box::new(Tensorfold::installed()),
@@ -429,6 +577,7 @@ pub fn prepare(
             wait_while_busy(wait, env, &base, &mut attempt, note)
         })
     })
+    .map(Some)
 }
 
 #[cfg(test)]
@@ -743,28 +892,14 @@ pub(crate) fn prepare_with(
     let endpoint = target.endpoint.named_id().unwrap_or_default().to_string();
     let port = target.endpoint.port.unwrap_or_default();
     let spec = engine.plan(&endpoint, port, &target.model)?;
-    refuse_engines_own_server(engine, dirs, &endpoint)?;
+    refuse_engines_own_server(engine, dirs, &endpoint, &target.model)?;
     // (#3504) No lease is written until this dispatch has decided to run:
     // a dispatch that turns out `busy`, and so may queue, holds nothing
     // another dispatch would read as held (every Flint server answers
     // `flint`, so a waiter's lease would pin them all).
     let lease = LeaseGuard::acquire();
     let start = Start { spec: &spec, need: engine.memory_need(&target.model), dirs, bounds, machine, lease: &lease, patience };
-    // A reuse decides nothing about memory and takes no residency lock.
-    // (#3511) It is decided under the endpoint's lock and never starts
-    // anything: a server judged reusable and then lost (an evictor stopped it
-    // in between) is started below, through the memory decision.
-    if server::running(dirs, &endpoint).is_some_and(|r| r.argv == spec.argv) {
-        write_lease(&lease, &spec.served_name)?;
-        let endpoint_lock = start.endpoint_lock(note)?;
-        if let Some(record) = start.reuse(&endpoint_lock)? {
-            drop(endpoint_lock);
-            let _ = lease.mark_loaded(std::slice::from_ref(&spec.served_name));
-            return Ok(EngineReady { record, started: false, _lease: lease });
-        }
-    }
-    let (record, started) = start.server(note)?;
-    let _ = lease.mark_loaded(std::slice::from_ref(&spec.served_name));
+    let (record, started) = start.darkmuxs(&endpoint, note)?;
     Ok(EngineReady { record, started, _lease: lease })
 }
 
@@ -780,6 +915,30 @@ struct Start<'a> {
 }
 
 impl Start<'_> {
+    /// darkmux's own server for the model on `endpoint`, reused or started:
+    /// the record, and whether this dispatch started it. The lease names the
+    /// served model once it answers.
+    ///
+    /// A reuse decides nothing about memory and takes no residency lock.
+    /// (#3511) It is decided under the endpoint's lock and never starts
+    /// anything: a server judged reusable and then lost (an evictor stopped
+    /// it in between) is started below, through the memory decision.
+    fn darkmuxs(&self, endpoint: &str, note: &mut dyn FnMut(Note, DispatchModelPayload)) -> Result<(EngineRecord, bool), NotResident> {
+        let served = std::slice::from_ref(&self.spec.served_name);
+        if server::running(self.dirs, endpoint).is_some_and(|r| r.argv == self.spec.argv) {
+            write_lease(self.lease, &self.spec.served_name)?;
+            let endpoint_lock = self.endpoint_lock(note)?;
+            if let Some(record) = self.reuse(&endpoint_lock)? {
+                drop(endpoint_lock);
+                let _ = self.lease.mark_loaded(served);
+                return Ok((record, false));
+            }
+        }
+        let (record, started) = self.server(note)?;
+        let _ = self.lease.mark_loaded(served);
+        Ok((record, started))
+    }
+
     /// Start the server, or reuse the one another dispatch started
     /// meanwhile: the record, and whether this dispatch started it. (#3509)
     /// Decided under both the machine-wide residency lock and the endpoint's
@@ -1022,18 +1181,29 @@ fn held_now(machine: &dyn Machine, lease: &LeaseGuard) -> Vec<String> {
     held
 }
 
-/// (#3453) Refuse `engine_in_use` when the engine's own server (one darkmux
-/// did not start) is up: rec holds a single-instance lock, and darkmux never
-/// stops or takes it over. The server darkmux itself runs on this endpoint
-/// is not that one when the engine names its port and darkmux's recorded
-/// server is what listens there (`server::listens`, #3453 review): a name
-/// or a port alone proves nothing.
-fn refuse_engines_own_server(engine: &dyn ServerEngine, dirs: &Dirs, endpoint: &str) -> Result<(), EngineRefusal> {
-    let Some(address) = engine.own_server()? else { return Ok(()) };
-    if flint::own_server_is_darkmuxs(&address, server::running(dirs, endpoint).as_ref()) {
-        return Ok(());
-    }
-    Err(refuse(ClientCode::EngineInUse, flint::own_server_refusal(&address)))
+/// (#3453, #3574) Refuse `engine_in_use` when the engine's own server (one
+/// darkmux did not start) is up, judged by [`flint::own_server_use`]: rec
+/// holds a single-instance lock, and darkmux never stops or takes it over.
+/// The server darkmux itself runs on this endpoint is not that one (its port
+/// and darkmux's recorded server listening there, #3453 review). A dispatch
+/// that uses rec's own server never gets here ([`decide_own`]); one that
+/// finds it serving the model now, after deciding otherwise (it came up
+/// while the dispatch waited), is refused to dispatch again.
+fn refuse_engines_own_server(
+    engine: &dyn ServerEngine,
+    dirs: &Dirs,
+    endpoint: &str,
+    model: &darkmux_types::ProfileModel,
+) -> Result<(), EngineRefusal> {
+    let own = engine.own_server()?;
+    let (address, why, remedy) = match flint::own_server_use(own.as_ref(), model, server::running(dirs, endpoint).as_ref()) {
+        flint::OwnServerUse::Free => return Ok(()),
+        flint::OwnServerUse::Reuse { chat_url } => {
+            (chat_url, "came up serving this model after this dispatch began".to_string(), flint::Remedy::DispatchAgain)
+        }
+        flint::OwnServerUse::Refuse { address, why, remedy } => (address, why, remedy),
+    };
+    Err(refuse(ClientCode::EngineInUse, flint::own_server_refusal(&address, &why, remedy)))
 }
 
 

@@ -34,9 +34,13 @@
 //!
 //! Flint is `startable` only when rec is the verified release with exactly
 //! one runtime and one model directory for the revision (the adapter's own
-//! checks), the port is free, and rec's own server is not running: rec runs
-//! one server per machine, so its own server reads `unavailable` with the
-//! refusal a dispatch gives (`engine_in_use`, naming `rec stop`).
+//! checks), the port is free, and rec's own server is not running. rec runs
+//! one server per machine, so its own server decides as a dispatch decides
+//! (`flint::own_server_use`, contract 4): `external` when it serves the
+//! model and `rec auth token` gives the key a dispatch sends (asked only
+//! then, the key dropped at once), else `unavailable` with the dispatch's
+//! refusal (`engine_in_use` with the remedy that fits, or
+//! `engine_unavailable` for the key).
 //!
 //! `unknown` is a probe that could not run or ran out of time (LM Studio not
 //! running, a listing that failed once the engine answered). A Tensorfold
@@ -50,9 +54,9 @@
 //! engine, an install rec's adapter cannot read, a model LM Studio has not
 //! downloaded), `model_start_failed` (`engine_args` the engine does not take,
 //! a model Tensorfold does not list), `port_in_use`, and `engine_in_use`
-//! (rec's own server). A registry problem a dispatch refuses before any
-//! engine is asked (no `n_ctx`, no `port`, an endpoint that does not
-//! resolve, a refused user file) carries none.
+//! (rec's own server, serving another model). A registry problem a
+//! dispatch refuses before any engine is asked (no `n_ctx`, no `port`, an
+//! endpoint that does not resolve, a refused user file) carries none.
 //!
 //! Whether a model FITS in memory right now is not availability: that changes
 //! with every dispatch, and `dispatch --check`'s `fit` answers it.
@@ -94,7 +98,9 @@ pub enum AvailabilityState {
     Startable,
     /// darkmux cannot make it resident; the reason says why.
     Unavailable,
-    /// An endpoint darkmux only sends requests to.
+    /// An endpoint darkmux only sends requests to; (#3574) also a Flint
+    /// model rec's own server already serves, which a dispatch uses without
+    /// darkmux managing it.
     External,
     /// A probe failed or ran out of time; the reason names which. Never read
     /// as `unavailable`. (#3450) Also a state a newer darkmux states that
@@ -114,8 +120,8 @@ pub struct Availability {
     /// (#3574) Why, for an app to branch on: the code a dispatch refusing
     /// for the same reason carries (`dispatch.error`'s `payload.code`, the
     /// client API's `ClientCode` spelling), so there is one vocabulary:
-    /// `engine_in_use` while rec's own server runs, `engine_unavailable`,
-    /// `port_in_use`, `model_start_failed`.
+    /// `engine_in_use` while rec's own server runs and does not serve the
+    /// model, `engine_unavailable`, `port_in_use`, `model_start_failed`.
     /// Absent when no dispatch refusal fits (a registry problem a dispatch
     /// refuses before any engine is asked, a state that is not
     /// `unavailable`). Additive (card schema 1.5): an older reader ignores
@@ -580,8 +586,13 @@ pub struct FlintAnswer {
     pub rec: super::flint::Rec,
     /// The verified version, or why not (missing, unreadable, unverified).
     pub version: Result<String, String>,
-    /// The endpoint rec's own server serves, when it is up or starting.
-    pub own_server: Result<Option<String>, String>,
+    /// What `rec status` says of rec's own server, when it is up or
+    /// starting.
+    pub own_server: Result<Option<super::flint::OwnServer>, String>,
+    /// (#3574) Whether `rec auth token` gave a key, asked only while rec's
+    /// own server is up: a dispatch that would use that server needs it.
+    /// The key itself is dropped at once, never kept. `None`: not asked.
+    pub key: Option<Result<(), String>>,
     pub dirs: Dirs,
 }
 
@@ -610,57 +621,100 @@ impl FlintAnswer {
                     .unwrap_or_else(|_| Err("`rec status` panicked".into())),
             )
         });
+        // Asked after `rec status`, and only while rec's own server is up.
+        let key = matches!(own_server, Ok(Some(_))).then(|| {
+            crate::gestalt_host::lms_host::with_deadline_cap(cap, || rec.auth_token().map(drop).map_err(msg))
+        });
         FlintAnswer {
             rec,
             version,
             own_server,
+            key,
             dirs,
         }
     }
 
-    /// Why rec itself cannot serve now (`None`: it can): an unverified or
-    /// silent rec, its own server up (`engine_in_use`), or `rec status`
-    /// that could not say (`unknown`).
-    fn rec_problem(
+    /// What rec itself says of the model before darkmux's own server is
+    /// looked at (`None`: nothing, so darkmux's server decides): an
+    /// unverified or silent rec, then what its own server means for the
+    /// model ([`Self::own_server_verdict`]).
+    fn rec_verdict(
         &self,
+        model: &ProfileModel,
         darkmuxs: Option<&darkmux_types::engine_record::EngineRecord>,
     ) -> Option<Availability> {
+        self.version_problem()
+            .or_else(|| self.own_server_verdict(model, darkmuxs))
+    }
+
+    /// An unverified rec (`engine_unavailable`), or one that did not answer
+    /// in time (`unknown`).
+    fn version_problem(&self) -> Option<Availability> {
         match &self.version {
-            Err(e) if ran_out_of_time(e) => {
+            Err(e) if ran_out_of_time(e) => Some(Availability::unknown(format!(
+                "rec did not answer in time: {e}"
+            ))),
+            Err(e) => Some(Availability::refused(
+                ClientCode::EngineUnavailable,
+                e.clone(),
+            )),
+            Ok(_) => None,
+        }
+    }
+
+    /// (#3574) rec's own server, judged as a dispatch judges it
+    /// ([`super::flint::own_server_use`]): `external` when it serves the
+    /// model and `rec auth token` gives the key a dispatch sends
+    /// (`engine_unavailable` when it does not), `unavailable`
+    /// (`engine_in_use`) when it is up and does not serve the model,
+    /// `unknown` when `rec status` could not say, `None` when it is not up.
+    fn own_server_verdict(
+        &self,
+        model: &ProfileModel,
+        darkmuxs: Option<&darkmux_types::engine_record::EngineRecord>,
+    ) -> Option<Availability> {
+        let own = match &self.own_server {
+            Err(e) => {
                 return Some(Availability::unknown(format!(
-                    "rec did not answer in time: {e}"
+                    "rec could not say whether its own server runs: {e}"
                 )))
             }
-            Err(e) => {
-                return Some(Availability::refused(
-                    ClientCode::EngineUnavailable,
-                    e.clone(),
-                ))
-            }
-            Ok(_) => {}
+            Ok(own) => own.as_ref(),
+        };
+        match super::flint::own_server_use(own, model, darkmuxs) {
+            super::flint::OwnServerUse::Free => None,
+            super::flint::OwnServerUse::Reuse { .. } => Some(self.key_verdict()),
+            super::flint::OwnServerUse::Refuse {
+                address,
+                why,
+                remedy,
+            } => Some(Availability::refused(
+                ClientCode::EngineInUse,
+                super::flint::own_server_refusal(&address, &why, remedy),
+            )),
         }
-        match &self.own_server {
-            Err(e) => Some(Availability::unknown(format!(
-                "rec could not say whether its own server runs: {e}"
-            ))),
-            Ok(Some(address)) if !super::flint::own_server_is_darkmuxs(address, darkmuxs) => {
-                Some(Availability::refused(
-                    ClientCode::EngineInUse,
-                    super::flint::own_server_refusal(address),
-                ))
-            }
-            Ok(_) => None,
+    }
+}
+
+impl FlintAnswer {
+    /// A model rec's own server serves: `external`, unless `rec auth token`
+    /// failed, which a dispatch refuses `engine_unavailable`.
+    fn key_verdict(&self) -> Availability {
+        match &self.key {
+            Some(Err(e)) => Availability::refused(ClientCode::EngineUnavailable, e.clone()),
+            _ => Availability::external(),
         }
     }
 }
 
 impl EngineAnswer for FlintAnswer {
-    /// `resident` when a dispatch would reuse darkmux's server on the
-    /// endpoint: rec is the verified release, its own server is not running
-    /// (what a dispatch checks first), and darkmux's server runs this
-    /// model's command, answers and listens; `startable` when rec also has
-    /// exactly one runtime and one model directory for the revision, and the
-    /// port is free or darkmux's.
+    /// `external` when rec's own server serves the model (#3574, judged
+    /// after the install, as a dispatch judges it); `resident` when a
+    /// dispatch would reuse darkmux's server on the endpoint: rec is the
+    /// verified release, its own server is not running, and darkmux's
+    /// server runs this model's command, answers and listens; `startable`
+    /// when rec also has exactly one runtime and one model directory for the
+    /// revision, and the port is free or darkmux's.
     fn judge(&self, model: &ProfileModel) -> Availability {
         let endpoint = model.endpoint.as_ref();
         let id = endpoint.and_then(|e| e.named_id()).unwrap_or_default();
@@ -679,8 +733,8 @@ impl EngineAnswer for FlintAnswer {
             }
         };
         let live = server::running_now(&self.dirs, id);
-        if let Some(problem) = self.rec_problem(live.as_ref()) {
-            return problem;
+        if let Some(verdict) = self.rec_verdict(model, live.as_ref()) {
+            return verdict;
         }
         if live
             .as_ref()

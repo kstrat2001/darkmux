@@ -1445,7 +1445,7 @@ pub(crate) fn assert_silent_peer_reaches_command_phase(port: u16) {
 /// the fleet hub (#3074, contract 3). Applied by `hub_route::hub_stream_for`,
 /// the one rule both the live write ([`RedisSink`]'s `persist`) and the
 /// outage backfill use.
-pub(crate) fn is_lab_session(session_id: Option<&str>) -> bool {
+pub fn is_lab_session(session_id: Option<&str>) -> bool {
     session_id
         .and_then(|wire| darkmux_types::session_id::SessionId::parse(wire).ok())
         .is_some_and(|s| s.run_id().kind() == darkmux_types::session_id::RunIdKind::Lab)

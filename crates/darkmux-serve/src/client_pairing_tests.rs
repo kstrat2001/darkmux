@@ -8014,6 +8014,53 @@ fn describe_profiles_reports_each_profiles_availability() {
     assert!(url.reachable, "the URL server is still probed: {url:?}");
 }
 
+/// (#3574, contract 4) A Flint profile whose model rec's own server
+/// already serves (ready, its revision, at its `n_ctx`) lists `external`,
+/// and its older fields read it as up: `reachable` (a dispatch goes to that
+/// server) and `loaded` (it is serving now). Nothing is started.
+#[test]
+#[serial_test::serial]
+fn a_flint_profile_recs_own_server_serves_is_external_reachable_and_loaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("share").join("rec");
+    std::fs::create_dir_all(data.join("runtimes/0906aa")).unwrap();
+    std::fs::write(data.join("runtimes/0906aa/rec-mlx"), "").unwrap();
+    std::fs::create_dir_all(data.join("models/fdc852")).unwrap();
+    std::fs::write(data.join("models/fdc852/flint-int4.json"), "{}").unwrap();
+    let rec = script(
+        tmp.path(),
+        "rec",
+        "case \"$1\" in\n  --version) echo 'rec 0.1.0';;\n  \
+         status) echo '{\"ready\":true,\"endpoint\":\"http://127.0.0.1:11500/v1\",\"revision\":\"flint-int4\",\"context\":32000}';;\n  \
+         auth) echo placeholder-key-for-tests;;\n  *) exit 9;;\nesac\n",
+    );
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let registry = tmp.path().join("profiles.json");
+    std::fs::write(
+        &registry,
+        format!(
+            r#"{{"profiles":{{"fl":{{"models":[{{"id":"flint-int4","n_ctx":32000,"endpoint":"fl"}}]}}}},
+                "endpoints":{{"fl":{{"managed":"flint","port":{port}}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let home = tmp.path().join("home");
+    let got = with_env_vars(
+        &[
+            ("DARKMUX_PROFILES", registry.as_os_str()),
+            ("DARKMUX_FLINT_BIN", rec.as_os_str()),
+            ("XDG_DATA_HOME", tmp.path().join("share").as_os_str()),
+            ("DARKMUX_HOME", home.as_os_str()),
+        ],
+        || describe_profiles("coder", &["fl".to_string()]),
+    );
+    let fl = got[0].clone().unwrap();
+    use darkmux_profiles::engine::availability::AvailabilityState as S;
+    assert_eq!(fl.availability.state, S::External, "{fl:?}");
+    assert_eq!(fl.endpoint, "flint");
+    assert_eq!((fl.reachable, fl.loaded), (true, Some(true)), "{fl:?}");
+}
+
 /// (#3466 review) An engine-server profile is `reachable` only when darkmux
 /// can make it resident now (`resident` or `startable`): an app that picks
 /// "the first that answers" must not pick one whose dispatch would fail

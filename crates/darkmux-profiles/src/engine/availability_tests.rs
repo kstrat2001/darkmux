@@ -800,12 +800,91 @@ fn flint_answer(
     FlintAnswer {
         rec: crate::engine::flint::Rec::at("/opt/rec/rec", Some(dir.path().join("rec"))),
         version: version.map(str::to_string).map_err(str::to_string),
-        own_server: own.map(|o| o.map(str::to_string)).map_err(str::to_string),
+        own_server: own.map(|o| o.map(serving_nothing)).map_err(str::to_string),
+        key: Some(Ok(())),
         dirs: Dirs {
             records: dir.path().join("run"),
             logs: dir.path().join("logs"),
         },
     }
+}
+
+/// rec's own server at `address`, ready, as `rec status` says when it names
+/// no revision or context: it serves nothing a profile could reuse.
+fn serving_nothing(address: &str) -> crate::engine::flint::OwnServer {
+    crate::engine::flint::OwnServer {
+        address: address.to_string(),
+        endpoint: Some(address.to_string()),
+        ready: true,
+        revision: None,
+        context: None,
+    }
+}
+
+/// (#3574, contract 4) rec's own server serving the profile's revision at
+/// its `n_ctx` or more reads `external`, as a dispatch reuses it: usable,
+/// and not darkmux's to manage. Another revision, or a smaller context,
+/// stays `unavailable` with `engine_in_use`, naming what does not match.
+#[test]
+fn recs_own_server_serving_the_model_is_external_and_otherwise_engine_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    rec_install(&dir.path().join("rec"), 1, &["flint-int4"]);
+    let rec_serving = |revision: &str, context: u64| {
+        let mut answer = flint_answer(&dir, Ok("0.1.0"), Ok(None));
+        answer.own_server = Ok(Some(crate::engine::flint::OwnServer {
+            revision: Some(revision.to_string()),
+            context: Some(context),
+            ..serving_nothing("http://127.0.0.1:11500/v1")
+        }));
+        answer.judge(&flint_model(free_port()))
+    };
+    assert_eq!(rec_serving("flint-int4", 8192), Availability::external());
+    assert_eq!(rec_serving("flint-int4", 262_144), Availability::external());
+    // A key `rec auth token` will not give refuses what a dispatch refuses.
+    let mut keyless = flint_answer(&dir, Ok("0.1.0"), Ok(None));
+    keyless.own_server = Ok(Some(crate::engine::flint::OwnServer {
+        revision: Some("flint-int4".into()),
+        context: Some(8192),
+        ..serving_nothing("http://127.0.0.1:11500/v1")
+    }));
+    keyless.key = Some(Err("`rec auth token` printed no key (exit 1)".into()));
+    let a = keyless.judge(&flint_model(free_port()));
+    assert_eq!((a.state, a.code.as_deref()), (AvailabilityState::Unavailable, Some("engine_unavailable")), "{a:?}");
+    assert!(a.reason.as_deref().unwrap().contains("auth token"), "{a:?}");
+    for (revision, context, says) in [("flint-int8", 8192, "`flint-int8`"), ("flint-int4", 4096, "4096")] {
+        let a = rec_serving(revision, context);
+        assert_eq!(a.state, AvailabilityState::Unavailable, "{a:?}");
+        assert_eq!(a.code.as_deref(), Some("engine_in_use"), "{a:?}");
+        assert!(a.reason.as_deref().unwrap().contains(says), "{a:?}");
+    }
+}
+
+/// (#3574) A listing asks `rec auth token` only while rec's own server is
+/// up, and keeps whether it gave a key, never the key.
+#[test]
+fn a_listing_asks_recs_key_only_while_its_own_server_is_up() {
+    use std::os::unix::fs::PermissionsExt;
+    let rec_with = |dir: &std::path::Path, status: &str, auth: &str| {
+        let bin = dir.join("rec-bin");
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\ncase \"$1\" in\n  --version) echo 'rec 0.1.0';;\n  status) {status};;\n  auth) {auth};;\nesac\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::engine::flint::Rec::at(bin.to_string_lossy().into_owned(), Some(dir.join("rec")))
+    };
+    let dirs = |dir: &tempfile::TempDir| Dirs { records: dir.path().join("run"), logs: dir.path().join("logs") };
+    let up = r#"echo '{"ready":true,"endpoint":"http://127.0.0.1:11500/v1","revision":"flint-int4","context":8192}'"#;
+    let dir = tempfile::tempdir().unwrap();
+    let failing = FlintAnswer::ask(rec_with(dir.path(), up, "exit 1"), dirs(&dir));
+    assert!(matches!(&failing.key, Some(Err(e)) if e.contains("auth token")), "{:?}", failing.key);
+    let dir = tempfile::tempdir().unwrap();
+    let keyed = FlintAnswer::ask(rec_with(dir.path(), up, "echo placeholder-key-for-tests"), dirs(&dir));
+    assert_eq!(keyed.key, Some(Ok(())));
+    let dir = tempfile::tempdir().unwrap();
+    let down = FlintAnswer::ask(rec_with(dir.path(), "exit 1", "exit 1"), dirs(&dir));
+    assert_eq!(down.key, None, "not asked while rec's own server is down");
 }
 
 /// A stopped Flint server is `startable`: rec 0.1.0, one runtime, one model

@@ -4720,6 +4720,10 @@ fn dispatch_unmanaged(
     target: &crate::target::Target,
     fails_at_cap: bool,
 ) -> Result<DispatchResult> {
+    // (#3574) Where the request goes, decided before any record names it:
+    // rec's own server when it serves the model (contract 4).
+    let own = crate::engine_dispatch::decide_own(target, &opts.session);
+    let target = &own.routed(target);
     let ep = &target.endpoint;
     let pm = &target.model;
     let session = &opts.session;
@@ -4733,7 +4737,7 @@ fn dispatch_unmanaged(
     // failure (missing Keychain item) then bails WITHOUT leaving an orphaned
     // in-flight session in the viewer.
     let url = target.chat_url.clone();
-    let auth = remote_auth_header(ep)?;
+    let auth = own.auth(remote_auth_header(ep)?);
     let phase = opts.phase_id.as_deref();
 
     // (#2902 step 5, #3035) The budgets, BEFORE any bookend is emitted: the
@@ -4825,7 +4829,7 @@ fn dispatch_unmanaged(
     // (#3504) A busy model waits as `fleet.busy_policy` says, at most the
     // call's own timeout.
     let wait = crate::engine_dispatch::BusyWait::configured(u64::from(opts.timeout_seconds), budget_caller);
-    let resident = engine_resident(target, &wait, |p| {
+    let resident = engine_resident(target, &own, &wait, |p| {
         let _ = darkmux_flow::record(build_unmanaged_record(&opts.role_id, session, execution, &pm.id, phase, p));
     });
     let _engine = match resident {
@@ -6700,16 +6704,19 @@ type HostedRoute = (crate::types::Role, String, crate::target::Target, crate::ro
 /// (#3448) Make `target`'s model resident when it runs on a server darkmux
 /// starts, recording each `dispatch.model.*` (and `dispatch.queue.*`) step
 /// through `record`; `None` for any other target. (#3504) A busy model
-/// waits as `wait` says.
+/// waits as `wait` says. (#3574) Nothing is made resident for a model
+/// rec's own server serves, and a refusal `own` decided is returned, both
+/// as `own` (decided before `dispatch.start`) says.
 fn engine_resident(
     target: &crate::target::Target,
+    own: &crate::engine_dispatch::OwnRoute,
     wait: &crate::engine_dispatch::BusyWait<'_>,
     mut record: impl FnMut(darkmux_flow::Payload),
 ) -> Result<Option<crate::engine_dispatch::EngineReady>, crate::engine_dispatch::NotResident> {
     if !crate::engine_dispatch::is_engine_server(target) {
         return Ok(None);
     }
-    crate::engine_dispatch::prepare(target, wait, &mut |n, p| record(model_record(n, p))).map(Some)
+    crate::engine_dispatch::prepare(target, own, wait, &mut |n, p| record(model_record(n, p)))
 }
 
 /// (#3448) The `dispatch.error` payload of a container dispatch whose model
@@ -6960,6 +6967,9 @@ struct ContainerRun {
     /// (#1187) The hosted brain's auth header, held only here until it is
     /// piped over the container's stdin.
     remote_auth: Option<(String, String)>,
+    /// (#3574) What rec's own server means for this run, decided before
+    /// its `dispatch.start` ([`container_brain_route`]).
+    own_route: crate::engine_dispatch::OwnRoute,
     /// (#3507) Held for the whole run, on the LM Studio job model and then
     /// the compactor ([`crate::lms_room::hold_dispatch_models`]).
     lease: darkmux_types::residency_lease::LeaseGuard,
@@ -6972,11 +6982,11 @@ struct ContainerRun {
     toolchain: darkmux_sandbox::toolchain::Toolchain,
 }
 
-/// The container path up to its `dispatch.start`, in the order the steps
-/// always ran: the resume preflight and the budget gate, the workdir's git
-/// check, the image, the role and its prompt, the workdir and any resume
-/// checkpoint, the model, the workspace, the out-dir, and the brain's
-/// credential. The first refusal wins, and none of them emits a bookend.
+/// The container path up to its `dispatch.start`: the resume preflight and
+/// the budget gate, the workdir's git check, the image, the role and its
+/// prompt, the workdir and any resume checkpoint, (#3574) where the hosted
+/// brain sends and its credential, the model, the workspace and the
+/// out-dir. The first refusal wins, and none of them emits a bookend.
 fn prepare_container_run(
     opts: &DispatchOpts,
     execution: &ExecutionId,
@@ -6996,6 +7006,8 @@ fn prepare_container_run(
     let (role, system_prompt, allowed_tools, provenance) =
         container_role(opts, brain.agentic_pm.as_ref().is_some_and(brain_leaves_this_machine), &workdir_split_gitdirs)?;
     let workspace_plan = plan_workspace(opts, unix_micros)?;
+    // (#3574) Where the hosted brain sends, decided before anything names it.
+    let (brain, own_route, remote_auth) = container_brain_route(opts, brain)?;
     let (model, resolved_profile, unmanaged_endpoint_raw_label, preflight_hold) =
         resolve_container_model(&role, opts, brain.agentic_pm.as_ref())?;
     let (lease, leased_job) = lease_lmstudio_job(opts, &brain, &model)?;
@@ -7011,18 +7023,6 @@ fn prepare_container_run(
         execution,
     )?;
 
-    // (#1187) Agentic-remote: resolve the auth header from Keychain (host-side,
-    // same `remote_auth_header` the light single-shot path uses). Deliberately
-    // held ONLY in this local variable, never written to any file or env var
-    // — `bash` has no `/workspace`-escape check (unlike `read`/`write`/`edit`;
-    // it's the deliberate general-purpose escape hatch), so a mounted
-    // secret-bearing file is reachable by a model-issued `cat`, and an env var
-    // is reachable even more trivially (`env`, visible to every process, no
-    // permission gate at all). Instead, once the container spawns, the
-    // secret is piped over its STDIN — a channel the container reads exactly
-    // once at startup, before the agent loop (and any chance of a tool call)
-    // exists, and which leaves no artifact on any filesystem afterward.
-    let remote_auth = brain.agentic_pm.as_ref().map(|t| remote_auth_header(&t.endpoint)).transpose()?.flatten();
     Ok(ContainerRun {
         workspace_cleanup,
         _execution_lock: execution_lock,
@@ -7038,10 +7038,42 @@ fn prepare_container_run(
         workspace,
         host_out,
         remote_auth,
+        own_route,
         lease,
         leased_job,
         toolchain: Default::default(),
     })
+}
+
+/// The container brain after [`container_brain_route`]: the brain, the route
+/// it was decided on, and the credential for the server it now names.
+type RoutedBrain = (ContainerBrain, crate::engine_dispatch::OwnRoute, Option<(String, String)>);
+
+/// (#3574) The container's hosted brain as the run sends to it, what rec's
+/// own server means for it, and the auth header it sends: decided before the
+/// run's records name the brain, so its route label, its `--chat-url` and
+/// its credential all name the same server.
+///
+/// (#1187) Agentic-remote: resolve the auth header from Keychain (host-side,
+/// same `remote_auth_header` the light single-shot path uses). Deliberately
+/// held ONLY in this local variable, never written to any file or env var
+/// — `bash` has no `/workspace`-escape check (unlike `read`/`write`/`edit`;
+/// it's the deliberate general-purpose escape hatch), so a mounted
+/// secret-bearing file is reachable by a model-issued `cat`, and an env var
+/// is reachable even more trivially (`env`, visible to every process, no
+/// permission gate at all). Instead, once the container spawns, the
+/// secret is piped over its STDIN — a channel the container reads exactly
+/// once at startup, before the agent loop (and any chance of a tool call)
+/// exists, and which leaves no artifact on any filesystem afterward.
+fn container_brain_route(
+    opts: &DispatchOpts,
+    brain: ContainerBrain,
+) -> Result<RoutedBrain> {
+    let own = brain.agentic_pm.as_ref().map_or_else(Default::default, |t| crate::engine_dispatch::decide_own(t, &opts.session));
+    let agentic_pm = brain.agentic_pm.map(|t| own.routed(&t));
+    let theirs = agentic_pm.as_ref().map(|t| remote_auth_header(&t.endpoint)).transpose()?.flatten();
+    let remote_auth = own.auth(theirs);
+    Ok((ContainerBrain { agentic_pm, ..brain }, own, remote_auth))
 }
 
 /// (#3507) The LM Studio route's job model, leased as soon as it is
@@ -8003,7 +8035,7 @@ fn container_model_resident(
     opts: &DispatchOpts,
     execution: &ExecutionId,
     model: &str,
-    brain: Option<&crate::target::Target>,
+    brain: Option<(&crate::target::Target, &crate::engine_dispatch::OwnRoute)>,
     endpoint_label: Option<&str>,
     bookend: &mut DispatchBookendGuard<'_>,
     started: std::time::Instant,
@@ -8025,8 +8057,8 @@ fn container_model_resident(
         effective_inactivity_timeout_seconds(opts.timeout_override_seconds).0,
         caller,
     );
-    let resident = brain.map_or(Ok(None), |t| {
-        engine_resident(t, &wait, |p| {
+    let resident = brain.map_or(Ok(None), |(t, own)| {
+        engine_resident(t, own, &wait, |p| {
             let _ = darkmux_flow::record(record(darkmux_flow::Level::Info, p));
         })
     });
@@ -8155,7 +8187,7 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
         opts,
         execution,
         &model,
-        run.brain.agentic_pm.as_ref(),
+        run.brain.agentic_pm.as_ref().map(|t| (t, &run.own_route)),
         run.unmanaged_endpoint_raw_label.as_deref(),
         &mut bookend,
         dispatch_start_instant,

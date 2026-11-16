@@ -16,10 +16,22 @@ darkmux release.
 
 ### Added
 
+- **A Flint dispatch uses rec's own server when it already serves the model (#3574).** When rec's own
+  server is up and `rec status` says it is ready, serving the profile model's revision at a context of
+  at least its `n_ctx`, on this machine's loopback, and the model declares no `engine_args`, the
+  dispatch goes to that server with rec's local key instead of being refused, and its records name
+  that server. darkmux starts, stops and evicts nothing there, and writes no engine record, lease or
+  reservation and no memory budget for it; flow records and the endpoint's token budget apply as
+  usual. A lab run never uses it. The listing reads such a model `external` (`reachable` and `loaded`
+  in `GET /client/profiles`) when `rec auth token` gives a key, and doctor's `flint engine` row passes
+  naming it. Anything else is still refused `engine_in_use`, naming what does not match, with the
+  remedy that fits (wait for rec's server to be ready, or `rec stop`). The server can change between
+  the check and the request, and a container run does not check again mid-run. The rule is contract 4
+  in `docs/agents/CONTRACTS.md`.
 - **A model's availability says why by code (#3574).** An `unavailable` availability in
   `GET /client/profiles`, `darkmux profile list --json` and the machine card (card schema 1.5) now
   carries an optional `code`, the one a dispatch refusing for the same reason carries:
-  `engine_in_use` while rec's own server runs, `engine_unavailable` (an unverified or missing engine, a
+  `engine_in_use` while rec's own server runs and does not serve the model, `engine_unavailable` (an unverified or missing engine, a
   rec install darkmux cannot read, a model LM Studio has not downloaded), `model_start_failed`
   (`engine_args` the engine does not take, a model Tensorfold does not list) and `port_in_use`. An app
   branches on the code instead of the wording. It is absent when no dispatch refusal fits (a registry
@@ -27,7 +39,7 @@ darkmux release.
   and a code this darkmux does not know reads back as its text. `GET /client/whoami` lists the new
   capability `availability_codes`, so an app tells a darkmux that predates codes from one where no code
   fits. A dispatch refusal and a listing now spell every code through the one `ClientCode` enum. rec's
-  own server is still never stopped or used by darkmux.
+  own server is still never stopped by darkmux.
 - **A paired app can ask what this darkmux's client API can do (#3494).** `GET /client/whoami` now
   carries `version` (darkmux's version, for display and diagnostics) and `capabilities`, every
   capability this build has, in a fixed order: `clean_preview`, `template_workspace`, `continues`,
