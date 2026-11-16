@@ -1167,9 +1167,8 @@ S(("127.0.0.1", port), H).serve_forever()
         Fixture { _dir: dir, dirs, script }
     }
 
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-    }
+    // A port held for this test alone (#3488).
+    use crate::test_ports::free_port;
 
     fn spec(f: &Fixture, endpoint: &str, model: &str, port: u16, extra: &[&str]) -> ServerSpec {
         let served_name = format!("darkmux:{model}");
