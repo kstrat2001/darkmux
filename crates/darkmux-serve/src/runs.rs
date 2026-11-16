@@ -2820,7 +2820,7 @@ impl PeerClocks {
     /// The live peers' clocks, from the shared Redis (empty when it is off or
     /// unreadable: nothing is corrected then).
     fn read() -> Self {
-        let Some(url) = darkmux_flow::redis_url() else { return Self::default() };
+        let Some(url) = crate::presence_hub_url() else { return Self::default() };
         let (beats, _) = crate::machine_beats(&url, crate::PresenceRead::ROUTE);
         // (#3125) The live session beats, read the same way; a failed read
         // knows nothing (`None`), never "every beat is gone".

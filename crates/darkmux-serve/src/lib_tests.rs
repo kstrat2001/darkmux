@@ -5662,7 +5662,8 @@
                     .and_then(|n| n.parse().ok())
                     .unwrap_or(0)
             };
-            let (connects0, gets0) = (stat(&mut conn, "total_connections_received"), stat(&mut conn, "cmdstat_get:"));
+            let (connects0, gets0, scans0) =
+                (stat(&mut conn, "total_connections_received"), stat(&mut conn, "cmdstat_get:"), stat(&mut conn, "cmdstat_scan:"));
             unsafe { std::env::set_var("DARKMUX_REDIS_URL", &redis.url) };
             let tmp = TempDir::new().unwrap();
             let get = |uri: &'static str| {
@@ -5678,13 +5679,238 @@
             let again = (get("/fleet/machines/live").await, get("/fleet/dispatches/live").await);
             let live = tokio::task::spawn_blocking(super::super::live_session_ids).await.unwrap();
             unsafe { std::env::remove_var("DARKMUX_REDIS_URL") };
-            let (connects, gets) = (stat(&mut conn, "total_connections_received") - connects0, stat(&mut conn, "cmdstat_get:") - gets0);
+            let (connects, gets, scans) = (
+                stat(&mut conn, "total_connections_received") - connects0,
+                stat(&mut conn, "cmdstat_get:") - gets0,
+                stat(&mut conn, "cmdstat_scan:") - scans0,
+            );
             assert_eq!(machines["machines"].as_array().map(Vec::len), Some(2), "{machines}");
             assert_eq!(dispatches["dispatches"].as_array().map(Vec::len), Some(3), "{dispatches}");
             assert_eq!((&again.0, &again.1), (&machines, &dispatches), "served from the same reads");
             assert_eq!(live.map(|s| s.len()), Some(4), "three sessions and their mission");
-            assert_eq!(connects, 2, "one connection per key space for five reads");
+            assert_eq!(scans, 2, "one read per key space for five reads");
+            assert_eq!(connects, 1, "both key spaces read on the one kept connection");
             assert_eq!(gets, 0, "beats come back in one MGET, not a GET each");
+        }
+
+        /// A counter from the hub's `INFO all`: `total_connections_received`,
+        /// or a `cmdstat_<cmd>:`'s `calls`.
+        fn hub_stat(conn: &mut redis::Connection, name: &str) -> u64 {
+            let info: String = redis::cmd("INFO").arg("all").query(conn).unwrap();
+            info.lines()
+                .find_map(|l| l.strip_prefix(name))
+                .and_then(|rest| rest.trim_start_matches(':').split([',', '\r']).next())
+                .map(|v| v.trim_start_matches("calls="))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0)
+        }
+
+        /// A hub with two machine beats, three session beats and one work
+        /// record, and a connection to it for the test's own counting.
+        fn seeded_hub() -> (RedisFixture, redis::Connection) {
+            let redis = spawn_redis();
+            let mut conn = redis::Client::open(redis.url.as_str()).unwrap().get_connection().unwrap();
+            let now = darkmux_flow::presence::now_ms();
+            for uid in ["UID-A", "UID-B"] {
+                let beat = serde_json::json!({ "machine_uid": uid, "display_name": uid, "schema_version": "1", "beat_ts_ms": now });
+                let _: () = redis::cmd("SET").arg(darkmux_flow::presence::presence_key(uid)).arg(beat.to_string()).arg("EX").arg(60).query(&mut conn).unwrap();
+            }
+            for sid in ["S-1", "S-2", "S-3"] {
+                let beat = serde_json::json!({ "session_id": sid, "display_name": "laptop", "beat_ts_ms": now });
+                let _: () = redis::cmd("SET").arg(darkmux_flow::session_presence::session_key(sid)).arg(beat.to_string()).arg("EX").arg(60).query(&mut conn).unwrap();
+            }
+            let record = serde_json::json!({ "ts": "2026-11-16T00:00:00Z", "level": "info", "action": "dispatch.start", "session_id": "S-1" });
+            let _: String = redis::cmd("XADD").arg(WORK_STREAM).arg("*").arg("schema").arg("1.8.0").arg("record").arg(record.to_string()).query(&mut conn).unwrap();
+            (redis, conn)
+        }
+
+        /// Every hub read one view refresh makes, each past its cache: the
+        /// machines' and the sessions' beats, the hub clock, and the fleet
+        /// window. Returns what each read saw.
+        fn refresh_hub_view(url: &darkmux_flow::RawRedisUrl, caches: &crate::fleet_window::FleetCaches, at: std::time::SystemTime) -> (usize, usize, bool, usize) {
+            use super::super::{machine_beats, session_beats, PresenceRead};
+            let (machines, m_state) = machine_beats(url, PresenceRead::FRESH);
+            let (sessions, s_state) = session_beats(url, PresenceRead::FRESH);
+            assert!(matches!(m_state, source_state::SourceState::Ok), "machines: {m_state:?}");
+            assert!(matches!(s_state, source_state::SourceState::Ok), "sessions: {s_state:?}");
+            let clock = super::super::hub_time_ms(url).is_some();
+            let window = crate::fleet_window::read_fleet_cached(caches, FleetScope::WithSamples, at, || Some(url.clone()));
+            assert!(matches!(window.state, source_state::SourceState::Ok), "window: {:?}", window.state);
+            (machines.len(), sessions.len(), clock, window.records.len())
+        }
+
+        /// (#3432) A hub view refresh opens a constant number of connections
+        /// however many reads it makes: the presence and clock reads share one
+        /// kept connection, the fleet window keeps its own, and later
+        /// refreshes open none. Before, every read opened its own: four per
+        /// refresh.
+        #[test]
+        #[serial]
+        fn hub_view_refreshes_open_a_constant_number_of_connections() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let (redis, mut conn) = seeded_hub();
+            let url = darkmux_flow::RawRedisUrl::new(redis.url.clone());
+            let caches = crate::fleet_window::FleetCaches::default();
+            let t0 = std::time::SystemTime::now();
+            let connects0 = hub_stat(&mut conn, "total_connections_received");
+            for i in 0..5u64 {
+                let seen = refresh_hub_view(&url, &caches, t0 + Duration::from_secs(10 * i));
+                assert_eq!(seen, (2, 3, true, 1), "refresh {i}");
+            }
+            let connects = hub_stat(&mut conn, "total_connections_received") - connects0;
+            eprintln!("hub connections opened over 5 view refreshes: {connects}");
+            assert_eq!(connects, 2, "one kept connection for presence and the clock, one for the fleet window");
+        }
+
+        /// (#3432) A kept connection the hub dropped is opened again on the
+        /// next read, which answers: the drop is not a failed read.
+        #[test]
+        #[serial]
+        fn a_dropped_hub_connection_is_opened_again_and_the_read_answers() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let (redis, mut conn) = seeded_hub();
+            let url = darkmux_flow::RawRedisUrl::new(redis.url.clone());
+            let caches = crate::fleet_window::FleetCaches::default();
+            let t0 = std::time::SystemTime::now();
+            let connects0 = hub_stat(&mut conn, "total_connections_received");
+            assert_eq!(refresh_hub_view(&url, &caches, t0), (2, 3, true, 1));
+            for i in 1..3u64 {
+                // Every client but this one: the kept connections.
+                let killed: u64 = redis::cmd("CLIENT").arg("KILL").arg("TYPE").arg("normal").arg("SKIPME").arg("yes").query(&mut conn).unwrap();
+                assert_eq!(killed, 2, "the two kept connections were open");
+                assert_eq!(refresh_hub_view(&url, &caches, t0 + Duration::from_secs(10 * i)), (2, 3, true, 1), "refresh {i}");
+            }
+            let connects = hub_stat(&mut conn, "total_connections_received") - connects0;
+            assert_eq!(connects, 6, "each drop costs one new connection per kept one");
+        }
+
+        /// (#3432) A kept connection is given back only after a read that
+        /// succeeded: after a failed one (a read deadline can leave a reply on
+        /// the socket) the next read opens a new connection.
+        #[test]
+        #[serial]
+        fn a_failed_read_gives_up_its_kept_connection() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let (redis, mut conn) = seeded_hub();
+            let kept = crate::hub_conn::KeptHubConnection::new();
+            let ping = |c: &mut redis::Connection| anyhow::Ok(redis::cmd("PING").query::<String>(c)?);
+            let connects0 = hub_stat(&mut conn, "total_connections_received");
+            kept.read(&redis.url, "a probe", ping).unwrap();
+            assert!(kept.is_kept());
+            assert!(kept.read(&redis.url, "a probe", |_| anyhow::Ok(Err::<(), _>(anyhow::anyhow!("a failed read"))?)).is_err());
+            assert!(!kept.is_kept(), "a failed read keeps nothing");
+            kept.read(&redis.url, "a probe", ping).unwrap();
+            assert_eq!(hub_stat(&mut conn, "total_connections_received") - connects0, 2, "the read after the failure opened a new one");
+        }
+
+        /// (#3432) A kept connection is to the hub it was opened to: a read of
+        /// another hub opens its own and reads that hub's keys.
+        #[test]
+        #[serial]
+        fn a_kept_connection_is_never_used_for_another_hub() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let (a, b) = (spawn_redis(), spawn_redis());
+            for (hub, value) in [(&a, "a"), (&b, "b")] {
+                let mut c = redis::Client::open(hub.url.as_str()).unwrap().get_connection().unwrap();
+                let _: () = redis::cmd("SET").arg("which").arg(value).query(&mut c).unwrap();
+            }
+            let kept = crate::hub_conn::KeptHubConnection::new();
+            let which = |c: &mut redis::Connection| anyhow::Ok(redis::cmd("GET").arg("which").query::<String>(c)?);
+            assert_eq!(kept.read(&a.url, "a probe", which).unwrap(), "a");
+            assert_eq!(kept.read(&b.url, "a probe", which).unwrap(), "b");
+            assert_eq!(kept.read(&a.url, "a probe", which).unwrap(), "a");
+        }
+
+        /// (#3432 review) A password rotated on the hub stops working for a
+        /// kept connection once it is [`ROTATED_PASSWORD_LIFETIME`] old: the
+        /// connection is opened again and authenticates anew, and the hub
+        /// refuses it. Younger, it keeps reading (Redis does not drop an
+        /// authenticated connection when the password changes).
+        #[test]
+        #[serial]
+        fn a_rotated_password_stops_working_within_its_lifetime() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            use crate::hub_conn::{KeptHubConnection, ROTATED_PASSWORD_LIFETIME};
+            let redis = spawn_redis();
+            let mut admin = redis::Client::open(redis.url.as_str()).unwrap().get_connection().unwrap();
+            let _: () = redis::cmd("CONFIG").arg("SET").arg("requirepass").arg("old-pass").query(&mut admin).unwrap();
+            let url = redis.url.replacen("redis://", "redis://:old-pass@", 1);
+            let kept = KeptHubConnection::new();
+            let ping = |c: &mut redis::Connection| anyhow::Ok(redis::cmd("PING").query::<String>(c)?);
+            let t0 = std::time::Instant::now();
+            kept.read_at(&url, "a probe", t0, ping).expect("the old password reads");
+            let _: () = redis::cmd("CONFIG").arg("SET").arg("requirepass").arg("new-pass").query(&mut admin).unwrap();
+            let young = t0 + ROTATED_PASSWORD_LIFETIME - Duration::from_secs(1);
+            kept.read_at(&url, "a probe", young, ping).expect("a younger kept connection still reads");
+            let refused = kept.read_at(&url, "a probe", t0 + ROTATED_PASSWORD_LIFETIME, ping);
+            assert!(refused.is_err(), "the rotated password still worked past its lifetime");
+            assert!(!kept.is_kept());
+        }
+
+        /// (#3432 review) A connection opened again after a drop is as young
+        /// as its reopening: its [`ROTATED_PASSWORD_LIFETIME`] counts from then.
+        #[test]
+        #[serial]
+        fn a_reopened_connection_counts_its_age_from_the_reopening() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            use crate::hub_conn::{KeptHubConnection, ROTATED_PASSWORD_LIFETIME};
+            let (redis, mut conn) = seeded_hub();
+            let kept = KeptHubConnection::new();
+            let ping = |c: &mut redis::Connection| anyhow::Ok(redis::cmd("PING").query::<String>(c)?);
+            let t0 = std::time::Instant::now();
+            kept.read_at(&redis.url, "a probe", t0, ping).unwrap();
+            let _: u64 = redis::cmd("CLIENT").arg("KILL").arg("TYPE").arg("normal").arg("SKIPME").arg("yes").query(&mut conn).unwrap();
+            let reopened = t0 + ROTATED_PASSWORD_LIFETIME - Duration::from_secs(1);
+            kept.read_at(&redis.url, "a probe", reopened, ping).unwrap();
+            let connects0 = hub_stat(&mut conn, "total_connections_received");
+            kept.read_at(&redis.url, "a probe", t0 + ROTATED_PASSWORD_LIFETIME + Duration::from_secs(1), ping).unwrap();
+            assert_eq!(hub_stat(&mut conn, "total_connections_received") - connects0, 0, "the reopened connection was aged from the first open");
+        }
+
+        /// (#3432 review) A hub turned off in config closes the kept
+        /// connections, at the hub, not only in the daemon's slot.
+        #[test]
+        #[serial]
+        fn a_hub_turned_off_closes_the_kept_connections() {
+            if !redis_server_available() {
+                eprintln!("skipping: redis-server not on PATH");
+                return;
+            }
+            let (redis, mut conn) = seeded_hub();
+            let url = darkmux_flow::RawRedisUrl::new(redis.url.clone());
+            let caches = crate::fleet_window::FleetCaches::default();
+            let clients = |conn: &mut redis::Connection| hub_stat(conn, "connected_clients");
+            let before = clients(&mut conn);
+            refresh_hub_view(&url, &caches, std::time::SystemTime::now());
+            assert_eq!(clients(&mut conn), before + 2, "presence and the window each keep one");
+            assert!(crate::hub_conn::url_or_forget(None, &crate::hub_conn::PRESENCE_READS).is_none());
+            let off = crate::fleet_window::read_fleet_cached(&caches, FleetScope::WithSamples, std::time::SystemTime::now(), || None);
+            assert!(matches!(off.state, source_state::SourceState::Off));
+            assert!(!crate::hub_conn::PRESENCE_READS.is_kept() && !caches.keeps_a_connection());
+            // The hub sees the close a moment later.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while clients(&mut conn) != before && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(clients(&mut conn), before, "the hub still holds the daemon's connections");
         }
 
         /// (#3432 review) The shared presence read is the last one from THIS

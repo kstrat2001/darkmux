@@ -1077,6 +1077,7 @@ RunStats
   gates: Gates
   bounds: { [key: string]: Knob }
   gpu_w_busy: double | null
+  gpu_w_max: double | null
   cpu_w_busy: double | null
   pkg_w_busy: double | null
   gpu_duty_pct: double | null

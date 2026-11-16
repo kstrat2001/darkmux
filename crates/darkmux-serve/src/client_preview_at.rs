@@ -135,12 +135,17 @@ impl Frame {
 /// reached from its own folder's descriptor; a file or a symlink unlinked
 /// (a link is never followed). Iterative, with the open folders on an
 /// explicit stack: a run can build a tree deeper than any thread's stack.
-fn remove_tree_at(dir: RawFd, name: &OsStr) -> io::Result<()> {
+/// Gives up (`Interrupted`) before an entry once `go_on` says no, leaving
+/// the rest.
+fn remove_tree_at(dir: RawFd, name: &OsStr, go_on: &dyn Fn() -> bool) -> io::Result<()> {
     let Some(first) = remove_or_open(dir, name)? else {
         return Ok(());
     };
     let mut stack = vec![first];
     while let Some(top) = stack.last_mut() {
+        if !go_on() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped before the delete finished"));
+        }
         match top.pending.pop() {
             Some(entry) => {
                 if let Some(sub) = remove_or_open(top.fd.as_raw_fd(), &entry)? {
@@ -207,8 +212,33 @@ fn parent_of(root: &Path, rel: &str) -> io::Result<(OwnedFd, OsString)> {
 
 /// Deletes `rel` inside `root`; absent is done.
 pub(crate) fn remove(root: &Path, rel: &str) -> io::Result<()> {
+    remove_while(root, rel, &|| true)
+}
+
+/// [`remove`], giving up (`Interrupted`) between entries once `go_on`
+/// says no.
+pub(crate) fn remove_while(root: &Path, rel: &str, go_on: &dyn Fn() -> bool) -> io::Result<()> {
     let (dir, name) = parent_of(root, rel)?;
-    remove_tree_at(dir.as_raw_fd(), &name)
+    remove_tree_at(dir.as_raw_fd(), &name, go_on)
+}
+
+/// Moves `rel` inside `root` (a symlink there as the link itself, never
+/// followed) to the new name `to_name` in the folder `to_dir` of `to`, in
+/// one rename: it is wholly at one place or the other, never half moved.
+/// `to_dir` is opened from `to`'s descriptor, so a link there is refused.
+/// Only within one filesystem. `false` when nothing is at `rel`.
+pub(crate) fn move_out(root: &Path, rel: &str, to: &Path, to_dir: &str, to_name: &str) -> io::Result<bool> {
+    let (dir, name) = parent_of(root, rel)?;
+    if lstat_at(dir.as_raw_fd(), &name)?.is_none() {
+        return Ok(false);
+    }
+    let into = open_at(open_root(to)?.as_raw_fd(), OsStr::new(to_dir), libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let (from, onto) = (cstr(&name)?, cstr(OsStr::new(to_name))?);
+    // SAFETY: two valid NUL-terminated names, each in a folder we hold open.
+    match unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), into.as_raw_fd(), onto.as_ptr()) } {
+        0 => Ok(true),
+        _ => Err(io::Error::last_os_error()),
+    }
 }
 
 /// Creates the new file `rel` inside `root` with permission bits `mode`;
@@ -677,5 +707,61 @@ mod tests {
         std::io::copy(&mut from, &mut to).unwrap();
         assert_eq!(std::fs::read_to_string(root.join("dst")).unwrap(), "body");
         assert!(create_new(&root, "dst", 0o600).is_err(), "never overwrites");
+    }
+
+    /// (#3585) A delete gives up between entries once `go_on` says no,
+    /// with `Interrupted`, leaving what it had not reached.
+    #[test]
+    fn remove_while_gives_up_once_told_to() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["t/a/1", "t/a/2", "t/b/3"] {
+            let path = dir.path().join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x").unwrap();
+        }
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let err = remove_while(dir.path(), "t", &|| asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted, "{err}");
+        assert!(dir.path().join("t").exists(), "the rest is left");
+        remove_while(dir.path(), "t", &|| true).unwrap();
+        assert!(!dir.path().join("t").exists());
+    }
+
+    /// (#3585) `move_out` moves a folder whole, moves a symlink as the link
+    /// (what it points at stays where it is), says `false` for an absent
+    /// name, and never moves through a symlinked folder on the way.
+    #[test]
+    fn move_out_moves_the_entry_itself_and_never_crosses_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, base, outside) = (dir.path().join("w"), dir.path().join("base"), dir.path().join("outside"));
+        let to = base.join("aside");
+        for d in [root.join("nm/deep"), to.clone(), outside.join("nm")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(root.join("nm/deep/f"), "x").unwrap();
+        assert!(move_out(&root, "nm", &base, "aside", "one").unwrap());
+        assert!(!root.join("nm").exists() && to.join("one/deep/f").exists(), "moved whole");
+        std::os::unix::fs::symlink(&outside, root.join("nm")).unwrap();
+        assert!(move_out(&root, "nm", &base, "aside", "two").unwrap());
+        assert!(std::fs::symlink_metadata(to.join("two")).unwrap().file_type().is_symlink(), "the link itself moved");
+        assert!(outside.join("nm").exists(), "what it pointed at stays");
+        assert!(!move_out(&root, "nm", &base, "aside", "three").unwrap(), "absent");
+        std::os::unix::fs::symlink(&outside, root.join("web")).unwrap();
+        assert!(move_out(&root, "web/nm", &base, "aside", "four").is_err(), "a symlinked folder on the way");
+        assert!(outside.join("nm").exists());
+    }
+
+    /// (#3585 review) `move_out` never moves into a destination folder that
+    /// is a link: the entry stays where it was.
+    #[test]
+    fn move_out_never_moves_through_a_linked_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, base, outside) = (dir.path().join("w"), dir.path().join("base"), dir.path().join("outside"));
+        for d in [root.join("nm"), base.clone(), outside.clone()] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, base.join("aside")).unwrap();
+        assert!(move_out(&root, "nm", &base, "aside", "one").is_err(), "moved through the link");
+        assert!(root.join("nm").exists() && !outside.join("one").exists());
     }
 }
