@@ -42,6 +42,8 @@ pub mod registry;
 pub mod review;
 pub mod run;
 pub mod sandbox_hash;
+// (#3394) Setup writes into a run's sandbox that never follow a symlink.
+pub(crate) mod sandbox_write;
 // (#1198) scores.json — the bench suite's persisted score artifact (#1197).
 pub mod scores;
 // (#2855) Derived run metrics — the lab computes them once, correctly, with
