@@ -222,10 +222,12 @@
 //! when its `unless_exists` path exists AND the record matches, so a
 //! dependency a run adds, a new image, or a broken earlier install is
 //! installed again; a failed install records nothing. A start with
-//! `{"clean": true}` stops the preview, forgets the record and deletes the
-//! `unless_exists` path inside the workspace (a symlink there is unlinked,
-//! never followed; nothing outside the work copy, never your checkout), then
-//! starts it with a fresh install. `env_from_source` copies untracked files (like `.env`) from
+//! `{"clean": true}` stops the preview, forgets the record and clears the
+//! `unless_exists` path out of the workspace (a symlink there is moved as
+//! the link, never followed; nothing outside the work copy, never your
+//! checkout), then starts it with a fresh install. (#3585) The path is
+//! moved aside in one rename and deleted in the background, so the request
+//! never waits on the delete. `env_from_source` copies untracked files (like `.env`) from
 //! that same checkout into the workspace, never overwriting and never
 //! through a symlink at either end.
 
@@ -250,6 +252,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// (#3585) The folder in the worktrees base that a clean start moves a
+/// workspace's install aside into, to be deleted in the background.
+const CLEANING_DIR: &str = ".cleaning";
 
 /// Where a repo keeps its recipe, relative to the checkout's top.
 pub const RECIPE_PATH: &str = ".darkmux/preview.json";
@@ -782,11 +788,75 @@ pub struct Previews {
     clock: Clock,
     /// Picks a free port (a test pins one, to make two runs share it).
     ports: Arc<dyn Fn() -> Result<u16, String> + Send + Sync>,
-    /// Set once `client serve` begins to stop: no preview starts after it.
-    stopping: std::sync::atomic::AtomicBool,
+    /// Set once `client serve` begins to stop: no preview starts after it,
+    /// and the background deletes give up ([`Previews::wait_cleanings`]).
+    stopping: Arc<std::sync::atomic::AtomicBool>,
     /// How long a started dev server may take to answer ([`READY_WITHIN`];
     /// a test's shorter one).
     ready_within: Duration,
+    /// (#3585) The deletes clean starts left running in the background.
+    cleanings: Arc<Cleanings>,
+}
+
+/// Deletes `rel` inside the folder `root`, no link followed, giving up
+/// between entries once `go_on` says no.
+pub(crate) type Remover = Arc<dyn Fn(&Path, &str, &dyn Fn() -> bool) -> Result<(), String> + Send + Sync>;
+
+/// (#3585) The background deletes of what clean starts moved aside, one
+/// thread each, counted so `client serve`'s stop can wait for them.
+struct Cleanings {
+    remover: Remover,
+    running: Mutex<usize>,
+    ended: std::sync::Condvar,
+}
+
+impl Cleanings {
+    fn new(remover: Remover) -> Self {
+        Cleanings { remover, running: Mutex::new(0), ended: std::sync::Condvar::new() }
+    }
+}
+
+/// One running background delete: counted ended when dropped, a panic
+/// included.
+struct Deleting(Arc<Cleanings>);
+
+impl Drop for Deleting {
+    fn drop(&mut self) {
+        *self.0.running.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        self.0.ended.notify_all();
+    }
+}
+
+/// What deletes a clean start's moved-aside tree in production: a
+/// descriptor walk that never follows a link ([`at::remove_while`]).
+fn default_remover() -> Remover {
+    Arc::new(|root: &Path, rel: &str, go_on: &dyn Fn() -> bool| {
+        #[cfg(unix)]
+        return at::remove_while(root, rel, go_on).map_err(|e| format!("deleting {}: {e}", root.join(rel).display()));
+        #[cfg(not(unix))]
+        {
+            let _ = go_on;
+            remove_by_path(&root.join(rel))
+        }
+    })
+}
+
+/// The serve-log line for a moved-aside tree a background delete left.
+fn undeleted_line(path: &Path, why: &str) -> String {
+    format!(
+        "darkmux client serve: could not delete {}, which a clean preview start moved aside: {why}; \
+         client serve tries again when it next starts",
+        path.display()
+    )
+}
+
+/// A name in [`CLEANING_DIR`] no other clean start takes: the workspace,
+/// this process, the time and a count.
+fn aside_name(workspace: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    format!("{workspace}-{}-{nanos}-{n}", std::process::id())
 }
 
 /// A relative path inside the work copy, spelled plainly: no absolute
@@ -1324,8 +1394,9 @@ impl Previews {
             entries: Mutex::new(HashMap::new()),
             clock: Arc::new(unix_seconds),
             ports: Arc::new(free_port),
-            stopping: std::sync::atomic::AtomicBool::new(false),
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ready_within: READY_WITHIN,
+            cleanings: Arc::new(Cleanings::new(default_remover())),
         }
     }
 
@@ -1341,6 +1412,63 @@ impl Previews {
     /// Whether [`Previews::begin_shutdown`] ran.
     pub fn stopping(&self) -> bool {
         self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The refusal of a start (or a clean start) once the stop began.
+    fn refused_while_stopping() -> RecipeRefusal {
+        RecipeRefusal::Unreadable("darkmux client serve is stopping; start the preview again once it is back".to_string())
+    }
+
+    /// (#3585) Deletes `names` in `folder` (trees clean starts moved aside)
+    /// on a thread of its own, which gives up between entries once
+    /// `client serve` begins to stop; what it leaves is deleted at the next
+    /// start ([`Previews::reap_cleanings`]). None starts once the stop
+    /// began: judged under the count's lock, so [`Previews::wait_cleanings`]
+    /// either counts it or it never runs.
+    fn delete_in_background(&self, folder: PathBuf, names: Vec<String>) {
+        let mut running = self.cleanings.running.lock().unwrap();
+        if names.is_empty() || self.stopping() {
+            return;
+        }
+        *running += 1;
+        drop(running);
+        let (deleting, stopping) = (Deleting(self.cleanings.clone()), self.stopping.clone());
+        std::thread::spawn(move || {
+            let go_on = || !stopping.load(std::sync::atomic::Ordering::SeqCst);
+            for name in &names {
+                if let Err(why) = (deleting.0.remover)(&folder, name, &go_on) {
+                    eprintln!("{}", undeleted_line(&folder.join(name), &why));
+                }
+            }
+        });
+    }
+
+    /// (#3585) Deletes, in the background, every tree a clean start moved
+    /// aside under `base` that a `client serve` which stopped (or died)
+    /// left. Run as `client serve` starts. Returns their names.
+    pub fn reap_cleanings(&self, base: &Path) -> Vec<String> {
+        let folder = base.join(CLEANING_DIR);
+        let mut names: Vec<String> = std::fs::read_dir(&folder)
+            .map(|d| d.filter_map(Result::ok).filter_map(|e| e.file_name().into_string().ok()).collect())
+            .unwrap_or_default();
+        names.sort();
+        self.delete_in_background(folder, names.clone());
+        names
+    }
+
+    /// (#3585) Waits, until `until` at the latest, for the background
+    /// deletes to end (once the stop began each gives up at its next
+    /// entry). Returns how many still run.
+    pub fn wait_cleanings(&self, until: Instant) -> usize {
+        let mut running = self.cleanings.running.lock().unwrap();
+        while *running > 0 {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            running = self.cleanings.ended.wait_timeout(running, left).unwrap().0;
+        }
+        *running
     }
 
     /// The same previews giving a dev server `within` to answer.
@@ -1462,9 +1590,7 @@ impl Previews {
     ) -> Result<(PreviewState, bool), RecipeRefusal> {
         let mut entries = self.entries.lock().unwrap();
         if self.stopping() {
-            return Err(RecipeRefusal::Unreadable(
-                "darkmux client serve is stopping; start the preview again once it is back".to_string(),
-            ));
+            return Err(Self::refused_while_stopping());
         }
         if let Some(e) = entries.get(name) {
             let mut e = e.lock().unwrap();
@@ -1520,12 +1646,14 @@ impl Previews {
     }
 
     /// (#3484) Clears the way for a fresh install: stops the preview (its
-    /// container removed), forgets its install record, and deletes the
-    /// recipe's `install.unless_exists` path inside the workspace. A recipe
-    /// with neither only has its record cleared. The workspace is
-    /// run-written, so the path is deleted only after it resolves inside the
-    /// work copy (no symlinked folder on the way), and a symlink there is
-    /// unlinked, never followed. Never the user's own checkout.
+    /// container removed), forgets its install record, and clears the
+    /// recipe's `install.unless_exists` path out of the workspace
+    /// ([`Previews::clear_aside`]: moved aside at once, deleted in the
+    /// background). A recipe with neither only has its record cleared. The
+    /// workspace is run-written, so the path is moved only after it resolves
+    /// inside the work copy (no symlinked folder on the way), and a symlink
+    /// there is moved as the link, never followed. Never the user's own
+    /// checkout. Refused once `client serve` began to stop.
     pub fn clean(
         &self,
         name: &str,
@@ -1533,6 +1661,9 @@ impl Previews {
         source: &RecipeSource,
     ) -> Result<(), RecipeRefusal> {
         let recipe = source.load()?;
+        if self.stopping() {
+            return Err(Self::refused_while_stopping());
+        }
         if source.checkout().is_some_and(|c| same_dir(c, workdir)) {
             return Err(RecipeRefusal::Invalid(format!(
                 "{} is your own checkout, not darkmux's workspace; refusing to clean it",
@@ -1550,7 +1681,38 @@ impl Previews {
         else {
             return Ok(());
         };
-        remove_inside(workdir, rel).map_err(RecipeRefusal::Unreadable)
+        self.clear_aside(name, workdir, rel).map_err(RecipeRefusal::Unreadable)
+    }
+
+    /// (#3585) Clears `rel` out of workspace `name` (at `workdir`) without
+    /// waiting on its delete: once [`remove_inside`]'s checks pass it is
+    /// moved whole, in one rename, into the worktrees base's
+    /// [`CLEANING_DIR`] (where no run writes) and deleted in the
+    /// background. The workspace holds all of it or none of it, never a
+    /// half-deleted tree for an install to run against. Where it cannot be
+    /// moved (another filesystem), it is deleted in place while the request
+    /// waits, as before.
+    fn clear_aside(&self, name: &str, workdir: &Path, rel: &str) -> Result<(), String> {
+        check_removable(workdir, rel)?;
+        let Some(folder) = workdir.parent().map(|base| base.join(CLEANING_DIR)) else {
+            return remove_inside(workdir, rel);
+        };
+        let aside = aside_name(name);
+        match std::fs::create_dir_all(&folder).and_then(|()| move_out(workdir, rel, &folder, &aside)) {
+            Ok(true) => {
+                self.delete_in_background(folder, vec![aside]);
+                Ok(())
+            }
+            Ok(false) => Ok(()),
+            Err(_) => remove_inside(workdir, rel),
+        }
+    }
+
+    /// The same previews deleting with `remover` (a test's slow one).
+    #[cfg(test)]
+    pub(crate) fn with_remover(mut self, remover: Remover) -> Self {
+        self.cleanings = Arc::new(Cleanings::new(remover));
+        self
     }
 
     /// The preview's state. An app asking counts: it restarts the idle
@@ -1960,16 +2122,38 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// delete itself walks from the workspace's descriptor ([`at::remove`]), so
 /// a run that swaps a folder for a link after the check is refused too.
 fn remove_inside(workdir: &Path, rel: &str) -> Result<(), String> {
-    if !plain_relative(rel) {
-        return Err(format!(
-            "{rel:?} is not a plain relative path; refusing to delete it"
-        ));
-    }
-    check_unlinked_inside(workdir, rel, "install.unless_exists", "delete")?;
+    check_removable(workdir, rel)?;
     #[cfg(unix)]
     return at::remove(workdir, rel).map_err(|e| format!("deleting {rel} in {}: {e}", workdir.display()));
     #[cfg(not(unix))]
     remove_by_path(&workdir.join(rel))
+}
+
+/// Whether `rel` may be deleted (or moved) out of `workdir`: a plain
+/// relative path ([`plain_relative`]) that resolves inside the work copy
+/// ([`check_unlinked_inside`]).
+fn check_removable(workdir: &Path, rel: &str) -> Result<(), String> {
+    if !plain_relative(rel) {
+        return Err(format!("{rel:?} is not a plain relative path; refusing to delete it"));
+    }
+    check_unlinked_inside(workdir, rel, "install.unless_exists", "delete")
+}
+
+/// Moves `rel` in `workdir` to `to_name` in the folder `to` in one rename,
+/// a link moved as itself ([`at::move_out`]); `false` when it is absent.
+#[cfg(unix)]
+fn move_out(workdir: &Path, rel: &str, to: &Path, to_name: &str) -> std::io::Result<bool> {
+    at::move_out(workdir, rel, to, to_name)
+}
+
+/// [`move_out`] where no descriptor walk exists.
+#[cfg(not(unix))]
+fn move_out(workdir: &Path, rel: &str, to: &Path, to_name: &str) -> std::io::Result<bool> {
+    let from = workdir.join(rel);
+    if std::fs::symlink_metadata(&from).is_err() {
+        return Ok(false);
+    }
+    std::fs::rename(&from, to.join(to_name)).map(|()| true)
 }
 
 /// [`remove_inside`]'s delete where no descriptor walk exists.
@@ -3461,6 +3645,170 @@ mod tests {
             "the marker path is deleted"
         );
         assert!(wt.join("package-lock.json").exists() && wt.join(".darkmux/preview.json").exists());
+    }
+
+    /// A user's checkout under `dir` holding `wt`'s recipe: where a clean
+    /// start reads it from (never the workspace itself).
+    fn a_checkout_with_the_recipe_of(wt: &Path, dir: &Path) -> RecipeSource {
+        let mine = dir.join("mine");
+        std::fs::create_dir_all(mine.join(".darkmux")).unwrap();
+        std::fs::copy(wt.join(".darkmux/preview.json"), mine.join(".darkmux/preview.json")).unwrap();
+        RecipeSource::Checkout(mine)
+    }
+
+    /// A remover that deletes only once `release` sends (or hangs up).
+    fn a_held_remover() -> (Remover, std::sync::mpsc::Sender<()>) {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let remover: Remover = Arc::new(move |root: &Path, rel: &str, _: &dyn Fn() -> bool| {
+            let _ = held.lock().unwrap().recv();
+            remove_inside(root, rel)
+        });
+        (remover, release)
+    }
+
+    /// The entries in the worktrees base's `.cleaning` folder.
+    fn moved_aside(base: &Path) -> Vec<String> {
+        std::fs::read_dir(base.join(CLEANING_DIR))
+            .map(|d| d.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// (#3585) A clean start answers without waiting on the delete: while
+    /// the remover is held, `clean` and the start still return at once, the
+    /// workspace has no `node_modules` from that moment (never a half-deleted
+    /// one for the install to run against), and the install runs. The tree
+    /// moved aside is deleted once the remover goes on.
+    #[test]
+    fn a_clean_start_answers_before_the_delete_and_installs_into_no_half_deleted_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = an_installed_workspace(dir.path(), "echo installed >> installs.txt");
+        std::fs::write(wt.join("node_modules/stale.txt"), "old").unwrap();
+        let source = a_checkout_with_the_recipe_of(&wt, dir.path());
+        let (remover, release) = a_held_remover();
+        let (previews, emu) = emulated(dir.path());
+        let previews = Arc::new(previews.with_remover(remover));
+        let (answered, answer) = std::sync::mpsc::channel();
+        {
+            let (previews, wt) = (previews.clone(), wt.clone());
+            std::thread::spawn(move || {
+                let started = previews.clean("w", &wt, &source).and_then(|()| previews.start("w", &wt, &source));
+                let _ = answered.send(started.map(|_| ()).map_err(|e| format!("{e:?}")));
+            });
+        }
+        let got = answer.recv_timeout(Duration::from_secs(3));
+        let gone_at_answer = std::fs::symlink_metadata(wt.join("node_modules")).is_err();
+        let aside_at_answer = moved_aside(&dir.path().join("base"));
+        let _ = release.send(());
+        assert_eq!(got, Ok(Ok(())), "the clean start waited on the delete");
+        assert!(gone_at_answer, "node_modules was still in the workspace when the start answered");
+        assert_eq!(aside_at_answer.len(), 1, "the tree is moved aside whole: {aside_at_answer:?}");
+        let spec = wait_container(&emu, 1);
+        assert!(spec.script.contains("installs.txt"), "the install runs: {}", spec.script);
+        for _ in 0..200 {
+            if moved_aside(&dir.path().join("base")).is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(moved_aside(&dir.path().join("base")).is_empty(), "the tree moved aside is deleted");
+        previews.stop("w");
+    }
+
+    /// A remover that deletes nothing and returns only once `client serve`
+    /// stops (`go_on` says no), counting its calls.
+    fn a_remover_until_the_stop(calls: Arc<std::sync::atomic::AtomicUsize>) -> Remover {
+        Arc::new(move |_root: &Path, _rel: &str, go_on: &dyn Fn() -> bool| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let until = Instant::now() + Duration::from_secs(10);
+            while go_on() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err("stopped".to_string())
+        })
+    }
+
+    /// (#3585) A background delete gives up as `client serve` stops, and
+    /// the stop's wait sees it end; none starts once the stop began; what
+    /// was left is deleted when `client serve` next starts.
+    #[test]
+    fn a_stop_ends_the_background_deletes_and_the_next_start_finishes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir_all(base.join(CLEANING_DIR).join("w-old/a/b")).unwrap();
+        std::fs::write(base.join(CLEANING_DIR).join("w-old/a/b/f"), "x").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (previews, _emu) = emulated(dir.path());
+        let previews = previews.with_remover(a_remover_until_the_stop(calls.clone()));
+        assert_eq!(previews.reap_cleanings(&base), ["w-old"]);
+        assert_eq!(previews.wait_cleanings(Instant::now() + Duration::from_millis(100)), 1, "it runs");
+        previews.begin_shutdown();
+        assert_eq!(previews.wait_cleanings(Instant::now() + Duration::from_secs(3)), 0, "it ended at the stop");
+        assert_eq!(previews.reap_cleanings(&base), ["w-old"]);
+        assert_eq!(previews.wait_cleanings(Instant::now()), 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "no delete starts once the stop began");
+        assert_eq!(moved_aside(&base), ["w-old"], "left for the next start");
+        let (next, _emu) = emulated(dir.path());
+        assert_eq!(next.reap_cleanings(&base), ["w-old"]);
+        assert_eq!(next.wait_cleanings(Instant::now() + Duration::from_secs(5)), 0);
+        assert!(moved_aside(&base).is_empty(), "the next start deleted it");
+    }
+
+    /// (#3585) A clean start once `client serve` began to stop is refused
+    /// like a start, and clears nothing.
+    #[test]
+    fn a_clean_start_is_refused_while_client_serve_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = an_installed_workspace(dir.path(), "true");
+        let source = a_checkout_with_the_recipe_of(&wt, dir.path());
+        let (previews, _emu) = emulated(dir.path());
+        previews.begin_shutdown();
+        let refused = previews.clean("w", &wt, &source);
+        assert!(matches!(&refused, Err(RecipeRefusal::Unreadable(why)) if why.contains("stopping")), "{refused:?}");
+        assert!(wt.join("node_modules").exists(), "nothing cleared");
+    }
+
+    /// (#3585) A second clean start while the first one's delete still
+    /// runs moves its own tree aside under a name of its own: neither
+    /// waits, both trees are deleted, and the workspace ends with none.
+    #[test]
+    fn a_second_clean_start_during_the_first_ones_delete_moves_its_own_tree_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = an_installed_workspace(dir.path(), "true");
+        std::fs::write(wt.join("node_modules/first.txt"), "1").unwrap();
+        let source = a_checkout_with_the_recipe_of(&wt, dir.path());
+        let (remover, release) = a_held_remover();
+        let (previews, _emu) = emulated(dir.path());
+        let previews = previews.with_remover(remover);
+        let started = Instant::now();
+        previews.clean("w", &wt, &source).unwrap();
+        std::fs::create_dir_all(wt.join("node_modules")).unwrap();
+        std::fs::write(wt.join("node_modules/second.txt"), "2").unwrap();
+        previews.clean("w", &wt, &source).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2), "a clean start waited: {:?}", started.elapsed());
+        let base = dir.path().join("base");
+        assert_eq!(moved_aside(&base).len(), 2, "{:?}", moved_aside(&base));
+        assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err());
+        drop(release);
+        assert_eq!(previews.wait_cleanings(Instant::now() + Duration::from_secs(5)), 0);
+        assert!(moved_aside(&base).is_empty(), "both deleted");
+    }
+
+    /// (#3585) Where the tree cannot be moved aside (here the folder for
+    /// it cannot be made), the clean start deletes it in place, as before.
+    #[test]
+    fn a_clean_start_that_cannot_move_the_tree_aside_deletes_it_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = an_installed_workspace(dir.path(), "true");
+        std::fs::write(wt.join("node_modules/stale.txt"), "old").unwrap();
+        std::fs::write(dir.path().join("base").join(CLEANING_DIR), "not a folder").unwrap();
+        let source = a_checkout_with_the_recipe_of(&wt, dir.path());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (previews, _emu) = emulated(dir.path());
+        let previews = previews.with_remover(a_remover_until_the_stop(calls.clone()));
+        previews.clean("w", &wt, &source).unwrap();
+        assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err(), "deleted");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "in place, not in the background");
     }
 
     /// The spec of the emulated container whose name starts `prefix`, the

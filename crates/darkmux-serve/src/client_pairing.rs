@@ -1533,6 +1533,7 @@ pub fn run(port: u16) -> Result<()> {
         state.remote = started.wire;
         state.tailnet_entry = started.serving.clone();
         log_lines(swept_partials(&state));
+        log_lines(reaped_cleanings(&state));
         // (#3456) Preview containers a `client serve` that died left behind.
         let reaper = state.previews.clone();
         std::thread::spawn(move || {
@@ -1619,6 +1620,24 @@ pub(crate) fn swept_partials(state: &ClientServerState) -> Vec<String> {
         .collect()
 }
 
+/// (#3585) Deletes, in the background, the trees clean preview starts moved
+/// aside that the last `client serve` did not finish deleting
+/// ([`crate::client_preview::Previews::reap_cleanings`]); one serve-log
+/// line when there were any.
+pub(crate) fn reaped_cleanings(state: &ClientServerState) -> Vec<String> {
+    let Ok(base) = (state.worktrees_base)() else {
+        return Vec::new();
+    };
+    let left = state.previews.reap_cleanings(&base);
+    if left.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "darkmux client serve: deleting {} tree(s) a clean preview start moved aside and a stop left",
+        left.len()
+    )]
+}
+
 /// How long a stopping `client serve` waits, from its stop signal, for the
 /// work it canceled to end, and for docker to remove its previews'
 /// containers: the executor's own [`CANCEL_GRACE`] (after
@@ -1648,15 +1667,27 @@ fn begin_stop(previews: &crate::client_preview::Previews, works: &Mutex<HashMap<
 /// container is removed (#3456) while the canceled work is waited for,
 /// each until `work_until` at the latest ([`end_running_work`]); a docker
 /// that answers no `stop` or `rm` by then is no longer waited for, and its
-/// containers stop themselves once the heartbeat goes stale. Returns the
-/// work still running then.
+/// containers stop themselves once the heartbeat goes stale. The
+/// background deletes of clean starts (#3585), told to give up as the stop
+/// began, are waited for too; what they leave is deleted at the next start.
+/// Returns the work still running then.
 async fn finish_stop(
     previews: Arc<crate::client_preview::Previews>,
     works: Arc<Mutex<HashMap<String, WorkEntry>>>,
     work_until: std::time::Instant,
 ) -> Vec<String> {
     let ending = tokio::task::spawn_blocking(move || end_running_work(&works, work_until));
-    let stopping = tokio::task::spawn_blocking(move || previews.stop_all());
+    let stopping = tokio::task::spawn_blocking(move || {
+        let removed = previews.stop_all();
+        let deleting = previews.wait_cleanings(work_until);
+        if deleting > 0 {
+            eprintln!(
+                "darkmux client serve: {deleting} background delete(s) of a clean preview start still running; \
+                 no longer waiting (what they leave is deleted when client serve next starts)"
+            );
+        }
+        removed
+    });
     match tokio::time::timeout_at(work_until.into(), stopping).await {
         Ok(removed) => {
             let removed = removed.unwrap_or_default();

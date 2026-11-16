@@ -165,6 +165,16 @@ darkmux release.
   every other refusal. `GET /client/recipe` now names a query it cannot read the same way (still
   `bad_request`) instead of asking for `workdir` or `workspace`.
 
+- **A clean preview start answers at once, whatever the size of `node_modules` (#3585).** `POST
+  /client/workspaces/{name}/preview` with `{"clean": true}` deleted the `install.unless_exists` path
+  while the request waited, so a large `node_modules` could outlast the app's request timeout. The
+  path is now moved out of the workspace in one rename, into `.cleaning` in the worktrees base, and
+  deleted in the background; the install never sees part of the old tree. The background delete gives
+  up when `client serve` stops, and what it left is deleted when `client serve` next starts. A clean
+  start is refused while `client serve` stops, as a start is. A tree that cannot be moved there
+  (another filesystem) is deleted in place as before. A moved tree deeper than 128 folders no longer
+  refuses the clean start: it stays in `.cleaning` and the serve log says so.
+
 ## [5.11.0] - 2026-11-14
 
 **darkmux no longer needs Docker.** On a Mac it runs every sandbox in macOS's own (Seatbelt); on

@@ -9017,6 +9017,34 @@ async fn a_run_in_flight_at_shutdown_ends_canceled_with_its_commit() {
     );
 }
 
+/// (#3585) The stop ends the background deletes of clean preview starts
+/// (each gives up as the stop begins) and waits for them: none is left
+/// running once it returns. What a stop left is found at the next start.
+#[tokio::test]
+async fn shutdown_ends_the_background_deletes_of_clean_preview_starts() {
+    let mut h = harness();
+    let slow: crate::client_preview::Remover = Arc::new(|_root: &Path, _rel: &str, go_on: &dyn Fn() -> bool| {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while go_on() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        Err("stopped".to_string())
+    });
+    let emu: Arc<dyn crate::client_preview::PreviewContainers> = h.containers.clone();
+    h.state.previews = Arc::new(crate::client_preview::Previews::new(h.dir.path().join("p"), emu).with_remover(slow));
+    let base = (h.state.worktrees_base)().unwrap();
+    std::fs::create_dir_all(base.join(".cleaning/w-1-2-3-0/node_modules")).unwrap();
+    assert_eq!(reaped_cleanings(&h.state).len(), 1, "the start says it found one");
+    let began = begin_stop(&h.state.previews, &h.state.works);
+    finish_stop(h.state.previews.clone(), h.state.works.clone(), began + std::time::Duration::from_secs(5)).await;
+    assert_eq!(
+        h.state.previews.wait_cleanings(std::time::Instant::now()),
+        0,
+        "a background delete outlived the stop"
+    );
+}
+
 /// A run that ignores its cancel never holds the exit: the wait for it ends
 /// at its bound and names it, and the runtime is left behind at its own
 /// bound while the run's thread is still going.
