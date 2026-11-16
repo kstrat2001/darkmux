@@ -38,12 +38,23 @@ enum Entry {
 
 fn entry_at(path: &Path) -> io::Result<Entry> {
     match fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_symlink() => Ok(Entry::Link),
-        Ok(m) if m.is_dir() => Ok(Entry::Folder),
-        Ok(m) if m.is_file() => Ok(Entry::File(m.permissions())),
-        Ok(_) => Ok(Entry::Other),
+        Ok(m) => Ok(entry_of(&m)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Entry::Missing),
         Err(e) => Err(e),
+    }
+}
+
+/// What `m` (read without following) says the entry is.
+fn entry_of(m: &fs::Metadata) -> Entry {
+    let kind = m.file_type();
+    if kind.is_symlink() {
+        Entry::Link
+    } else if kind.is_dir() {
+        Entry::Folder
+    } else if kind.is_file() {
+        Entry::File(m.permissions())
+    } else {
+        Entry::Other
     }
 }
 
@@ -79,10 +90,11 @@ fn refuse_link(shown: &Path) -> anyhow::Error {
 /// Make sure `root/shown` is a real folder, creating it when missing.
 fn ensure_folder(root: &Path, shown: &Path) -> Result<()> {
     let at = root.join(shown);
-    match entry_at(&at).with_context(|| format!("reading {}", at.display()))? {
+    let in_sandbox = || format!("`{}` in the sandbox", shown.display());
+    match entry_at(&at).with_context(|| format!("reading {}", in_sandbox()))? {
         Entry::Folder => Ok(()),
         Entry::Link => Err(refuse_link(shown)),
-        Entry::Missing => fs::create_dir(&at).with_context(|| format!("creating {}", at.display())),
+        Entry::Missing => fs::create_dir(&at).with_context(|| format!("creating {}", in_sandbox())),
         Entry::File(_) | Entry::Other => {
             bail!("`{}` in the sandbox is not a folder", shown.display())
         }
@@ -108,7 +120,7 @@ fn prepare(
     let parent = root.join(&shown);
     shown.push(last);
     let existing = match entry_at(&root.join(&shown))
-        .with_context(|| format!("reading {}", shown.display()))?
+        .with_context(|| format!("reading `{}` in the sandbox", shown.display()))?
     {
         Entry::Missing => None,
         Entry::File(mode) => Some(mode),
@@ -120,24 +132,50 @@ fn prepare(
     Ok((parent, last.to_os_string(), existing))
 }
 
-/// Fill a fresh temp file beside `name` in `parent`, then rename it over
-/// `name`. The temp name is created with `create_new`, so nothing already
-/// there (a link included) is opened.
+/// How many temp names [`create_temp`] tries before giving up. Each name
+/// already taken is an entry the fixture (or a concurrent setup) holds.
+const TEMP_ATTEMPTS: u32 = 64;
+
+/// The `n`th temp name a setup write tries in a folder. Its length does not
+/// depend on the file's own name, so a name up to the filesystem's limit
+/// still has room for its temp file.
+fn temp_name(n: u32) -> String {
+    format!(".darkmux-setup-{}-{n}", std::process::id())
+}
+
+/// A fresh temp file in `parent` and its path. `create_new` refuses any
+/// entry already at the name (a link included, never followed), and such a
+/// name is skipped for the next one rather than touched.
+fn create_temp(parent: &Path) -> io::Result<(fs::File, PathBuf)> {
+    for n in 0..TEMP_ATTEMPTS {
+        let tmp = parent.join(temp_name(n));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => return Ok((f, tmp)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("{TEMP_ATTEMPTS} temp names beside the file are all taken"),
+    ))
+}
+
+/// Fill a fresh temp file in `parent`, then rename it over `name`. On a
+/// failure after the temp file was made, that file (and only that one) is
+/// removed.
 fn replace(
     parent: &Path,
     name: &std::ffi::OsStr,
     mode: Option<fs::Permissions>,
     fill: impl FnOnce(&mut fs::File) -> io::Result<()>,
 ) -> io::Result<()> {
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(name);
-    tmp_name.push(format!(".darkmux-setup-{}", std::process::id()));
-    let tmp = parent.join(tmp_name);
+    let (mut f, tmp) = create_temp(parent)?;
     let placed = (|| {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
         fill(&mut f)?;
         f.flush()?;
         if let Some(mode) = mode {
@@ -156,7 +194,7 @@ fn replace(
 pub(crate) fn write_file(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
     let (parent, name, existing) = prepare(root, rel)?;
     replace(&parent, &name, existing, |f| f.write_all(content))
-        .with_context(|| format!("writing {} in the sandbox", rel.display()))
+        .with_context(|| format!("writing `{}` in the sandbox", rel.display()))
 }
 
 /// Copy the regular file `src` to `root/rel` without following a symlink
@@ -170,7 +208,7 @@ pub(crate) fn copy_file(src: &Path, root: &Path, rel: &Path) -> Result<()> {
     })
     .with_context(|| {
         format!(
-            "copying {} to {} in the sandbox",
+            "copying {} to `{}` in the sandbox",
             src.display(),
             rel.display()
         )
@@ -286,5 +324,99 @@ mod tests {
             .to_string();
         assert!(err.contains("`l`"), "{err}");
         assert!(!outside.join("c").exists());
+    }
+
+    #[test]
+    fn write_file_takes_a_name_as_long_as_the_filesystem_allows() {
+        // (#3599 review) The temp name must not grow with the key: a 250-byte
+        // name is legal (the limit is 255) and plain `fs::write` took it.
+        let tmp = TempDir::new().unwrap();
+        let name = format!("{}.txt", "a".repeat(246));
+        assert_eq!(name.len(), 250);
+        write_file(tmp.path(), Path::new(&name), b"long").unwrap();
+        assert_eq!(fs::read_to_string(tmp.path().join(&name)).unwrap(), "long");
+    }
+
+    #[test]
+    fn a_link_planted_at_the_temp_name_is_never_written_through() {
+        // (#3599 review) The fixture holds a link at the name the temp file
+        // would take: the write must not open it, and the link stays.
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside.txt");
+        fs::write(&outside, "keep").unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        symlink(&outside, root.join(temp_name(0))).unwrap();
+        write_file(&root, Path::new("notes.txt"), b"new").unwrap();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(root.join("notes.txt")).unwrap(), "new");
+        assert!(fs::symlink_metadata(root.join(temp_name(0)))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn an_entry_the_fixture_holds_at_the_temp_name_survives() {
+        // (#3599 review) A name `create_new` refused belongs to the fixture,
+        // not to this write: the cleanup must not remove it.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(temp_name(0)), "the fixture's own").unwrap();
+        write_file(tmp.path(), Path::new("notes.txt"), b"new").unwrap();
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(temp_name(0))).unwrap(),
+            "the fixture's own"
+        );
+        let failed = replace(tmp.path(), "x".as_ref(), None, |_| {
+            Err(io::Error::other("fill failed"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(temp_name(0))).unwrap(),
+            "the fixture's own"
+        );
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_temp_file_behind() {
+        let tmp = TempDir::new().unwrap();
+        let failed = replace(tmp.path(), "x".as_ref(), None, |_| {
+            Err(io::Error::other("fill failed"))
+        });
+        assert!(failed.is_err());
+        // A rename that fails after the fill: the target is a non-empty folder.
+        fs::create_dir(tmp.path().join("full")).unwrap();
+        fs::write(tmp.path().join("full/in"), "").unwrap();
+        let failed = replace(tmp.path(), "full".as_ref(), None, |f| f.write_all(b"x"));
+        assert!(failed.is_err());
+        let names: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec!["full"], "only the folder is left");
+    }
+
+    #[test]
+    fn create_temp_gives_up_when_every_name_is_taken() {
+        let tmp = TempDir::new().unwrap();
+        for n in 0..TEMP_ATTEMPTS {
+            fs::write(tmp.path().join(temp_name(n)), "").unwrap();
+        }
+        let err = create_temp(tmp.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_made_is_named_by_its_sandbox_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+        let err = write_file(&root, Path::new("a/x"), b"x").map_err(|e| format!("{e:#}"));
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let err = err.unwrap_err();
+        assert!(err.starts_with("creating `a` in the sandbox"), "{err}");
+        assert!(!err.contains(&*root.to_string_lossy()), "{err}");
     }
 }
