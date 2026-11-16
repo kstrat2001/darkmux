@@ -1087,9 +1087,20 @@ pub enum Hold {
 /// own name.
 #[derive(Debug)]
 pub struct NameHold {
-    _file: std::fs::File,
+    file: std::fs::File,
     path: PathBuf,
     how: Hold,
+}
+
+impl Drop for NameHold {
+    /// Unlocks before the file closes (#3543). A child spawned while the
+    /// name was held has a copy of the file open until it execs, and an
+    /// `flock` lasts until its last copy closes; an explicit unlock ends it
+    /// for every copy, so the name is free the moment its holder lets go.
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 impl NameHold {
@@ -1121,7 +1132,7 @@ pub fn try_hold(base: &Path, name: &str, how: Hold) -> Result<Option<NameHold>, 
             return Ok(None);
         };
         if is_file_at(&file, &path)? {
-            return Ok(Some(NameHold { _file: file, path, how }));
+            return Ok(Some(NameHold { file, path, how }));
         }
     }
     Err(format!("{} kept being replaced while darkmux locked it", path.display()))
@@ -1884,11 +1895,12 @@ mod tests {
     }
 
     /// Sets `vars` (`None` removes one) for the duration of `f`, then puts
-    /// back what was there. Callers are `#[serial]`.
+    /// back what was there. A caller setting a variable git reads runs in its
+    /// own process (`run_in_own_process!`).
     fn with_env<T>(vars: &[(&str, Option<&std::ffi::OsStr>)], f: impl FnOnce() -> T) -> T {
         let prev: Vec<(&str, Option<std::ffi::OsString>)> = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
         for (k, v) in vars {
-            // SAFETY: #[serial] callers; restored below.
+            // SAFETY: callers run in their own process; restored below.
             match v {
                 Some(v) => unsafe { std::env::set_var(k, v) },
                 None => unsafe { std::env::remove_var(k) },
@@ -1913,6 +1925,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_credential_helpers_are_the_operators_own_never_the_checkouts() {
+        darkmux_types::run_in_own_process!();
         let tmp = tempfile::tempdir().unwrap();
         let (root, src, _marker) = checkout_for_test(&tmp);
         let log = root.join("helpers-ran");
@@ -1969,6 +1982,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn fetch_runs_the_global_ssh_command() {
+        darkmux_types::run_in_own_process!();
         let tmp = tempfile::tempdir().unwrap();
         let (root, src, _marker) = checkout_for_test(&tmp);
         let fx = darkmux_types::host_git::fixture::git;
@@ -1980,7 +1994,7 @@ mod tests {
         // touch reads the `-p` among them as an option and touches nothing.
         std::fs::write(&global, format!("[core]\n\tsshCommand = \"touch '{}'; false\"\n", global_marker.display())).unwrap();
         let prev = std::env::var_os("GIT_CONFIG_GLOBAL");
-        // SAFETY: #[serial]; restored below.
+        // SAFETY: in its own process; restored below.
         unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &global) };
         let out = fetch_with_git(&src);
         unsafe {
@@ -2173,6 +2187,66 @@ mod tests {
         assert!(!is_commit_sha("main"));
         assert!(!is_commit_sha("E044900CD94D086C841616B05ED63638AA402BE4"));
         assert!(!is_commit_sha(&"g".repeat(40)));
+    }
+
+    /// (#3543) A hold let go frees its name at once, even while a child
+    /// process started during the hold still has the lock's file open. Every
+    /// spawn copies the process's open files into the child until it execs,
+    /// and `client serve` spawns git on many threads at a time; a lock let go
+    /// only by closing would stay held through that child's copy, and the
+    /// next request would get a 409 for a name nobody holds.
+    #[test]
+    fn a_hold_let_go_is_free_while_a_child_still_has_its_file_open() {
+        // Its own process: the forked child holds a copy of every file the
+        // process has open, other tests' pipes included.
+        darkmux_types::run_in_own_process!();
+        let dir = tempfile::tempdir().unwrap();
+        let held = try_hold(dir.path(), "site", Hold::Sole).unwrap().unwrap();
+        let child = ChildWithOpenFiles::start();
+        drop(held);
+        let shared = try_hold(dir.path(), "site", Hold::Shared).unwrap();
+        child.end();
+        assert!(shared.is_some(), "the name stayed held through the child's copy of the lock file");
+    }
+
+    /// A forked child that keeps a copy of every open file of this process
+    /// until [`Self::end`], as a spawned child does until it execs.
+    struct ChildWithOpenFiles {
+        pid: libc::pid_t,
+        release: std::fs::File,
+    }
+
+    impl ChildWithOpenFiles {
+        fn start() -> Self {
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            for fd in fds {
+                // Kept out of every other child this process spawns.
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }, 0);
+            }
+            // SAFETY: the child calls only `read` and `_exit`, which are
+            // async-signal-safe, so forking a threaded process is sound.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                let mut byte = 0u8;
+                unsafe {
+                    libc::close(fds[1]);
+                    libc::read(fds[0], (&mut byte as *mut u8).cast(), 1);
+                    libc::_exit(0);
+                }
+            }
+            unsafe { libc::close(fds[0]) };
+            // SAFETY: `fds[1]` is this process's own, newly made write end.
+            let release = unsafe { <std::fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(fds[1]) };
+            Self { pid, release }
+        }
+
+        fn end(self) {
+            drop(self.release);
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(self.pid, &mut status, 0) }, self.pid);
+        }
     }
 
     /// A name held alone excludes every other hold; shared holds go

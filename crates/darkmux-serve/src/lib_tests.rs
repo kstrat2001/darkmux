@@ -1124,6 +1124,7 @@
     #[test]
     #[serial_test::serial]
     fn the_residents_read_lists_darkmuxs_engine_servers() {
+        darkmux_types::run_in_own_process!();
         let _home = CrewDirGuard::new();
         let tmp = TempDir::new().unwrap();
         let _server = RecordedServer::start("tf", "tensorfold", "TensorFold/q38", 262_144);
@@ -1147,6 +1148,7 @@
     #[test]
     #[serial_test::serial]
     fn a_card_read_with_silent_servers_returns_well_inside_a_peers_timeout() {
+        darkmux_types::run_in_own_process!();
         let _home = CrewDirGuard::new();
         let tmp = TempDir::new().unwrap();
         let silent: Vec<std::net::TcpListener> = (0..3).map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap()).collect();
@@ -7134,8 +7136,8 @@
     /// `CrewDirGuard` pattern used throughout `darkmux-crew`'s own tests
     /// (`cli.rs`, `index.rs`) — `DARKMUX_HOME` is the darkmux root, read
     /// live per call, so no process restart is needed for the override to
-    /// take effect. Callers of anything backed by this guard MUST be
-    /// `#[serial_test::serial]` (env var mutation isn't thread-safe).
+    /// take effect. It sets `HOME`, which every child of the process reads, so
+    /// a test using it runs in its own process (`run_in_own_process!`).
     struct CrewDirGuard {
         prev: Option<String>,
         prev_home: Option<String>,
@@ -7233,6 +7235,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn runs_requests_inside_the_ttl_share_one_build() {
+        darkmux_types::run_in_own_process!();
         let _guard = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
         let builds = || super::RUNS_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
@@ -7283,6 +7286,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn a_runs_poll_past_the_ttl_with_nothing_new_is_served_while_it_rebuilds() {
+        darkmux_types::run_in_own_process!();
         let _guard = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
         let builds = || super::RUNS_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
@@ -7331,6 +7335,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn a_live_runs_rebuild_superseded_by_new_work_is_dropped_and_runs_alone() {
+        darkmux_types::run_in_own_process!();
         let _guard = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
         let builds = || super::RUNS_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
@@ -7415,6 +7420,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn the_first_runs_poll_after_an_idle_hour_waits_for_a_new_build() {
+        darkmux_types::run_in_own_process!();
         let _guard = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
         let get = || async {
@@ -7442,6 +7448,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn a_board_with_no_running_row_reads_no_view_and_no_beats() {
+        darkmux_types::run_in_own_process!();
         use std::sync::atomic::Ordering;
         let _guard = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
@@ -7495,6 +7502,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn runs_handler_lists_a_tracked_mission_run() {
+        darkmux_types::run_in_own_process!();
         let _guard = CrewDirGuard::new();
         let mission = minimal_mission("runs-test-mission", vec![]);
         save_test_mission(&mission);
@@ -7531,6 +7539,7 @@
     #[tokio::test]
     #[serial_test::serial] // pins HOME and DARKMUX_HOME
     async fn runs_handler_publishes_its_lifecycle_policy() {
+        darkmux_types::run_in_own_process!();
         let _home = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
         let app = build_router_full_local(flows.path().to_path_buf(), None);
@@ -7549,6 +7558,7 @@
     #[tokio::test]
     #[serial_test::serial] // pins HOME and DARKMUX_HOME
     async fn runs_handler_names_the_tokens_on_no_run_so_rows_plus_it_reconcile() {
+        darkmux_types::run_in_own_process!();
         let _home = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
         let ts = darkmux_flow::ts_utc_now();
@@ -7584,6 +7594,7 @@
     #[tokio::test]
     #[serial_test::serial] // pins HOME, DARKMUX_HOME and DARKMUX_REDIS_URL
     async fn runs_handler_marks_a_running_row_on_a_down_peer_not_reporting() {
+        darkmux_types::run_in_own_process!();
         use crate::fleet_view::{tests as fv, CardOutcome, FleetContext, UnreachableReason};
         let _home = CrewDirGuard::new();
         let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
@@ -7726,6 +7737,7 @@
     #[tokio::test]
     #[serial_test::serial] // pins HOME and DARKMUX_HOME
     async fn runs_handler_includes_lab_runs_with_kind_lab() {
+        darkmux_types::run_in_own_process!();
         let _home = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
         let lab = TempDir::new().unwrap();
@@ -7753,6 +7765,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn runs_handler_never_errors_with_no_sources_configured() {
+        darkmux_types::run_in_own_process!();
         let _guard = CrewDirGuard::new();
         let flows = TempDir::new().unwrap();
         let app = build_router_full_local(flows.path().to_path_buf(), None);
@@ -7793,6 +7806,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn run_list_verb_and_runs_handler_agree_on_the_same_fixture() {
+        darkmux_types::run_in_own_process!();
         let _guard = CrewDirGuard::new();
         let mission = minimal_mission("conformance-mission", vec![]);
         save_test_mission(&mission);
@@ -8018,6 +8032,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_json_returns_404_for_unknown_mission() {
+        darkmux_types::run_in_own_process!();
         let _guard = CrewDirGuard::new();
         let app = build_router_local(PathBuf::new());
         let response = app
@@ -8035,6 +8050,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_json_rejects_invalid_id() {
+        darkmux_types::run_in_own_process!();
         let _guard = CrewDirGuard::new();
         let app = build_router_local(PathBuf::new());
         let response = app
@@ -8056,6 +8072,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_json_legacy_mission_is_phases_only_with_a_note() {
+        darkmux_types::run_in_own_process!();
         let _guard = CrewDirGuard::new();
         let mission = minimal_mission("legacy-mission", vec!["only-phase".to_string()]);
         save_test_mission(&mission);
@@ -8093,6 +8110,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_json_fan_in_shape() {
+        darkmux_types::run_in_own_process!();
         let _guard = CrewDirGuard::new();
         let mission_id = "fanin-mission";
         let mission = minimal_mission(mission_id, vec!["p1".to_string()]);
@@ -8288,6 +8306,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_json_live_mixed_phase_renders_running_with_counts() {
+        darkmux_types::run_in_own_process!();
         let _guard = CrewDirGuard::new();
         let mission_id = "mixed-2406";
         let mission = minimal_mission(mission_id, vec!["p1".to_string()]);
@@ -8394,6 +8413,7 @@
     // sibling), 0/25 with the attribute.
     #[serial_test::serial]
     async fn mission_graph_json_admitted_not_dispatched_task_reads_waiting_not_running() {
+        darkmux_types::run_in_own_process!();
         let _guard = CrewDirGuard::new();
         let mission_id = "waiting-2343";
         let mission = minimal_mission(mission_id, vec!["p1".to_string()]);
@@ -8498,6 +8518,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_json_synthesizes_planned_steps_for_unpersisted_step_files() {
+        darkmux_types::run_in_own_process!();
         let _guard = CrewDirGuard::new();
         let mission_id = "midrun-mission";
         save_test_mission(&minimal_mission(mission_id, vec!["p1".to_string()]));
@@ -8727,6 +8748,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_json_review_config_interpreted_shape() {
+        darkmux_types::run_in_own_process!();
         let _guard = CrewDirGuard::new();
         let loaded = darkmux_crew::mission_config::load("review").expect("embedded review config loads");
 
@@ -8828,6 +8850,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_json_backfills_completed_step_totals_from_flow_records() {
+        darkmux_types::run_in_own_process!();
         use darkmux_crew::types::{NodeStatus, Step, Task};
         let _guard = CrewDirGuard::new();
         let mission_id = "backfill-mission";
@@ -8929,6 +8952,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_json_backfill_absent_when_no_flow_records() {
+        darkmux_types::run_in_own_process!();
         use darkmux_crew::types::{NodeStatus, Step, Task};
         let _guard = CrewDirGuard::new();
         let mission_id = "no-records-mission";
@@ -9010,6 +9034,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn mission_graph_json_planned_step_shows_no_phantom_tokens_from_collided_record() {
+        darkmux_types::run_in_own_process!();
         use darkmux_crew::types::{NodeStatus, Step, Task};
         let _guard = CrewDirGuard::new();
         let mission_id = "phantom-tokens-mission";

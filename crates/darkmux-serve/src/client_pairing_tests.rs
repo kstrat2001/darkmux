@@ -3686,6 +3686,7 @@ fn a_work_copy_whose_repo_config_defines_a_filter_is_refused() {
 #[test]
 #[serial_test::serial]
 fn reading_changes_runs_nothing_a_planted_submodule_names_under_diff_submodule_diff() {
+    darkmux_types::run_in_own_process!();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let marker = root.join("host-ran-a-planted-submodule");
@@ -3704,7 +3705,7 @@ fn reading_changes_runs_nothing_a_planted_submodule_names_under_diff_submodule_d
     let global = root.join("global-config");
     std::fs::write(&global, "[diff]\n\tsubmodule = diff\n").unwrap();
     let prev = std::env::var_os("GIT_CONFIG_GLOBAL");
-    // SAFETY: #[serial]; restored below.
+    // SAFETY: in its own process; restored below.
     unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &global) };
     let read = (|| {
         let before = snapshot_tree(&wd)?;
@@ -8433,6 +8434,7 @@ async fn host_git_touches_only_a_recorded_workspace_directly_under_the_base() {
 #[test]
 #[serial_test::serial]
 fn a_first_commit_on_a_machine_with_no_git_identity_is_darkmuxs() {
+    darkmux_types::run_in_own_process!();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let (w, g) = (root.join("w"), root.join(".w.git"));
