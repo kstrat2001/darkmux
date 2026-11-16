@@ -3103,7 +3103,8 @@ mod tests {
     /// arguments to `calls` and answers as a daemon would: `create` fails
     /// for a container named `*fail*`, `exec` prints listeners (none for
     /// `*quiet*`), `start -a` prints a line, `version` reports the daemon
-    /// down. Callers are `#[serial]`.
+    /// down. Callers run in their own process (`run_in_own_process!`): every
+    /// child of the process reads `PATH`.
     #[cfg(unix)]
     fn with_fake_docker<T>(f: impl FnOnce(&Path) -> T) -> T {
         use std::os::unix::fs::PermissionsExt;
@@ -3124,7 +3125,7 @@ mod tests {
         let mut path = std::ffi::OsString::from(dir.path());
         path.push(":");
         path.push(&prev);
-        // SAFETY: #[serial] callers; restored below.
+        // SAFETY: callers run in their own process; restored below.
         unsafe { std::env::set_var("PATH", &path) };
         let out = f(&calls);
         unsafe { std::env::set_var("PATH", &prev) };
@@ -3139,6 +3140,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_docker_cli_is_driven_as_previews_need() {
+        darkmux_types::run_in_own_process!();
         let recipe = a_recipe(serde_json::json!({"schema_version": "1.0", "command": "npm run dev"}));
         let mut spec = a_spec(&recipe, None);
         let docker = Docker { image: Some("sha256:pinned".into()) };
@@ -3173,6 +3175,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_preview_image_is_the_pinned_one_or_the_resolved_runtime_image() {
+        darkmux_types::run_in_own_process!();
         let user = darkmux_crew::dispatch_internal::runtime_container_user().unwrap();
         with_fake_docker(|_| {
             let pinned = Docker { image: Some("sha256:pinned".into()) }.image_and_user().unwrap();
