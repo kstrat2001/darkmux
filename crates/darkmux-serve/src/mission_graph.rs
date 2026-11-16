@@ -288,8 +288,12 @@ impl GraphNode {
 }
 
 impl StepRow {
-    /// See [`GraphNode::status_word`].
+    /// See [`GraphNode::status_word`]. (#3195) `waiting` for a step that
+    /// waits for its turn ([`StepRow::waiting`]), as its task reads.
     pub fn status_word(&self) -> String {
+        if self.waiting {
+            return "waiting".to_string();
+        }
         shown_word(&self.status, self.abandoned_reason)
     }
 }
