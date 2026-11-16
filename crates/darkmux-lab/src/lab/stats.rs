@@ -62,7 +62,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Data-shape semver for [`RunStats`], per the repo's additive-minor rule.
-pub const RUN_STATS_SCHEMA_VERSION: &str = "2.3.0";
+pub const RUN_STATS_SCHEMA_VERSION: &str = "2.4.0";
 
 use darkmux_trajectory::DEGENERATE_TAIL_RATIO;
 
@@ -72,6 +72,18 @@ use darkmux_trajectory::DEGENERATE_TAIL_RATIO;
 /// 96-97% at 28-46 W against idle at 0-2% and 0-43 mW. Anything in the middle
 /// would be an artifact of a sample landing on a boundary, not a real state.
 pub const BUSY_GPU_PCT: u64 = 20;
+
+/// (#3402) GPU-rail watts at or under which the GPU drew no more than
+/// background work does (window compositing, a browser, video), whatever
+/// its utilization read.
+///
+/// Measured on an M5 Max over 83,047 telemetry samples (October and
+/// November 2026): samples at or above [`BUSY_GPU_PCT`] utilization fall in
+/// two groups, background use at 0 to 2 W (6,882 samples) and model
+/// generation from 5 W up, with 2.5 to 4.5 W nearly empty (78 samples).
+/// The line sits at the bottom of that gap. Another chip's generation draw
+/// was not measured; a smaller GPU's could sit lower.
+pub const IDLE_GPU_W: f64 = 2.5;
 
 /// Decimal places a renderer must keep when printing a tail ratio.
 ///
@@ -326,6 +338,9 @@ pub struct RunStats {
 
     // --- host -------------------------------------------------------------
     pub gpu_w_busy: Option<f64>,
+    /// (2.4.0, #3402) The highest GPU-rail watts any telemetry sample in the
+    /// run window read, busy or not. `None` where no sample reads a GPU rail.
+    pub gpu_w_max: Option<f64>,
     pub cpu_w_busy: Option<f64>,
     pub pkg_w_busy: Option<f64>,
     /// GPU utilization's duty cycle. `None` where the host reads no GPU
@@ -960,6 +975,7 @@ pub(crate) fn derive_stats(
         },
         bounds: flows.bounds.clone(),
         gpu_w_busy: host.gpu_w_busy,
+        gpu_w_max: host.gpu_w_max,
         cpu_w_busy: host.cpu_w_busy,
         pkg_w_busy: host.pkg_w.map(|v| round(v, 1)),
         gpu_duty_pct: host.duty,
@@ -1198,6 +1214,7 @@ fn host_unmeasured(samples: &[Sample], host: &HostFigures) -> BTreeMap<String, S
     }
     let unread = [
         ("gpu_w_busy", host.gpu_w_busy.is_none() && samples.iter().all(|s| s.w_gpu.is_none()), "a GPU power rail"),
+        ("gpu_w_max", host.gpu_w_max.is_none(), "a GPU power rail"),
         ("cpu_w_busy", host.cpu_w_busy.is_none() && samples.iter().all(|s| s.w_cpu.is_none()), "a CPU power rail"),
         ("thermal_states_busy", samples.iter().all(|s| s.thermal_state.is_none()), "a thermal pressure state"),
         ("cpu_speed_limit_min", samples.iter().all(|s| s.cpu_speed_limit_pct.is_none()), "a CPU speed limit"),
@@ -1226,6 +1243,7 @@ struct HostFigures {
     samples_busy: usize,
     pkg_w: Option<f64>,
     gpu_w_busy: Option<f64>,
+    gpu_w_max: Option<f64>,
     cpu_w_busy: Option<f64>,
     duty: Option<f64>,
     busy_ms: Option<u64>,
@@ -1268,6 +1286,7 @@ impl HostFigures {
             samples_busy: busy.len(),
             pkg_w: mean(busy.iter().map(|s| s.w_total)),
             gpu_w_busy: mean(busy.iter().filter_map(|s| s.w_gpu)).map(|v| round(v, 1)),
+            gpu_w_max: flows.samples.iter().filter_map(|s| s.w_gpu).reduce(f64::max).map(|v| round(v, 1)),
             cpu_w_busy: mean(busy.iter().filter_map(|s| s.w_cpu)).map(|v| round(v, 1)),
             // A duty from stream bookends is not a GPU figure, so it is not
             // reported as one; `busy_ms` still carries it.
