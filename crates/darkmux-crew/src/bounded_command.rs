@@ -329,6 +329,7 @@ fn sweep_group(pid: u32) {
 
 /// [`sweep_group`]'s loop: `kill` only after `has_members` said yes, and
 /// `nap` between rounds.
+#[cfg(unix)]
 fn sweep_group_with(mut has_members: impl FnMut() -> bool, mut kill: impl FnMut(), nap: Duration) {
     for _ in 0..SWEEP_ROUNDS {
         if !has_members() {
@@ -485,29 +486,108 @@ mod tests {
         assert!(left.is_empty(), "a forked grandchild survived the group kill: {left}");
     }
 
-    /// (#2823) Every `run_bounded` kill path sweeps the group: a command
-    /// forking in a loop when its bound runs out leaves nothing running.
-    /// On macOS one group kill misses a child forked during it (this test
-    /// finds survivors with the sweeps removed); Linux's kill reaches such a
-    /// child, so there it holds either way. Its forks are bounded by the
-    /// 300 ms run.
+    /// (#2823) A command that forks in a loop, at most four live children at
+    /// a time (it kills each batch itself), so a run holds the burst small
+    /// on any machine. It writes `started` first. On macOS one group kill
+    /// against it left a child forked mid-kill alive in 6 of 20 tries.
+    fn forking_loop(m: &str, started: &std::path::Path) -> String {
+        format!(
+            ": > '{}'; while :; do sleep {m} & a=$!; sleep {m} & b=$!; sleep {m} & c=$!; sleep {m} & d=$!; \
+             kill $a $b $c $d 2>/dev/null; done",
+            started.display()
+        )
+    }
+
+    /// How many runs each kill-path test makes at once: one run's kill lands
+    /// mid-fork about a third of the time, so with the sweep removed these
+    /// leave a survivor all but certainly.
+    const FORK_TRIALS: usize = 16;
+
+    /// `run(i, started_i)` for each trial on threads of its own, each with
+    /// its own `started` file under `dir`; their outcomes.
+    fn run_trials(dir: &std::path::Path, run: impl Fn(&std::path::Path) -> Bounded + Sync) -> Vec<Bounded> {
+        std::thread::scope(|scope| {
+            let runs: Vec<_> = (0..FORK_TRIALS)
+                .map(|i| {
+                    let (run, started) = (&run, dir.join(format!("started-{i}")));
+                    scope.spawn(move || run(&started))
+                })
+                .collect();
+            runs.into_iter().map(|r| r.join().unwrap()).collect()
+        })
+    }
+
+    /// Nothing named `sleep <m>` is left running half a second on.
+    fn assert_none_left(m: &str, path: &str) {
+        std::thread::sleep(Duration::from_millis(500));
+        let left = survivors_now(m);
+        let _ = Command::new("pkill").args(["-f", &format!("sleep {m}")]).status();
+        assert!(left.is_empty(), "children of a command killed on the {path} path were left running: {left}");
+    }
+
+    /// (#2823) Each `run_bounded` kill path sweeps the group: a command
+    /// forking when it is killed leaves nothing running. With that path's
+    /// sweep removed these fail on macOS. Linux's group kill reaches a child
+    /// forked during it, so there they hold either way.
     #[test]
     #[serial_test::serial]
     #[cfg(unix)]
     fn a_command_forking_when_its_bound_runs_out_leaves_nothing_running() {
-        let m = marker(9);
-        let out = run_bounded(sh(&format!("while :; do sleep {m} & done")), Duration::from_millis(300));
-        assert!(matches!(out, Bounded::TimedOut { .. }), "got {out:?}");
-        std::thread::sleep(Duration::from_millis(500));
-        let left = survivors_now(&m);
-        let _ = Command::new("pkill").args(["-f", &format!("sleep {m}")]).status();
-        assert!(left.is_empty(), "children of a killed command were left running: {left}");
+        let (m, dir) = (marker(9), tempfile::tempdir().unwrap());
+        let outs = run_trials(dir.path(), |started| run_bounded(sh(&forking_loop(&m, started)), Duration::from_millis(100)));
+        assert!(outs.iter().all(|o| matches!(o, Bounded::TimedOut { .. })), "{outs:?}");
+        assert_none_left(&m, "timeout");
+    }
+
+    /// (#2823) The interrupt path, as above.
+    #[test]
+    #[serial_test::serial] // the interrupt flag is process-wide
+    #[cfg(unix)]
+    fn a_command_forking_when_a_signal_is_caught_leaves_nothing_running() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        let (m, dir) = (marker(10), tempfile::tempdir().unwrap());
+        darkmux_types::interrupt::reset_for_test();
+        let raiser = {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while (0..FORK_TRIALS).any(|i| !dir.join(format!("started-{i}")).exists()) {
+                    assert!(Instant::now() < deadline, "the commands never all started");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                darkmux_types::interrupt::simulate_sigterm_for_test();
+            })
+        };
+        let outs = run_trials(dir.path(), |started| run_bounded(sh(&forking_loop(&m, started)), Duration::from_secs(60)));
+        let raised = raiser.join();
+        darkmux_types::interrupt::reset_for_test();
+        raised.expect("the raiser must see every command running, then raise the flag");
+        assert!(outs.iter().all(|o| matches!(o, Bounded::Interrupted)), "{outs:?}");
+        assert_none_left(&m, "interrupt");
+    }
+
+    /// (#2823) The finished path, as above: the command exits at once and
+    /// leaves the forking loop holding its output, which `run_bounded` kills
+    /// once the drain grace is out.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn a_finished_command_whose_leftover_is_forking_leaves_nothing_running() {
+        let (m, dir) = (marker(11), tempfile::tempdir().unwrap());
+        let outs = run_trials(dir.path(), |started| {
+            run_bounded(sh(&format!("( {} ) & :", forking_loop(&m, started))), Duration::from_secs(60))
+        });
+        assert!(outs.iter().all(|o| matches!(o, Bounded::Finished { success: true, .. })), "{outs:?}");
+        assert_none_left(&m, "finished");
     }
 
     /// (#2823) The sweep kills only after a look found a member, and stops
     /// at the first look that finds none, so it never signals a group that
     /// has emptied (whose id could be reused).
     #[test]
+    #[cfg(unix)]
     fn the_sweep_kills_only_after_a_look_finds_a_member() {
         for (members, kills) in [(vec![false], 0), (vec![true, true, false], 2), (vec![true; 60], SWEEP_ROUNDS as usize)] {
             let looks = std::cell::RefCell::new(members.clone().into_iter());
