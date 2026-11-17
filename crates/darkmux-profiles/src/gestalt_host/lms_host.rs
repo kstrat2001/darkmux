@@ -1270,6 +1270,22 @@ esac"#,
         assert!(matches!(err, HostError::Timeout { phase: "ls", .. }), "{err:?}");
     }
 
+    /// (#1135 class) The limit read before a load is bounded like every
+    /// other listing: a wedged `lms ls` states no limit at the adapter's
+    /// list bound, and its child is killed there, not waited out.
+    #[cfg(unix)]
+    #[test]
+    fn context_limit_with_a_wedged_ls_states_none_at_the_adapter_bound() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = outlives_marker(dir.path());
+        let stub = write_stub(dir.path(), &format!("(sleep 30; touch '{}') & wait", marker.display()));
+        let mut host = LmsHost::with_bin(stub.to_string_lossy()).with_list_bound(Duration::from_millis(200));
+        let started = Instant::now();
+        assert_eq!(host.context_limit("m"), None, "a wedged listing states no limit");
+        assert!(started.elapsed() < Duration::from_secs(10), "returned at the bound: {:?}", started.elapsed());
+        assert!(!marker.exists(), "the listing was killed at its bound, not waited out");
+    }
+
     #[cfg(unix)]
     #[test]
     fn list_resident_preserves_host_order_and_raw_bytes() {

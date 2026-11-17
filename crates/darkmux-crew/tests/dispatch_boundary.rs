@@ -1054,6 +1054,22 @@ fn a_base_url_override_skips_residency_and_addresses_the_bare_model() {
     assert_eq!(payload(&rig.record("telemetry.tokens"))["endpoint"], "http://127.0.0.1:9/v1", "usage names the override");
 }
 
+/// (#1135 class) A model resident at its context is reused, and the model's
+/// maximum context is read only for a load: a reuse asks LM Studio's
+/// catalog nothing (no `lms ls`) and loads nothing.
+#[test]
+#[serial]
+fn a_reuse_reads_no_catalog_and_loads_nothing() {
+    own_process!();
+    let rig = Rig::new();
+    rig.container(ONE_TURN, ENVELOPE, "", 0);
+    let (res, _) = run(&rig, rig.opts());
+    assert_eq!(res.expect("reuses the resident at 32000").exit_code, 0);
+    let lms = rig.lms_log();
+    assert!(lms.iter().any(|l| l == "ps --json"), "residency was read: {lms:?}");
+    assert!(lms.iter().all(|l| !l.starts_with("ls") && !l.starts_with("load")), "{lms:?}");
+}
+
 #[test]
 #[serial]
 fn a_model_that_is_not_resident_is_loaded_namespaced_at_its_context() {
