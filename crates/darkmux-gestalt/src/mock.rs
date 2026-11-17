@@ -38,6 +38,12 @@ pub struct MockHost {
     /// recorded (the attempt happened).
     pub fail_next_load: Option<HostError>,
     pub fail_next_unload: Option<HostError>,
+    /// The largest context each model takes, as a catalog states it
+    /// ([`ModelHost::context_limit`]); a model not listed states none.
+    pub context_limits: std::collections::BTreeMap<String, u64>,
+    /// Every load lands at this context, whatever was asked, as a host
+    /// that caps a load would; `None` loads at the asked context.
+    pub loads_at: Option<u64>,
 }
 
 impl MockHost {
@@ -74,6 +80,12 @@ impl MockHost {
             model_key: model_key.to_string(),
             size_bytes: Some(size_bytes),
         });
+        self
+    }
+
+    /// Builder: the catalog states `model_key` takes at most `limit`.
+    pub fn context_limited(mut self, model_key: &str, limit: u64) -> Self {
+        self.context_limits.insert(model_key.to_string(), limit);
         self
     }
 
@@ -117,14 +129,21 @@ impl ModelHost for MockHost {
         if let Some(err) = self.fail_next_load.take() {
             return Err(err);
         }
+        let ctx = self.loads_at.unwrap_or(u64::from(min_ctx));
         self.residents.push(ResidentFact {
             identifier: identifier.to_string(),
             model_key: model_key.to_string(),
-            ctx: u64::from(min_ctx),
+            ctx,
             est_bytes: None,
             parallel: 0,
         });
-        Ok(LoadReport { resolved_ctx: Some(u64::from(min_ctx)), ..Default::default() })
+        Ok(LoadReport { resolved_ctx: Some(ctx), ..Default::default() })
+    }
+
+    /// Read from [`MockHost::context_limits`]; recorded as no op, since it
+    /// mutates nothing.
+    fn context_limit(&mut self, model_key: &str) -> Option<u64> {
+        self.context_limits.get(model_key).copied()
     }
 
     fn unload(&mut self, target: &OwnedTarget, _deadline: Deadline) -> Result<(), HostError> {
