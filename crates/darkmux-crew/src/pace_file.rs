@@ -182,6 +182,45 @@ pub(crate) fn write_with_turn_delay(
     if std::fs::write(&tmp_path, &json).is_ok() {
         let _ = std::fs::rename(&tmp_path, path(host_out));
     }
+    #[cfg(test)]
+    write_log::record(host_out, pause, reason, turn_delay_ms);
+}
+
+/// Every pace-file write this thread made, so a test can check each write
+/// inside a tick rather than only the file the tick leaves behind (the
+/// runtime polls on its own cadence and can read any of them). Test builds
+/// only; a thread-local, so parallel tests never see each other's writes.
+#[cfg(test)]
+pub(crate) mod write_log {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    /// One write: what it told the runtime.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct Write {
+        pub pause: bool,
+        pub reason: String,
+        pub turn_delay_ms: Option<u64>,
+    }
+
+    thread_local! {
+        static LOG: RefCell<Vec<(PathBuf, Write)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(host_out: &Path, pause: bool, reason: &str, turn_delay_ms: Option<u64>) {
+        let write = Write { pause, reason: reason.to_string(), turn_delay_ms };
+        LOG.with(|l| l.borrow_mut().push((host_out.to_path_buf(), write)));
+    }
+
+    /// The writes to `host_out` since the last call, in order; clears them.
+    pub(crate) fn take(host_out: &Path) -> Vec<Write> {
+        LOG.with(|l| {
+            let mut log = l.borrow_mut();
+            let (mine, rest): (Vec<_>, Vec<_>) = log.drain(..).partition(|(p, _)| p == host_out);
+            *log = rest;
+            mine.into_iter().map(|(_, w)| w).collect()
+        })
+    }
 }
 
 #[cfg(test)]

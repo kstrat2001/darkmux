@@ -46,9 +46,16 @@ pub struct TickRecord {
     pub at_ms: u64,
     pub reading: HostReading,
     pub events: TickEvents,
+    /// What the budget pacer decided this tick, when the tick ran one
+    /// ([`ScenarioDriver::tick_beside_pacer`]).
+    pub pacer: Option<crate::budget::PacerEvent>,
     /// The pace file's contents after this tick, when one exists.
     pub pace: Option<serde_json::Value>,
 }
+
+/// A budget pacer and what it ticks against, lent to one driver tick.
+type PacerSeat<'a, 'c> =
+    (&'a mut crate::budget::BudgetPacer, &'a crate::budget::BudgetCaller<'c>, &'a dyn crate::budget::BudgetEnv);
 
 /// Drives a scenario through a governor pair and records every tick.
 pub struct ScenarioDriver {
@@ -97,14 +104,38 @@ impl ScenarioDriver {
     }
 
     /// One tick: advance the simulated clock, read, feed both governors,
-    /// snapshot the pace file.
+    /// snapshot the pace file. No budget pacer runs.
     pub fn tick(&mut self) -> &TickRecord {
+        self.step(None)
+    }
+
+    /// One tick with a real budget pacer beside the governors, in the live
+    /// sampler's order: both governors (told whether the pacer holds a pause
+    /// as the tick begins), then the pacer (told what they now hold, through
+    /// `GovernorPair::other_pacing`). The pacer's window is whatever `env`
+    /// says; a scenario file carries host readings only, so the test drives
+    /// the window.
+    pub fn tick_beside_pacer(
+        &mut self,
+        pacer: &mut crate::budget::BudgetPacer,
+        caller: &crate::budget::BudgetCaller<'_>,
+        env: &dyn crate::budget::BudgetEnv,
+    ) -> &TickRecord {
+        self.step(Some((pacer, caller, env)))
+    }
+
+    fn step(&mut self, pacer: Option<PacerSeat<'_, '_>>) -> &TickRecord {
         self.source.advance(self.tick_ms);
         self.at_ms = self.at_ms.saturating_add(self.tick_ms);
         let reading = self.source.read();
-        let events = self.pair.tick(&reading, self.tick_ms, &self.host_out, self.stop_file.as_deref(), false);
+        let budget_pausing = pacer.as_ref().is_some_and(|(p, _, _)| p.is_pausing());
+        let events =
+            self.pair.tick(&reading, self.tick_ms, &self.host_out, self.stop_file.as_deref(), budget_pausing);
+        let pacer = pacer.and_then(|(p, caller, env)| {
+            p.on_tick(self.tick_ms, &self.host_out, &self.pair.other_pacing(), caller, env)
+        });
         let pace = read_pace(&self.host_out);
-        self.ticks.push(TickRecord { at_ms: self.at_ms, reading, events, pace });
+        self.ticks.push(TickRecord { at_ms: self.at_ms, reading, events, pacer, pace });
         self.ticks.last().expect("just pushed")
     }
 
@@ -125,6 +156,16 @@ impl ScenarioDriver {
             self.tick();
         }
         self
+    }
+
+    /// The source's simulated clock and the scenario's own span, so a test
+    /// that steps tick by tick knows where it is and where the run ends.
+    pub fn source_now_ms(&self) -> u64 {
+        self.source.now_ms()
+    }
+
+    pub fn span_ms(&self) -> u64 {
+        self.source.span_ms()
     }
 
     pub fn ticks(&self) -> &[TickRecord] {
@@ -270,6 +311,12 @@ pub mod library {
     /// survive the thermal duty cycle.
     pub const BATTERY_CRITICAL_THEN_FAIR: &str =
         include_str!("../scenarios/battery-critical-then-fair.jsonl");
+    /// A thermal duty cycle, then a battery pause and its release, all
+    /// while a budget pacer holds the run: no governor's release may land
+    /// on the pacer's pause, and the pacer's own release hands back the
+    /// duty cycle.
+    pub const PACER_HOLDS_ACROSS_DUTY_AND_BATTERY: &str =
+        include_str!("../scenarios/pacer-holds-across-duty-and-battery.jsonl");
     /// Every soft severity, replayed under degenerate threshold pairs.
     pub const MIXED_READINGS: &str = include_str!("../scenarios/mixed-readings.jsonl");
     /// A GAP in the OS thermal reading mid-episode — "time passed, no new
@@ -306,6 +353,7 @@ pub mod library {
             ("one-sustained-serious.jsonl", ONE_SUSTAINED_SERIOUS),
             ("critical-breaker.jsonl", CRITICAL_BREAKER),
             ("battery-critical-then-fair.jsonl", BATTERY_CRITICAL_THEN_FAIR),
+            ("pacer-holds-across-duty-and-battery.jsonl", PACER_HOLDS_ACROSS_DUTY_AND_BATTERY),
             ("mixed-readings.jsonl", MIXED_READINGS),
             ("reading-gaps.jsonl", READING_GAPS),
             ("flapping-at-the-threshold.jsonl", FLAPPING_AT_THE_THRESHOLD),

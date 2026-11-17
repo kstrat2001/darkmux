@@ -1232,3 +1232,230 @@ fn a_disabled_governor_decides_nothing_at_all() {
     );
     assert!(!d.stop_file_written(), "and must never stop a crawl");
 }
+
+// ── the budget pacer as a scenario writer ────────────────────────────────
+
+/// A battery governor with the floor at 50% whose heartbeat and blind
+/// ceiling follow `max_pause_ms` the way production derives both.
+fn battery_at_floor_50(max_pause_ms: u64) -> BatteryGovernor {
+    let ceiling = if max_pause_ms == 0 { darkmux_types::config_access::THERMAL_MAX_PAUSE_MS_DEFAULT } else { max_pause_ms };
+    BatteryGovernor::new(PowerPolicyConfig { min_battery_pct: 50, refuse_start_below_min: true, pause_running_below_min: true })
+        .with_restamp_interval_ms((ceiling / 4).max(1))
+        .with_blind_ceiling_ms(ceiling)
+}
+
+#[test]
+fn the_pacer_holds_across_a_duty_cycle_and_a_battery_pause_and_hands_back_the_duty_cycle() {
+    use crate::budget::tests::{solo_caller, T0};
+    let out = out_dir();
+    let pair = GovernorPair::new(ThermalGovernor::new(shipped_defaults()), battery_at_floor_50(shipped_defaults().max_pause_ms));
+    let mut d = ScenarioDriver::new(source(library::PACER_HOLDS_ACROSS_DUTY_AND_BATTERY), pair, out.path());
+    let (mut pacer, env) = full_then_free_window();
+    let caller = solo_caller();
+    let free_at = d.span_ms() - 20_000;
+    let mut held_paused = 0;
+    while d.source_now_ms() < d.span_ms() {
+        if d.source_now_ms() >= free_at {
+            env.at(T0 + 86_400 + 1);
+        }
+        crate::pace_file::write_log::take(out.path());
+        let t = d.tick_beside_pacer(&mut pacer, &caller, &env);
+        let writes = crate::pace_file::write_log::take(out.path());
+        if pacer.is_pausing() {
+            held_paused += 1;
+            assert!(
+                writes.iter().all(|w| w.pause),
+                "at {} ms a release was written over the pacer's live pause: {writes:?}",
+                t.at_ms
+            );
+            assert_eq!(t.pace.as_ref().map(|p| p["pause"].clone()), Some(serde_json::json!(true)), "at {} ms", t.at_ms);
+        }
+    }
+    assert!(held_paused > 200, "the pacer must hold for most of the run, or nothing was tested");
+    let names = thermal_event_names(&d);
+    assert_eq!(names, vec!["DutyCycleEntered"], "the duty cycle engaged under the pacer and stayed");
+    let battery: Vec<_> = d.battery_events().into_iter().map(|(_, e)| e).collect();
+    assert!(
+        matches!(battery.as_slice(), [BatteryEvent::Paused { .. }, BatteryEvent::Resumed { .. }]),
+        "the battery paused and let go under the pacer: {battery:?}"
+    );
+    assert!(
+        d.ticks().iter().any(|t| matches!(t.pacer, Some(crate::budget::PacerEvent::Resumed { .. }))),
+        "the window must free, or the pacer's release is untested"
+    );
+    let last = d.pace().expect("pace file");
+    assert_eq!(
+        (last["pause"].as_bool(), last["reason"].as_str(), last["turn_delay_ms"].as_u64()),
+        (Some(false), Some(crate::pace_file::THERMAL_DUTY_REASON), Some(15_000)),
+        "the pacer's release hands the run back to the duty cycle in force: {last}"
+    );
+}
+
+// ── all three writers under random host histories ────────────────────────
+
+/// A small deterministic PRNG (splitmix64), so the fuzz below runs the same
+/// histories on every machine and every CI run.
+struct SplitMix(u64);
+
+impl SplitMix {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A value in `0..n`.
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// A random host history as scenario text: segments of one to 40 ticks,
+/// each a thermal reading (critical rarely, since the breaker is terminal)
+/// or a gap, and a charge either side of the 50% floor or a gap.
+fn random_history(rng: &mut SplitMix, ticks: u64) -> String {
+    let mut text = String::new();
+    let mut left = ticks;
+    while left > 0 {
+        let n = (1 + rng.below(40)).min(left);
+        left -= n;
+        let thermal = match rng.below(100) {
+            0..=29 => r#", "thermal": {"state": "nominal"}"#,
+            30..=59 => r#", "thermal": {"state": "fair"}"#,
+            60..=81 => r#", "thermal": {"state": "serious"}"#,
+            82..=83 => r#", "thermal": {"state": "critical"}"#,
+            _ => "",
+        };
+        let battery = match rng.below(5) {
+            0 | 1 => r#", "battery": {"charge_pct": 45}"#,
+            2 | 3 => r#", "battery": {"charge_pct": 80}"#,
+            _ => "",
+        };
+        text.push_str(&format!("{{\"hold_ms\": {}{thermal}{battery}}}\n", n * DEFAULT_TICK_MS));
+    }
+    text
+}
+
+/// What one tick of the fuzz saw: each writer's pause before and after,
+/// every write made inside the tick, and the file it left.
+struct FuzzTick {
+    at_ms: u64,
+    before: [bool; 3],
+    after: [bool; 3],
+    writes: Vec<crate::pace_file::write_log::Write>,
+    pace: Option<serde_json::Value>,
+    duty_delay: Option<u64>,
+}
+
+/// The five properties every tick must hold, whatever the history:
+/// A, no release is written in a tick where some writer held its pause
+/// throughout; B, any writer pausing means the file says pause; C, none
+/// pausing means it does not; D, with none pausing the file's turn delay is
+/// exactly the duty cycle in force; E, a held pause was written less than
+/// the runtime's staleness ceiling ago (the heartbeat contract).
+fn check_fuzz_tick(t: &FuzzTick, last_write_at: u64, ceiling_ms: u64, label: &str) {
+    let held_throughout = (0..3).any(|i| t.before[i] && t.after[i]);
+    let any_pausing = t.after.iter().any(|p| *p);
+    let paused = t.pace.as_ref().is_some_and(|p| p["pause"] == serde_json::json!(true));
+    let delay = t.pace.as_ref().and_then(|p| p["turn_delay_ms"].as_u64());
+    let at = format!("{label} at {} ms (thermal, battery, pacer) {:?} -> {:?}", t.at_ms, t.before, t.after);
+    assert!(!(held_throughout && t.writes.iter().any(|w| !w.pause)), "A: a release over a live pause, {at}: {:?}", t.writes);
+    assert!(!any_pausing || paused, "B: a writer pauses but the file does not, {at}: {:?}", t.pace);
+    assert!(any_pausing || !paused, "C: nobody pauses but the file does, {at}: {:?}", t.pace);
+    assert!(any_pausing || delay == t.duty_delay, "D: turn delay {delay:?}, duty cycle {:?}, {at}", t.duty_delay);
+    assert!(!any_pausing || t.at_ms - last_write_at < ceiling_ms, "E: a held pause went stale, {at}, last write {last_write_at} ms");
+}
+
+/// The overlaps the fuzz exists to meet, counted so it cannot quietly stop
+/// meeting them (a changed history generator, a governor that no longer
+/// reaches a state): `(name, ticks seen)`.
+fn fuzz_overlaps(t: &FuzzTick, seen: &mut std::collections::BTreeMap<&'static str, u64>) {
+    let [thermal, battery, pacer] = t.after;
+    let duty = t.duty_delay.is_some();
+    let battery_let_go = t.before[1] && !battery;
+    for (name, hit) in [
+        ("duty cycle under a battery pause", duty && battery),
+        ("duty cycle under a pacer pause", duty && pacer),
+        ("thermal pause over a battery pause", thermal && battery),
+        ("thermal pause over a pacer pause", thermal && pacer),
+        ("battery pause beside a pacer pause", battery && pacer),
+        ("battery release under a pacer pause", battery_let_go && pacer),
+        ("battery release into a duty cycle", battery_let_go && duty && !pacer && !thermal),
+    ] {
+        if hit {
+            *seen.entry(name).or_default() += 1;
+        }
+    }
+}
+
+/// One random history through the live order: both governors, then the
+/// pacer when there is one, its window flipped between full and free.
+fn fuzz_one(
+    seed: u64,
+    cfg: &ThermalGovernorConfig,
+    with_pacer: bool,
+    ticks: u64,
+    seen: &mut std::collections::BTreeMap<&'static str, u64>,
+) {
+    use crate::budget::tests::{solo_caller, T0};
+    let label = format!("seed {seed}, max_pause_ms {}, tier4 {}, pacer {with_pacer}", cfg.max_pause_ms, cfg.tier4_enabled);
+    let mut rng = SplitMix(seed);
+    let out = out_dir();
+    let pair = GovernorPair::new(ThermalGovernor::new(cfg.clone()), battery_at_floor_50(cfg.max_pause_ms));
+    let mut d = ScenarioDriver::new(source(&random_history(&mut rng, ticks)), pair, out.path());
+    let (mut pacer, env) = full_then_free_window();
+    let caller = solo_caller();
+    let ceiling_ms = if cfg.max_pause_ms == 0 { darkmux_types::config_access::THERMAL_MAX_PAUSE_MS_DEFAULT } else { cfg.max_pause_ms };
+    let (mut full, mut last_write_at) = (true, 0);
+    crate::pace_file::write_log::take(out.path());
+    for _ in 0..ticks {
+        if rng.below(25) == 0 {
+            full = !full;
+            env.at(if full { T0 } else { T0 + 86_400 + 1 });
+        }
+        let states = |d: &ScenarioDriver, p: &crate::budget::BudgetPacer| {
+            [d.pair().thermal.is_pausing(), d.pair().battery.is_pacing(), with_pacer && p.is_pausing()]
+        };
+        let before = states(&d, &pacer);
+        let (at_ms, pace) = {
+            let t = if with_pacer { d.tick_beside_pacer(&mut pacer, &caller, &env) } else { d.tick() };
+            (t.at_ms, t.pace.clone())
+        };
+        let writes = crate::pace_file::write_log::take(out.path());
+        if !writes.is_empty() {
+            last_write_at = at_ms;
+        }
+        let duty_delay = d.pair().thermal.duty_cycle().map(|(ms, _)| ms);
+        let t = FuzzTick { at_ms, before, after: states(&d, &pacer), writes, pace, duty_delay };
+        check_fuzz_tick(&t, last_write_at, ceiling_ms, &label);
+        fuzz_overlaps(&t, seen);
+    }
+}
+
+/// The reviewer's fuzz of PR #3638, kept as a regression test: fixed seeds
+/// across three configs, with and without the pacer, so every ordering of
+/// the three writers' pauses, releases and heartbeats is met and the run is
+/// the same on every machine.
+#[test]
+fn every_tick_of_random_histories_keeps_the_pace_file_rule() {
+    let configs = [
+        shipped_defaults(),
+        ThermalGovernorConfig { tier4_enabled: false, ..shipped_defaults() },
+        ThermalGovernorConfig { max_pause_ms: 3_600_000, ..shipped_defaults() },
+    ];
+    let mut seen = std::collections::BTreeMap::new();
+    for seed in 0..FUZZ_SEEDS {
+        for cfg in &configs {
+            for with_pacer in [false, true] {
+                fuzz_one(seed, cfg, with_pacer, FUZZ_TICKS, &mut seen);
+            }
+        }
+    }
+    assert_eq!(seen.len(), 7, "every overlap must be met, or part of the rule went untested: {seen:?}");
+    assert!(seen.values().all(|n| *n >= 3), "each overlap must be met more than by accident: {seen:?}");
+}
+
+const FUZZ_SEEDS: u64 = 40;
+const FUZZ_TICKS: u64 = 400;
