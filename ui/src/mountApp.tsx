@@ -95,16 +95,22 @@ export function isExtensionOrigin(reason: unknown): boolean {
 
 /**
  * Mount the viewer into `#root`, and return the function that takes down
- * everything this call set up: the React root (which discards a render still
- * in flight), the query cache (which cancels the timers its queries left
- * pending, such as their five-minute garbage collection), and the two global
- * listeners `installSafetyNet` added.
+ * everything this call set up: the React root, the queries and their timers,
+ * and the two global listeners `installSafetyNet` added. It resolves once
+ * the queries' in-flight fetches have settled and nothing they scheduled is
+ * left pending.
+ *
+ * What it does NOT do: unmounting a root does not cancel a render React has
+ * already queued. `createRoot(...).render()` is concurrent, so a render
+ * requested and then unmounted in the same tick still commits on a later
+ * scheduler task (into the now-empty root). A host that unmounts must let
+ * the first render commit first; under test that is React's `act`.
  *
  * `main.tsx` never calls it, because the page itself is the app's lifetime.
- * Any other host does: a test that mounts the app and leaves it mounted
- * leaves React rendering after the test is over (#2501).
+ * A test does: an app left mounted keeps working after the test is over, and
+ * fails the run once its environment is torn down (#2501).
  */
-export function mountApp(): () => void {
+export function mountApp(): () => Promise<void> {
   const removeSafetyNet = installSafetyNet();
 
   const rootEl = document.getElementById("root");
@@ -115,7 +121,7 @@ export function mountApp(): () => void {
     // Calling `paintBootError` here directly is simpler to test and skips
     // one throw/catch round trip for a case we already know about.)
     paintBootError(new Error("darkmux: #root element missing from index.html"), "boot");
-    return removeSafetyNet;
+    return async () => removeSafetyNet();
   }
 
   const queryClient = createQueryClient();
@@ -131,10 +137,15 @@ export function mountApp(): () => void {
     </StrictMode>,
   );
 
-  return () => {
+  return async () => {
     root.unmount();
-    queryClient.clear();
     removeSafetyNet();
+    // A fetch still in flight schedules its query's garbage collection when
+    // it settles, even on a query already removed from the cache, so clearing
+    // first would leave that five-minute timer behind. Wait for the canceled
+    // fetches to settle, then clear the cache and every timer it holds.
+    await queryClient.cancelQueries();
+    queryClient.clear();
   };
 }
 

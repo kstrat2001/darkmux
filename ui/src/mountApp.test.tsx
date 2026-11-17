@@ -1,4 +1,5 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, afterAll } from "vitest";
+import { act } from "@testing-library/react";
 import { mountApp, isExtensionOrigin } from "./mountApp";
 
 /**
@@ -12,44 +13,133 @@ import { mountApp, isExtensionOrigin } from "./mountApp";
  * (#2501) Every React root a test mounts is unmounted before the test ends.
  *
  * `mountApp()` renders the whole app concurrently, so its first render is
- * still in flight when a test returns. A root left mounted kept rendering
- * after the last test, and when jsdom tore its window down first the commit
- * threw `window is not defined`: the file exited 1 with every test passing.
- * This wraps `createRoot` to count roots that are still mounted, so a test
- * that leaves one behind fails here, at its own name, every time, instead of
- * the run failing once in four with no test to point at.
+ * still queued when a test returns. A root left mounted kept rendering after
+ * the last test, and when jsdom tore its window down first the commit threw
+ * `window is not defined`: the file exited 1 with every test passing. This
+ * wraps `createRoot` to count roots that are still mounted, so a test that
+ * leaves one behind fails here, at its own name.
+ *
+ * Unmounted is necessary, not sufficient: `root.unmount()` alone does not
+ * cancel a render already queued, which still commits on a later scheduler
+ * turn. So the wrapper also reads, the moment `unmount()` returns, whether
+ * React still holds work for that root (`pendingLanes`, `callbackNode` on
+ * React 18's internal root), and counts a root unmounted with work queued.
+ * That is why every mount below runs inside `act`, and why the `afterAll`
+ * teardown check further down exists.
  */
 const liveRoots = vi.hoisted(() => new Set<object>());
+const unmountedWithWorkQueued = vi.hoisted(() => ({ count: 0 }));
 vi.mock("react-dom/client", async (importOriginal) => {
   const real = await importOriginal<typeof import("react-dom/client")>();
   const createRoot: typeof real.createRoot = (...args) => {
     const root = real.createRoot(...args);
     liveRoots.add(root);
     const unmount = root.unmount.bind(root);
+    const internal = (root as unknown as { _internalRoot: { pendingLanes: number; callbackNode: unknown } })
+      ._internalRoot;
     root.unmount = () => {
       liveRoots.delete(root);
       unmount();
+      if (internal.pendingLanes !== 0 || internal.callbackNode !== null) unmountedWithWorkQueued.count++;
     };
     return root;
   };
   return { ...real, createRoot };
 });
 
-/** Every test mounts through this, so `afterEach` can take each app down. */
-const mounted: Array<() => void> = [];
-function mount(): void {
-  mounted.push(mountApp());
+/**
+ * Mount the app inside React's `act`, so the first render commits (and its
+ * effects run) before `act` returns, instead of on scheduler turns nobody
+ * waits for. `act` is React's own flush of the work it queued.
+ *
+ * The returned unmount runs as production runs it, outside `act`; with the
+ * first render already committed there is nothing queued for it to leave
+ * behind, which the `createRoot` wrapper above checks on every unmount.
+ */
+function mountInAct(): () => Promise<void> {
+  let unmount = async () => {};
+  act(() => {
+    unmount = mountApp();
+  });
+  return unmount;
 }
 
-afterEach(() => {
-  for (const unmount of mounted.splice(0)) unmount();
+/**
+ * Wait until every `selectionchange` already queued has been delivered.
+ *
+ * Focusing an element (the overlay focuses its first button) or blurring one
+ * moves the document selection, and jsdom delivers `selectionchange` later,
+ * from a zero-delay Node timer. React listens for that event on `document`
+ * for the document's lifetime, mounted or not, and its handler reads
+ * `window`: one still queued at teardown throws there. Node runs timers of
+ * equal delay in the order they were queued, so a zero-delay timer queued
+ * now runs after every one jsdom queued before it, however loaded the
+ * machine is.
+ */
+function queuedSelectionChangesDelivered(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** Every test mounts through this, so `afterEach` can take each app down. */
+const mounted: Array<() => Promise<void>> = [];
+function mount(): void {
+  mounted.push(mountInAct());
+}
+
+afterEach(async () => {
+  for (const unmount of mounted.splice(0)) await unmount();
   const leaked = liveRoots.size;
   // Take a leaked root down anyway, so one test's leak fails that test alone.
   for (const root of [...liveRoots]) (root as { unmount: () => void }).unmount();
+  const leftWorking = unmountedWithWorkQueued.count;
+  unmountedWithWorkQueued.count = 0;
   expect(leaked, "a test left a React root mounted").toBe(0);
+  expect(leftWorking, "a root was unmounted with a render still queued, which commits after the test").toBe(0);
   document.body.innerHTML = "";
   document.querySelectorAll('meta[name^="darkmux-"]').forEach((el) => el.remove());
   vi.restoreAllMocks();
+  await queuedSelectionChangesDelivered();
+});
+
+/**
+ * (#2501) Nothing this file started may still run once its environment is
+ * gone.
+ *
+ * After the last test, vitest's jsdom environment deletes `window`,
+ * `document` and the rest of the DOM globals. Any React work still queued
+ * then throws `window is not defined`, which fails the run with every test
+ * passing, and only when that work happens to lose the race. This removes the
+ * same globals itself, gives queued work a window to run in, and fails the
+ * file if anything threw, every run, instead of the race deciding.
+ */
+const TEARDOWN_GLOBALS = ["window", "self", "top", "parent", "document"] as const;
+/** How long queued work gets to show itself. A detection window, not a
+ * wait the app depends on: React's scheduler runs a render in 5ms slices
+ * across turns, and a whole-app first render takes several. */
+const TEARDOWN_WINDOW_MS = 300;
+
+async function errorsAfterSimulatedTeardown(): Promise<string[]> {
+  const errors: string[] = [];
+  const record = (e: unknown) => errors.push(e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+  // Node's own timer, captured before the globals go; it outlives them.
+  const timeout = globalThis.setTimeout;
+  const started = Date.now();
+  const saved = TEARDOWN_GLOBALS.map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
+  process.on("uncaughtException", record);
+  process.on("unhandledRejection", record);
+  try {
+    for (const [key] of saved) delete (globalThis as Record<string, unknown>)[key];
+    while (Date.now() - started < TEARDOWN_WINDOW_MS) await new Promise((r) => timeout(r, 0));
+  } finally {
+    for (const [key, descriptor] of saved) if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+    process.off("uncaughtException", record);
+    process.off("unhandledRejection", record);
+  }
+  return errors;
+}
+
+afterAll(async () => {
+  expect(await errorsAfterSimulatedTeardown(), "work this file queued ran after teardown").toEqual([]);
 });
 
 describe("mountApp — #root missing", () => {
@@ -133,10 +223,10 @@ describe("mountApp — unmounting takes down what mounting set up (#2501)", () =
     document.body.innerHTML = '<div id="root"></div>';
     vi.spyOn(console, "error").mockImplementation(() => {});
 
-    const unmount = mountApp();
-    await vi.waitFor(() => expect(document.getElementById("root")!.children.length).toBeGreaterThan(0));
+    const unmount = mountInAct();
+    expect(document.getElementById("root")!.children.length, "the app committed").toBeGreaterThan(0);
     expect(pending.size, "the mounted app schedules work, or this test proves nothing").toBeGreaterThan(0);
-    unmount();
+    await unmount();
     // The query cache flushes its change notifications on a zero-delay timer;
     // those fire on the next turn and reach no listener once unmounted. A
     // zero-delay timer queued now runs after them.
@@ -145,20 +235,20 @@ describe("mountApp — unmounting takes down what mounting set up (#2501)", () =
     expect([...pending.values()]).toEqual([]);
   });
 
-  it("removes the global listeners, so an error after unmount paints nothing", () => {
+  it("removes the global listeners, so an error after unmount paints nothing", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     vi.spyOn(console, "error").mockImplementation(() => {});
 
-    mountApp()();
+    await mountInAct()();
     dispatchAfterUnmount();
 
     expect(document.querySelector('[role="alert"]')).toBeNull();
   });
 
-  it("removes the listeners on the #root-missing path too", () => {
+  it("removes the listeners on the #root-missing path too", async () => {
     document.body.innerHTML = "";
     vi.spyOn(console, "error").mockImplementation(() => {});
-    mountApp()();
+    await mountInAct()();
     document.body.innerHTML = "";
 
     dispatchAfterUnmount();
@@ -269,10 +359,10 @@ describe("mountApp — a later-tick throw over a LIVE app is escapable", () => {
     document.body.innerHTML = '<div id="root"></div>';
     vi.spyOn(console, "error").mockImplementation(() => {});
     mount();
-    // React 18's render is async, so `#root` is still ours in this tick.
-    // Standing in for a committed app tree: what `paintBootError` reads is
-    // simply "does #root have children", from the live DOM.
-    document.getElementById("root")!.innerHTML = "<div>a live, mounted app</div>";
+    // `mount()` commits the real app inside `act`, so `#root` holds a live,
+    // mounted tree: what `paintBootError` reads is "does #root have
+    // children", from the live DOM.
+    expect(document.getElementById("root")!.children.length).toBeGreaterThan(0);
     window.dispatchEvent(new ErrorEvent("error", { error: new Error("a poll threw on tick 7") }));
   }
 
@@ -302,8 +392,12 @@ describe("mountApp — a later-tick throw over a LIVE app is escapable", () => {
   it("offers NO dismiss when #root is empty — a real boot failure has nothing to go back to", () => {
     document.body.innerHTML = '<div id="root"></div>';
     vi.spyOn(console, "error").mockImplementation(() => {});
-    mount();
-    window.dispatchEvent(new ErrorEvent("error", { error: new Error("failed before first paint") }));
+    // The error lands inside `act`, after `render()` was called but before
+    // React has committed anything: a failure before first paint.
+    act(() => {
+      mounted.push(mountApp());
+      window.dispatchEvent(new ErrorEvent("error", { error: new Error("failed before first paint") }));
+    });
 
     const buttons = [...document.querySelectorAll(".bootcrash-overlay button")].map((b) => b.textContent);
     expect(buttons).toEqual(["reload"]);
