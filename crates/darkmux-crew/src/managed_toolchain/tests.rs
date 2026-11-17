@@ -1281,6 +1281,7 @@ mod live {
             mounts,
             ports: Vec::new(),
             stdin: false,
+            host_services: Vec::new(),
             host_alias: None,
             user: None,
             env,

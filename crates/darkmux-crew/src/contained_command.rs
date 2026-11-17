@@ -133,6 +133,7 @@ pub fn policy_with(
         mounts,
         ports: Vec::new(),
         stdin: false,
+        host_services: Vec::new(),
         host_alias: None,
         user: run.user.clone(),
         // The image's home belongs to the image's own user.

@@ -44,8 +44,10 @@
 //!   listeners its processes hold are read every second and one beyond the
 //!   loopback stops it (`darkmux-crew`'s `sandbox_listeners`; detection with
 //!   a window, not a boundary). It may reach any address, the host's own
-//!   loopback services included, but no unix socket outside its mounts and
-//!   no abstract one outside the sandbox. [`Network::None`] has a loopback of
+//!   loopback services included, whatever `host_services` says (Landlock
+//!   grants a connect by port, on every address at once, so it cannot keep
+//!   the loopback's ports apart from the network's), but no unix socket
+//!   outside its mounts and no abstract one outside the sandbox. [`Network::None`] has a loopback of
 //!   its own and nothing else.
 //! - **Keep a dispatch off a host service's loopback port (#3567).** As
 //!   under Seatbelt, a dispatch may bind a port of its choosing on
@@ -517,6 +519,7 @@ mod tests {
             mounts,
             ports: vec![8080],
             stdin: false,
+            host_services: Vec::new(),
             host_alias: None,
             user: None,
             env: vec![("A".into(), "1".into())],

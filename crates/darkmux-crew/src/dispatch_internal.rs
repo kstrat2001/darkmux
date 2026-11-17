@@ -2732,6 +2732,7 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
         mounts,
         ports: Vec::new(),
         stdin: config.needs_stdin(),
+        host_services: endpoint_ports(config),
         host_alias: (config.container_host_access == darkmux_platform::ContainerHostAccess::HostGateway)
             .then(|| "host.docker.internal".to_string()),
         user,
@@ -2742,6 +2743,25 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
         // first (`darkmux runtime run …`).
         command: config.runtime_leading_args.iter().cloned().chain(runtime_args(config, &out_at)).collect(),
     }
+}
+
+/// The port the runtime's model client dials when it is passed no
+/// `--base-url` (`runtime/src/lmstudio.rs`'s `DEFAULT_BASE_URL`).
+const RUNTIME_DEFAULT_MODEL_PORT: u16 = 1234;
+
+/// The ports of the endpoints a dispatch's runtime dials, sorted: its model
+/// server (`--base-url`, else the runtime's default), a brain's
+/// `--chat-url` and an unmanaged compactor's, each at the port its URL names
+/// or its scheme's. Wherever the URL points: a sandbox on the host is given
+/// these of this host's services and no other, and a URL may name this
+/// machine by a name or address that is not the loopback's.
+fn endpoint_ports(config: &DockerRunConfig) -> Vec<u16> {
+    let urls = [&config.remote_chat_url, &config.compaction.compactor_chat_url];
+    let base = config.base_url_override.as_deref().map_or(Some(RUNTIME_DEFAULT_MODEL_PORT), darkmux_types::endpoint::url_port);
+    let mut ports: Vec<u16> = urls.iter().filter_map(|u| u.as_deref().and_then(darkmux_types::endpoint::url_port)).chain(base).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 /// `KEY=value` as its two halves (a value may hold `=`).

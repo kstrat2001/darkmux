@@ -6550,6 +6550,27 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(prompt(&docker).as_deref(), Some("/darkmux-out/.prompt.txt"));
     }
 
+    /// A dispatch is given exactly the ports of the endpoints its runtime
+    /// dials, wherever each URL points: its model server (`--base-url`, or
+    /// the runtime's own default when none is passed), a brain's
+    /// `--chat-url` and an unmanaged compactor's, each at the port it names
+    /// or its scheme's. Nothing else on this host is given.
+    #[test]
+    fn a_dispatch_is_given_the_ports_of_the_endpoints_its_runtime_dials() {
+        use darkmux_sandbox::SeatbeltBackend;
+        let mut cfg = argv_config_with_base_url(Some("http://localhost:1234/v1".to_string()));
+        assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [1234]);
+        cfg.base_url_override = Some("http://127.0.0.1:41999/v1".to_string());
+        cfg.remote_chat_url = Some("https://api.example.com/v1/chat/completions".to_string());
+        cfg.compaction.compactor_chat_url = Some("http://[::1]:8088/v1/chat/completions".to_string());
+        assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [443, 8088, 41999]);
+        cfg.base_url_override = None;
+        cfg.remote_chat_url = None;
+        cfg.compaction.compactor_chat_url = None;
+        assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [1234], "the runtime's own default");
+        assert!(dispatch_policy_for(&cfg, &SeatbeltBackend).ports.is_empty(), "a dispatch binds any port");
+    }
+
     /// (#3561) A dispatch on the host runs with its managed Node: the
     /// toolchain's PATH, its folder read-only where it is. A container's
     /// config carries none, so its policy names no PATH (the image's own).

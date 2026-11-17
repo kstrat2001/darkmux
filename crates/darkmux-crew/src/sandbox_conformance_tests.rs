@@ -146,6 +146,7 @@ fn policy(backend: &dyn SandboxBackend, image: &str, tree: &Path, script: &str) 
         mounts: vec![Mount { host: tree.to_path_buf(), at: "/workspace".to_string(), access: Access::ReadWrite }],
         ports: Vec::new(),
         stdin: false,
+        host_services: Vec::new(),
         host_alias: None,
         user: None,
         env: Vec::new(),

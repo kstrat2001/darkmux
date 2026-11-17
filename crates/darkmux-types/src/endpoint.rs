@@ -1103,6 +1103,30 @@ pub fn lmstudio_chat_url(base: &str) -> String {
     format!("{}/chat/completions", lmstudio_v1_base(base))
 }
 
+/// The port `url` is dialed on: the one it names, else its scheme's.
+pub fn url_port(url: &str) -> Option<u16> {
+    let (scheme, _) = url.split_once("://")?;
+    // A host `url_host` accepts closes any `[` it opens.
+    let hostport = url_host(url)?;
+    let after_host = match hostport.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').map_or("", |(_, tail)| tail),
+        None => hostport.find(':').map_or("", |i| &hostport[i..]),
+    };
+    match after_host.strip_prefix(':').filter(|p| !p.is_empty()) {
+        Some(port) => port.parse().ok(),
+        None => scheme_port(scheme),
+    }
+}
+
+/// The port a URL scheme dials when the URL names none.
+fn scheme_port(scheme: &str) -> Option<u16> {
+    match scheme.to_ascii_lowercase().as_str() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
+}
+
 /// The authority of `url` with any userinfo stripped: `https://tok@h:1/p`
 /// → `h:1`. `None` when `url` has no `scheme://`.
 pub fn url_host(url: &str) -> Option<String> {

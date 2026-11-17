@@ -698,7 +698,7 @@ pub fn machine_port_owners() -> Vec<PortOwner> {
     let mut owners = Vec::new();
     let lms = crate::config_access::lmstudio_url();
     if crate::endpoint::url_names_this_machine(&lms) {
-        if let Some(port) = url_port(&lms) {
+        if let Some(port) = crate::endpoint::url_port(&lms) {
             owners.push(PortOwner { port, owner: "LM Studio's (`lmstudio_url`)".to_string() });
         }
     }
@@ -708,30 +708,6 @@ pub fn machine_port_owners() -> Vec<PortOwner> {
         owners.push(PortOwner { port: rec.port, owner: format!("the running darkmux daemon's (pid {})", rec.pid) });
     }
     owners
-}
-
-/// The port `url` is dialed on: the one it names, else its scheme's.
-fn url_port(url: &str) -> Option<u16> {
-    let (scheme, _) = url.split_once("://")?;
-    // A host `url_host` accepts closes any `[` it opens.
-    let hostport = crate::endpoint::url_host(url)?;
-    let after_host = match hostport.strip_prefix('[') {
-        Some(v6) => v6.split_once(']').map_or("", |(_, tail)| tail),
-        None => hostport.find(':').map_or("", |i| &hostport[i..]),
-    };
-    match after_host.strip_prefix(':').filter(|p| !p.is_empty()) {
-        Some(port) => port.parse().ok(),
-        None => scheme_port(scheme),
-    }
-}
-
-/// The port a URL scheme dials when the URL names none.
-fn scheme_port(scheme: &str) -> Option<u16> {
-    match scheme.to_ascii_lowercase().as_str() {
-        "http" => Some(80),
-        "https" => Some(443),
-        _ => None,
-    }
 }
 
 /// Every engine endpoint (a server darkmux starts) whose `port` something
@@ -1114,7 +1090,7 @@ mod tests {
             ("http://bad host:1234", None),
             ("http://localhost:99999", None),
         ] {
-            assert_eq!(super::url_port(url), port, "{url}");
+            assert_eq!(crate::endpoint::url_port(url), port, "{url}");
         }
     }
 

@@ -230,6 +230,16 @@ impl Platform for LinuxPlatform {
         )
     }
 
+    /// The LISTEN sockets in `/proc/net/tcp` and `tcp6`, every owner's.
+    fn tcp_listening_ports(&self) -> Option<Vec<u16>> {
+        let mut listening = listening_sockets(&read_to_string("/proc/net/tcp")?);
+        listening.extend(listening_sockets(&read_to_string("/proc/net/tcp6").unwrap_or_default()));
+        let mut ports: Vec<u16> = listening.iter().map(|(at, _)| at.port()).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        Some(ports)
+    }
+
     /// The ESTABLISHED sockets in `/proc/net/tcp` and `tcp6` (where a
     /// dual-stack client's socket shows its v4-mapped address) whose other
     /// end is `local`, matched in one pass over every process's fds to the

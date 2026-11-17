@@ -31,6 +31,19 @@
 //!   (`darkmux-crew`'s `sandbox_listeners`), a client preview watches its
 //!   two ports. Both are detection with a window, not a boundary.
 //!   [`Network::None`] allows no network at all, the loopback included.
+//! - **Tell a server the sandbox started from the host's.** The default
+//!   network reaches the rest of the network as before, but of this
+//!   machine's own services (at any of its addresses: SBPL's `remote ip
+//!   "localhost:<port>"` matches the loopback, IPv4 and IPv6, and the LAN
+//!   address) only its `host_services` and its own `ports`. A policy naming
+//!   ports binds only those, so every other port of this machine is refused.
+//!   One naming none (a dispatch's) may bind any port and must reach its own
+//!   servers there (a test suite's HTTP server), which SBPL cannot tell from
+//!   the host's, and SBPL takes no port range: the ports this host listens
+//!   on when the sandbox is planned are refused instead, the given ones
+//!   excepted. A service that first listens after that is reachable. When
+//!   this host's listeners cannot be read, every port but the given ones is
+//!   refused.
 //! - **Reach every descendant.** A sandbox is the session its launcher leads
 //!   (#3559): its process group is killed over and over until it is empty (a
 //!   process that keeps forking is caught), then every other process in the
@@ -236,6 +249,12 @@ impl SeatbeltBackend {
     /// over an earlier read-write one denies writes beneath it; Seatbelt's
     /// later rule wins), and its network.
     pub fn profile(policy: &SandboxPolicy, dir: &Path) -> String {
+        Self::profile_with(policy, dir, || darkmux_platform::current().tcp_listening_ports())
+    }
+
+    /// [`Self::profile`], this host's listening ports read by `listening`
+    /// (only for a policy that needs them).
+    fn profile_with(policy: &SandboxPolicy, dir: &Path, listening: impl FnOnce() -> Option<Vec<u16>>) -> String {
         let mut p = String::from("(version 1)\n(deny default)\n");
         p.push_str("(allow process-fork)\n(allow process-exec)\n");
         p.push_str("(allow signal (target same-sandbox))\n(allow process-info* (target same-sandbox))\n");
@@ -283,6 +302,7 @@ impl SeatbeltBackend {
                     "(deny network-outbound (remote unix-socket))\n",
                     "(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n",
                 ));
+                p.push_str(&Self::host_services_rule(policy, listening));
             }
             // Nothing: a sandbox has no loopback of its own, and the host's
             // runs its databases and model servers (#3553 review).
@@ -306,6 +326,50 @@ impl SeatbeltBackend {
         }
         let named = join(ports.iter().map(|p| format!("(local ip \"localhost:{p}\")")));
         format!("(allow network-bind {named})\n(deny network-inbound)\n(allow network-inbound {named})\n")
+    }
+
+    /// Which of this host's own services the default network reaches: its
+    /// `host_services` and its own `ports`, no other. SBPL's `remote ip
+    /// "localhost:<port>"` matches every address of this machine (the
+    /// loopback, IPv4 and IPv6, and its LAN address; measured on macOS
+    /// 26.6), while the rest of the network stays reachable.
+    ///
+    /// With ports named (a preview's shape) the sandbox binds only those, so
+    /// every other port on this machine is another's: all are refused but
+    /// the named and given ones. With none named (a dispatch's shape) it may
+    /// bind any port and must reach its own servers there, which SBPL cannot
+    /// tell from the host's: the ports something on this host listens on as
+    /// the sandbox starts (`listening`) are refused instead, the given ones
+    /// excepted. A service that first listens after the sandbox started is
+    /// not refused. When this host's listeners cannot be read, every port
+    /// but the given ones is refused (its own servers too).
+    fn host_services_rule(policy: &SandboxPolicy, listening: impl FnOnce() -> Option<Vec<u16>>) -> String {
+        let given: Vec<u16> = policy.ports.iter().chain(&policy.host_services).copied().collect();
+        let held = if policy.ports.is_empty() { listening() } else { None };
+        match held {
+            Some(held) => Self::refuse_ports(held.into_iter().filter(|p| !given.contains(p))),
+            None => Self::refuse_all_ports_but(given),
+        }
+    }
+
+    /// Outbound to these ports of this machine refused; none, no rule.
+    fn refuse_ports(ports: impl Iterator<Item = u16>) -> String {
+        let refused = join(ports.map(|p| format!("(remote ip \"localhost:{p}\")")));
+        if refused.is_empty() {
+            return String::new();
+        }
+        format!("(deny network-outbound {refused})\n")
+    }
+
+    /// Outbound to every port of this machine refused but `allowed`.
+    fn refuse_all_ports_but(mut allowed: Vec<u16>) -> String {
+        allowed.sort_unstable();
+        allowed.dedup();
+        let mut rule = "(deny network-outbound (remote ip \"localhost:*\"))\n".to_string();
+        if !allowed.is_empty() {
+            rule.push_str(&format!("(allow network-outbound {})\n", join(allowed.iter().map(|p| format!("(remote ip \"localhost:{p}\")")))));
+        }
+        rule
     }
 
     /// The directories above every path the sandbox may reach, and the
@@ -630,6 +694,7 @@ mod tests {
             mounts,
             ports: Vec::new(),
             stdin: false,
+            host_services: Vec::new(),
             host_alias: None,
             user: None,
             env: vec![("A".into(), "1".into())],
@@ -677,10 +742,42 @@ mod tests {
         // (#3112 review) A listen with no bind gets an ephemeral port the
         // bind rule never sees: inbound is held to the named ports too.
         assert!(named.contains("(deny network-inbound)\n(allow network-inbound (local ip \"localhost:4100\") (local ip \"localhost:4200\"))\n"), "{named}");
-        assert!(!named.contains("localhost:*"), "{named}");
+        assert!(!named.contains("(local ip \"localhost:*\")"), "{named}");
         let any = SeatbeltBackend::profile(&policy(Vec::new(), Network::Default), Path::new("/s"));
         assert!(any.contains("(allow network-bind (local ip \"localhost:*\"))"), "{any}");
         assert!(!any.contains("network-inbound"), "no ports named, inbound as it was: {any}");
+    }
+
+    /// Which of this host's services the default network reaches: with
+    /// ports named, every port of this machine is refused but those and the
+    /// given ones; with none named, the ports this host listens on are, but
+    /// the given ones, and when its listeners cannot be read, every port but
+    /// the given ones. No network has no such rule (it has no network).
+    #[test]
+    fn the_default_network_refuses_this_hosts_services_it_was_not_given() {
+        let mut preview = policy(Vec::new(), Network::Default);
+        (preview.ports, preview.host_services) = (vec![4100, 4200], vec![1234]);
+        let read = std::cell::Cell::new(false);
+        let named = SeatbeltBackend::profile_with(&preview, Path::new("/s"), || {
+            read.set(true);
+            Some(vec![8799])
+        });
+        assert!(!read.get(), "a policy naming ports needs no listing");
+        assert!(named.ends_with("(deny network-outbound (remote ip \"localhost:*\"))\n(allow network-outbound (remote ip \"localhost:1234\") (remote ip \"localhost:4100\") (remote ip \"localhost:4200\"))\n"), "{named}");
+        let mut dispatch = policy(Vec::new(), Network::Default);
+        dispatch.host_services = vec![1234];
+        let held = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || Some(vec![1234, 6379, 8799]));
+        assert!(held.ends_with("(deny network-outbound (remote ip \"localhost:6379\") (remote ip \"localhost:8799\"))\n"), "{held}");
+        assert!(!held.contains("(remote ip \"localhost:*\")"), "its own servers on any other port stay reachable: {held}");
+        let only_given = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || Some(vec![1234]));
+        assert!(!only_given.contains("(remote ip"), "{only_given}");
+        let unread = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || None);
+        assert!(unread.ends_with("(deny network-outbound (remote ip \"localhost:*\"))\n(allow network-outbound (remote ip \"localhost:1234\"))\n"), "{unread}");
+        dispatch.host_services.clear();
+        let nothing_given = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || None);
+        assert!(nothing_given.ends_with("(deny network-outbound (remote ip \"localhost:*\"))\n"), "{nothing_given}");
+        let none = SeatbeltBackend::profile_with(&policy(Vec::new(), Network::None), Path::new("/s"), || Some(vec![8799]));
+        assert!(!none.contains("network"), "{none}");
     }
 
     /// No network allows no network rule at all, the host's loopback
@@ -951,5 +1048,84 @@ mod tests {
     fn sh_quoting_keeps_an_argument_whole() {
         let out = Command::new(SH).arg("-c").arg(format!("printf '%s|' {}", sh_quote("a 'b' $HOME"))).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "a 'b' $HOME|");
+    }
+
+    /// What a sandbox on the host under the default network reaches of this
+    /// host's own services: `host_services` and its own servers, never
+    /// another listener on the loopback (IPv4 or IPv6). Lines the probe
+    /// script printed, one per port it connected to.
+    fn reached(ports: Vec<u16>, host_services: Vec<u16>, own: u16, probes: &[Probe]) -> Vec<String> {
+        let root = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var_os(STATE_DIR_ENV);
+        unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
+        // Its own server on `own`, up before any probe runs, then each probe.
+        let mut script = format!("/usr/bin/nc -lk 127.0.0.1 {own} >/dev/null 2>&1 &\ni=0; until /usr/bin/nc -z -G 1 127.0.0.1 {own} 2>/dev/null || [ $i -ge 50 ]; do sleep 0.1; i=$((i + 1)); done\n");
+        script.push_str(&format!("/usr/bin/nc -z -G 2 127.0.0.1 {own} 2>/dev/null && echo own\n"));
+        for (said, at, port) in probes {
+            script.push_str(&format!("/usr/bin/nc -z -G 2 {at} {port} 2>/dev/null && echo {said}\n"));
+        }
+        script.push_str("kill %1 2>/dev/null; true\n");
+        let mut p = policy(Vec::new(), Network::Default);
+        p.name = format!("darkmux-loopback-test-{}-{own}", std::process::id());
+        p.ports = ports;
+        p.host_services = host_services;
+        p.entrypoint = Some(SH.into());
+        p.command = vec!["-c".into(), script];
+        let (mut cmd, _) = SeatbeltBackend.run(&p);
+        let out = cmd.output().unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(STATE_DIR_ENV, v),
+                None => std::env::remove_var(STATE_DIR_ENV),
+            }
+        }
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect()
+    }
+
+    /// A port nothing on this host holds yet.
+    fn a_free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// A probe: what the script prints when it connects, and where.
+    type Probe = (&'static str, &'static str, u16);
+
+    /// This host's listeners the sandbox must not reach, and the one it is
+    /// given: `(said, address, port)` probes, with the listeners held open.
+    fn host_listeners() -> (Vec<std::net::TcpListener>, u16, Vec<Probe>) {
+        let given = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ungiven = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ungiven6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let port = |l: &std::net::TcpListener| l.local_addr().unwrap().port();
+        let probes = vec![("given", "127.0.0.1", port(&given)), ("ungiven", "127.0.0.1", port(&ungiven)), ("ungiven6", "::1", port(&ungiven6))];
+        let given_port = port(&given);
+        (vec![given, ungiven, ungiven6], given_port, probes)
+    }
+
+    /// A dispatch's shape (no ports named, any bind): it reaches the host
+    /// service it is given and its own server on a port it picked, never
+    /// another service listening on this host's loopback.
+    #[test]
+    #[serial_test::serial]
+    fn a_dispatch_reaches_only_the_host_services_it_is_given_and_its_own() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let (_held, given, probes) = host_listeners();
+        assert_eq!(reached(Vec::new(), vec![given], a_free_port(), &probes), ["own", "given"]);
+    }
+
+    /// A preview's shape (its ports named): it reaches its own ports and the
+    /// host service it is given, never another service on this host.
+    #[test]
+    #[serial_test::serial]
+    fn a_preview_reaches_only_its_ports_and_the_host_services_it_is_given() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let (_held, given, probes) = host_listeners();
+        let own = a_free_port();
+        assert_eq!(reached(vec![own], vec![given], own, &probes), ["own", "given"]);
     }
 }

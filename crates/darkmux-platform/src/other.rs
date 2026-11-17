@@ -120,6 +120,10 @@ impl Platform for OtherPlatform {
         None
     }
 
+    fn tcp_listening_ports(&self) -> Option<Vec<u16>> {
+        None
+    }
+
     fn tcp_listeners_held_by(&self, _leader: u32) -> Option<Vec<(u16, crate::PortListener)>> {
         None
     }
