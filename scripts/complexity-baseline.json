@@ -304,7 +304,6 @@
   "src/mission_launch.rs::ensure_mission_and_phases_with_provenance_and_start_payload": 11,
   "src/mission_launch.rs::grow_phase": 14,
   "src/mission_launch.rs::launch": 101,
-  "src/mission_launch.rs::print_dry_run_graph": 13,
   "src/mission_launch.rs::refuse_utility_staffed_tasks": 15,
   "src/mission_launch.rs::register_coder_phase_kinds": 11,
   "src/mod_cli.rs::list": 11,

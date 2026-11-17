@@ -2940,20 +2940,63 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Sets one environment variable for a test's scope and restores the
+    /// previous value (or its absence) on drop. Callers are
+    /// `#[serial_test::serial]`.
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            // SAFETY: every caller is #[serial_test::serial].
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: every caller is #[serial_test::serial].
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     /// The end the operator actually cares about: the params the panel
     /// synthesizes make `mission launch review --dry-run` resolve every
-    /// input and reach the dry-run graph, minting nothing.
+    /// input to the value synthesized and plan the review's steps, minting
+    /// nothing.
     ///
     /// (#2513) In process, through the same `mission_launch::launch` call
-    /// the CLI makes (its `--dry-run` only appends `dry_run=true`), so the
-    /// outcome depends on the code alone. Spawning the built binary from a
-    /// unit test made it depend on whether `target/debug/darkmux` happened
-    /// to exist: cargo sets `CARGO_BIN_EXE_darkmux` for integration tests
-    /// only. Every state destination is pinned under a throwaway root.
+    /// the CLI makes (its `--dry-run` only appends `dry_run=true`), reading
+    /// the plan the dry run printed, so the outcome depends on the code
+    /// alone. Spawning the built binary from a unit test made it depend on
+    /// whether `target/debug/darkmux` happened to exist: cargo sets
+    /// `CARGO_BIN_EXE_darkmux` for integration targets only.
+    ///
+    /// Every state destination is pinned under a throwaway root. A launch
+    /// that ran past the dry-run short-circuit would reach for a model, so
+    /// `lms` is a stub that records each call and fails, and the LM Studio
+    /// URL is a closed loopback port: no path here reaches a real one, and
+    /// the test names the broken short-circuit when either is touched.
     #[test]
     #[serial_test::serial]
     fn the_panel_synthesized_params_dry_run_green() {
+        use std::os::unix::fs::PermissionsExt;
         let state = darkmux_types::test_isolation::IsolatedState::new();
+        let lms_calls = state.join("lms-calls");
+        let lms = state.join("lms");
+        std::fs::write(&lms, format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 1\n", lms_calls.display())).unwrap();
+        std::fs::set_permissions(&lms, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _lms = EnvVarGuard::set("DARKMUX_LMS_BIN", &lms);
+        let _lmstudio = EnvVarGuard::set("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:9");
         std::fs::write(state.join("profiles.json"), r#"{"profiles":{},"default_profile":null}"#).unwrap();
         let repo = temp_repo(2);
         let synth = match synthesize_diff_launch_inputs(&embedded_review(), repo.path()).unwrap() {
@@ -2962,9 +3005,28 @@ pub(crate) mod tests {
         };
         let mut params = synth.params().to_vec();
         params.push("dry_run=true".to_string());
-        let exit = crate::mission_launch::launch("review", None, &params, None)
-            .unwrap_or_else(|e| panic!("the panel's params must dry-run green: {e:#}"));
+
+        let _ = crate::mission_launch::take_last_dry_run_report();
+        let result = crate::mission_launch::launch("review", None, &params, None);
+        let report = crate::mission_launch::take_last_dry_run_report();
+
+        let short_circuit_broke = "launch went past its --dry-run short-circuit";
+        assert!(
+            !lms_calls.exists(),
+            "the dry run called `lms` ({}): {short_circuit_broke}",
+            std::fs::read_to_string(&lms_calls).unwrap_or_default().trim()
+        );
+        let exit = result.unwrap_or_else(|e| panic!("the panel's params must dry-run green: {e:#}"));
         assert_eq!(exit, 0);
+        let report = report.unwrap_or_else(|| panic!("the dry run printed no plan: {short_circuit_broke}"));
+        assert!(report.contains("[plan.sites]"), "the graph must mint the plan steps:\n{report}");
+        for param in synth.params() {
+            let (key, value) = param.split_once('=').unwrap();
+            assert!(
+                report.lines().any(|l| l == format!("  {key} = {value}")),
+                "`{key}` must resolve to the value the panel synthesized:\n{report}"
+            );
+        }
         let minted = std::fs::read_dir(crate::crew::loader::missions_dir()).map(|rd| rd.count()).unwrap_or(0);
         assert_eq!(minted, 0, "a dry run must mint no mission");
     }
