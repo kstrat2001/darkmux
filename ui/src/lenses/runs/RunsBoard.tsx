@@ -3,7 +3,7 @@ import { RunKindIcon } from "../../components/RunKindIcon";
 import { Shimmer } from "../../components/Placeholder";
 import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { fetchJson } from "../../lib/fetcher";
+import { fetchJson, loadFailureText, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { missionGraphReachable } from "../../lib/source";
@@ -586,10 +586,6 @@ export function RunsBoard({
     );
   }
 
-  const labConfigured = labRunsQuery.data.ok ? labRunsQuery.data.data.configured !== false : false;
-  const labDir = labRunsQuery.data.ok ? labRunsQuery.data.data.dir : null;
-  const labDirExists = labRunsQuery.data.ok ? labRunsQuery.data.data.exists : null;
-
   // The filter bar speaks in values; the hash carries machine KEYS. A value
   // that is already selected keeps the key it arrived with, so an unresolved
   // key survives the other choices being toggled.
@@ -612,12 +608,10 @@ export function RunsBoard({
 
   const notice =
     kind === "lab"
-      ? labSourceNotice({
-          hasLabRuns: allRuns.some((r) => r.kind === "lab"),
-          configured: labConfigured,
-          dir: labDir,
-          dirExists: labDirExists,
-        })
+      ? labSourceNotice(
+          allRuns.some((r) => r.kind === "lab"),
+          labRunsQuery.data,
+        )
       : null;
 
   const machineLabels = runsMultiMachine(filtered) ? runMachineLabels(filtered) : NO_MACHINE_LABELS;
@@ -661,32 +655,43 @@ export function RunsBoard({
             )}
           </>
         ) : (
-          <div className="none">
-            {filtering
-              ? "no runs match these filters. Remove a filter, or Clear all."
-              : `no ${kind === "all" ? "" : `${kind} `}runs recorded yet.`}
-          </div>
+          <RunsEmpty runs={runsQuery.data} filtering={filtering} kind={kind} />
         )}
       </div>
     </div>
   );
 }
 
+/** The list's empty state. A failed `/runs` read says so (status and
+ * reason): the list is empty because nothing was read, and "no runs recorded
+ * yet" would tell the operator nothing ran. The next poll retries. */
+function RunsEmpty({ runs, filtering, kind }: { runs: FetchResult<RunsResponse>; filtering: boolean; kind: RunsKind }) {
+  if (!runs.ok) {
+    return (
+      <div className="none" data-state="error" role="alert">
+        {loadFailureText("runs", runs)}
+      </div>
+    );
+  }
+  return (
+    <div className="none">
+      {filtering ? "no runs match these filters. Remove a filter, or Clear all." : `no ${kind === "all" ? "" : `${kind} `}runs recorded yet.`}
+    </div>
+  );
+}
+
 /** The reasons the lab tab can be empty,
- * each with a different remedy: no source wired, a dir not created yet, or a
- * genuinely empty lab. */
-function labSourceNotice(s: {
-  hasLabRuns: boolean;
-  configured: boolean;
-  dir: string | null;
-  dirExists: boolean | null;
-}): string | null {
-  if (s.hasLabRuns) return null;
-  const at = s.dir ? ` (${s.dir})` : "";
-  if (!s.configured) {
+ * each with a different remedy: the read failed, no source wired, a dir not
+ * created yet, or a genuinely empty lab. A failed `/lab/runs` read is named
+ * as one, never read as "no source wired". */
+function labSourceNotice(hasLabRuns: boolean, lab: FetchResult<LabRunsResponse>): string | null {
+  if (hasLabRuns) return null;
+  if (!lab.ok) return loadFailureText("lab runs", lab);
+  const at = lab.data.dir ? ` (${lab.data.dir})` : "";
+  if (lab.data.configured === false) {
     return "this daemon has no lab-run source wired: darkmux doctor shows the resolved dirs.lab and where it came from.";
   }
-  if (s.dirExists === false) return `the configured lab dir does not exist yet${at}: it appears with the first run.`;
+  if (lab.data.exists === false) return `the configured lab dir does not exist yet${at}: it appears with the first run.`;
   return `no lab runs found under the configured lab dir${at}.`;
 }
 

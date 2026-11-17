@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { fetchJson } from "../../lib/fetcher";
+import { fetchJson, loadFailureText, type FetchResult } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
 import type { FlowDay } from "../../types/generated/FlowDay";
 import type { FlowDaysResponse } from "../../types/generated/FlowDaysResponse";
@@ -141,8 +141,11 @@ export function CatalogPanel({ label }: { label?: ReactNode } = {}) {
 
   // Both fetches are gated on `open` (never fired until the operator asks
   // for history), and every open re-fetches — matching `toggleCatalog()`
-  // itself, which never caches across opens.
-  const pending = open && (!daysQuery.data || !missionsQuery.data);
+  // itself, which never caches across opens. Until BOTH have answered the
+  // panel is loading, never empty: a section with no answer yet has no rows
+  // and no failure to show.
+  const days = daysQuery.data;
+  const missions = missionsQuery.data;
 
   return (
     <div className="catalog-anchor" ref={anchorRef}>
@@ -175,7 +178,7 @@ export function CatalogPanel({ label }: { label?: ReactNode } = {}) {
       </button>
       {open && (
         <div className="catpanel" id="catpanel">
-          {pending ? (
+          {!days || !missions ? (
             // (#2862) Not one of the issue's two named surfaces (a small
             // history-browsing dropdown, not a page) — still no bare
             // "loading…" text; a shimmer bar the size of a real `.cathdr`
@@ -185,8 +188,10 @@ export function CatalogPanel({ label }: { label?: ReactNode } = {}) {
             </div>
           ) : (
             <CatalogContent
-              days={daysQuery.data?.ok ? daysQuery.data.data.days : []}
-              missions={missionsQuery.data?.ok ? missionsQuery.data.data.missions : []}
+              days={days}
+              missions={missions}
+              onRetryDays={() => void daysQuery.refetch()}
+              onRetryMissions={() => void missionsQuery.refetch()}
               onLive={goLive}
               onDay={goDay}
               onMission={goMission}
@@ -201,26 +206,31 @@ export function CatalogPanel({ label }: { label?: ReactNode } = {}) {
 /** `viewer.html`'s `toggleCatalog()` content-build, ported to JSX: the
  * unconditional live row, the mission section (only when non-empty, capped
  * + disclosed via `missionsHeader`), then either the day rows or the
- * `.catempty` fallback. A failed fetch on either side (a non-2xx/network
- * error via `fetchJson`) is treated the same as legacy's
- * `Promise.allSettled` catch-swallow: an empty array for that section, not a
- * distinct error state — this panel is a convenience browser over data that
- * degrades gracefully, not a load-bearing data view (Rule 1, pure port
- * including its silences). */
+ * `.catempty` fallback.
+ *
+ * A failed read on either side (a non-2xx or network error via `fetchJson`)
+ * renders as a failure in that section, naming the status and reason, with a
+ * retry: never as the empty section. Legacy's `Promise.allSettled` swallowed
+ * it, so a daemon that did not answer read as "no recorded days yet", which
+ * tells the operator they have no history. The other section and the live row
+ * still render. */
 function CatalogContent({
   days,
   missions,
+  onRetryDays,
+  onRetryMissions,
   onLive,
   onDay,
   onMission,
 }: {
-  days: FlowDay[];
-  missions: FlowMissionSummary[];
+  days: FetchResult<FlowDaysResponse>;
+  missions: FetchResult<FlowMissionsResponse>;
+  onRetryDays: () => void;
+  onRetryMissions: () => void;
   onLive: () => void;
   onDay: (date: string) => void;
   onMission: (id: string) => void;
 }) {
-  const today = todayUTC();
   return (
     <>
       <div className="cathdr">playback catalog</div>
@@ -237,47 +247,86 @@ function CatalogContent({
         <div className="cd">● live</div>
         <div className="cs">now-ish on present machines</div>
       </button>
-      {missions.length > 0 && (
-        <>
-          <div className="cathdr">{missionsHeader(missions.length, CATALOG_MISSION_CAP)}</div>
-          {missions.slice(0, CATALOG_MISSION_CAP).map((m) => (
-            <button
-              type="button"
-              className="catrow"
-              data-act="gomission"
-              data-arg={m.mission_id}
-              key={m.mission_id}
-              onClick={() => onMission(m.mission_id)}
-            >
-              <div className="cd">▣ {m.mission_id}</div>
-              <div className="cs">{missionSummary(m)}</div>
-            </button>
-          ))}
-        </>
-      )}
-      {days.length > 0 ? (
-        <>
-          <div className="cathdr">days</div>
-          {days.map((d) => (
-            <button
-              type="button"
-              className="catrow"
-              data-act="goday"
-              data-arg={d.date}
-              key={d.date}
-              onClick={() => onDay(d.date)}
-            >
-              <div className="cd">
-                {d.date}
-                {d.date === today ? " · today" : ""}
-              </div>
-              <div className="cs">{daySummary(d)}</div>
-            </button>
-          ))}
-        </>
+      {missions.ok ? (
+        <MissionRows missions={missions.data.missions} onMission={onMission} />
       ) : (
-        <div className="catempty">no recorded days yet — dispatches you run will appear here.</div>
+        <CatalogFailure header="missions" what="missions" failure={missions} onRetry={onRetryMissions} />
       )}
+      {days.ok ? (
+        <DayRows days={days.data.days} onDay={onDay} />
+      ) : (
+        <CatalogFailure header="days" what="recorded days" failure={days} onRetry={onRetryDays} />
+      )}
+    </>
+  );
+}
+
+/** A section whose read failed: its header, the failure as text, and a
+ *  retry. The panel does not poll, so without the button the only way to
+ *  ask again is to close and reopen it. */
+function CatalogFailure({
+  header,
+  what,
+  failure,
+  onRetry,
+}: {
+  header: string;
+  what: string;
+  failure: { status: number | null; message: string };
+  onRetry: () => void;
+}) {
+  return (
+    <div data-state="error">
+      <div className="cathdr">{header}</div>
+      <div className="catempty" role="alert">
+        {loadFailureText(what, failure)}
+      </div>
+      <button type="button" className="catretry" title={`retry: read ${what} again`} onClick={onRetry}>
+        ↻ retry
+      </button>
+    </div>
+  );
+}
+
+function MissionRows({ missions, onMission }: { missions: FlowMissionSummary[]; onMission: (id: string) => void }) {
+  if (missions.length === 0) return null;
+  return (
+    <>
+      <div className="cathdr">{missionsHeader(missions.length, CATALOG_MISSION_CAP)}</div>
+      {missions.slice(0, CATALOG_MISSION_CAP).map((m) => (
+        <button
+          type="button"
+          className="catrow"
+          data-act="gomission"
+          data-arg={m.mission_id}
+          key={m.mission_id}
+          onClick={() => onMission(m.mission_id)}
+        >
+          <div className="cd">▣ {m.mission_id}</div>
+          <div className="cs">{missionSummary(m)}</div>
+        </button>
+      ))}
+    </>
+  );
+}
+
+function DayRows({ days, onDay }: { days: FlowDay[]; onDay: (date: string) => void }) {
+  if (days.length === 0) {
+    return <div className="catempty">no recorded days yet — dispatches you run will appear here.</div>;
+  }
+  const today = todayUTC();
+  return (
+    <>
+      <div className="cathdr">days</div>
+      {days.map((d) => (
+        <button type="button" className="catrow" data-act="goday" data-arg={d.date} key={d.date} onClick={() => onDay(d.date)}>
+          <div className="cd">
+            {d.date}
+            {d.date === today ? " · today" : ""}
+          </div>
+          <div className="cs">{daySummary(d)}</div>
+        </button>
+      ))}
     </>
   );
 }

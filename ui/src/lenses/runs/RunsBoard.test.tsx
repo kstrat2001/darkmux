@@ -404,10 +404,31 @@ describe("RunsBoard", () => {
     expect(window.location.hash).toBe("");
   });
 
-  it("degrades a /runs fetch failure to the empty-runs render (matches legacy's silent catch)", async () => {
+  // A failed read is never shown as empty: "no runs recorded yet" off a 500
+  // tells the operator nothing ran when the daemon simply did not answer.
+  it("a /runs fetch failure says it could not load runs, with the status, never 'no runs recorded yet'", async () => {
     mockFetch(false, true);
     renderBoard();
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/^couldn't load runs \(HTTP 500\): 500/);
+    expect(screen.queryByText(/no runs recorded yet/i)).toBeNull();
+  });
+
+  it("a genuinely empty /runs still reads as no runs recorded yet, with no error", async () => {
+    mockFetch(true, true, {}, []);
+    renderBoard();
     await waitFor(() => expect(screen.getByText(/no runs recorded yet/i)).toBeInTheDocument());
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("a /lab/runs fetch failure says so on the lab tab, never 'no lab-run source wired'", async () => {
+    mockFetch(true, false, {}, NO_LAB_RUNS);
+    const { container } = renderBoard();
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    fireEvent.click(container.querySelector('[data-arg="lab"]')!);
+    await waitFor(() => expect(screen.getByText(/^couldn't load lab runs \(HTTP 500\): 500/)).toBeInTheDocument());
+    expect(screen.queryByText(/no lab-run source wired/i)).toBeNull();
+    expect(screen.queryByText(/no lab runs found/i)).toBeNull();
   });
 
   it("clicking a tracked mission row navigates in-app to #mission=<id> when a real daemon is behind the page (#1868)", async () => {

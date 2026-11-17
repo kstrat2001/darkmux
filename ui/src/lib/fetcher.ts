@@ -13,6 +13,15 @@ export type FetchResult<T> =
   | { ok: true; data: T }
   | { ok: false; status: number | null; message: string };
 
+/** A failed read, as a view states it in place of the data it could not
+ *  get: `couldn't load <what> (HTTP <n>): <message>`. The status is left out
+ *  when there was none (the daemon never answered). Same wording as the
+ *  event log's own failure line. */
+export function loadFailureText(what: string, failure: { status: number | null; message: string }): string {
+  const status = failure.status !== null ? ` (HTTP ${failure.status})` : "";
+  return `couldn't load ${what}${status}: ${failure.message}`;
+}
+
 export async function fetchJson<T>(path: string, init?: RequestInit): Promise<FetchResult<T>> {
   let response: Response;
   try {
