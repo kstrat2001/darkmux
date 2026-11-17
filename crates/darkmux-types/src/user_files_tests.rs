@@ -767,3 +767,29 @@ fn escape_text_keeping_lines_leaves_plain_text_and_unicode_unchanged() {
         assert_eq!(escape_text_keeping_lines(text), text);
     }
 }
+
+/// Real text that needs a joiner or a direction mark reads as written: a
+/// ZWJ family, a ZWNJ in Persian, a flag, and Hebrew with a right-to-left
+/// mark. None of these can reorder or hide what is around them.
+#[test]
+fn escape_text_keeps_joiners_direction_marks_and_flags() {
+    for text in ["👩\u{200d}💻 👨\u{200d}👩\u{200d}👧", "می\u{200c}خواهم", "🇺🇸🇯🇵", "שלום\u{200f} world\u{200e}"] {
+        assert_eq!(escape_text(text), text);
+        assert_eq!(escape_text_keeping_lines(text), text);
+    }
+}
+
+/// The bidi overrides and isolates, zero-width characters and invisible
+/// tag characters are escaped: each can reorder text or hide content.
+#[test]
+fn escape_text_escapes_overrides_isolates_zero_width_and_tags() {
+    assert_eq!(escape_text("a\u{202e}b\u{2066}c\u{2069}d\u{200b}e\u{2060}f"), "a\\u{202e}b\\u{2066}c\\u{2069}d\\u{200b}e\\u{2060}f");
+    assert_eq!(escape_text("x\u{e0041}\u{e007f}y"), "x\\u{e0041}\\u{e007f}y");
+}
+
+/// A lone carriage return would let one line overwrite another, so it is
+/// escaped; a `\r\n` line end is a line end.
+#[test]
+fn escape_text_keeping_lines_escapes_a_lone_carriage_return() {
+    assert_eq!(escape_text_keeping_lines("safe\rFORGED\r\nnext"), "safe\\u{d}FORGED\nnext");
+}

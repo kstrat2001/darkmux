@@ -1392,9 +1392,16 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     }
     print!("{}", dispatch_stdout_shown(json, &result.stdout));
     if !quiet && !result.stderr.is_empty() {
-        eprint!("{}", darkmux_types::user_files::escape_text_keeping_lines(&result.stderr));
+        eprint!("{}", dispatch_stderr_shown(&result.stderr));
     }
     Ok(result.exit_code)
+}
+
+/// What `dispatch` prints of the run's stderr, in either mode: the runtime's
+/// and the engine's diagnostics, which can quote what the model or an
+/// endpoint said, escaped with their lines kept.
+fn dispatch_stderr_shown(stderr: &str) -> String {
+    darkmux_types::user_files::escape_text_keeping_lines(stderr)
 }
 
 /// What `dispatch` prints of the run's stdout. Without `--json` that is the
@@ -2710,6 +2717,17 @@ mod tests {
         assert_eq!(dispatch_stdout_shown(false, plain), plain);
         let envelope = r#"{"final_assistant":"\u001b]0;x"}"#;
         assert_eq!(dispatch_stdout_shown(true, envelope), envelope);
+    }
+
+    /// The dispatch's stderr, which can quote an endpoint's error, prints
+    /// an OSC 0 title, a screen clear and an OSC 52 clipboard write as text.
+    #[test]
+    fn dispatch_stderr_prints_hostile_text_inert_and_plain_text_unchanged() {
+        let inert = |t: &str| !t.chars().any(|c| (c.is_control() && c != '\n' && c != '\t') || c == '\u{202e}');
+        let shown = dispatch_stderr_shown(&format!("engine: {}\nnext\n", "\x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}"));
+        assert!(inert(&shown), "{shown:?}");
+        assert!(shown.ends_with("\nnext\n"), "{shown:?}");
+        assert_eq!(dispatch_stderr_shown("warn: café\n\tdetail\n"), "warn: café\n\tdetail\n");
     }
 
     /// A doctor row quoting an endpoint's reply that holds an OSC 0 title, a

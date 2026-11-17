@@ -4,7 +4,9 @@
 //! whatever form the proposer chose. **darkmux never types a kit and never
 //! opens it.** `list` previews the raw kit truncated and nothing else — no
 //! parsed fields, no diff rendering, no verdict — the same discipline
-//! `finding list` applies to an emission.
+//! `finding list` applies to an emission. Every human rendering shows an
+//! escape sequence in the kit or a field as text (`\u{1b}`), never passing
+//! it to the terminal; `--json` carries the bytes.
 //!
 //! `--mission` answers from the mod's own create-time SNAPSHOT of its
 //! findings, not from the finding store as it stands now: a mod created
@@ -426,12 +428,12 @@ mod tests {
     fn mod_show_leaves_plain_text_newlines_and_unicode_unchanged() {
         let root = tempfile::tempdir().unwrap();
         let mut r = bare();
-        r.kit = Some("café 日本語 🇺🇸\n\tindented\n".into());
+        r.kit = Some("café 日本語 🇺🇸 👩\u{200d}💻 שלום\u{200f}\n\tindented\n".into());
         let text = show_text(&r, root.path());
         assert_eq!(
             text,
-            "mod       mod-1\nrecorded  t\nby        kain\nkind      (untyped)\ngate      (not yet gated)\nfor       (none)\n\nkit\ncafé 日本語 🇺🇸\n\tindented\n"
+            "mod       mod-1\nrecorded  t\nby        kain\nkind      (untyped)\ngate      (not yet gated)\nfor       (none)\n\nkit\ncafé 日本語 🇺🇸 👩\u{200d}💻 שלום\u{200f}\n\tindented\n"
         );
-        assert_eq!(list_row(&r), "mod-1  t  kain  [for (none)]\n    café 日本語 🇺🇸 indented");
+        assert_eq!(list_row(&r), "mod-1  t  kain  [for (none)]\n    café 日本語 🇺🇸 👩\u{200d}💻 שלום\u{200f} indented");
     }
 }

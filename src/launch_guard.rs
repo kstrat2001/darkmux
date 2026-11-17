@@ -208,9 +208,9 @@ fn signal_exit_code() -> Option<i32> {
 /// exits `128 + signo`.
 ///
 /// (#2462 review) `main` returns `anyhow::Result<()>`, so an `Err` that
-/// propagates out of `run` is printed by std's own `Termination` impl as
-/// `Error: {err:?}` (anyhow's `Debug`, i.e. the message plus its `Caused
-/// by:` chain). `std::process::exit` runs BEFORE any of that. So a site
+/// propagates out of `run` is printed by `main`'s exit report
+/// (`multicall::Exit`) as `Error: {err:?}` (anyhow's `Debug`, i.e. the
+/// message plus its `Caused by:` chain), escaped. `std::process::exit` runs BEFORE any of that. So a site
 /// that force-exits on the way out of an error path throws the error text
 /// away entirely: the operator gets exit 130 and nothing else on stderr,
 /// and a `--json` orchestrator gets no diagnosis at all.
@@ -224,10 +224,10 @@ fn signal_exit_code() -> Option<i32> {
 /// `tests/cli.rs` sent the child's stderr to `/dev/null`; they capture it
 /// to a file and assert the text now.
 ///
-/// Formats with `{err:?}` and the `Error: ` prefix DELIBERATELY — that is
-/// byte-for-byte what std would have printed on the ordinary `?` return,
-/// so a signal-interrupted run says exactly what a non-interrupted failure
-/// says, plus the distinguishing exit code.
+/// Prints through [`crate::multicall::error_report`] DELIBERATELY: that is
+/// byte-for-byte what `main` prints on the ordinary `?` return (std's
+/// `Error: {err:?}`, escaped), so a signal-interrupted run says exactly what
+/// a non-interrupted failure says, plus the distinguishing exit code.
 pub(crate) fn report_reap_and_exit_on_signal(err: &anyhow::Error) {
     if !darkmux_types::interrupt::is_set() {
         return;
@@ -235,7 +235,7 @@ pub(crate) fn report_reap_and_exit_on_signal(err: &anyhow::Error) {
     // No operator stop (the run's own bound raised the flag): nothing exits
     // here, so the `Err` reaches `main`, which prints it once.
     if signal_exit_code().is_some() {
-        eprintln!("Error: {err:?}");
+        eprintln!("{}", crate::multicall::error_report(err));
     }
     reap_and_exit_on_signal();
 }

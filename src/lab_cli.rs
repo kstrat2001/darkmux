@@ -146,11 +146,17 @@ fn cmd_lab_run_dispatch(
     if !quiet {
         println!("\n{}", lab::run::batch_summary(&outcomes));
         for o in &outcomes {
-            // A note can quote a verify command's output: shown, not acted on.
-            println!("  {}: {}", o.run_id, darkmux_types::user_files::escape_text(&o.notes.join(" | ")));
+            println!("{}", batch_note_line(o));
         }
     }
     Ok(lab::run::exit_code(&outcomes))
+}
+
+/// One run's line under `lab run`'s batch summary. A note can quote what a
+/// verify command printed, which the model's code wrote, so the notes are
+/// escaped (`escape_text`): shown, never acted on by the terminal.
+fn batch_note_line(o: &lab::run::RunOutcome) -> String {
+    format!("  {}: {}", o.run_id, darkmux_types::user_files::escape_text(&o.notes.join(" | ")))
 }
 
 /// `lab characterize`: a single `lab_run`, reported.
@@ -202,4 +208,29 @@ fn cmd_lab_doctor() -> Result<i32> {
         if report.fixture_count == 1 { "" } else { "s" }
     );
     Ok(if report.has_warnings() { 1 } else { 0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A verify note holding an OSC 0 title, a screen clear and an OSC 52
+    /// clipboard write prints as text; plain notes print unchanged.
+    #[test]
+    fn a_batch_note_line_prints_a_hostile_note_inert() {
+        let outcome = |notes: Vec<String>| lab::run::RunOutcome {
+            run_id: "r1".into(),
+            run_dir: std::path::PathBuf::new(),
+            ok: true,
+            verify_passed: Some(false),
+            duration_ms: 0,
+            notes,
+            provider_error: None,
+            escalation: None,
+        };
+        let inert = |t: &str| !t.chars().any(|c| (c.is_control() && c != '\n' && c != '\t') || c == '\u{202e}');
+        let line = batch_note_line(&outcome(vec![format!("verify=fail ({})", "\x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}")]));
+        assert!(inert(&line), "{line:?}");
+        assert_eq!(batch_note_line(&outcome(vec!["provider=stub".into(), "café 日本語".into()])), "  r1: provider=stub | café 日本語");
+    }
 }

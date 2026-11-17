@@ -119,7 +119,7 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
                 // 300s ceiling. Exit 1: the question was not answered, and
                 // a script must be able to tell that from an answer.
                 Ok(crate::radio_answer::LiveAnswer::Busy(busy)) => {
-                    println!("radio: {}", shown(&busy.answering_seat_message()));
+                    println!("{}", answer_line(&busy.answering_seat_message()));
                     Ok(1)
                 }
                 // The model was reached for routing but not for answering: the
@@ -133,7 +133,7 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
         // non-zero exit so `darkmux radio` in a script or CI job fails
         // instead of printing a command listing and returning 0.
         RouteDecision::Unavailable { error } => {
-            eprintln!("radio: could not reach a model.\n{}", shown(&error.to_string()));
+            eprintln!("{}", unreachable_text(&error));
             Ok(1)
         }
         RouteDecision::Route { command, args } => {
@@ -194,6 +194,17 @@ fn answer_failure_output(e: &anyhow::Error, catalog: &[CatalogEntry]) -> AnswerF
 /// cannot clear the screen, set the title or write the clipboard.
 fn answer_line(rendered: &str) -> String {
     format!("radio: {}", shown(rendered))
+}
+
+/// What radio prints when the routing seat could not be reached: the error,
+/// which can quote an endpoint's reply, escaped as [`answer_line`] escapes.
+fn unreachable_text(error: &str) -> String {
+    format!("radio: could not reach a model.\n{}", shown(error))
+}
+
+/// What radio prints when a routed ephemeral run failed: its error, escaped.
+fn command_failed_line(e: &anyhow::Error) -> String {
+    format!("radio: command failed: {}", shown(&format!("{e:#}")))
 }
 
 /// (#3123) What radio says when it has no answer it could check: true of
@@ -423,7 +434,7 @@ fn run_ephemeral_and_report(config: &crate::crew::mission_config::MissionConfig,
             if outcome.success { Ok(0) } else { Ok(1) }
         }
         Err(e) => {
-            eprintln!("radio: command failed: {}", shown(&format!("{e:#}")));
+            eprintln!("{}", command_failed_line(&e));
             Ok(1)
         }
     }
@@ -917,5 +928,21 @@ mod tests {
         confirm_launch(std::io::BufReader::new(NoRead), &mut out, false, &line, &[]);
         let out = String::from_utf8(out).unwrap();
         assert!(inert(&out), "{out:?}");
+    }
+
+    /// The busy message, the unreachable error, a routed run's own output
+    /// and its failure line each print hostile text inert. The busy line is
+    /// [`answer_line`] (LM Studio's own words); the ephemeral output is the
+    /// same escape the run's printer applies.
+    #[test]
+    fn the_busy_unreachable_and_ephemeral_lines_print_hostile_text_inert() {
+        assert!(inert(&answer_line(&format!("seat busy: {HOSTILE}"))));
+        let unreachable = unreachable_text(&format!("endpoint said {HOSTILE}\nretry"));
+        assert!(inert(&unreachable) && unreachable.ends_with("\nretry"), "{unreachable:?}");
+        assert!(inert(&shown(&format!("step output {HOSTILE}\n\tdone"))));
+        let failed = command_failed_line(&anyhow::anyhow!("boom {HOSTILE}"));
+        assert!(inert(&failed), "{failed:?}");
+        assert_eq!(unreachable_text("no model loaded"), "radio: could not reach a model.\nno model loaded");
+        assert_eq!(command_failed_line(&anyhow::anyhow!("café")), "radio: command failed: café");
     }
 }

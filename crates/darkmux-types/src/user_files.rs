@@ -758,9 +758,13 @@ fn segment(key: &str) -> String {
 }
 
 /// `text` with every control character and every invisible format
-/// character (bidi overrides and isolates, zero-width marks, line and
-/// paragraph separators) written as a `\u{..}` escape, so a terminal shows
-/// it instead of acting on it.
+/// character (bidi embeddings, overrides and isolates, zero-width spaces and
+/// word joiners, line and paragraph separators, tag characters) written as a
+/// `\u{..}` escape, so a terminal shows it instead of acting on it. The
+/// joiners (ZWJ, ZWNJ) and the direction marks (LRM, RLM, ALM) are kept:
+/// real text needs them (an emoji family, Persian, Hebrew or Arabic next to
+/// Latin), and a mark only sets the direction of the spot it sits in, so it
+/// can neither reorder the text around it nor hide any of it.
 pub fn escape_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -790,9 +794,20 @@ pub fn escape_text_keeping_lines(text: &str) -> String {
     lines.join("\n")
 }
 
-/// Unicode format characters a terminal acts on without showing them.
+/// Unicode format characters a terminal acts on without showing them (see
+/// [`escape_text`] for the joiners and marks deliberately left out).
 fn is_invisible_format(c: char) -> bool {
-    matches!(c as u32, 0xAD | 0x61C | 0x180E | 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB)
+    matches!(
+        c as u32,
+        0xAD | 0x180E
+            | 0x200B
+            | 0x2028..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0xE0000..=0xE007F
+    )
 }
 
 fn join(parent: &str, key: &str) -> String {

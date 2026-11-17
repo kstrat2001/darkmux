@@ -91,7 +91,7 @@ impl Termination for Exit {
 /// can quote what another system sent (an endpoint's error body, a peer's
 /// refusal, a model's reply), so an escape sequence in it is shown as text
 /// rather than acted on, while its lines still read as lines.
-fn error_report(e: &anyhow::Error) -> String {
+pub(crate) fn error_report(e: &anyhow::Error) -> String {
     format!("Error: {}", darkmux_types::user_files::escape_text_keeping_lines(&format!("{e:?}")))
 }
 

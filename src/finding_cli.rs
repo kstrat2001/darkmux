@@ -8,7 +8,8 @@
 //!
 //! **darkmux never interprets the emission.** `list` shows a truncated, compact
 //! preview of the raw JSON the model produced and nothing else — no parsed
-//! fields, no severity, no verdict. A finding's location is domain-specific (a
+//! fields, no severity, no verdict (an escape sequence in it shown as text,
+//! as in `finding show`). A finding's location is domain-specific (a
 //! line for text, a page for a PDF, a rect for an image), so there is nothing
 //! for darkmux to read inside it. The filters below key on the record's own
 //! `context` — provenance the LAUNCHER supplied — never on the emission.

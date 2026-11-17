@@ -2730,3 +2730,13 @@ edit loop detected on src/widget.rs in an earlier dispatch
             darkmux_types::style::set_colorize_override(None);
         }
     }
+
+    /// A mission description holding an OSC 0 title, a screen clear and an
+    /// OSC 52 clipboard write prints as text in the debrief.
+    #[test]
+    fn the_debrief_description_prints_hostile_text_inert() {
+        let line = debrief_description_line(&format!("Fix it{}\nsecond", "\x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}")).unwrap();
+        assert!(!line.chars().any(|c| c.is_control() || c == '\u{202e}'), "{line:?}");
+        assert_eq!(debrief_description_line("  café 日本語 \nmore").as_deref(), Some("  café 日本語"));
+        assert_eq!(debrief_description_line("  \n"), None);
+    }

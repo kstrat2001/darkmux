@@ -2619,6 +2619,14 @@ impl DebriefPhase {
     }
 }
 
+/// The debrief's description line: the mission description's first line,
+/// escaped (`escape_text`), or nothing when it is blank. A description can
+/// come from a ticket or a routed request, not only the operator.
+fn debrief_description_line(description: &str) -> Option<String> {
+    let desc = description.lines().next().unwrap_or("").trim();
+    (!desc.is_empty()).then(|| format!("  {}", darkmux_types::user_files::escape_text(desc)))
+}
+
 /// Print a bullet list, or a dim "(none)" when empty — the debrief's
 /// section renderer. The collected strings are already bullet-formatted
 /// (`- …`) by the caution / correction collectors.
@@ -2803,9 +2811,8 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
         "{}",
         style::header(&format!("debrief: mission `{}`", report.mission.id))
     );
-    let desc = report.mission.description.lines().next().unwrap_or("").trim();
-    if !desc.is_empty() {
-        println!("  {}", darkmux_types::user_files::escape_text(desc));
+    if let Some(line) = debrief_description_line(&report.mission.description) {
+        println!("{line}");
     }
     println!();
 
