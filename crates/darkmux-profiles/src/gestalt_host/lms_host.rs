@@ -165,6 +165,21 @@ impl ModelHost for LmsHost {
         facts
     }
 
+    /// (#1135 class) The `maxContextLength` LM Studio lists for the model
+    /// `lms load` would resolve `model_key` to (its key, path or a variant,
+    /// as `ModelMeta::answers_to` reads them): the rows of the catalog just
+    /// listed, or a fresh `lms ls --json`. `None` when the listing fails or
+    /// states no positive maximum, so an unknown limit never refuses a load.
+    fn context_limit(&mut self, model_key: &str) -> Option<u64> {
+        let rows = match self.last_ls.take() {
+            Some(rows) => rows,
+            None => self.run_json_list(&["ls", "--json"], "ls", Deadline(self.list_bound)).ok()?,
+        };
+        let limit = stated_context_limit(&rows, model_key);
+        self.last_ls = Some(rows);
+        limit
+    }
+
     /// `lms load <key> --context-length <ctx> --identifier <id> -y` under the
     /// enforced deadline. Flags match the old `lms::load_with_identifier` plus
     /// `-y`: inside a dispatch the load must never wait on an interactive
@@ -253,6 +268,17 @@ impl ModelHost for LmsHost {
 }
 
 // ── JSON → fact parsers (pure; canned-payload tests below) ──
+
+/// The positive `maxContextLength` of the `lms ls --json` row that answers
+/// to `model_key`, parsed as the catalog parses it (`lms::meta_from_json`).
+fn stated_context_limit(rows: &[serde_json::Value], model_key: &str) -> Option<u64> {
+    rows.iter()
+        .filter_map(crate::lms::meta_from_json)
+        .find(|m| m.answers_to(model_key))
+        .and_then(|m| m.max_context_length)
+        .filter(|limit| *limit > 0)
+        .map(u64::from)
+}
 
 /// One `lms ps --json` row → [`ResidentFact`]. Field fallback chains mirror
 /// `crate::lms::model_from_json` (`identifier`|`id`; `modelKey`|`model`|`id`;
@@ -1093,6 +1119,37 @@ esac"#,
             .load("qwen/qwen3-4b-2507", "darkmux:qwen3-4b", 32768, Deadline(Duration::from_secs(10)))
             .expect("stub load succeeds");
         assert_eq!(report.resolved_ctx, Some(32768));
+    }
+
+    /// (#1135 class) The model's maximum context is LM Studio's
+    /// `maxContextLength` for the row `lms load` resolves the name to (its
+    /// key, path or a variant); a row without one, a model not listed or a
+    /// listing that fails states none.
+    #[cfg(unix)]
+    #[test]
+    fn context_limit_reads_the_catalogs_max_context_for_the_name_lms_loads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let count = dir.path().join("ls-calls");
+        let stub = write_stub(
+            dir.path(),
+            &format!(
+                r#"case "$1" in
+  ls) echo x >> '{}'; echo '[{{"modelKey":"m","path":"pub/m-GGUF","variants":["m@q4"],"maxContextLength":4096}},{{"modelKey":"n","maxContextLength":0}},{{"modelKey":"o"}}]' ;;
+esac"#,
+                count.display()
+            ),
+        );
+        let mut host = LmsHost::with_bin(stub.to_string_lossy());
+        for name in ["m", "pub/m-GGUF", "m@q4"] {
+            assert_eq!(host.context_limit(name), Some(4096), "{name}");
+        }
+        for name in ["n", "o", "absent"] {
+            assert_eq!(host.context_limit(name), None, "{name}");
+        }
+        assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1, "one `lms ls`, its rows kept");
+
+        let failing = write_stub(dir.path(), "exit 1");
+        assert_eq!(LmsHost::with_bin(failing.to_string_lossy()).context_limit("m"), None, "a failed listing states none");
     }
 
     #[test]

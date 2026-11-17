@@ -722,10 +722,14 @@ fn a_model_that_will_not_load_fails_before_a_record() {
     let (res, _) = run(&rig, rig.opts());
     let err = format!("{:#}", res.expect_err("load failure"));
     assert!(err.starts_with("model selection failed: darkmux: model `model-a` could not load at n_ctx=32000"), "{err}");
-    // The load is priced off the catalog for its reservation (#3514), its
-    // memory decided as a wave's on LM Studio's residents read again under
-    // the residency lock.
-    assert_eq!(rig.lms_log(), vec!["ps --json", "ps --json", "ls --json", "load model-a --context-length 32000 --identifier darkmux:model-a -y"]);
+    // The model's maximum context is read off the catalog before anything
+    // is unloaded or loaded (#1135 class). The load is priced off the
+    // catalog for its reservation (#3514), its memory decided as a wave's
+    // on LM Studio's residents read again under the residency lock.
+    assert_eq!(
+        rig.lms_log(),
+        vec!["ps --json", "ls --json", "ps --json", "ls --json", "load model-a --context-length 32000 --identifier darkmux:model-a -y"]
+    );
     assert!(rig.docker_run().is_none());
     assert!(bookends(&rig).is_empty(), "records: {:?}", rig.actions());
 }
@@ -1062,6 +1066,29 @@ fn a_model_that_is_not_resident_is_loaded_namespaced_at_its_context() {
     res.unwrap();
     let lms = rig.lms_log();
     assert!(lms.contains(&"load model-a --context-length 32000 --identifier darkmux:model-a -y".to_string()), "{lms:?}");
+}
+
+/// (#1135 class) LM Studio finishes the load but holds the model at 4096,
+/// not the 32000 the profile declares: the dispatch fails before a record,
+/// naming the instance, what was asked and what it got, and no container
+/// runs truncated.
+#[test]
+#[serial]
+fn a_load_lm_studio_holds_below_the_profiles_context_fails_before_a_record() {
+    own_process!();
+    let rig = Rig::new();
+    rig.resident(&[]);
+    rig.fake("lms-ps-after-load.json", lms_ps(&[("darkmux:model-a", "model-a", 4096)]));
+    rig.container(ONE_TURN, ENVELOPE, "", 0);
+    let (res, _) = run(&rig, rig.opts());
+    let err = format!("{:#}", res.expect_err("held at 4096"));
+    assert!(
+        err.starts_with("model selection failed: darkmux: `darkmux:model-a` loaded at context 4096, below the n_ctx=32000 asked"),
+        "{err}"
+    );
+    assert!(err.contains("set the profile's `n_ctx` to 4096 or less"), "{err}");
+    assert!(rig.docker_run().is_none(), "no container ran on the short model");
+    assert!(bookends(&rig).is_empty(), "records: {:?}", rig.actions());
 }
 
 /// (#3514) The same reload while another dispatch holds that instance (its

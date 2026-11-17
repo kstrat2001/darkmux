@@ -789,15 +789,8 @@ fn execute_plan(
     // residency lock there.
     before_load: &mut dyn FnMut(),
 ) -> PlanExecOutcome {
-    // (#2674) The refuse-fast gate: decide every Block first, mutate
-    // nothing. Reports the FIRST refusal in action order — identical to
-    // what the in-order loop below used to surface, so the reason the
-    // caller retries (or gives up) on is unchanged.
-    if let Some((model_key, reason)) = plan.actions.iter().find_map(|p| match &p.action {
-        Action::Block { model_key, .. } => Some((model_key.clone(), p.reason.clone())),
-        _ => None,
-    }) {
-        return PlanExecOutcome::Blocked { model_key, reason };
+    if let Some(refused) = refused_before_mutating(plan, host) {
+        return refused;
     }
     for planned in &plan.actions {
         match &planned.action {
@@ -809,7 +802,9 @@ fn execute_plan(
             }
             Action::Load { model_key, identifier, min_ctx } => {
                 before_load();
-                if let Err(host_error) = host.load(model_key, identifier, *min_ctx, deadline) {
+                // (#1135 class) A load the host reports below `min_ctx` is
+                // a failure, never a wave that runs truncated.
+                if let Err(host_error) = darkmux_gestalt::load_verified(host, model_key, identifier, *min_ctx, deadline) {
                     return PlanExecOutcome::HostFailed {
                         detail: format!(
                             "load failed for \"{model_key}\" (\"{identifier}\"): {host_error}"
@@ -832,6 +827,33 @@ fn execute_plan(
         }
     }
     PlanExecOutcome::Loaded
+}
+
+/// The refuse-fast gate, decided before any host mutation.
+///
+/// (#2674) Every Block first. Reports the FIRST refusal in action order —
+/// identical to what the in-order loop used to surface, so the reason the
+/// caller retries (or gives up) on is unchanged.
+///
+/// (#1135 class) Then every load whose context the model cannot take, as
+/// the host's catalog states its maximum: refused before a preceding
+/// unload evicts anything, as a load that would only land short.
+fn refused_before_mutating(plan: &Plan, host: &mut dyn ModelHost) -> Option<PlanExecOutcome> {
+    if let Some((model_key, reason)) = plan.actions.iter().find_map(|p| match &p.action {
+        Action::Block { model_key, .. } => Some((model_key.clone(), p.reason.clone())),
+        _ => None,
+    }) {
+        return Some(PlanExecOutcome::Blocked { model_key, reason });
+    }
+    plan.actions.iter().find_map(|p| match &p.action {
+        Action::Load { model_key, identifier, min_ctx } => {
+            darkmux_gestalt::check_context_limit(host, model_key, *min_ctx).err().map(|host_error| PlanExecOutcome::HostFailed {
+                detail: format!("load refused for \"{model_key}\" (\"{identifier}\"): {host_error}"),
+                host_error,
+            })
+        }
+        _ => None,
+    })
 }
 
 /// One planned unload, re-verified immediately before it runs (#3511): the
@@ -2261,6 +2283,69 @@ mod tests {
         settle_attempt(drift(), 1, &[], &[]).expect("the first drift replans");
         let err = settle_attempt(drift(), BLOCKED_BY_HOLDER_RETRY_ATTEMPTS, &[], &[]).expect_err("spent");
         assert_eq!(crate::engine_dispatch::refusal_code(&err), Some("busy"), "{err:#}");
+    }
+
+    /// A host that loads every model at `at` context, whatever was asked,
+    /// and says so in its report (LM Studio capping `--context-length`).
+    struct LoadsAt {
+        inner: MockHost,
+        at: u64,
+    }
+
+    impl ModelHost for LoadsAt {
+        fn list_resident(&mut self) -> Result<Vec<ResidentFact>, HostError> {
+            self.inner.list_resident()
+        }
+        fn list_catalog(&mut self) -> Result<Vec<darkmux_gestalt::CatalogFact>, HostError> {
+            self.inner.list_catalog()
+        }
+        fn load(&mut self, model_key: &str, identifier: &str, min_ctx: u32, deadline: Deadline) -> Result<darkmux_gestalt::LoadReport, HostError> {
+            self.inner.load(model_key, identifier, min_ctx, deadline)?;
+            Ok(darkmux_gestalt::LoadReport { resolved_ctx: Some(self.at), ..Default::default() })
+        }
+        fn unload(&mut self, target: &darkmux_gestalt::OwnedTarget, deadline: Deadline) -> Result<(), HostError> {
+            self.inner.unload(target, deadline)
+        }
+    }
+
+    /// (#1135 class) A wave's load the host finishes below the context the
+    /// placement asked is the wave's failure, naming asked and got, never
+    /// a wave that runs truncated.
+    #[test]
+    fn execute_plan_fails_a_load_that_lands_below_its_context() {
+        // The load of `fresh` at 8000 alone.
+        let plan = Plan { actions: unload_then_load(None).actions.split_off(1), ..Default::default() };
+        let mut host = LoadsAt { inner: MockHost::new(), at: 4_096 };
+        let outcome = execute_plan(&plan, &mut host, Deadline::from_secs(1), &mut Vec::new(), &Vec::new, &mut || {});
+        let PlanExecOutcome::HostFailed { detail, .. } = &outcome else { panic!("the load at 4096 was not a failure") };
+        for part in ["darkmux:fresh", "4096", "8000", "n_ctx"] {
+            assert!(detail.contains(part), "names {part}: {detail}");
+        }
+        let mut at_ctx = LoadsAt { inner: MockHost::new(), at: 8_000 };
+        let outcome = execute_plan(&plan, &mut at_ctx, Deadline::from_secs(1), &mut Vec::new(), &Vec::new, &mut || {});
+        assert!(matches!(outcome, PlanExecOutcome::Loaded), "a load at the asked context loads");
+    }
+
+    /// (#1135 class) A wave's load asking more context than the model takes,
+    /// as the host's catalog states it, is refused before the plan's
+    /// preceding unload evicts anything, and the wave fails
+    /// `model_start_failed` with the remedy, never retried.
+    #[test]
+    fn execute_plan_refuses_a_load_beyond_the_models_context_before_any_unload() {
+        let mut host = MockHost::new().resident("darkmux:orphan", "orphan", 8_000, Some(1_000)).context_limited("fresh", 4_096);
+        let mut committed = Vec::new();
+        let outcome = execute_plan(&unload_then_load(Some(8_000)), &mut host, Deadline::from_secs(1), &mut committed, &Vec::new, &mut || {});
+        let PlanExecOutcome::HostFailed { detail, host_error } = outcome else { panic!("the load beyond 4096 was not refused") };
+        assert!(matches!(host_error, HostError::ContextBeyondModel { limit: 4_096, asked: 8_000, .. }), "{host_error:?}");
+        assert!(host.ops.is_empty(), "nothing unloaded or loaded: {:?}", host.ops);
+        assert!(committed.is_empty());
+        let err = settle_attempt(PlanExecOutcome::HostFailed { detail, host_error }, 1, &[], &[]).expect_err("never retried");
+        assert_eq!(crate::engine_dispatch::refusal_code(&err), Some("model_start_failed"), "{err:#}");
+        assert!(format!("{err:#}").contains("`n_ctx` to 4096 or less"), "{err:#}");
+
+        let mut roomy = MockHost::new().resident("darkmux:orphan", "orphan", 8_000, Some(1_000)).context_limited("fresh", 8_000);
+        let outcome = execute_plan(&unload_then_load(Some(8_000)), &mut roomy, Deadline::from_secs(1), &mut Vec::new(), &Vec::new, &mut || {});
+        assert!(matches!(outcome, PlanExecOutcome::Loaded), "a model that takes 8000 loads at 8000");
     }
 
     /// A host whose second `lms ps` (the re-read before the first unload)
