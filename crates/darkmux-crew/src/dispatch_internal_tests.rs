@@ -6573,6 +6573,9 @@ S(("127.0.0.1", port), H).serve_forever()
         cfg.compaction.compactor_chat_url = None;
         assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [1234], "the runtime's own default");
         assert!(dispatch_policy_for(&cfg, &SeatbeltBackend).ports.is_empty(), "a dispatch binds any port");
+        let refused = dispatch_policy_for(&cfg, &SeatbeltBackend).refused_ports;
+        assert_eq!(refused, darkmux_types::config_enum::darkmux_service_ports(), "darkmux's own services, refused before they listen");
+        assert!(refused.contains(&darkmux_types::config_access::serve_port()), "{refused:?}");
     }
 
     /// What names this machine in an endpoint's URL, read as the runtime's

@@ -520,6 +520,7 @@ mod tests {
             ports: vec![8080],
             stdin: false,
             host_services: Vec::new(),
+            refused_ports: Vec::new(),
             host_alias: None,
             user: None,
             env: vec![("A".into(), "1".into())],

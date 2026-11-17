@@ -1108,6 +1108,7 @@ pub fn preview_policy(spec: &ContainerSpec) -> SandboxPolicy {
         ports: spec.ports.to_vec(),
         stdin: false,
         host_services: Vec::new(),
+        refused_ports: Vec::new(),
         host_alias: None,
         user: spec.user.clone(),
         env: home.chain(spec.env.iter().cloned()).collect(),

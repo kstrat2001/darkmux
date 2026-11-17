@@ -2733,6 +2733,9 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
         ports: Vec::new(),
         stdin: config.needs_stdin(),
         host_services: endpoint_ports(config),
+        // Refused even before they listen: a daemon started after the
+        // dispatch is planned (the profile's listing missed it).
+        refused_ports: darkmux_types::config_enum::darkmux_service_ports(),
         host_alias: (config.container_host_access == darkmux_platform::ContainerHostAccess::HostGateway)
             .then(|| "host.docker.internal".to_string()),
         user,

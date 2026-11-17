@@ -710,6 +710,23 @@ pub fn machine_port_owners() -> Vec<PortOwner> {
     owners
 }
 
+/// The ports darkmux's own services and LM Studio listen on here, as
+/// resolved now, whether or not they run: [`machine_port_owners`]' (LM
+/// Studio's when `lmstudio_url` names this machine, the daemon's
+/// `serve.port`, a running daemon's own), the fleet listener's
+/// (`fleet.listener.port`, bound to the overlay address) and `darkmux client
+/// serve`'s default ([`crate::config_access::CLIENT_SERVE_PORT`], on the
+/// loopback and published on the overlay). Sorted, once each. What a
+/// sandbox on the host is refused even before they listen.
+pub fn darkmux_service_ports() -> Vec<u16> {
+    let owned = machine_port_owners().into_iter().map(|o| o.port);
+    let started = [crate::config_access::fleet_listener_port(), crate::config_access::CLIENT_SERVE_PORT];
+    let mut ports: Vec<u16> = owned.chain(started).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
 /// Every engine endpoint (a server darkmux starts) whose `port` something
 /// else already uses: an engine endpoint before it (by id), or one of
 /// `owners` ([`machine_port_owners`]). Two servers cannot listen on one
@@ -1065,6 +1082,25 @@ pub fn config_path_of(setting: &EnumSetting) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// darkmux's own service ports are refused before they listen: the
+    /// daemon's resolved `serve.port`, the fleet listener's, `client serve`'s
+    /// default, and LM Studio's when it is on this machine; once each, sorted.
+    #[test]
+    fn darkmux_service_ports_name_every_listener_darkmux_starts() {
+        let ports = super::darkmux_service_ports();
+        for want in [crate::config_access::serve_port(), crate::config_access::fleet_listener_port(), crate::config_access::CLIENT_SERVE_PORT] {
+            assert!(ports.contains(&want), "{want} missing from {ports:?}");
+        }
+        let lms = crate::config_access::lmstudio_url();
+        if crate::endpoint::url_names_this_machine(&lms) {
+            assert!(ports.contains(&crate::endpoint::url_port(&lms).unwrap()), "{ports:?}");
+        }
+        let mut sorted = ports.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(ports, sorted);
+    }
+
 
     /// (#3504) A busy dispatch reads `fleet.busy_policy`, so every entry
     /// point that dispatches refuses a value it does not know, as the fleet

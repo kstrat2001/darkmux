@@ -147,6 +147,7 @@ fn policy(backend: &dyn SandboxBackend, image: &str, tree: &Path, script: &str) 
         ports: Vec::new(),
         stdin: false,
         host_services: Vec::new(),
+        refused_ports: Vec::new(),
         host_alias: None,
         user: None,
         env: Vec::new(),

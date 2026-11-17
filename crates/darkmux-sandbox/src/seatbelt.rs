@@ -44,8 +44,10 @@
 //!   must reach its own servers there (a test suite's HTTP server), which
 //!   SBPL cannot tell from the host's, and SBPL takes no port range: the
 //!   ports this host listens on when the sandbox is planned are refused
-//!   instead (IPv4 to this machine, IPv6 to any address), the given ones
-//!   excepted. A service that first listens after that is reachable. When
+//!   instead (IPv4 to this machine, IPv6 to any address), and so are its
+//!   `refused_ports` (darkmux's own services) whether or not they listen
+//!   yet, the given ones excepted. Another service that first listens
+//!   after that is reachable. When
 //!   this host's listeners cannot be read, it is held as one naming ports.
 //! - **Reach every descendant.** A sandbox is the session its launcher leads
 //!   (#3559): its process group is killed over and over until it is empty (a
@@ -349,16 +351,28 @@ impl SeatbeltBackend {
     /// bind any port and must reach its own servers there, which SBPL cannot
     /// tell from the host's: the ports something on this host listens on as
     /// the sandbox starts (`listening`) are refused instead, IPv4 to this
-    /// machine and IPv6 to any address, the given ones excepted. A service
-    /// that first listens after the sandbox started is not refused. When
+    /// machine and IPv6 to any address, and so are its `refused_ports`
+    /// whether or not they listen yet (darkmux's own services), the given
+    /// ones excepted. Another service that first listens after the sandbox
+    /// started is not refused. When
     /// this host's listeners cannot be read, it is held as one naming ports.
     fn host_services_rule(policy: &SandboxPolicy, listening: impl FnOnce() -> Option<Vec<u16>>) -> String {
         let given: Vec<u16> = policy.ports.iter().chain(&policy.host_services).copied().collect();
         let held = if policy.ports.is_empty() { listening() } else { None };
         match held {
-            Some(held) => Self::refuse_ports(held.into_iter().filter(|p| !given.contains(p)).collect()),
+            Some(held) => Self::refuse_ports(Self::refused_of(held, &policy.refused_ports, &given)),
             None => Self::refuse_all_ports_but(given),
         }
+    }
+
+    /// The ports a policy naming none is refused: those `held` (listening
+    /// as it is planned) and those it is told to refuse whether or not they
+    /// listen yet, each once, sorted, but never a `given` one.
+    fn refused_of(held: Vec<u16>, always: &[u16], given: &[u16]) -> Vec<u16> {
+        let mut refused: Vec<u16> = held.into_iter().chain(always.iter().copied()).filter(|p| !given.contains(p)).collect();
+        refused.sort_unstable();
+        refused.dedup();
+        refused
     }
 
     /// Outbound to these ports refused: on this machine over IPv4, at any
@@ -708,6 +722,7 @@ mod tests {
             ports: Vec::new(),
             stdin: false,
             host_services: Vec::new(),
+            refused_ports: Vec::new(),
             host_alias: None,
             user: None,
             env: vec![("A".into(), "1".into())],
@@ -787,6 +802,10 @@ mod tests {
         let refused = "(deny network-outbound (remote ip4 \"localhost:6379\") (remote ip4 \"localhost:8799\") (remote ip6 \"*:6379\") (remote ip6 \"*:8799\"))\n";
         assert!(held.ends_with(refused), "{held}");
         assert!(!held.contains("localhost:*\") (remote ip6"), "its own servers on any other port stay reachable: {held}");
+        dispatch.refused_ports = vec![8765, 1234, 6379];
+        let always = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || Some(vec![6379]));
+        assert!(always.ends_with("(deny network-outbound (remote ip4 \"localhost:6379\") (remote ip4 \"localhost:8765\") (remote ip6 \"*:6379\") (remote ip6 \"*:8765\"))\n"), "refused before it listens, never a given one: {always}");
+        dispatch.refused_ports.clear();
         let only_given = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || Some(vec![1234]));
         assert!(!only_given.contains("(remote ip"), "{only_given}");
         let unread = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || None);
@@ -1198,5 +1217,49 @@ mod tests {
         let own = a_free_port();
         let (sandboxed, control) = reached(vec![own], vec![given], own, &probes);
         assert_only_own_and_given(&sandboxed, &control);
+    }
+
+    /// A dispatch's shape: a port it is told to refuse is refused even when
+    /// nothing listens on it as the sandbox is planned (a darkmux daemon
+    /// started after the dispatch), at 127.0.0.1, `::1` and the IPv4-mapped
+    /// loopback, unless it is given; a listener that also starts late on a
+    /// port it is not told to refuse is reached (the probes ran after both
+    /// were up).
+    #[test]
+    #[serial_test::serial]
+    fn a_dispatch_never_reaches_a_refused_port_that_starts_listening_after_it_is_planned() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let (refused, given, late) = (a_free_port(), a_free_port(), a_free_port());
+        let root = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var_os(STATE_DIR_ENV);
+        unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
+        let mut script = String::from("sleep 2\n");
+        for (said, at, port) in [("refused", "127.0.0.1", refused), ("refused6", "::1", refused), ("refused-mapped", "::ffff:127.0.0.1", refused), ("given", "127.0.0.1", given), ("late", "127.0.0.1", late)] {
+            script.push_str(&format!("/usr/bin/nc -z -G 1 '{at}' {port} 2>/dev/null && echo '{said}'\n"));
+        }
+        let mut p = policy(Vec::new(), Network::Default);
+        p.name = format!("darkmux-late-listener-test-{}", std::process::id());
+        (p.host_services, p.refused_ports) = (vec![given], vec![refused, given]);
+        p.entrypoint = Some(SH.into());
+        p.command = vec!["-c".into(), script.clone()];
+        let (mut cmd, _) = SeatbeltBackend.run(&p);
+        let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        // Every listener starts after the profile was built (at `run`).
+        let bind = |at: String| std::net::TcpListener::bind(at).unwrap();
+        let _up = [bind(format!("127.0.0.1:{refused}")), bind(format!("[::1]:{refused}")), bind(format!("127.0.0.1:{given}")), bind(format!("127.0.0.1:{late}"))];
+        let out = child.wait_with_output().unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(STATE_DIR_ENV, v),
+                None => std::env::remove_var(STATE_DIR_ENV),
+            }
+        }
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let control = Command::new(SH).arg("-c").arg(&script).output().unwrap();
+        let lines = |o: &[u8]| String::from_utf8_lossy(o).lines().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(lines(&control.stdout), ["refused", "refused6", "refused-mapped", "given", "late"], "the control reaches every listener");
+        assert_eq!(lines(&out.stdout), ["given", "late"]);
     }
 }
