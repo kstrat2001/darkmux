@@ -20,10 +20,12 @@ import {
   isUnknownStatus,
   keepPageStatus,
   mergeGraphs,
+  missionSpan,
   missionTotals,
   phaseOrderEdges,
   recordInMission,
   seedMetricsFromGraph,
+  shownGraph,
   statusFromRecord,
   statusRank,
   stepDisplayMetrics,
@@ -779,6 +781,111 @@ describe("stepMeterFor wall time (#2269)", () => {
   it("a step that never started has no wall time", () => {
     const step = { id: "s", label: "u-0004", kind: "dispatch.internal", status: "planned" as const };
     expect(stepMeterFor(step, {}, T0).wallMs).toBe(0);
+  });
+});
+
+// (#3195) A step admitted with its wave but queued for its endpoint's call
+// slot: the scheduler writes `step.queue.wait` when it is queued and
+// `step.queue.resume` when it takes the slot. It reads waiting until then,
+// and its work timer starts at the resume, not at its `step.start`.
+describe("a step queued for its call slot (#3195)", () => {
+  const T0 = Date.parse("2026-08-19T00:00:00Z");
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const at = (action: string, ms: number) => rec({ action, ts: iso(ms), handle: "b-step", session_id: "task-b", mission_id: "m1" });
+  const planned = (): MissionGraph => {
+    const g = baseGraph();
+    return { ...g, nodes: g.nodes.map((n) => (n.id === "b" ? { ...n, steps: [{ ...n.steps![0], status: "planned" as const }] } : n)) };
+  };
+  const stepStatus = (g: MissionGraph) => g.nodes.find((n) => n.id === "b")!.steps![0].status;
+  const fold = (records: NormRecord[]) => foldFlowRecords(planned(), records, indexGraph(planned()), "m1");
+  const queued = [at("step.start", T0), at("step.queue.wait", T0)];
+  const resumed = [...queued, at("step.queue.resume", T0 + 600_000), at("dispatch.start", T0 + 601_000)];
+
+  it("reads waiting from its wait until it takes the slot, then running, then its terminal", () => {
+    expect(stepStatus(fold(queued))).toBe("waiting");
+    expect(stepStatus(fold(resumed))).toBe("running");
+    expect(stepStatus(fold([...resumed, at("step.complete", T0 + 660_000)]))).toBe("complete");
+  });
+
+  // The server's snapshot of a step admitted but not yet dispatching:
+  // `running` by the scheduler's word, marked `waiting`.
+  type WireGraph = Parameters<typeof shownGraph>[0];
+  const wire = (waiting: boolean): WireGraph => {
+    const g = planned();
+    const step = { id: "b-step", label: "Dispatch", kind: "dispatch.single_shot", status: "running" as const, waiting };
+    // The fixture's other rows carry no `waiting`, so they are wire rows too.
+    return { ...g, generated_at_ms: T0 + 1_000, nodes: g.nodes.map((n) => (n.id === "b" ? { ...n, steps: [step] } : n)) } as WireGraph;
+  };
+  const wireWaiting = () => wire(true);
+
+  it("a step the server marks waiting reads waiting; the server's word stands for the rest", () => {
+    const shown = shownGraph(wireWaiting());
+    expect(stepStatus(shown)).toBe("waiting");
+    expect(shown.nodes.find((n) => n.id === "a")!.steps![0].status).toBe("complete");
+    // A server that marks nothing (older than #3195) reads as it did.
+    const unmarked = wire(false);
+    expect(shownGraph(unmarked)).toBe(unmarked);
+    expect(stepStatus(shownGraph(unmarked))).toBe("running");
+  });
+
+  it("a page loaded during the wait (the snapshot says waiting) reads running at the step's resume", () => {
+    const snap = shownGraph(wireWaiting());
+    const folded = foldFlowRecords(snap, resumed, indexGraph(snap), "m1");
+    expect(stepStatus(folded)).toBe("running");
+  });
+
+  it("a wait never reopens a step that already ended", () => {
+    expect(stepStatus(fold([at("step.start", T0), at("step.complete", T0 + 1_000), at("step.queue.wait", T0 + 2_000)]))).toBe("complete");
+  });
+
+  const meter = (records: NormRecord[], status: "waiting" | "running", now: number) => {
+    const idx = indexGraph(planned());
+    const metrics = records.reduce<MetricsMap>((m, r) => applyRecordToMetrics(m, r, idx, "m1"), {});
+    const step = { id: "b-step", label: "Dispatch", kind: "dispatch.single_shot", status };
+    return stepMeterFor(step, metrics, now, new Map([["b-step", "open"]]));
+  };
+
+  it("a waiting step has no start of its own until it takes the slot", () => {
+    const idx = indexGraph(planned());
+    const fold = (records: NormRecord[]) => records.reduce<MetricsMap>((m, r) => applyRecordToMetrics(m, r, idx, "m1"), {});
+    expect(fold(queued)["b-step"].startTs).toBe(0);
+    expect(fold(resumed)["b-step"].startTs).toBe(T0 + 600_000);
+  });
+
+  it("the mission's span still counts from its first step's admission, waits included", () => {
+    // Every step waited (a local wave loading its model): the mission
+    // header shows the whole, from the admission, not from the first work.
+    const idx = indexGraph(planned());
+    const metrics = resumed.reduce<MetricsMap>((m, r) => applyRecordToMetrics(m, r, idx, "m1"), {});
+    expect(missionSpan(metrics).start).toBe(T0);
+  });
+
+  it("a waiting step shows no work timer, however long it has waited", () => {
+    const m = meter(queued, "waiting", T0 + 600_000);
+    expect(m.generating).toBe(false);
+    expect(m.elapsedMs).toBe(0);
+    expect(m.wallMs).toBe(0);
+  });
+
+  it("the meter says a waiting step waits", () => {
+    expect(meter(queued, "waiting", T0 + 600_000).waiting).toBe(true);
+    expect(meter(resumed, "running", T0 + 660_000).waiting).toBe(false);
+  });
+
+  it("a step whose records name no wait still counts from its true start, the snapshot's", () => {
+    // A step whose wait no record names (its start record is its admission)
+    // but whose snapshot carries the instant its dispatch began.
+    const idx = indexGraph(planned());
+    const metrics = [at("step.start", T0)].reduce<MetricsMap>((m, r) => applyRecordToMetrics(m, r, idx, "m1"), {});
+    const step = { id: "b-step", label: "Dispatch", kind: "dispatch.single_shot", status: "running" as const, startedTs: (T0 + 600_000) / 1000 };
+    const seeded = seedMetricsFromGraph(metrics, { nodes: [{ ...TASK_B, steps: [step] }] });
+    expect(stepMeterFor(step, seeded, T0 + 660_000, new Map([["b-step", "open"]])).elapsedMs).toBe(60_000);
+  });
+
+  it("once it takes the slot, its timer counts from then, not from its admission", () => {
+    const m = meter(resumed, "running", T0 + 660_000);
+    expect(m.generating).toBe(true);
+    expect(m.elapsedMs).toBe(60_000);
   });
 });
 

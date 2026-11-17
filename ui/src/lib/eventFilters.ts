@@ -383,6 +383,8 @@ const ACTION_FACET: { readonly [K in keyof typeof ACTION]: ActivityFacet } = {
   StepComplete: { section: "MISSION", failure: false },
   StepError: { section: "MISSION", failure: true },
   StepResult: { section: "MISSION", failure: false },
+  StepQueueWait: { section: "MISSION", failure: false },
+  StepQueueResume: { section: "MISSION", failure: false },
   StepTiming: { section: "MISSION", failure: false },
   StepSeatUnresolved: { section: "MISSION", failure: false },
   StreamError: { section: "OTHER", failure: true },

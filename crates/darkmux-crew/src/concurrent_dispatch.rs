@@ -163,6 +163,14 @@ pub type DispatchJob<T> = Box<dyn FnOnce() -> JobOutcome<T> + Send>;
 /// rather than spelled inline at every call site.
 type ResultsSink<T> = Mutex<Vec<(usize, JobOutcome<T>)>>;
 
+/// Where a track reports: each job's outcome, and (#3195) each job that
+/// waits for a slot (its index, told once, when its track queues it behind
+/// the jobs ahead of it).
+struct TrackOut<'a, T> {
+    results: &'a ResultsSink<T>,
+    on_queued: &'a (dyn Fn(usize) + Sync),
+}
+
 /// Spawn a scoped worker thread that inherits the CURRENT thread's name
 /// instead of `std::thread::scope`'s default unnamed. Purely a debugging
 /// nicety in production (readable thread names in panics/backtraces) — but
@@ -360,21 +368,26 @@ pub fn lms_host_factory() -> Box<dyn ModelHost> {
 /// which this function does not use); a per-job failure is always carried
 /// in that job's own `Result` slot in the returned `Vec`, never surfaced
 /// here.
+///
+/// (#3195) `on_queued` is told the index of each job that waits before it
+/// can run, once, from its track's thread, before any job of that track
+/// runs:
+///
+/// - an endpoint's or the dispatch-free track's job past the first batch
+///   (its endpoint's `limits.concurrent_calls`, or `dispatch_free_cap`);
+/// - every local job that can run, whatever its wave: a later wave waits
+///   for the earlier ones, and the first waits for its own model's load.
+///   A local placement no wave can ever fit is never told (it never runs).
+///
+/// A job never told started at once.
 pub(crate) fn run_bounded<T: Send + 'static>(
     jobs: Vec<QueuedJob<T>>,
     facts: &Facts,
     est: &(dyn FootprintEstimator + Sync),
-    // (#2394) The concurrency ceiling for `SeatClaim::NoModel` jobs — the
-    // caller-resolved `config_access::dispatch_free_concurrency()` (which
-    // is itself never below 1). `0` means unbounded
-    // (`config_access::jobs_at_once`), the darkmux bound convention.
     dispatch_free_cap: usize,
     host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
-    // (#3514) The machine the local track is planned against; `None` for
-    // the room of the host `host_factory` makes (this machine for LM
-    // Studio, none for a double), asked only when a local placement needs a
-    // host at all.
     room: Option<&crate::lms_room::ServerRoom<'_>>,
+    on_queued: &(dyn Fn(usize) + Sync),
 ) -> Result<Vec<(usize, JobOutcome<T>)>> {
     // ── partition + stamp local placements with a job-unique seat label ──
     // `plan_waves` returns `Vec<Placement>` BY VALUE; two jobs wanting
@@ -426,13 +439,15 @@ pub(crate) fn run_bounded<T: Send + 'static>(
     let schedule = schedule_waves(&placements, facts, est, host_factory, room)?;
 
     let results: ResultsSink<T> = Mutex::new(Vec::new());
+    let out = TrackOut { results: &results, on_queued };
+    let out = &out;
 
     std::thread::scope(|scope| {
         // Sibling scoped threads — genuinely interleaved wall-clock windows
         // (module doc: "interleaved with, never blocked behind").
         let local_track = (!local_by_seat.is_empty() || !schedule.refusals.is_empty()).then(|| {
             spawn_scoped_named(scope, || {
-                run_local_waves(schedule, local_by_seat, &results, est, host_factory, facts.utility_binding.as_deref(), room)
+                run_local_waves(schedule, local_by_seat, out, est, host_factory, facts.utility_binding.as_deref(), room)
             })
         });
         let endpoint_tracks: Vec<_> = endpoint_jobs
@@ -440,15 +455,14 @@ pub(crate) fn run_bounded<T: Send + 'static>(
             .map(|batch| {
                 note_serial_endpoint(&batch.slot, batch.jobs.len());
                 let width = batch.slot.width();
-                let results = &results;
-                spawn_scoped_named(scope, move || run_capped_batches(batch.jobs, width, results))
+                spawn_scoped_named(scope, move || run_capped_batches(batch.jobs, width, out))
             })
             .collect();
         // (#2394) The third sibling. Same batching mechanism as the unmanaged-endpoint
         // track, a DIFFERENT cap — and running on its own thread means a
         // long dispatch-free wait never occupies a hosted-endpoint slot.
         let dispatch_free_track = (!dispatch_free_jobs.is_empty()).then(|| {
-            spawn_scoped_named(scope, || run_capped_batches(dispatch_free_jobs, dispatch_free_cap, &results))
+            spawn_scoped_named(scope, || run_capped_batches(dispatch_free_jobs, dispatch_free_cap, out))
         });
 
         // (#1452) Join each track EXPLICITLY. A track thread panics when one
@@ -555,7 +569,7 @@ pub(crate) fn schedule_waves(
 fn run_local_waves<T: Send + 'static>(
     schedule: WaveSchedule,
     mut by_seat: HashMap<String, (usize, DispatchJob<T>)>,
-    results: &ResultsSink<T>,
+    out: &TrackOut<'_, T>,
     est: &(dyn FootprintEstimator + Sync),
     host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
     utility_binding: Option<&str>,
@@ -585,17 +599,25 @@ fn run_local_waves<T: Send + 'static>(
     let room = room.unwrap_or(&own);
     for refusal in &schedule.refusals {
         if let Some((index, _job)) = by_seat.remove(&refusal.placement.seat) {
-            results.lock().expect("results mutex poisoned").push((
+            out.results.lock().expect("results mutex poisoned").push((
                 index,
                 Err(never_fits(&refusal.placement.model_key, &refusal.reason)),
             ));
         }
     }
+    // (#3195) Every job left waits for its wave's model before it can run
+    // (a later wave behind the earlier ones, the first behind its own
+    // load): say so now, once, before any wave loads. The waves' own
+    // batches below then tell no one again.
+    for (index, _) in by_seat.values() {
+        (out.on_queued)(*index);
+    }
+    let out = &TrackOut { results: out.results, on_queued: &|_| {} };
     for wave in &schedule.waves {
         if let Err(e) = ensure_wave_loaded(wave, est, host.as_mut(), &lease_guard, utility_binding, room) {
             for placement in wave {
                 if let Some((index, _job)) = by_seat.remove(&placement.seat) {
-                    results.lock().expect("results mutex poisoned").push((
+                    out.results.lock().expect("results mutex poisoned").push((
                         index,
                         Err(wave_failure(&e, &placement.model_key)),
                     ));
@@ -634,7 +656,7 @@ fn run_local_waves<T: Send + 'static>(
             for (identifier, id_jobs) in by_identifier {
                 let cap = local_seat_cap(&residents, &identifier);
                 spawn_scoped_named(wave_scope, move || {
-                    run_capped_batches(id_jobs, cap, results);
+                    run_capped_batches(id_jobs, cap, out);
                 });
             }
         });
@@ -1501,9 +1523,16 @@ fn note_serial_endpoint_in(
 fn run_capped_batches<T: Send + 'static>(
     mut capped_jobs: Vec<(usize, DispatchJob<T>)>,
     cap: usize,
-    results: &ResultsSink<T>,
+    out: &TrackOut<'_, T>,
 ) {
-    for batch in capped_jobs.chunks_mut(darkmux_types::config_access::jobs_at_once(cap)) {
+    let width = darkmux_types::config_access::jobs_at_once(cap);
+    // (#3195) Every job past the first batch waits for a slot: say so
+    // now, before any of them runs.
+    for (index, _) in capped_jobs.iter().skip(width) {
+        (out.on_queued)(*index);
+    }
+    let results = out.results;
+    for batch in capped_jobs.chunks_mut(width) {
         // A batch whose job panicked re-panics at the end of its scope. That
         // must not end the track: the jobs queued behind it (one at a time on
         // an endpoint with no declared concurrency, #3035) still run. The
@@ -1628,7 +1657,7 @@ mod tests {
         dispatch_free_cap: usize,
         host_factory: &(dyn Fn() -> Box<dyn ModelHost> + Sync),
     ) -> Result<Vec<(usize, JobOutcome<T>)>> {
-        super::run_bounded(jobs, facts, est, dispatch_free_cap, host_factory, Some(&crate::lms_room::ServerRoom::without_machine()))
+        super::run_bounded(jobs, facts, est, dispatch_free_cap, host_factory, Some(&crate::lms_room::ServerRoom::without_machine()), &|_| {})
     }
 
     /// [`super::ensure_wave_loaded`] in its host's room: a double's loads
@@ -3695,6 +3724,46 @@ mod tests {
         }
     }
 
+    /// (#3195) Every local job waits for its wave's model before it can
+    /// run (a later wave behind the earlier ones, the first behind its own
+    /// load), so each is told it is queued, once, before any local job
+    /// runs. A placement that can never fit never runs, so it is not told.
+    #[serial_test::serial]
+    #[test]
+    fn on_queued_names_every_local_job_before_its_wave_loads() {
+        let _env = LeaseTestEnv::new();
+        let est = FixedEstimator(BTreeMap::from([
+            ("small-a".to_string(), 10_000_000_000),
+            ("small-b".to_string(), 10_000_000_000),
+            ("big-c".to_string(), 10_000_000_000),
+            ("too-big".to_string(), 50_000_000_000),
+        ]));
+        // Two of the three fit at once (20 GB), so they run in two waves.
+        let facts = Facts { budget: Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
+        let marker = Arc::new(AtomicU32::new(0));
+        let jobs = vec![
+            QueuedJob { index: 0, seat: SeatClaim::LocalModel(placement("small-a", 8_000)), job: ok_job(0, marker.clone()) },
+            QueuedJob { index: 1, seat: SeatClaim::LocalModel(placement("small-b", 8_000)), job: ok_job(1, marker.clone()) },
+            QueuedJob { index: 2, seat: SeatClaim::LocalModel(placement("big-c", 8_000)), job: ok_job(2, marker.clone()) },
+            QueuedJob { index: 3, seat: SeatClaim::LocalModel(placement("too-big", 8_000)), job: ok_job(3, marker.clone()) },
+            // A second job on `small-a`'s one slot, queued behind index 0
+            // within its wave too: still told only once.
+            QueuedJob { index: 4, seat: SeatClaim::LocalModel(placement("small-a", 8_000)), job: ok_job(4, marker.clone()) },
+        ];
+        let told = Mutex::new(Vec::new());
+        let ran_before_told = AtomicU32::new(0);
+        let on_queued = |i: usize| {
+            ran_before_told.fetch_max(marker.load(Ordering::SeqCst), Ordering::SeqCst);
+            told.lock().unwrap().push(i);
+        };
+        let results = super::run_bounded(jobs, &facts, &est, 4, &mock_host_factory, Some(&crate::lms_room::ServerRoom::without_machine()), &on_queued).expect("planned");
+        assert_eq!(results.len(), 5);
+        let mut told = told.into_inner().unwrap();
+        told.sort_unstable();
+        assert_eq!(told, vec![0, 1, 2, 4], "every local job that runs waits for its wave, told once; the refused one is not");
+        assert_eq!(ran_before_told.load(Ordering::SeqCst), 0, "told before any local job ran");
+    }
+
     /// A local job whose placement can never fit ANY wave (its estimate
     /// alone exceeds the whole budget) never runs — it comes back as an
     /// `Err` naming the refusal, and every OTHER job still completes.
@@ -4202,6 +4271,31 @@ mod tests {
                 job: tracked_job(i, in_flight, high_water, Duration::from_millis(60)),
             })
             .collect()
+    }
+
+    /// (#3195) The executor names each job it queues behind the jobs ahead
+    /// of it on its slot, before any job on that track runs, and no other:
+    /// two of five past an endpoint's two concurrent calls wait (indices 2,
+    /// 3, 4), an endpoint with no bound queues nothing.
+    #[test]
+    fn on_queued_names_each_job_past_its_slot_before_the_track_runs() {
+        let (in_flight, high_water) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let mut jobs = endpoint_jobs("two-at-once", Some(2), 0..5, &in_flight, &high_water);
+        // Its own counters: this track may run before the other is told.
+        let (other_in_flight, other_high_water) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        jobs.extend(endpoint_jobs("unbounded", Some(0), 10..13, &other_in_flight, &other_high_water));
+        let told = Mutex::new(Vec::new());
+        let ran_before_told = AtomicUsize::new(0);
+        let on_queued = |i: usize| {
+            ran_before_told.fetch_max(high_water.load(Ordering::SeqCst), Ordering::SeqCst);
+            told.lock().unwrap().push(i);
+        };
+        let results = super::run_bounded(jobs, &Facts::default(), &FixedEstimator::default(), 1, &mock_host_factory, None, &on_queued).expect("planned");
+        assert_eq!(results.len(), 8);
+        let mut told = told.into_inner().unwrap();
+        told.sort_unstable();
+        assert_eq!(told, vec![2, 3, 4], "only the jobs past the two-call slot wait");
+        assert_eq!(ran_before_told.load(Ordering::SeqCst), 0, "told before any job on the track ran");
     }
 
     /// (#3035) An unmanaged endpoint that declares no `limits.concurrent_calls`

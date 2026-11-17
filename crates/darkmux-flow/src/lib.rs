@@ -4100,7 +4100,9 @@ mod tests {
         //   2.8.0 — (#3112) additive: `payload.context.root`, where a
         //            dispatch's sandbox saw the workspace when it is not
         //            the container's `/workspace` (a sandbox on the host).
-        assert_eq!(FLOW_SCHEMA_VERSION, "2.8.0");
+        //   2.9.0 — (#3195) additive: `step.queue.wait` / `.resume`, a
+        //            step that waits its turn for a call slot.
+        assert_eq!(FLOW_SCHEMA_VERSION, "2.9.0");
     }
 
     #[test]

@@ -180,6 +180,12 @@ pub struct StepRow {
     /// the page then falls back to showing a meter only if metrics arrive.
     pub kind: String,
     pub status: NodeStatus,
+    /// (#3195) The step waits for its turn ([`step_waiting`]): `running` by
+    /// the scheduler's word, but admitted and not yet dispatching, queued
+    /// for its call slot or its wave's model. Absent when it does not wait.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
+    pub waiting: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(type = "number", optional))]
     pub started_ts: Option<u64>,
@@ -282,8 +288,12 @@ impl GraphNode {
 }
 
 impl StepRow {
-    /// See [`GraphNode::status_word`].
+    /// See [`GraphNode::status_word`]. (#3195) `waiting` for a step that
+    /// waits for its turn ([`StepRow::waiting`]), as its task reads.
     pub fn status_word(&self) -> String {
+        if self.waiting {
+            return "waiting".to_string();
+        }
         shown_word(&self.status, self.abandoned_reason)
     }
 }
@@ -484,6 +494,14 @@ fn derive_task_status(steps: &[(NodeStatus, Option<u64>)]) -> TaskDisplayStatus 
         return TaskDisplayStatus::Waiting;
     }
     TaskDisplayStatus::Planned
+}
+
+/// (#3195) Whether a step waits for its turn: admitted to its wave
+/// (`Running`) but not yet dispatching (no `started_ts`, `Step::started_ts`'s
+/// own doc), queued for its call slot or its wave's model. The task rule
+/// for a task of one step ([`derive_task_status`]'s `Waiting`).
+pub(crate) fn step_waiting(status: NodeStatus, started_ts: Option<u64>) -> bool {
+    status == NodeStatus::Running && derive_task_status(&[(status, started_ts)]) == TaskDisplayStatus::Waiting
 }
 
 /// (#2406, extended #2343) A phase's DISPLAY status — a superset of
@@ -1539,6 +1557,7 @@ pub fn build_mission_graph(
                             label: resolve_step_label(&step.kind, &step.id),
                             kind: step.kind.clone(),
                             status: step.status,
+                            waiting: step_waiting(step.status, step.started_ts),
                             started_ts: step.started_ts,
                             completed_ts: step.completed_ts,
                             tokens_final,
@@ -1564,6 +1583,7 @@ pub fn build_mission_graph(
                                 label: resolve_step_label(&kind, step_id),
                                 kind,
                                 status: NodeStatus::Planned,
+                                waiting: false,
                                 started_ts: None,
                                 completed_ts: None,
                                 tokens_final,
@@ -2302,6 +2322,18 @@ mod tests {
     }
 
     // ─── derive_task_status ────────────────────────────────────────────
+
+    /// (#3195) A step waits only when it is running by the scheduler's
+    /// word with no dispatch begun; every other status, `unknown` included,
+    /// does not.
+    #[test]
+    fn step_waiting_is_admitted_and_not_dispatching() {
+        assert!(step_waiting(NodeStatus::Running, None));
+        assert!(!step_waiting(NodeStatus::Running, Some(1)));
+        for status in [NodeStatus::Planned, NodeStatus::Complete, NodeStatus::Error, NodeStatus::Abandoned, NodeStatus::Unknown] {
+            assert!(!step_waiting(status, None), "{status:?}");
+        }
+    }
 
     #[test]
     fn derive_task_status_error_wins_over_everything() {
