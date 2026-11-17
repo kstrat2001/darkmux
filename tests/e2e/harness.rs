@@ -57,8 +57,9 @@
 //! instead of racing. Set `DARKMUX_E2E_BIN=<path>` to point at an
 //! already-built binary and skip the build step entirely (e.g. a CI
 //! job that built the release binary in an earlier step). It must be
-//! built outside the test build: `cargo test` rebuilds
-//! `target/debug/darkmux` with `test-support`, which ignores
+//! built outside the test build: `cargo test` rebuilds the binary in its
+//! profile's folder (`target/debug`, or `target/release` under `--release`)
+//! with `test-support`, which ignores
 //! `DARKMUX_REDIS_URL`, and `boot` refuses such a binary (#3155).
 //!
 //! ## Out of scope (v1)
@@ -892,7 +893,8 @@ fn refuse_unless_the_harness_binary_honors_redis() -> Result<(), String> {
 /// A build with darkmux-flow's `test-support` feature removes that variable
 /// before its flow sink is built, by design, so a daemon spawned from it
 /// never writes the hub: every hub assertion then fails blaming the daemon,
-/// or passes for nothing. `cargo test` rebuilds `target/debug/darkmux` with
+/// or passes for nothing. `cargo test` rebuilds the binary in its profile's
+/// folder (`target/debug`, or `target/release` under `--release`) with
 /// that feature, so a `DARKMUX_E2E_BIN` pointed there is swapped for one
 /// mid-run. The binary is asked directly: `darkmux flow status --json`
 /// lists the sinks the process actually built. The URL names a refused
@@ -917,8 +919,9 @@ fn refuse_a_binary_that_ignores_redis(bin: &Path) -> Result<(), String> {
     Err(format!(
         "{} ignores DARKMUX_REDIS_URL: it was built with darkmux-flow's `test-support` feature, \
          which removes that variable by design, so its daemons would never write the hub. \
-         `cargo test` rebuilds target/debug/darkmux with that feature; point DARKMUX_E2E_BIN at \
-         a binary built outside the test build (`cargo build --release --bin darkmux`) (#3155)",
+         `cargo test` rebuilds the binary in its profile's folder (target/debug, or target/release \
+         under --release) with that feature; point DARKMUX_E2E_BIN at a binary built outside \
+         the test build, in a profile the test run does not rebuild (#3155)",
         bin.display()
     ))
 }
