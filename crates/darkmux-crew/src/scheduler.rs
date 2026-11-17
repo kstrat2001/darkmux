@@ -53,6 +53,7 @@ use darkmux_flow::{Category, FlowRecord, Level, Stage};
 use darkmux_gestalt::{Facts, FootprintEstimator, ModelHost};
 use darkmux_types::session_id::{RunId, SessionId};
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ─── Task dependency cycle detection (graph-load-time) (#1341) ────────
@@ -1136,6 +1137,13 @@ pub fn run_step_graph(
         // only the jobs' `StepRunCtx`s and their job wrappers do. When
         // `run_bounded` finishes every job (each ctx + `term_tx` clone
         // dropped), the channel closes and the drain loop below ends naturally.
+        // (#3195) The executor's own word on which steps wait for a slot:
+        // each writes `step.queue.wait` when queued and `step.queue.resume`
+        // when its dispatch begins. The hook holds a sender; it moves into
+        // the worker and drops when `run_bounded` returns, so the channel
+        // still closes at wave-end.
+        let waited: Mutex<HashSet<usize>> = Mutex::default();
+        let on_queued = queue_hook(run, ready_ids.iter().map(|id| steps[id].clone()).collect(), &waited, tx.clone());
         drop(tx);
         // Run the wave on a sibling scoped thread and drain its live signals on
         // this (main) thread. `emit`/`persist`/`steps` stay main-thread-only
@@ -1157,7 +1165,7 @@ pub fn run_step_graph(
             // `concurrent_dispatch::spawn_scoped_named`'s doc: every hop a
             // job's DARKMUX_* env reads cross needs to propagate the test
             // thread's name for the #2632 audit to attribute them.
-            let worker = crate::concurrent_dispatch::spawn_scoped_named(scope, || {
+            let worker = crate::concurrent_dispatch::spawn_scoped_named(scope, move || {
                 crate::concurrent_dispatch::run_bounded(
                     jobs,
                     facts,
@@ -1172,6 +1180,7 @@ pub fn run_step_graph(
                     // host's loads take this machine's memory, the host
                     // made only when a local step needs one.
                     None,
+                    &on_queued,
                 )
             });
             for sig in rx.iter() {
@@ -1196,6 +1205,8 @@ pub fn run_step_graph(
                             .expect("index came from this wave's own ready_ids");
                         step.started_ts = Some(at);
                         persist(step);
+                        // (#3195) A step that waited for its slot starts its work now.
+                        queue_resume(&waited, index, run, step).into_iter().for_each(&mut *emit);
                     }
                     crate::step_kinds::WaveSignal::StepTerminal { index, at, wall_ms, result, flow_records, degraded } => {
                         apply_step_terminal(
@@ -1773,6 +1784,13 @@ fn now_unix() -> u64 {
 /// `darkmux-lab::lab::review`'s cross-path conformance test, so the two
 /// test suites assert against the SAME source of truth and cannot drift
 /// apart silently.
+///
+/// (#3195) Between a step's start and its terminal, this scheduler may
+/// also write `step.queue.wait` (the step waits its turn: its endpoint's
+/// call slot, its model's parallel slots, the dispatch-free cap, or its
+/// wave's model) and `step.queue.resume` (its work starts). They are not
+/// transitions of their own: the step is open throughout, and a driver
+/// that never queues a step writes neither.
 pub const STEP_LIFECYCLE_ACTIONS: [darkmux_flow::FlowAction; 3] = [
     darkmux_flow::FlowAction::StepStart,
     darkmux_flow::FlowAction::StepComplete,
@@ -1888,6 +1906,41 @@ fn step_complete_record(run: &RunId, step: &Step, later_step_planned: bool) -> F
             step.id.clone(),
         )
     }
+}
+
+/// (#3195) The executor's `on_queued` for one wave: a step it queues behind
+/// the jobs ahead of it on its slot writes `step.queue.wait` (sent over the
+/// wave's channel, ahead of the step's own `StepDispatching`, since the
+/// executor tells before any job of that track runs) and is noted in
+/// `waited`, so [`queue_resume`] writes its `step.queue.resume`. `ready`
+/// holds the wave's steps by job index.
+fn queue_hook<'a>(
+    run: &'a RunId,
+    ready: Vec<Step>,
+    waited: &'a Mutex<HashSet<usize>>,
+    tx: std::sync::mpsc::Sender<crate::step_kinds::WaveSignal>,
+) -> impl Fn(usize) + Sync + 'a {
+    move |index| {
+        waited.lock().unwrap_or_else(|p| p.into_inner()).insert(index);
+        let rec = step_lifecycle_record(run, &ready[index], darkmux_flow::FlowAction::StepQueueWait);
+        let _ = tx.send(crate::step_kinds::WaveSignal::Record(rec));
+    }
+}
+
+/// (#3195) The `step.queue.resume` of a step whose dispatch is beginning,
+/// when it waited for its slot; `None` for a step that started at once, and
+/// for one whose run is being stopped (its job only ends it, abandoned or
+/// errored, without starting its work: the terminal closes the wait).
+///
+/// Known edge: the stop is read here, on the main thread, when the step's
+/// `StepDispatching` signal is handled, not when its job sent it. So a step
+/// whose dispatch began just before the stop but was handled after it, or a
+/// step kind that ignores the stop (a dispatch-free kind that runs to its
+/// end anyway), writes no resume and reads waiting until its terminal.
+fn queue_resume(waited: &Mutex<HashSet<usize>>, index: usize, run: &RunId, step: &Step) -> Option<FlowRecord> {
+    let was_queued = waited.lock().unwrap_or_else(|p| p.into_inner()).remove(&index);
+    let starts_work = !darkmux_types::interrupt::is_set();
+    (was_queued && starts_work).then(|| step_lifecycle_record(run, step, darkmux_flow::FlowAction::StepQueueResume))
 }
 
 /// The `step.start` record, stamped with what the step consumes: the same
@@ -4316,6 +4369,118 @@ mod tests {
              (barrier preserved) — dep_start={dep_start} slow_done={slow_done} fast_done={fast_done}"
         );
         assert_eq!(steps["c-dep-step"].status, NodeStatus::Complete);
+    }
+
+    /// (#3195) Steps admitted together behind one call slot (an endpoint
+    /// with no `limits.concurrent_calls`, so one call at a time): the first
+    /// starts at once and writes no wait; each later one writes
+    /// `step.queue.wait` on its task session when it is queued, and
+    /// `step.queue.resume` when it takes the slot, after the step ahead of
+    /// it ended. Without these a queued step read running from its
+    /// `step.start`, its timer counting the whole queue.
+    #[test]
+    fn steps_queued_behind_one_call_slot_record_their_wait() {
+        let kind = Arc::new(SleepKind);
+        let (ta, sa) = kinded_step("a", "test.sleep", json!({ "sleep_ms": 30 }), &[]);
+        let (tb, sb) = kinded_step("b", "test.sleep", json!({ "sleep_ms": 30 }), &[]);
+        let (tc, sc) = kinded_step("c", "test.sleep", json!({ "sleep_ms": 30 }), &[]);
+        let (tasks, mut steps) = graph(vec![(ta, sa), (tb, sb), (tc, sc)]);
+
+        let emitted = run_graph_with_kind(kind, &tasks, &mut steps);
+
+        use darkmux_flow::FlowAction::{StepComplete, StepQueueResume, StepQueueWait, StepStart};
+        let pos = |action: darkmux_flow::FlowAction, handle: &str| emitted.iter().position(|r| r.action == action && r.handle == handle);
+        let count = |action: darkmux_flow::FlowAction| emitted.iter().filter(|r| r.action == action).count();
+        assert_eq!((count(StepQueueWait), count(StepQueueResume)), (2, 2), "two of the three steps wait for the slot");
+        // Which one went first is the executor's order; the other two waited.
+        let first = ["a-step", "b-step", "c-step"].into_iter().find(|h| pos(StepQueueWait, h).is_none()).expect("one step took the slot at once");
+        assert_eq!(pos(StepQueueResume, first), None, "{first} never waited, so it never resumes");
+        for h in ["a-step", "b-step", "c-step"].into_iter().filter(|h| *h != first) {
+            let (start, wait, resume) = (pos(StepStart, h).unwrap(), pos(StepQueueWait, h).unwrap(), pos(StepQueueResume, h).unwrap());
+            assert!(start < wait && wait < resume, "{h}: start {start} < wait {wait} < resume {resume}");
+            assert!(pos(StepComplete, first).unwrap() < resume, "{h} resumes only after {first} freed the slot");
+            assert!(resume < pos(StepComplete, h).unwrap(), "{h} resumes before it completes");
+            let rec = &emitted[wait];
+            assert_eq!(rec.session_id, emitted[start].session_id, "{h}: the wait is on the step's own task session");
+        }
+        assert!(steps.values().all(|s| s.status == NodeStatus::Complete));
+    }
+
+    /// The record positions a wait/resume test reads: `(wait, resume,
+    /// terminal)` for a step's handle, `None` where it wrote none.
+    fn queue_positions(emitted: &[FlowRecord], handle: &str) -> (Option<usize>, Option<usize>, Option<usize>) {
+        use darkmux_flow::FlowAction::{StepComplete, StepError, StepQueueResume, StepQueueWait};
+        let pos = |f: &dyn Fn(&darkmux_flow::FlowAction) -> bool| emitted.iter().position(|r| f(&r.action) && r.handle == handle);
+        (pos(&|a| *a == StepQueueWait), pos(&|a| *a == StepQueueResume), pos(&|a| matches!(a, StepComplete | StepError)))
+    }
+
+    /// (#3195) Local steps whose models do not all fit at once run in two
+    /// waves: each waits for its wave's model (the later wave behind the
+    /// first, the first behind its own load), so each writes a wait when
+    /// admitted and a resume when its dispatch begins, before it ends.
+    #[test]
+    #[serial_test::serial]
+    fn local_steps_waiting_for_their_wave_record_wait_and_resume() {
+        let entries = ["a", "b", "c"]
+            .into_iter()
+            .map(|id| kinded_step(id, "test.role-local-model", json!({ "model_key": format!("model-{id}") }), &[]))
+            .collect();
+        let (tasks, mut steps) = graph(entries);
+        let kinds = StepKindRegistry::new();
+        kinds.register(Arc::new(RoleLocalModelKind)).unwrap();
+        // Any two of the three fit (20 GB), so two waves.
+        let facts = Facts { budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(20_000_000_000) }, ..Default::default() };
+        let est = FixedEstimator(["model-a", "model-b", "model-c"].into_iter().map(|m| (m.to_string(), 10_000_000_000)).collect());
+        let mut emitted = Vec::new();
+        run_step_graph(&crate::test_run(), &mut steps, &tasks, &kinds, &facts, &est, &mock_host_factory, &mut |r| emitted.push(r), &mut |_s| {}, None, None, &[]).unwrap();
+        for h in ["a-step", "b-step", "c-step"] {
+            let (wait, resume, end) = queue_positions(&emitted, h);
+            let (wait, resume, end) = (wait.expect("waits for its wave"), resume.expect("resumes when it dispatches"), end.expect("ends"));
+            assert!(wait < resume && resume < end, "{h}: wait {wait} < resume {resume} < end {end}");
+        }
+        assert!(steps.values().all(|s| s.status == NodeStatus::Complete));
+    }
+
+    /// A step kind that ends at once when the run is being stopped, as a
+    /// real dispatch does before it sends anything. The first to run is
+    /// where the operator's stop lands (after every step was admitted).
+    struct StopAwareKind;
+    impl StepKind for StopAwareKind {
+        fn seat(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> SeatClaim {
+            SeatClaim::UnmanagedEndpoint(crate::step_kinds::EndpointSlot::new("test-endpoint", None))
+        }
+        fn id(&self) -> &'static str {
+            "test.stop-aware"
+        }
+        fn run(&self, step: &Step, _t: &Task, _i: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
+            if !darkmux_types::interrupt::is_set() {
+                darkmux_types::interrupt::simulate_sigint_for_test();
+            }
+            darkmux_types::interrupt::bail_if_set("test.stop-aware")?;
+            Ok(StepOutcome { output: step.id.clone(), flow_records: vec![], degraded: None })
+        }
+    }
+
+    /// (#3195) A run stopped while its steps wait for their slot: each
+    /// queued step still runs its job to end itself, but it never starts
+    /// its work, so it writes no `step.queue.resume`; its terminal closes
+    /// the wait.
+    #[test]
+    #[serial_test::serial]
+    fn a_queued_step_stopped_before_it_works_writes_no_resume() {
+        let entries = ["a", "b", "c"].into_iter().map(|id| kinded_step(id, "test.stop-aware", json!({}), &[])).collect();
+        let (tasks, mut steps) = graph(entries);
+        darkmux_types::interrupt::reset_for_test();
+        let emitted = run_graph_with_kind(Arc::new(StopAwareKind), &tasks, &mut steps);
+        darkmux_types::interrupt::reset_for_test();
+        let waits: Vec<_> = ["a-step", "b-step", "c-step"].into_iter().filter_map(|h| queue_positions(&emitted, h).0.map(|w| (h, w))).collect();
+        assert_eq!(waits.len(), 2, "two steps waited for the slot");
+        for (h, wait) in waits {
+            let (_, resume, end) = queue_positions(&emitted, h);
+            assert_eq!(resume, None, "{h} never started its work");
+            assert!(wait < end.expect("its terminal closes the wait"));
+        }
+        assert!(steps.values().all(|s| s.status == NodeStatus::Abandoned), "an operator's stop ends them abandoned");
     }
 
     // ─── #1877 item 3: the scheduler times and emits StepRecords itself ─

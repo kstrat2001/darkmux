@@ -11,12 +11,13 @@ import type { ReactNode } from "react";
 import { fmtModel, fmtTok, stepLead, stepSeat, type GraphStep, type StepMeter } from "./graph";
 import { fmtElapsed } from "../../lib/format";
 import { onIntentClick } from "../../lib/clickIntent";
+import type { PhaseElapsed } from "./timeline";
 
 /** `tools` is OPTIONAL here (unlike {@link StepMeter}'s own required field)
  * so this same renderer also takes a task-level {@link
  * import("./timeline").TaskAggMetrics}, which never tracks tool-calls at
  * the aggregate level — see that type's own doc. */
-type MeterLike = Omit<StepMeter, "tools" | "wallMs"> & { tools?: number; wallMs?: number };
+type MeterLike = Omit<StepMeter, "tools" | "wallMs" | "waiting"> & { tools?: number; wallMs?: number; waiting?: boolean };
 
 /** (U3-6) What this badge's duration actually measures, spelled out. The
  * number here is the STEP SPAN — `stepStartMs` → `stepEndMs`, which brackets
@@ -35,40 +36,8 @@ const STEP_TIME_TITLE = "step time — the whole step span: setup, model work an
 
 export function StepMeterEl({ meter }: { meter: MeterLike | undefined }) {
   if (!meter || !meter.show) return null;
-  const children: ReactNode[] = [];
-  if (meter.generating) {
-    children.push(
-      <span key="g" className="gen" data-hint={STEP_TIME_HINT} title={STEP_TIME_TITLE}>
-        <span className="genpulse" />
-        {meter.elapsedMs ? fmtElapsed(meter.elapsedMs) : "live"}
-      </span>,
-    );
-  }
-  if (!meter.generating && meter.wallMs) {
-    // (#2269) Finished: the pulse is gone, so the wall time stands alone.
-    children.push(
-      <span key="w" className="wall" data-hint={STEP_TIME_HINT} title={STEP_TIME_TITLE}>
-        {fmtElapsed(meter.wallMs)}
-      </span>,
-    );
-  }
-  if (meter.tokens) {
-    // (#2834) No `cloud` class here. It painted these tokens in the WARN
-    // colour, so a step served by a local inference engine read as a cost
-    // warning. The flag it keyed on is endpoint presence, which is not a
-    // cost fact — see MissionGraphLens.
-    children.push(
-      <span key="t" className="tok">
-        {fmtTok(meter.tokens) + " tok"}
-      </span>,
-    );
-  }
-  if (meter.turns) {
-    children.push(<span key="n">{meter.turns + (meter.turns === 1 ? " turn" : " turns")}</span>);
-  }
-  if (meter.tools) {
-    children.push(<span key="c">{meter.tools + (meter.tools === 1 ? " tool" : " tools")}</span>);
-  }
+  const time = timeBadge(meter);
+  const children: ReactNode[] = [...(time ? [time] : []), ...countBadges(meter)];
   if (!children.length) {
     return (
       <span className="mn-step-meter">
@@ -77,6 +46,54 @@ export function StepMeterEl({ meter }: { meter: MeterLike | undefined }) {
     );
   }
   return <span className="mn-step-meter">{children}</span>;
+}
+
+/** The meter's time: the pulse while it works, its wall time once done, or
+ *  (#3195) "waiting" while it is queued for its call slot, with no timer. */
+function timeBadge(meter: MeterLike): ReactNode {
+  if (meter.generating) {
+    return (
+      <span key="g" className="gen" data-hint={STEP_TIME_HINT} title={STEP_TIME_TITLE}>
+        <span className="genpulse" />
+        {meter.elapsedMs ? fmtElapsed(meter.elapsedMs) : "live"}
+      </span>
+    );
+  }
+  if (meter.waiting) {
+    return (
+      <span key="q" className="waiting" title="waiting for a call slot: its time starts when it gets one">
+        waiting
+      </span>
+    );
+  }
+  if (meter.wallMs) {
+    // (#2269) Finished: the pulse is gone, so the wall time stands alone.
+    return (
+      <span key="w" className="wall" data-hint={STEP_TIME_HINT} title={STEP_TIME_TITLE}>
+        {fmtElapsed(meter.wallMs)}
+      </span>
+    );
+  }
+  return null;
+}
+
+/** The meter's counts: tokens, turns, tool calls, each only when nonzero. */
+function countBadges(meter: MeterLike): ReactNode[] {
+  const out: ReactNode[] = [];
+  if (meter.tokens) {
+    // (#2834) No `cloud` class here. It painted these tokens in the WARN
+    // colour, so a step served by a local inference engine read as a cost
+    // warning. The flag it keyed on is endpoint presence, which is not a
+    // cost fact — see MissionGraphLens.
+    out.push(
+      <span key="t" className="tok">
+        {fmtTok(meter.tokens) + " tok"}
+      </span>,
+    );
+  }
+  if (meter.turns) out.push(<span key="n">{meter.turns + (meter.turns === 1 ? " turn" : " turns")}</span>);
+  if (meter.tools) out.push(<span key="c">{meter.tools + (meter.tools === 1 ? " tool" : " tools")}</span>);
+  return out;
 }
 
 /** `stepRowEls` — mission-graph.html. `extraClass` distinguishes the canvas
@@ -155,5 +172,17 @@ export function StepRow({
       ) : null}
       <StepMeterEl meter={meter} />
     </div>
+  );
+}
+
+/** (#3195, operator 2026-10-10) A phase heading's running total, in the
+ *  mission header's words: "N elapsed" while it runs, "ran N" once done. */
+export function PhaseTime({ elapsed, className }: { elapsed: PhaseElapsed | null; className: string }) {
+  if (!elapsed) return null;
+  const t = fmtElapsed(elapsed.ms);
+  return (
+    <span className={className} title="phase time: its first step's start until now, or until its last step ended">
+      {elapsed.running ? `${t} elapsed` : `ran ${t}`}
+    </span>
   );
 }

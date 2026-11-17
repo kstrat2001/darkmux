@@ -18,8 +18,19 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "2.8.0";
+pub const FLOW_SCHEMA_VERSION: &str = "2.9.0";
 // Version history:
+//   2.9.0 (#3195): two step actions with no payload, `step.queue.wait` (an
+//           admitted step waits its turn: its endpoint's
+//           `limits.concurrent_calls`, the dispatch-free cap, or, for every
+//           local step, its wave's model, even one already resident, where
+//           the wait is milliseconds) and `step.queue.resume` (its work
+//           starts), on the step's task session like `step.start`. A step
+//           that started at once has neither; a step whose run is stopped
+//           before its work starts has a wait and no resume (its terminal
+//           closes the wait). ADDITIVE: a reader that does not know them
+//           keeps them as unknown records, and a step with neither reads as
+//           before.
 //   2.8.0 (#3112): `payload.context.root`, where a dispatch's sandbox saw the
 //           workspace, stamped only when it is not the container's
 //           `/workspace` (a sandbox on the host sees it at its own path); a

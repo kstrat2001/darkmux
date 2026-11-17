@@ -186,11 +186,24 @@ darkmux release.
   `run list` (its rows, the `--usage` breakdown and an endpoint's `reported model`), `run show`,
   `mission show`, the fleet rows of `mission status`, `radio` (the answer, the command it asks you to
   confirm, and its failure lines), `dispatch`'s human output (the model's reply), the QA review and
-  `mission debrief` lines, `doctor`'s rows, and the `Error:` line any failing command ends with all
+  `mission debrief` lines, `doctor`'s rows, `lab run`, `lab characterize`, `lab tune` and `lab submit`,
+  and the `Error:` line any failing command ends with (an interrupted run's too) all
   print an escape sequence, a C1 control or a bidirectional override as text (`\u{1b}`) instead of
   passing it to the terminal, so none of them can set the window title, clear the screen, write the
   clipboard or reorder text. Lines and tabs still read as written, and a column cell is held to its
-  display width. `--json` output is unchanged. Found by the 2026-11-17 layer review.
+  display width. Emoji joined with ZWJ and the direction marks Hebrew and Arabic text needs are kept;
+  invisible tag characters are shown. `--json` output is unchanged. Found by the 2026-11-17 layer review.
+- **A mission step waiting its turn reads waiting, not running (#3195).** Steps admitted together
+  behind one slot (an endpoint with no `limits.concurrent_calls` runs its calls one at a time), or a
+  local step waiting for its wave's model (a later wave, or its own wave's load), all read running from
+  their `step.start`, each with a timer counting the whole wait. The scheduler now writes
+  `step.queue.wait` on a step's task session when it is queued and `step.queue.resume` when its work
+  starts (none when the run is stopped first: its terminal closes the wait), and the mission graph's
+  step row (`graph.json`, and `mission show --json`) gains `waiting: true` for a step admitted but not
+  yet dispatching, by the rule its task already used; its `status` keeps the scheduler's word. The viewer shows such a step and its task as
+  waiting with no timer, takes a step's start from when its work began, and gives each phase heading
+  its own running total beside the mission's. `FLOW_SCHEMA_VERSION` 2.8.0 -> 2.9.0, additive: a step
+  that started at once writes neither record.
 - **A paired device's long names no longer push the rest of a line off screen (#3626).**
   Each tailnet user, device and host name that `client serve`'s log, the pairing dialog,
   `client approve` and `client list` show, and the device name an app sends when it asks to pair,
