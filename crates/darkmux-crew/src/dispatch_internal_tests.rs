@@ -6550,25 +6550,61 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(prompt(&docker).as_deref(), Some("/darkmux-out/.prompt.txt"));
     }
 
-    /// A dispatch is given exactly the ports of the endpoints its runtime
-    /// dials, wherever each URL points: its model server (`--base-url`, or
-    /// the runtime's own default when none is passed), a brain's
-    /// `--chat-url` and an unmanaged compactor's, each at the port it names
-    /// or its scheme's. Nothing else on this host is given.
+    /// A dispatch is given the port of each endpoint its runtime dials on
+    /// this machine: its model server (`--base-url`, or the runtime's own
+    /// default when none is passed), a brain's `--chat-url` and an unmanaged
+    /// compactor's, each at the port it names or its scheme's. An endpoint
+    /// on another host opens no port of this one (an `https` brain is not
+    /// this machine's :443).
     #[test]
-    fn a_dispatch_is_given_the_ports_of_the_endpoints_its_runtime_dials() {
+    fn a_dispatch_is_given_the_ports_of_the_endpoints_its_runtime_dials_here() {
         use darkmux_sandbox::SeatbeltBackend;
         let mut cfg = argv_config_with_base_url(Some("http://localhost:1234/v1".to_string()));
         assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [1234]);
         cfg.base_url_override = Some("http://127.0.0.1:41999/v1".to_string());
         cfg.remote_chat_url = Some("https://api.example.com/v1/chat/completions".to_string());
         cfg.compaction.compactor_chat_url = Some("http://[::1]:8088/v1/chat/completions".to_string());
-        assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [443, 8088, 41999]);
+        assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [8088, 41999], "a hosted brain opens no port here");
+        cfg.remote_chat_url = Some("http://192.0.2.7/v1/chat/completions".to_string());
+        cfg.compaction.compactor_chat_url = Some("http://[::ffff:127.0.0.1]:8090/v1".to_string());
+        assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [8090, 41999], "another host's address opens no :80");
         cfg.base_url_override = None;
         cfg.remote_chat_url = None;
         cfg.compaction.compactor_chat_url = None;
         assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [1234], "the runtime's own default");
         assert!(dispatch_policy_for(&cfg, &SeatbeltBackend).ports.is_empty(), "a dispatch binds any port");
+    }
+
+    /// What names this machine in an endpoint's URL: `localhost`, a
+    /// loopback or unspecified literal in any spelling (an IPv4-mapped one
+    /// included), an address of this host's own (one it can bind), and its
+    /// own name, with or without `.local`. Nothing else, and no name is
+    /// looked up.
+    #[test]
+    fn an_endpoint_is_on_this_machine_only_when_its_host_names_it() {
+        let binds = |ip: std::net::IpAddr| ip == "192.168.1.5".parse::<std::net::IpAddr>().unwrap() || ip == "2001:db8::5".parse::<std::net::IpAddr>().unwrap();
+        let here = |url: &str| host_is_this_machine(url, Some("Mac-Studio.local"), binds);
+        for yes in [
+            "http://localhost:1234/v1",
+            "http://127.0.0.1:1234",
+            "http://127.9.9.9:1",
+            "http://0.0.0.0:1",
+            "http://[::1]:1",
+            "http://[::]:1",
+            "http://[::ffff:127.0.0.1]:1",
+            "http://[::ffff:7f00:1]:1",
+            "http://192.168.1.5:1234",
+            "http://[::ffff:192.168.1.5]:1",
+            "http://[2001:db8::5]:1",
+            "http://mac-studio.local:1234",
+            "http://Mac-Studio:1234",
+        ] {
+            assert!(here(yes), "{yes}");
+        }
+        for no in ["https://api.example.com/v1", "http://192.0.2.7/v1", "http://[2001:db8::9]:1", "http://mac-studio.example.com:1", "http://studio:1", "not a url"] {
+            assert!(!here(no), "{no}");
+        }
+        assert!(!host_is_this_machine("http://mac-studio:1", None, binds), "no name of its own, no name matches");
     }
 
     /// (#3561) A dispatch on the host runs with its managed Node: the

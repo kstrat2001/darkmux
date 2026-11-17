@@ -33,17 +33,20 @@
 //!   [`Network::None`] allows no network at all, the loopback included.
 //! - **Tell a server the sandbox started from the host's.** The default
 //!   network reaches the rest of the network as before, but of this
-//!   machine's own services (at any of its addresses: SBPL's `remote ip
-//!   "localhost:<port>"` matches the loopback, IPv4 and IPv6, and the LAN
-//!   address) only its `host_services` and its own `ports`. A policy naming
-//!   ports binds only those, so every other port of this machine is refused.
-//!   One naming none (a dispatch's) may bind any port and must reach its own
-//!   servers there (a test suite's HTTP server), which SBPL cannot tell from
-//!   the host's, and SBPL takes no port range: the ports this host listens
-//!   on when the sandbox is planned are refused instead, the given ones
+//!   machine's own services (at any of its addresses: SBPL's `remote ip4
+//!   "localhost:<port>"` matches the loopback and every IPv4 address of this
+//!   host) only its `host_services` and its own `ports`. No SBPL filter
+//!   matches an IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) as this
+//!   machine's, so IPv6 is held by port at every address. A policy naming
+//!   ports binds only those, so every other port of this machine is
+//!   refused, and so is all of IPv6, the internet's included (an install
+//!   goes over IPv4). One naming none (a dispatch's) may bind any port and
+//!   must reach its own servers there (a test suite's HTTP server), which
+//!   SBPL cannot tell from the host's, and SBPL takes no port range: the
+//!   ports this host listens on when the sandbox is planned are refused
+//!   instead (IPv4 to this machine, IPv6 to any address), the given ones
 //!   excepted. A service that first listens after that is reachable. When
-//!   this host's listeners cannot be read, every port but the given ones is
-//!   refused.
+//!   this host's listeners cannot be read, it is held as one naming ports.
 //! - **Reach every descendant.** A sandbox is the session its launcher leads
 //!   (#3559): its process group is killed over and over until it is empty (a
 //!   process that keeps forking is caught), then every other process in the
@@ -329,45 +332,55 @@ impl SeatbeltBackend {
     }
 
     /// Which of this host's own services the default network reaches: its
-    /// `host_services` and its own `ports`, no other. SBPL's `remote ip
-    /// "localhost:<port>"` matches every address of this machine (the
-    /// loopback, IPv4 and IPv6, and its LAN address; measured on macOS
-    /// 26.6), while the rest of the network stays reachable.
+    /// `host_services` and its own `ports`, no other. SBPL's `remote ip4
+    /// "localhost:<port>"` matches every IPv4 address of this machine (the
+    /// loopback, its LAN and tailnet addresses; measured on macOS 26.6) and
+    /// nothing beyond it. No `localhost` filter matches an IPv4-mapped IPv6
+    /// address (`::ffff:127.0.0.1` reaches a server on 127.0.0.1), so IPv6 is
+    /// refused by port (`remote ip6 "*:<port>"`), whatever the address. A
+    /// rule spelled `remote ip` is never used: next to an `ip6` one it stops
+    /// matching IPv4 (measured).
     ///
     /// With ports named (a preview's shape) the sandbox binds only those, so
-    /// every other port on this machine is another's: all are refused but
-    /// the named and given ones. With none named (a dispatch's shape) it may
+    /// every other port on this machine is another's: IPv4 to this machine
+    /// is refused, and all of IPv6 (the internet's too: an IPv4-mapped
+    /// address cannot be told from any other), but the named and given
+    /// ports, on this machine. With none named (a dispatch's shape) it may
     /// bind any port and must reach its own servers there, which SBPL cannot
     /// tell from the host's: the ports something on this host listens on as
-    /// the sandbox starts (`listening`) are refused instead, the given ones
-    /// excepted. A service that first listens after the sandbox started is
-    /// not refused. When this host's listeners cannot be read, every port
-    /// but the given ones is refused (its own servers too).
+    /// the sandbox starts (`listening`) are refused instead, IPv4 to this
+    /// machine and IPv6 to any address, the given ones excepted. A service
+    /// that first listens after the sandbox started is not refused. When
+    /// this host's listeners cannot be read, it is held as one naming ports.
     fn host_services_rule(policy: &SandboxPolicy, listening: impl FnOnce() -> Option<Vec<u16>>) -> String {
         let given: Vec<u16> = policy.ports.iter().chain(&policy.host_services).copied().collect();
         let held = if policy.ports.is_empty() { listening() } else { None };
         match held {
-            Some(held) => Self::refuse_ports(held.into_iter().filter(|p| !given.contains(p))),
+            Some(held) => Self::refuse_ports(held.into_iter().filter(|p| !given.contains(p)).collect()),
             None => Self::refuse_all_ports_but(given),
         }
     }
 
-    /// Outbound to these ports of this machine refused; none, no rule.
-    fn refuse_ports(ports: impl Iterator<Item = u16>) -> String {
-        let refused = join(ports.map(|p| format!("(remote ip \"localhost:{p}\")")));
-        if refused.is_empty() {
+    /// Outbound to these ports refused: on this machine over IPv4, at any
+    /// address over IPv6. None, no rule.
+    fn refuse_ports(ports: Vec<u16>) -> String {
+        if ports.is_empty() {
             return String::new();
         }
-        format!("(deny network-outbound {refused})\n")
+        let v4 = ports.iter().map(|p| format!("(remote ip4 \"localhost:{p}\")"));
+        let v6 = ports.iter().map(|p| format!("(remote ip6 \"*:{p}\")"));
+        format!("(deny network-outbound {})\n", join(v4.chain(v6)))
     }
 
-    /// Outbound to every port of this machine refused but `allowed`.
+    /// Outbound to this machine over IPv4, and all of IPv6, refused but
+    /// `allowed` on this machine.
     fn refuse_all_ports_but(mut allowed: Vec<u16>) -> String {
         allowed.sort_unstable();
         allowed.dedup();
-        let mut rule = "(deny network-outbound (remote ip \"localhost:*\"))\n".to_string();
+        let mut rule = "(deny network-outbound (remote ip4 \"localhost:*\") (remote ip6 \"*:*\"))\n".to_string();
         if !allowed.is_empty() {
-            rule.push_str(&format!("(allow network-outbound {})\n", join(allowed.iter().map(|p| format!("(remote ip \"localhost:{p}\")")))));
+            let at = allowed.iter().flat_map(|p| [format!("(remote ip4 \"localhost:{p}\")"), format!("(remote ip6 \"localhost:{p}\")")]);
+            rule.push_str(&format!("(allow network-outbound {})\n", join(at)));
         }
         rule
     }
@@ -749,33 +762,41 @@ mod tests {
     }
 
     /// Which of this host's services the default network reaches: with
-    /// ports named, every port of this machine is refused but those and the
-    /// given ones; with none named, the ports this host listens on are, but
-    /// the given ones, and when its listeners cannot be read, every port but
-    /// the given ones. No network has no such rule (it has no network).
+    /// ports named, IPv4 to this machine and all of IPv6 are refused but
+    /// those and the given ones; with none named, the ports this host
+    /// listens on are (IPv4 to this machine, IPv6 to any address), but the
+    /// given ones, and when its listeners cannot be read, it is held as one
+    /// naming ports. No rule says `remote ip` (it stops matching IPv4 next
+    /// to an `ip6` one). No network has no such rule (it has no network).
     #[test]
     fn the_default_network_refuses_this_hosts_services_it_was_not_given() {
+        let deny_all = "(deny network-outbound (remote ip4 \"localhost:*\") (remote ip6 \"*:*\"))\n";
         let mut preview = policy(Vec::new(), Network::Default);
-        (preview.ports, preview.host_services) = (vec![4100, 4200], vec![1234]);
+        (preview.ports, preview.host_services) = (vec![4200, 4100], vec![1234]);
         let read = std::cell::Cell::new(false);
         let named = SeatbeltBackend::profile_with(&preview, Path::new("/s"), || {
             read.set(true);
             Some(vec![8799])
         });
         assert!(!read.get(), "a policy naming ports needs no listing");
-        assert!(named.ends_with("(deny network-outbound (remote ip \"localhost:*\"))\n(allow network-outbound (remote ip \"localhost:1234\") (remote ip \"localhost:4100\") (remote ip \"localhost:4200\"))\n"), "{named}");
+        let allow = "(allow network-outbound (remote ip4 \"localhost:1234\") (remote ip6 \"localhost:1234\") (remote ip4 \"localhost:4100\") (remote ip6 \"localhost:4100\") (remote ip4 \"localhost:4200\") (remote ip6 \"localhost:4200\"))\n";
+        assert!(named.ends_with(&format!("{deny_all}{allow}")), "{named}");
         let mut dispatch = policy(Vec::new(), Network::Default);
         dispatch.host_services = vec![1234];
         let held = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || Some(vec![1234, 6379, 8799]));
-        assert!(held.ends_with("(deny network-outbound (remote ip \"localhost:6379\") (remote ip \"localhost:8799\"))\n"), "{held}");
-        assert!(!held.contains("(remote ip \"localhost:*\")"), "its own servers on any other port stay reachable: {held}");
+        let refused = "(deny network-outbound (remote ip4 \"localhost:6379\") (remote ip4 \"localhost:8799\") (remote ip6 \"*:6379\") (remote ip6 \"*:8799\"))\n";
+        assert!(held.ends_with(refused), "{held}");
+        assert!(!held.contains("localhost:*\") (remote ip6"), "its own servers on any other port stay reachable: {held}");
         let only_given = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || Some(vec![1234]));
         assert!(!only_given.contains("(remote ip"), "{only_given}");
         let unread = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || None);
-        assert!(unread.ends_with("(deny network-outbound (remote ip \"localhost:*\"))\n(allow network-outbound (remote ip \"localhost:1234\"))\n"), "{unread}");
+        assert!(unread.ends_with(&format!("{deny_all}(allow network-outbound (remote ip4 \"localhost:1234\") (remote ip6 \"localhost:1234\"))\n")), "{unread}");
         dispatch.host_services.clear();
         let nothing_given = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || None);
-        assert!(nothing_given.ends_with("(deny network-outbound (remote ip \"localhost:*\"))\n"), "{nothing_given}");
+        assert!(nothing_given.ends_with(deny_all), "{nothing_given}");
+        for p in [&named, &held, &unread] {
+            assert!(!p.contains("(remote ip \""), "`remote ip` stops matching IPv4 next to `ip6`: {p}");
+        }
         let none = SeatbeltBackend::profile_with(&policy(Vec::new(), Network::None), Path::new("/s"), || Some(vec![8799]));
         assert!(!none.contains("network"), "{none}");
     }
@@ -1052,9 +1073,10 @@ mod tests {
 
     /// What a sandbox on the host under the default network reaches of this
     /// host's own services: `host_services` and its own servers, never
-    /// another listener on the loopback (IPv4 or IPv6). Lines the probe
-    /// script printed, one per port it connected to.
-    fn reached(ports: Vec<u16>, host_services: Vec<u16>, own: u16, probes: &[Probe]) -> Vec<String> {
+    /// another listener on this machine. Lines the probe script printed, one
+    /// per probe that connected, run in the sandbox and (the control, which
+    /// shows each probe can connect at all) outside it.
+    fn reached(ports: Vec<u16>, host_services: Vec<u16>, own: u16, probes: &[Probe]) -> (Vec<String>, Vec<String>) {
         let root = tempfile::TempDir::new().unwrap();
         let prev = std::env::var_os(STATE_DIR_ENV);
         unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
@@ -1062,7 +1084,7 @@ mod tests {
         let mut script = format!("/usr/bin/nc -lk 127.0.0.1 {own} >/dev/null 2>&1 &\ni=0; until /usr/bin/nc -z -G 1 127.0.0.1 {own} 2>/dev/null || [ $i -ge 50 ]; do sleep 0.1; i=$((i + 1)); done\n");
         script.push_str(&format!("/usr/bin/nc -z -G 2 127.0.0.1 {own} 2>/dev/null && echo own\n"));
         for (said, at, port) in probes {
-            script.push_str(&format!("/usr/bin/nc -z -G 2 {at} {port} 2>/dev/null && echo {said}\n"));
+            script.push_str(&format!("/usr/bin/nc -z -G 1 '{at}' {port} 2>/dev/null && echo '{said}'\n"));
         }
         script.push_str("kill %1 2>/dev/null; true\n");
         let mut p = policy(Vec::new(), Network::Default);
@@ -1070,7 +1092,7 @@ mod tests {
         p.ports = ports;
         p.host_services = host_services;
         p.entrypoint = Some(SH.into());
-        p.command = vec!["-c".into(), script];
+        p.command = vec!["-c".into(), script.clone()];
         let (mut cmd, _) = SeatbeltBackend.run(&p);
         let out = cmd.output().unwrap();
         unsafe {
@@ -1080,7 +1102,9 @@ mod tests {
             }
         }
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect()
+        let control = Command::new(SH).arg("-c").arg(&script).output().unwrap();
+        let lines = |o: &[u8]| String::from_utf8_lossy(o).lines().map(str::to_string).collect();
+        (lines(&out.stdout), lines(&control.stdout))
     }
 
     /// A port nothing on this host holds yet.
@@ -1089,18 +1113,63 @@ mod tests {
     }
 
     /// A probe: what the script prints when it connects, and where.
-    type Probe = (&'static str, &'static str, u16);
+    type Probe = (String, String, u16);
 
-    /// This host's listeners the sandbox must not reach, and the one it is
-    /// given: `(said, address, port)` probes, with the listeners held open.
+    /// This host's own addresses beyond the loopback (its LAN and tailnet
+    /// ones, each IPv6 one with its scope), from `ifconfig`.
+    fn this_hosts_addresses() -> (Vec<String>, Vec<String>) {
+        let out = Command::new("/sbin/ifconfig").output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let of = |family: &str| -> Vec<String> {
+            text.lines().filter_map(|l| l.split_whitespace().collect::<Vec<_>>().get(..2).filter(|f| f[0] == family).map(|f| f[1].to_string())).filter(|a| a != "127.0.0.1" && a != "::1" && a != "fe80::1%lo0").collect()
+        };
+        (of("inet"), of("inet6"))
+    }
+
+    /// This host's listeners the sandbox must not reach, at every address
+    /// form that reaches each (127.0.0.1, `::1`, the IPv4-mapped forms of the
+    /// loopback and of every IPv4 address of this host, `0.0.0.0`, `::`,
+    /// `fe80::1%lo0`, every other address of this host and its name), and
+    /// the one it is given: probes, with the listeners held open.
     fn host_listeners() -> (Vec<std::net::TcpListener>, u16, Vec<Probe>) {
-        let given = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let ungiven = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let ungiven6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let bind = |at: &str| std::net::TcpListener::bind(at).unwrap();
         let port = |l: &std::net::TcpListener| l.local_addr().unwrap().port();
-        let probes = vec![("given", "127.0.0.1", port(&given)), ("ungiven", "127.0.0.1", port(&ungiven)), ("ungiven6", "::1", port(&ungiven6))];
+        let (given, v4, v6, any4) = (bind("127.0.0.1:0"), bind("127.0.0.1:0"), bind("[::1]:0"), bind("0.0.0.0:0"));
+        let (given6, any6) = (bind(&format!("[::1]:{}", port(&given))), bind("[::]:0"));
+        let probe = |said: &str, at: &str, l: &std::net::TcpListener| (said.to_string(), at.to_string(), port(l));
+        let mut probes = vec![
+            probe("given", "127.0.0.1", &given),
+            probe("given6", "::1", &given6),
+            probe("v4", "127.0.0.1", &v4),
+            probe("mapped", "::ffff:127.0.0.1", &v4),
+            probe("mapped-hex", "::ffff:7f00:1", &v4),
+            probe("v6", "::1", &v6),
+            probe("zero4", "0.0.0.0", &any4),
+            probe("zero6", "::", &any6),
+            probe("lo0-link-local", "fe80::1%lo0", &any6),
+        ];
+        let hostname = String::from_utf8_lossy(&Command::new("/bin/hostname").output().unwrap().stdout).trim().to_string();
+        probes.push(probe("hostname", &hostname, &any4));
+        let (inet, inet6) = this_hosts_addresses();
+        for a in &inet {
+            probes.push(probe(&format!("own4 {a}"), a, &any4));
+            probes.push(probe(&format!("mapped-own4 {a}"), &format!("::ffff:{a}"), &any4));
+        }
+        probes.extend(inet6.iter().map(|a| probe(&format!("own6 {a}"), a, &any6)));
         let given_port = port(&given);
-        (vec![given, ungiven, ungiven6], given_port, probes)
+        (vec![given, given6, v4, v6, any4, any6], given_port, probes)
+    }
+
+    /// The probes the control reached that the sandbox must not: every one
+    /// but `own` and `given` (on 127.0.0.1 and `::1`). The control reaching each fixed form (and at
+    /// least one other IPv4 address of this host) shows the probes can
+    /// connect at all.
+    fn assert_only_own_and_given(sandboxed: &[String], control: &[String]) {
+        for must in ["own", "given", "given6", "v4", "mapped", "mapped-hex", "v6", "zero4", "zero6", "lo0-link-local", "hostname"] {
+            assert!(control.iter().any(|l| l == must), "the control never reached {must}: {control:?}");
+        }
+        assert!(control.iter().any(|l| l.starts_with("mapped-own4 ")), "no other IPv4 address of this host was probed: {control:?}");
+        assert_eq!(sandboxed, ["own", "given", "given6"], "control reached {control:?}");
     }
 
     /// A dispatch's shape (no ports named, any bind): it reaches the host
@@ -1113,7 +1182,8 @@ mod tests {
             return;
         }
         let (_held, given, probes) = host_listeners();
-        assert_eq!(reached(Vec::new(), vec![given], a_free_port(), &probes), ["own", "given"]);
+        let (sandboxed, control) = reached(Vec::new(), vec![given], a_free_port(), &probes);
+        assert_only_own_and_given(&sandboxed, &control);
     }
 
     /// A preview's shape (its ports named): it reaches its own ports and the
@@ -1126,6 +1196,7 @@ mod tests {
         }
         let (_held, given, probes) = host_listeners();
         let own = a_free_port();
-        assert_eq!(reached(vec![own], vec![given], own, &probes), ["own", "given"]);
+        let (sandboxed, control) = reached(vec![own], vec![given], own, &probes);
+        assert_only_own_and_given(&sandboxed, &control);
     }
 }

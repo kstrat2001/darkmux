@@ -2749,19 +2749,86 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
 /// `--base-url` (`runtime/src/lmstudio.rs`'s `DEFAULT_BASE_URL`).
 const RUNTIME_DEFAULT_MODEL_PORT: u16 = 1234;
 
-/// The ports of the endpoints a dispatch's runtime dials, sorted: its model
-/// server (`--base-url`, else the runtime's default), a brain's
-/// `--chat-url` and an unmanaged compactor's, each at the port its URL names
-/// or its scheme's. Wherever the URL points: a sandbox on the host is given
-/// these of this host's services and no other, and a URL may name this
-/// machine by a name or address that is not the loopback's.
+/// The ports of the endpoints a dispatch's runtime dials on this machine,
+/// sorted: its model server (`--base-url`, else the runtime's default, which
+/// names this host), a brain's `--chat-url` and an unmanaged compactor's,
+/// each at the port its URL names or its scheme's, when its host is this
+/// machine ([`host_is_this_machine`]). A sandbox on the host is given these
+/// of this host's services and no other.
 fn endpoint_ports(config: &DockerRunConfig) -> Vec<u16> {
-    let urls = [&config.remote_chat_url, &config.compaction.compactor_chat_url];
-    let base = config.base_url_override.as_deref().map_or(Some(RUNTIME_DEFAULT_MODEL_PORT), darkmux_types::endpoint::url_port);
-    let mut ports: Vec<u16> = urls.iter().filter_map(|u| u.as_deref().and_then(darkmux_types::endpoint::url_port)).chain(base).collect();
+    let here = |url: &&str| host_is_this_machine(url, this_hosts_name().as_deref(), binds_here);
+    let urls = [&config.base_url_override, &config.remote_chat_url, &config.compaction.compactor_chat_url];
+    let named = urls.into_iter().filter_map(|u| u.as_deref()).filter(here).filter_map(darkmux_types::endpoint::url_port);
+    let default = config.base_url_override.is_none().then_some(RUNTIME_DEFAULT_MODEL_PORT);
+    let mut ports: Vec<u16> = named.chain(default).collect();
     ports.sort_unstable();
     ports.dedup();
     ports
+}
+
+/// Whether `url`'s host is this machine: `localhost`, a loopback or
+/// unspecified literal in any spelling (an IPv4-mapped one included), an
+/// address of this host (`binds`: one a socket here can bind), or this
+/// host's `name`, with or without `.local`, in any case. No name is looked
+/// up.
+pub(crate) fn host_is_this_machine(url: &str, name: Option<&str>, binds: impl Fn(std::net::IpAddr) -> bool) -> bool {
+    if darkmux_types::endpoint::url_names_this_machine(url) {
+        return true;
+    }
+    let Some(host) = url_host_alone(url) else { return false };
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip_is_this_machine(ip, binds),
+        Err(_) => name.is_some_and(|n| same_host_name(&host, n)),
+    }
+}
+
+/// `url`'s host without its port or an IPv6 literal's brackets.
+fn url_host_alone(url: &str) -> Option<String> {
+    let hostport = darkmux_types::endpoint::url_host(url)?;
+    if let Some(v6) = hostport.strip_prefix('[') {
+        return v6.split_once(']').map(|(h, _)| h.to_string());
+    }
+    Some(hostport.rsplit_once(':').map_or(hostport.as_str(), |(h, _)| h).to_string())
+}
+
+/// Whether `ip` (an IPv4-mapped one read as its IPv4 address) is a loopback
+/// or unspecified address, or one `binds` says is this host's.
+fn ip_is_this_machine(ip: std::net::IpAddr, binds: impl Fn(std::net::IpAddr) -> bool) -> bool {
+    let ip = ip.to_canonical();
+    ip.is_loopback() || ip.is_unspecified() || binds(ip)
+}
+
+/// Whether two host names are one, ignoring case and a `.local` suffix.
+fn same_host_name(a: &str, b: &str) -> bool {
+    let bare = |n: &str| {
+        let n = n.trim_end_matches('.').to_ascii_lowercase();
+        n.strip_suffix(".local").map(str::to_string).unwrap_or(n)
+    };
+    bare(a) == bare(b)
+}
+
+/// Whether `ip` is an address of this host: a socket can bind it.
+fn binds_here(ip: std::net::IpAddr) -> bool {
+    std::net::UdpSocket::bind((ip, 0)).is_ok()
+}
+
+/// This host's own name, as the kernel has it.
+#[cfg(unix)]
+fn this_hosts_name() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer is valid for `len` bytes; gethostname writes at most
+    // that many and the result is read only up to its first NUL.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    std::str::from_utf8(&buf[..end]).ok().map(str::to_string).filter(|s| !s.is_empty())
+}
+
+#[cfg(not(unix))]
+fn this_hosts_name() -> Option<String> {
+    None
 }
 
 /// `KEY=value` as its two halves (a value may hold `=`).
