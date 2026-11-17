@@ -1590,6 +1590,11 @@ fn a_tool_granting_role_on_a_hosted_endpoint_runs_in_the_container_with_the_secr
 /// and under Linux's 128 KiB limit on one environment string, so the write
 /// blocks until the container's end of the pipe closes and then fails, every
 /// time, instead of landing in the pipe's buffer.
+/// That holds where a pipe holds 64 KiB: macOS, and Linux with 4 KiB pages
+/// (CI's runners). On Linux with 16 or 64 KiB pages (Asahi, some aarch64
+/// distributions) a pipe holds 256 KiB to 1 MiB, the secret fits, and this
+/// test fails without a defect; the environment-string limit rules out a
+/// larger secret.
 #[test]
 #[serial]
 fn a_secret_write_the_container_refuses_kills_the_container_by_name() {
