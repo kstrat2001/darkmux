@@ -4856,6 +4856,68 @@ S(("127.0.0.1", port), H).serve_forever()
         format!("http://127.0.0.1:{port}/v1/chat/completions")
     }
 
+    /// A loopback endpoint that answers every request with a 429, counting
+    /// the requests it took.
+    fn rate_limited_http_mock() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write as IoWrite};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let taken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&taken);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut chunk = [0u8; 8192];
+                let _ = stream.read(&mut chunk);
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = r#"{"error":{"code":429,"message":"slow down"}}"#;
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1/chat/completions"), taken)
+    }
+
+    /// An operator's stop during the rate-limit backoff (30 s after a 429,
+    /// then 60, then 120) ends the call at once, and nothing more is sent:
+    /// before, the backoff slept its whole length and then sent one more
+    /// request, holding a stopped run for minutes.
+    #[test]
+    #[serial]
+    fn a_stop_during_the_rate_limit_backoff_returns_at_once_and_sends_nothing_more() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        darkmux_types::interrupt::reset_for_test();
+        let (url, taken) = rate_limited_http_mock();
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(remote_chat_completion(&url, None, &serde_json::json!({"model": "m", "messages": []}), 30, None));
+        });
+        let first = Instant::now();
+        while taken.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(first.elapsed() < Duration::from_secs(20), "the first request never arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The 429 is answered; the call is now in its 30 s backoff.
+        std::thread::sleep(Duration::from_millis(200));
+        let stopped = Instant::now();
+        darkmux_types::interrupt::raise_for_test();
+        let outcome = result.recv_timeout(Duration::from_secs(3));
+        let waited = stopped.elapsed();
+        // Room for a request the call would wrongly send after waking.
+        std::thread::sleep(Duration::from_millis(300));
+        darkmux_types::interrupt::reset_for_test();
+        let err = outcome.expect("the call must return within seconds of the stop, not after its backoff").unwrap_err();
+        assert!(waited < Duration::from_millis(1500), "returned {waited:?} after the stop");
+        assert!(err.to_string().contains(darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL), "{err:#}");
+        assert!(!call_may_have_spent(&err), "a request never sent is never charged: {err:#}");
+        assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 1, "no request after the stop");
+    }
+
     /// The cutoff arms at the first body byte: a prefill that sends nothing
     /// for longer than the cutoff, then streams its reply, is not cut. Before
     /// the first byte, the call's total timeout is the bound.

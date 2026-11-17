@@ -92,6 +92,7 @@ static SIGHUP_COUNT: AtomicU32 = AtomicU32::new(0);
 fn deliver(signum: libc::c_int, count: &AtomicU32) {
     INTERRUPTED.store(true, Ordering::SeqCst);
     LAST_SIGNAL.store(signum, Ordering::SeqCst);
+    wake_sleepers();
     let n = count.fetch_add(1, Ordering::SeqCst) + 1;
     if n >= 2 {
         // (#1959 merge-gate finding 13) A caller that never polls `is_set`
@@ -224,6 +225,79 @@ pub fn stop_reason() -> Option<&'static str> {
     })
 }
 
+/// The write end of the pipe a [`sleep`] waits on, or -1 until the first
+/// `sleep` makes it. Read by every raiser, the signal handler included.
+static WAKE_WRITE: AtomicI32 = AtomicI32::new(-1);
+
+/// The read end of the wake pipe, made by the first caller: both ends
+/// close-on-exec (a child never inherits them) and non-blocking (a raiser
+/// never blocks on a full pipe). `None` when the pipe could not be made.
+fn wake_pipe() -> Option<libc::c_int> {
+    static PIPE: std::sync::OnceLock<Option<libc::c_int>> = std::sync::OnceLock::new();
+    *PIPE.get_or_init(|| {
+        let mut fds = [-1 as libc::c_int; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        for fd in fds {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK);
+            }
+        }
+        WAKE_WRITE.store(fds[1], Ordering::SeqCst);
+        Some(fds[0])
+    })
+}
+
+/// Wake every [`sleep`]: one byte into the wake pipe, which stays there, so
+/// every sleeper, now and later, sees it readable. Called after the flag is
+/// raised. Async-signal-safe (an atomic load and `write(2)`), so the signal
+/// handler calls it too.
+fn wake_sleepers() {
+    let fd = WAKE_WRITE.load(Ordering::SeqCst);
+    if fd >= 0 {
+        let byte = 1u8;
+        unsafe {
+            libc::write(fd, (&byte as *const u8).cast(), 1);
+        }
+    }
+}
+
+/// Sleep for `d`, or until the flag is raised, whichever comes first: `true`
+/// when the stop ended the wait (or had already landed), `false` when `d`
+/// ran out. Every raiser (a signal, [`mark_interrupted`],
+/// [`mark_bound_exceeded`]) wakes it at once, so a backoff never holds a
+/// stopped run for its full length. The wait blocks on a pipe the raiser
+/// writes, never a polling loop. The pipe is made by the first call and its
+/// fd stored before the flag is read, and a raiser stores the flag before it
+/// reads the fd, so a stop that lands while the pipe is being made is seen
+/// one way or the other. Should the pipe not be made (no fds left), it
+/// sleeps the whole `d`.
+pub fn sleep(d: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + d;
+    let Some(fd) = wake_pipe() else {
+        std::thread::sleep(d);
+        return is_set();
+    };
+    loop {
+        if is_set() {
+            return true;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        // At least 1 ms: a sub-millisecond rest rounds to 0, which would spin.
+        let ms = left.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+        let mut wake = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        // A signal (EINTR) or a byte ends the poll early; the loop reads why.
+        unsafe {
+            libc::poll(&mut wake, 1, ms);
+        }
+    }
+}
+
 /// (#2476) Set [`INTERRUPTED`] directly, WITHOUT installing (or touching)
 /// any `libc::signal(2)` disposition — the production twin of
 /// [`simulate_sigint_for_test`] etc., callable from a normal (non-test)
@@ -255,6 +329,7 @@ pub fn stop_reason() -> Option<&'static str> {
 /// the two production call sites.
 pub fn mark_interrupted() {
     INTERRUPTED.store(true, Ordering::SeqCst);
+    wake_sleepers();
 }
 
 /// (#2678, #3074) The run's own wall-clock bound fired: raise the flag the way
@@ -345,11 +420,20 @@ pub fn simulate_sighup_for_test() {
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_for_test() {
     INTERRUPTED.store(false, Ordering::SeqCst);
+    drain_wake_pipe();
     BOUND_EXCEEDED.store(false, Ordering::SeqCst);
     LAST_SIGNAL.store(0, Ordering::SeqCst);
     SIGINT_COUNT.store(0, Ordering::SeqCst);
     SIGTERM_COUNT.store(0, Ordering::SeqCst);
     SIGHUP_COUNT.store(0, Ordering::SeqCst);
+}
+
+/// Empty the wake pipe, so a [`sleep`] after [`reset_for_test`] waits again.
+#[cfg(any(test, feature = "test-support"))]
+fn drain_wake_pipe() {
+    let Some(fd) = wake_pipe() else { return };
+    let mut buf = [0u8; 64];
+    while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
 }
 
 /// (#2131 review round 2, NEW-5; round 4, F6) Test-only: restore SIGINT,
@@ -506,6 +590,67 @@ mod tests {
 
         reset_for_test();
         assert_eq!(received_signal(), None);
+    }
+
+    /// The CPU time this process has used, user and system.
+    fn cpu_time() -> std::time::Duration {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+        let of = |t: libc::timeval| std::time::Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
+        of(usage.ru_utime) + of(usage.ru_stime)
+    }
+
+    /// A sleep nothing stops runs its whole length, says so, and blocks the
+    /// whole time rather than spinning: it uses a sliver of the CPU a busy
+    /// loop over its length would.
+    fn assert_sleeps_blocked(d: std::time::Duration) {
+        let (t0, cpu0) = (std::time::Instant::now(), cpu_time());
+        assert!(!sleep(d), "nothing stopped it");
+        let (waited, spent) = (t0.elapsed(), cpu_time() - cpu0);
+        assert!(waited >= d, "returned after {waited:?} of {d:?}");
+        assert!(spent < d / 4, "used {spent:?} of CPU over a {d:?} sleep: it spun");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sleep_runs_its_length_when_nothing_stops_it() {
+        // It reads the process-wide interrupt flag another test may raise.
+        crate::run_in_own_process!();
+        reset_for_test();
+        assert_sleeps_blocked(std::time::Duration::from_millis(200));
+    }
+
+    /// Every raiser wakes a sleep at once: the signal handler (through the
+    /// shared handler body), a host's `mark_interrupted`, and the run's own
+    /// wall-clock bound. A sleep started after the stop returns at once too.
+    #[test]
+    #[serial_test::serial]
+    fn every_raiser_wakes_a_sleep_at_once() {
+        // (#3100) It raises the process-wide interrupt flag.
+        crate::run_in_own_process!();
+        let long = std::time::Duration::from_secs(5);
+        for (name, raise) in [
+            ("a signal", simulate_sigterm_for_test as fn()),
+            ("a host's own stop", mark_interrupted),
+            ("the wall-clock bound", mark_bound_exceeded),
+        ] {
+            reset_for_test();
+            let sleeper = std::thread::spawn(move || {
+                let t0 = std::time::Instant::now();
+                (sleep(long), t0.elapsed())
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            raise();
+            let (stopped, waited) = sleeper.join().unwrap();
+            assert!(stopped, "{name}: the sleep must report the stop");
+            assert!(waited < std::time::Duration::from_secs(2), "{name}: woke after {waited:?}");
+            let t0 = std::time::Instant::now();
+            assert!(sleep(long), "{name}: a sleep after the stop reports it");
+            assert!(t0.elapsed() < std::time::Duration::from_millis(500), "{name}: {:?}", t0.elapsed());
+        }
+        // A reset empties the wake pipe: the next sleep blocks again.
+        reset_for_test();
+        assert_sleeps_blocked(std::time::Duration::from_millis(200));
     }
 
     /// (#3100) Each test-only raiser raises the flag it names, as the real

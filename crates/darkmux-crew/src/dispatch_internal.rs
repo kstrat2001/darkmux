@@ -3989,6 +3989,12 @@ const RATE_LIMIT_BACKOFF_SECONDS: [u64; 3] = [30, 60, 120];
 /// `pub(crate)` (#1222 Phase B packet 2) — `single_shot.rs` reuses this
 /// hardened curl machinery (0600 secret-bearing config file, 429 backoff)
 /// for the local single-shot chat primitive.
+///
+/// Once the run is stopped no request is sent: the check runs before every
+/// attempt, and a stop during a backoff wakes it at once
+/// ([`darkmux_types::interrupt::sleep`]) rather than holding the stopped run
+/// for up to two minutes and then sending one more request. The error
+/// carries the interrupt marker and no failure class, so it is never charged.
 pub(crate) fn remote_chat_completion(
     url: &str,
     auth_header: Option<&(String, String)>,
@@ -4009,7 +4015,10 @@ pub(crate) fn remote_chat_completion(
                 "darkmux: hosted endpoint rate-limited or unavailable, retry {i}/{} in {delay}s",
                 attempts - 1
             );
-            std::thread::sleep(std::time::Duration::from_secs(delay));
+            darkmux_types::interrupt::sleep(std::time::Duration::from_secs(delay));
+        }
+        if darkmux_types::interrupt::is_set() {
+            anyhow::bail!("{}: the request to {url} was not sent", darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL);
         }
         match remote_chat_attempt(url, auth_header, body, timeout_seconds, progress.as_deref_mut()) {
             Ok(v) => return Ok(v),
