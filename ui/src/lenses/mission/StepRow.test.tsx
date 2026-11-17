@@ -28,6 +28,7 @@ const meter = (over: Partial<StepMeter>): StepMeter => ({
   generating: false,
   elapsedMs: 0,
   wallMs: 0,
+  waiting: false,
   ...over,
 });
 
@@ -60,5 +61,13 @@ describe("(U3-6) the step badge says WHICH clock it is", () => {
     // this project's answer to that.
     const { container } = render(<StepMeterEl meter={meter({ wallMs: 3_000, tokens: 1200, turns: 2 })} />);
     expect(container.querySelector(".mn-step-meter")?.textContent).toBe("0:031.2k tok2 turns");
+  });
+});
+
+describe("(#3195) a step waiting for its call slot", () => {
+  it("says waiting, with no timer", () => {
+    const { container } = render(<StepMeterEl meter={meter({ waiting: true })} />);
+    expect(container.querySelector(".waiting")?.textContent).toBe("waiting");
+    expect(container.querySelector(".gen, .wall")).toBeNull();
   });
 });

@@ -7228,6 +7228,14 @@ body {
    proportionally to factor x base size, so a large factor here makes the note
    give up nearly all of it first; the name still shrinks rather than
    overflowing once even a zero-width note is not enough. */
+/* (#3195) The phase's running total: never shrinks, the counts give way first. */
+.missionlens .phasegroup .pg-time {
+  flex: 0 0 auto;
+  font: calc(10px * var(--fs-scale))/1.1 var(--font-mono);
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 .missionlens .phasegroup .pg-note {
   flex: 0 999 auto;
   font: calc(10px * var(--fs-scale))/1.1 var(--font-mono);
@@ -7406,6 +7414,10 @@ body {
 .missionlens .mn-step-meter .idle {
   opacity: 0.45;
 }
+/* (#3195) Queued for its call slot: the idle family's word, no pulse. */
+.missionlens .mn-step-meter .waiting {
+  color: var(--status-idle);
+}
 .missionlens .mn-step-meter .gen {
   display: inline-flex;
   align-items: center;
@@ -7582,6 +7594,18 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* (#3195) The phase's running total, at the right edge beside its chip. */
+.missionlens .tlphase .tlph-hd .tlph-time {
+  margin-left: auto;
+  flex: 0 0 auto;
+  font: calc(10px * var(--fs-scale))/1 var(--font-mono);
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.missionlens .tlphase .tlph-hd .tlph-time + .tlph-tag {
+  margin-left: 0;
 }
 .missionlens .tlphase .tlph-hd .tlph-tag {
   margin-left: auto;

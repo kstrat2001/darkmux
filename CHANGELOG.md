@@ -181,6 +181,17 @@ darkmux release.
 
 ### Fixed
 
+- **A mission step waiting its turn reads waiting, not running (#3195).** Steps admitted together
+  behind one slot (an endpoint with no `limits.concurrent_calls` runs its calls one at a time), or a
+  local step waiting for its wave's model (a later wave, or its own wave's load), all read running from
+  their `step.start`, each with a timer counting the whole wait. The scheduler now writes
+  `step.queue.wait` on a step's task session when it is queued and `step.queue.resume` when its work
+  starts (none when the run is stopped first: its terminal closes the wait), and the mission graph's
+  step row (`graph.json`, and `mission show --json`) gains `waiting: true` for a step admitted but not
+  yet dispatching, by the rule its task already used; its `status` keeps the scheduler's word. The viewer shows such a step and its task as
+  waiting with no timer, takes a step's start from when its work began, and gives each phase heading
+  its own running total beside the mission's. `FLOW_SCHEMA_VERSION` 2.8.0 -> 2.9.0, additive: a step
+  that started at once writes neither record.
 - **A paired device's long names no longer push the rest of a line off screen (#3626).**
   Each tailnet user, device and host name that `client serve`'s log, the pairing dialog,
   `client approve` and `client list` show, and the device name an app sends when it asks to pair,

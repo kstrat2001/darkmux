@@ -359,6 +359,16 @@ flow_actions! {
     RunError => Run, "run.error", Run Error;
     SessionEnd => Session, "session.end";
     StepStart => Step, "step.start";
+    /// (#3195) An admitted step waits its turn: its endpoint's
+    /// `limits.concurrent_calls`, the dispatch-free cap, or, for every local
+    /// step, its wave's model (even one already resident, where the wait is
+    /// milliseconds). Written when the wait starts. The step's work starts
+    /// at its `step.queue.resume`; until then it reads waiting, not running.
+    StepQueueWait => Step, "step.queue.wait";
+    /// (#3195) The waiting step took its slot: its work starts now. Not
+    /// written for a step whose run is stopped before its work starts: its
+    /// terminal closes the wait.
+    StepQueueResume => Step, "step.queue.resume";
     StepComplete => Step, "step.complete";
     StepError => Step, "step.error";
     StepResult => Step, "step.result";

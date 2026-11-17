@@ -218,6 +218,8 @@ const ACTION_WIRE = {
   RunError: "run.error",
   SessionEnd: "session.end",
   StepStart: "step.start",
+  StepQueueWait: "step.queue.wait",
+  StepQueueResume: "step.queue.resume",
   StepComplete: "step.complete",
   StepError: "step.error",
   StepResult: "step.result",

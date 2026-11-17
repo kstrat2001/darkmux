@@ -28,7 +28,8 @@ import ReactFlow, {
   type OnNodesChange,
 } from "reactflow";
 import "reactflow/dist/style.css";
-import { StepRow } from "./StepRow";
+import { PhaseTime, StepRow } from "./StepRow";
+import { phaseElapsed, type PhaseElapsed } from "./timeline";
 import { WorkStatus, workStatusKind } from "../../components/WorkStatus";
 import { useIsMobile } from "../../hooks/useIsMobile";
 import {
@@ -107,7 +108,7 @@ function MissionNode({ data }: NodeProps<MissionNodeData>) {
 
 function PhaseGroup({
   data,
-}: NodeProps<{ label: string; status: GraphNodeStatus; abandonedReason?: GraphNode["abandonedReason"]; description?: string; statusNote?: string }>) {
+}: NodeProps<{ label: string; status: GraphNodeStatus; abandonedReason?: GraphNode["abandonedReason"]; description?: string; statusNote?: string; elapsed: PhaseElapsed | null }>) {
   // (#2406, post-review) The phase box used to carry NO status word at
   // all — a degraded phase was conveyed purely by border color, and the
   // counts reached the page only as a `title=`. Tooltips do not exist on
@@ -137,6 +138,7 @@ function PhaseGroup({
         <span className="pg-state">
           <span className="pg-name">{data.label || ""}</span>
           <WorkStatus status={data.status} abandonReason={data.abandonedReason} className="pg-tag" />
+          <PhaseTime elapsed={data.elapsed} className="pg-time" />
           {data.statusNote ? <span className="pg-note">{data.statusNote}</span> : null}
         </span>
       </div>
@@ -247,7 +249,14 @@ function toRfNodes(
         type: "phaseGroup",
         position: { x: box.x, y: box.y },
         style: { width: box.w, height: box.h },
-        data: { label: n.label, status: n.status, abandonedReason: n.abandonedReason, description: n.description, statusNote: n.statusNote },
+        data: {
+          label: n.label,
+          status: n.status,
+          abandonedReason: n.abandonedReason,
+          description: n.description,
+          statusNote: n.statusNote,
+          elapsed: phaseElapsed(graphNodes.filter((t) => t.kind === "task" && t.parentId === n.id), metrics, now),
+        },
         draggable: false,
         selectable: false,
         zIndex: 0,
