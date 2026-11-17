@@ -340,6 +340,7 @@ mod tests {
             label: "Plan".into(),
             kind: "plan.sites".into(),
             status,
+            waiting: false,
             started_ts: None,
             completed_ts: None,
             tokens_final: None,
@@ -360,6 +361,33 @@ mod tests {
         let fine = row(darkmux_crew::types::NodeStatus::Complete, None);
         assert!(!step_line(&fine).contains("error:"));
         assert!(serde_json::to_value(&fine).unwrap().get("error").is_none());
+    }
+
+    /// (#3195) A step admitted but not yet dispatching (`waiting` beside its
+    /// scheduler word `running`) reads waiting on its own line, as its task
+    /// does; `--json` keeps both fields.
+    #[test]
+    fn a_waiting_step_reads_waiting() {
+        let row = StepRow {
+            id: "unit-step".into(),
+            label: "Dispatch".into(),
+            kind: "dispatch.internal".into(),
+            status: darkmux_crew::types::NodeStatus::Running,
+            waiting: true,
+            started_ts: None,
+            completed_ts: None,
+            tokens_final: None,
+            tokens_utility: None,
+            turns_final: None,
+            model: None,
+            error: None,
+            abandoned_reason: None,
+        };
+        assert!(step_line(&row).contains("unit-step [dispatch.internal] waiting"), "{}", step_line(&row));
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!((json["status"].as_str(), json["waiting"].as_bool()), (Some("running"), Some(true)));
+        let running = StepRow { waiting: false, started_ts: Some(1), ..row };
+        assert!(step_line(&running).contains("unit-step [dispatch.internal] running"), "{}", step_line(&running));
     }
 
     /// A mission with no resolvable config still shows: `config` is absent,

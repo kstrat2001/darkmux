@@ -556,7 +556,7 @@ fn a_refused_wave_runs_none_of_its_jobs_and_each_ends_in_an_error() {
         let free = || Some(GIB);
         let machine = FakeMachine { capacity: Some(capacity), ..FakeMachine::new(&free) };
         let est = FixedEstimator(std::collections::BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
-        let results = run_bounded(jobs, &Facts::default(), &est, 4, &factory, Some(&rig.room(&machine))).expect("planned");
+        let results = run_bounded(jobs, &Facts::default(), &est, 4, &factory, Some(&rig.room(&machine)), &|_| {}).expect("planned");
         assert_eq!(ran.load(Ordering::SeqCst), 0, "no job of the refused wave ran");
         assert_eq!(results.len(), 2, "every job has its terminal result");
         for (_, r) in &results {
