@@ -135,7 +135,7 @@ echo $$ > "$d/pid" && st=$(/usr/bin/env -i TZ=UTC0 /bin/ps -o lstart= -p $$) && 
 trap : TERM INT HUP
 [ -z "$wd" ] || cd "$wd" || { rm -rf "$d"; exit 125; }
 [ -n "$1" ] || { echo "seatbelt: no program to run (a policy needs an entrypoint)" >&2; rm -rf "$d"; exit 125; }
-/usr/bin/sandbox-exec -f "$d/profile.sb" "$@"
+/usr/bin/perl -e '{CARRY}' /usr/bin/sandbox-exec -f "$d/profile.sb" "$@"
 rc=$?
 g=$$
 "#;
@@ -186,8 +186,24 @@ exit $rc
 
 /// The whole launcher script.
 fn launcher() -> String {
-    format!("{}{LAUNCHED}", LAUNCH.replacen("{GUARD}", GUARD, 1))
+    format!("{}{LAUNCHED}", LAUNCH.replacen("{GUARD}", GUARD, 1).replacen("{CARRY}", CARRY, 1))
 }
+
+/// The prefix of the variables that carry a policy's environment through
+/// the launcher ([`SeatbeltBackend::launcher_environment`]): each holds one
+/// `key=value`. The launcher's shell, its guard and its bookkeeping run with
+/// nothing else, so no policy variable reaches them under its own name
+/// (`BASH_FUNC_*`, `SHELLOPTS` and `PS4`, `PERL5OPT`, `IFS` ...); only the
+/// program gets them ([`CARRY`]).
+pub(crate) const CARRIED: &str = "DARKMUX_SANDBOX_ENV_";
+
+/// Perl that sets the program's environment to exactly the carried
+/// variables ([`CARRIED`]), each under its own name, plus the launcher's
+/// `PWD` when the policy names none, then runs its arguments as the
+/// program (`sandbox-exec` and what it runs), never through a shell. It
+/// starts with the launcher's own environment, so no policy variable
+/// reaches perl itself. No single quote: it runs inside one.
+const CARRY: &str = "my %e; for my $k (keys %ENV) { next unless $k =~ /^DARKMUX_SANDBOX_ENV_[0-9]+$/; my ($n, $v) = split(/=/, $ENV{$k}, 2); $e{$n} = $v if defined $v && length $n; } $e{PWD} = $ENV{PWD} if defined $ENV{PWD} && !exists $e{PWD}; %ENV = %e; exec { $ARGV[0] } @ARGV; exit 127;";
 
 /// The launcher's guard ([`LAUNCH`]), its launcher's pid its argument: the
 /// group drained, then the session swept ([`sweep!`]).
@@ -207,7 +223,21 @@ const OURS: &str = r#"[ -f "$d/profile.sb" ]"#;
 /// recorded and read as [`STARTED_PREFIX`] and `ps -o lstart=` run by
 /// [`STARTED_READER`], never in the sandbox's own environment: `lstart`'s
 /// text follows `TZ` and the locale, which a policy may set.
-const ALIVE: &str = r#"pid=$(cat "$d/pid" 2>/dev/null) && kill -0 "$pid" 2>/dev/null && started=$(cat "$d/started" 2>/dev/null) && [ -n "$started" ] && [ "utc:$(/usr/bin/env -i TZ=UTC0 /bin/ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ]"#;
+///
+/// A record without the prefix was written by a launcher from before it,
+/// in its policy's environment: it is compared the way that launcher's own
+/// check compared it (`ps -o lstart=` with only `PATH` set), and when that
+/// does not match while the pid lives, the sandbox is [`UNDECIDED`], never
+/// gone.
+const ALIVE: &str = r#"pid=$(cat "$d/pid" 2>/dev/null) && kill -0 "$pid" 2>/dev/null && started=$(cat "$d/started" 2>/dev/null) && [ -n "$started" ] && { [ "utc:$(/usr/bin/env -i TZ=UTC0 /bin/ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ] || { case $started in utc:*) false ;; *) [ "$(/bin/ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ] ;; esac; }; }"#;
+
+/// Whether `$d`'s sandbox, which [`ALIVE`] did not find running, may still
+/// run: its pid lives and no record in the [`STARTED_PREFIX`] form says it
+/// is another process (the record is from an older launcher, or not written
+/// yet). Such a sandbox is never removed, stopped or listed as exited:
+/// what decides it is gone is a dead pid or a comparable record that
+/// differs.
+const UNDECIDED: &str = r#"pid=$(cat "$d/pid" 2>/dev/null) && kill -0 "$pid" 2>/dev/null && case $(cat "$d/started" 2>/dev/null) in utc:*) false ;; *) true ;; esac"#;
 
 /// How a launcher's start is recorded in `$d/started` and read back ([`LAUNCH`],
 /// [`ALIVE`], and `host_leaders`): this prefix, then `ps -o lstart=` with no
@@ -377,6 +407,17 @@ impl SeatbeltBackend {
         env
     }
 
+    /// The environment a launcher runs in: `PATH`, and the policy's
+    /// environment ([`Self::environment`]) carried under [`CARRIED`] names
+    /// for the program alone ([`CARRY`]). A variable whose name is empty or
+    /// holds `=` is not one a program could be given, and is dropped.
+    fn launcher_environment(policy: &SandboxPolicy, dir: &Path) -> Vec<(String, String)> {
+        let carried = Self::environment(policy, dir).into_iter().filter(|(k, _)| !k.is_empty() && !k.contains('='));
+        std::iter::once(("PATH".to_string(), DEFAULT_PATH.to_string()))
+            .chain(carried.enumerate().map(|(i, (k, v))| (format!("{CARRIED}{i}"), format!("{k}={v}"))))
+            .collect()
+    }
+
     /// The program and its arguments: the entrypoint, then the command.
     fn program(policy: &SandboxPolicy) -> Vec<String> {
         policy.entrypoint.iter().cloned().chain(policy.command.iter().cloned()).collect()
@@ -430,9 +471,10 @@ impl SeatbeltBackend {
 }
 
 /// Removes `$d`'s sandbox, killing it first if it runs; leaves alone a
-/// directory this backend did not write ([`OURS`]).
+/// directory this backend did not write ([`OURS`]), and one whose sandbox
+/// may still run ([`UNDECIDED`]).
 fn remove_script() -> String {
-    format!("{OURS} || exit 0\nif {ALIVE}; then kill -KILL -- \"-$pid\" 2>/dev/null; g=$pid\n{DRAIN}fi\nrm -rf \"$d\"; exit 0")
+    format!("{OURS} || exit 0\nif {ALIVE}; then kill -KILL -- \"-$pid\" 2>/dev/null; g=$pid\n{DRAIN}elif {UNDECIDED}; then exit 0\nfi\nrm -rf \"$d\"; exit 0")
 }
 
 /// Lists the sandboxes under `$1`, skipping any directory this backend did
@@ -442,7 +484,7 @@ fn list_script() -> String {
         r#"r=$1; [ -d "$r" ] || exit 0
 for d in "$r"/*; do
   {OURS} || continue
-  if {ALIVE}; then s=running; elif [ -f "$d/pid" ]; then s=exited; else s=created; fi
+  if {{ {ALIVE}; }} || {{ {UNDECIDED}; }}; then s=running; elif [ -f "$d/pid" ]; then s=exited; else s=created; fi
   printf 'N\t%s\t%s\n' "${{d##*/}}" "$s"
   sed 's/^/L	/' "$d/labels" 2>/dev/null
 done
@@ -529,7 +571,7 @@ impl SandboxBackend for SeatbeltBackend {
             policy.workdir.clone().unwrap_or_default(),
         ];
         args.extend(Self::program(policy));
-        let mut cmd = Self::launcher_script(&format!("{PREPARE}shift 3\n{}", launcher()), &args, &Self::environment(policy, &dir));
+        let mut cmd = Self::launcher_script(&format!("{PREPARE}shift 3\n{}", launcher()), &args, &Self::launcher_environment(policy, &dir));
         if !policy.stdin {
             cmd.stdin(Stdio::null());
         }
@@ -540,7 +582,7 @@ impl SandboxBackend for SeatbeltBackend {
         let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: policy.name.clone() };
         let Some(dir) = dir_of(&policy.name) else { return (refused(&policy.name), handle) };
         let _ = std::fs::create_dir_all(state_root());
-        let env = Self::environment(policy, &dir);
+        let env = Self::launcher_environment(policy, &dir);
         let launch_args: Vec<String> = [dir.to_string_lossy().into_owned(), policy.workdir.clone().unwrap_or_default()]
             .into_iter()
             .chain(Self::program(policy))
@@ -571,7 +613,8 @@ if {ALIVE}; then
   i=0; while kill -0 "$pid" 2>/dev/null && [ "$i" -lt "$(($2 * 10))" ]; do sleep 0.1; i=$((i + 1)); done
   kill -KILL -- "-$pid" 2>/dev/null
   g=$pid
-{DRAIN}fi
+{DRAIN}elif {UNDECIDED}; then exit 0
+fi
 rm -rf "$d"; exit 0"#
         );
         Self::on_dir(handle, &script, &[grace.as_secs().to_string()])
@@ -765,6 +808,127 @@ mod tests {
         assert!(ALIVE.contains(&format!("\"{STARTED_PREFIX}$({reader} -p \"$pid\" 2>/dev/null)\"")), "{ALIVE}");
     }
 
+    /// Runs `p` under a state root of its own until its launcher has
+    /// recorded its start; the launcher, its directory and the root (kept
+    /// alive by the caller), with [`STATE_DIR_ENV`] pointing at it until
+    /// [`StateRoot`] drops.
+    fn running(mut p: SandboxPolicy, name: &str) -> (std::process::Child, PathBuf, StateRoot) {
+        let root = StateRoot::new();
+        p.name = name.into();
+        let (mut cmd, _) = SeatbeltBackend.run(&p);
+        let child = cmd.spawn().unwrap();
+        let d = canonical(root.0.path()).join(name);
+        for _ in 0..300 {
+            if std::fs::read_to_string(d.join("started")).is_ok_and(|s| !s.trim().is_empty()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (child, d, root)
+    }
+
+    /// A temporary [`STATE_DIR_ENV`], restored on drop.
+    struct StateRoot(tempfile::TempDir, Option<std::ffi::OsString>);
+
+    impl StateRoot {
+        fn new() -> Self {
+            let root = tempfile::TempDir::new().unwrap();
+            let prev = std::env::var_os(STATE_DIR_ENV);
+            unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
+            StateRoot(root, prev)
+        }
+    }
+
+    impl Drop for StateRoot {
+        fn drop(&mut self) {
+            unsafe {
+                match self.1.take() {
+                    Some(v) => std::env::set_var(STATE_DIR_ENV, v),
+                    None => std::env::remove_var(STATE_DIR_ENV),
+                }
+            }
+        }
+    }
+
+    /// A process's start as `ps -o lstart=` prints it under `env`, the way
+    /// a launcher before the `utc:` form recorded it in its policy's
+    /// environment.
+    fn lstart_under(pid: u32, env: &[(&str, &str)]) -> String {
+        let out = Command::new("/bin/ps").args(["-o", "lstart=", "-p", &pid.to_string()]).env_clear().envs(env.iter().copied()).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim_end_matches('\n').to_string()
+    }
+
+    /// A sandbox left running by a launcher that recorded its start the
+    /// older way (no `utc:` prefix, in its policy's time zone) is never
+    /// taken for gone: when its record cannot be compared, remove and stop
+    /// leave its directory and its processes alone, and the listing says
+    /// running. When its record does compare (written with no time zone),
+    /// remove ends it as before.
+    #[test]
+    #[serial_test::serial]
+    fn a_sandbox_with_an_older_start_record_is_never_taken_for_gone() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let mut p = policy(Vec::new(), Network::None);
+        p.entrypoint = Some("/bin/sleep".into());
+        p.command = vec!["20".into()];
+        let (mut child, d, root) = running(p.clone(), "darkmux-older-record");
+        let pid: u32 = std::fs::read_to_string(d.join("pid")).unwrap().trim().parse().unwrap();
+        std::fs::write(d.join("started"), format!("{}\n", lstart_under(pid, &[("TZ", "Pacific/Kiritimati"), ("PATH", DEFAULT_PATH)]))).unwrap();
+        let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: "darkmux-older-record".into() };
+        let removed = SeatbeltBackend.remove(&handle).status().unwrap();
+        let stopped = SeatbeltBackend.stop(&handle, Duration::from_secs(1)).status().unwrap();
+        let listing = String::from_utf8_lossy(&SeatbeltBackend.list(&Query::labeled("darkmux.host.pid")).output().unwrap().stdout).into_owned();
+        let launchers = crate::host_leaders::host_sandbox_launchers();
+        let (kept, alive) = (d.is_dir(), child.try_wait().unwrap().is_none());
+        let _ = std::fs::write(d.join("started"), format!("{}\n", lstart_under(pid, &[("PATH", DEFAULT_PATH)])));
+        let ended = SeatbeltBackend.remove(&handle).status().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let gone = child.try_wait().unwrap().is_some();
+        let _ = Command::new("/bin/kill").args(["-KILL", &format!("-{pid}")]).status();
+        let _ = child.wait();
+        drop(root);
+        assert!(removed.success() && stopped.success());
+        assert!(kept && alive, "remove or stop took a live sandbox for gone (dir kept {kept}, alive {alive})");
+        assert!(listing.contains("N\tdarkmux-older-record\trunning"), "{listing}");
+        assert_eq!(launchers, Some(vec![pid]));
+        assert!(ended.success() && gone && !d.exists(), "a record that compares is still ended by remove");
+    }
+
+    /// A policy's environment reaches the program and nothing the launcher
+    /// does: functions exported to the shell (`BASH_FUNC_*`) cannot forge
+    /// its pid or its start record.
+    #[test]
+    #[serial_test::serial]
+    fn a_policys_environment_cannot_forge_the_launchers_record() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let mut p = policy(Vec::new(), Network::None);
+        p.env = vec![
+            ("A".into(), "seen".into()),
+            ("BASH_FUNC_echo%%".into(), "() { builtin echo 4242; }".into()),
+            ("BASH_FUNC_printf%%".into(), "() { builtin printf 'utc:forged\\n'; }".into()),
+            ("SHELLOPTS".into(), "xtrace".into()),
+            ("PS4".into(), "$(builtin echo 4242 > \"$d/pid\")".into()),
+        ];
+        p.entrypoint = Some("/bin/sh".into());
+        p.command = vec!["-c".into(), "/usr/bin/printenv A > \"$TMPDIR/a\"; exec /bin/sleep 3".into()];
+        let (mut child, d, root) = running(p, "darkmux-env-forge");
+        std::thread::sleep(Duration::from_millis(300));
+        let pid = std::fs::read_to_string(d.join("pid")).unwrap_or_default();
+        let started = std::fs::read_to_string(d.join("started")).unwrap_or_default();
+        let seen = std::fs::read_to_string(d.join("tmp/a")).unwrap_or_default();
+        let real = Command::new(STARTED_READER[0]).args(&STARTED_READER[1..]).args(["-p", &child.id().to_string()]).output().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(root);
+        assert_eq!(pid.trim(), child.id().to_string(), "the launcher's own pid");
+        assert_eq!(started.trim(), format!("{STARTED_PREFIX}{}", String::from_utf8_lossy(&real.stdout).trim()), "the launcher's own start");
+        assert_eq!(seen.trim(), "seen", "the program still gets the policy's environment");
+    }
+
     /// A running sandbox whose policy sets `TZ` and a locale is still the
     /// running sandbox its directory records: its listing says running, and
     /// its launcher is among the host's sandbox launchers. Its start is
@@ -900,25 +1064,34 @@ mod tests {
         let prev = std::env::var_os(STATE_DIR_ENV);
         unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
         let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: "darkmux-stale-b3559".into() };
-        let stale = |lead: u32| {
-            let d = canonical(root.path()).join(&handle.id);
+        let d = canonical(root.path()).join(&handle.id);
+        let stale = |lead: u32, record: &str| {
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(d.join("profile.sb"), "(version 1)").unwrap();
             std::fs::write(d.join("pid"), lead.to_string()).unwrap();
-            std::fs::write(d.join("started"), "Thu Jan  1 00:00:00 1970\n").unwrap();
+            std::fs::write(d.join("started"), format!("{record}\n")).unwrap();
         };
         let lifecycle: [(&str, &dyn Fn() -> Command); 3] = [
             ("remove", &|| SeatbeltBackend.remove(&handle)),
             ("stop", &|| SeatbeltBackend.stop(&handle, Duration::from_secs(1))),
             ("kill", &|| SeatbeltBackend.kill(&handle)),
         ];
-        let mut ended = Vec::new();
-        for (what, command) in lifecycle {
-            let s = session();
-            stale(s.leader.id());
-            let _ = command().output().unwrap();
-            if !alive(&s.leader.id().to_string()) || !alive(&s.child) {
-                ended.push(what);
+        let (mut ended, mut kept) = (Vec::new(), Vec::new());
+        // A record in today's form that is not the leader's start says the
+        // pid was reused: remove and stop clear the directory. An older
+        // launcher's record cannot say so, and leaves it.
+        for record in ["utc:Thu Jan  1 00:00:00 1970", "Thu Jan  1 00:00:00 1970"] {
+            for (what, command) in &lifecycle {
+                let s = session();
+                stale(s.leader.id(), record);
+                let _ = command().output().unwrap();
+                if !alive(&s.leader.id().to_string()) || !alive(&s.child) {
+                    ended.push(*what);
+                }
+                if d.exists() && *what != "kill" && record.starts_with("utc:") {
+                    kept.push(*what);
+                }
+                let _ = std::fs::remove_dir_all(&d);
             }
         }
         unsafe {
@@ -928,6 +1101,7 @@ mod tests {
             }
         }
         assert_eq!(ended, Vec::<&str>::new(), "an unrelated session was ended");
+        assert_eq!(kept, Vec::<&str>::new(), "a reused pid's stale directory was kept");
     }
 
     /// A lifecycle command runs its script with `$d` the sandbox's
