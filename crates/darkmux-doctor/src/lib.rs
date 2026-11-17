@@ -717,37 +717,46 @@ fn audit_write_drops_check(dropped: &[darkmux_flow::DroppedAuditWrites]) -> Chec
     }
 }
 
-/// Whether the local sink can write day files under the flows dir. In the
-/// default setup it is the only sink, and every caller discards a failed
-/// write, so an unwritable flows dir drops every record (the dispatch
-/// bookends included) with one stderr line per process as its only trace.
+/// Whether the local sink can write today's day file under the flows dir,
+/// and, when audit is on, the audit sink its own. In the default setup the
+/// local sink is the only sink, and every caller discards a failed write, so
+/// an unwritable flows dir drops every record (the dispatch bookends included)
+/// with one stderr line per process as its only trace. A full disk is not
+/// probed (`day_file_write_problem`).
 fn check_flows_dir_writable() -> Check {
-    let dir = darkmux_types::config_access::flows_dir();
-    let problem = darkmux_flow::flows_dir_write_problem(&dir);
-    flows_dir_writable_check(&dir, problem)
+    use darkmux_flow::DayFileAccess;
+    let today = darkmux_flow::day_utc_now();
+    let flows = darkmux_types::config_access::flows_dir();
+    let flows_problem = darkmux_flow::day_file_write_problem(&flows, &today, DayFileAccess::Append);
+    let audit = darkmux_types::config_access::audit_enabled().then(darkmux_flow::audit_dir);
+    let audit_problem = audit.and_then(|dir| darkmux_flow::day_file_write_problem(&dir, &today, DayFileAccess::ReadWrite));
+    flows_dir_writable_check(&flows, flows_problem, audit_problem)
 }
 
-fn flows_dir_writable_check(dir: &std::path::Path, problem: Option<String>) -> Check {
+fn flows_dir_writable_check(dir: &std::path::Path, flows: Option<String>, audit: Option<String>) -> Check {
     let name = "flow records writable".to_string();
-    match problem {
-        None => Check {
+    if flows.is_none() && audit.is_none() {
+        return Check {
             name,
             status: Status::Pass,
             message: format!("day files can be written under {}", dir.display()),
             hint: None,
-        },
-        Some(problem) => Check {
-            name,
-            status: Status::Fail,
-            message: format!("flow records cannot be written under {}: {problem}", dir.display()),
-            hint: Some(
-                "Every flow record, the dispatch bookends included, is dropped while this holds; \
-                 the work itself still runs. Fix the path or its permissions, or point the flows \
-                 dir at a writable directory: `darkmux config set dirs.flows <dir>` (an exported \
-                 DARKMUX_FLOWS_DIR wins over it)."
-                    .into(),
-            ),
-        },
+        };
+    }
+    let flows = flows.map(|p| format!("flow records cannot be written under {}: {p}", dir.display()));
+    let audit = audit.map(|p| format!("audit records cannot be written: {p}"));
+    Check {
+        name,
+        status: Status::Fail,
+        message: [flows, audit].into_iter().flatten().collect::<Vec<_>>().join("; "),
+        hint: Some(
+            "While this holds, every record to that sink is dropped (for the flows dir, the \
+             dispatch bookends included); the work itself still runs. Fix the path or its \
+             permissions (a day file left read-only or owned by root by a `sudo darkmux` run \
+             counts), or point the dir at a writable one: `darkmux config set dirs.flows <dir>` \
+             or `audit.dir` (an exported DARKMUX_FLOWS_DIR or DARKMUX_AUDIT_DIR wins over it)."
+                .into(),
+        ),
     }
 }
 
@@ -10703,19 +10712,25 @@ mod tests {
         assert!(check.hint.unwrap().contains("exits 3"));
     }
 
-    /// An unwritable flows dir fails doctor, naming the dir and why; a
-    /// writable one passes.
+    /// An unwritable flows dir fails doctor, naming the dir and why, and so
+    /// does an audit day file the audit sink cannot open; a writable setup
+    /// passes.
     #[test]
     fn an_unwritable_flows_dir_fails_naming_it() {
+        use darkmux_flow::DayFileAccess;
         let tmp = tempfile::TempDir::new().unwrap();
         let blocker = tmp.path().join("a-regular-file");
         std::fs::write(&blocker, "").unwrap();
         let dir = blocker.join("flows");
-        let check = flows_dir_writable_check(&dir, darkmux_flow::flows_dir_write_problem(&dir));
+        let problem = darkmux_flow::day_file_write_problem(&dir, "2026-11-17", DayFileAccess::Append);
+        let check = flows_dir_writable_check(&dir, problem, None);
         assert_eq!(check.status, Status::Fail, "{}", check.message);
         assert!(check.message.contains(&dir.display().to_string()) && check.message.contains("not a directory"), "{}", check.message);
         assert!(check.hint.unwrap().contains("dirs.flows"));
-        let ok = flows_dir_writable_check(tmp.path(), darkmux_flow::flows_dir_write_problem(tmp.path()));
+        let audit = flows_dir_writable_check(tmp.path(), None, Some("cannot open /audit/2026-11-17.jsonl for writing".into()));
+        assert_eq!(audit.status, Status::Fail);
+        assert!(audit.message.starts_with("audit records cannot be written: cannot open /audit/"), "{}", audit.message);
+        let ok = flows_dir_writable_check(tmp.path(), darkmux_flow::day_file_write_problem(tmp.path(), "2026-11-17", DayFileAccess::Append), None);
         assert_eq!(ok.status, Status::Pass, "{}", ok.message);
     }
 

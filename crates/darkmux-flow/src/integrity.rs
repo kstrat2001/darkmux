@@ -420,9 +420,15 @@ fn holds_only_whitespace(bytes: &[u8]) -> bool {
 }
 
 /// Whether a day file holding no line (its `contents`) was cut rather than
-/// just created: whitespace only, or emptied after its creation.
-fn lineless_file_was_cut(path: &Path, contents: &[u8]) -> bool {
-    holds_only_whitespace(contents) || (contents.is_empty() && fs::metadata(path).is_ok_and(|md| emptied_after_creation(&md)))
+/// just created: whitespace only, or emptied after its creation. `stat` is
+/// the file's metadata taken BEFORE `contents` was read, and its size must
+/// agree with what was read: a new day file whose first write lands while it
+/// is checked grows under the reader, and a stat taken after the read would
+/// show it written to (modified after it was born) while the bytes read are
+/// still none, which is not a cut.
+pub(crate) fn lineless_file_was_cut(stat: Option<&fs::Metadata>, contents: &[u8]) -> bool {
+    let Some(stat) = stat.filter(|md| md.len() == contents.len() as u64) else { return false };
+    holds_only_whitespace(contents) || (contents.is_empty() && emptied_after_creation(stat))
 }
 
 /// Record that the chain of the day file at `path` starts over: a restart
@@ -625,6 +631,8 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
 }
 
 fn walk_chain(path: &Path) -> Result<IntegrityReport> {
+    // Taken before the read, for `lineless_file_was_cut`.
+    let stat = fs::metadata(path).ok();
     let contents = fs::read_to_string(path)
         .with_context(|| format!("reading audit log {}", path.display()))?;
     let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -638,7 +646,7 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
             break_reason: None,
             writer_schema_version: None,
             torn_tails: Vec::new(),
-            chain_restarted: lineless_file_was_cut(path, contents.as_bytes()),
+            chain_restarted: lineless_file_was_cut(stat.as_ref(), contents.as_bytes()),
         });
     }
 

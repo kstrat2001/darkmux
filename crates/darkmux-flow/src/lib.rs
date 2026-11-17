@@ -300,25 +300,59 @@ fn report_local_write_failure(path: &Path, err: &anyhow::Error) {
     });
 }
 
-/// Why the local sink could not write a day file under `dir`, `None` when it
-/// can. `darkmux doctor` asks this of the flows dir. The probe does what a
-/// day's first record does: it creates a file there (and removes it). A dir
-/// not yet created is judged at its nearest existing ancestor, where the
-/// first write creates it; the probe never creates a directory itself.
-pub fn flows_dir_write_problem(dir: &Path) -> Option<String> {
-    let existing = dir.ancestors().find(|a| a.exists())?;
-    if !existing.is_dir() {
-        return Some(format!("{} is not a directory", existing.display()));
+/// How a sink opens a day file that already exists: the local sink appends;
+/// the audit sink reads its tail and appends under a lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DayFileAccess {
+    Append,
+    ReadWrite,
+}
+
+/// Why a sink could not write `day`'s file under `dir`, `None` when it can.
+/// `darkmux doctor` asks this of the flows dir and, when audit is on, of the
+/// audit dir. Two things are probed, the way a write would meet them: the dir
+/// takes a new file (one is created and removed; a dir not yet created is
+/// judged at its nearest existing ancestor, and a symlink to a missing target
+/// fails, since the first write's `create_dir_all` fails on it), and `day`'s
+/// file, when it already exists, opens as its sink opens it (`access`; the
+/// probe never writes to it). A full disk is not probed: creating an empty
+/// file succeeds on one.
+pub fn day_file_write_problem(dir: &Path, day: &str, access: DayFileAccess) -> Option<String> {
+    dir_write_problem(dir).or_else(|| existing_day_file_problem(&dir.join(format!("{day}.jsonl")), access))
+}
+
+/// Whether `dir` takes a new file (see [`day_file_write_problem`]).
+fn dir_write_problem(dir: &Path) -> Option<String> {
+    let nearest = dir.ancestors().find(|a| a.symlink_metadata().is_ok())?;
+    if !nearest.exists() {
+        return Some(format!("{} is a symlink to a missing target", nearest.display()));
+    }
+    if !nearest.is_dir() {
+        return Some(format!("{} is not a directory", nearest.display()));
     }
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    let probe = existing.join(format!(".darkmux-write-probe-{}-{nanos}", std::process::id()));
+    let probe = nearest.join(format!(".darkmux-write-probe-{}-{nanos}", std::process::id()));
     match fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
         Ok(_) => {
             let _ = fs::remove_file(&probe);
             None
         }
-        Err(e) => Some(format!("cannot create a file in {}: {e}", existing.display())),
+        Err(e) => Some(format!("cannot create a file in {}: {e}", nearest.display())),
     }
+}
+
+/// Whether an existing day file opens as its sink opens it. Opening writes
+/// nothing; a file not there yet is the dir probe's.
+fn existing_day_file_problem(file: &Path, access: DayFileAccess) -> Option<String> {
+    if !file.exists() {
+        return None;
+    }
+    let mut options = fs::OpenOptions::new();
+    match access {
+        DayFileAccess::Append => options.append(true),
+        DayFileAccess::ReadWrite => options.read(true).write(true),
+    };
+    options.open(file).err().map(|e| format!("cannot open {} for writing: {e}", file.display()))
 }
 
 impl FlowSink for LocalFileSink {
@@ -2705,6 +2739,48 @@ mod tests {
         assert!(about[0].contains("os error"), "the OS error is named: {about:?}");
     }
 
+    fn day_file_write_problem_today(dir: &std::path::Path) -> Option<String> {
+        day_file_write_problem(dir, "2026-11-17", DayFileAccess::Append)
+    }
+
+    /// A day file that exists but cannot be opened the way its sink opens it
+    /// fails the probe, naming the file, without the probe writing to it:
+    /// the dir itself is writable, so a probe of the dir alone passes while
+    /// every write fails.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_fails_a_day_file_its_sink_cannot_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("2026-11-17.jsonl");
+        std::fs::write(&file, "kept\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let problem = day_file_write_problem(tmp.path(), "2026-11-17", DayFileAccess::Append).expect("a read-only day file cannot take an append");
+        assert!(problem.contains(&file.display().to_string()) && problem.contains("os error"), "{problem}");
+        assert_eq!(day_file_write_problem(tmp.path(), "2026-11-18", DayFileAccess::Append), None, "another day's file is not today's");
+
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o200)).unwrap();
+        assert_eq!(day_file_write_problem(tmp.path(), "2026-11-17", DayFileAccess::Append), None, "append needs no read");
+        let audit = day_file_write_problem(tmp.path(), "2026-11-17", DayFileAccess::ReadWrite).expect("the audit sink reads its tail");
+        assert!(audit.contains(&file.display().to_string()), "{audit}");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "kept\n", "the probe never writes to the day file");
+    }
+
+    /// A flows dir that is a symlink to a missing target fails the probe,
+    /// naming the link: the first write's `create_dir_all` would fail on it.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_fails_a_dangling_symlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("flows");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &link).unwrap();
+        for dir in [link.clone(), link.join("nested")] {
+            let problem = day_file_write_problem_today(&dir).expect("a dangling link is not writable");
+            assert!(problem.contains(&link.display().to_string()) && problem.contains("missing target"), "{problem}");
+        }
+    }
+
     /// The doctor's flows-dir probe names a path the local sink could not
     /// write under, and passes a writable one, existing or not yet created,
     /// leaving nothing behind.
@@ -2713,15 +2789,15 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let blocker = tmp.path().join("a-regular-file");
         std::fs::write(&blocker, "").unwrap();
-        let problem = flows_dir_write_problem(&blocker.join("flows")).expect("a dir under a regular file is not writable");
+        let problem = day_file_write_problem_today(&blocker.join("flows")).expect("a dir under a regular file is not writable");
         assert!(problem.contains(&blocker.display().to_string()) && problem.contains("not a directory"), "{problem}");
-        assert_eq!(flows_dir_write_problem(&blocker), Some(format!("{} is not a directory", blocker.display())));
+        assert_eq!(day_file_write_problem_today(&blocker), Some(format!("{} is not a directory", blocker.display())));
 
         let existing = tmp.path().join("flows");
         std::fs::create_dir(&existing).unwrap();
-        assert_eq!(flows_dir_write_problem(&existing), None);
+        assert_eq!(day_file_write_problem_today(&existing), None);
         assert_eq!(std::fs::read_dir(&existing).unwrap().count(), 0, "the probe leaves nothing behind");
-        assert_eq!(flows_dir_write_problem(&tmp.path().join("not-yet").join("flows")), None, "created on the first write");
+        assert_eq!(day_file_write_problem_today(&tmp.path().join("not-yet").join("flows")), None, "created on the first write");
         assert!(!tmp.path().join("not-yet").exists(), "the probe creates no directory");
 
         #[cfg(unix)]
@@ -2730,7 +2806,7 @@ mod tests {
             let read_only = tmp.path().join("read-only");
             std::fs::create_dir(&read_only).unwrap();
             std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o500)).unwrap();
-            let problem = flows_dir_write_problem(&read_only);
+            let problem = day_file_write_problem_today(&read_only);
             std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o700)).unwrap();
             let problem = problem.expect("a read-only dir is not writable");
             assert!(problem.contains(&read_only.display().to_string()) && problem.contains("os error"), "{problem}");
@@ -6655,6 +6731,51 @@ mod tests {
             let report = integrity_check_file(path).unwrap();
             assert!(report.chain_valid && !report.chain_restarted, "{report:?}");
             assert!(torn_sidecars(path).is_empty(), "{report:?}");
+        }
+    }
+
+    /// A new day file whose first write lands while it is being checked is
+    /// not a restart: the check judges the file by a stat taken before it
+    /// read the bytes, so a file that grew under it is never called emptied.
+    #[test]
+    fn a_first_write_landing_during_a_check_is_not_a_chain_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fresh.jsonl");
+        std::fs::File::create(&path).unwrap();
+        let before_read = std::fs::metadata(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        append_one(&path, "first");
+        assert!(!crate::integrity::lineless_file_was_cut(Some(&before_read), b""), "judged by the stat before the read");
+        let after = std::fs::metadata(&path).unwrap();
+        assert!(!crate::integrity::lineless_file_was_cut(Some(&after), b""), "a size that disagrees with the bytes read is not a cut file");
+    }
+
+    /// The race through the real walk: a checker spinning on new day files
+    /// while their first record is written never reads a restart.
+    #[test]
+    fn a_checker_racing_first_writes_never_reads_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..200 {
+            let path = tmp.path().join(format!("race-{i}.jsonl"));
+            std::fs::File::create(&path).unwrap();
+            let writer = {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_micros(50 * (i % 7) as u64));
+                    append_one(&path, "first");
+                })
+            };
+            let mut restarted = None;
+            while restarted.is_none() {
+                let report = integrity_check_file(&path).unwrap();
+                if report.chain_restarted {
+                    restarted = Some(report);
+                } else if report.records_checked >= 1 {
+                    break;
+                }
+            }
+            writer.join().unwrap();
+            assert!(restarted.is_none(), "file {i}: {restarted:?}");
         }
     }
 

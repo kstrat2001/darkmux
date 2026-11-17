@@ -120,7 +120,7 @@ frame:
   What remains is structural rather than a bug.
 
   **Truncating the tail of a file is undetectable, and it is the least
-  conspicuous of the three** — it leaves a present, plausible-looking file
+  conspicuous of the ceilings below** — it leaves a present, plausible-looking file
   rather than a missing day. Delete the last record line (or the last k of them)
   and the walk sees a shorter but fully consistent chain: every `prev_hash`
   links, every byte-hash matches, the file reports valid. Nothing records how many records a file should contain or
@@ -157,7 +157,19 @@ frame:
   attacker with write access who rewrites a file wholesale (fresh header,
   recomputed hashes, relinked `prev_hash`) produces one that validates.
 
-  All three ceilings are inherent to an anchorless local chain. What the walk
+  **A restart can be hidden.** Empty a day file (or cut it to a header-shaped
+  prefix), let the next write reseed it, then delete the restart sidecar that
+  write left: the day file holds a short chain that verifies, nothing else
+  records that it started over, and `flow integrity-check` exits 0. The
+  sidecar is the only record of the restart, and anyone with write access to
+  the audit dir can remove it.
+
+  **A dropped audit write can be hidden.** Its only record is the
+  `audit.write_failed` breadcrumb in the local flow file, and the local flow
+  files are not hash-chained: delete those lines and neither `darkmux doctor`
+  nor `flow integrity-check` reports the gap.
+
+  All five ceilings are inherent to an anchorless local chain. What the walk
   does catch: in-place edits, reordering, insertion, and **any deletion that is
   not a pure suffix** — removing the first record, or a run from the middle,
   breaks the following record's `prev_hash` linkage. Only records removed from
