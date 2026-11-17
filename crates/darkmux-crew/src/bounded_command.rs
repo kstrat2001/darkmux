@@ -47,6 +47,14 @@
 //!    itself exited, something it spawned is holding the pipe; that
 //!    process group is killed before the runner returns, so a
 //!    `test_command` that starts a daemon leaks nothing.
+//!
+//! 4. **The output is bounded as well as the time.** Each stream keeps its
+//!    first and last bytes, [`OUTPUT_CAP_BYTES`] in all, while the drains
+//!    keep reading so the child never blocks on a full pipe. A stream that
+//!    wrote more carries a note where its middle was, naming how many bytes
+//!    were cut and the cap (see [`CappedStream`]). Without it a chatty
+//!    command (`yes`) buffered everything it wrote for the whole 600 s
+//!    default bound.
 
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -69,8 +77,82 @@ enum DrainSource {
     Err(std::process::ChildStderr),
 }
 
-fn snapshot(buf: &std::sync::Mutex<Vec<u8>>) -> Vec<u8> {
-    buf.lock().map(|b| b.clone()).unwrap_or_default()
+fn snapshot(buf: &std::sync::Mutex<CappedStream>, name: &str) -> Vec<u8> {
+    buf.lock().map(|b| b.to_bytes(name)).unwrap_or_default()
+}
+
+/// The most bytes of each stream (stdout, stderr) a bounded command keeps.
+///
+/// Sized for every reader of that output: `procedural.shell`'s step output
+/// (what `{{from.output}}`, a `grow` and the viewer read; the shipped
+/// commands print a few KiB), a lab verify command's `verify-output.txt`
+/// (whose test summary and coverage table are at the end, inside the
+/// kept tail), and the Docker, `curl` and `tar` calls darkmux makes itself
+/// (an id, a short JSON document, an error line). The gate reads only the
+/// exit code. At the dispatch-free concurrency default of 8, the whole
+/// mission holds at most 16 MiB of command output at once.
+pub const OUTPUT_CAP_BYTES: usize = 1024 * 1024;
+
+/// One stream of a bounded command: its first bytes, its last bytes, and
+/// how many it wrote in all. Three quarters of the cap go to the head
+/// (where a command echoes what it is doing and a JSON document starts)
+/// and one quarter to the tail (where a test run prints its verdict), the
+/// same split `dispatch_internal`'s `cap_result_middle` uses for a tool
+/// result. It never holds more than its cap, whatever the command writes.
+struct CappedStream {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    total: u64,
+    cap: usize,
+}
+
+impl CappedStream {
+    fn new(cap: usize) -> Self {
+        Self { head: Vec::new(), tail: std::collections::VecDeque::new(), total: 0, cap }
+    }
+
+    fn head_cap(&self) -> usize {
+        self.cap / 4 * 3
+    }
+
+    fn tail_cap(&self) -> usize {
+        self.cap - self.head_cap()
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.total += chunk.len() as u64;
+        let room = self.head_cap().saturating_sub(self.head.len());
+        let (to_head, rest) = chunk.split_at(chunk.len().min(room));
+        self.head.extend_from_slice(to_head);
+        self.tail.extend(rest);
+        let over = self.tail.len().saturating_sub(self.tail_cap());
+        self.tail.drain(..over);
+    }
+
+    /// How many bytes the cap dropped from the middle.
+    fn cut(&self) -> u64 {
+        self.total - (self.head.len() + self.tail.len()) as u64
+    }
+
+    /// The kept bytes, with a note between head and tail when the cap cut
+    /// any. The cut is by byte, so a multi-byte character at either edge
+    /// reads as a replacement character once decoded.
+    fn to_bytes(&self, name: &str) -> Vec<u8> {
+        let mut out = self.head.clone();
+        if self.cut() > 0 {
+            out.extend_from_slice(cut_note(self.cut(), name, self.cap).as_bytes());
+        }
+        out.extend(self.tail.iter());
+        out
+    }
+}
+
+/// The in-band note standing where a stream's middle was cut.
+fn cut_note(cut: u64, name: &str, cap: usize) -> String {
+    format!(
+        "\n[darkmux cut {cut} bytes from the middle of {name}: a step command keeps the first and last \
+         bytes of each stream, up to a {cap}-byte cap]\n"
+    )
 }
 
 /// What a bounded run produced. Every arm is a fact a caller can record —
@@ -97,13 +179,14 @@ pub enum Bounded {
 }
 
 /// The shared buffer a drain thread fills, and the channel it signals EOF on.
-type DrainBuf = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+type DrainBuf = std::sync::Arc<std::sync::Mutex<CappedStream>>;
 
 /// Start one drain thread per pipe (see the comment at its call site for why
-/// they signal rather than being joined).
-fn spawn_drains(child: &mut std::process::Child) -> (DrainBuf, DrainBuf, std::sync::mpsc::Receiver<()>) {
-    let out_buf = DrainBuf::default();
-    let err_buf = DrainBuf::default();
+/// they signal rather than being joined). Each keeps reading to EOF however
+/// much the cap drops, so the child never blocks on a full pipe.
+fn spawn_drains(child: &mut std::process::Child, cap: usize) -> (DrainBuf, DrainBuf, std::sync::mpsc::Receiver<()>) {
+    let out_buf = DrainBuf::new(std::sync::Mutex::new(CappedStream::new(cap)));
+    let err_buf = DrainBuf::new(std::sync::Mutex::new(CappedStream::new(cap)));
     let (eof_tx, eof_rx) = std::sync::mpsc::channel::<()>();
     for (pipe, buf) in [
         (child.stdout.take().map(DrainSource::Out), out_buf.clone()),
@@ -122,7 +205,7 @@ fn spawn_drains(child: &mut std::process::Child) -> (DrainBuf, DrainBuf, std::sy
                         break;
                     }
                     if let Ok(mut b) = buf.lock() {
-                        b.extend_from_slice(&chunk[..n]);
+                        b.push(&chunk[..n]);
                     }
                 }
             }
@@ -168,11 +251,12 @@ pub fn run_bounded(cmd: Command, timeout: Duration) -> Bounded {
     if darkmux_types::interrupt::is_set() {
         return Bounded::Interrupted;
     }
-    spawn_and_poll(cmd, timeout)
+    spawn_and_poll(cmd, timeout, OUTPUT_CAP_BYTES)
 }
 
-/// [`run_bounded`]'s spawn, drain and poll loop.
-fn spawn_and_poll(mut cmd: Command, timeout: Duration) -> Bounded {
+/// [`run_bounded`]'s spawn, drain and poll loop, keeping at most `cap`
+/// bytes of each stream.
+fn spawn_and_poll(mut cmd: Command, timeout: Duration, cap: usize) -> Bounded {
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -205,7 +289,7 @@ fn spawn_and_poll(mut cmd: Command, timeout: Duration) -> Bounded {
     // then never returns — reintroducing exactly the unbounded wait this
     // module exists to remove. Proven by this module's own tests: the
     // first cut joined, and the grandchild test hung the whole suite.
-    let (out_buf, err_buf, eof_rx) = spawn_drains(&mut child);
+    let (out_buf, err_buf, eof_rx) = spawn_drains(&mut child, cap);
     // (#2479 audit) `Instant`, deliberately: `started` bounds THIS spawned
     // child (an operator's `test_command`), not wall-clock time. Same
     // reasoning as its sibling in `gestalt_host::lms_host` — if the host
@@ -258,8 +342,8 @@ fn spawn_and_poll(mut cmd: Command, timeout: Duration) -> Bounded {
                 break Bounded::Finished {
                     success: status.success(),
                     code: status.code(),
-                    stdout: snapshot(&out_buf),
-                    stderr: snapshot(&err_buf),
+                    stdout: snapshot(&out_buf, "stdout"),
+                    stderr: snapshot(&err_buf, "stderr"),
                 };
             }
             Ok(None) => {}
@@ -815,6 +899,65 @@ mod tests {
             None => std::env::remove_var(k),
         }
         assert_eq!(timeout, Duration::from_secs(7));
+    }
+
+    /// A command that writes 1 MiB to each stream under a 64 KiB cap keeps
+    /// the head and the tail of each, with a note in between naming how many
+    /// bytes were cut and the cap. The first and last bytes are distinct
+    /// markers, so a head-only or tail-only cut fails here.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn a_command_writing_past_the_output_cap_keeps_its_head_and_tail_and_names_the_cut() {
+        const CAP: usize = 64 * 1024;
+        const BODY: usize = 1024 * 1024;
+        let script = format!(
+            "printf OUT-HEAD; head -c {BODY} /dev/zero | tr '\\0' x; printf OUT-TAIL; \
+             printf ERR-HEAD >&2; head -c {BODY} /dev/zero | tr '\\0' y >&2; printf ERR-TAIL >&2"
+        );
+        let Bounded::Finished { success: true, stdout, stderr, .. } = spawn_and_poll(sh(&script), Duration::from_secs(60), CAP) else {
+            panic!("expected a successful Finished");
+        };
+        for (bytes, name, head, tail) in [(&stdout, "stdout", "OUT-HEAD", "OUT-TAIL"), (&stderr, "stderr", "ERR-HEAD", "ERR-TAIL")] {
+            let text = String::from_utf8_lossy(bytes);
+            let cut = BODY + head.len() + tail.len() - CAP;
+            assert!(bytes.len() <= CAP + 512, "{name} kept {} bytes under a {CAP}-byte cap", bytes.len());
+            assert!(text.starts_with(head), "{name} lost its head");
+            assert!(text.ends_with(tail), "{name} lost its tail");
+            assert!(text.contains(&format!("cut {cut} bytes from the middle of {name}")), "{name} has no cut note: {}", &text[..200.min(text.len())]);
+            assert!(text.contains(&format!("{CAP}-byte cap")), "{name}'s note does not name the cap");
+        }
+    }
+
+    /// The stream never holds more than its cap while a command writes
+    /// past it, which is what bounds memory: checked after every chunk, not
+    /// only at the end.
+    #[test]
+    fn a_capped_stream_never_holds_more_than_its_cap() {
+        const CAP: usize = 64 * 1024;
+        let mut stream = CappedStream::new(CAP);
+        let chunk = [b'x'; 8192];
+        for _ in 0..128 {
+            stream.push(&chunk);
+            assert!(stream.head.len() + stream.tail.len() <= CAP, "held {} bytes", stream.head.len() + stream.tail.len());
+        }
+        assert_eq!(stream.total, 128 * 8192);
+        assert_eq!(stream.cut(), 128 * 8192 - CAP as u64);
+        assert_eq!((stream.head.len(), stream.tail.len()), (CAP / 4 * 3, CAP / 4), "three quarters head, one quarter tail");
+    }
+
+    /// Output that fits the cap comes back byte for byte, with no note; one
+    /// byte over is cut and says so.
+    #[test]
+    fn output_within_the_cap_is_untouched_and_one_byte_over_is_marked() {
+        let mut fits = CappedStream::new(16);
+        fits.push(b"0123456789abcdef");
+        assert_eq!(fits.to_bytes("stdout"), b"0123456789abcdef");
+        let mut over = CappedStream::new(16);
+        over.push(b"0123456789abcdefg");
+        let text = String::from_utf8(over.to_bytes("stdout")).unwrap();
+        assert!(text.starts_with("0123456789ab\n[") && text.ends_with("]\ndefg"), "{text}");
+        assert!(text.contains("cut 1 bytes from the middle of stdout") && text.contains("16-byte cap"), "{text}");
     }
 
     #[test]

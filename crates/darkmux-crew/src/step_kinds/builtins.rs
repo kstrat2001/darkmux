@@ -2947,7 +2947,11 @@ impl StepKind for DispatchMapStepKind {
 /// `DARKMUX_STEP_INPUT_<SANITIZED-DEP-ID>` (non-alphanumeric bytes in
 /// the dependency id become `_`) so a shell step can consume prior
 /// output without darkmux having to parse the command's own
-/// substitution syntax. `DARKMUX_BIN` is exported too — the absolute path
+/// substitution syntax. An output the environment cannot carry (over
+/// 64 KiB, or past 256 KiB for all of a step's inputs together) is written
+/// whole to `$DARKMUX_STEP_INPUTS_DIR/<SANITIZED-DEP-ID>` instead, and its
+/// variable holds a note naming that file; see [`export_step_inputs`].
+/// `DARKMUX_BIN` is exported too — the absolute path
 /// of the darkmux running the mission, for a command that has to call
 /// darkmux back. A non-zero exit is a loud `Err` carrying stdout
 /// + stderr, never a silently-`Ok` failed command.
@@ -3152,10 +3156,9 @@ impl StepKind for ProceduralShellStepKind {
                 other => cmd.env(name, other.to_string()),
             };
         }
-        for (dep_id, output) in input {
-            let env_key = sanitize_env_key(dep_id);
-            cmd.env(format!("DARKMUX_STEP_INPUT_{env_key}"), output);
-        }
+        // Held until the command has finished: it owns the files an input
+        // too large for the environment was written to.
+        let _inputs_dir = export_step_inputs(step, &mut cmd, input)?;
         // (#2310 P4e) `DARKMUX_BIN` — THIS darkmux, by absolute path, so a
         // step command that has to ask darkmux something (`review`'s
         // wait step polls `mod list --for`) calls the binary running the
@@ -3242,6 +3245,81 @@ impl StepKind for ProceduralShellStepKind {
             }
         }
     }
+}
+
+/// The most bytes of one dependency's output a `procedural.shell` command
+/// gets in its `DARKMUX_STEP_INPUT_*` variable, under Linux's 128 KiB limit
+/// on any one variable.
+const STEP_INPUT_ENV_MAX_BYTES: usize = 64 * 1024;
+
+/// The most bytes all of one command's `DARKMUX_STEP_INPUT_*` values take
+/// together, well under macOS's 1 MiB limit on a new process's arguments
+/// and environment combined, which the inherited environment and the
+/// command's own text also spend.
+const STEP_INPUT_ENV_TOTAL_BYTES: usize = 256 * 1024;
+
+/// The dependencies whose output goes to a file instead of the environment:
+/// any over `per` bytes, and, in dependency order, any that would take the
+/// values kept in the environment past `total` bytes.
+fn inputs_for_files(input: &BTreeMap<String, String>, per: usize, total: usize) -> std::collections::BTreeSet<&str> {
+    let mut used = 0;
+    let mut files = std::collections::BTreeSet::new();
+    for (dep_id, output) in input {
+        if output.len() > per || used + output.len() > total {
+            files.insert(dep_id.as_str());
+        } else {
+            used += output.len();
+        }
+    }
+    files
+}
+
+/// Export each dependency's output to `cmd` as `DARKMUX_STEP_INPUT_<KEY>`.
+/// One the environment cannot carry ([`inputs_for_files`]) is written whole
+/// to `$DARKMUX_STEP_INPUTS_DIR/<KEY>` instead, and its variable holds a
+/// note naming that file, so a spawn never fails on the size of an input.
+/// The returned directory owns those files and must outlive the command.
+fn export_step_inputs(
+    step: &Step,
+    cmd: &mut std::process::Command,
+    input: &BTreeMap<String, String>,
+) -> Result<Option<tempfile::TempDir>> {
+    let to_files = inputs_for_files(input, STEP_INPUT_ENV_MAX_BYTES, STEP_INPUT_ENV_TOTAL_BYTES);
+    let dir = match to_files.is_empty() {
+        true => None,
+        false => Some(
+            tempfile::Builder::new()
+                .prefix("darkmux-step-inputs-")
+                .tempdir()
+                .with_context(|| format!("step `{}`: creating a directory for inputs too large for the environment", step.id))?,
+        ),
+    };
+    for (dep_id, output) in input {
+        let name = format!("DARKMUX_STEP_INPUT_{}", sanitize_env_key(dep_id));
+        match &dir {
+            Some(dir) if to_files.contains(dep_id.as_str()) => cmd.env(name, write_step_input(step, dir.path(), dep_id, output)?),
+            _ => cmd.env(name, output),
+        };
+    }
+    if let Some(dir) = &dir {
+        cmd.env("DARKMUX_STEP_INPUTS_DIR", dir.path());
+    }
+    Ok(dir)
+}
+
+/// Write one dependency's output to `<dir>/<KEY>`; the note its variable
+/// holds in place of the value.
+fn write_step_input(step: &Step, dir: &std::path::Path, dep_id: &str, output: &str) -> Result<String> {
+    let path = dir.join(sanitize_env_key(dep_id));
+    std::fs::write(&path, output)
+        .with_context(|| format!("step `{}`: writing the output of `{dep_id}` to {}", step.id, path.display()))?;
+    Ok(format!(
+        "[darkmux: the output of `{dep_id}` is {} bytes, more than a step command's environment carries \
+         ({STEP_INPUT_ENV_MAX_BYTES} bytes for one input, {STEP_INPUT_ENV_TOTAL_BYTES} for all of them); \
+         it is in the file {}]",
+        output.len(),
+        path.display()
+    ))
 }
 
 fn sanitize_env_key(id: &str) -> String {
@@ -4526,6 +4604,77 @@ mod tests {
         );
         let out = ProceduralShellStepKind.run(&s, &empty_task(), &input, &crate::step_kinds::StepRunCtx::for_test()).unwrap();
         assert!(out.output.contains("value-from-upstream"), "got: {}", out.output);
+    }
+
+    /// A dependency's output larger than the environment can carry (2 MiB,
+    /// past macOS's 1 MiB argument-plus-environment limit and Linux's
+    /// 128 KiB per variable) reaches the command in a file, and the step's
+    /// spawn does not fail. Its variable holds a note naming the file.
+    #[test]
+    // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
+    #[serial_test::serial]
+    fn procedural_shell_hands_an_input_too_large_for_the_environment_over_in_a_file() {
+        let big = format!("first-line\n{}\nlast-line", "z".repeat(2 * 1024 * 1024));
+        let input = BTreeMap::from([("upstream-step".to_string(), big.clone())]);
+        let command = r#"f="$DARKMUX_STEP_INPUTS_DIR/UPSTREAM_STEP"; printf 'bytes=%s\n' "$(wc -c < "$f" | tr -d ' ')"; tail -n 1 "$f"; echo; printf '%s' "$DARKMUX_STEP_INPUT_UPSTREAM_STEP""#;
+        let s = step("s1", "procedural.shell", json!({"command": command}));
+        let out = ProceduralShellStepKind
+            .run(&s, &empty_task(), &input, &crate::step_kinds::StepRunCtx::for_test())
+            .expect("a large input must not fail the step's spawn");
+        assert!(out.output.contains(&format!("bytes={}", big.len())), "the file holds the whole input: {}", out.output);
+        assert!(out.output.contains("last-line"), "{}", out.output);
+        assert!(out.output.contains("is in the file") && out.output.contains("UPSTREAM_STEP"), "the variable names the file: {}", out.output);
+    }
+
+    /// A shell step whose command writes past the output cap (2 MB against
+    /// 1 MiB) records the head and tail of it as the step's output, with the
+    /// note naming the cut and the cap, instead of holding all of it.
+    #[test]
+    // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
+    #[serial_test::serial]
+    fn procedural_shell_output_past_the_cap_is_recorded_with_a_cut_note() {
+        let command = r#"printf 'start\n'; head -c 2000000 /dev/zero | tr '\0' x; printf '\nverdict: ok'"#;
+        let s = step("s1", "procedural.shell", json!({"command": command}));
+        let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
+        let cap = crate::bounded_command::OUTPUT_CAP_BYTES;
+        assert!(out.output.len() <= cap + 512, "kept {} bytes", out.output.len());
+        assert!(out.output.starts_with("start\n") && out.output.ends_with("verdict: ok"), "head and tail survive");
+        assert!(out.output.contains(&format!("cut {} bytes from the middle of stdout", "start\n".len() + 2_000_000 + "\nverdict: ok".len() - cap)), "no cut note");
+    }
+
+    /// An input over the per-input limit goes to a file; so does, in
+    /// dependency order, one that would take the environment's values past
+    /// the total; an input at either limit exactly stays in the environment.
+    #[test]
+    fn inputs_too_large_for_the_environment_are_picked_for_files() {
+        let input = BTreeMap::from([
+            ("a".to_string(), "x".repeat(4)),
+            ("b".to_string(), "x".repeat(5)),
+            ("c".to_string(), "x".repeat(4)),
+            ("d".to_string(), "x".repeat(2)),
+            ("e".to_string(), "x".to_string()),
+        ]);
+        let files: Vec<_> = inputs_for_files(&input, 4, 7).into_iter().collect();
+        assert_eq!(files, ["b", "c"], "b is over 4; c would make 8 of 7; d makes 6, e makes 7 exactly");
+        assert!(inputs_for_files(&input, 5, 16).is_empty(), "everything fits: 16 of 16");
+        let per_only: Vec<_> = inputs_for_files(&input, 4, 100).into_iter().collect();
+        assert_eq!(per_only, ["b"], "the per-input limit applies with room left in the total");
+    }
+
+    /// Many inputs that each fit, but not all together (twenty of 60 KiB,
+    /// past macOS's 1 MiB limit), do not fail the step's spawn either: the
+    /// ones past the total reach the command in files.
+    #[test]
+    // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
+    #[serial_test::serial]
+    fn procedural_shell_moves_inputs_past_the_environments_total_to_files() {
+        let input: BTreeMap<String, String> = (0..20).map(|i| (format!("dep-{i:02}"), "y".repeat(60 * 1024))).collect();
+        let command = r#"printf '%s ' "${#DARKMUX_STEP_INPUT_DEP_00}"; ls "$DARKMUX_STEP_INPUTS_DIR" | wc -l | tr -d ' '"#;
+        let s = step("s1", "procedural.shell", json!({"command": command}));
+        let out = ProceduralShellStepKind
+            .run(&s, &empty_task(), &input, &crate::step_kinds::StepRunCtx::for_test())
+            .expect("many inputs must not fail the step's spawn");
+        assert_eq!(out.output.trim(), format!("{} 16", 60 * 1024), "the first four stay in the environment, sixteen go to files");
     }
 
     /// (#2310 P4e) A step command that has to call darkmux back gets the
