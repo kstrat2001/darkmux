@@ -57,7 +57,7 @@
     },
     {
       "name": "rules",
-      "description": "Comma-separated rule ids to review with, the same rule-selection mechanism every rule-planning document uses — a `plan-<rule>` task whose rule is not named is pruned at mint with reason `not_selected`. Absent means every enabled plan task this document declares.",
+      "description": "Comma-separated rule ids to review with, the same rule-selection mechanism every rule-planning document uses — a `plan-<rule>` task whose rule is not named is pruned at mint with reason `not_selected`. Absent means every enabled plan task this document declares. A name no plan task declares is refused before anything mints, naming the closest declared rule.",
       "required": false
     },
     {
