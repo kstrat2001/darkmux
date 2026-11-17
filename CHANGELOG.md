@@ -188,11 +188,15 @@ darkmux release.
   confirm, and its failure lines), `dispatch`'s human output (the model's reply), the QA review and
   `mission debrief` lines, `doctor`'s rows, `lab run`, `lab characterize`, `lab tune` and `lab submit`,
   and the `Error:` line any failing command ends with (an interrupted run's too) all
-  print an escape sequence, a C1 control or a bidirectional override as text (`\u{1b}`) instead of
-  passing it to the terminal, so none of them can set the window title, clear the screen, write the
-  clipboard or reorder text. Lines and tabs still read as written, and a column cell is held to its
-  display width. Emoji joined with ZWJ and the direction marks Hebrew and Arabic text needs are kept;
-  invisible tag characters are shown. `--json` output is unchanged. Found by the 2026-11-17 layer review.
+  print an escape sequence, a C1 control or a bidirectional override or isolate as text (`\u{1b}`)
+  instead of passing it to the terminal, so none of them can set the window title, clear the screen
+  or write the clipboard. Lines and tabs still read as written, and a column cell is held to its
+  display width. For readable prose, emoji joined with ZWJ and the direction marks Hebrew and Arabic
+  need are kept (a mark can still change how nearby text is laid out). What you approve or must
+  check exactly is shown strictly, every mark and joiner as text: the command `radio` asks you to
+  confirm, the editor's run and sign-off dialogs, a mission's sign-off prompt, and `init
+  --add-engine`'s question. Invisible tag characters and blank fillers are shown. `--json` output is
+  unchanged. Found by the 2026-11-17 layer review.
 - **A mission step waiting its turn reads waiting, not running (#3195).** Steps admitted together
   behind one slot (an endpoint with no `limits.concurrent_calls` runs its calls one at a time), or a
   local step waiting for its wave's model (a later wave, or its own wave's load), all read running from

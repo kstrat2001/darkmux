@@ -288,8 +288,9 @@ fn confirm_launch<R: std::io::BufRead, W: std::io::Write>(
     synthesized: &[&str],
 ) -> Consent {
     // The routing model chose the params, so an escape sequence in one could
-    // redraw the very line being confirmed: it is shown as text instead.
-    let shown_line = darkmux_types::user_files::escape_text(command_line);
+    // redraw the very line being confirmed, and a direction mark could show
+    // `500 / 5` for a stored `5 / 500`: the strict escape shows both as text.
+    let shown_line = darkmux_types::user_files::escape_text_strict(command_line);
     let _ = writeln!(writer, "radio: chose this command from your text:\n\n    {shown_line}\n");
     if !interactive {
         let _ = writeln!(
@@ -944,5 +945,20 @@ mod tests {
         assert!(inert(&failed), "{failed:?}");
         assert_eq!(unreachable_text("no model loaded"), "radio: could not reach a model.\nno model loaded");
         assert_eq!(command_failed_line(&anyhow::anyhow!("café")), "radio: command failed: café");
+    }
+
+    /// The command the operator approves shows every direction mark as
+    /// text: `budget=<RLM>5 / 500<RLM>` would otherwise display as
+    /// `budget=500 / 5`, and `ids=<ALM>17, 42<ALM>` as `ids=42 ,17`, while
+    /// argv runs the stored order.
+    #[test]
+    fn the_confirmed_command_shows_direction_marks_and_joiners_as_text() {
+        let line = launch_command_line("review", &["budget=\u{200f}5 / 500\u{200f}".into(), "ids=\u{61c}17, 42\u{61c}".into(), "a\u{200d}b".into()]);
+        let mut out = Vec::new();
+        confirm_launch(std::io::BufReader::new(NoRead), &mut out, false, &line, &[]);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("'budget=\\u{200f}5 / 500\\u{200f}'"), "{out}");
+        assert!(out.contains("'ids=\\u{61c}17, 42\\u{61c}'"), "{out}");
+        assert!(out.contains("'a\\u{200d}b'"), "{out}");
     }
 }

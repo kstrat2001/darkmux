@@ -1883,6 +1883,14 @@ async fn announce_and_confirm_route(
 
 /// `text` in a fenced code block, so backticks, `*` and newlines in it render
 /// literally. The fence is longer than any backtick run inside.
+/// The body of the dialog that asks to run `command_line`. The routing model
+/// chose its params, so it goes through the strict escape (`escape_text_strict`):
+/// a direction mark or joiner in a param is shown as text, so the command
+/// the operator allows reads in the order it will run.
+fn permission_command_text(command_line: &str) -> String {
+    fenced(&darkmux_types::user_files::escape_text_strict(command_line))
+}
+
 fn fenced(text: &str) -> String {
     let mut longest = 0;
     let mut run = 0;
@@ -1911,7 +1919,7 @@ async fn confirm_then_execute(
     let Some(prepared) = prepare_or_report(session_id, &plan, cwd, cx)? else { return Ok(()) };
     let command_line = crate::radio_cli::launch_command_line(&plan.config_id, &prepared.params);
     let title = format!("darkmux: run this command chosen from your text? `{}`", plan.config_id);
-    let answer = request_permission(cx, session_id, &plan.config_id, title, &fenced(&command_line)).await;
+    let answer = request_permission(cx, session_id, &plan.config_id, title, &permission_command_text(&command_line)).await;
     match answer.refusal_reason("radio launch", "confirmation") {
         None => run_prepared_launch(session_id, plan, prepared, cwd, cx, sessions).await,
         Some(reason) => {
@@ -2377,7 +2385,10 @@ fn render_gate_facts(facts: &BTreeMap<String, String>) -> String {
     if facts.is_empty() {
         return "(no upstream facts)".to_string();
     }
-    facts.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n")
+    // A fact is an upstream step's output, which a model wrote, and the
+    // operator signs off on it as read: strict, so every mark shows as text.
+    let strict = darkmux_types::user_files::escape_text_strict;
+    facts.iter().map(|(k, v)| format!("{}: {}", strict(k), strict(v))).collect::<Vec<_>>().join("\n")
 }
 
 /// (#2476 review round 2, MUST FIX 2) The pids of every currently-live
@@ -3558,6 +3569,19 @@ mod tests {
         assert_ne!(next["method"], "session/request_permission", "must not ask: {next}");
         assert!(!chunk_text(&next).is_empty());
         assert_end_turn(&recv_json(&mut f.reader).await);
+    }
+
+    /// The command a permission dialog asks the operator to allow, and the
+    /// facts a sign-off shows, carry every direction mark and joiner as
+    /// text, so the dialog cannot show `500 / 5` for a stored `5 / 500`.
+    #[test]
+    fn permission_dialogs_show_direction_marks_and_escapes_as_text() {
+        let body = permission_command_text("darkmux mission launch review --param 'budget=\u{200f}5 / 500\u{200f}'");
+        assert_eq!(body, "```\ndarkmux mission launch review --param 'budget=\\u{200f}5 / 500\\u{200f}'\n```");
+        let mut facts = BTreeMap::new();
+        facts.insert("ids".to_string(), "\u{61c}17, 42\u{61c}\x1b]0;x\x07".to_string());
+        assert_eq!(render_gate_facts(&facts), "ids: \\u{61c}17, 42\\u{61c}\\u{1b}]0;x\\u{7}");
+        assert_eq!(permission_command_text("darkmux mission launch review"), "```\ndarkmux mission launch review\n```");
     }
 
     #[test]

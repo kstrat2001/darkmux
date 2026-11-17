@@ -759,31 +759,53 @@ fn segment(key: &str) -> String {
 
 /// `text` with every control character and every invisible format
 /// character (bidi embeddings, overrides and isolates, zero-width spaces and
-/// word joiners, line and paragraph separators, tag characters) written as a
-/// `\u{..}` escape, so a terminal shows it instead of acting on it. The
-/// joiners (ZWJ, ZWNJ) and the direction marks (LRM, RLM, ALM) are kept:
-/// real text needs them (an emoji family, Persian, Hebrew or Arabic next to
-/// Latin), and a mark only sets the direction of the spot it sits in, so it
-/// can neither reorder the text around it nor hide any of it.
+/// word joiners, line and paragraph separators, tag characters, blank
+/// fillers) written as a `\u{..}` escape, so a terminal shows it instead of
+/// acting on it.
+///
+/// For readable prose, the joiners (ZWJ, ZWNJ) and the direction marks (LRM,
+/// RLM, ALM) are kept: real text needs them (an emoji family, Persian, Hebrew
+/// or Arabic next to Latin). A mark CAN change how the text around it is laid
+/// out (`5 / 500` between two RLMs displays as `500 / 5`) and a joiner is
+/// invisible, so text the operator must verify exactly (an approval prompt, a
+/// command about to run, an id to compare) uses [`escape_text_strict`].
 pub fn escape_text(text: &str) -> String {
+    escape_with(text, is_invisible_format)
+}
+
+/// [`escape_text`] for text the operator must verify character for
+/// character: the joiners and direction marks are escaped too, so what is
+/// shown is laid out in the order it is stored and holds nothing unseen.
+pub fn escape_text_strict(text: &str) -> String {
+    escape_with(text, |c| is_invisible_format(c) || is_joiner_or_mark(c))
+}
+
+fn escape_with(text: &str, invisible: impl Fn(char) -> bool) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() || is_invisible_format(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c if c.is_control() || invisible(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
             c => out.push(c),
         }
     }
     out
 }
 
+/// The joiners and direction marks [`escape_text`] keeps for prose and
+/// [`escape_text_strict`] escapes: ZWNJ, ZWJ, LRM, RLM and ALM.
+fn is_joiner_or_mark(c: char) -> bool {
+    matches!(c, '\u{200C}'..='\u{200F}' | '\u{061C}')
+}
+
 /// [`escape_text`] for text printed whole, a block a model, a peer or an
 /// endpoint wrote (a kit, a reply, an error body): its lines and tabs are
 /// kept, so it still reads as written, and every other control and
 /// invisible format character in it is escaped, so it cannot move the
-/// cursor, clear the screen, set the title or the clipboard, or reorder
-/// text. A `\r\n` line end is a line end; a lone `\r` is escaped, since it
+/// cursor, clear the screen, set the title or the clipboard, or override
+/// the text's direction (the prose marks [`escape_text`] keeps still apply).
+/// A `\r\n` line end is a line end; a lone `\r` is escaped, since it
 /// would let one line overwrite another.
 pub fn escape_text_keeping_lines(text: &str) -> String {
     let lines: Vec<String> = text
@@ -799,13 +821,19 @@ pub fn escape_text_keeping_lines(text: &str) -> String {
 fn is_invisible_format(c: char) -> bool {
     matches!(
         c as u32,
-        0xAD | 0x180E
+        0xAD | 0x115F
+            | 0x1160
+            | 0x180E
             | 0x200B
             | 0x2028..=0x202E
             | 0x2060..=0x2064
             | 0x2066..=0x206F
+            | 0x3164
             | 0xFEFF
+            | 0xFFA0
             | 0xFFF9..=0xFFFB
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
             | 0xE0000..=0xE007F
     )
 }

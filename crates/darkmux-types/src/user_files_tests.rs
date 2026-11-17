@@ -770,7 +770,7 @@ fn escape_text_keeping_lines_leaves_plain_text_and_unicode_unchanged() {
 
 /// Real text that needs a joiner or a direction mark reads as written: a
 /// ZWJ family, a ZWNJ in Persian, a flag, and Hebrew with a right-to-left
-/// mark. None of these can reorder or hide what is around them.
+/// mark. Prose needs them; exact-text surfaces use `escape_text_strict`.
 #[test]
 fn escape_text_keeps_joiners_direction_marks_and_flags() {
     for text in ["👩\u{200d}💻 👨\u{200d}👩\u{200d}👧", "می\u{200c}خواهم", "🇺🇸🇯🇵", "שלום\u{200f} world\u{200e}"] {
@@ -780,7 +780,8 @@ fn escape_text_keeps_joiners_direction_marks_and_flags() {
 }
 
 /// The bidi overrides and isolates, zero-width characters and invisible
-/// tag characters are escaped: each can reorder text or hide content.
+/// tag characters are escaped: each can override the text's direction or
+/// hide content.
 #[test]
 fn escape_text_escapes_overrides_isolates_zero_width_and_tags() {
     assert_eq!(escape_text("a\u{202e}b\u{2066}c\u{2069}d\u{200b}e\u{2060}f"), "a\\u{202e}b\\u{2066}c\\u{2069}d\\u{200b}e\\u{2060}f");
@@ -792,4 +793,31 @@ fn escape_text_escapes_overrides_isolates_zero_width_and_tags() {
 #[test]
 fn escape_text_keeping_lines_escapes_a_lone_carriage_return() {
     assert_eq!(escape_text_keeping_lines("safe\rFORGED\r\nnext"), "safe\\u{d}FORGED\nnext");
+}
+
+/// Text the operator must verify exactly (an approval prompt, a command
+/// about to run) keeps no mark: the RLM and ALM probes that would show
+/// `budget=500 / 5` and `ids=42 ,17` show every mark as text, and so do the
+/// joiners, which are invisible.
+#[test]
+fn escape_text_strict_shows_every_mark_and_joiner() {
+    assert_eq!(escape_text_strict("budget=\u{200f}5 / 500\u{200f}"), "budget=\\u{200f}5 / 500\\u{200f}");
+    assert_eq!(escape_text_strict("ids=\u{61c}17, 42\u{61c}"), "ids=\\u{61c}17, 42\\u{61c}");
+    assert_eq!(escape_text_strict("a\u{200d}b\u{200c}c\u{200e}d"), "a\\u{200d}b\\u{200c}c\\u{200e}d");
+    assert_eq!(escape_text_strict("x\x1b[2J\u{202e}y\n"), "x\\u{1b}[2J\\u{202e}y\\n");
+    assert_eq!(escape_text_strict("darkmux mission launch review --param pr=42 café"), "darkmux mission launch review --param pr=42 café");
+}
+
+/// Invisible format characters and blank-looking fillers are escaped in
+/// both variants: shorthand format controls, musical symbol format
+/// controls, and the Hangul fillers.
+#[test]
+fn escape_text_escapes_shorthand_musical_and_hangul_fillers() {
+    for c in ['\u{1bca0}', '\u{1bca3}', '\u{1d173}', '\u{1d17a}', '\u{115f}', '\u{1160}', '\u{3164}', '\u{ffa0}'] {
+        let text = format!("a{c}b");
+        let want = format!("a\\u{{{:x}}}b", c as u32);
+        assert_eq!(escape_text(&text), want);
+        assert_eq!(escape_text_keeping_lines(&text), want);
+        assert_eq!(escape_text_strict(&text), want);
+    }
 }
