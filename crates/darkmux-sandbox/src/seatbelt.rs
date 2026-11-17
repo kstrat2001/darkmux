@@ -17,9 +17,12 @@
 //!   `limits.pids` is the kernel's `RLIMIT_NPROC`, which macOS counts per
 //!   USER, not per sandbox: a fork in the sandbox fails once the user's
 //!   processes number what they did at launch plus `pids`. So the sandbox
-//!   may start about `pids` processes (threads are not counted), and the
-//!   user's other processes starting or ending while it runs take or give
-//!   back room. The limit is set on the sandboxed program alone, so nothing
+//!   may start about `pids` processes (threads are not counted). The room is
+//!   SHARED with every other process of the user's: another sandbox, a
+//!   parallel build or an app that starts while it runs takes from it (one
+//!   that ends gives back), and a fork that finds no room fails with a bare
+//!   `EAGAIN` ("Resource temporarily unavailable") that says nothing of
+//!   why. The limit is set on the sandboxed program alone, so nothing
 //!   else of the user's is held by it, and a fork bomb stops at `pids` more
 //!   rather than at the system's per-user cap, where nothing of the user's
 //!   could start. `limits.memory` is a watch, not a boundary ([`WATCH`]):
@@ -27,8 +30,9 @@
 //!   (`RLIMIT_AS` and `RLIMIT_DATA` are refused below the address space
 //!   every process already maps, and `RLIMIT_RSS` is not enforced), so the
 //!   resident memory of the sandbox's session is summed every second and
-//!   the sandbox is stopped (exit 137, its reason on stderr) once the sum is
-//!   over the limit. It can be over for up to a second; a process that
+//!   the sandbox is stopped (exit 137) once the sum is over the limit, its
+//!   reason the last line of its stderr (what a dispatch error's stderr
+//!   tail shows), naming the limit, what it used and `sandbox.memory`. It can be over for up to a second; a process that
 //!   started a session of its own is neither counted nor stopped. Docker
 //!   holds both inside the container's cgroup: tasks (threads included) and
 //!   the memory the kernel charges it, page cache included.
@@ -148,11 +152,11 @@ mkdir -m 700 "$d/tmp" && printf '%s' "$2" > "$d/profile.sb" && printf '%s' "$3" 
 /// runtime's tool command does) ends too. Only one that started a session of
 /// its own (`setsid`) is not reached: unlike a container's, this sandbox
 /// does not end everything in it.
-const LAUNCH: &str = r#"wd=$1; pids=$2; mem=$3; shift 3
+const LAUNCH: &str = r#"wd=$1; pids=$2; mem=$3; memtext=$4; shift 4
 echo $$ > "$d/pid" && ps -o lstart= -p $$ > "$d/started" || exit 125
 {GUARD} "$$" </dev/null >/dev/null 2>&1 &
 guard=$!
-if [ -n "$mem" ]; then {WATCH} "$$" "$mem" "$guard" "$d/limit" </dev/null >/dev/null 2>&1 & fi
+if [ -n "$mem" ]; then {WATCH} "$$" "$mem" "$guard" "$d/limit" "$memtext" </dev/null >/dev/null 2>&1 & fi
 trap : TERM INT HUP
 [ -z "$wd" ] || cd "$wd" || { rm -rf "$d"; exit 125; }
 [ -n "$1" ] || { echo "seatbelt: no program to run (a policy needs an entrypoint)" >&2; rm -rf "$d"; exit 125; }
@@ -163,16 +167,17 @@ if [ -n "$pids" ]; then
   nproc=$((n + pids)); h=$(ulimit -Hu)
   [ "$h" = unlimited ] || [ "$nproc" -le "$h" ] || nproc=$h
 fi
-( [ -z "$nproc" ] || ulimit -u "$nproc" || { echo "seatbelt: could not limit the sandbox to $nproc processes" >&2; exit 125; }
-  exec /usr/bin/sandbox-exec -f "$d/profile.sb" "$@" )
+{ ( exec 2>&3 3>&-
+  [ -z "$nproc" ] || ulimit -u "$nproc" || { echo "seatbelt: could not limit the sandbox to $nproc processes" >&2; exit 125; }
+  exec /usr/bin/sandbox-exec -f "$d/profile.sb" "$@" ); } 3>&2 2>/dev/null
 rc=$?
 [ ! -f "$d/limit" ] || cat "$d/limit" >&2
 g=$$
 "#;
 
 /// (#3112) The memory ceiling's watch, beside the guard ([`LAUNCH`]): its
-/// arguments the launcher's pid, the limit in bytes, the guard's pid and the
-/// file it writes its reason to. Every second, while the launcher is
+/// arguments the launcher's pid, the limit in bytes, the guard's pid, the
+/// file it writes its reason to and the limit as a person reads it. Every second, while the launcher is
 /// its parent, it sums the resident memory of every live process in the
 /// launcher's session (the sandbox, the launcher, the guard and itself; a
 /// process that started a session of its own is not counted, nor reached),
@@ -189,10 +194,11 @@ g=$$
 /// seconds over 10 s with 1,000 running), about 2.5% of one core per
 /// running sandbox. No single quote: it runs inside one.
 const WATCH: &str = concat!(
-    r#"/usr/bin/perl -e 'my ($l, $cap, $g, $f) = @ARGV; my %keep = ($$ => 1, $l => 1, $g => 1); "#,
+    r#"/usr/bin/perl -e 'my ($l, $cap, $g, $f, $limit) = @ARGV; my %keep = ($$ => 1, $l => 1, $g => 1); "#,
+    r#"sub human { my $b = shift; my $t = $b >= 2 ** 30 ? sprintf("%.1f GiB", $b / 2 ** 30) : sprintf("%.1f MiB", $b / 2 ** 20); $t =~ s/\.0 / /; $t } "#,
     r#"sub mine { map { $_->[0] } grep { $_->[0] > 1 && $_->[2] !~ /^Z/ && syscall(310, $_->[0] + 0) == $l } map { [split] } `/bin/ps -A -o pid=,rss=,stat=` } "#,
     r#"sub held { my $sum = 0; for (`/bin/ps -A -o pid=,rss=,stat=`) { my ($p, $r, $s) = split; $sum += $r * 1024 if $p > 1 && $s !~ /^Z/ && syscall(310, $p + 0) == $l; } $sum } "#,
-    r#"while (getppid() == $l) { my $sum = held(); if ($sum > $cap) { open(F, ">", $f); print F "seatbelt: stopped: the sandbox held $sum bytes resident, over its memory limit of $cap bytes\n"; close(F); "#,
+    r#"while (getppid() == $l) { my $sum = held(); if ($sum > $cap) { open(F, ">", $f); printf F "seatbelt: the job was stopped: its processes used %s of memory, over the %s sandbox memory limit (sandbox.memory). To give it more: darkmux config set sandbox.memory <size>, e.g. 16g\n", human($sum), $limit; close(F); "#,
     r#"for (1 .. 200) { my @p = grep { !$keep{$_} } mine(); last unless @p; kill("KILL", @p); select(undef, undef, undef, 0.01); } exit 0; } select(undef, undef, undef, 1); }'"#
 );
 
@@ -539,42 +545,15 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// A size in Docker's syntax (`--memory`'s): a whole number, then
-/// optionally `b`, `k`, `m` or `g` (binary units, either case), then
-/// optionally `b`. `None` when it is not one.
-pub(crate) fn size_bytes(text: &str) -> Option<u64> {
-    let lower = text.to_ascii_lowercase();
-    let digits = lower.trim_end_matches(|c: char| c.is_ascii_alphabetic());
-    let shift = match &lower[digits.len()..] {
-        "" | "b" => 0,
-        "k" | "kb" => 10,
-        "m" | "mb" => 20,
-        "g" | "gb" => 30,
-        _ => return None,
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse::<u64>().ok()?.checked_mul(1 << shift)
-}
-
-/// The launcher's `$2` and `$3`: the processes the sandbox may add to its
-/// user's, and its memory limit in bytes, each empty for none. `Err` names a
-/// memory limit that is not a size.
-fn limit_args(limits: &Limits) -> Result<[String; 2], String> {
+/// The launcher's `$2` to `$4`: the processes the sandbox may add to its
+/// user's, and its memory limit in bytes and as a person reads it, each
+/// empty for none. `Err` names a memory limit that is not one
+/// ([`darkmux_types::size::sandbox_memory_bytes`]).
+fn limit_args(limits: &Limits) -> Result<[String; 3], String> {
     let pids = limits.pids.map(|n| n.to_string()).unwrap_or_default();
-    let memory = match &limits.memory {
-        None => String::new(),
-        Some(text) => size_bytes(text).ok_or_else(|| format!("seatbelt: memory limit {text:?} is not a size (a whole number, then b, k, m or g)"))?.to_string(),
-    };
-    Ok([pids, memory])
-}
-
-/// A command that fails (125), saying `message`.
-fn failing(message: &str) -> Command {
-    let mut cmd = Command::new(SH);
-    cmd.arg("-c").arg(r#"echo "$1" >&2; exit 125"#).arg("sh").arg(message);
-    cmd
+    let Some(text) = &limits.memory else { return Ok([pids, String::new(), String::new()]) };
+    let bytes = crate::memory_bytes(text)?;
+    Ok([pids, bytes.to_string(), darkmux_types::size::human_bytes(bytes)])
 }
 
 impl SandboxBackend for SeatbeltBackend {
@@ -603,7 +582,7 @@ impl SandboxBackend for SeatbeltBackend {
         let Some(dir) = dir_of(&policy.name) else { return (refused(&policy.name), handle) };
         let limits = match limit_args(&policy.limits) {
             Ok(limits) => limits,
-            Err(why) => return (failing(&why), handle),
+            Err(why) => return (crate::failing(&why), handle),
         };
         let _ = std::fs::create_dir_all(state_root());
         let mut args = vec![
@@ -626,7 +605,7 @@ impl SandboxBackend for SeatbeltBackend {
         let Some(dir) = dir_of(&policy.name) else { return (refused(&policy.name), handle) };
         let limits = match limit_args(&policy.limits) {
             Ok(limits) => limits,
-            Err(why) => return (failing(&why), handle),
+            Err(why) => return (crate::failing(&why), handle),
         };
         let _ = std::fs::create_dir_all(state_root());
         let env = Self::environment(policy, &dir);
@@ -862,12 +841,18 @@ mod tests {
         let root = tempfile::TempDir::new().unwrap();
         let prev = std::env::var_os(STATE_DIR_ENV);
         unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
+        // Only this test's own guards count: another test's sandbox may be
+        // ending at the same moment, its guard still draining it. A guard's
+        // last argument is its launcher's pid.
+        let mut launchers = std::collections::HashSet::new();
         for n in 0..20 {
             let mut p = policy(Vec::new(), Network::None);
             p.name = format!("darkmux-guard-test-{n}");
             p.workdir = Some("/nonexistent-darkmux-workdir".into());
             let (mut cmd, _) = SeatbeltBackend.run(&p);
-            let out = cmd.output().unwrap();
+            let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            launchers.insert(child.id().to_string());
+            let out = child.wait_with_output().unwrap();
             assert_eq!(out.status.code(), Some(125), "{}", String::from_utf8_lossy(&out.stderr));
         }
         unsafe {
@@ -879,7 +864,9 @@ mod tests {
         // And the guard alone, under a parent that is gone before it starts:
         // it must not mistake launchd (its new parent) for its launcher.
         for _ in 0..5 {
-            Command::new(SH).arg("-c").arg(format!("{GUARD} \"$$\" </dev/null >/dev/null 2>&1 & exit 0")).status().unwrap();
+            let child = Command::new(SH).arg("-c").arg(format!("{GUARD} \"$$\" </dev/null >/dev/null 2>&1 & exit 0")).spawn().unwrap();
+            launchers.insert(child.id().to_string());
+            child.wait_with_output().unwrap();
         }
         std::thread::sleep(Duration::from_millis(500));
         // A guard is a perl that moved itself to a group of its own; once its
@@ -888,6 +875,7 @@ mod tests {
         let pids: Vec<String> = String::from_utf8_lossy(&ps.stdout)
             .lines()
             .filter(|l| l.contains("/usr/bin/perl -e setpgrp(0, 0); my $l = "))
+            .filter(|l| l.split_whitespace().last().is_some_and(|pid| launchers.contains(pid)))
             .filter_map(|l| {
                 let mut f = l.split_whitespace();
                 let (pid, ppid) = (f.next()?, f.next()?);

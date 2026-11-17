@@ -6336,7 +6336,7 @@ S(("127.0.0.1", port), H).serve_forever()
             "must include --pids-limit 512"
         );
         assert!(
-            argv.contains(&format!("--memory={}", DOCKER_MEMORY)),
+            argv.contains(&format!("--memory={}", darkmux_types::config_access::SANDBOX_MEMORY_DEFAULT)),
             "must include --memory 4g"
         );
         assert!(
@@ -6548,6 +6548,36 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(env(&docker, "CARGO_HOME"), Some("/darkmux-cache/cargo".to_string()));
         assert_eq!(docker.entrypoint.as_deref(), Some("/darkmux-runtime"));
         assert_eq!(prompt(&docker).as_deref(), Some("/darkmux-out/.prompt.txt"));
+    }
+
+    /// (#3112) `sandbox.memory` reaches a dispatch under either backend:
+    /// the default `4g`, else what the operator set, which Docker passes as
+    /// `--memory` and Seatbelt hands its watch in bytes.
+    #[test]
+    #[serial]
+    fn the_sandbox_memory_setting_reaches_both_backends() {
+        use darkmux_sandbox::{DockerBackend, SandboxBackend, SeatbeltBackend};
+        let k = darkmux_types::config_access::SANDBOX_MEMORY_ENV;
+        let prev = std::env::var_os(k);
+        unsafe { std::env::remove_var(k) };
+        let cfg = argv_config_with_base_url(None);
+        let default = dispatch_policy_for(&cfg, &DockerBackend);
+        unsafe { std::env::set_var(k, "16g") };
+        let docker = dispatch_policy_for(&cfg, &DockerBackend);
+        let seatbelt = dispatch_policy_for(&cfg, &SeatbeltBackend);
+        let docker_argv: Vec<String> = DockerBackend.run(&docker).0.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let seatbelt_argv: Vec<String> = SeatbeltBackend.run(&seatbelt).0.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        assert_eq!(default.limits.memory.as_deref(), Some("4g"));
+        assert_eq!(docker.limits.memory.as_deref(), Some("16g"));
+        assert_eq!(seatbelt.limits.memory.as_deref(), Some("16g"));
+        assert!(docker_argv.contains(&"--memory=16g".to_string()), "{docker_argv:?}");
+        assert!(seatbelt_argv.contains(&(16u64 << 30).to_string()) && seatbelt_argv.contains(&"16 GiB".to_string()), "{seatbelt_argv:?}");
     }
 
     /// (#3561) A dispatch on the host runs with its managed Node: the
@@ -7335,7 +7365,7 @@ S(("127.0.0.1", port), H).serve_forever()
         assert!(argv.contains(&format!("--cap-drop={}", DOCKER_CAP_DROP)));
         assert!(argv.contains(&format!("--security-opt={}", DOCKER_SECURITY_OPT)));
         assert!(argv.contains(&format!("--pids-limit={}", DOCKER_PIDS_LIMIT)));
-        assert!(argv.contains(&format!("--memory={}", DOCKER_MEMORY)));
+        assert!(argv.contains(&format!("--memory={}", darkmux_types::config_access::SANDBOX_MEMORY_DEFAULT)));
         // (#2481) --init is unconditional — a minimal dispatch still needs
         // its orphaned grandchildren reaped.
         assert!(argv.contains(&"--init".to_string()));

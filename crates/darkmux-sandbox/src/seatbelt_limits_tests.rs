@@ -106,7 +106,13 @@ fn a_sandbox_over_its_memory_limit_is_stopped() {
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(!stdout.contains("survived"), "128 MiB held under a 64 MiB limit; stderr: {stderr}");
     assert!(!out.status.success(), "{out:?}");
-    assert!(stderr.contains("over its memory limit of 67108864 bytes"), "the reason is given: {stderr}");
+    // The reason is the last line, the one a dispatch error's stderr tail
+    // shows, and the shell's own "Killed: 9" notice is not printed.
+    let last = stderr.lines().last().unwrap_or_default();
+    assert!(last.starts_with("seatbelt: the job was stopped: its processes used "), "{stderr}");
+    assert!(last.contains("over the 64 MiB sandbox memory limit (sandbox.memory)"), "{stderr}");
+    assert!(last.contains("darkmux config set sandbox.memory <size>"), "{stderr}");
+    assert!(!stderr.contains("Killed"), "the shell's notice is suppressed: {stderr}");
     assert!(took < Duration::from_secs(3), "stopped in {took:?}, not when the program ended");
     let (ok, _) = held("512m");
     assert!(String::from_utf8_lossy(&ok.stdout).contains("survived"), "under its limit it runs: {ok:?}");
@@ -126,7 +132,7 @@ fn a_started_sandbox_is_held_to_its_memory_limit() {
     assert!(create.status().unwrap().success());
     let out = SeatbeltBackend.start(&handle).output().unwrap();
     assert!(!String::from_utf8_lossy(&out.stdout).contains("survived"), "{out:?}");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("over its memory limit"), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("over the 64 MiB sandbox memory limit"), "{out:?}");
 }
 
 /// A memory limit that is not a size is refused before anything runs.
@@ -139,17 +145,21 @@ fn a_memory_limit_that_is_not_a_size_is_refused() {
     let out = cmd.output().unwrap();
     assert_eq!(out.status.code(), Some(125), "{out:?}");
     assert!(out.stdout.is_empty(), "the program ran");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("\"four gigs\""), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("`four gigs` is not a size"), "{out:?}");
 }
 
-/// Docker's size syntax: a whole number, then `b`, `k`, `m` or `g` (binary
-/// units, either case, an optional trailing `b`).
+/// A memory limit Docker would read as no limit (`0`) is refused by both
+/// backends before anything runs, Docker's without calling `docker`.
 #[test]
-fn memory_sizes_read_as_docker_reads_them() {
-    for (text, bytes) in [("4g", 4u64 << 30), ("512m", 512 << 20), ("64M", 64 << 20), ("1024k", 1 << 20), ("100", 100), ("100b", 100), ("2gb", 2 << 30)] {
-        assert_eq!(size_bytes(text), Some(bytes), "{text}");
-    }
-    for bad in ["", "g", "4x", "-1g", "1.5g", "four gigs", "4 g"] {
-        assert_eq!(size_bytes(bad), None, "{bad}");
+#[serial_test::serial]
+fn a_zero_memory_limit_is_refused_by_both_backends() {
+    let _state = StateDir::new();
+    let limits = Limits { memory: Some("0".into()), pids: None };
+    let policy = perl("darkmux-limits-zero", limits, "print \"ran\\n\";");
+    for (name, (mut cmd, _)) in [("seatbelt", SeatbeltBackend.run(&policy)), ("docker", crate::DockerBackend.run(&policy)), ("docker create", crate::DockerBackend.create(&policy))] {
+        assert_ne!(cmd.get_program(), "docker", "{name} would run docker");
+        let out = cmd.output().unwrap();
+        assert_eq!(out.status.code(), Some(125), "{name}: {out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("`0` is below the 6m"), "{name}: {out:?}");
     }
 }

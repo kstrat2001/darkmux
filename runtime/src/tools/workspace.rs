@@ -325,9 +325,9 @@ fn read_capped(file: std::fs::File, size: u64, cap: u64, path: &Path) -> Result<
     Ok(FileStart { bytes, whole, size })
 }
 
-/// The whole of the regular file at `path` as text, refused unread
-/// ([`TooLarge`]) when it is over `cap` bytes.
-pub fn read_whole_regular(path: &Path, cap: u64) -> Result<String> {
+/// The whole of the regular file at `path`, refused unread ([`TooLarge`])
+/// when it is over `cap` bytes.
+pub fn read_whole_regular_bytes(path: &Path, cap: u64) -> Result<Vec<u8>> {
     let (file, size) = open_regular(path)?;
     if size > cap {
         return Err(TooLarge { path: path.to_path_buf(), size, cap }.into());
@@ -336,7 +336,12 @@ pub fn read_whole_regular(path: &Path, cap: u64) -> Result<String> {
     if !start.whole {
         return Err(TooLarge { path: path.to_path_buf(), size: start.size, cap }.into());
     }
-    String::from_utf8(start.bytes).with_context(|| format!("reading {path:?}: not UTF-8 text"))
+    Ok(start.bytes)
+}
+
+/// [`read_whole_regular_bytes`] as text.
+pub fn read_whole_regular(path: &Path, cap: u64) -> Result<String> {
+    String::from_utf8(read_whole_regular_bytes(path, cap)?).with_context(|| format!("reading {path:?}: not UTF-8 text"))
 }
 
 /// Open and write to a regular file, never through a symlink at the final
@@ -694,6 +699,24 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&outside).unwrap(), "original");
         let _ = fs::remove_file(&outside);
+    }
+
+    /// A file of exactly the cap is whole; one byte more is not, and is
+    /// cut to the cap. The whole-file reader takes the first and refuses
+    /// the second.
+    #[test]
+    fn a_file_of_exactly_the_cap_is_whole_and_one_byte_more_is_not() {
+        let ws = fresh_workspace();
+        let (at, over) = (ws.path().join("at"), ws.path().join("over"));
+        fs::write(&at, vec![b'a'; 64]).unwrap();
+        fs::write(&over, vec![b'a'; 65]).unwrap();
+        let exact = read_regular(&at, 64).unwrap();
+        assert!(exact.whole && exact.bytes.len() == 64 && exact.size == 64);
+        let more = read_regular(&over, 64).unwrap();
+        assert!(!more.whole && more.bytes.len() == 64 && more.size == 65);
+        assert_eq!(read_whole_regular_bytes(&at, 64).unwrap().len(), 64);
+        let err = read_whole_regular_bytes(&over, 64).unwrap_err();
+        assert!(err.downcast_ref::<TooLarge>().is_some(), "{err:#}");
     }
 
     /// A named pipe that has a reader opens for writing at once: the check

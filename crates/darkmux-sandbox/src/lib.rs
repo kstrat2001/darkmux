@@ -112,6 +112,23 @@ pub struct SandboxPolicy {
     pub command: Vec<String>,
 }
 
+/// (#3112) `text` as a sandbox memory limit in bytes, or the refusal
+/// naming it: the grammar `sandbox.memory`'s preflight reads
+/// ([`darkmux_types::size::sandbox_memory_bytes`]), so a value one backend
+/// takes, every backend takes, and none reads `0` as no limit.
+pub fn memory_bytes(text: &str) -> Result<u64, String> {
+    darkmux_types::size::sandbox_memory_bytes(text)
+        .map_err(|why| format!("sandbox: memory limit refused: {why}; the form is {}", darkmux_types::size::SANDBOX_MEMORY_FORM))
+}
+
+/// A command that fails (125, Docker's "could not make it"), saying
+/// `message`: what a backend hands back for a policy it refuses.
+pub(crate) fn failing(message: &str) -> Command {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(r#"echo "$1" >&2; exit 125"#).arg("sh").arg(message);
+    cmd
+}
+
 /// Which backend a handle belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

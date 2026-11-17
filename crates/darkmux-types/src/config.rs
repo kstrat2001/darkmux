@@ -472,7 +472,12 @@ use std::path::Path;
 //           published on this machine's tailnet over HTTPS by `tailscale
 //           serve`, and removed on shutdown. An older binary refuses a
 //           config carrying it.
-pub const CONFIG_SCHEMA_VERSION: &str = "2.10";
+//   2.11 (#3112): additive `sandbox.memory` (`DARKMUX_SANDBOX_MEMORY`; a
+//           size in Docker's syntax, at least `6m`, default `4g`), the memory
+//           every sandbox may hold before it is stopped, under Docker and
+//           Seatbelt alike. Written by `init`. An older binary refuses a
+//           config carrying it.
+pub const CONFIG_SCHEMA_VERSION: &str = "2.11";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
 /// that this one does not. The unknown-key gate (`user_files`) names it with
@@ -861,6 +866,9 @@ pub struct DarkmuxConfig {
     pub audit: Option<AuditConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeBehaviorConfig>,
+    /// (#3112, 2.11) What every sandbox may use: see [`SandboxConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet: Option<FleetConfig>,
     /// (#2706) The battery-charge policy gate — see [`PowerConfig`]'s own
@@ -1462,6 +1470,22 @@ pub struct DetectionConfig {
     /// `observe` the check-in still fires on exactly the same cadence and the
     /// tail ratio is still computed and recorded; what stops is the cut.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub degeneracy: Option<DetectorConfig>,
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schemars(skip)]
+    pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#3112, 2.11) What every sandbox darkmux starts (a dispatch, a contained
+/// command such as a lab run's tests or the mods gate, a client preview) may
+/// use, whichever backend runs it. Visible: `init` writes the default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SandboxConfig {
+    /// The memory a sandbox may hold before it is stopped, in Docker's size
+    /// syntax (`crate::size::SANDBOX_MEMORY_FORM`). Default `4g`
+    /// (`DARKMUX_SANDBOX_MEMORY`). Docker holds it in the container's cgroup;
+    /// Seatbelt watches the sandbox's resident memory once a second. A value
+    /// that is not a size of at least 6m refuses every entry point.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub memory: Option<String>,
     #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
     #[schemars(skip)]
     pub extras: serde_json::Map<String, serde_json::Value>,
@@ -2559,6 +2583,11 @@ impl DarkmuxConfig {
                 // discoverable and one edit from a tighter/looser window.
                 liveness_retention_hours: Some(168),
                 verbose: Some(false),
+                extras: Default::default(),
+            }),
+            // (#3112) Visible `4g`, the default, one edit from more.
+            sandbox: Some(SandboxConfig {
+                memory: Some(crate::config_access::SANDBOX_MEMORY_DEFAULT.to_string()),
                 extras: Default::default(),
             }),
             fleet: Some(FleetConfig {
