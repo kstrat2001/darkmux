@@ -405,7 +405,7 @@ pub(crate) fn answer_from_button(label: &str) -> AllowAnswer {
 /// read waits for that process too (as it did before the output was
 /// drained), and a command killed at the bound leaves its readers to end
 /// when that process does.
-pub(crate) fn output_within(mut cmd: std::process::Command, deadline: std::time::Duration) -> Option<std::process::Output> {
+pub fn output_within(mut cmd: std::process::Command, deadline: std::time::Duration) -> Option<std::process::Output> {
     use std::process::Stdio;
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().ok()?;
     let stdout = drain(child.stdout.take());

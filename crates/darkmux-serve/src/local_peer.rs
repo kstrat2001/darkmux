@@ -274,24 +274,36 @@ async fn judge_peer(mut req: Request, next: Next) -> Response {
 /// `conn`'s verdict from this machine's socket and process tables; the
 /// operator's is held for as long as the connection lasts.
 async fn verdict_of(conn: &PeerConn) -> PeerProcess {
-    let kind = match conn.local {
-        None => PeerProcess::Unknown("the connection's own address could not be read"),
-        Some(local) => match ROUNDS.holders_of(local, conn.remote, conn.accepted).await {
-            None => PeerProcess::Unknown("this machine's connections could not be read"),
-            Some(holders) => judged_now(holders).await,
-        },
-    };
+    let kind = tokio::time::timeout(JUDGE_BOUND, looked_up(conn))
+        .await
+        .unwrap_or(PeerProcess::Unknown("the lookup did not finish in time"));
     if kind == PeerProcess::Operator {
         hold(conn.remote);
     }
     kind
 }
 
-/// [`judge`] of `holders` against this host's tables, off the async workers.
-async fn judged_now(holders: Vec<u32>) -> PeerProcess {
+/// `conn`'s verdict from its round ([`Rounds::look`]) and this host's
+/// process table.
+async fn looked_up(conn: &PeerConn) -> PeerProcess {
+    let Some(local) = conn.local else {
+        return PeerProcess::Unknown("the connection's own address could not be read");
+    };
+    match ROUNDS.look(local, conn.remote, conn.accepted).await {
+        None => PeerProcess::Unknown("this machine's connections could not be read"),
+        Some(looked) => judged_now(looked).await,
+    }
+}
+
+/// [`judge`] of what a round found, against this host's process table, off
+/// the async workers.
+async fn judged_now(looked: Looked) -> PeerProcess {
     tokio::task::spawn_blocking(move || {
-        let launchers = darkmux_sandbox::host_sandbox_launchers();
-        judge(darkmux_platform::current(), &holders, launchers.as_deref())
+        judge(
+            darkmux_platform::current(),
+            &looked.holders,
+            looked.launchers.as_deref(),
+        )
     })
     .await
     .unwrap_or(PeerProcess::Unknown("the lookup did not finish"))
@@ -302,16 +314,31 @@ async fn judged_now(holders: Vec<u32>) -> PeerProcess {
 pub(crate) type PeersReader =
     Arc<dyn Fn(SocketAddr) -> Option<Vec<(SocketAddr, u32)>> + Send + Sync>;
 
-/// How long a connection waits for its round: as long as one socket-table
-/// read may take (the platform bounds `lsof` and `netstat` at 5 s). One
-/// that has not answered by then is no answer, so its caller is remote.
+/// What reads the launchers of this host's sandboxes
+/// ([`darkmux_sandbox::host_sandbox_launchers`]); `None`: no answer.
+pub(crate) type LaunchersReader = Arc<dyn Fn() -> Option<Vec<u32>> + Send + Sync>;
+
+/// What a round tells one connection: who holds its other end, and the
+/// host's sandbox launchers (`None`: they could not be read).
+pub(crate) struct Looked {
+    pub(crate) holders: Vec<u32>,
+    pub(crate) launchers: Option<Vec<u32>>,
+}
+
+/// How long a connection waits for its verdict, its round included: as
+/// long as one socket-table read may take (the platform bounds `lsof` and
+/// `netstat` at 5 s, and each start a launcher check reads). One that has
+/// not answered by then is no answer, so its caller is remote.
 const JUDGE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// One read of the connections to a listener: when it began, and every
-/// `(peer, pid)` it found (`None`: the read gave no answer).
+/// One read of the connections to a listener: when it began, every
+/// `(peer, pid)` it found (`None`: the read gave no answer), and the host's
+/// sandbox launchers then (read once per round, so a burst of connections
+/// shares one look at them too).
 struct Round {
     started: Instant,
     peers: Option<Vec<(SocketAddr, u32)>>,
+    launchers: Option<Vec<u32>>,
 }
 
 /// One listener's rounds: the latest that finished (each waiter is told
@@ -326,6 +353,7 @@ struct ListenerRounds {
 /// the first round that began after it was accepted, at most `bound`.
 pub(crate) struct Rounds {
     read: PeersReader,
+    launchers: LaunchersReader,
     bound: std::time::Duration,
     listeners: Mutex<HashMap<SocketAddr, ListenerRounds>>,
 }
@@ -338,29 +366,38 @@ enum Step {
 }
 
 impl Rounds {
-    pub(crate) fn new(read: PeersReader, bound: std::time::Duration) -> Arc<Self> {
+    pub(crate) fn new(
+        read: PeersReader,
+        launchers: LaunchersReader,
+        bound: std::time::Duration,
+    ) -> Arc<Self> {
         Arc::new(Rounds {
             read,
+            launchers,
             bound,
             listeners: Mutex::new(HashMap::new()),
         })
     }
 
     /// Every process holding the other end of `remote`'s connection to the
-    /// listener at `local`, accepted at `accepted`, from the first round
-    /// that began after it was accepted (so the connection was in the table
-    /// it read). `None` when that round gives no answer or does not finish
-    /// within the bound.
-    pub(crate) async fn holders_of(
+    /// listener at `local`, accepted at `accepted`, and the host's sandbox
+    /// launchers, from the first round that began after it was accepted (so
+    /// the connection was in the table it read). `None` when that round
+    /// gives no answer or does not finish within the bound.
+    pub(crate) async fn look(
         self: &Arc<Self>,
         local: SocketAddr,
         remote: SocketAddr,
         accepted: Instant,
-    ) -> Option<Vec<u32>> {
+    ) -> Option<Looked> {
         let round = tokio::time::timeout(self.bound, self.round_after(canonical(local), accepted))
             .await
             .ok()?;
-        Some(holders_in(round.peers.as_ref()?, remote))
+        let holders = holders_in(round.peers.as_ref()?, remote);
+        Some(Looked {
+            holders,
+            launchers: round.launchers.clone(),
+        })
     }
 
     /// The first round at `local` that began at or after `accepted`.
@@ -399,18 +436,40 @@ impl Rounds {
     fn start_round(self: &Arc<Self>, local: SocketAddr, started: Instant) {
         let rounds = self.clone();
         tokio::spawn(async move {
-            let read = rounds.read.clone();
-            let peers = tokio::task::spawn_blocking(move || read(local))
-                .await
-                .ok()
-                .flatten();
+            let (read, launchers) = (rounds.read.clone(), rounds.launchers.clone());
+            let tables = tokio::task::spawn_blocking(move || {
+                let peers = read(local);
+                let launchers = peers.as_ref().and_then(|_| launchers());
+                (peers, launchers)
+            });
+            let (peers, launchers) = tables.await.unwrap_or((None, None));
             let mut listeners = rounds.listeners.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(at) = listeners.get_mut(&local) {
                 at.running = None;
-                at.latest
-                    .send_replace(Some(Arc::new(Round { started, peers })));
+                at.latest.send_replace(Some(Arc::new(Round {
+                    started,
+                    peers,
+                    launchers,
+                })));
             }
         });
+    }
+
+    /// (Test support) Rounds reading `read`, with no host sandbox running.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(read: PeersReader, bound: std::time::Duration) -> Arc<Self> {
+        Rounds::new(read, Arc::new(|| Some(Vec::new())), bound)
+    }
+
+    /// (Test support) [`Self::look`]'s holders alone.
+    #[cfg(test)]
+    pub(crate) async fn holders_of(
+        self: &Arc<Self>,
+        local: SocketAddr,
+        remote: SocketAddr,
+        accepted: Instant,
+    ) -> Option<Vec<u32>> {
+        self.look(local, remote, accepted).await.map(|l| l.holders)
     }
 
     /// (Test support) Whether a round has run or runs at `local`.
@@ -427,6 +486,7 @@ impl Rounds {
 static ROUNDS: LazyLock<Arc<Rounds>> = LazyLock::new(|| {
     Rounds::new(
         Arc::new(|local| darkmux_platform::current().tcp_peers_of(local)),
+        Arc::new(darkmux_sandbox::host_sandbox_launchers),
         JUDGE_BOUND,
     )
 });

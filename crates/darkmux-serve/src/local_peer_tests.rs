@@ -353,7 +353,7 @@ async fn a_hung_read_is_no_answer_within_the_bound_and_holds_up_no_other_listene
     );
     let peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let rounds = Rounds::new(
+    let rounds = Rounds::new_for_test(
         reader(std::time::Duration::ZERO, Some(stuck), calls),
         std::time::Duration::from_millis(400),
     );
@@ -387,7 +387,7 @@ async fn connections_waiting_together_share_one_read() {
     let local: SocketAddr = "127.0.0.1:3".parse().unwrap();
     let peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let rounds = Rounds::new(
+    let rounds = Rounds::new_for_test(
         reader(std::time::Duration::from_millis(100), None, calls.clone()),
         std::time::Duration::from_secs(5),
     );
@@ -414,5 +414,58 @@ async fn connections_waiting_together_share_one_read() {
         calls.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "a connection accepted after it gets a read of its own"
+    );
+}
+
+/// The host's sandbox launchers are read once per round, so connections
+/// waiting together share that look too, and a look that hangs is no
+/// answer within the bound: the caller is remote, never left waiting.
+#[tokio::test]
+async fn a_round_reads_the_sandbox_launchers_once_and_a_hung_read_is_no_answer() {
+    let local: SocketAddr = "127.0.0.1:4".parse().unwrap();
+    let peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+    let looks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = looks.clone();
+    let launchers: LaunchersReader = Arc::new(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        Some(vec![100])
+    });
+    let peers = reader(
+        std::time::Duration::ZERO,
+        None,
+        Arc::new(Default::default()),
+    );
+    let rounds = Rounds::new(peers.clone(), launchers, std::time::Duration::from_secs(5));
+    let accepted = Instant::now();
+    let waiting: Vec<_> = (0..5)
+        .map(|_| {
+            let r = rounds.clone();
+            tokio::spawn(async move { r.look(local, peer, accepted).await })
+        })
+        .collect();
+    for w in waiting {
+        let looked = w.await.unwrap().expect("an answer");
+        assert_eq!(
+            (looked.holders, looked.launchers),
+            (vec![9], Some(vec![100]))
+        );
+    }
+    assert_eq!(
+        looks.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one look at the launchers"
+    );
+    let hung: LaunchersReader = Arc::new(|| {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        Some(vec![])
+    });
+    let stuck = Rounds::new(peers, hung, std::time::Duration::from_millis(300));
+    let begun = Instant::now();
+    assert!(stuck.look(local, peer, begun).await.is_none(), "no answer");
+    assert!(
+        begun.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        begun.elapsed()
     );
 }

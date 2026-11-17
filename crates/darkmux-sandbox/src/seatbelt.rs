@@ -130,7 +130,7 @@ mkdir -m 700 "$d/tmp" && printf '%s' "$2" > "$d/profile.sb" && printf '%s' "$3" 
 /// its own (`setsid`) is not reached: unlike a container's, this sandbox
 /// does not end everything in it.
 const LAUNCH: &str = r#"wd=$1; shift
-echo $$ > "$d/pid" && ps -o lstart= -p $$ > "$d/started" || exit 125
+echo $$ > "$d/pid" && st=$(/usr/bin/env -i TZ=UTC0 /bin/ps -o lstart= -p $$) && [ -n "$st" ] && printf 'utc:%s\n' "$st" > "$d/started" || exit 125
 {GUARD} "$$" </dev/null >/dev/null 2>&1 &
 trap : TERM INT HUP
 [ -z "$wd" ] || cd "$wd" || { rm -rf "$d"; exit 125; }
@@ -203,8 +203,22 @@ const OURS: &str = r#"[ -f "$d/profile.sb" ]"#;
 
 /// Whether `$d`'s sandbox is running: its launcher's pid is alive and is
 /// still that launcher, started when the launcher recorded (a reused pid,
-/// or another sandbox's launcher, is not), leaving `$pid` set.
-const ALIVE: &str = r#"pid=$(cat "$d/pid" 2>/dev/null) && kill -0 "$pid" 2>/dev/null && started=$(cat "$d/started" 2>/dev/null) && [ -n "$started" ] && [ "$(ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ]"#;
+/// or another sandbox's launcher, is not), leaving `$pid` set. A start is
+/// recorded and read as [`STARTED_PREFIX`] and `ps -o lstart=` run by
+/// [`STARTED_READER`], never in the sandbox's own environment: `lstart`'s
+/// text follows `TZ` and the locale, which a policy may set.
+const ALIVE: &str = r#"pid=$(cat "$d/pid" 2>/dev/null) && kill -0 "$pid" 2>/dev/null && started=$(cat "$d/started" 2>/dev/null) && [ -n "$started" ] && [ "utc:$(/usr/bin/env -i TZ=UTC0 /bin/ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ]"#;
+
+/// How a launcher's start is recorded in `$d/started` and read back ([`LAUNCH`],
+/// [`ALIVE`], and `host_leaders`): this prefix, then `ps -o lstart=` with no
+/// environment but UTC, so its text is the same whatever `TZ`, locale or
+/// system time zone the recorder and the reader have. A record without the
+/// prefix was written some other way and cannot be compared.
+pub(crate) const STARTED_PREFIX: &str = "utc:";
+
+/// The command, then the pid, that reads a process's start as
+/// [`STARTED_PREFIX`] records it.
+pub(crate) const STARTED_READER: [&str; 6] = ["/usr/bin/env", "-i", "TZ=UTC0", "/bin/ps", "-o", "lstart="];
 
 /// The directory sandboxes live under: [`STATE_DIR_ENV`], else
 /// `~/.darkmux/seatbelt` (not `~/.darkmux/sandboxes`, which holds the lab's
@@ -740,6 +754,59 @@ mod tests {
         std::os::unix::fs::symlink("/usr/bin", &link).unwrap();
         assert!(SeatbeltBackend.host_reads(&link), "a link into the system reads where it leads");
         assert!(!crate::DockerBackend.host_reads(Path::new("/usr/bin")), "a container reads only its image and mounts");
+    }
+
+    /// The launcher records a start, and `ALIVE` reads one, with the same
+    /// reader and prefix `host_leaders` compares against.
+    #[test]
+    fn a_start_is_recorded_and_read_by_the_one_reader() {
+        let reader = STARTED_READER.join(" ");
+        assert!(LAUNCH.contains(&format!("st=$({reader} -p $$)")) && LAUNCH.contains(&format!("'{STARTED_PREFIX}%s\\n'")), "{LAUNCH}");
+        assert!(ALIVE.contains(&format!("\"{STARTED_PREFIX}$({reader} -p \"$pid\" 2>/dev/null)\"")), "{ALIVE}");
+    }
+
+    /// A running sandbox whose policy sets `TZ` and a locale is still the
+    /// running sandbox its directory records: its listing says running, and
+    /// its launcher is among the host's sandbox launchers. Its start is
+    /// recorded and read in one fixed environment, whatever the policy's.
+    #[test]
+    #[serial_test::serial]
+    fn a_policys_time_zone_and_locale_never_make_a_running_sandbox_look_gone() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let root = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var_os(STATE_DIR_ENV);
+        unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
+        let mut p = policy(Vec::new(), Network::None);
+        p.name = "darkmux-tz-test".into();
+        p.env = vec![("TZ".into(), "Pacific/Kiritimati".into()), ("LANG".into(), "fr_FR.UTF-8".into()), ("LC_ALL".into(), "fr_FR.UTF-8".into())];
+        p.entrypoint = Some("/bin/sleep".into());
+        p.command = vec!["5".into()];
+        let (mut cmd, _) = SeatbeltBackend.run(&p);
+        let mut child = cmd.spawn().unwrap();
+        let d = canonical(root.path()).join("darkmux-tz-test");
+        for _ in 0..200 {
+            if std::fs::read_to_string(d.join("started")).is_ok_and(|s| !s.trim().is_empty()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let listing = SeatbeltBackend.list(&Query::labeled("darkmux.host.pid")).output().unwrap();
+        let launchers = crate::host_leaders::host_sandbox_launchers();
+        let pid: Option<u32> = std::fs::read_to_string(d.join("pid")).ok().and_then(|s| s.trim().parse().ok());
+        let _ = SeatbeltBackend.remove(&SandboxHandle { backend: BackendKind::Seatbelt, id: "darkmux-tz-test".into() }).status();
+        let _ = child.kill();
+        let _ = child.wait();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(STATE_DIR_ENV, v),
+                None => std::env::remove_var(STATE_DIR_ENV),
+            }
+        }
+        let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
+        assert!(listing.contains("N\tdarkmux-tz-test\trunning"), "{listing}");
+        assert_eq!(launchers, Some(vec![pid.expect("the launcher recorded its pid")]));
     }
 
     /// (#3112 review, MAJOR D) A launcher that ends at once (its working
