@@ -2698,3 +2698,35 @@ edit loop detected on src/widget.rs in an earlier dispatch
         std::fs::write(dir.path().join("file"), "").unwrap();
         assert!(restore_worktree_pointer(&dir.path().join("file/wt"), &admin).is_err());
     }
+
+    /// A reviewer's finding and a recorded correction holding an OSC 0 title,
+    /// a screen clear and an OSC 52 clipboard write print as text; plain text
+    /// prints unchanged.
+    // Colors forced off (a process-global override, hence serial), so the
+    // only control bytes the output could hold are the hostile text's.
+    #[test]
+    #[serial_test::serial]
+    fn review_findings_and_debrief_bullets_print_hostile_text_inert() {
+        darkmux_types::style::set_colorize_override(Some(false));
+        let _restore = RestoreColor;
+        let hostile = "\x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}";
+        let inert = |t: &str| !t.chars().any(|c| c.is_control() || c == '\u{202e}');
+        let line = review_finding_line(&crate::phase_review::ReviewFinding {
+            severity: "flag".into(),
+            text: format!("x{hostile}"),
+        });
+        assert!(inert(&line), "{line:?}");
+        let bullets = bullet_lines(&[format!("- first{hostile}\nsecond{hostile}")]);
+        assert!(bullets.iter().all(|l| inert(l)), "{bullets:?}");
+        assert_eq!(bullet_lines(&["- café 日本語\nmore".to_string()]), vec!["  - café 日本語", "    more"]);
+        let plain = review_finding_line(&crate::phase_review::ReviewFinding { severity: "flag".into(), text: "café 🇺🇸".into() });
+        assert!(plain.ends_with(" café 🇺🇸"), "{plain:?}");
+    }
+
+    /// Puts the colorize override back on drop, even when an assertion fails.
+    struct RestoreColor;
+    impl Drop for RestoreColor {
+        fn drop(&mut self) {
+            darkmux_types::style::set_colorize_override(None);
+        }
+    }

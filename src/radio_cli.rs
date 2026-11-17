@@ -26,6 +26,7 @@
 
 use crate::radio::{self, CatalogEntry, RouteDecision};
 use anyhow::{Context, Result};
+use darkmux_types::user_files::escape_text_keeping_lines as shown;
 use std::io::IsTerminal;
 
 /// Top-level entry called from `main.rs`'s dispatch table for `Cmd::Radio`.
@@ -109,7 +110,7 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
             let overrides = crate::radio_answer::AnswererOverrides::default();
             match crate::radio_answer::answer_live(text, &catalog, &shelf, &overrides, radio::RadioSurface::Cli) {
                 Ok(crate::radio_answer::LiveAnswer::Answered(outcome)) => {
-                    println!("radio: {}", outcome.rendered);
+                    println!("{}", answer_line(&outcome.rendered));
                     Ok(0)
                 }
                 // (#2917) The seat's instance is busy: say so at once —
@@ -118,7 +119,7 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
                 // 300s ceiling. Exit 1: the question was not answered, and
                 // a script must be able to tell that from an answer.
                 Ok(crate::radio_answer::LiveAnswer::Busy(busy)) => {
-                    println!("radio: {}", busy.answering_seat_message());
+                    println!("radio: {}", shown(&busy.answering_seat_message()));
                     Ok(1)
                 }
                 // The model was reached for routing but not for answering: the
@@ -132,7 +133,7 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
         // non-zero exit so `darkmux radio` in a script or CI job fails
         // instead of printing a command listing and returning 0.
         RouteDecision::Unavailable { error } => {
-            eprintln!("radio: could not reach a model.\n{error}");
+            eprintln!("radio: could not reach a model.\n{}", shown(&error.to_string()));
             Ok(1)
         }
         RouteDecision::Route { command, args } => {
@@ -172,17 +173,27 @@ fn print_answer_failure(out: &AnswerFailureOutput) -> i32 {
 /// so and why, and nothing about darkmux. Any other failure (a reply radio
 /// rejected) prints a fixed line and the listing, with the failure on
 /// stderr; never the router's reason (#3123).
+///
+/// Both carry text a model or an endpoint wrote (the seat's error, a reply
+/// radio rejected), so both are escaped as [`answer_line`] escapes an answer.
 fn answer_failure_output(e: &anyhow::Error, catalog: &[CatalogEntry]) -> AnswerFailureOutput {
     match crate::radio_answer::seat_unavailable_notice(e) {
-        Some(notice) => AnswerFailureOutput { answer: notice, diagnostic: None },
+        Some(notice) => AnswerFailureOutput { answer: shown(&notice), diagnostic: None },
         // (#3123) Not the router's reason: that is a routing model's free
         // text about which mission to launch, and shown here it called real
         // commands invalid. Only what was checked is said.
         None => AnswerFailureOutput {
             answer: format!("radio: {UNCHECKED_ANSWER}\n{}", advertised_list_message(catalog)),
-            diagnostic: Some(format!("radio: the answering seat failed ({e:#}); falling back to the plain refusal")),
+            diagnostic: Some(shown(&format!("radio: the answering seat failed ({e:#}); falling back to the plain refusal"))),
         },
     }
+}
+
+/// The line `radio` prints for the answering seat's reply: the model's own
+/// text, its lines kept and every escape sequence shown as text, so a reply
+/// cannot clear the screen, set the title or write the clipboard.
+fn answer_line(rendered: &str) -> String {
+    format!("radio: {}", shown(rendered))
 }
 
 /// (#3123) What radio says when it has no answer it could check: true of
@@ -265,7 +276,10 @@ fn confirm_launch<R: std::io::BufRead, W: std::io::Write>(
     command_line: &str,
     synthesized: &[&str],
 ) -> Consent {
-    let _ = writeln!(writer, "radio: chose this command from your text:\n\n    {command_line}\n");
+    // The routing model chose the params, so an escape sequence in one could
+    // redraw the very line being confirmed: it is shown as text instead.
+    let shown_line = darkmux_types::user_files::escape_text(command_line);
+    let _ = writeln!(writer, "radio: chose this command from your text:\n\n    {shown_line}\n");
     if !interactive {
         let _ = writeln!(
             writer,
@@ -405,11 +419,11 @@ fn run_ephemeral_and_report(config: &crate::crew::mission_config::MissionConfig,
     let mut gate = cli_gate_handler();
     match crate::acp_panel::run_ephemeral(config, params, &cwd, Some(&mut *gate)) {
         Ok(outcome) => {
-            println!("{}", outcome.text);
+            println!("{}", shown(&outcome.text));
             if outcome.success { Ok(0) } else { Ok(1) }
         }
         Err(e) => {
-            eprintln!("radio: command failed: {e:#}");
+            eprintln!("radio: command failed: {}", shown(&format!("{e:#}")));
             Ok(1)
         }
     }
@@ -866,5 +880,42 @@ mod tests {
         let msg = advertised_list_message(&catalog);
         assert!(msg.contains("`darkmux mission launch review`"), "{msg}");
         assert!(msg.contains("`darkmux mission launch pr-list`"), "{msg}");
+    }
+
+    // ── model and endpoint text printed inert ───────────────────────────
+
+    /// An OSC 0 title, a screen clear and an OSC 52 clipboard write, plus a
+    /// C1 CSI and a bidi override: what an answering or routing model can
+    /// put in its reply.
+    const HOSTILE: &str = "\x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}";
+
+    fn inert(text: &str) -> bool {
+        !text.chars().any(|c| (c.is_control() && c != '\n' && c != '\t') || c == '\u{202e}')
+    }
+
+    #[test]
+    fn a_hostile_answer_prints_inert_and_a_plain_one_unchanged() {
+        let line = answer_line(&format!("Run `darkmux doctor`.{HOSTILE}\nsecond line"));
+        assert!(inert(&line), "{line:?}");
+        assert!(line.starts_with("radio: Run `darkmux doctor`.\\u{1b}]0;owned") && line.ends_with("\nsecond line"), "{line:?}");
+        let plain = "Run `darkmux doctor`: café 日本語 🇺🇸\n\tindented";
+        assert_eq!(answer_line(plain), format!("radio: {plain}"));
+    }
+
+    #[test]
+    fn a_hostile_answering_failure_prints_inert() {
+        let e = anyhow::anyhow!("endpoint said {HOSTILE}");
+        let out = answer_failure_output(&e, &[]);
+        assert!(inert(&out.answer), "{:?}", out.answer);
+        assert!(inert(out.diagnostic.as_deref().unwrap_or_default()), "{:?}", out.diagnostic);
+    }
+
+    #[test]
+    fn a_routed_command_with_a_hostile_param_is_confirmed_inert() {
+        let line = launch_command_line("review", &[format!("pr={HOSTILE}")]);
+        let mut out = Vec::new();
+        confirm_launch(std::io::BufReader::new(NoRead), &mut out, false, &line, &[]);
+        let out = String::from_utf8(out).unwrap();
+        assert!(inert(&out), "{out:?}");
     }
 }

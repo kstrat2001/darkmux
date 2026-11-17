@@ -748,3 +748,22 @@ fn each_retired_key_is_judged_by_its_value() {
         assert!(!crate::config::leftover_is_harmless(key, &value), "{key} = {value} must refuse");
     }
 }
+
+/// Text a model, a peer or an endpoint wrote, printed whole: every escape
+/// sequence is shown as text, never acted on, and the lines and tabs it
+/// holds still read as lines and tabs.
+#[test]
+fn escape_text_keeping_lines_shows_escapes_and_keeps_lines_and_tabs() {
+    let hostile = "a\x1b]0;owned\x07b\n\x1b[2J\tc\x1b]52;c;aGk=\x07\u{9b}31m\u{202e}d\r\ne";
+    let shown = escape_text_keeping_lines(hostile);
+    assert!(!shown.chars().any(|c| c.is_control() && c != '\n' && c != '\t'), "{shown:?}");
+    assert!(!shown.contains('\u{202e}'), "{shown:?}");
+    assert_eq!(shown, "a\\u{1b}]0;owned\\u{7}b\n\\u{1b}[2J\tc\\u{1b}]52;c;aGk=\\u{7}\\u{9b}31m\\u{202e}d\ne");
+}
+
+#[test]
+fn escape_text_keeping_lines_leaves_plain_text_and_unicode_unchanged() {
+    for text in ["", "plain", "two\nlines\n", "a\tb", "café 日本語 🇺🇸 👍🏽", "trailing\n\n"] {
+        assert_eq!(escape_text_keeping_lines(text), text);
+    }
+}

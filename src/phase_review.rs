@@ -541,7 +541,9 @@ pub(crate) fn phase_review_output_at(
                     phase_id,
                 ),
             );
-            eprintln!("warning: dispatch failed ({e}); emitting empty review");
+            // The error can quote an endpoint's reply: shown, not acted on.
+            let shown = darkmux_types::user_files::escape_text_keeping_lines(&e.to_string());
+            eprintln!("warning: dispatch failed ({shown}); emitting empty review");
             return Err(anyhow::anyhow!("dispatch failed: {e}"));
         }
     };

@@ -146,7 +146,8 @@ fn cmd_lab_run_dispatch(
     if !quiet {
         println!("\n{}", lab::run::batch_summary(&outcomes));
         for o in &outcomes {
-            println!("  {}: {}", o.run_id, o.notes.join(" | "));
+            // A note can quote a verify command's output: shown, not acted on.
+            println!("  {}: {}", o.run_id, darkmux_types::user_files::escape_text(&o.notes.join(" | ")));
         }
     }
     Ok(lab::run::exit_code(&outcomes))

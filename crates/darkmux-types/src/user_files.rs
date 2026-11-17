@@ -774,6 +774,22 @@ pub fn escape_text(text: &str) -> String {
     out
 }
 
+/// [`escape_text`] for text printed whole, a block a model, a peer or an
+/// endpoint wrote (a kit, a reply, an error body): its lines and tabs are
+/// kept, so it still reads as written, and every other control and
+/// invisible format character in it is escaped, so it cannot move the
+/// cursor, clear the screen, set the title or the clipboard, or reorder
+/// text. A `\r\n` line end is a line end; a lone `\r` is escaped, since it
+/// would let one line overwrite another.
+pub fn escape_text_keeping_lines(text: &str) -> String {
+    let lines: Vec<String> = text
+        .replace("\r\n", "\n")
+        .split('\n')
+        .map(|line| line.split('\t').map(escape_text).collect::<Vec<_>>().join("\t"))
+        .collect();
+    lines.join("\n")
+}
+
 /// Unicode format characters a terminal acts on without showing them.
 fn is_invisible_format(c: char) -> bool {
     matches!(c as u32, 0xAD | 0x61C | 0x180E | 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB)

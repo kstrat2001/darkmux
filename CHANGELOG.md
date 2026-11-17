@@ -181,6 +181,16 @@ darkmux release.
 
 ### Fixed
 
+- **Text a model, a peer or an endpoint wrote can no longer drive your terminal.** `mod list` and
+  `mod show` (a kit a local seat wrote through `create_mod`), `finding list` and `finding show`,
+  `run list` (its rows, the `--usage` breakdown and an endpoint's `reported model`), `run show`,
+  `mission show`, the fleet rows of `mission status`, `radio` (the answer, the command it asks you to
+  confirm, and its failure lines), `dispatch`'s human output (the model's reply), the QA review and
+  `mission debrief` lines, `doctor`'s rows, and the `Error:` line any failing command ends with all
+  print an escape sequence, a C1 control or a bidirectional override as text (`\u{1b}`) instead of
+  passing it to the terminal, so none of them can set the window title, clear the screen, write the
+  clipboard or reorder text. Lines and tabs still read as written, and a column cell is held to its
+  display width. `--json` output is unchanged. Found by the 2026-11-17 layer review.
 - **A paired device's long names no longer push the rest of a line off screen (#3626).**
   Each tailnet user, device and host name that `client serve`'s log, the pairing dialog,
   `client approve` and `client list` show, and the device name an app sends when it asks to pair,
