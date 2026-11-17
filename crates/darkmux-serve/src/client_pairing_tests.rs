@@ -11505,6 +11505,46 @@ fn an_add_over_the_tailnet_is_recorded_naming_the_device_it_came_from() {
     assert!(!line.contains(&"f".repeat(64)), "no token hash: {line}");
 }
 
+/// (#3626) Every line that names a tailnet identity (the serve log's remote
+/// pairing and engine-add lines, and the pairing dialog) is no wider with a
+/// device's overlong names than with names exactly at the limit, so the
+/// names never push what follows them off screen. The names mix full-width,
+/// combining and emoji characters with line separators, which the add
+/// line's escaping would otherwise widen after the cut.
+#[test]
+fn a_device_s_long_tailnet_names_never_widen_a_line_past_the_limit() {
+    use crate::client_tailnet::{TailnetDevice, TailnetIdentity, NAME_COLUMNS};
+    use darkmux_flow::hooks::display_columns;
+    let named = |login: String, name: String, host: String| TailnetIdentity {
+        login,
+        device: TailnetDevice { id: "nPHONE1CNTRL".into(), name, host_name: Some(host) },
+    };
+    let limit = "a".repeat(NAME_COLUMNS);
+    let at_limit = named(limit.clone(), limit.clone(), limit);
+    let long = named(
+        format!("{}{}", "長".repeat(200), "\u{2028}".repeat(30)),
+        format!("{}{}", "e\u{301}".repeat(300), "\u{2029}".repeat(30)),
+        format!("{}{}", "😀".repeat(100), "☺\u{FE0F}".repeat(30)),
+    );
+    let lines = |id: &TailnetIdentity| {
+        let mut client = adding_client();
+        client.tailnet = Some(id.clone());
+        [
+            crate::client_trust::remote_pairing_line("r-1", "4F7-K2Q", id),
+            crate::client_engines::added_line(&client, RequestVia::Tailnet, &flint_planned()),
+            crate::client_trust::tailnet_dialog_message("4F7-K2Q", id),
+        ]
+    };
+    for (long, at_limit) in lines(&long).iter().zip(lines(&at_limit).iter()) {
+        for (row, limit_row) in long.lines().zip(at_limit.lines()) {
+            assert!(display_columns(row) <= display_columns(limit_row), "{} > {}: {row}", display_columns(row), display_columns(limit_row));
+        }
+        assert_eq!(long.lines().count(), at_limit.lines().count(), "{long}");
+        assert!(long.contains('…'), "{long}");
+    }
+    assert!(lines(&long)[0].ends_with("`darkmux client approve --code 4F7-K2Q`"), "what follows the names is still there");
+}
+
 /// A client the add-line tests record: auto-approved, paired on the Mac.
 fn adding_client() -> ApprovedClient {
     ApprovedClient {

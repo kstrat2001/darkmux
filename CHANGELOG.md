@@ -181,6 +181,13 @@ darkmux release.
 
 ### Fixed
 
+- **A paired device's long names no longer push the rest of a line off screen (#3626).**
+  Each tailnet user, device and host name that `client serve`'s log, the pairing dialog,
+  `client approve` and `client list` show, and the device name an app sends when it asks to pair,
+  is now cut to 40 display columns at a `…`, keeping its start and end, and is shown on one line
+  with no invisible or blank-looking character. Full-width text, combining marks and emoji are
+  measured by the columns they take, not their bytes, and a cut never splits a flag, a skin tone or
+  a joined emoji.
 - **`lab submit`'s GPU note no longer fires on background GPU use (#3402).** It said a hosted run's
   GPU "was busy" from utilization alone, so window compositing or video (0.6 W at 60.5% duty in
   one hosted run) tripped it. It now also needs the busy samples to draw more than 2.5 W on
