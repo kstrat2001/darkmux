@@ -33,6 +33,11 @@ const fn longer(a: Duration, b: Duration) -> Duration {
     }
 }
 
+/// How long a sender's fleet POST may take over each write of its request
+/// to the receiver's socket. The receiver bounds the whole body's arrival
+/// from it.
+pub const SUBMISSION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The least time any waited-on job may wait for its seat, a job at the
 /// timeout cap included.
 pub const QUEUE_ROOM: Duration = Duration::from_secs(300);

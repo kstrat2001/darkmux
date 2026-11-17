@@ -95,6 +95,8 @@ pub(crate) struct FleetListenerState {
     pub queue_heartbeat: std::time::Duration,
     /// How long a queued job may wait for its seat ([`queue_deadline`]).
     pub queue_limits: QueueLimits,
+    /// How long a submission's body may take to arrive ([`BODY_READ_TIMEOUT`]).
+    pub body_read_timeout: std::time::Duration,
     /// Per-peer throttle on refusal log lines.
     pub refusal_log: Arc<RefusalLog>,
     /// (#2916 round 3 C5) Requests in flight per admitted NODE, so a node
@@ -162,6 +164,7 @@ impl FleetListenerState {
             queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
             queue_heartbeat: QUEUE_HEARTBEAT,
             queue_limits: QueueLimits::PRODUCTION,
+            body_read_timeout: BODY_READ_TIMEOUT,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
@@ -951,6 +954,29 @@ fn scope_job(state: &FleetListenerState, admitted: &Admitted, job: &WorkJob) -> 
     darkmux_fleet::check_scope(&state.receiver, state.receiver_uid.as_deref(), admitted, job, resolution)
 }
 
+/// The longest a submission's body may take to arrive once its headers
+/// have: the sender's write timeout ([`darkmux_fleet::SUBMISSION_WRITE_TIMEOUT`])
+/// and as long again for a slow link. A peer that drips its body in is
+/// answered and cut off then, never held to its connection's lifetime.
+pub(crate) const BODY_READ_TIMEOUT: std::time::Duration = darkmux_fleet::SUBMISSION_WRITE_TIMEOUT.saturating_mul(2);
+
+/// The most of a submission's body the listener reads: axum's default
+/// limit for a `Bytes` body, kept.
+const MAX_SUBMISSION_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// A submission's body, read within `deadline` and up to
+/// [`MAX_SUBMISSION_BODY_BYTES`].
+async fn read_body(deadline: std::time::Duration, body: axum::body::Body) -> Result<Bytes, Refusal> {
+    match tokio::time::timeout(deadline, axum::body::to_bytes(body, MAX_SUBMISSION_BODY_BYTES)).await {
+        Ok(read) => read.map_err(|e| {
+            Refusal::BadRequest(format!(
+                "the body could not be read: larger than {MAX_SUBMISSION_BODY_BYTES} bytes, or the connection broke off ({e})"
+            ))
+        }),
+        Err(_) => Err(Refusal::BadRequest(format!("the body did not arrive within {deadline:?}"))),
+    }
+}
+
 /// `POST` a job or a check: refuses a caller the allow-list does not list,
 /// with the remedy for the job it posted, else hands the admitted job on.
 async fn submit_route(
@@ -958,8 +984,12 @@ async fn submit_route(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     authorization: Authorization,
     Extension(token): Extension<TokenFingerprint>,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Response {
+    let body = match read_body(state.body_read_timeout, body).await {
+        Ok(bytes) => bytes,
+        Err(r) => return refuse(&state, Some(peer_addr.ip()), &r),
+    };
     match authorization.admitted(&body) {
         Ok(admitted) => submit_handler(state, peer_addr, admitted, token, body).await,
         Err(refusal) => refuse(&state, Some(peer_addr.ip()), &refusal),
@@ -1604,6 +1634,10 @@ mod tests {
         }
     }
 
+    /// The test receiver's body-read deadline: a local test's body arrives
+    /// in moments, and a dripping one is cut off well inside a test.
+    const TEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
     /// Wide queue limits: nothing in a test waits long enough to hit them.
     const WIDE: QueueLimits = QueueLimits {
         budget: darkmux_fleet::WaitBudget { connection_lifetime: Duration::from_secs(3600), ..darkmux_fleet::WaitBudget::PRODUCTION },
@@ -1753,6 +1787,7 @@ mod tests {
             queue_slots: queue_slots.clone(),
             queue_heartbeat: Duration::from_millis(100),
             queue_limits,
+            body_read_timeout: TEST_BODY_READ_TIMEOUT,
             refusal_log: refusal_log.clone(),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
@@ -2875,6 +2910,76 @@ mod tests {
         assert_eq!(h.ran.lock().unwrap().len(), 1, "the waited job ran after it was refused");
     }
 
+    /// The receiver ends a connection at its own budget's lifetime: a
+    /// waited-on job that fits its budget but runs past it (an agentic run
+    /// outlasting its timeout) loses its connection at 5 s, before its
+    /// answer at 7 s, and the job still runs to its end.
+    #[test]
+    fn the_receiver_ends_a_connection_at_its_budgets_lifetime() {
+        let h = short_receiver();
+        let j = short_job("s-overrun", 7_000);
+        let sent = std::time::Instant::now();
+        let got = darkmux_fleet::post_submission_with_progress(
+            &h.url,
+            TOKEN,
+            &WorkSubmission::new(j, true),
+            Duration::from_secs(20),
+            &mut |_| {},
+        );
+        let after = sent.elapsed();
+        assert!(got.is_err(), "the answer outlived the connection's lifetime: {got:?}");
+        let lifetime = SHORT_BUDGET.connection_lifetime;
+        assert!(after >= lifetime - Duration::from_millis(500) && after < Duration::from_millis(6_500), "closed after {after:?}");
+        wait_ran(&h, 1);
+    }
+
+    /// A peer that drips its request body in is answered and cut off at the
+    /// body-read deadline, not held to its connection's lifetime.
+    #[test]
+    fn a_body_that_drips_in_is_refused_at_the_body_read_deadline() {
+        use std::io::{Read, Write};
+        let h = start(Some(laptop()), false, 0);
+        let addr = h.url.trim_start_matches("http://").split('/').next().unwrap().to_string();
+        let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+        write!(
+            sock,
+            "POST {} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n",
+            darkmux_fleet::SUBMISSION_PATH,
+        )
+        .unwrap();
+        let sent = std::time::Instant::now();
+        // One byte every 200 ms, for longer than the deadline and the
+        // reader's own wait, until the listener stops reading.
+        let mut drip = sock.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..50 {
+                if drip.write_all(b" ").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        sock.set_read_timeout(Some(TEST_BODY_READ_TIMEOUT * 3)).unwrap();
+        let mut got = Vec::new();
+        let mut b = [0u8; 4096];
+        while let Ok(n @ 1..) = sock.read(&mut b) {
+            got.extend_from_slice(&b[..n]);
+        }
+        let answer = String::from_utf8_lossy(&got);
+        assert!(answer.starts_with("HTTP/1.1 400"), "no refusal within {:?}: {answer:?}", TEST_BODY_READ_TIMEOUT * 3);
+        assert!(answer.contains("did not arrive within 2s"), "{answer}");
+        assert!(sent.elapsed() < TEST_BODY_READ_TIMEOUT * 2, "answered after {:?}", sent.elapsed());
+        assert!(h.ran.lock().unwrap().is_empty());
+    }
+
+    /// The production body-read deadline: the sender's write timeout and
+    /// as long again, far inside the connection's lifetime.
+    #[test]
+    fn the_body_read_deadline_is_twice_the_senders_write_timeout() {
+        assert_eq!(BODY_READ_TIMEOUT, darkmux_fleet::SUBMISSION_WRITE_TIMEOUT * 2);
+        assert!(BODY_READ_TIMEOUT < ConnLimits::PRODUCTION.conn_deadline / 10);
+    }
+
     /// A waited-on job whose run cannot fit one connection is refused when
     /// it is submitted, naming the bound, and nothing runs. Sent without
     /// waiting it holds no connection, and is taken.
@@ -2978,6 +3083,7 @@ mod tests {
             queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
             queue_heartbeat: QUEUE_HEARTBEAT,
             queue_limits: QueueLimits::PRODUCTION,
+            body_read_timeout: BODY_READ_TIMEOUT,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
@@ -3055,6 +3161,7 @@ mod tests {
             queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
             queue_heartbeat: QUEUE_HEARTBEAT,
             queue_limits: QueueLimits::PRODUCTION,
+            body_read_timeout: BODY_READ_TIMEOUT,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
@@ -3360,6 +3467,7 @@ mod tests {
             queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
             queue_heartbeat: QUEUE_HEARTBEAT,
             queue_limits: QueueLimits::PRODUCTION,
+            body_read_timeout: BODY_READ_TIMEOUT,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
@@ -3421,6 +3529,7 @@ mod tests {
             queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
             queue_heartbeat: QUEUE_HEARTBEAT,
             queue_limits: QueueLimits::PRODUCTION,
+            body_read_timeout: BODY_READ_TIMEOUT,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(1)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
