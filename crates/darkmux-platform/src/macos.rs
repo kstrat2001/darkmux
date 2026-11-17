@@ -85,15 +85,11 @@ impl Platform for MacPlatform {
         Vec::new()
     }
 
-    /// IOReport reads a Mac's power, by rail, in darkmux-crew's probe.
-    fn package_power_mw(&self) -> Option<f64> {
-        None
-    }
-
-    /// A Mac's thermal reading is its pressure state (darkmux-crew's
-    /// `thermal` probe); its board sensors are not read.
-    fn board_sensors(&self) -> Option<crate::BoardSensors> {
-        None
+    /// IOReport reads a Mac's power, by rail, in darkmux-crew's probe. A
+    /// Mac's thermal reading is its pressure state (darkmux-crew's `thermal`
+    /// probe); its board sensors are not read.
+    fn board_readings(&self) -> crate::BoardReadings {
+        crate::BoardReadings::default()
     }
 
     /// `vm_stat`'s free plus inactive pages, times the page size (`pagesize`,

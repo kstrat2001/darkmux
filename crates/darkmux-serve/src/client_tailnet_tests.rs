@@ -397,6 +397,68 @@ fn a_remote_identity_is_described_safely() {
     assert!(!shown.contains('\u{202E}') && shown.ends_with("device sams-iphone"), "{shown}");
 }
 
+/// (#3626) A paired device chooses its own names, so each one is cut to
+/// [`NAME_COLUMNS`] display columns (not bytes, not chars) at a visible `…`;
+/// one that fits exactly is shown whole.
+#[test]
+fn a_tailnet_name_is_bounded_by_display_columns_with_a_visible_cut() {
+    use darkmux_flow::hooks::display_columns;
+    let at_limit = [
+        "a".repeat(NAME_COLUMNS),
+        "長".repeat(NAME_COLUMNS / 2),
+        format!("{}é", "e\u{301}".repeat(NAME_COLUMNS - 1)),
+    ];
+    for name in &at_limit {
+        assert_eq!(&shown_name(name), name, "exactly {NAME_COLUMNS} columns is shown whole");
+    }
+    assert_eq!(shown_name("Sam's\niPhone\u{202E}"), "Sam's iPhone", "a line break still separates words");
+    let over = [
+        ("one column over", "a".repeat(NAME_COLUMNS + 1)),
+        ("one wide char over", format!("a{}", "長".repeat(NAME_COLUMNS / 2))),
+        ("full-width CJK", "長".repeat(200)),
+        ("combining marks", "e\u{301}".repeat(200)),
+        ("a stack of combining marks", format!("a{}", "\u{301}".repeat(1000))),
+        ("emoji", "😀".repeat(100)),
+        ("emoji presentation selectors", "☺\u{FE0F}".repeat(100)),
+        ("flags", "🇺🇸".repeat(30)),
+        ("skin tones", "👋🏽".repeat(30)),
+        ("one heavily marked last character", format!("{}{}", "a".repeat(NAME_COLUMNS), "\u{301}".repeat(200))),
+    ];
+    for (what, name) in &over {
+        let shown = shown_name(name);
+        let columns = display_columns(&shown);
+        assert!(columns <= NAME_COLUMNS && shown.contains('…'), "{what}: {columns} columns: {shown}");
+        assert!(shown.chars().count() <= 4 * NAME_COLUMNS, "{what}: {} chars", shown.chars().count());
+        // U+FE0F turns a 1-column character into a 2-column emoji, which a
+        // per-character column count does not see: none may survive.
+        assert!(!shown.contains('\u{FE0F}'), "{what}: {shown}");
+        // The end shows too: the name's last character that takes a column
+        // is after the cut, unless it is the name's only one.
+        let (_, end) = shown.split_once('…').expect("cut");
+        let mut bases = name.chars().filter(|c| display_columns(&c.to_string()) > 0);
+        let last = bases.clone().next_back().expect("a base");
+        assert!(end.contains(last) || bases.nth(1).is_none(), "{what}: {shown}");
+    }
+}
+
+/// (#3626) `described` shows all three names bounded: however long a
+/// device names itself, the identity takes its own words plus at most three
+/// names' columns.
+#[test]
+fn a_described_identity_is_bounded_whatever_the_device_names_itself() {
+    use darkmux_flow::hooks::display_columns;
+    let blank = TailnetDevice { id: "n".into(), name: String::new(), host_name: Some(String::new()) };
+    let words = display_columns(&described(&TailnetIdentity { login: String::new(), device: blank }));
+    let mut long = sam();
+    long.login = format!("{}@example.com", "長".repeat(200));
+    long.device.name = "長".repeat(200);
+    long.device.host_name = Some("e\u{301}".repeat(500));
+    let shown = described(&long);
+    assert!(display_columns(&shown) <= words + 3 * NAME_COLUMNS, "{} columns: {shown}", display_columns(&shown));
+    assert_eq!(shown.matches('…').count(), 3, "every name is cut visibly: {shown}");
+    assert!(shown.starts_with("tailnet user 長") && shown.contains(", device 長"), "{shown}");
+}
+
 #[test]
 fn a_request_from_neither_is_not_local_with_no_entry_and_not_forwarded_with_one() {
     let (status, code, _) = not_from_here(None);

@@ -695,7 +695,10 @@ impl HostProbe {
         // EVERY target, not dead code the non-aarch64 lib build would flag
         // under `-D warnings`, matching the module doc's "tested (and, here,
         // exercised) everywhere" promise.
-        let power = power_from_rails(None, None, None).or_else(platform::package_power);
+        // (#3621) One read of the board answers both its power and its
+        // sensors: on Linux that is one hwmon read per sample, not two.
+        let board = darkmux_platform::current().board_readings();
+        let power = power_from_rails(None, None, None).or_else(|| platform::package_power(&board));
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let (clusters, gpu_mhz, power) = {
             let mut clusters = clusters;
@@ -749,7 +752,7 @@ impl HostProbe {
             // slow half (health) is NOT read here; see the field's doc.
             battery: host_reading.battery,
             power,
-            sensors: darkmux_platform::current().board_sensors(),
+            sensors: board.sensors,
         }
     }
 }
@@ -868,7 +871,7 @@ mod platform {
     }
 
     /// IOReport's rails are the power reading here (the branch above).
-    pub fn package_power() -> Option<super::PowerSample> {
+    pub fn package_power(_board: &darkmux_platform::BoardReadings) -> Option<super::PowerSample> {
         None
     }
 }
@@ -891,8 +894,8 @@ mod platform {
 
     /// (#3331) The platform's one package total (Omarchy: the SMC's
     /// `Heatpipe Power`), with no rails beside it.
-    pub fn package_power() -> Option<super::PowerSample> {
-        darkmux_platform::current().package_power_mw().map(super::PowerSample::total_only)
+    pub fn package_power(board: &darkmux_platform::BoardReadings) -> Option<super::PowerSample> {
+        board.package_power_mw.map(super::PowerSample::total_only)
     }
 }
 

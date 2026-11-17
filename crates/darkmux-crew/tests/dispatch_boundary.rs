@@ -47,8 +47,9 @@
 //! # What this file cannot see
 //!
 //! - The sampler's clock and cadence: it ticks every 2s of real time on its
-//!   own thread, so the sampler tests hold the fake container open for a few
-//!   seconds and assert what happened, never how many ticks.
+//!   own thread, so the sampler tests hold the fake container open (a few
+//!   seconds for one tick, until the asserted records land for more) and
+//!   assert what happened, never how many ticks.
 //! - The session-presence heartbeat (Redis is unset by the isolation guard).
 //! - Whether a kill reached a container: the fake `docker kill` always
 //!   succeeds, so only that a kill was ISSUED, by name, is pinned.
@@ -327,25 +328,26 @@ impl Rig {
 
     /// Every flow record written under the isolated flows dir.
     fn flows(&self) -> Vec<Value> {
-        let mut out = Vec::new();
-        let mut stack = vec![self.state.join("flows")];
-        while let Some(d) = stack.pop() {
-            let Ok(rd) = fs::read_dir(&d) else { continue };
-            let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
-            entries.sort();
-            for p in entries {
-                if p.is_dir() {
-                    stack.push(p);
-                } else if p.extension().is_some_and(|e| e == "jsonl") {
-                    for line in fs::read_to_string(&p).unwrap_or_default().lines() {
-                        if let Ok(v) = serde_json::from_str::<Value>(line) {
-                            out.push(v);
-                        }
-                    }
-                }
+        flows_under(&self.state.join("flows"))
+    }
+
+    /// Holds the fake container open (its run script is [`HELD_OPEN`]) until
+    /// `done` reads true over the dispatch's flow records, then lets it exit.
+    /// `done` sees every new read, so it may also act on the way (change what
+    /// `lms ps` reports once a first tick is recorded). A sampler test waits
+    /// on what it asserts, never on a fixed sleep the sampler's tick could
+    /// outrun on a slow host (#3621). Join the watcher after the dispatch.
+    fn hold_open_until(&self, mut done: impl FnMut(&[Value]) -> bool + Send + 'static) -> std::thread::JoinHandle<()> {
+        let (root, release) = (self.state.join("flows"), self.fakes.join("release"));
+        let _ = fs::remove_file(&release);
+        self.fake("run-script", HELD_OPEN);
+        std::thread::spawn(move || {
+            let hang_guard = std::time::Instant::now() + HANG_GUARD;
+            while !done(&flows_under(&root)) && std::time::Instant::now() < hang_guard {
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-        }
-        out
+            fs::write(&release, "").unwrap();
+        })
     }
 
     fn actions(&self) -> Vec<String> {
@@ -381,6 +383,38 @@ impl Rig {
     fn opts(&self) -> DispatchOpts {
         opts_with(&self.profiles)
     }
+}
+
+/// How long a held container waits before calling the dispatch hung: never
+/// the thing a test measures.
+const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The fake container's run script for [`Rig::hold_open_until`]: wait for
+/// the release file, or [`HANG_GUARD`]'s 60 s (1200 naps of 50 ms).
+const HELD_OPEN: &str =
+    "i=0\nwhile [ ! -f \"$FAKE_DOCKER_STATE_DIR/release\" ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n";
+
+/// Every flow record written under `root`.
+fn flows_under(root: &Path) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        entries.sort();
+        for p in entries {
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|e| e == "jsonl") {
+                for line in fs::read_to_string(&p).unwrap_or_default().lines() {
+                    if let Ok(v) = serde_json::from_str::<Value>(line) {
+                        out.push(v);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A loopback port with no listener: bind, read it, drop it.
@@ -1703,12 +1737,27 @@ fn a_resume_stages_the_origin_checkpoint_and_a_clean_finish_closes_the_origin() 
 
 // ─── 7. the telemetry sampler, seen through the dispatch ────────────────
 //
-// The sampler ticks every 2s of real time on its own thread. These hold the
-// fake container open long enough for at least one more tick and assert what
-// was recorded, never how many ticks ran.
+// The sampler ticks every 2s of real time on its own thread, plus whatever
+// one tick costs on this host. A test needing a single tick holds the fake
+// container open a few seconds: the tick that starts before the container
+// exits finishes. A test needing a later tick holds it open until the
+// records it asserts on have landed (`Rig::hold_open_until`), because a
+// fixed sleep is outrun by a slow tick (#3621). Each asserts what was
+// recorded, never how many ticks ran.
 
 fn telemetry_lms(rig: &Rig) -> Vec<Value> {
-    rig.flows().into_iter().filter(|r| r["action"] == "telemetry.lms").map(|r| payload(&r).clone()).collect()
+    lms_events(&rig.flows())
+}
+
+fn lms_events(flows: &[Value]) -> Vec<Value> {
+    flows.iter().filter(|r| r["action"] == "telemetry.lms").map(|r| payload(r).clone()).collect()
+}
+
+/// Writes `body` to `path` whole: a reader sees the old file or the new one.
+fn replace_file(path: &Path, body: &str) {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, body).unwrap();
+    fs::rename(&tmp, path).unwrap();
 }
 
 #[test]
@@ -1746,10 +1795,21 @@ fn the_first_lms_sample_is_a_baseline_tagged_by_seat() {
 fn a_residency_change_mid_run_is_recorded_as_an_unload_and_a_load() {
     own_process!();
     let rig = Rig::new();
-    rig.fake("lms-ps-mid.json", lms_ps(&[("darkmux:model-b", "model-b", 8192)]));
     rig.container(ONE_TURN, ENVELOPE, "", 0);
-    rig.fake("run-script", "sleep 1\ncp \"$FAKE_DOCKER_STATE_DIR/lms-ps-mid.json\" \"$FAKE_DOCKER_STATE_DIR/lms-ps.json\"\nsleep 3\n");
+    // Once a first tick has recorded the baseline, model-b replaces model-a;
+    // the run ends once a later tick has recorded the change.
+    let (ps, mid) = (rig.fakes.join("lms-ps.json"), lms_ps(&[("darkmux:model-b", "model-b", 8192)]));
+    let mut swapped = false;
+    let watcher = rig.hold_open_until(move |flows| {
+        let lms = lms_events(flows);
+        if !swapped && !lms.is_empty() {
+            replace_file(&ps, &mid);
+            swapped = true;
+        }
+        lms.iter().any(|p| p["event"] == "unload")
+    });
     let (res, _) = run(&rig, rig.opts());
+    watcher.join().unwrap();
     res.unwrap();
     assert_eq!(
         telemetry_lms(&rig),
@@ -1823,7 +1883,16 @@ fn engine_server_stand_in(endpoint: &str) -> ServerStandIn {
 }
 
 fn rests(rig: &Rig) -> Vec<Value> {
-    rig.flows().into_iter().filter(|r| r["action"] == "dispatch.rest").collect()
+    rests_in(&rig.flows())
+}
+
+fn rests_in(flows: &[Value]) -> Vec<Value> {
+    flows.iter().filter(|r| r["action"] == "dispatch.rest").cloned().collect()
+}
+
+/// Whether a `dispatch.rest` record's payload has `key` == `value`.
+fn rested_with(flows: &[Value], key: &str, value: &str) -> bool {
+    rests_in(flows).iter().any(|r| payload(r)[key] == value)
 }
 
 #[test]
@@ -1881,8 +1950,9 @@ fn a_serious_machine_pauses_the_run_and_resumes_it_when_nominal() {
     rig.env().set("DARKMUX_THERMAL_RESUME_HOLD_MS", "1");
     scenario(&mut rig, "{\"hold_ms\": 2500, \"thermal\": {\"state\": \"serious\"}}\n{\"hold_ms\": 600000, \"thermal\": {\"state\": \"nominal\"}}\n");
     rig.container(ONE_TURN, ENVELOPE, "", 0);
-    rig.fake("run-script", "sleep 7\n");
+    let watcher = rig.hold_open_until(|flows| rested_with(flows, "state", "nominal"));
     let (res, _) = run(&rig, rig.opts());
+    watcher.join().unwrap();
     let out = res.unwrap().out_dir.unwrap();
     let r: Vec<(String, String, bool)> = rests(&rig)
         .iter()
@@ -1905,8 +1975,9 @@ fn a_fair_machine_enters_the_duty_cycle_and_leaves_it_when_nominal() {
     rig.env().set("DARKMUX_THERMAL_RESUME_HOLD_MS", "1");
     scenario(&mut rig, "{\"hold_ms\": 2500, \"thermal\": {\"state\": \"fair\"}}\n{\"hold_ms\": 600000, \"thermal\": {\"state\": \"nominal\"}}\n");
     rig.container(ONE_TURN, ENVELOPE, "", 0);
-    rig.fake("run-script", "sleep 7\n");
+    let watcher = rig.hold_open_until(|flows| rested_with(flows, "state", "nominal"));
     let (res, _) = run(&rig, rig.opts());
+    watcher.join().unwrap();
     res.unwrap();
     let r: Vec<Value> = rests(&rig).iter().map(|r| payload(r).clone()).collect();
     assert_eq!(r.len(), 2, "{r:?}");
@@ -2202,8 +2273,9 @@ fn a_pause_held_past_its_limit_trips_the_breaker_without_an_eject() {
     rig.env().set("DARKMUX_THERMAL_MAX_PAUSE_MS", "1");
     scenario(&mut rig, r#"{"hold_ms": 600000, "thermal": {"state": "serious"}}"#);
     rig.container(ONE_TURN, ENVELOPE, "", 0);
-    rig.fake("run-script", "sleep 5\n");
+    let watcher = rig.hold_open_until(|flows| rested_with(flows, "reason", "thermal-critical"));
     let (res, _) = run(&rig, rig.opts());
+    watcher.join().unwrap();
     res.unwrap();
     let r: Vec<(String, String, bool)> = rests(&rig)
         .iter()
@@ -2239,8 +2311,9 @@ fn a_one_ms_machine_interval_stamps_the_previous_writes_cost_on_the_next_sample(
     let mut rig = Rig::new();
     rig.env().set("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "1");
     rig.container(ONE_TURN, ENVELOPE, "", 0);
-    rig.fake("run-script", "sleep 3\n");
+    let watcher = rig.hold_open_until(|flows| flows.iter().filter(|r| r["action"] == "machine.telemetry").count() >= 2);
     let (res, _) = run(&rig, rig.opts());
+    watcher.join().unwrap();
     res.unwrap();
     let curve: Vec<Value> = rig.flows().into_iter().filter(|r| r["action"] == "machine.telemetry").map(|r| payload(&r).clone()).collect();
     assert!(curve.len() >= 2, "{curve:?}");
@@ -2277,8 +2350,18 @@ fn a_sampler_lock_released_mid_run_is_taken_over() {
     )
     .unwrap();
     rig.container(ONE_TURN, ENVELOPE, "", 0);
-    rig.fake("run-script", format!("sleep 1\nrm -f '{}'\nsleep 5\n", lock.display()));
+    // Released once, after a first tick is recorded, so the sampler started
+    // while it was held.
+    let mut released = false;
+    let watcher = rig.hold_open_until(move |flows| {
+        if !released && !lms_events(flows).is_empty() {
+            fs::remove_file(&lock).unwrap();
+            released = true;
+        }
+        flows.iter().any(|r| r["action"] == "machine.telemetry")
+    });
     let (res, _) = run(&rig, rig.opts());
+    watcher.join().unwrap();
     res.unwrap();
     assert!(rig.actions().contains(&"machine.telemetry".to_string()), "{:?}", rig.actions());
 }

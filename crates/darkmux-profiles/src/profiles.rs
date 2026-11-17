@@ -35,15 +35,34 @@ pub fn default_locations() -> Vec<PathBuf> {
 /// ([`parse_registry_lenient`], #1282); a broken registry shell fails the
 /// load outright. Neither is silent.
 pub fn user_file_problem(path: &Path) -> Option<darkmux_types::user_files::FileProblem> {
-    use darkmux_types::user_files::{check_path_and, Issue, KeyIssue, Problem, UserFileKind};
-    let inline_endpoints = |doc: &serde_json::Value| -> Vec<KeyIssue> {
-        ProfileRegistry::inline_endpoint_rewrites(doc)
-            .into_iter()
-            .map(|r| KeyIssue { issue: Issue::Removed(r.line()), path: r.path })
-            .chain(darkmux_types::bare_utility_in(doc).map(|(path, line)| KeyIssue { issue: Issue::Removed(line), path: path.to_string() }))
-            .collect()
-    };
-    let mut found = check_path_and::<ProfileRegistry>(UserFileKind::Profiles, path, &|_| None, &inline_endpoints)?;
+    use darkmux_types::user_files::{check_path_and, UserFileKind};
+    let found = check_path_and::<ProfileRegistry>(UserFileKind::Profiles, path, &|_| None, &registry_shape_issues)?;
+    keys_only(found)
+}
+
+/// (#3569) [`user_file_problem`] of a registry's `text`, as if it were the
+/// file at `path`: the check a write runs on what it is about to write.
+pub fn user_file_problem_text(path: &Path, text: &str) -> Option<darkmux_types::user_files::FileProblem> {
+    use darkmux_types::user_files::{check_text_and, UserFileKind};
+    let found = check_text_and::<ProfileRegistry>(UserFileKind::Profiles, path, text, &|_| None, &registry_shape_issues)?;
+    keys_only(found)
+}
+
+/// What the registry's schema cannot say: an inline endpoint, a bare
+/// utility binding.
+fn registry_shape_issues(doc: &serde_json::Value) -> Vec<darkmux_types::user_files::KeyIssue> {
+    use darkmux_types::user_files::{Issue, KeyIssue};
+    ProfileRegistry::inline_endpoint_rewrites(doc)
+        .into_iter()
+        .map(|r| KeyIssue { issue: Issue::Removed(r.line()), path: r.path })
+        .chain(darkmux_types::bare_utility_in(doc).map(|(path, line)| KeyIssue { issue: Issue::Removed(line), path: path.to_string() }))
+        .collect()
+}
+
+/// A problem without the wrong-type and missing-key issues the registry
+/// quarantines instead; `None` when nothing else is left.
+fn keys_only(mut found: darkmux_types::user_files::FileProblem) -> Option<darkmux_types::user_files::FileProblem> {
+    use darkmux_types::user_files::{Issue, Problem};
     if let Problem::Keys(keys) = &mut found.problem {
         keys.retain(|k| !matches!(k.issue, Issue::WrongType { .. } | Issue::Missing { .. }));
         if keys.is_empty() {

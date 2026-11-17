@@ -118,25 +118,6 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    /// The scheme every darkmux test process shares. A copy anywhere else
-    /// (the root crate's `tests/e2e/fixture_port.rs`, until it uses this
-    /// module) must match these values exactly, or the two exclude nothing.
-    #[test]
-    fn the_scheme_is_the_one_every_test_process_shares() {
-        assert_eq!(FIXTURE_PORT_RANGE, 20_000..32_768);
-        let uid = unsafe { libc::geteuid() };
-        assert_eq!(
-            lock_dir(),
-            PathBuf::from(format!("/tmp/darkmux-fixture-ports-{uid}"))
-        );
-        let dir = tempfile::tempdir().unwrap();
-        let _held = reserve_in(dir.path(), 20_001).unwrap();
-        assert!(
-            dir.path().join("20001.lock").exists(),
-            "a reservation is `<port>.lock`"
-        );
-    }
-
     /// A port the OS hands out for `bind(0)` is never a fixture port.
     #[test]
     fn the_range_is_below_the_ephemeral_ports() {

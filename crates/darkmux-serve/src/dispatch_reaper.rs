@@ -142,6 +142,7 @@ mod tests {
     #[test]
     #[serial]
     fn the_production_tick_keeps_a_live_hosts_container_and_kills_a_dead_ones() {
+        darkmux_types::run_in_own_process!();
         let me = darkmux_crew::orphan_reaper::HostIdentity::this_process()
             .expect("this host reads its own pid, start time, machine uid and pid namespace");
         let mut child = std::process::Command::new("true").spawn().unwrap();
@@ -167,7 +168,8 @@ mod tests {
 
     fn with_path<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
         let prev = std::env::var("PATH").ok();
-        // SAFETY: every caller is `#[serial]`.
+        // SAFETY: every caller runs in its own process (`run_in_own_process!`),
+        // since every child of the process reads `PATH`.
         unsafe {
             std::env::set_var(
                 "PATH",
@@ -190,6 +192,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_serve_tick_kills_the_orphan_and_names_it_and_its_host() {
+        darkmux_types::run_in_own_process!();
         let dir = TempDir::new().unwrap();
         let record = dir.path().join("calls.txt");
         let docker = dir.path().join("docker");

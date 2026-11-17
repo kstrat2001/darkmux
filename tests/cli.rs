@@ -12,6 +12,30 @@ use std::collections::BTreeMap;
 use std::fs;
 use tempfile::TempDir;
 
+#[path = "e2e/fixture_port.rs"]
+mod fixture_port;
+
+/// (#2898) A port for a daemon this file spawns (`serve`, `client serve`)
+/// to bind. Chosen here and bound by the child a moment later, so it must
+/// not be an OS ephemeral port: in that gap any `bind(0)` or outgoing
+/// connection's source port can take one, and the child then exits with
+/// "Address already in use". From the fleet harness's allocator.
+fn daemon_port() -> u16 {
+    fixture_port::pick_fixture_port().expect("a free fixture port")
+}
+
+#[test]
+fn every_port_handed_to_a_spawned_daemon_is_outside_the_os_ephemeral_range() {
+    let ephemeral = fixture_port::os_ephemeral_range().expect("reading the OS ephemeral port range");
+    for _ in 0..8 {
+        let port = daemon_port();
+        assert!(
+            !ephemeral.contains(&port),
+            "port {port} is in the OS ephemeral range {ephemeral:?}: a bind(0) or an outgoing connection can take it before the daemon binds"
+        );
+    }
+}
+
 // ===== DARKMUX-SPAWN-HELPERS: BEGIN (#2184) ==========================
 //
 // The only place this file names the darkmux binary. Every child process
@@ -504,9 +528,9 @@ fn darkmux_cmd_keeps_a_child_out_of_the_process_home() {
     );
 }
 
-/// Every `.rs` file under `tests/`, recursively. Sorted, so a failure
-/// message is stable run to run.
-fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
+/// Every `.rs` file under `rel` (a path relative to this crate's root),
+/// recursively. Sorted, so a failure message is stable run to run.
+fn rust_sources_under(rel: &str) -> Vec<std::path::PathBuf> {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let entries = fs::read_dir(dir)
             .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
@@ -519,11 +543,16 @@ fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
             }
         }
     }
-    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests"));
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
     let mut out = Vec::new();
-    walk(root, &mut out);
+    walk(&root, &mut out);
     out.sort();
     out
+}
+
+/// Every `.rs` file under `tests/`, recursively.
+fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
+    rust_sources_under("tests")
 }
 
 /// (#2184/#2710) The structural half of the fix: a source-scanning
@@ -814,6 +843,102 @@ fn every_darkmux_spawn_in_the_tests_dir_goes_through_an_isolating_helper() {
 }
 
 // ===== DARKMUX-SPAWN-HELPERS: END (#2184) ============================
+
+/// The source roots whose tests never get `CARGO_BIN_EXE_darkmux`: the
+/// root crate's `src/` (unit tests), and every workspace crate's
+/// `crates/<name>/src/` and `crates/<name>/tests/` (cargo sets the variable
+/// only for the package that owns the binary, and only in its integration
+/// targets, which are the root `tests/`).
+fn sources_without_the_darkmux_binary() -> Vec<String> {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut roots = vec!["src".to_string()];
+    for entry in fs::read_dir(manifest.join("crates")).expect("reading crates/") {
+        let name = entry.expect("dir entry").file_name().to_string_lossy().to_string();
+        for sub in ["src", "tests"] {
+            if manifest.join("crates").join(&name).join(sub).is_dir() {
+                roots.push(format!("crates/{name}/{sub}"));
+            }
+        }
+    }
+    roots.sort();
+    roots
+}
+
+/// The code lines (comments skipped) of `src` that contain any of `tokens`,
+/// as `rel:line: text`.
+fn code_lines_naming(rel: &str, src: &str, tokens: &[&str]) -> Vec<String> {
+    src.lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim_start().starts_with("//") && tokens.iter().any(|t| l.contains(t)))
+        .map(|(i, l)| format!("  {rel}:{}: {}", i + 1, l.trim()))
+        .collect()
+}
+
+/// (#2513) No test outside the root `tests/` resolves the darkmux binary
+/// through cargo. Cargo sets `CARGO_BIN_EXE_darkmux` only for this
+/// package's integration targets, so a unit test, or a workspace crate's
+/// own test, that asks for it gets `assert_cmd`'s fallback: a lookup of
+/// `target/debug/darkmux` that passes or panics on whether an earlier
+/// build happened to leave that file behind. Such a test drives the code
+/// in process; a test that needs the binary lives under the root `tests/`.
+///
+/// What this text scan does NOT catch, stated rather than discovered:
+/// - A literal path lookup (`target/debug/darkmux`,
+///   `target/release/darkmux`) or a `Command::new("darkmux")` resolved
+///   from `PATH`. Both have the same ambient dependence, but matching them
+///   as text also matches strings that only mention such a path (a
+///   fixture answer in `src/radio_answer.rs` does), so they are not tokens
+///   here. The one known path lookup is the `#[ignore]`d
+///   `fleet_snapshot_cli_end_to_end_matches_a_bare_invocation` in
+///   `crates/darkmux-serve/src/lib_tests.rs`, which skips when the release
+///   binary is missing.
+/// - Only lines whose first characters are `//` are skipped as comments.
+///   A token inside a block comment, after code on the same line, or in a
+///   string literal is reported, so a false positive is possible; reword
+///   or split the token with `concat!` as the constant below does.
+#[test]
+fn no_test_outside_the_root_tests_dir_resolves_the_darkmux_binary() {
+    // Split with `concat!` so these lines do not name the binary
+    // themselves and trip the spawn guard above.
+    const TOKENS: [&str; 2] = [concat!("cargo", "_bin"), concat!("CARGO_BIN_EXE_", "darkmux")];
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let roots = sources_without_the_darkmux_binary();
+    let files: Vec<std::path::PathBuf> = roots.iter().flat_map(|r| rust_sources_under(r)).collect();
+    // Anti-vacuity: the walk must reach the root crate, a workspace crate's
+    // source and a workspace crate's integration tests.
+    for expected in [
+        "src/acp_panel.rs",
+        "crates/darkmux-types/src/test_isolation.rs",
+        "crates/darkmux-crew/tests/mock_dispatch_proof.rs",
+    ] {
+        assert!(files.iter().any(|p| p.ends_with(expected)), "the walk over {roots:?} missed {expected}");
+    }
+    // Positive control: the scan fires on each form it exists to catch, so a
+    // typo in a token cannot switch the guard off.
+    for planted in [
+        concat!("    let mut cmd = Command::", "cargo", "_bin(\"dark", "mux\").unwrap();"),
+        concat!("    let bin = env!(\"CARGO_BIN_EXE_", "darkmux\");"),
+    ] {
+        assert_eq!(code_lines_naming("planted.rs", planted, &TOKENS).len(), 1, "the scan missed: {planted}");
+    }
+    let offenders: Vec<String> = files
+        .iter()
+        .flat_map(|path| {
+            let rel = path.strip_prefix(manifest).unwrap_or(path).display().to_string();
+            let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {rel}: {e}"));
+            code_lines_naming(&rel, &src, &TOKENS)
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "(#2513) {} line(s) outside the root tests/ resolve the darkmux binary. Those tests \
+         never get `{}`, so this passes or fails on whether `target/debug/darkmux` happens to \
+         exist. Drive the code in process, or move the test under the root tests/:\n{}",
+        offenders.len(),
+        TOKENS[1],
+        offenders.join("\n")
+    );
+}
 
 fn fixture_json() -> &'static str {
     r#"{
@@ -4846,12 +4971,8 @@ fn spawn_fleet_daemon(profiles_json: &str, nofile: Option<u64>) -> Option<FleetD
         docker_shim_dir().display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let free_port = || {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port");
-        l.local_addr().unwrap().port()
-    };
-    let serve_port = free_port();
-    let fleet_port = free_port();
+    let serve_port = daemon_port();
+    let fleet_port = daemon_port();
     let mut cmd = darkmux_std_cmd();
     cmd.env("HOME", &home)
         .env("DARKMUX_HOME", &darkmux_home)
@@ -4907,10 +5028,7 @@ fn serve_raises_its_open_file_soft_limit_at_start() {
         return;
     }
     let (home, darkmux_home) = isolated_roots();
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     let mut cmd = darkmux_std_cmd();
     cmd.env("HOME", &home)
         .env("DARKMUX_HOME", &darkmux_home)
@@ -4946,10 +5064,7 @@ fn serve_raises_its_open_file_soft_limit_at_start() {
 /// its environment only) and passes, and a clean shutdown removes the record.
 #[test]
 fn a_daemon_started_with_a_port_flag_is_found_by_doctor_and_unrecorded_on_exit() {
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     assert_ne!(port, 8765, "the test needs a port the built-in default does not name");
     let mut cmd = darkmux_std_cmd();
     let env_of = |cmd: &std::process::Command, key: &str| {
@@ -15260,10 +15375,7 @@ fn flow_status_withholds_its_directories_from_a_remote_viewer() {
 /// pointer is spelled the same.
 #[test]
 fn every_console_panel_serves_a_remote_viewer_redacted_and_this_machine_in_full() {
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     let mut cmd = darkmux_std_cmd();
     console_env(&mut cmd);
     let home = spawn_env(&cmd, "HOME");
@@ -15886,10 +15998,7 @@ fn profile_list_machine_names_an_unknown_peer() {
 #[test]
 fn client_serve_shuts_down_cleanly_on_sigterm_sighup_and_sigint() {
     for (signal, name) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGHUP, "SIGHUP"), (libc::SIGINT, "SIGINT")] {
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
+        let port = daemon_port();
         let log = tempfile::NamedTempFile::new().unwrap();
         let mut cmd = darkmux_std_cmd();
         cmd.args(["client", "serve", "--port", &port.to_string()])
@@ -15964,10 +16073,7 @@ const FAKE_TAILNET_OPERATOR: &str =
 #[test]
 fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed_ones() {
     let tmp = TempDir::new().unwrap();
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     let home = tmp.path().join("darkmux-home");
     fs::create_dir_all(&home).unwrap();
     let fake = fake_tailnet_tool(&tmp.path().join("fake"), &home, port);
@@ -16132,10 +16238,7 @@ fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed
 #[test]
 fn a_signal_while_client_serve_is_starting_still_runs_its_cleanup() {
     let tmp = TempDir::new().unwrap();
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     let home = tmp.path().join("darkmux-home");
     fs::create_dir_all(&home).unwrap();
     let fake = fake_tailnet_tool(&tmp.path().join("fake"), &home, port);
@@ -16178,10 +16281,7 @@ fn a_signal_while_client_serve_is_starting_still_runs_its_cleanup() {
 /// Spawns `client serve` on an isolated HOME and its own port; returns the
 /// child, its port and its stderr log once it listens.
 fn a_listening_client_serve() -> (DirectChildGuard, u16, tempfile::NamedTempFile) {
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     let log = tempfile::NamedTempFile::new().unwrap();
     let mut cmd = darkmux_std_cmd();
     cmd.args(["client", "serve", "--port", &port.to_string()])

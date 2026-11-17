@@ -273,6 +273,25 @@ fn harness() -> Harness {
             name: "studio".into(),
         },
         profile_info: Arc::new(|_role, names| names.iter().map(|n| test_profile_info(n)).collect()),
+        detect_engines: Arc::new(test_engines),
+        log_add: {
+            let log = dir.path().join("serve.log");
+            Arc::new(move |line| {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&log).unwrap();
+                writeln!(f, "{line}").unwrap();
+            })
+        },
+        add_engine: {
+            let registry = dir.path().join("profiles.json");
+            std::fs::write(&registry, TEST_REGISTRY).unwrap();
+            Arc::new(move |req| {
+                let found = |reg: Option<&darkmux_types::ProfileRegistry>| {
+                    vec![test_flint(darkmux_profiles::engine::detect::declaring(reg, darkmux_types::ManagedBackend::Flint))]
+                };
+                crate::client_engines::add_in(Some(&registry), req, &found, &|_| true)
+            })
+        },
         check_workdir: Arc::new(move |p| {
             darkmux_types::workdir::validate_remote_workdir_in(p, &canon_base)
                 .map_err(|e| format!("{e:#}"))
@@ -680,6 +699,8 @@ async fn every_route_refuses_a_browser_and_a_bodyless_post_needs_no_type() {
     for (method, path) in [
         ("GET", "/client/whoami"),
         ("GET", "/client/profiles"),
+        ("GET", "/client/engines"),
+        ("POST", "/client/engines"),
         ("POST", "/client/work"),
         ("GET", "/client/work/w-1"),
         ("POST", "/client/work/w-1/cancel"),
@@ -754,7 +775,7 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
                            "capabilities": ["clean_preview", "template_workspace", "continues", "clone_preview",
                                             "recipe_set", "workspace_image", "workspace_edit", "workspace_remove",
                                              "remote_tailscale", "availability_codes",
-                                             "remote_requests", "remote_preview"],
+                                             "remote_requests", "remote_preview", "engines"],
                             "remote": {"state": "off", "url": null, "reason": null},
                             "via": "local"})
     );
@@ -3686,6 +3707,7 @@ fn a_work_copy_whose_repo_config_defines_a_filter_is_refused() {
 #[test]
 #[serial_test::serial]
 fn reading_changes_runs_nothing_a_planted_submodule_names_under_diff_submodule_diff() {
+    darkmux_types::run_in_own_process!();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let marker = root.join("host-ran-a-planted-submodule");
@@ -3704,7 +3726,7 @@ fn reading_changes_runs_nothing_a_planted_submodule_names_under_diff_submodule_d
     let global = root.join("global-config");
     std::fs::write(&global, "[diff]\n\tsubmodule = diff\n").unwrap();
     let prev = std::env::var_os("GIT_CONFIG_GLOBAL");
-    // SAFETY: #[serial]; restored below.
+    // SAFETY: in its own process; restored below.
     unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &global) };
     let read = (|| {
         let before = snapshot_tree(&wd)?;
@@ -8433,6 +8455,7 @@ async fn host_git_touches_only_a_recorded_workspace_directly_under_the_base() {
 #[test]
 #[serial_test::serial]
 fn a_first_commit_on_a_machine_with_no_git_identity_is_darkmuxs() {
+    darkmux_types::run_in_own_process!();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let (w, g) = (root.join("w"), root.join(".w.git"));
@@ -10048,10 +10071,10 @@ async fn every_declared_body_is_the_one_its_handler_reads() {
             }
         }
     }
-    assert_eq!(bodies, 8, "every route that declares a body was probed");
+    assert_eq!(bodies, 9, "every route that declares a body was probed");
     // (#3560) The two preview link routes answer this Mac's app
     // `tailnet_only`, past the token, before any lookup.
-    assert_eq!(reached, 16, "every route that declares none was probed past its lookups");
+    assert_eq!(reached, 17, "every route that declares none was probed past its lookups");
 }
 
 /// (#3494 review) Each property a route's declared query has is a field its
@@ -11321,6 +11344,297 @@ async fn an_auto_approval_is_the_approval_client_approve_makes() {
     assert!(p.auto_approved.is_some());
     assert!(revoke(&h.store, p.client_name.as_deref().unwrap()).unwrap(), "revocable like any approval");
     assert_eq!(poll(&h, &id, SECRET).await.1["status"], "denied");
+}
+
+// ─── (#3569) Engines ────────────────────────────────────────────────────
+
+/// The registry the harness's engine add writes.
+const TEST_REGISTRY: &str = "{\n  \"profiles\": {\n    \"fast\": { \"models\": [ { \"id\": \"qwen\", \"n_ctx\": 8192 } ] }\n  }\n}\n";
+
+/// rec 0.1.0 with `flint-int4` pulled, declared by `endpoints`.
+fn test_flint(endpoints: Vec<String>) -> darkmux_profiles::engine::detect::DetectedEngine {
+    use darkmux_profiles::engine::detect::{judge_flint, FlintFacts};
+    let pulled = vec![darkmux_profiles::engine::flint::Pulled { revision: "flint-int4".into(), max_context: Some(262_144) }];
+    judge_flint(FlintFacts { version: Ok("0.1.0".into()), runtime: Ok(()), pulled: Ok(pulled) }, endpoints)
+}
+
+/// What the harness's detection finds: LM Studio with nothing downloaded,
+/// and rec's Flint, usable and not configured.
+fn test_engines() -> darkmux_profiles::engine::detect::Detected {
+    let lms = darkmux_profiles::engine::detect::judge_lmstudio(None, Ok(Vec::new()));
+    darkmux_profiles::engine::detect::Detected::of(vec![lms, test_flint(Vec::new())])
+}
+
+/// `GET /client/engines` lists what detection found, whether any is
+/// usable, and this machine; it takes a token like every route.
+#[tokio::test]
+async fn the_engines_route_lists_what_was_found_and_whether_any_is_usable() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(&h, get("/client/engines", &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["usable"], true);
+    assert_eq!(v["machine"]["name"], "studio");
+    assert_eq!(v["detected"][0]["engine"], "lmstudio");
+    assert_eq!(v["detected"][0]["state"], "unusable");
+    assert_eq!(v["detected"][1]["engine"], "flint");
+    assert_eq!(v["detected"][1]["can_add"], true);
+    assert_eq!(v["detected"][1]["models"][0], serde_json::json!({"id": "flint-int4", "max_context": 262144}));
+    let (code, v) = call(&h, get("/client/engines", &[])).await;
+    assert_eq!((code, v["code"].as_str()), (401, Some("unauthorized")));
+}
+
+/// `POST /client/engines` adds the engine the confirmed request names and
+/// says what it wrote; a second add is refused `conflict`, LM Studio
+/// `bad_request`, and an engine word darkmux does not know `bad_request`.
+#[tokio::test]
+async fn the_engine_add_writes_what_was_asked_and_refuses_what_it_cannot() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(&h, post("/client/engines", Some(&token), serde_json::json!({"engine": "flint"}))).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(
+        v,
+        serde_json::json!({"engine": "flint", "endpoint": "flint", "port": 8091, "profile": "flint", "model": "flint-int4", "n_ctx": 262144})
+    );
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(h.dir.path().join("profiles.json")).unwrap()).unwrap();
+    assert_eq!(written["endpoints"]["flint"], serde_json::json!({"managed": "flint", "port": 8091}));
+    for (body, status, code) in [
+        (serde_json::json!({"engine": "flint"}), 409, "conflict"),
+        (serde_json::json!({"engine": "lmstudio"}), 400, "bad_request"),
+        (serde_json::json!({"engine": "ollama"}), 400, "bad_request"),
+        (serde_json::json!({}), 400, "bad_request"),
+    ] {
+        let (got, v) = call(&h, post("/client/engines", Some(&token), body.clone())).await;
+        assert_eq!((got, v["code"].as_str()), (status, Some(code)), "{body}: {v}");
+    }
+    let (code, _) = call(&h, post("/client/engines", None, serde_json::json!({"engine": "flint"}))).await;
+    assert_eq!(code, 401);
+}
+
+/// An approved device paired over the tailnet adds an engine through the
+/// entry as an app on this Mac does: the same reply, the registry written,
+/// and the serve log naming the client, that it came over the tailnet, and
+/// the tailnet user and device it paired as. Listing stays open to it too.
+#[tokio::test]
+async fn an_engine_add_from_a_device_paired_over_the_tailnet_is_written_and_recorded() {
+    let mut h = harness();
+    let token = paired(&h).await;
+    paired_as(&h, "sam-s-iphone", SAM);
+    on_the_tailnet(&mut h);
+    let auth = bearer(&token);
+    let (status, v) = call(&h, get("/client/engines", &with_token(&forwarded(Some(SAM)), Some(&auth)))).await;
+    assert_eq!(status, 200, "{v}");
+    let req = adding(post("/client/engines", Some(&token), serde_json::json!({"engine": "flint"})), &forwarded(Some(SAM)));
+    let (status, v) = call(&h, req).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(
+        v,
+        serde_json::json!({"engine": "flint", "endpoint": "flint", "port": 8091, "profile": "flint", "model": "flint-int4", "n_ctx": 262144})
+    );
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(h.dir.path().join("profiles.json")).unwrap()).unwrap();
+    assert_eq!(written["endpoints"]["flint"], serde_json::json!({"managed": "flint", "port": 8091}));
+    let log = std::fs::read_to_string(h.dir.path().join("serve.log")).unwrap();
+    assert_eq!(log.lines().count(), 1, "{log}");
+    for part in ["client `sam-s-iphone`", "over the tailnet", "tailnet user sam@example.com", "device sams-iphone", "added engine `flint`", "port 8091"] {
+        assert!(log.contains(part), "{part}: {log}");
+    }
+    assert!(!log.contains("this Mac"), "not from this Mac: {log}");
+    assert!(!log.contains(&token), "no token: {log}");
+}
+
+/// Through the tailnet entry, an add from anything but an approved device
+/// paired over the tailnet, as the user it paired as, is refused as every
+/// route refuses it (no token, an unknown one, a pairing made on the Mac,
+/// another tailnet user, another of the user's devices, a revoked device),
+/// and nothing is written or recorded.
+#[tokio::test]
+async fn an_engine_add_through_the_tailnet_from_no_approved_device_is_refused_and_writes_nothing() {
+    let mut h = harness();
+    let token = paired(&h).await;
+    on_the_tailnet(&mut h);
+    let auth = bearer(&token);
+    let add = |headers: &[(&str, &str)]| adding(post("/client/engines", None, serde_json::json!({"engine": "flint"})), headers);
+    let (status, v) = call(&h, add(&with_token(&forwarded(Some(SAM)), Some(&auth)))).await;
+    assert_eq!((status, v["code"].as_str()), (403, Some("not_paired_remotely")), "paired on the Mac: {v}");
+    paired_as(&h, "sam-s-iphone", SAM);
+    let wrong = bearer(&"0".repeat(64));
+    for token in [None, Some(wrong.as_str())] {
+        let (status, v) = call(&h, add(&with_token(&forwarded(Some(SAM)), token))).await;
+        assert_eq!((status, v["code"].as_str()), (401, Some("unauthorized")), "{token:?}: {v}");
+    }
+    let mut alex = forwarded(None);
+    alex.push(("tailscale-user-login", ALEX));
+    let (status, v) = call(&h, add(&with_token(&alex, Some(&auth)))).await;
+    assert_eq!((status, v["code"].as_str()), (403, Some("remote_identity_mismatch")), "another user: {v}");
+    h.devices.place(&laptop_node(), &[LAPTOP_V4]);
+    let (status, v) = call(&h, add(&with_token(&from_addr(forwarded(Some(SAM)), LAPTOP_V4), Some(&auth)))).await;
+    assert_eq!((status, v["code"].as_str()), (403, Some("remote_device_mismatch")), "another of the user's devices: {v}");
+    assert!(revoke(&h.store, "sam-s-iphone").unwrap());
+    let (status, v) = call(&h, add(&with_token(&forwarded(Some(SAM)), Some(&auth)))).await;
+    assert_eq!((status, v["code"].as_str()), (401, Some("unauthorized")), "revoked: {v}");
+    let registry = std::fs::read_to_string(h.dir.path().join("profiles.json")).unwrap();
+    assert_eq!(registry, TEST_REGISTRY, "nothing written");
+    assert!(!h.dir.path().join("serve.log").exists(), "nothing recorded");
+}
+
+/// (#3569 review) Every add is recorded in the serve log: the client, the
+/// engine and what was written; never the token.
+#[test]
+fn an_add_is_recorded_naming_the_client_and_what_was_written() {
+    let line = crate::client_engines::added_line(&adding_client(), RequestVia::Local, &flint_planned());
+    for part in ["`mux-bot`", "c-0123456789abcdef", "TEAM123/com.example.muxbot", "an app on this Mac", "engine `flint`", "port 8091", "profile `flint`", "`flint-int4`", "262144"] {
+        assert!(line.contains(part), "{part}: {line}");
+    }
+    assert!(!line.contains("tailnet"), "from this Mac: {line}");
+    assert!(!line.contains(&"f".repeat(64)), "no token hash: {line}");
+}
+
+/// An add through the tailnet entry is recorded as over the tailnet, from
+/// the tailnet user and device the client paired as, never as this Mac.
+#[test]
+fn an_add_over_the_tailnet_is_recorded_naming_the_device_it_came_from() {
+    let mut client = adding_client();
+    client.tailnet = Some(phone_as(SAM));
+    let line = crate::client_engines::added_line(&client, RequestVia::Tailnet, &flint_planned());
+    for part in ["`mux-bot`", "c-0123456789abcdef", "over the tailnet from tailnet user sam@example.com, device sams-iphone (Sam's iPhone)", "engine `flint`"] {
+        assert!(line.contains(part), "{part}: {line}");
+    }
+    assert!(!line.contains("this Mac"), "{line}");
+    assert!(!line.contains("nPHONE1CNTRL"), "the node id is never shown: {line}");
+    assert!(!line.contains(&"f".repeat(64)), "no token hash: {line}");
+}
+
+/// (#3626) Every line that names a tailnet identity (the serve log's remote
+/// pairing and engine-add lines, and the pairing dialog) is no wider with a
+/// device's overlong names than with names exactly at the limit, so the
+/// names never push what follows them off screen. The names mix full-width,
+/// combining and emoji characters with line separators, which the add
+/// line's escaping would otherwise widen after the cut.
+#[test]
+fn a_device_s_long_tailnet_names_never_widen_a_line_past_the_limit() {
+    use crate::client_tailnet::{TailnetDevice, TailnetIdentity, NAME_COLUMNS};
+    use darkmux_flow::hooks::display_columns;
+    let named = |login: String, name: String, host: String| TailnetIdentity {
+        login,
+        device: TailnetDevice { id: "nPHONE1CNTRL".into(), name, host_name: Some(host) },
+    };
+    let limit = "a".repeat(NAME_COLUMNS);
+    let at_limit = named(limit.clone(), limit.clone(), limit);
+    let long = named(
+        format!("{}{}", "長".repeat(200), "\u{2028}".repeat(30)),
+        format!("{}{}", "e\u{301}".repeat(300), "\u{2029}".repeat(30)),
+        format!("{}{}", "😀".repeat(100), "☺\u{FE0F}".repeat(30)),
+    );
+    let lines = |id: &TailnetIdentity| {
+        let mut client = adding_client();
+        client.tailnet = Some(id.clone());
+        [
+            crate::client_trust::remote_pairing_line("r-1", "4F7-K2Q", id),
+            crate::client_engines::added_line(&client, RequestVia::Tailnet, &flint_planned()),
+            crate::client_trust::tailnet_dialog_message("4F7-K2Q", id),
+        ]
+    };
+    for (long, at_limit) in lines(&long).iter().zip(lines(&at_limit).iter()) {
+        for (row, limit_row) in long.lines().zip(at_limit.lines()) {
+            assert!(display_columns(row) <= display_columns(limit_row), "{} > {}: {row}", display_columns(row), display_columns(limit_row));
+        }
+        assert_eq!(long.lines().count(), at_limit.lines().count(), "{long}");
+        assert!(long.contains('…'), "{long}");
+    }
+    assert!(lines(&long)[0].ends_with("`darkmux client approve --code 4F7-K2Q`"), "what follows the names is still there");
+}
+
+/// A client the add-line tests record: auto-approved, paired on the Mac.
+fn adding_client() -> ApprovedClient {
+    ApprovedClient {
+        name: "mux-bot".into(),
+        id: "c-0123456789abcdef".into(),
+        created: 0,
+        token_hash: "f".repeat(64),
+        auto_approved: SigningIdentity::parse("TEAM123/com.example.muxbot"),
+        tailnet: None,
+    }
+}
+
+/// The add of rec's Flint the harness's engine add plans.
+fn flint_planned() -> darkmux_profiles::engine::add::Planned {
+    use darkmux_profiles::engine::add::{ContextFrom, Planned};
+    Planned {
+        engine: darkmux_types::ManagedBackend::Flint,
+        endpoint: "flint".into(),
+        port: 8091,
+        profile: "flint".into(),
+        model: "flint-int4".into(),
+        n_ctx: 262_144,
+        n_ctx_from: ContextFrom::EngineStated,
+        text: String::new(),
+    }
+}
+
+/// (#3569 review) Two adds racing through the API: one lands, the other is
+/// told `conflict` (configured already), and the registry stays whole.
+#[tokio::test]
+async fn of_two_racing_api_adds_the_loser_is_told_conflict() {
+    let h = harness();
+    let token = paired(&h).await;
+    let body = || serde_json::json!({"engine": "flint"});
+    let (a, b) = tokio::join!(
+        call(&h, post("/client/engines", Some(&token), body())),
+        call(&h, post("/client/engines", Some(&token), body()))
+    );
+    let mut codes = vec![a.0, b.0];
+    codes.sort();
+    assert_eq!(codes, [200, 409], "{a:?} {b:?}");
+    let loser = if a.0 == 409 { a.1 } else { b.1 };
+    assert_eq!(loser["code"], "conflict", "{loser}");
+    assert!(loser["error"].as_str().unwrap().contains("configured already"), "{loser}");
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(h.dir.path().join("profiles.json")).unwrap()).unwrap();
+    assert_eq!(written["endpoints"].as_object().unwrap().len(), 1);
+}
+
+/// Each refusal of an add carries the code an app branches on.
+#[test]
+fn an_add_refusal_carries_its_code() {
+    use darkmux_profiles::engine::add::Refusal;
+    for (r, status, code) in [
+        (Refusal::Unavailable("x".into()), 409, "engine_unavailable"),
+        (Refusal::Configured("x".into()), 409, "conflict"),
+        (Refusal::Changed("x".into()), 409, "conflict"),
+        (Refusal::BadRequest("x".into()), 400, "bad_request"),
+        (Refusal::Registry("x".into()), 422, "unprocessable"),
+    ] {
+        let resp = crate::client_engines::refusal_response(&r);
+        assert_eq!(resp.status().as_u16(), status, "{r:?}");
+        let body = futures_body(resp);
+        assert_eq!(body["code"], code, "{r:?}");
+    }
+}
+
+/// Without a registry there is nothing to add to, named or on disk: both
+/// are refused `unprocessable` naming `darkmux init`, and neither asks the engines.
+#[test]
+fn an_add_without_a_registry_to_write_is_refused_and_asks_nothing() {
+    use darkmux_profiles::engine::add::{AddRequest, Refusal};
+    use darkmux_profiles::engine::detect::DetectedKind;
+    let req = AddRequest { engine: DetectedKind::Flint, model: None, n_ctx: None };
+    let asked = std::cell::Cell::new(false);
+    let found = |_: Option<&darkmux_types::ProfileRegistry>| {
+        asked.set(true);
+        Vec::new()
+    };
+    let none = crate::client_engines::add_in(None, &req, &found, &|_| true).unwrap_err();
+    assert!(matches!(&none, Refusal::Registry(m) if m.contains("run `darkmux init`")), "{none:?}");
+    let dir = tempfile::tempdir().unwrap();
+    let gone = crate::client_engines::add_in(Some(&dir.path().join("profiles.json")), &req, &found, &|_| true).unwrap_err();
+    assert!(matches!(&gone, Refusal::Registry(m) if m.contains("run `darkmux init`")), "{gone:?}");
+    assert!(!asked.get());
+}
+
+fn futures_body(resp: axum::response::Response) -> Value {
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let bytes = rt.block_on(axum::body::to_bytes(resp.into_body(), 1 << 16)).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
 }
 
 /// (#3560, part 4) The preview proxy's tests, on this harness.
