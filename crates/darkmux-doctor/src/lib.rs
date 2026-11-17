@@ -7561,19 +7561,13 @@ fn check_ram_headroom_load_projection(platform: &dyn darkmux_platform::Platform)
     // partial picture rather than a missing check.
     let catalog = engine::lmstudio().catalog().unwrap_or_default();
     let mut total_unloaded_gb = 0.0_f64;
+    let mut freed_gb = 0.0_f64;
     let mut pending: Vec<String> = Vec::new();
     for pm in &unloaded {
-        let size_gb = catalog
-            .iter()
-            .find(|m| m.model_key == pm.id)
-            .map(|m| m.size_bytes as f64 / 1_000_000_000.0)
-            .unwrap_or(0.0);
+        let (size_gb, freed, entry) = pending_load(pm, &catalog, &loaded);
         total_unloaded_gb += size_gb;
-        if size_gb > 0.0 {
-            pending.push(format!("{} ~{:.1} GB", pm.id, size_gb));
-        } else {
-            pending.push(format!("{} (size unknown)", pm.id));
-        }
+        freed_gb += freed;
+        pending.push(entry);
     }
 
     let reclaimable_gb = match reclaimable_gb_from(platform) {
@@ -7581,7 +7575,34 @@ fn check_ram_headroom_load_projection(platform: &dyn darkmux_platform::Platform)
         None => return skip("could not read reclaimable memory on this machine"),
     };
 
-    classify_load_projection(reclaimable_gb, total_unloaded_gb, &pending, profile_name)
+    // A reload unloads darkmux's undersized instance before it loads the new
+    // one, so what that instance holds is reclaimable for the load.
+    classify_load_projection(reclaimable_gb + freed_gb, total_unloaded_gb, &pending, profile_name)
+}
+
+/// One model the projection still has to load: its catalog size (0 when
+/// unknown), the memory its load frees first (what darkmux's undersized
+/// instance holds, unloaded before a reload), and how the summary names it.
+fn pending_load(
+    pm: &darkmux_types::ProfileModel,
+    catalog: &[darkmux_profiles::engine::ModelMeta],
+    loaded: &[darkmux_types::LoadedModel],
+) -> (f64, f64, String) {
+    let size_gb = catalog
+        .iter()
+        .find(|m| m.model_key == pm.id)
+        .map_or(0.0, |m| m.size_bytes as f64 / 1_000_000_000.0);
+    let named = if size_gb > 0.0 { format!("{} ~{size_gb:.1} GB", pm.id) } else { format!("{} (size unknown)", pm.id) };
+    let darkmux_crew::dispatch_internal::PreflightDecision::Reload { stale_identifier, .. } = preflight_for(pm, loaded)
+    else {
+        return (size_gb, 0.0, named);
+    };
+    let held = loaded
+        .iter()
+        .find(|m| m.identifier == stale_identifier)
+        .and_then(|m| darkmux_types::size::parse_size_gb(&m.size))
+        .unwrap_or(0.0);
+    (size_gb, held, format!("{named}, reloads `{stale_identifier}`, freeing ~{held:.1} GB"))
 }
 
 /// Pure verdict logic for the load-projection check. Extracted so the

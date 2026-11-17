@@ -297,6 +297,40 @@ fn projection_fails_when_the_rest_of_the_profile_would_not_fit() {
     assert!(c.message.ends_with("— load would swap or OOM"), "{}", c.message);
 }
 
+/// An `lms ps --json` row with the memory the instance holds.
+fn row_holding(identifier: &str, model: &str, context: u64, size_bytes: u64) -> String {
+    format!(
+        r#"{{"identifier":"{identifier}","modelKey":"{model}","status":"idle","contextLength":{context},"sizeBytes":{size_bytes}}}"#
+    )
+}
+
+/// An undersized darkmux instance is reloaded, and a dispatch unloads it
+/// first: the memory it holds comes back before the new load, so it is
+/// credited to what is reclaimable. A reload that does not fit even then
+/// still fails.
+#[serial_test::serial]
+#[test]
+fn projection_credits_an_undersized_instance_with_the_memory_its_reload_frees() {
+    let tight = |held: u64| {
+        Fakes::new(Some(PROFILES))
+            .loaded(&format!(
+                "[{},{}]",
+                row_holding("darkmux:big", "big", 8192, 1_000_000_000),
+                row_holding("darkmux:helper", "helper", 2048, held)
+            ))
+            .catalog(r#"[{"modelKey":"helper","type":"llm","sizeBytes":40000000000}]"#)
+            .free_gb(16)
+    };
+    let f = tight(40_000_000_000);
+    let c = f.projection();
+    assert_ne!(c.status, Status::Fail, "the reload frees what the instance holds: {}", c.message);
+    assert!(c.message.contains("reloads `darkmux:helper`, freeing ~40.0 GB"), "{}", c.message);
+    drop(f);
+    let f = tight(4_000_000_000);
+    let c = f.projection();
+    assert_eq!(c.status, Status::Fail, "a reload that is too big still fails: {}", c.message);
+}
+
 #[serial_test::serial]
 #[test]
 fn projection_skips_when_free_memory_cannot_be_read() {
