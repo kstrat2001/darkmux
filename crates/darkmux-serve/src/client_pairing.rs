@@ -6388,29 +6388,11 @@ pub(crate) fn run_dispatch_child(
     let stdout_bytes = out_reader.join().unwrap_or_default();
     let stderr_bytes = err_reader.join().unwrap_or_default();
     let stdout = String::from_utf8_lossy(&stdout_bytes);
-    // (#3505) A refused dispatch prints its refusal envelope: a failed run,
-    // carrying the envelope's code.
-    let mut refused_code = None;
-    // (#3578) A dispatch that failed (exit non-zero, or its envelope says
-    // `error`: the model's server refused the connection, say) still prints
-    // an envelope; it is a failed run carrying the envelope's error, never
-    // `done`.
-    let mut envelope_error = None;
-    if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(stdout.trim()) {
-        let result = v.get("result").and_then(Value::as_str);
-        if result != Some("refused") && result != Some("error") && status.success() {
-            return Ok(v);
-        }
-        if result == Some("refused") {
-            refused_code = v.get("code").and_then(Value::as_str).map(str::to_string);
-        }
-        envelope_error = v.get("error").and_then(Value::as_str).map(str::to_string);
-    }
-    let stderr = stderr_tail(&stderr_bytes);
-    let tail = match envelope_error {
-        Some(e) if !e.is_empty() && !stderr.contains(&e) => format!("{e}\n{stderr}").trim_end().to_string(),
-        _ => stderr,
+    let (refused_code, envelope_error) = match read_envelope(&stdout, status.success()) {
+        Ok(v) => return Ok(v),
+        Err(failed_with) => failed_with,
     };
+    let tail = failure_tail(envelope_error, stderr_tail(&stderr_bytes));
     #[cfg(unix)]
     let signal = std::os::unix::process::ExitStatusExt::signal(&status);
     #[cfg(not(unix))]
@@ -6418,6 +6400,34 @@ pub(crate) fn run_dispatch_child(
     let mut e = failed(&exit_reason(status.code(), signal), tail);
     e.code = refused_code.or_else(|| teardown.dispatch_error_code(spec));
     Err(e)
+}
+
+/// What a dispatch's `--json` envelope says: `Ok` with it for a run that
+/// succeeded, else the refusal code (#3505: a refused dispatch prints its
+/// refusal envelope) and the envelope's error. (#3578) A dispatch that
+/// failed (exit non-zero, or its envelope says `error`: the model's server
+/// refused the connection, say) still prints an envelope; it is a failed
+/// run carrying the envelope's error, never `done`.
+fn read_envelope(stdout: &str, success: bool) -> Result<Value, (Option<String>, Option<String>)> {
+    let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(stdout.trim()) else {
+        return Err((None, None));
+    };
+    let field = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    match v.get("result").and_then(Value::as_str) {
+        Some("refused") => Err((field("code"), field("error"))),
+        Some("error") => Err((None, field("error"))),
+        _ if !success => Err((None, field("error"))),
+        _ => Ok(v),
+    }
+}
+
+/// A failed run's error text: the envelope's error first, unless the
+/// stderr tail already says it.
+fn failure_tail(envelope_error: Option<String>, stderr: String) -> String {
+    match envelope_error {
+        Some(e) if !e.is_empty() && !stderr.contains(&e) => format!("{e}\n{stderr}").trim_end().to_string(),
+        _ => stderr,
+    }
 }
 
 /// The most of a failed child's stderr a status keeps.

@@ -1117,7 +1117,7 @@ fn each_engines_unavailable_carries_the_code_its_dispatch_refusal_carries() {
     let dir = tempfile::tempdir().unwrap();
     // LM Studio: a model it has not downloaded is the planner's
     // `UnknownModelKey`, `engine_unavailable`.
-    let lms = LmStudioAnswer { loaded: Ok(vec![]), catalog: Ok(vec![meta("other")]) }.judge(&lms_model());
+    let lms = LmStudioAnswer { server_up: true, server_startable: false, loaded: Ok(vec![]), catalog: Ok(vec![meta("other")]) }.judge(&lms_model());
     assert_eq!((state(&lms), code(&lms)), (AvailabilityState::Unavailable, Some("engine_unavailable")), "{lms:?}");
 
     // Tensorfold: `plan`'s `verified_version` is `engine_unavailable`, its
@@ -1181,7 +1181,7 @@ fn no_code_where_no_dispatch_refusal_fits() {
     let dir = tempfile::tempdir().unwrap();
     let mut no_ctx = lms_model();
     no_ctx.n_ctx = None;
-    let lms = LmStudioAnswer { loaded: Ok(vec![]), catalog: Ok(vec![meta("qwen")]) }.judge(&no_ctx);
+    let lms = LmStudioAnswer { server_up: true, server_startable: false, loaded: Ok(vec![]), catalog: Ok(vec![meta("qwen")]) }.judge(&no_ctx);
     assert_eq!((state(&lms), code(&lms)), (AvailabilityState::Unavailable, None));
     let mut no_port = tf_model(free_port(), "[]");
     no_port.endpoint.as_mut().unwrap().port = None;
