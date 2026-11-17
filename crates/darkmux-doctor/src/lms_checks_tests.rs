@@ -113,7 +113,11 @@ impl Drop for Fakes {
 }
 
 fn row(identifier: &str, model: &str) -> String {
-    format!(r#"{{"identifier":"{identifier}","modelKey":"{model}","status":"idle","contextLength":8192}}"#)
+    row_at(identifier, model, 8192)
+}
+
+fn row_at(identifier: &str, model: &str, context: u64) -> String {
+    format!(r#"{{"identifier":"{identifier}","modelKey":"{model}","status":"idle","contextLength":{context}}}"#)
 }
 
 fn ps(rows: &[(&str, &str)]) -> String {
@@ -152,12 +156,36 @@ fn profile_match_warns_when_nothing_is_loaded() {
 #[serial_test::serial]
 #[test]
 fn profile_match_passes_naming_every_profile_whose_default_model_is_loaded() {
-    // `big` under its namespaced identifier, `other` under its plain one.
-    let _f = Fakes::new(Some(PROFILES)).loaded(&ps(&[("darkmux:big", "big"), ("other", "other")]));
+    let _f = Fakes::new(Some(PROFILES)).loaded(&ps(&[("darkmux:big", "big"), ("darkmux:other", "other")]));
     let c = check_profile_loaded_match();
     assert_eq!(c.status, Status::Pass, "{}", c.message);
     assert_eq!(c.message, "loaded state matches profile(s): p, q");
     assert!(c.hint.is_none());
+}
+
+/// (Contract 4) A profile matches only on the instance a dispatch would
+/// use: darkmux's own at the profile's window or more. A copy darkmux did
+/// not load never matches, and neither does darkmux's own below the window;
+/// each is named with the window it is loaded at.
+#[serial_test::serial]
+#[test]
+fn profile_match_never_counts_a_user_copy_or_an_undersized_instance() {
+    let user = Fakes::new(Some(PROFILES)).loaded(&format!("[{}]", row_at("big", "big", 8192)));
+    let c = check_profile_loaded_match();
+    assert_eq!(c.status, Status::Warn, "a user copy is never dispatched to: {}", c.message);
+    assert!(c.message.contains("`big`") && c.message.contains("never uses"), "{}", c.message);
+    assert!(c.hint.as_deref().is_some_and(|h| h.contains("--identifier darkmux:big")), "{:?}", c.hint);
+    drop(user);
+    let small = Fakes::new(Some(PROFILES)).loaded(&format!("[{}]", row_at("darkmux:big", "big", 4096)));
+    let c = check_profile_loaded_match();
+    assert_eq!(c.status, Status::Warn, "an undersized instance is reloaded: {}", c.message);
+    assert!(c.message.contains("4096") && c.message.contains("8192"), "{}", c.message);
+    let hint = c.hint.unwrap_or_default();
+    assert!(hint.contains("`lms unload darkmux:big`, then `lms load big --context-length 8192 --identifier darkmux:big`"), "{hint}");
+    drop(small);
+    let _big = Fakes::new(Some(PROFILES)).loaded(&format!("[{}]", row_at("darkmux:big", "big", 16384)));
+    let c = check_profile_loaded_match();
+    assert_eq!((c.status, c.message.as_str()), (Status::Pass, "loaded state matches profile(s): p"));
 }
 
 #[serial_test::serial]
@@ -210,16 +238,30 @@ fn projection_skips_when_no_profile_matches() {
 
 #[serial_test::serial]
 #[test]
-fn projection_passes_when_the_active_profile_is_fully_resident_whichever_way_each_model_is_named() {
-    // `big` by its plain identifier (under another model key), `helper` by its
-    // model key under a custom identifier, `extra` by its namespaced
-    // identifier: each counts as loaded.
+fn projection_passes_when_the_active_profile_is_fully_resident_as_darkmuxs_own_instances() {
     let f = Fakes::new(Some(PROFILES))
-        .loaded(&ps(&[("big", "vendor/big-gguf"), ("my-helper", "helper"), ("darkmux:extra", "x-key")]))
+        .loaded(&ps(&[("darkmux:big", "big"), ("darkmux:helper", "helper"), ("darkmux:extra", "extra")]))
         .free_gb(64);
     let c = f.projection();
     assert_eq!(c.status, Status::Pass, "{}", c.message);
     assert_eq!(c.message, "active profile `p` fully resident");
+}
+
+/// (Contract 4) A copy darkmux did not load is not resident for the
+/// projection: a dispatch loads darkmux's own beside it, so it is counted
+/// as still to load, and a profile whose default model is resident only so
+/// is not the active one.
+#[serial_test::serial]
+#[test]
+fn projection_counts_a_user_copy_as_still_to_load() {
+    let f = Fakes::new(Some(PROFILES))
+        .loaded(&ps(&[("darkmux:big", "big"), ("helper", "helper"), ("my-extra", "extra")]))
+        .free_gb(64);
+    let c = f.projection();
+    assert!(c.message.contains("(helper (size unknown), extra (size unknown))"), "{}", c.message);
+    drop(f);
+    let f = Fakes::new(Some(PROFILES)).loaded(&ps(&[("big", "big")])).free_gb(64);
+    assert_eq!(skipped(&f.projection()), "no profile matches loaded state");
 }
 
 #[serial_test::serial]
