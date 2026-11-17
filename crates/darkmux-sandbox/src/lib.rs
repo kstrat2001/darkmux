@@ -61,10 +61,15 @@ pub enum Network {
     Default,
 }
 
-/// Resource limits. `None` leaves the backend's own.
+/// Resource limits. `None` leaves the backend's own. Docker holds both in
+/// the container's cgroup; Seatbelt holds `pids` with the user's
+/// `RLIMIT_NPROC` and watches `memory` ([`seatbelt`]'s doc says how far
+/// each reaches); Landlock holds neither ([`landlock`]'s doc).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Limits {
-    /// Memory, in the backend's size syntax (`4g`).
+    /// Memory, in Docker's size syntax (`4g`: a whole number, then `b`,
+    /// `k`, `m` or `g`). A backend that holds memory refuses a value that
+    /// is not one.
     pub memory: Option<String>,
     /// Processes the sandbox may hold at once.
     pub pids: Option<u64>,

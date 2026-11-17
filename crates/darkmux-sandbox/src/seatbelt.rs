@@ -11,8 +11,27 @@
 //!   runs this host's programs, read-only, and `policy.image` is unused. It
 //!   needs an `entrypoint` (a host program), since there is no image to
 //!   supply one.
-//! - **Limit memory or processes, or switch user.** `limits` and `user` are
-//!   unused; the process runs as the caller's user.
+//! - **Switch user.** `user` is unused; the process runs as the caller's
+//!   user.
+//! - **Hold processes and memory the way a container does (#3112).**
+//!   `limits.pids` is the kernel's `RLIMIT_NPROC`, which macOS counts per
+//!   USER, not per sandbox: a fork in the sandbox fails once the user's
+//!   processes number what they did at launch plus `pids`. So the sandbox
+//!   may start about `pids` processes (threads are not counted), and the
+//!   user's other processes starting or ending while it runs take or give
+//!   back room. The limit is set on the sandboxed program alone, so nothing
+//!   else of the user's is held by it, and a fork bomb stops at `pids` more
+//!   rather than at the system's per-user cap, where nothing of the user's
+//!   could start. `limits.memory` is a watch, not a boundary ([`WATCH`]):
+//!   macOS gives a process no memory ceiling it can set on itself
+//!   (`RLIMIT_AS` and `RLIMIT_DATA` are refused below the address space
+//!   every process already maps, and `RLIMIT_RSS` is not enforced), so the
+//!   resident memory of the sandbox's session is summed every second and
+//!   the sandbox is stopped (exit 137, its reason on stderr) once the sum is
+//!   over the limit. It can be over for up to a second; a process that
+//!   started a session of its own is neither counted nor stopped. Docker
+//!   holds both inside the container's cgroup: tasks (threads included) and
+//!   the memory the kernel charges it, page cache included.
 //! - **Publish one port, or hold a bind to the loopback (#3559).** The
 //!   default network may bind any port on ANY local address: `0.0.0.0` and
 //!   this host's LAN address included, so a server that binds every address
@@ -48,7 +67,7 @@
 //! `TMPDIR`), and, for one created but not started, its start script. The
 //! launcher removes the directory when the sandbox exits.
 
-use crate::{Access, BackendKind, Having, Listed, Mount, Network, Query, SandboxBackend, SandboxHandle, SandboxPolicy};
+use crate::{Access, BackendKind, Having, Limits, Listed, Mount, Network, Query, SandboxBackend, SandboxHandle, SandboxPolicy};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -129,16 +148,53 @@ mkdir -m 700 "$d/tmp" && printf '%s' "$2" > "$d/profile.sb" && printf '%s' "$3" 
 /// runtime's tool command does) ends too. Only one that started a session of
 /// its own (`setsid`) is not reached: unlike a container's, this sandbox
 /// does not end everything in it.
-const LAUNCH: &str = r#"wd=$1; shift
+const LAUNCH: &str = r#"wd=$1; pids=$2; mem=$3; shift 3
 echo $$ > "$d/pid" && ps -o lstart= -p $$ > "$d/started" || exit 125
 {GUARD} "$$" </dev/null >/dev/null 2>&1 &
+guard=$!
+if [ -n "$mem" ]; then {WATCH} "$$" "$mem" "$guard" "$d/limit" </dev/null >/dev/null 2>&1 & fi
 trap : TERM INT HUP
 [ -z "$wd" ] || cd "$wd" || { rm -rf "$d"; exit 125; }
 [ -n "$1" ] || { echo "seatbelt: no program to run (a policy needs an entrypoint)" >&2; rm -rf "$d"; exit 125; }
-/usr/bin/sandbox-exec -f "$d/profile.sb" "$@"
+nproc=
+if [ -n "$pids" ]; then
+  n=$(/bin/ps -A -o uid= | /usr/bin/awk -v u="$(/usr/bin/id -u)" '$1 == u { n++ } END { print n + 0 }')
+  [ "$n" -gt 0 ] 2>/dev/null || { echo "seatbelt: could not count this user's processes" >&2; rm -rf "$d"; exit 125; }
+  nproc=$((n + pids)); h=$(ulimit -Hu)
+  [ "$h" = unlimited ] || [ "$nproc" -le "$h" ] || nproc=$h
+fi
+( [ -z "$nproc" ] || ulimit -u "$nproc" || { echo "seatbelt: could not limit the sandbox to $nproc processes" >&2; exit 125; }
+  exec /usr/bin/sandbox-exec -f "$d/profile.sb" "$@" )
 rc=$?
+[ ! -f "$d/limit" ] || cat "$d/limit" >&2
 g=$$
 "#;
+
+/// (#3112) The memory ceiling's watch, beside the guard ([`LAUNCH`]): its
+/// arguments the launcher's pid, the limit in bytes, the guard's pid and the
+/// file it writes its reason to. Every second, while the launcher is
+/// its parent, it sums the resident memory of every live process in the
+/// launcher's session (the sandbox, the launcher, the guard and itself; a
+/// process that started a session of its own is not counted, nor reached),
+/// and once the sum is over the limit, writes why and kills every one of
+/// them but the launcher, the guard and itself, listing them again until
+/// none is left (at most 200 times). The launcher then sees its program
+/// end, says why, and ends as it always does. macOS has no memory ceiling a
+/// process can set on itself and its children: `RLIMIT_AS` and
+/// `RLIMIT_DATA` are refused below the address space every process already
+/// maps (about 400 GiB), and `RLIMIT_RSS` is not enforced. So this is
+/// detection with a window, not a boundary: a program can hold more than
+/// the limit for up to a second, as much more as it can allocate in that
+/// time. Each look lists every process on the host (measured: 0.24 CPU
+/// seconds over 10 s with 1,000 running), about 2.5% of one core per
+/// running sandbox. No single quote: it runs inside one.
+const WATCH: &str = concat!(
+    r#"/usr/bin/perl -e 'my ($l, $cap, $g, $f) = @ARGV; my %keep = ($$ => 1, $l => 1, $g => 1); "#,
+    r#"sub mine { map { $_->[0] } grep { $_->[0] > 1 && $_->[2] !~ /^Z/ && syscall(310, $_->[0] + 0) == $l } map { [split] } `/bin/ps -A -o pid=,rss=,stat=` } "#,
+    r#"sub held { my $sum = 0; for (`/bin/ps -A -o pid=,rss=,stat=`) { my ($p, $r, $s) = split; $sum += $r * 1024 if $p > 1 && $s !~ /^Z/ && syscall(310, $p + 0) == $l; } $sum } "#,
+    r#"while (getppid() == $l) { my $sum = held(); if ($sum > $cap) { open(F, ">", $f); print F "seatbelt: stopped: the sandbox held $sum bytes resident, over its memory limit of $cap bytes\n"; close(F); "#,
+    r#"for (1 .. 200) { my @p = grep { !$keep{$_} } mine(); last unless @p; kill("KILL", @p); select(undef, undef, undef, 0.01); } exit 0; } select(undef, undef, undef, 1); }'"#
+);
 
 /// (#3559) Perl that kills every process in session `$ARGV[0]` but itself,
 /// zombies and pids 0 and 1, listing them again until none is left (at most
@@ -186,7 +242,7 @@ exit $rc
 
 /// The whole launcher script.
 fn launcher() -> String {
-    format!("{}{LAUNCHED}", LAUNCH.replacen("{GUARD}", GUARD, 1))
+    format!("{}{LAUNCHED}", LAUNCH.replacen("{GUARD}", GUARD, 1).replacen("{WATCH}", WATCH, 1))
 }
 
 /// The launcher's guard ([`LAUNCH`]), its launcher's pid its argument: the
@@ -483,6 +539,44 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// A size in Docker's syntax (`--memory`'s): a whole number, then
+/// optionally `b`, `k`, `m` or `g` (binary units, either case), then
+/// optionally `b`. `None` when it is not one.
+pub(crate) fn size_bytes(text: &str) -> Option<u64> {
+    let lower = text.to_ascii_lowercase();
+    let digits = lower.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let shift = match &lower[digits.len()..] {
+        "" | "b" => 0,
+        "k" | "kb" => 10,
+        "m" | "mb" => 20,
+        "g" | "gb" => 30,
+        _ => return None,
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()?.checked_mul(1 << shift)
+}
+
+/// The launcher's `$2` and `$3`: the processes the sandbox may add to its
+/// user's, and its memory limit in bytes, each empty for none. `Err` names a
+/// memory limit that is not a size.
+fn limit_args(limits: &Limits) -> Result<[String; 2], String> {
+    let pids = limits.pids.map(|n| n.to_string()).unwrap_or_default();
+    let memory = match &limits.memory {
+        None => String::new(),
+        Some(text) => size_bytes(text).ok_or_else(|| format!("seatbelt: memory limit {text:?} is not a size (a whole number, then b, k, m or g)"))?.to_string(),
+    };
+    Ok([pids, memory])
+}
+
+/// A command that fails (125), saying `message`.
+fn failing(message: &str) -> Command {
+    let mut cmd = Command::new(SH);
+    cmd.arg("-c").arg(r#"echo "$1" >&2; exit 125"#).arg("sh").arg(message);
+    cmd
+}
+
 impl SandboxBackend for SeatbeltBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Seatbelt
@@ -507,6 +601,10 @@ impl SandboxBackend for SeatbeltBackend {
     fn run(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle) {
         let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: policy.name.clone() };
         let Some(dir) = dir_of(&policy.name) else { return (refused(&policy.name), handle) };
+        let limits = match limit_args(&policy.limits) {
+            Ok(limits) => limits,
+            Err(why) => return (failing(&why), handle),
+        };
         let _ = std::fs::create_dir_all(state_root());
         let mut args = vec![
             dir.to_string_lossy().into_owned(),
@@ -514,6 +612,7 @@ impl SandboxBackend for SeatbeltBackend {
             Self::labels(policy),
             policy.workdir.clone().unwrap_or_default(),
         ];
+        args.extend(limits);
         args.extend(Self::program(policy));
         let mut cmd = Self::launcher_script(&format!("{PREPARE}shift 3\n{}", launcher()), &args, &Self::environment(policy, &dir));
         if !policy.stdin {
@@ -525,10 +624,15 @@ impl SandboxBackend for SeatbeltBackend {
     fn create(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle) {
         let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: policy.name.clone() };
         let Some(dir) = dir_of(&policy.name) else { return (refused(&policy.name), handle) };
+        let limits = match limit_args(&policy.limits) {
+            Ok(limits) => limits,
+            Err(why) => return (failing(&why), handle),
+        };
         let _ = std::fs::create_dir_all(state_root());
         let env = Self::environment(policy, &dir);
         let launch_args: Vec<String> = [dir.to_string_lossy().into_owned(), policy.workdir.clone().unwrap_or_default()]
             .into_iter()
+            .chain(limits)
             .chain(Self::program(policy))
             .collect();
         let start = format!(
@@ -614,6 +718,10 @@ pub(crate) fn parse_listing(kind: BackendKind, query: &Query, listing: &str) -> 
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "seatbelt_limits_tests.rs"]
+mod limits_tests;
 
 #[cfg(test)]
 mod tests {
