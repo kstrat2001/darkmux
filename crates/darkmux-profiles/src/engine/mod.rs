@@ -297,6 +297,13 @@ pub(crate) fn assert_declaration_holds(engine: &dyn Engine, unload_probe: &str) 
 }
 
 
+/// (#3578) Start LM Studio's local server when it is off and on this
+/// machine, so a model darkmux made resident there can answer a dispatch.
+/// `Ok(true)` when darkmux started it.
+pub fn ensure_lmstudio_server() -> anyhow::Result<bool> {
+    crate::lms::ensure_server_running()
+}
+
 #[cfg(test)]
 mod local_engine_tests {
     use super::*;
@@ -400,11 +407,4 @@ mod local_engine_tests {
         assert_eq!(bogus.0, Loading::Unknown, "a bad value is not LM Studio");
         assert!(bogus.2.unwrap()[0].is_managed(), "a bad value moves no model; preflight refuses it");
     }
-}
-
-/// (#3578) Start LM Studio's local server when it is off and on this
-/// machine, so a model darkmux made resident there can answer a dispatch.
-/// `Ok(true)` when darkmux started it.
-pub fn ensure_lmstudio_server() -> anyhow::Result<bool> {
-    crate::lms::ensure_server_running()
 }
