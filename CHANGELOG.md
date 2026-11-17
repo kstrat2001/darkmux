@@ -204,9 +204,10 @@ darkmux release.
   decide when they agree on the machine (one hosted id on two providers, the same managed model listed
   twice), and decide nothing when they disagree (`run stats` reads `hardware: null`; `lab submit`
   takes `--hardware` under the same contradiction checks as one entry, and otherwise asks for it). A run
-  from before the snapshot reads the registry by the same rule. `run stats` adds `compactor_calls_here`
-  for a run served elsewhere: its compactor calls to a model this machine served (`null` when a call's
-  model is not placed by the snapshot). In a set, a run served elsewhere with none no longer counts as
+  from before the snapshot reads the registry by the same rule, and `flint` (the name a managed Flint
+  server always answers to) names the managed Flint model. `run stats` adds `compactor_calls_here` for a
+  run served elsewhere: its compactions on a model this machine served, each `compaction.start`
+  counting whether or not a reply followed (`null` when one's model is not placed by the snapshot). In a set, a run served elsewhere with none no longer counts as
   overlapping a local run, and an energy cost withheld because of a run served elsewhere says so.
 
 - **A mission step waiting its turn reads waiting, not running (#3195).** Steps admitted together

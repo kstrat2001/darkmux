@@ -1434,3 +1434,17 @@ fn a_run_before_the_snapshot_reads_the_registry_by_the_wire_name() {
     assert!(r.is_err(), "{r:?}");
     assert_eq!(served_by("r1", "q", None, &hosted_then_peer, Some(SubmittingMachine)).unwrap().hardware, SubmittingMachine);
 }
+
+/// (#3644 third review) Before the snapshot, a Flint run's `flint` names
+/// the profile's managed Flint model, not a hosted seat beside it.
+#[test]
+fn a_flint_run_before_the_snapshot_names_its_managed_flint_model() {
+    let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(json!({
+        "profiles": {"p": {"models": [{"id": "claude-opus-4", "endpoint": "anthropic"}, {"id": "flint-int4", "endpoint": "fl"}]}},
+        "endpoints": {"fl": {"managed": "flint", "port": 8092}, "anthropic": {"url": "https://api.anthropic.com/v1"}}}))
+    .unwrap();
+    reg.materialize_endpoints();
+    let named = profile_models_named(&reg.profiles["p"].models, "flint");
+    assert_eq!(named.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["flint-int4"]);
+    assert_eq!(served_by("r1", "flint", None, &named, None).unwrap().hardware, SubmittingMachine);
+}

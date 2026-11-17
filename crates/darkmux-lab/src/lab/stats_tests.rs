@@ -1830,3 +1830,48 @@ fn compactor_calls_here_is_read_only_for_a_run_served_elsewhere() {
     let local = busy_run("darkmux:m", Some(served("managed", Some("submitting-machine"))));
     assert_eq!(local.compactor_calls_here, None);
 }
+
+/// (#3644 third review) The runtime writes `compaction.call` only for a
+/// compactor call that got a reply. A local compaction that timed out,
+/// errored or was killed leaves only its `compaction.start`, and still drew
+/// on this machine: each start counts, placed by its `requested_model`.
+#[test]
+fn a_compaction_that_got_no_reply_still_counts_as_work_here() {
+    let start = |model: Option<&str>| {
+        let mut e = serde_json::json!({"type": "compaction.start", "generation": 1, "ts": 5});
+        if let Some(m) = model {
+            e["requested_model"] = m.into();
+        }
+        line(e)
+    };
+    let call = line(serde_json::json!({"type": "compaction.call", "generation": 1, "ts": 6, "requested_model": "darkmux:qwen3-4b"}));
+    let snap: Vec<crate::lab::manifest::ModelHardware> = serde_json::from_value(serde_json::json!([
+        {"model": "claude-opus-4", "from": "provider", "hardware": "unknown", "provider": "Anthropic API"},
+        {"model": "qwen3-4b", "from": "managed", "hardware": "submitting-machine"},
+    ]))
+    .unwrap();
+    let timed_out = start(Some("darkmux:qwen3-4b"));
+    assert_eq!(compactor_calls_here(&timed_out, Some(&snap)), Some(1), "a start with no reply drew here");
+    let answered = format!("{}{call}", start(Some("darkmux:qwen3-4b")));
+    assert_eq!(compactor_calls_here(&answered, Some(&snap)), Some(1), "a start and its reply are one compaction");
+    assert_eq!(compactor_calls_here(&start(None), Some(&snap)), None, "a start naming no model cannot be placed");
+    assert_eq!(compactor_calls_here(&call, Some(&snap)), Some(1), "a trajectory with replies and no starts");
+}
+
+/// (#3644 third review) A managed Flint server always answers to `flint`
+/// (rec has no `--name`), so a Flint run sends `flint`, never its snapshot
+/// entry's id. In a profile beside a hosted seat, that name is the managed
+/// entry's, and the run is this machine's, as `lab submit` reads it.
+#[test]
+fn a_flint_run_is_its_managed_entry_beside_a_hosted_seat() {
+    let snap = snapshot_of(serde_json::json!({
+        "profiles": {"p": {"models": [{"id": "flint-int4", "n_ctx": 262144, "endpoint": "fl"},
+            {"id": "claude-opus-4", "endpoint": "anthropic"}]}},
+        "endpoints": {"fl": {"managed": "flint", "port": 8092}, "anthropic": {"url": "https://api.anthropic.com/v1"}}}));
+    let snapshot: Vec<crate::lab::manifest::ModelHardware> = serde_json::from_value(snap.clone()).unwrap();
+    assert_eq!(served_hardware(Some(&snapshot), Some("flint")), Some(darkmux_types::Hardware::SubmittingMachine));
+    let by = crate::lab::submit::served_by("r1", "flint", Some(&snapshot), &[], None).unwrap();
+    assert_eq!(by.hardware, darkmux_types::Hardware::SubmittingMachine, "run stats and lab submit agree");
+    let s = busy_run("flint", Some(snap));
+    assert_eq!((s.hardware, s.pkg_w_busy), (Some(darkmux_types::Hardware::SubmittingMachine), Some(47.0)));
+}

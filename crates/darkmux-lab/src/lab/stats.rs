@@ -399,10 +399,10 @@ pub struct RunStats {
     /// was doing meanwhile is still on record; never the run's figures.
     /// `None` for every other run, and with no telemetry in the window.
     pub this_machine: Option<MachineReadings>,
-    /// (2.5.0) For a run another machine served: how many of its compactor
-    /// calls (`compaction.call`) went to a model the snapshot says this
-    /// machine served, the run's own draw on this machine. `Some(0)` when
-    /// it made none; `None` when a call's model is one the snapshot does
+    /// (2.5.0) For a run another machine served: how many of its
+    /// compactions (each `compaction.start`, answered or not) went to a
+    /// model the snapshot says this machine served, the run's own draw on
+    /// this machine. `Some(0)` when it made none; `None` when a call's model is one the snapshot does
     /// not place (darkmux cannot say where it ran), and for every run this
     /// machine served or did not record.
     pub compactor_calls_here: Option<u64>,
@@ -516,22 +516,40 @@ pub(crate) fn served_hardware(
     }
 }
 
-/// (2.5.0) How many of the run's compactor calls went to a model the
-/// snapshot says this machine served; `None` when one went to a model it
-/// does not place. Only the entries naming the model count: a compactor
-/// outside the profile is not placed by what the profile's models say.
+/// (2.5.0) How many of the run's compactions went to a model the snapshot
+/// says this machine served; `None` when one went to a model it does not
+/// place. Each `compaction.start` counts, placed by its `requested_model`,
+/// whether or not a reply followed: a call that timed out, errored or was
+/// killed drew here too, and only one that got a reply writes
+/// `compaction.call`. A trajectory with replies and no starts counts its
+/// replies. Only the entries naming the model place it: a compactor outside
+/// the profile is not placed by what the profile's models say.
 pub(crate) fn compactor_calls_here(trajectory: &str, snapshot: Option<&[crate::lab::manifest::ModelHardware]>) -> Option<u64> {
+    compactor_models(trajectory).iter().try_fold(0, |here, model| match placed(snapshot?, model.as_deref()?)? {
+        darkmux_types::Hardware::SubmittingMachine => Some(here + 1),
+        darkmux_types::Hardware::Unknown => Some(here),
+    })
+}
+
+/// The model each compaction asked for: one per `compaction.start` (`None`
+/// where a start named none), or per `compaction.call` in a trajectory
+/// with no starts.
+fn compactor_models(trajectory: &str) -> Vec<Option<String>> {
     use darkmux_trajectory::event::{parse_line, TrajectoryEvent};
-    let mut here = 0;
-    for line in trajectory.lines() {
-        let Some(TrajectoryEvent::CompactionCall(c)) = parse_line(line) else { continue };
-        let named = crate::lab::manifest::snapshot_matches(snapshot?, &c.requested_model);
-        match agreed(named.into_iter().map(|e| e.hardware))? {
-            darkmux_types::Hardware::SubmittingMachine => here += 1,
-            darkmux_types::Hardware::Unknown => {}
+    let (mut starts, mut replies) = (Vec::new(), Vec::new());
+    for event in trajectory.lines().filter_map(parse_line) {
+        match event {
+            TrajectoryEvent::CompactionStart(s) => starts.push(s.requested_model),
+            TrajectoryEvent::CompactionCall(c) => replies.push(Some(c.requested_model)),
+            _ => {}
         }
     }
-    Some(here)
+    if starts.is_empty() { replies } else { starts }
+}
+
+/// The machine the snapshot entries naming `model` agree on.
+fn placed(snapshot: &[crate::lab::manifest::ModelHardware], model: &str) -> Option<darkmux_types::Hardware> {
+    agreed(crate::lab::manifest::snapshot_matches(snapshot, model).into_iter().map(|e| e.hardware))
 }
 
 /// The one value every item is, when there is at least one.

@@ -1039,13 +1039,23 @@ fn agreed_n_ctx(models: &[darkmux_types::ProfileModel]) -> Option<u64> {
 }
 
 /// The models of a profile a dispatched name could be, by the same rule
-/// as the run's snapshot: the wire name's kind first.
+/// as the run's snapshot: the wire name's kind first, and `flint` names a
+/// managed Flint model.
 pub fn profile_models_named(models: &[darkmux_types::ProfileModel], dispatched: &str) -> Vec<darkmux_types::ProfileModel> {
     use darkmux_types::HardwareBasis;
     let managed = |m: &darkmux_types::ProfileModel| {
         matches!(m.endpoint.as_ref().map_or(HardwareBasis::Managed, |e| e.hardware_basis()), HardwareBasis::Managed)
     };
-    crate::lab::manifest::by_wire_name(models, dispatched, |m, id| m.id == id || m.identifier.as_deref() == Some(id), managed)
+    // A managed Flint server answers to `flint` whatever its model's id.
+    let flint = |m: &darkmux_types::ProfileModel| {
+        m.endpoint.as_ref().is_some_and(|e| {
+            e.kind() == Ok(darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Flint))
+        })
+    };
+    let names = |m: &darkmux_types::ProfileModel, id: &str| {
+        m.id == id || m.identifier.as_deref() == Some(id) || (id == darkmux_profiles::engine::flint::SERVED_NAME && flint(m))
+    };
+    crate::lab::manifest::by_wire_name(models, dispatched, names, managed)
         .into_iter()
         .cloned()
         .collect()

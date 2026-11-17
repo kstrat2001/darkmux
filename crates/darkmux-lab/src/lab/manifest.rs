@@ -216,13 +216,20 @@ pub fn by_wire_name<'a, T>(
 }
 
 /// The snapshot entries a dispatched model name could be ([`by_wire_name`]).
+/// A managed Flint server answers to `flint` whatever its model's id (rec
+/// has no `--name`), so that name also names every managed entry: the
+/// snapshot does not record which managed engine an entry ran on, and
+/// every managed entry is this machine's, so reading them together never
+/// changes the answer. An endpoint's model with the literal id `flint` is
+/// still taken first, by the wire name's kind.
 pub fn snapshot_matches<'a>(snapshot: &'a [ModelHardware], dispatched: &str) -> Vec<&'a ModelHardware> {
-    by_wire_name(
-        snapshot,
-        dispatched,
-        |e, id| e.model == id || e.identifier.as_deref() == Some(id),
-        |e| e.from == HardwareFrom::Managed,
-    )
+    let managed = |e: &ModelHardware| e.from == HardwareFrom::Managed;
+    let names = |e: &ModelHardware, id: &str| {
+        e.model == id
+            || e.identifier.as_deref() == Some(id)
+            || (id == darkmux_profiles::engine::flint::SERVED_NAME && managed(e))
+    };
+    by_wire_name(snapshot, dispatched, names, managed)
 }
 
 /// (#3397) The model a run's replies say answered, from its trajectory's
