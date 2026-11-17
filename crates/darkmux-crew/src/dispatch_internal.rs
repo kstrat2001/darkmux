@@ -11591,6 +11591,7 @@ impl DispatchSampler {
             thermal_elapsed_ms,
             &self.host_out,
             self.thermal_stop_file.as_deref(),
+            self.budget_pacer.as_ref().is_some_and(crate::budget::BudgetPacer::is_pausing),
         );
         // Every state change (pause/resume/breaker) is a
         // `dispatch.rest`-family flow record, so a slowed or stopped run

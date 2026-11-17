@@ -102,7 +102,7 @@ impl ScenarioDriver {
         self.source.advance(self.tick_ms);
         self.at_ms = self.at_ms.saturating_add(self.tick_ms);
         let reading = self.source.read();
-        let events = self.pair.tick(&reading, self.tick_ms, &self.host_out, self.stop_file.as_deref());
+        let events = self.pair.tick(&reading, self.tick_ms, &self.host_out, self.stop_file.as_deref(), false);
         let pace = read_pace(&self.host_out);
         self.ticks.push(TickRecord { at_ms: self.at_ms, reading, events, pace });
         self.ticks.last().expect("just pushed")

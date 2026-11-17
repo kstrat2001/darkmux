@@ -241,13 +241,25 @@ enum State {
 /// working, the battery keeps draining, and nothing is checking it.
 /// Deferring is only safe for a condition that ALREADY satisfies "stop the
 /// run."
+///
+/// # Letting go
+///
+/// A release follows `pace_file`'s rule for every writer: it is written
+/// only when no other writer holds a live pause, and it restores the thermal
+/// duty cycle's instruction when one is in force ([`crate::pace_file::release`]).
+/// It is decided by the others' live state, not by whether the file still
+/// carries this governor's pause: a thermal resume that landed while this
+/// governor held its pause wrote nothing, so the file may still carry
+/// thermal's last pause, and this governor is the one that must let it go.
 pub struct BatteryGovernor {
     config: PowerPolicyConfig,
     state: State,
     /// Whether the pace file currently carries THIS governor's pause. Goes
-    /// false whenever the thermal governor takes the file over, which is
-    /// what makes the re-assert on the next free tick unconditional rather
-    /// than dependent on the heartbeat happening to come due.
+    /// false whenever the thermal governor takes the file over with its own
+    /// pause, which is what makes the re-assert on the next free tick
+    /// unconditional rather than dependent on the heartbeat happening to
+    /// come due. It drives only that re-assert; a release is gated on the
+    /// other writers' live state (see "Letting go" above).
     pace_owned: bool,
     /// Whether this run type can be resumed from a pace pause. `true` for
     /// the container-backed dispatch path, whose pause is an in-memory rest
@@ -374,12 +386,30 @@ impl BatteryGovernor {
         host_out: &Path,
         thermal_pausing: bool,
     ) -> Option<BatteryEvent> {
+        self.on_sample_beside(battery, elapsed_ms, host_out, thermal_pausing, &crate::pace_file::OtherPacing::default())
+    }
+
+    /// [`Self::on_sample`] beside the pace file's other writers, the way the
+    /// live sampler calls it (through `governor_tick::GovernorPair::tick`).
+    /// `others` is what they hold apart from a thermal pause: whether the
+    /// budget pacer holds a pause, and the thermal duty cycle's instruction
+    /// when one is in force. A release this tick writes nothing over the
+    /// pacer's pause and restores the duty cycle (see "Letting go" on the
+    /// struct).
+    pub fn on_sample_beside(
+        &mut self,
+        battery: Option<&BatterySample>,
+        elapsed_ms: u64,
+        host_out: &Path,
+        thermal_pausing: bool,
+        others: &crate::pace_file::OtherPacing,
+    ) -> Option<BatteryEvent> {
         // THE INERTNESS, first and unconditional. A machine with no battery
         // never reaches a config read or a threshold comparison, and never
         // holds a pause, so the only thing an absent reading can do is keep
         // an already-held pause alive (#3074).
         let Some(b) = battery else {
-            return self.hold_pause_without_reading(elapsed_ms, host_out, thermal_pausing);
+            return self.hold_pause_without_reading(elapsed_ms, host_out, thermal_pausing, others);
         };
         self.blind_ms = 0;
         self.probe_failing_reported = false;
@@ -399,34 +429,13 @@ impl BatteryGovernor {
 
         let below = b.charge_pct < self.config.min_battery_pct;
         match self.state {
-            State::Idle if below => {
-                if !self.pause_supported {
-                    if self.announced_unsupported {
-                        return None;
-                    }
-                    self.announced_unsupported = true;
-                    return Some(BatteryEvent::PauseUnsupported {
-                        charge_pct: b.charge_pct,
-                        floor_pct: self.config.min_battery_pct,
-                    });
-                }
-                self.state = State::Paused;
-                self.write_pause(host_out, true);
-                Some(BatteryEvent::Paused {
-                    charge_pct: b.charge_pct,
-                    floor_pct: self.config.min_battery_pct,
-                })
-            }
+            State::Idle if below => self.enter_pause(b.charge_pct, host_out),
             State::Idle => None,
             State::Paused if !below => {
                 self.state = State::Idle;
-                // Only clear a pause we actually own. If thermal overwrote
-                // the file while we were standing down, clearing it here
-                // would release THEIR hold on a machine still too hot.
-                if self.pace_owned {
-                    self.write_pause(host_out, false);
-                    self.pace_owned = false;
-                }
+                // Thermal is not pausing (that returned above), so its pause
+                // cannot be the one released here.
+                self.release(host_out, others);
                 Some(BatteryEvent::Resumed {
                     charge_pct: b.charge_pct,
                     floor_pct: self.config.min_battery_pct,
@@ -438,19 +447,46 @@ impl BatteryGovernor {
                 // heartbeat cadence — a pause that stops being re-stamped
                 // is a pause the runtime releases.
                 self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
-                if !self.pace_owned || self.ms_since_stamp >= self.restamp_interval_ms {
-                    self.write_pause(host_out, true);
+                if self.restamp_due() {
+                    self.write_pause(host_out);
                 }
                 None
             }
         }
     }
 
+    /// The charge just crossed below the floor: pause the run, or, for a run
+    /// type that cannot resume from a pause, say so once and leave it running.
+    fn enter_pause(&mut self, charge_pct: u8, host_out: &Path) -> Option<BatteryEvent> {
+        let floor_pct = self.config.min_battery_pct;
+        if !self.pause_supported {
+            if std::mem::replace(&mut self.announced_unsupported, true) {
+                return None;
+            }
+            return Some(BatteryEvent::PauseUnsupported { charge_pct, floor_pct });
+        }
+        self.state = State::Paused;
+        self.write_pause(host_out);
+        Some(BatteryEvent::Paused { charge_pct, floor_pct })
+    }
+
+    /// A held pause is written again now: at once when the file no longer
+    /// carries it (a thermal pause took it over), else on the heartbeat.
+    fn restamp_due(&self) -> bool {
+        !self.pace_owned || self.ms_since_stamp >= self.restamp_interval_ms
+    }
+
     /// A tick with no reading (#3074). A held pause keeps its heartbeat at the last known
     /// charge, and yields to thermal exactly as a tick with a reading does; only a reading
     /// above the floor releases it, or the blind ceiling. The first blind tick of an
     /// episode reports it. Anything else is a no-op.
-    fn hold_pause_without_reading(&mut self, elapsed_ms: u64, host_out: &Path, thermal_pausing: bool) -> Option<BatteryEvent> {
+    fn hold_pause_without_reading(
+        &mut self,
+        elapsed_ms: u64,
+        host_out: &Path,
+        thermal_pausing: bool,
+        others: &crate::pace_file::OtherPacing,
+    ) -> Option<BatteryEvent> {
         if self.state != State::Paused {
             return None;
         }
@@ -459,16 +495,16 @@ impl BatteryGovernor {
         let held_pct = self.last_known_pct;
         if self.blind_ceiling_ms != 0 && self.blind_ms >= self.blind_ceiling_ms {
             self.state = State::Idle;
-            if self.pace_owned && !thermal_pausing {
-                self.write_pause(host_out, false);
+            if !thermal_pausing {
+                self.release(host_out, others);
             }
             self.pace_owned = false;
             return Some(BatteryEvent::ProbeCeiling { held_pct });
         }
         if thermal_pausing {
             self.pace_owned = false;
-        } else if !self.pace_owned || self.ms_since_stamp >= self.restamp_interval_ms {
-            self.write_pause(host_out, true);
+        } else if self.restamp_due() {
+            self.write_pause(host_out);
         }
         if std::mem::replace(&mut self.probe_failing_reported, true) {
             return None;
@@ -476,22 +512,26 @@ impl BatteryGovernor {
         Some(BatteryEvent::ProbeFailing { held_pct })
     }
 
-    /// Write the pace file and reset the heartbeat accounting together, so
-    /// the counter and the file on disk can never drift apart.
+    /// Let go of the pace file as this governor's pause ends, under
+    /// `pace_file`'s rule: nothing over another writer's live pause, the
+    /// thermal duty cycle restored when one is in force.
+    fn release(&mut self, host_out: &Path, others: &crate::pace_file::OtherPacing) {
+        crate::pace_file::release(host_out, others, PACE_REASON, &format!("{}%", self.last_known_pct));
+        self.ms_since_stamp = 0;
+        self.pace_owned = false;
+    }
+
+    /// Write this governor's pause and reset the heartbeat accounting
+    /// together, so the counter and the file on disk can never drift apart.
     ///
     /// `state` carries the charge reading the decision was made on, which
     /// is what the runtime echoes into its own `runtime.rest` trajectory
     /// events — so a paused run's own artifact says how much charge was
     /// left, not merely that something paused it.
-    fn write_pause(&mut self, host_out: &Path, pause: bool) {
-        crate::pace_file::write(
-            host_out,
-            pause,
-            PACE_REASON,
-            &format!("{}%", self.last_known_pct),
-        );
+    fn write_pause(&mut self, host_out: &Path) {
+        crate::pace_file::write(host_out, true, PACE_REASON, &format!("{}%", self.last_known_pct));
         self.ms_since_stamp = 0;
-        self.pace_owned = pause;
+        self.pace_owned = true;
     }
 }
 
@@ -767,19 +807,74 @@ mod tests {
     }
 
     #[test]
-    fn a_battery_resume_never_clears_a_pause_it_does_not_own() {
+    fn a_battery_resume_never_clears_a_live_thermal_pause() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut g = BatteryGovernor::new(cfg(50, true, true));
         g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
-        // Thermal takes over; we stand down and no longer own the file.
-        g.on_sample(Some(&at(40)), 2_000, dir.path(), true);
+        // Thermal takes over with a critical stop and keeps holding it.
         crate::pace_file::write(dir.path(), true, "thermal-critical", "critical");
-        // Charge recovers while thermal still holds a critical stop. The
-        // battery governor goes Idle but must NOT release the machine.
-        g.on_sample(Some(&at(90)), 2_000, dir.path(), false);
+        // Charge recovers while thermal still holds: the battery governor
+        // decides nothing and writes nothing.
+        assert_eq!(g.on_sample(Some(&at(90)), 2_000, dir.path(), true), None);
         let v = pace_json(dir.path());
         assert_eq!(v["pause"], true, "a battery recovery must not release a thermal hold");
         assert_eq!(v["reason"], "thermal-critical");
+    }
+
+    /// Thermal's resume writes nothing while this governor holds its pause
+    /// (`pace_file`'s rule), so the file can still carry thermal's last
+    /// pause when the charge recovers. This governor is then the last
+    /// writer letting go, and must write the release, or the run stays
+    /// parked behind a pause nobody holds.
+    #[test]
+    fn a_battery_resume_writes_the_release_a_yielding_thermal_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = BatteryGovernor::new(cfg(50, true, true));
+        g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
+        g.on_sample(Some(&at(40)), 2_000, dir.path(), true);
+        crate::pace_file::write(dir.path(), true, "thermal", "serious");
+        // Thermal has let go (it is no longer pausing) and, yielding to this
+        // governor's live pause, wrote nothing; the charge is back.
+        let duty = crate::pace_file::OtherPacing { pausing: false, duty_cycle: Some((15_000, "fair".into())) };
+        let ev = g.on_sample_beside(Some(&at(90)), 2_000, dir.path(), false, &duty);
+        assert!(matches!(ev, Some(BatteryEvent::Resumed { .. })), "{ev:?}");
+        let v = pace_json(dir.path());
+        assert_eq!(
+            (v["pause"].as_bool(), v["reason"].as_str(), v["turn_delay_ms"].as_u64()),
+            (Some(false), Some(crate::pace_file::THERMAL_DUTY_REASON), Some(15_000)),
+            "the release lets the run go AND restores the duty cycle in force: {v}"
+        );
+    }
+
+    /// The release writes nothing over the budget pacer's live pause.
+    #[test]
+    fn a_battery_resume_never_clears_the_budget_pacers_live_pause() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = BatteryGovernor::new(cfg(50, true, true));
+        g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
+        let pacer = crate::pace_file::OtherPacing { pausing: true, duty_cycle: None };
+        let ev = g.on_sample_beside(Some(&at(90)), 2_000, dir.path(), false, &pacer);
+        assert!(matches!(ev, Some(BatteryEvent::Resumed { .. })), "{ev:?}");
+        assert_eq!(pace_json(dir.path())["pause"], true, "the pacer still holds the run");
+    }
+
+    /// The blind ceiling's release follows the same rule.
+    #[test]
+    fn the_ceiling_release_restores_the_duty_cycle_and_spares_the_pacer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = BatteryGovernor::new(cfg(50, true, true)).with_restamp_interval_ms(1).with_blind_ceiling_ms(2_000);
+        g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
+        let pacer = crate::pace_file::OtherPacing { pausing: true, duty_cycle: None };
+        assert_eq!(g.on_sample_beside(None, 2_000, dir.path(), false, &pacer), Some(BatteryEvent::ProbeCeiling { held_pct: 40 }));
+        assert_eq!(pace_json(dir.path())["pause"], true, "the pacer still holds the run");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut g = BatteryGovernor::new(cfg(50, true, true)).with_restamp_interval_ms(1).with_blind_ceiling_ms(2_000);
+        g.on_sample(Some(&at(40)), 2_000, dir.path(), false);
+        let duty = crate::pace_file::OtherPacing { pausing: false, duty_cycle: Some((15_000, "fair".into())) };
+        assert_eq!(g.on_sample_beside(None, 2_000, dir.path(), false, &duty), Some(BatteryEvent::ProbeCeiling { held_pct: 40 }));
+        let v = pace_json(dir.path());
+        assert_eq!((v["pause"].as_bool(), v["turn_delay_ms"].as_u64()), (Some(false), Some(15_000)), "{v}");
     }
 
     #[test]

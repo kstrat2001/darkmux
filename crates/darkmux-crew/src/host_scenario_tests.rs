@@ -503,8 +503,10 @@ fn a_critical_breaker_event_is_what_tier_five_s_eject_keys_on() {
 fn a_live_battery_pause_survives_a_thermal_duty_cycle() {
     let out = out_dir();
     // The battery governor's heartbeat is PINNED rather than derived from
-    // `thermal_max_pause_ms()`, which reads process env — see
-    // `with_restamp_interval_ms`'s own doc.
+    // `thermal_max_pause_ms()`, which reads process env (see
+    // `with_restamp_interval_ms`'s own doc), and pinned at the PRODUCTION
+    // cadence: a quarter of the shipped `max_pause_ms`. A short test
+    // interval hides an overwrite inside a gap too brief to notice.
     let pair = GovernorPair::new(
         ThermalGovernor::new(shipped_defaults()),
         BatteryGovernor::new(PowerPolicyConfig {
@@ -512,7 +514,7 @@ fn a_live_battery_pause_survives_a_thermal_duty_cycle() {
             refuse_start_below_min: true,
             pause_running_below_min: true,
         })
-        .with_restamp_interval_ms(20_000),
+        .with_restamp_interval_ms(shipped_defaults().max_pause_ms / 4),
     );
     let mut d = ScenarioDriver::new(source(library::BATTERY_CRITICAL_THEN_FAIR), pair, out.path());
     d.run_to_end();
@@ -533,41 +535,149 @@ fn a_live_battery_pause_survives_a_thermal_duty_cycle() {
         .map(|(at, _)| at)
         .expect("the thermal duty cycle must engage, or the interaction is untested");
     assert!(duty_at > battery_paused_at, "the duty cycle must arrive ON TOP of a live battery pause");
-
-    // The inversion, stated as the safety property it is.
-    let final_pace = d.pace().expect("something owns the pace file");
-    assert_eq!(
-        final_pace["pause"],
-        serde_json::json!(true),
-        "a run below the battery floor must END paused. Standing the battery governor down \
-         for a duty cycle (gating on `is_pacing` rather than `is_pausing`) leaves this at \
-         `false` and the machine drains toward 0% while the run keeps working."
-    );
-    assert_eq!(
-        final_pace["reason"],
-        serde_json::json!(crate::power_policy::PACE_REASON),
-        "and the pause in force must be the BATTERY's, not a stale thermal instruction"
+    let heartbeats_after_duty = d.ticks().iter().filter(|t| t.at_ms > duty_at).count() as u64 * DEFAULT_TICK_MS;
+    assert!(
+        heartbeats_after_duty > 2 * (shipped_defaults().max_pause_ms / 4),
+        "the duty cycle must run long enough for its own heartbeat to fire, or only its entry is tested"
     );
 
-    // The duty cycle does transiently take the file; what matters is that
-    // the battery governor takes it back, within its own heartbeat.
-    let reasserted = d
-        .ticks()
+    // The safety property, on EVERY tick from the battery pause on: the
+    // runtime polls the file on its own cadence, so a tick that ends with
+    // `pause: false` is a window in which the run takes turns on a battery
+    // below the floor. Checking only the final state (or only that the
+    // pause comes back eventually) passes while most of those ticks read
+    // `pause: false`.
+    let held: Vec<&TickRecord> = d.ticks().iter().filter(|t| t.at_ms >= battery_paused_at).collect();
+    let unpaused: Vec<u64> = held
         .iter()
-        .find(|t| {
-            t.at_ms > duty_at
-                && t.pace.as_ref().is_some_and(|p| {
-                    p["pause"] == serde_json::json!(true)
-                        && p["reason"] == serde_json::json!(crate::power_policy::PACE_REASON)
-                })
+        .filter(|t| {
+            !t.pace.as_ref().is_some_and(|p| {
+                p["pause"] == serde_json::json!(true)
+                    && p["reason"] == serde_json::json!(crate::power_policy::PACE_REASON)
+            })
         })
         .map(|t| t.at_ms)
-        .expect("the battery pause must be re-asserted after the duty cycle overwrote it");
+        .collect();
     assert!(
-        reasserted - duty_at <= 2 * 20_000 + 2 * DEFAULT_TICK_MS,
-        "the re-assert must land inside a heartbeat interval, not eventually: {}ms",
-        reasserted - duty_at
+        unpaused.is_empty(),
+        "{} of {} ticks after the battery pause did not carry it (first at {:?} ms, last at {:?} ms). \
+         A thermal duty cycle wrote `pause: false` over a live battery pause, and the run kept \
+         working on a battery below the floor.",
+        unpaused.len(),
+        held.len(),
+        unpaused.first(),
+        unpaused.last()
     );
+}
+
+/// The full round trip beside a live battery pause: a thermal pause on top
+/// of it, the resume into a duty cycle, the duty cycle's heartbeats, and
+/// then the charge coming back. Every tick below the floor must end paused,
+/// carrying the battery's reason whenever thermal is not itself pausing, and
+/// the battery's release must hand the run back to the duty cycle in force
+/// rather than to a bare `pause: false`.
+#[test]
+fn a_battery_pause_holds_through_a_thermal_pause_and_resume_and_hands_back_the_duty_cycle() {
+    let text = r#"
+{"hold_ms": 10000, "thermal": {"state": "nominal"}, "battery": {"charge_pct": 45}}
+{"hold_ms": 30000, "thermal": {"state": "serious"}, "battery": {"charge_pct": 45}}
+{"hold_ms": 600000, "thermal": {"state": "fair"}, "battery": {"charge_pct": 45}}
+{"hold_ms": 20000, "thermal": {"state": "fair"}, "battery": {"charge_pct": 80}}
+"#;
+    let out = out_dir();
+    let pair = GovernorPair::new(
+        ThermalGovernor::new(shipped_defaults()),
+        BatteryGovernor::new(PowerPolicyConfig {
+            min_battery_pct: 50,
+            refuse_start_below_min: true,
+            pause_running_below_min: true,
+        })
+        .with_restamp_interval_ms(shipped_defaults().max_pause_ms / 4),
+    );
+    let mut d = ScenarioDriver::new(source(text), pair, out.path());
+    d.run_to_end();
+    let names = thermal_event_names(&d);
+    assert_eq!(names, vec!["Paused", "Resumed"], "thermal must pause, then resume into the duty cycle");
+    assert!(d.pair().thermal.duty_cycle().is_some(), "the resume landed in the duty cycle");
+
+    let below: Vec<&TickRecord> =
+        d.ticks().iter().filter(|t| t.reading.battery.as_ref().is_some_and(|b| b.charge_pct < 50)).collect();
+    let thermal_paused = |t: &TickRecord| t.pace.as_ref().is_some_and(|p| p["reason"] == "thermal");
+    let wrong: Vec<u64> = below
+        .iter()
+        .filter(|t| {
+            let paused = t.pace.as_ref().is_some_and(|p| p["pause"] == serde_json::json!(true));
+            let battery = t.pace.as_ref().is_some_and(|p| p["reason"] == crate::power_policy::PACE_REASON);
+            !paused || !(battery || thermal_paused(t))
+        })
+        .map(|t| t.at_ms)
+        .collect();
+    assert!(wrong.is_empty(), "{} of {} ticks below the floor were not paused: {wrong:?}", wrong.len(), below.len());
+    let resumed_at = d.thermal_events().iter().find(|(_, e)| matches!(e, ThermalEvent::Resumed { .. })).unwrap().0;
+    assert!(
+        below.iter().filter(|t| t.at_ms >= resumed_at).all(|t| !thermal_paused(t)),
+        "once thermal let go, the pause in force must be the battery's, not thermal's stale one"
+    );
+
+    assert!(matches!(d.battery_events().last(), Some((_, BatteryEvent::Resumed { .. }))));
+    let last = d.pace().expect("pace file");
+    assert_eq!(
+        (last["pause"].as_bool(), last["reason"].as_str(), last["turn_delay_ms"].as_u64()),
+        (Some(false), Some(crate::pace_file::THERMAL_DUTY_REASON), d.pair().thermal.duty_cycle().map(|(ms, _)| ms)),
+        "the battery's release hands the run back to the duty cycle in force: {last}"
+    );
+}
+
+/// A thermal duty cycle never writes over the budget pacer's live pause:
+/// the pacer re-holds only after the governors decide, and the runtime polls
+/// on its own cadence, so a duty-cycle write in between is a turn taken
+/// while the window is full.
+#[test]
+fn a_thermal_duty_cycle_never_writes_over_the_budget_pacers_pause() {
+    use crate::host_source::HostSource;
+    let out = out_dir();
+    crate::pace_file::write(out.path(), true, crate::budget::PACE_REASON, "ep");
+    let mut pair = thermal_only(shipped_defaults());
+    let src = source(library::SUSTAINED_FAIR);
+    let mut entered = false;
+    for _ in 0..((shipped_defaults().max_pause_ms / 4) / DEFAULT_TICK_MS + 60) {
+        src.advance(DEFAULT_TICK_MS);
+        let ev = pair.tick(&src.read(), DEFAULT_TICK_MS, out.path(), None, true);
+        entered |= matches!(ev.thermal, Some(ThermalEvent::DutyCycleEntered { .. }));
+        assert_eq!(pace_on_disk(out.path())["reason"], crate::budget::PACE_REASON, "a duty-cycle write landed on the pacer's pause");
+    }
+    assert!(entered, "the duty cycle must engage, or nothing was tested");
+    assert_eq!(pair.other_pacing().duty_cycle.map(|(ms, _)| ms), Some(15_000), "the pacer's release restores this");
+}
+
+/// The battery's release never writes over the budget pacer's live pause:
+/// the charge coming back must not let a turn out while the window is full.
+#[test]
+fn a_battery_release_never_writes_over_the_budget_pacers_pause() {
+    use crate::host_source::HostSource;
+    let text = r#"
+{"hold_ms": 10000, "thermal": {"state": "nominal"}, "battery": {"charge_pct": 45}}
+{"hold_ms": 10000, "thermal": {"state": "nominal"}, "battery": {"charge_pct": 80}}
+"#;
+    let out = out_dir();
+    let mut pair = GovernorPair::new(
+        ThermalGovernor::new(shipped_defaults()),
+        BatteryGovernor::new(PowerPolicyConfig {
+            min_battery_pct: 50,
+            refuse_start_below_min: true,
+            pause_running_below_min: true,
+        })
+        .with_restamp_interval_ms(shipped_defaults().max_pause_ms / 4),
+    );
+    let src = source(text);
+    let mut resumed = false;
+    for _ in 0..10 {
+        src.advance(DEFAULT_TICK_MS);
+        let ev = pair.tick(&src.read(), DEFAULT_TICK_MS, out.path(), None, true);
+        resumed |= matches!(ev.battery, Some(BatteryEvent::Resumed { .. }));
+        assert_eq!(pace_on_disk(out.path())["pause"], true, "a battery release landed on the pacer's pause");
+    }
+    assert!(resumed, "the charge must recover, or nothing was tested");
 }
 
 // ── the budget pacer beside the two governors ────────────────────────────

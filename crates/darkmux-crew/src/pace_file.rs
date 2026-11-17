@@ -19,6 +19,31 @@
 //! for as long as it holds it; a writer that stamps once and goes quiet has
 //! written an expiring pause, whatever it meant.
 //!
+//! **Who may write what: a live pause is never written over (2026-11-17
+//! layer review).** Three writers share this file: the thermal governor
+//! (its tiers, including tier 2's duty cycle), the battery governor, and the
+//! budget pacer. Each decides on its own, and each yields by reading the
+//! others' LIVE state rather than the file, through [`OtherPacing`]:
+//!
+//! - **A pause may always be written.** `pause: true` over another
+//!   writer's pause stops nothing that was running. Precedence for which
+//!   reason is shown is thermal, then battery, then budget: the battery
+//!   governor writes nothing while thermal pauses, and the pacer writes
+//!   nothing while either governor pauses.
+//! - **A release is written only when no other writer holds a live
+//!   pause.** A release is anything that lets the run take turns:
+//!   `pause: false`, or the duty cycle's `pause: false` with a turn delay.
+//!   A writer whose release would land on another's live pause writes
+//!   nothing, and that pause stays in force.
+//! - **Whoever lets go last writes the release, through [`release`].** It
+//!   restores the thermal duty cycle's instruction when one is in force,
+//!   because a writer that yielded its own write never gets to repeat it.
+//!
+//! The governors decide in one synchronous tick (thermal, then battery, then
+//! the pacer), but the runtime polls this file on its own cadence, so the
+//! rule holds for every write, not just for whatever the file says when the
+//! tick ends.
+//!
 //! **Not under `/workspace`** (operator correction during the #2110/#2109
 //! review): crawl units mount that read-only and a coder run's workspace IS
 //! the operator's own repo tree — the wrong place for darkmux's own
@@ -61,6 +86,43 @@ struct PaceFile<'a> {
     /// `turn_delay_ms` field doc).
     #[serde(skip_serializing_if = "Option::is_none")]
     turn_delay_ms: Option<u64>,
+}
+
+/// What the OTHER writers of the pace file hold on the tick a writer
+/// decides, read from their live state (see this module's doc for the rule
+/// it carries).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OtherPacing {
+    /// Another writer holds a genuine pause: a release from this writer
+    /// writes nothing.
+    pub pausing: bool,
+    /// The thermal governor is duty-cycling (`pause: false` with a turn
+    /// delay): `(turn_delay_ms, state)`. A writer that lets go of the file
+    /// writes this instruction back rather than a bare `pause: false`.
+    pub duty_cycle: Option<(u64, String)>,
+}
+
+/// The `reason` the thermal duty cycle writes, restored verbatim when
+/// another writer lets go of the file during a duty-cycle episode.
+pub const THERMAL_DUTY_REASON: &str = "thermal-duty-cycle";
+
+/// Let go of the pace file on behalf of a writer whose pause ended. Writes
+/// nothing while another writer holds a live pause (theirs stays in force,
+/// and they write the release when they let go); otherwise writes the
+/// thermal duty cycle's instruction when one is in force, else
+/// `pause: false` with this writer's `reason` and `state`. Returns whether
+/// it wrote.
+pub(crate) fn release(host_out: &Path, others: &OtherPacing, reason: &str, state: &str) -> bool {
+    if others.pausing {
+        return false;
+    }
+    match &others.duty_cycle {
+        Some((delay, thermal_state)) => {
+            write_with_turn_delay(host_out, false, THERMAL_DUTY_REASON, thermal_state, Some(*delay))
+        }
+        None => write(host_out, false, reason, state),
+    }
+    true
 }
 
 /// UNIX epoch milliseconds. `0` on the vanishingly rare
@@ -180,6 +242,31 @@ mod tests {
             v.get("turn_delay_ms").is_none(),
             "an ordinary pause/resume write must not carry a stale or spurious turn_delay_ms key: {raw}"
         );
+    }
+
+    #[test]
+    fn a_release_writes_nothing_over_another_writers_live_pause() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), true, "battery", "38%");
+        let held = OtherPacing { pausing: true, duty_cycle: Some((15_000, "fair".into())) };
+        assert!(!release(dir.path(), &held, "budget", "ep"), "a live pause is never written over");
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path(dir.path())).unwrap()).unwrap();
+        assert_eq!((v["pause"].as_bool(), v["reason"].as_str()), (Some(true), Some("battery")));
+    }
+
+    #[test]
+    fn a_release_restores_the_duty_cycle_or_writes_a_plain_resume() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let duty = OtherPacing { pausing: false, duty_cycle: Some((15_000, "fair".into())) };
+        assert!(release(dir.path(), &duty, "battery", "60%"));
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path(dir.path())).unwrap()).unwrap();
+        assert_eq!(
+            (v["pause"].as_bool(), v["reason"].as_str(), v["state"].as_str(), v["turn_delay_ms"].as_u64()),
+            (Some(false), Some(THERMAL_DUTY_REASON), Some("fair"), Some(15_000))
+        );
+        assert!(release(dir.path(), &OtherPacing::default(), "battery", "60%"));
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path(dir.path())).unwrap()).unwrap();
+        assert_eq!((v["pause"].as_bool(), v["reason"].as_str(), v.get("turn_delay_ms")), (Some(false), Some("battery"), None));
     }
 
     #[test]
