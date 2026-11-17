@@ -442,7 +442,7 @@ where
             (None, Err(e)) if issues.is_empty() => failures.push(format!("{name}: the gate passed `{key}` written twice, serde refused it ({e})")),
             _ => {}
         }
-        if let Some(r) = repeat {
+        if let Some(r @ (Repeat::Field | Repeat::Entry)) = repeat {
             REPEATS_SEEN[usize::from(r == Repeat::Entry)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }

@@ -723,11 +723,16 @@ pub(crate) fn load_object_for_write(path: &Path) -> Result<Value> {
     }
     // A rewrite from `root` would keep only the last copy of a key written
     // twice and delete the rest, silently: the operator chooses which stays.
-    if let Some(lines) = duplicate_lines_at(path) {
+    // Every repeat counts here, a `_comment` note included, which the gate
+    // lets a load through with but a rewrite would still lose.
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let repeated: Vec<String> = darkmux_types::user_files::duplicate_paths(&raw).iter().map(|p| format!("`{p}`")).collect();
+    if !repeated.is_empty() {
         bail!(
-            "{}: {lines}. Refusing to rewrite it: a rewrite would keep only the last copy of each and delete the rest. \
-             Fix it by hand first (`darkmux doctor` names the fix)",
-            path.display()
+            "{}: {} written more than once in the same object. Refusing to rewrite it: a rewrite would keep only the \
+             last copy of each and delete the rest. Fix it by hand first",
+            path.display(),
+            repeated.join(", ")
         );
     }
     Ok(root)
@@ -860,8 +865,21 @@ mod tests {
         let original = r#"{"machine_id": "a", "role_profiles": {"coder": "p", "coder": "q"}, "machine_id": "b"}"#;
         std::fs::write(f.path(), original).unwrap();
         let err = set_at(f.path(), "serve.port", "8799").unwrap_err().to_string();
-        assert!(err.contains("duplicate key `machine_id`") && err.contains("duplicate key `role_profiles.coder`"), "{err}");
+        assert!(err.contains("`machine_id`") && err.contains("`role_profiles.coder`") && err.contains("written more than once"), "{err}");
         assert!(err.contains("by hand"), "{err}");
+        assert_eq!(std::fs::read_to_string(f.path()).unwrap(), original);
+    }
+
+    /// A repeated `_comment` note loads (the gate lets it through), but a
+    /// rewrite would keep only its last copy: the writer refuses it too,
+    /// naming it, and leaves the file as it was.
+    #[test]
+    fn config_set_refuses_a_config_with_a_repeated_comment_note() {
+        let f = tmp();
+        let original = r#"{"runtime": {"_comment": "note one", "max_turns": 5, "_comment": "note two"}}"#;
+        std::fs::write(f.path(), original).unwrap();
+        let err = set_at(f.path(), "serve.port", "8799").unwrap_err().to_string();
+        assert!(err.contains("`runtime._comment`") && err.contains("by hand"), "{err}");
         assert_eq!(std::fs::read_to_string(f.path()).unwrap(), original);
     }
 

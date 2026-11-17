@@ -2180,8 +2180,12 @@ fn unloaded_words(kind: darkmux_types::user_files::UserFileKind) -> &'static str
 /// loads with only the last copy used.
 fn duplicate_key_hint(keys: &[darkmux_types::user_files::KeyIssue], unloaded: &str) -> String {
     use darkmux_types::user_files::{Issue, Repeat};
-    let fails = keys.iter().any(|k| k.issue == Issue::Duplicate(Repeat::Field));
-    let meanwhile = if fails { unloaded } else { "the file loads with only the last copy of each used" };
+    let has = |r: Repeat| keys.iter().any(|k| k.issue == Issue::Duplicate(r));
+    let meanwhile = match (has(Repeat::Field), has(Repeat::Unjudged)) {
+        (true, _) => unloaded,
+        (false, true) => "the file may fail to load, or load with only the last copy of each used",
+        (false, false) => "the file loads with only the last copy of each used",
+    };
     format!("delete all but one copy of each duplicate key; until then {meanwhile}")
 }
 
@@ -17743,6 +17747,20 @@ mod user_file_key_tests {
         let hint = rows[0].hint.clone().unwrap_or_default();
         assert!(hint.contains("delete") && hint.contains("only the last copy of each used"), "{hint}");
         assert!(!hint.contains("falls back") && !hint.contains("fails to load"), "{hint}");
+    }
+
+    /// Past the trial cap a repeat is not judged, so with no repeated field
+    /// among the judged ones the fix says the file MAY fail to load.
+    #[test]
+    fn past_the_trial_cap_the_fix_says_the_file_may_fail_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let n = darkmux_types::user_files::MAX_REPEAT_TRIALS + 1;
+        let entries: Vec<String> = (0..n).map(|i| format!(r#""r{i}": "p", "r{i}": "q""#)).collect();
+        std::fs::write(&path, format!(r#"{{"role_profiles": {{{}}}}}"#, entries.join(", "))).unwrap();
+        let problem = darkmux_types::user_files::config_json_problem_at(&path).expect("refused");
+        let hint = user_file_key_rows(&[problem], &[])[0].hint.clone().unwrap_or_default();
+        assert!(hint.contains("may fail to load, or load with only the last copy"), "{hint}");
     }
 
     /// (review C2) A file name cannot forge a doctor line either.

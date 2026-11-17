@@ -249,7 +249,14 @@ pub enum Repeat {
     /// a file read through a `serde_json::Value` (the registry, a rule):
     /// the file loads and only the last copy is used, silently.
     Entry,
+    /// Past [`MAX_REPEAT_TRIALS`] repeats in one file: refused without
+    /// saying what it costs, since finding out takes a typed load each.
+    Unjudged,
 }
+
+/// How many repeats in one file are classified by a trial load (each one
+/// reads the whole document as its type); the rest are [`Repeat::Unjudged`].
+pub const MAX_REPEAT_TRIALS: usize = 8;
 
 impl fmt::Display for KeyIssue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -260,17 +267,21 @@ impl fmt::Display for KeyIssue {
             Issue::WrongType { expected, got } => write!(f, "`{}` must be {expected}, got {got}", self.path),
             Issue::Missing { expected } if expected.is_empty() => write!(f, "missing required key `{}`", self.path),
             Issue::Missing { expected } => write!(f, "missing required key `{}` ({expected})", self.path),
-            Issue::Duplicate(Repeat::Field) => {
-                write!(f, "duplicate key `{}`: it is written more than once in the same object, so the file fails to load; keep one", self.path)
-            }
-            Issue::Duplicate(Repeat::Entry) => {
-                write!(f, "duplicate key `{}`: it is written more than once in the same object, and only the last copy is used; keep one", self.path)
-            }
+            Issue::Duplicate(repeat) => self.fmt_repeat(f, *repeat),
         }
     }
 }
 
 impl KeyIssue {
+    fn fmt_repeat(&self, f: &mut fmt::Formatter<'_>, repeat: Repeat) -> fmt::Result {
+        let cost = match repeat {
+            Repeat::Field => ", so the file fails to load",
+            Repeat::Entry => ", and only the last copy is used",
+            Repeat::Unjudged => "",
+        };
+        write!(f, "duplicate key `{}`: it is written more than once in the same object{cost}; keep one", self.path)
+    }
+
     fn fmt_unknown(&self, f: &mut fmt::Formatter<'_>, closest: Option<&str>, valid: &[String]) -> fmt::Result {
         write!(f, "unknown key `{}`", self.path)?;
         if let Some(c) = closest {
@@ -320,21 +331,29 @@ where
 /// What each repeat costs a typed load, found by trying it: the document
 /// with that one key written twice is read as `T`. Whether serde refuses a
 /// repeat is not in the schema (a field read through a lenient value keeps
-/// the last copy, like a map entry), so it is asked. `None` for every
-/// repeat when the document fails to load without any (the walk then
-/// judges by the schema).
+/// the last copy, like a map entry), so it is asked. Each trial reads the
+/// whole document, so a clean file runs none and a file with many repeats
+/// runs at most [`MAX_REPEAT_TRIALS`]; the rest are [`Repeat::Unjudged`].
+/// `None` for a judged repeat when the document fails to load without any
+/// (the walk then judges by the schema).
 fn repeat_costs<T: serde::de::DeserializeOwned>(doc: &Value, found: &[Dup]) -> BTreeMap<String, Option<Repeat>> {
+    if found.is_empty() {
+        return BTreeMap::new();
+    }
     let loads = serde_json::from_value::<T>(doc.clone()).is_ok();
-    found
-        .iter()
-        .map(|d| {
-            let cost = loads.then(|| match repeated_text(doc, &d.object, &d.key) {
-                Some(text) if serde_json::from_str::<T>(&text).is_err() => Repeat::Field,
-                _ => Repeat::Entry,
-            });
-            (d.path.clone(), cost)
-        })
-        .collect()
+    let cost = |i: usize, d: &Dup| match i < MAX_REPEAT_TRIALS {
+        true => loads.then(|| trial_cost::<T>(doc, d)),
+        false => Some(Repeat::Unjudged),
+    };
+    found.iter().enumerate().map(|(i, d)| (d.path.clone(), cost(i, d))).collect()
+}
+
+/// What the repeat `d` alone costs a typed load of `doc` as `T`.
+fn trial_cost<T: serde::de::DeserializeOwned>(doc: &Value, d: &Dup) -> Repeat {
+    match repeated_text(doc, &d.object, &d.key) {
+        Some(text) if serde_json::from_str::<T>(&text).is_err() => Repeat::Field,
+        _ => Repeat::Entry,
+    }
 }
 
 /// `doc` as JSON text with `key` of the object at the JSON pointer `object`

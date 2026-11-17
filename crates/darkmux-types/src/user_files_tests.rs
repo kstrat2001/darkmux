@@ -518,6 +518,49 @@ fn a_repeat_inside_a_free_value_is_a_last_copy_entry() {
     assert_eq!(repeats(&fp), [("anything.k", Repeat::Entry)]);
 }
 
+/// A type that counts how often it is deserialized: the trial loads that
+/// classify repeats are the gate's only typed loads.
+struct Counted;
+
+static LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl<'de> Deserialize<'de> for Counted {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Value::deserialize(d).map(|_| Counted)
+    }
+}
+
+impl JsonSchema for Counted {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Counted".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type": "object"})
+    }
+}
+
+/// A clean file costs no typed load, and a file with many repeats costs a
+/// bounded number: past the cap, a repeat is refused without saying what
+/// it costs, so a hostile file cannot stall a preflight.
+#[test]
+fn classifying_repeats_costs_a_bounded_number_of_loads() {
+    let loads = || LOADS.load(std::sync::atomic::Ordering::SeqCst);
+    let before = loads();
+    assert_eq!(check_text::<Counted>(UserFileKind::Role, Path::new("f"), r#"{"a": 1, "b": {"c": 2}}"#, &no_retired), None);
+    assert_eq!(loads(), before, "no repeat, no typed load");
+    let keys: Vec<String> = (0..50).map(|i| format!("\"k{i}\": 1, \"k{i}\": 2")).collect();
+    let text = format!("{{{}}}", keys.join(", "));
+    let fp = check_text::<Counted>(UserFileKind::Role, Path::new("f"), &text, &no_retired).expect("refused");
+    let found = repeats(&fp);
+    assert_eq!(found.len(), 50, "every repeat is still refused");
+    let judged = found.iter().filter(|(_, r)| *r != Repeat::Unjudged).count();
+    assert_eq!(judged, MAX_REPEAT_TRIALS, "{found:?}");
+    assert!(loads() - before <= MAX_REPEAT_TRIALS + 1, "{} loads", loads() - before);
+    let msg = fp.to_string();
+    assert!(msg.contains("duplicate key `k49`: it is written more than once in the same object; keep one"), "{msg}");
+}
+
 /// Every user file kind goes through the one check, so every kind refuses it.
 #[test]
 fn every_user_file_kind_refuses_a_duplicate_key() {
