@@ -1010,17 +1010,42 @@ impl ServedBy {
 /// before the snapshot (run manifest 1.3) reads the registry as it is now for
 /// a managed model or a listed host only: an endpoint's declaration today is
 /// not the run's. A model the registry does not list reads as LM Studio's,
-/// as before.
+/// as before. `dispatched` is the model name the run sent, namespace and
+/// all, which picks the snapshot entry
+/// ([`crate::lab::manifest::snapshot_entry`]); a name several entries match
+/// takes the flag, and without one is refused, naming what to pass.
 pub fn served_by(
     run_id: &str,
-    model_id: &str,
+    dispatched: &str,
     snapshot: Option<&[crate::lab::manifest::ModelHardware]>,
     current: Option<&darkmux_types::ProfileModel>,
     flag: Option<darkmux_types::Hardware>,
 ) -> std::result::Result<ServedBy, String> {
-    let entry = snapshot
-        .and_then(|s| s.iter().find(|e| e.model == model_id || e.identifier.as_deref() == Some(model_id)));
-    served_by_entry(run_id, model_id, entry, current, flag)
+    use crate::lab::manifest::SnapshotMatch;
+    let model_id = model_id_from(Some(dispatched)).unwrap_or_default();
+    let entry = match snapshot.map(|s| crate::lab::manifest::snapshot_entry(s, dispatched)) {
+        Some(SnapshotMatch::Several) => return ambiguous_hardware(run_id, &model_id, flag),
+        Some(SnapshotMatch::One(e)) => Some(e),
+        Some(SnapshotMatch::None) | None => None,
+    };
+    served_by_entry(run_id, &model_id, entry, current, flag)
+}
+
+/// A dispatched name that several models of the run's profile match: the
+/// flag says which machine served it, and without one the run is refused.
+fn ambiguous_hardware(
+    run_id: &str,
+    model_id: &str,
+    flag: Option<darkmux_types::Hardware>,
+) -> std::result::Result<ServedBy, String> {
+    match flag {
+        Some(f) => Ok(ServedBy::fixed(f, None, false)),
+        None => Err(format!(
+            "{run_id}: {model_id} names more than one model of the run's profile, so its record does not say which \
+             machine served it. Pass --hardware submitting-machine (this machine served it) or --hardware unknown \
+             (another machine did)"
+        )),
+    }
 }
 
 /// [`served_by`] for the run's own snapshot entry, when it has one.
@@ -1448,12 +1473,13 @@ impl Machine {
         let mut refused = Vec::new();
         for input in inputs {
             let model_id = input.model_id().unwrap_or_default();
+            let dispatched = input.stats.get("model").and_then(Value::as_str).unwrap_or_default();
             let snapshot = input
                 .manifest
                 .get("model_hardware")
                 .and_then(|v| serde_json::from_value::<Vec<crate::lab::manifest::ModelHardware>>(v.clone()).ok());
             let current = self.profile_model(&input.manifest, &model_id);
-            match served_by(&input.run_id, &model_id, snapshot.as_deref(), current.as_ref(), stated.hardware) {
+            match served_by(&input.run_id, dispatched, snapshot.as_deref(), current.as_ref(), stated.hardware) {
                 Ok(by) => served.push(by),
                 Err(why) => refused.push(why),
             }

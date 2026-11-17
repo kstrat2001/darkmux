@@ -1356,3 +1356,19 @@ fn the_gpu_cross_check_reads_this_machines_readings_when_the_run_withheld_them()
     let e = hardware_check(Unknown, &withheld).expect("this machine's GPU was busy while stated elsewhere");
     assert!(e.contains("60.5%") && e.contains("31.2 W"), "{e}");
 }
+
+/// (#3644 review) The same model managed here and on a peer's endpoint:
+/// the dispatched wire name picks the entry (`darkmux:` is the managed one),
+/// and a name that several entries match is not decided by order.
+#[test]
+fn the_wire_name_picks_the_snapshot_entry_and_an_ambiguous_one_needs_a_flag() {
+    let both = [snap("qwen3", HardwareFrom::Managed, Some(SubmittingMachine)), snap("qwen3", HardwareFrom::Endpoint, Some(Unknown))];
+    let at = |name: &str, s: &[ModelHardware], flag| served_by("r1", name, Some(s), None, flag);
+    assert_eq!(at("qwen3", &both, None).unwrap().hardware, Unknown, "a bare name is the endpoint's");
+    let here = at("darkmux:qwen3", &both, None).unwrap();
+    assert_eq!((here.hardware, here.lmstudio), (SubmittingMachine, true), "the namespaced name is the managed one");
+    let two = [snap("qwen3", HardwareFrom::Endpoint, Some(Unknown)), snap("qwen3", HardwareFrom::Endpoint, Some(SubmittingMachine))];
+    let e = at("qwen3", &two, None).unwrap_err();
+    assert!(e.contains("more than one model") && e.contains("--hardware"), "{e}");
+    assert_eq!(at("qwen3", &two, Some(Unknown)).unwrap().hardware, Unknown, "the flag decides what the record cannot");
+}

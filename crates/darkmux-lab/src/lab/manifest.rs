@@ -194,6 +194,43 @@ pub struct ModelHardware {
     pub endpoint: Option<String>,
 }
 
+/// Which entry of a run's `model_hardware` snapshot a dispatched model is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SnapshotMatch<'a> {
+    One(&'a ModelHardware),
+    /// Several entries match and nothing chooses between them.
+    Several,
+    None,
+}
+
+/// The snapshot entry for `dispatched`, the model name the run sent. The
+/// wire name says which kind of entry it is: `darkmux:<id>` is a managed
+/// model (darkmux's namespace in LM Studio), a bare name an endpoint's. An
+/// entry of that kind with that id or identifier is taken; with none, the
+/// name without the namespace is matched against every entry. Either way
+/// one match decides and several decide nothing, so a profile listing the
+/// same model managed here and on a peer is never decided by its order.
+pub fn snapshot_entry<'a>(snapshot: &'a [ModelHardware], dispatched: &str) -> SnapshotMatch<'a> {
+    let (id, managed) = match dispatched.strip_prefix("darkmux:") {
+        Some(id) => (id, true),
+        None => (dispatched, false),
+    };
+    let names = |e: &&ModelHardware| e.model == id || e.identifier.as_deref() == Some(id);
+    let of_kind = one_of(snapshot.iter().filter(names).filter(|e| (e.from == HardwareFrom::Managed) == managed));
+    match of_kind {
+        SnapshotMatch::None => one_of(snapshot.iter().filter(names)),
+        decided => decided,
+    }
+}
+
+fn one_of<'a>(mut found: impl Iterator<Item = &'a ModelHardware>) -> SnapshotMatch<'a> {
+    match (found.next(), found.next()) {
+        (None, _) => SnapshotMatch::None,
+        (Some(e), None) => SnapshotMatch::One(e),
+        (Some(_), Some(_)) => SnapshotMatch::Several,
+    }
+}
+
 /// (#3397) The model a run's replies say answered, from its trajectory's
 /// `model.completed` events (`reported_model`): the one name they agree on,
 /// `None` when they named none, or more than one. A compactor's calls are

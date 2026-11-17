@@ -1721,3 +1721,44 @@ fn unrecorded_hardware_is_no_caveat_without_host_figures() {
     assert_eq!(s.hardware, None);
     assert!(!s.unreconciled().iter().any(|c| c.contains("which machine")), "{:?}", s.unreconciled());
 }
+
+/// (#3644 review) A profile can list the same model twice: managed on this
+/// machine, and on a peer's endpoint. The wire name tells them apart
+/// (`darkmux:<id>` is the managed one, a bare name the endpoint's), so it is
+/// matched before the namespace is stripped; a run the peer served keeps
+/// none of this machine's watts.
+#[test]
+fn the_wire_name_tells_a_managed_model_from_a_peers_of_the_same_name() {
+    use darkmux_types::Hardware::{SubmittingMachine, Unknown};
+    let both = serde_json::json!([
+        {"model": "qwen3", "from": "managed", "hardware": "submitting-machine"},
+        {"model": "qwen3", "from": "endpoint", "hardware": "unknown", "endpoint": "peer"},
+    ]);
+    let peer = busy_run("qwen3", Some(both.clone()));
+    assert_eq!(peer.hardware, Some(Unknown));
+    assert_eq!((peer.pkg_w_busy, peer.pkg_j_per_1k_tokens), (None, None), "the peer's run keeps none of this machine's draw");
+    let here = busy_run("darkmux:qwen3", Some(both));
+    assert_eq!(here.hardware, Some(SubmittingMachine));
+    assert_eq!((here.pkg_w_busy, here.pkg_j_per_1k_tokens), (Some(47.0), Some(470.0)));
+}
+
+/// Several entries a name matches, with nothing to choose between them,
+/// decide nothing: the run's hardware is not recorded, and says so.
+#[test]
+fn a_name_several_entries_match_decides_nothing() {
+    let entry = |hardware: &str, endpoint: &str| {
+        serde_json::from_value::<crate::lab::manifest::ModelHardware>(
+            serde_json::json!({"model": "qwen3", "from": "endpoint", "hardware": hardware, "endpoint": endpoint}),
+        )
+        .unwrap()
+    };
+    let two = [entry("unknown", "peer"), entry("submitting-machine", "splash")];
+    assert_eq!(served_hardware(Some(&two), Some("qwen3")), None);
+    assert_eq!(served_hardware(Some(&two), Some("darkmux:qwen3")), None, "no managed entry, and the fallback is ambiguous");
+    let one = [entry("unknown", "peer")];
+    assert_eq!(
+        served_hardware(Some(&one), Some("darkmux:qwen3")),
+        Some(darkmux_types::Hardware::Unknown),
+        "the stripped name, when exactly one entry matches it"
+    );
+}

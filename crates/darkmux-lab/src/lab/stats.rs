@@ -491,22 +491,22 @@ pub struct MachineReadings {
 }
 
 /// (2.5.0) Which machine served a run's model, from the run's own
-/// `model_hardware` snapshot: the entry naming `model` (the dispatched name,
-/// with or without darkmux's namespace, as an id or an identifier), or,
-/// when none does, the answer every entry agrees on. `None` when the run
-/// recorded no snapshot, the entry declared no hardware, or the entries
-/// disagree. Never read from the registry as it is now: that is not the
-/// run's record.
+/// `model_hardware` snapshot: the entry the dispatched name `model` is
+/// ([`crate::lab::manifest::snapshot_entry`]), or, when no entry names it,
+/// the answer every entry agrees on. `None` when the run recorded no
+/// snapshot, the entry declared no hardware, several entries match the
+/// name, or the entries disagree. Never read from the registry as it is
+/// now: that is not the run's record.
 pub(crate) fn served_hardware(
     snapshot: Option<&[crate::lab::manifest::ModelHardware]>,
     model: Option<&str>,
 ) -> Option<darkmux_types::Hardware> {
+    use crate::lab::manifest::SnapshotMatch;
     let snapshot = snapshot?;
-    let id = crate::lab::submit::model_id_from(model);
-    let named = id.and_then(|id| snapshot.iter().find(|e| e.model == id || e.identifier.as_deref() == Some(id.as_str())));
-    match named {
-        Some(e) => e.hardware,
-        None => agreed(snapshot.iter().map(|e| e.hardware)),
+    match crate::lab::manifest::snapshot_entry(snapshot, model.unwrap_or_default()) {
+        SnapshotMatch::One(e) => e.hardware,
+        SnapshotMatch::Several => None,
+        SnapshotMatch::None => agreed(snapshot.iter().map(|e| e.hardware)),
     }
 }
 

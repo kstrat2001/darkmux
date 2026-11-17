@@ -198,7 +198,12 @@ darkmux release.
   field of a run whose bundle says `unknown`, including a run `--hardware unknown` corrects. Additive
   to the `run stats --json` shape; the meaning of the host fields narrows to "the machine that served
   the run". The submit bundle's shape and format version are unchanged (those fields were already
-  nullable).
+  nullable). Both `run stats` and `lab submit` pick the run's snapshot entry by the name the run sent:
+  `darkmux:<id>` is the managed model and a bare name the endpoint's, so a profile listing the same
+  model managed here and on a peer is no longer decided by its order. A name several entries match
+  decides nothing (`run stats` reads `hardware: null`; `lab submit` asks for `--hardware`). In a set, a
+  run served elsewhere no longer counts as overlapping a local run (it draws nothing on this machine's
+  meter), and an energy cost withheld because of it says so.
 
 - **A mission step waiting its turn reads waiting, not running (#3195).** Steps admitted together
   behind one slot (an endpoint with no `limits.concurrent_calls` runs its calls one at a time), or a
