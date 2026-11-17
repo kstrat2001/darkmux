@@ -323,6 +323,9 @@ pub enum Refusal {
     /// ([`crate::WaitBudget::fits`]): refused before it runs, since its
     /// answer could not reach the sender. `detail` names the bound.
     TooLongToWait { detail: String },
+    /// A request body over the listener's size limit: refused 413 before
+    /// the rest is read. `detail` is what the limit said.
+    BodyTooLarge { detail: String },
     /// (#2916 stage 2) The job's seat is busy and this machine refuses
     /// (`fleet.busy_policy = refuse`). `what` names what is running.
     Busy { what: String },
@@ -453,6 +456,7 @@ impl Refusal {
     pub fn http_status(&self) -> u16 {
         match self {
             Refusal::Token => 401,
+            Refusal::BodyTooLarge { .. } => 413,
             Refusal::Misaddressed { .. } | Refusal::UidUnconfirmable { .. } => 421,
             Refusal::SchemaMismatch { .. } | Refusal::BadRequest(_) | Refusal::TooLongToWait { .. } => 400,
             Refusal::NoWorkProfile { .. } => 422,
@@ -489,7 +493,7 @@ impl Refusal {
             Refusal::UtilityProfile { .. } => RefusalCode::ProfileNotAllowed,
             Refusal::NoWorkProfile { .. } => RefusalCode::ProfileUndefined,
             Refusal::SchemaMismatch { .. } => RefusalCode::Version,
-            Refusal::BadRequest(_) | Refusal::TooLongToWait { .. } => RefusalCode::BadRequest,
+            Refusal::BadRequest(_) | Refusal::TooLongToWait { .. } | Refusal::BodyTooLarge { .. } => RefusalCode::BadRequest,
             Refusal::Busy { .. } | Refusal::QueueFull { .. } | Refusal::TooManyAtOnce { .. } => RefusalCode::Busy,
             Refusal::SeatChanged { .. } => RefusalCode::SeatChanged,
             Refusal::BoundaryUnmanaged { .. } | Refusal::BoundaryUnknown => RefusalCode::Boundary,
@@ -610,6 +614,7 @@ impl Refusal {
             ),
             Refusal::BadRequest(detail) => format!("{receiver} refused a malformed request: {detail}"),
             Refusal::TooLongToWait { detail } => format!("{receiver} cannot hold the answer's connection that long: {detail}"),
+            Refusal::BodyTooLarge { detail } => format!("{receiver} refused a request body over its size limit: {detail}"),
             Refusal::ResolutionFailed { detail } => {
                 format!("{receiver} could not resolve a profile for this job ({detail}); retry, and if it repeats, look at {receiver}'s `darkmux serve` log")
             }
@@ -2367,6 +2372,7 @@ mod tests {
             (Refusal::SchemaMismatch { got: s() }, RefusalCode::Version),
             (Refusal::BadRequest(s()), RefusalCode::BadRequest),
             (Refusal::TooLongToWait { detail: s() }, RefusalCode::BadRequest),
+            (Refusal::BodyTooLarge { detail: s() }, RefusalCode::BadRequest),
             (Refusal::Busy { what: s() }, RefusalCode::Busy),
             (Refusal::QueueFull { peer: s(), what: s() }, RefusalCode::Busy),
             (Refusal::SeatChanged { profile: s() }, RefusalCode::SeatChanged),

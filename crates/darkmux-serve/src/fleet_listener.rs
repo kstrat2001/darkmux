@@ -960,20 +960,25 @@ fn scope_job(state: &FleetListenerState, admitted: &Admitted, job: &WorkJob) -> 
 /// answered and cut off then, never held to its connection's lifetime.
 pub(crate) const BODY_READ_TIMEOUT: std::time::Duration = darkmux_fleet::SUBMISSION_WRITE_TIMEOUT.saturating_mul(2);
 
-/// The most of a submission's body the listener reads: axum's default
-/// limit for a `Bytes` body, kept.
-const MAX_SUBMISSION_BODY_BYTES: usize = 2 * 1024 * 1024;
-
-/// A submission's body, read within `deadline` and up to
-/// [`MAX_SUBMISSION_BODY_BYTES`].
-async fn read_body(deadline: std::time::Duration, body: axum::body::Body) -> Result<Bytes, Refusal> {
-    match tokio::time::timeout(deadline, axum::body::to_bytes(body, MAX_SUBMISSION_BODY_BYTES)).await {
-        Ok(read) => read.map_err(|e| {
-            Refusal::BadRequest(format!(
-                "the body could not be read: larger than {MAX_SUBMISSION_BODY_BYTES} bytes, or the connection broke off ({e})"
-            ))
-        }),
+/// A submission's body, read within `deadline` by axum's own `Bytes`
+/// extractor, so its size limit (axum's default) and the 413 for a body
+/// over it are what they always were.
+async fn read_body(deadline: std::time::Duration, request: Request) -> Result<Bytes, Refusal> {
+    use axum::extract::FromRequest;
+    match tokio::time::timeout(deadline, Bytes::from_request(request, &())).await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(rejection)) => Err(body_refusal(rejection.status(), rejection.body_text())),
         Err(_) => Err(Refusal::BadRequest(format!("the body did not arrive within {deadline:?}"))),
+    }
+}
+
+/// The refusal for a body axum could not read: too large (413), or
+/// anything else (400).
+fn body_refusal(status: StatusCode, detail: String) -> Refusal {
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        Refusal::BodyTooLarge { detail }
+    } else {
+        Refusal::BadRequest(format!("the body could not be read: {detail}"))
     }
 }
 
@@ -984,9 +989,9 @@ async fn submit_route(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     authorization: Authorization,
     Extension(token): Extension<TokenFingerprint>,
-    body: axum::body::Body,
+    request: Request,
 ) -> Response {
-    let body = match read_body(state.body_read_timeout, body).await {
+    let body = match read_body(state.body_read_timeout, request).await {
         Ok(bytes) => bytes,
         Err(r) => return refuse(&state, Some(peer_addr.ip()), &r),
     };
@@ -2970,6 +2975,59 @@ mod tests {
         assert!(answer.contains("did not arrive within 2s"), "{answer}");
         assert!(sent.elapsed() < TEST_BODY_READ_TIMEOUT * 2, "answered after {:?}", sent.elapsed());
         assert!(h.ran.lock().unwrap().is_empty());
+    }
+
+    /// A body over the listener's size limit (axum's default for a body,
+    /// 2 MiB) is refused 413, as it always was, with the JSON refusal and
+    /// the `bad_request` code; nothing runs.
+    #[test]
+    fn a_body_over_the_size_limit_is_refused_413() {
+        use std::io::{Read, Write};
+        let h = start(Some(laptop()), false, 0);
+        let addr = h.url.trim_start_matches("http://").split('/').next().unwrap().to_string();
+        let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+        let len = 2 * 1024 * 1024 + 1;
+        write!(
+            sock,
+            "POST {} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\n\r\n",
+            darkmux_fleet::SUBMISSION_PATH,
+        )
+        .unwrap();
+        // The listener may answer before the body is all sent, and stop
+        // reading: the writer stops at its first failed write.
+        let mut writer = sock.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let chunk = vec![b' '; 64 * 1024];
+            let mut left = len;
+            while left > 0 {
+                let n = left.min(chunk.len());
+                if writer.write_all(&chunk[..n]).is_err() {
+                    return;
+                }
+                left -= n;
+            }
+        });
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut got = Vec::new();
+        let mut b = [0u8; 4096];
+        while let Ok(n @ 1..) = sock.read(&mut b) {
+            got.extend_from_slice(&b[..n]);
+        }
+        let answer = String::from_utf8_lossy(&got);
+        assert!(answer.starts_with("HTTP/1.1 413"), "{answer:?}");
+        assert!(answer.contains("\"refusal\":\"bad_request\""), "{answer}");
+        assert!(h.ran.lock().unwrap().is_empty());
+    }
+
+    /// Only a body over the size limit is a 413; any other failure to read
+    /// one is a 400.
+    #[test]
+    fn only_an_oversized_body_is_refused_413() {
+        let too_large = body_refusal(StatusCode::PAYLOAD_TOO_LARGE, "length limit exceeded".into());
+        assert_eq!((too_large.http_status(), too_large.code()), (413, darkmux_fleet::RefusalCode::BadRequest));
+        let broken = body_refusal(StatusCode::BAD_REQUEST, "the connection broke off".into());
+        assert_eq!((broken.http_status(), broken.code()), (400, darkmux_fleet::RefusalCode::BadRequest));
+        assert!(broken.reason("studio").contains("the body could not be read: the connection broke off"));
     }
 
     /// The production body-read deadline: the sender's write timeout and
