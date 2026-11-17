@@ -24,7 +24,15 @@
 //! **A value of the wrong type is refused the same way** ([`Issue::WrongType`]):
 //! one such value fails the whole typed load, which for `config.json` means
 //! every setting falls back to its default, and for a user role, skill or
-//! rule means the builtin of the same id silently stands in.
+//! rule means the builtin of the same id silently stands in. The refusal
+//! names the JSON type it got, never the value: a value is whatever the
+//! operator pasted (a Redis URL carries its password), and the message
+//! reaches preflight stderr, doctor and the daemon's log.
+//!
+//! **So is a key written twice in one object** ([`Issue::Duplicate`], at any
+//! depth): a typed load refuses the whole document over it, and a lenient
+//! one keeps only the last copy. A `serde_json::Value` hides it, so
+//! [`check_text_and`] reads the text itself ([`duplicate_keys`]).
 //!
 //! **One mechanism, derived from the type.** Each file kind's valid keys and
 //! value types are its Rust type's derived JSON schema
@@ -214,24 +222,33 @@ pub enum Issue {
     /// A value the schema accepts but its consumer refuses: the rule it
     /// breaks, named with the step and key.
     Rule(String),
+    /// A key written more than once in one object. A typed load refuses the
+    /// whole document over it (`config.json` falls back to every default),
+    /// and a lenient one silently keeps the last copy.
+    Duplicate,
 }
 
 impl fmt::Display for KeyIssue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.issue {
-            Issue::Unknown { closest, valid } => {
-                write!(f, "unknown key `{}`", self.path)?;
-                if let Some(c) = closest {
-                    write!(f, ": did you mean `{c}`?")?;
-                }
-                write!(f, " (valid keys here: {})", valid.join(", "))
-            }
+            Issue::Unknown { closest, valid } => self.fmt_unknown(f, closest.as_deref(), valid),
             Issue::Retired(line) => write!(f, "unknown key `{}`: {line}", self.path),
             Issue::Removed(line) | Issue::Rule(line) => write!(f, "`{}`: {line}", self.path),
             Issue::WrongType { expected, got } => write!(f, "`{}` must be {expected}, got {got}", self.path),
             Issue::Missing { expected } if expected.is_empty() => write!(f, "missing required key `{}`", self.path),
             Issue::Missing { expected } => write!(f, "missing required key `{}` ({expected})", self.path),
+            Issue::Duplicate => write!(f, "duplicate key `{}`: it is written more than once in the same object; keep one", self.path),
         }
+    }
+}
+
+impl KeyIssue {
+    fn fmt_unknown(&self, f: &mut fmt::Formatter<'_>, closest: Option<&str>, valid: &[String]) -> fmt::Result {
+        write!(f, "unknown key `{}`", self.path)?;
+        if let Some(c) = closest {
+            write!(f, ": did you mean `{c}`?")?;
+        }
+        write!(f, " (valid keys here: {})", valid.join(", "))
     }
 }
 
@@ -473,7 +490,7 @@ impl<'a> Walker<'a, '_> {
         if chosen.is_empty() {
             let mut expected: Vec<String> = nodes.iter().flat_map(|n| self.describe(n)).collect();
             expected.dedup();
-            let issue = Issue::WrongType { expected: expected.join(" or "), got: shorten(&escape_text(&doc.to_string())) };
+            let issue = Issue::WrongType { expected: expected.join(" or "), got: self.got_words(nodes, doc) };
             self.out.push(KeyIssue { path: path.to_string(), issue });
             return;
         }
@@ -489,6 +506,30 @@ impl<'a> Walker<'a, '_> {
             }
             _ => {}
         }
+    }
+
+    /// What a refused value is, by its JSON type only, never the value: it
+    /// is whatever the operator pasted (a URL carries its password) and
+    /// would reach preflight stderr, doctor and the daemon's log. A value of
+    /// a type `nodes` accepts broke a narrower rule (a range, an enum token,
+    /// a text form), so it is "a <type> that does not fit".
+    fn got_words(&self, nodes: &[&'a Value], doc: &Value) -> String {
+        let kind = json_type(doc);
+        if nodes.iter().any(|n| self.declares_type_of(n, doc)) {
+            format!("{kind} that does not fit")
+        } else {
+            kind.to_string()
+        }
+    }
+
+    /// Whether `node`, or one of its branches, names `value`'s JSON type.
+    fn declares_type_of(&self, node: &'a Value, value: &Value) -> bool {
+        let Some(node) = self.resolve(node) else { return false };
+        let tokens = node.get("const").into_iter().chain(node.get("enum").and_then(Value::as_array).into_iter().flatten());
+        let types = node.get("type").into_iter().flat_map(|t| t.as_array().map_or_else(|| vec![t], |ts| ts.iter().collect()));
+        tokens.into_iter().any(|t| std::mem::discriminant(t) == std::mem::discriminant(value))
+            || types.filter_map(Value::as_str).any(|t| type_holds(t, value))
+            || branches(node).any(|b| self.declares_type_of(b, value))
     }
 
     fn walk_object(&mut self, nodes: &[&'a Value], map: &serde_json::Map<String, Value>, path: &str, bare: &str) {
@@ -661,10 +702,84 @@ fn array_words(node: &Value) -> String {
     }
 }
 
-/// A value as JSON, cut to 60 characters so a pasted blob never floods the
-/// message.
-fn shorten(text: &str) -> String {
-    shorten_to(text, 60)
+/// A value's JSON type in operator words, the words [`type_words`] uses.
+pub fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(n) if n.is_i64() || n.is_u64() => "an integer",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// A typed load's error in words that never quote the file: serde's own
+/// message names a wrong value by quoting it (`invalid type: string
+/// "redis://:pw@host"`), and the message reaches load warnings, doctor and
+/// a fleet sender's refusal. Keys, types and the position stay.
+pub fn load_error(e: &serde_json::Error) -> String {
+    without_values(&e.to_string())
+}
+
+/// `message` (a serde error) with each value it quotes replaced by what it
+/// is: serde writes a wrong string as `string "<value>"` (Rust-escaped) and
+/// an unregistered variant as ``unknown variant `<value>` ``.
+pub fn without_values(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some((at, end, words)) = next_quoted_value(rest) {
+        out.push_str(&rest[..at]);
+        out.push_str(words);
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The first value `text` quotes: where it starts, where it ends, and the
+/// words that replace it.
+fn next_quoted_value(text: &str) -> Option<(usize, usize, &'static str)> {
+    const STRING: &str = "string \"";
+    const VARIANT: &str = "unknown variant `";
+    let string = text.find(STRING).map(|at| (at, at + STRING.len() + escaped_string_len(&text[at + STRING.len()..]), "a string"));
+    let variant = text.find(VARIANT).map(|at| {
+        let body = &text[at + VARIANT.len()..];
+        let len = ["`, expected", "`, there are no variants"].iter().filter_map(|t| body.find(t)).min().map_or(body.len(), |i| i + 1);
+        (at, at + VARIANT.len() + len, "an unknown variant")
+    });
+    [string, variant].into_iter().flatten().min_by_key(|(at, _, _)| *at)
+}
+
+/// The length of a Rust-escaped string's body up to and including its
+/// closing quote (all of `body` when it has none).
+fn escaped_string_len(body: &str) -> usize {
+    let mut escaped = false;
+    for (i, c) in body.char_indices() {
+        match (escaped, c) {
+            (true, _) => escaped = false,
+            (false, '\\') => escaped = true,
+            (false, '"') => return i + 1,
+            _ => {}
+        }
+    }
+    body.len()
+}
+
+/// Whether a JSON-schema `type` name holds `value`, its other constraints
+/// aside.
+fn type_holds(t: &str, value: &Value) -> bool {
+    match t {
+        "integer" => value.is_i64() || value.is_u64(),
+        "number" => value.is_number(),
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "null" => value.is_null(),
+        _ => false,
+    }
 }
 
 fn shorten_to(text: &str, cap: usize) -> String {
@@ -901,21 +1016,104 @@ pub fn check_text_and<T: JsonSchema + 'static>(
 ) -> Option<FileProblem> {
     let problem = match serde_json::from_str::<Value>(text) {
         Err(e) => Problem::NotJson(e.to_string()),
-        Ok(doc) => doc_problem::<T>(kind, &doc, retired, extra)?,
+        Ok(doc) => doc_problem::<T>(kind, &doc, duplicate_keys(text), retired, extra)?,
     };
     Some(FileProblem { kind, path: path.to_path_buf(), problem, note: None })
 }
 
-/// What is wrong with a parsed document, `None` when it is clean. A marker
-/// newer than the binary's ends the check: its keys are not judged.
-fn doc_problem<T: JsonSchema + 'static>(kind: UserFileKind, doc: &Value, retired: RetiredLookup<'_>, extra: ExtraIssues<'_>) -> Option<Problem> {
+/// What is wrong with a parsed document, `None` when it is clean.
+/// `duplicates` are the keys its text writes twice, which the parsed
+/// document no longer shows. A marker newer than the binary's ends the
+/// check: its keys are not judged.
+fn doc_problem<T: JsonSchema + 'static>(
+    kind: UserFileKind,
+    doc: &Value,
+    duplicates: Vec<KeyIssue>,
+    retired: RetiredLookup<'_>,
+    extra: ExtraIssues<'_>,
+) -> Option<Problem> {
     let known = kind.schema_version();
     if let Some(file_version) = crate::data_version::newer(doc, known) {
         return Some(Problem::Newer { file_version, known: known.to_string() });
     }
-    let mut keys = key_issues::<T>(doc, retired);
+    let mut keys = duplicates;
+    keys.extend(key_issues::<T>(doc, retired));
     keys.extend(extra(doc));
     (!keys.is_empty()).then_some(Problem::Keys(keys))
+}
+
+/// Every key `text` writes more than once in one object, at any depth, once
+/// each, in document order. A `serde_json::Value` keeps only the last copy,
+/// so this reads the text itself. Text that is not JSON has none (its
+/// parse error is reported instead).
+pub fn duplicate_keys(text: &str) -> Vec<KeyIssue> {
+    let mut found = Vec::new();
+    let mut de = serde_json::Deserializer::from_str(text);
+    let _ = serde::de::DeserializeSeed::deserialize(DuplicateScan { path: String::new(), found: &mut found }, &mut de);
+    found.into_iter().map(|path| KeyIssue { path, issue: Issue::Duplicate }).collect()
+}
+
+/// One value of a document being scanned for duplicate keys: its display
+/// path, and where each duplicate's path goes.
+struct DuplicateScan<'f> {
+    path: String,
+    found: &'f mut Vec<String>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for DuplicateScan<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for DuplicateScan<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        let DuplicateScan { path, found } = self;
+        for i in 0.. {
+            let item = DuplicateScan { path: format!("{path}[{i}]"), found: &mut *found };
+            if seq.next_element_seed(item)?.is_none() {
+                break;
+            }
+        }
+        Ok(())
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let DuplicateScan { path, found } = self;
+        let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let at = join_display(&path, &key);
+            let count = seen.entry(key).or_default();
+            *count += 1;
+            if *count == 2 {
+                found.push(at.clone());
+            }
+            map.next_value_seed(DuplicateScan { path: at, found: &mut *found })?;
+        }
+        Ok(())
+    }
 }
 
 /// The largest user file the gate reads (and the crew loader parses): 1 MiB,
@@ -1011,6 +1209,29 @@ pub fn open_objects<T: JsonSchema>() -> Vec<String> {
         .filter(|(_, d)| d.get("properties").is_some() && d.get("additionalProperties") == Some(&Value::Bool(true)))
         .map(|(n, _)| n.clone())
         .collect()
+}
+
+/// `doc` as JSON text in which the object at `pointer` writes its first key a
+/// second time, with the same value, and that key's display path: a document
+/// a `serde_json::Value` cannot hold, for tests of the duplicate-key refusal.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_duplicate_key(doc: &Value, pointer: &str) -> (String, String) {
+    const SENTINEL: &str = "__duplicate_key_sentinel__";
+    let mut copy = doc.clone();
+    let object = copy.pointer_mut(pointer).and_then(Value::as_object_mut).expect("an object at the pointer");
+    let (key, value) = object.iter().next().map(|(k, v)| (k.clone(), v.clone())).expect("a key to repeat");
+    object.insert(SENTINEL.to_string(), value);
+    let text = copy.to_string().replace(&format!("\"{SENTINEL}\""), &serde_json::to_string(&key).expect("a key"));
+    let mut path = String::new();
+    let mut at = doc;
+    for segment in pointer.split('/').skip(1) {
+        path = match at {
+            Value::Array(_) => format!("{path}[{segment}]"),
+            _ => join_display(&path, segment),
+        };
+        at = at.get(segment).or_else(|| segment.parse().ok().and_then(|i: usize| at.get(i))).expect("the pointer's value");
+    }
+    (text, join_display(&path, &key))
 }
 
 /// `config.json`'s retired keys: the line says what replaced the key (a rename names

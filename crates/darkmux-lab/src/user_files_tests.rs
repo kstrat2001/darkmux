@@ -5,7 +5,7 @@
 
 use super::*;
 use darkmux_types::test_isolation::IsolatedState;
-use darkmux_types::user_files::{key_issues, no_retired, open_objects, Reach, UserFileKind};
+use darkmux_types::user_files::{duplicate_keys, key_issues, no_retired, open_objects, with_duplicate_key, Reach, UserFileKind};
 use serde_json::{json, Value};
 
 fn quick_q() -> Value {
@@ -83,6 +83,43 @@ fn a_workload_with_an_unknown_key_is_refused_by_the_lab_preflight() {
             assert_eq!(preflight_with(scope, None, None), Ok(()), "a workload is consumed only by a lab run ({scope:?})");
         }
     }
+}
+
+/// A key written twice in a workload, top level or nested, is refused by
+/// the lab preflight and doctor, naming its path, and by no other scope. A
+/// `serde_json::Value` keeps only the last copy, so the gate never saw it,
+/// while the workload's typed load refuses the whole file over it.
+#[test]
+#[serial_test::serial]
+fn a_workload_with_a_duplicate_key_is_refused_by_the_lab_preflight() {
+    for pointer in ["", "/workload", "/workload/verify"] {
+        let (text, key) = with_duplicate_key(&quick_q(), pointer);
+        assert!(serde_json::from_str::<crate::workloads::types::WorkloadManifest>(&text).is_err(), "precondition: {key} fails the typed load");
+        let state = IsolatedState::new();
+        let path = write_workload(&state, &quick_q());
+        std::fs::write(&path, &text).unwrap();
+        let found = problems(UserFileKind::Workload, Reach::Every);
+        assert_eq!(found.len(), 1, "{key}: {found:?}");
+        let refusal = preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)).expect_err(&key).to_string();
+        for msg in [found[0].to_string(), refusal] {
+            assert!(msg.contains(&path.display().to_string()) && msg.contains(&format!("duplicate key `{key}`")), "{msg}");
+        }
+        for scope in [Scope::Dispatch, Scope::MissionLaunch, Scope::FleetSubmission] {
+            assert_eq!(preflight_with(scope, None, None), Ok(()), "a workload is consumed only by a lab run ({scope:?})");
+        }
+    }
+}
+
+/// A fixture manifest the run binds is refused the same way.
+#[test]
+#[serial_test::serial]
+fn a_fixture_manifest_with_a_duplicate_key_is_refused_by_the_lab_preflight() {
+    let (text, key) = with_duplicate_key(&tiny_fixture(), "");
+    let state = IsolatedState::new();
+    let path = register_fixture(&state, &tiny_fixture());
+    std::fs::write(&path, &text).unwrap();
+    let refusal = preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)).expect_err(&key).to_string();
+    assert!(refusal.contains(&path.display().to_string()) && refusal.contains(&format!("duplicate key `{key}`")), "{refusal}");
 }
 
 #[test]
@@ -253,7 +290,7 @@ fn a_mistyped_workload_value_is_refused() {
     wl["workload"]["verify"] = json!({"must_contain": "four"});
     write_workload(&state, &wl);
     let refusal = preflight_with(Scope::LabRun, None, Some(PROBE_FIXTURE)).unwrap_err().to_string();
-    assert!(refusal.contains("`workload.verify.must_contain` must be a list, got \"four\""), "{refusal}");
+    assert!(refusal.contains("`workload.verify.must_contain` must be a list, got a string"), "{refusal}");
 }
 
 /// (`verify.expect`, `replyRoom`) The answer a workload expects is data, so
@@ -367,6 +404,30 @@ where
     }
     if passed <= 1 {
         failures.push(format!("{name}: the gate passed {passed} variant(s); the base is refused, nothing exercised"));
+    }
+    gate_agrees_with_loader_on_text::<T>(name, base, failures);
+}
+
+/// The same promise for what a `Value` cannot hold: `base` with a key
+/// written twice in each of its objects. A text the gate passes must load
+/// from that text with serde, the way every loader reads a file.
+fn gate_agrees_with_loader_on_text<T>(name: &str, base: &Value, failures: &mut Vec<String>)
+where
+    T: schemars::JsonSchema + serde::de::DeserializeOwned + 'static,
+{
+    let mut ptrs = Vec::new();
+    pointers(base, String::new(), &mut ptrs);
+    let objects: Vec<String> = ptrs.into_iter().filter(|p| base.pointer(p).and_then(Value::as_object).is_some_and(|o| !o.is_empty())).collect();
+    if objects.is_empty() {
+        failures.push(format!("{name}: no object to write a key twice in, nothing exercised"));
+    }
+    for p in objects {
+        let (text, key) = with_duplicate_key(base, &p);
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        let passed = duplicate_keys(&text).is_empty() && key_issues::<T>(&doc, &no_retired).is_empty();
+        if let (true, Err(e)) = (passed, serde_json::from_str::<T>(&text)) {
+            failures.push(format!("{name}: the gate passed `{key}` written twice, serde refused it ({e})"));
+        }
     }
 }
 

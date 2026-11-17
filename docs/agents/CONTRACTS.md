@@ -161,7 +161,9 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    Both name the file, the key's dotted path and the closest valid key (the same shape as
    contract 9's enum refusal); a retired key names what replaced it instead of a guess.
    **A value of the wrong type, or a missing required key, is refused the same way**, naming the path, the expected
-   type and what it got: one such value fails the whole typed load, which for `config.json`
+   type and the JSON type it got (never the value, which may be a pasted credential); **so is a key written twice in
+   one object**, at any depth, which a `serde_json::Value` hides (the gate reads the text for it): one such value or
+   key fails the whole typed load, which for `config.json`
    means every setting falls back to its default (Redis and audit silently off) and for a
    user role, skill or rule means the builtin of the same id silently stands in. The
    registry is the one exception: it already quarantines a mistyped profile or endpoint

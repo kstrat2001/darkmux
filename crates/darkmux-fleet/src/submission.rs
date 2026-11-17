@@ -755,7 +755,7 @@ pub fn read_allow_list(path: &std::path::Path) -> std::result::Result<BTreeMap<S
         Err(e) => return Err(format!("reading {}: {e}", path.display())),
     };
     let cfg: darkmux_types::config::DarkmuxConfig =
-        serde_json::from_str(&raw).map_err(|e| format!("{} does not parse: {e}", path.display()))?;
+        serde_json::from_str(&raw).map_err(|e| format!("{} does not parse: {}", path.display(), darkmux_types::user_files::load_error(&e)))?;
     Ok(cfg.fleet.and_then(|f| f.accept_work).unwrap_or_default())
 }
 
@@ -2323,6 +2323,19 @@ mod tests {
         assert_eq!(read_allow_list(&p).unwrap()["laptop"].node_id.as_deref(), Some("n1"));
         std::fs::write(&p, "{ not json").unwrap();
         assert!(read_allow_list(&p).is_err());
+    }
+
+    /// An allow-list read failure reaches doctor and the refusal a sender
+    /// gets back, so it never quotes the file: serde's own message for a
+    /// wrong value quotes the value, and a Redis URL carries its password.
+    #[test]
+    fn an_unreadable_allow_list_never_quotes_the_file() {
+        let d = tempfile::TempDir::new().unwrap();
+        let p = d.path().join("config.json");
+        std::fs::write(&p, r#"{"redis":"redis://:hunter2@10.0.0.5:6379/0"}"#).unwrap();
+        let err = read_allow_list(&p).unwrap_err();
+        assert!(err.contains(&p.display().to_string()) && err.contains("line 1"), "names the file and where: {err}");
+        assert!(!err.contains("hunter2") && !err.contains("10.0.0.5"), "the value leaked: {err}");
     }
 
     /// A 3.x sender speaks v6, whose `session_id` is a free-form string.

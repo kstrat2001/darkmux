@@ -14617,7 +14617,7 @@ fn a_mistyped_value_in_a_user_file_is_refused_by_every_consuming_entry_point() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{args:?} succeeded: {stderr}");
         assert!(stderr.contains("refusing to start: bad config") && stderr.contains(&path.display().to_string()), "{args:?}: {stderr}");
-        assert!(stderr.contains("`skills` must be a list, got \"code-reviewing\""), "{args:?}: {stderr}");
+        assert!(stderr.contains("`skills` must be a list, got a string"), "{args:?}: {stderr}");
         let mut written = Vec::new();
         collect_files(&home, &mut written);
         written.retain(|p| p != &path && !p.components().any(|c| c.as_os_str() == "liveness"));
