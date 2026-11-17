@@ -36,6 +36,7 @@
 use crate::job::{Boundary, SubmissionMode, WorkJob, WorkVersion, WORK_JOB_SCHEMA_VERSION};
 use crate::identity::{IdentityProvider, NodeIdentity};
 use crate::peer::TargetError;
+use crate::wait_budget::reply_wait;
 use anyhow::{anyhow, Context, Result};
 use darkmux_types::config::AcceptWorkEntry;
 use darkmux_types::session_id::SessionId;
@@ -318,6 +319,10 @@ pub enum Refusal {
     NoWorkProfile { role: String, detail: String },
     SchemaMismatch { got: String },
     BadRequest(String),
+    /// A waited-on job whose run does not fit one connection here
+    /// ([`crate::WaitBudget::fits`]): refused before it runs, since its
+    /// answer could not reach the sender. `detail` names the bound.
+    TooLongToWait { detail: String },
     /// (#2916 stage 2) The job's seat is busy and this machine refuses
     /// (`fleet.busy_policy = refuse`). `what` names what is running.
     Busy { what: String },
@@ -449,7 +454,7 @@ impl Refusal {
         match self {
             Refusal::Token => 401,
             Refusal::Misaddressed { .. } | Refusal::UidUnconfirmable { .. } => 421,
-            Refusal::SchemaMismatch { .. } | Refusal::BadRequest(_) => 400,
+            Refusal::SchemaMismatch { .. } | Refusal::BadRequest(_) | Refusal::TooLongToWait { .. } => 400,
             Refusal::NoWorkProfile { .. } => 422,
             Refusal::Busy { .. }
             | Refusal::QueueFull { .. }
@@ -484,7 +489,7 @@ impl Refusal {
             Refusal::UtilityProfile { .. } => RefusalCode::ProfileNotAllowed,
             Refusal::NoWorkProfile { .. } => RefusalCode::ProfileUndefined,
             Refusal::SchemaMismatch { .. } => RefusalCode::Version,
-            Refusal::BadRequest(_) => RefusalCode::BadRequest,
+            Refusal::BadRequest(_) | Refusal::TooLongToWait { .. } => RefusalCode::BadRequest,
             Refusal::Busy { .. } | Refusal::QueueFull { .. } | Refusal::TooManyAtOnce { .. } => RefusalCode::Busy,
             Refusal::SeatChanged { .. } => RefusalCode::SeatChanged,
             Refusal::BoundaryUnmanaged { .. } | Refusal::BoundaryUnknown => RefusalCode::Boundary,
@@ -604,6 +609,7 @@ impl Refusal {
                  major version on both machines, and the newer minor on the receiver"
             ),
             Refusal::BadRequest(detail) => format!("{receiver} refused a malformed request: {detail}"),
+            Refusal::TooLongToWait { detail } => format!("{receiver} cannot hold the answer's connection that long: {detail}"),
             Refusal::ResolutionFailed { detail } => {
                 format!("{receiver} could not resolve a profile for this job ({detail}); retry, and if it repeats, look at {receiver}'s `darkmux serve` log")
             }
@@ -1428,48 +1434,6 @@ fn deliver(
     })
 }
 
-/// (#3429) What a waited-on job's answer gets past the job's own run: the
-/// receiver's bookkeeping and the answer's trip back.
-pub const ANSWER_SLACK: Duration = Duration::from_secs(120);
-
-/// (#3429) The longest a target may spend, before an agentic job's work
-/// begins, getting what its sandbox needs on first use: a Docker target
-/// pulls the runtime image (bounded by `darkmux_crew::runtime_image::PULL_TIMEOUT`),
-/// and a sandbox on the host fetches its managed toolchain (bounded by
-/// `darkmux_crew::managed_toolchain::FIRST_USE_BOUND`). The sender cannot
-/// see which sandbox the target runs, so it allows the longer.
-pub const SANDBOX_FIRST_USE: Duration =
-    longer(darkmux_crew::runtime_image::PULL_TIMEOUT, darkmux_crew::managed_toolchain::FIRST_USE_BOUND);
-
-const fn longer(a: Duration, b: Duration) -> Duration {
-    if a.as_nanos() >= b.as_nanos() {
-        a
-    } else {
-        b
-    }
-}
-
-/// (#3429) How long a sender waits for the next line of a job's reply (a
-/// read deadline, so each `queued` line restarts it). An unwaited job's one
-/// line is the acknowledgment, sent before anything runs. A waited-on job's
-/// last line comes after its run: the job's own timeout, then the answer's
-/// slack, and for an agentic job first the sandbox's first-use allowance
-/// ([`SANDBOX_FIRST_USE`]). A single-shot job starts no sandbox. The job's
-/// timeout bounds only a single-shot job's run: an agentic job runs on the
-/// receiver's own inactivity budget (`timeout_override_seconds` does not
-/// cross the wire), so it can outlast this wait, and the sender then reports
-/// the answer lost, naming the session to follow.
-pub fn reply_wait(job: &WorkJob, wait: bool) -> Duration {
-    if !wait {
-        return ACKNOWLEDGMENT_WAIT;
-    }
-    let first_use = if job.single_shot.is_some() { Duration::ZERO } else { SANDBOX_FIRST_USE };
-    Duration::from_secs(u64::from(job.timeout_seconds)) + first_use + ANSWER_SLACK
-}
-
-/// How long a sender waits for an unwaited job's acknowledgment.
-const ACKNOWLEDGMENT_WAIT: Duration = Duration::from_secs(60);
-
 /// Submit `job` to the machine it is addressed to ([`send_job`]). A refusal
 /// comes back as `Err` carrying a [`SubmitRefused`] (the receiver's reason,
 /// control characters removed, and its typed code).
@@ -1675,6 +1639,7 @@ fn check_outcome(target: &str, code: u16, reply: SubmissionReply) -> CheckOutcom
 mod tests {
     use super::*;
     use crate::identity::test_node;
+    use crate::wait_budget::{ANSWER_SLACK, SANDBOX_FIRST_USE};
 
     /// (#2988 review) A machine whose Keychain item exists can still have no
     /// token, because `serve.token_keychain` is the switch that reads it. The
@@ -2401,6 +2366,7 @@ mod tests {
             (Refusal::NoWorkProfile { role: s(), detail: s() }, RefusalCode::ProfileUndefined),
             (Refusal::SchemaMismatch { got: s() }, RefusalCode::Version),
             (Refusal::BadRequest(s()), RefusalCode::BadRequest),
+            (Refusal::TooLongToWait { detail: s() }, RefusalCode::BadRequest),
             (Refusal::Busy { what: s() }, RefusalCode::Busy),
             (Refusal::QueueFull { peer: s(), what: s() }, RefusalCode::Busy),
             (Refusal::SeatChanged { profile: s() }, RefusalCode::SeatChanged),

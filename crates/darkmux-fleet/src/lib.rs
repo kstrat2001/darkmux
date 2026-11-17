@@ -12,6 +12,7 @@ mod routing;
 mod runner;
 mod seats;
 mod submission;
+mod wait_budget;
 
 pub use identity::*;
 pub use identity_knowledge::*;
@@ -22,6 +23,7 @@ pub use routing::*;
 pub use runner::*;
 pub use seats::*;
 pub use submission::*;
+pub use wait_budget::*;
 
 /// A test's session: an ad-hoc dispatch `nonce` of `coder` in mission `m-1`.
 #[cfg(test)]
