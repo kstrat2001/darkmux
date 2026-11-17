@@ -3,7 +3,8 @@ import { RunKindIcon } from "../../components/RunKindIcon";
 import { Shimmer } from "../../components/Placeholder";
 import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { fetchJson, loadFailureText, type FetchResult } from "../../lib/fetcher";
+import { fetchJson, loadFailureText, staleReadText, type FetchResult } from "../../lib/fetcher";
+import { useKeptRead } from "../../hooks/useKeptRead";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { missionGraphReachable } from "../../lib/source";
@@ -410,6 +411,9 @@ export function RunsBoard({
     queryFn: () => fetchJson<RunsResponse>(runsSrc()),
     refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
   });
+  // The board polls: a failed poll keeps the last good runs on screen,
+  // marked stale (`RunsStale`), rather than replacing them.
+  const runsRead = useKeptRead(runsQuery.data);
   const labRunsQuery = useQuery({
     queryKey: queryKeys.labRuns(),
     queryFn: () => fetchJson<LabRunsResponse>(labRunsSrc()),
@@ -421,10 +425,7 @@ export function RunsBoard({
   // lab run with a representative session opens the shared session view;
   // only a run without one keeps its own record page. `location.replace`,
   // so Back does not land on the redirect and bounce forward again.
-  const labRunRow =
-    labRunDir && runsQuery.data?.ok
-      ? runsQuery.data.data.runs.find((r) => r.kind === "lab" && r.id === labRunDir)
-      : undefined;
+  const labRunRow = labRunRowOf(runsRead.good, labRunDir);
   const labRunDest = labRunRow ? runDestination(labRunRow, missionGraphReachable()) : null;
   const labRunRedirect = labRunDest?.kind === "hash" ? labRunDest.hash : null;
   useEffect(() => {
@@ -484,7 +485,7 @@ export function RunsBoard({
   // shows.
   const keyCtx = useMachineKeyContext(pinRecords, daemonBacked ? flowWindow.settled : !day.loading, daemonBacked);
 
-  const allRuns = useMemo(() => (runsQuery.data?.ok ? (runsQuery.data.data.runs ?? NO_RUNS) : NO_RUNS), [runsQuery.data]);
+  const allRuns = useMemo(() => runsOf(runsRead.good), [runsRead.good]);
   const index = useMemo(() => machineIndex(allRuns, keyCtx.ctx, sel.machine), [allRuns, keyCtx.ctx, sel.machine]);
   // Windows are minutes wide at their narrowest, so a once-a-minute clock keeps
   // the facet counts from recomputing on every poll.
@@ -586,6 +587,11 @@ export function RunsBoard({
     );
   }
 
+  // No read of `/runs` has ever succeeded: say so, and draw no kind bar or
+  // count, since any number there would claim "zero runs".
+  const unread = neverRead(runsRead);
+  if (unread) return <RunsUnread failure={unread} />;
+
   // The filter bar speaks in values; the hash carries machine KEYS. A value
   // that is already selected keeps the key it arrived with, so an unresolved
   // key survives the other choices being toggled.
@@ -636,6 +642,7 @@ export function RunsBoard({
         </div>
       )}
       {notice && <div className="labnotice">{notice}</div>}
+      <RunsStale read={runsRead} />
       <div className="lablist">
         {shown.length ? (
           <>
@@ -655,24 +662,61 @@ export function RunsBoard({
             )}
           </>
         ) : (
-          <RunsEmpty runs={runsQuery.data} filtering={filtering} kind={kind} />
+          <RunsEmpty filtering={filtering} kind={kind} />
         )}
       </div>
     </div>
   );
 }
 
-/** The list's empty state. A failed `/runs` read says so (status and
- * reason): the list is empty because nothing was read, and "no runs recorded
- * yet" would tell the operator nothing ran. The next poll retries. */
-function RunsEmpty({ runs, filtering, kind }: { runs: FetchResult<RunsResponse>; filtering: boolean; kind: RunsKind }) {
-  if (!runs.ok) {
-    return (
-      <div className="none" data-state="error" role="alert">
-        {loadFailureText("runs", runs)}
+/** The board when `/runs` has never answered: the failure (status and
+ * reason) under the header, and nothing else. "no runs recorded yet", a kind
+ * bar of zeros or "Showing 0 runs" would each tell the operator nothing ran
+ * when the daemon simply did not answer. The next poll retries. */
+function RunsUnread({ failure }: { failure: Failure }) {
+  return (
+    <div data-state="error">
+      <div className="stagehdr">runs</div>
+      <div className="none" role="alert">
+        {loadFailureText("runs", failure)}
       </div>
-    );
-  }
+    </div>
+  );
+}
+
+/** The latest poll failed while earlier runs are on screen: says how old
+ * they are and why the refresh failed. Renders nothing while reads succeed. */
+function RunsStale({ read }: { read: { good: RunsResponse | null; failure: Failure | null } }) {
+  if (!read.failure || !read.good) return null;
+  return (
+    <div className="labnotice" data-state="stale" role="status">
+      {staleReadText("runs", read.good.generated_at_ms, read.failure)}
+    </div>
+  );
+}
+
+type Failure = { status: number | null; message: string };
+
+/** The lab run a `lab=<dir>` deep link names, from the kept `/runs` read. */
+function labRunRowOf(good: RunsResponse | null, labRunDir: string | null | undefined): Run | undefined {
+  if (!labRunDir || !good) return undefined;
+  return good.runs.find((r) => r.kind === "lab" && r.id === labRunDir);
+}
+
+/** The runs a kept read holds, or none before any good read. */
+function runsOf(good: RunsResponse | null): Run[] {
+  return good?.runs ?? NO_RUNS;
+}
+
+/** The failure to show in place of the board when `/runs` has never
+ * answered; null once any read has succeeded (a later failure is stale, not
+ * unread) or while no read has failed. */
+function neverRead(read: { good: RunsResponse | null; failure: Failure | null }): Failure | null {
+  return read.good ? null : read.failure;
+}
+
+/** The list's empty state, for a read that succeeded with no matching runs. */
+function RunsEmpty({ filtering, kind }: { filtering: boolean; kind: RunsKind }) {
   return (
     <div className="none">
       {filtering ? "no runs match these filters. Remove a filter, or Clear all." : `no ${kind === "all" ? "" : `${kind} `}runs recorded yet.`}

@@ -1,3 +1,5 @@
+import { clk } from "./format";
+
 /**
  * The one typed fetch wrapper every query in this app goes through. Returns
  * a DISCRIMINATED RESULT rather than throwing — a lens component checks
@@ -18,8 +20,19 @@ export type FetchResult<T> =
  *  when there was none (the daemon never answered). Same wording as the
  *  event log's own failure line. */
 export function loadFailureText(what: string, failure: { status: number | null; message: string }): string {
+  return `couldn't load ${what}${failureDetail(failure)}`;
+}
+
+/** A refetch failed but an earlier read is still on screen: says how old
+ *  that read is (its `generated_at_ms`, local time) and why the newest one
+ *  failed, in the same wording as `loadFailureText`. */
+export function staleReadText(what: string, readAtMs: number, failure: { status: number | null; message: string }): string {
+  return `showing ${what} from ${clk(readAtMs)}; couldn't refresh${failureDetail(failure)}`;
+}
+
+function failureDetail(failure: { status: number | null; message: string }): string {
   const status = failure.status !== null ? ` (HTTP ${failure.status})` : "";
-  return `couldn't load ${what}${status}: ${failure.message}`;
+  return `${status}: ${failure.message}`;
 }
 
 export async function fetchJson<T>(path: string, init?: RequestInit): Promise<FetchResult<T>> {

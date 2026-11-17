@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { CatalogPanel } from "./CatalogPanel";
 import { todayUTC } from "./format";
 import { queryKeys } from "../../lib/queryKeys";
+import { clk } from "../../lib/format";
 
 function jsonResponse(body: unknown, status = 200) {
   return Promise.resolve(new Response(JSON.stringify(body), { status }));
@@ -202,6 +203,41 @@ describe("CatalogPanel", () => {
     expect(screen.queryByRole("alert")).toBeNull();
     // Retry happens inside the panel: it must not close it.
     expect(document.getElementById("catpanel")).toBeTruthy();
+  });
+
+  it("a failed re-read after a good one keeps the days already shown, marked stale with the failure, and retry clears it", async () => {
+    let daysOk = true;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith("/flow-days"))
+          return daysOk
+            ? jsonResponse({ days: [{ date: "2026-08-07", records: 5, dispatches: 1, missions: [] }], generated_at_ms: 1 })
+            : jsonResponse({}, 500);
+        return jsonResponse({ missions: [], generated_at_ms: 1 });
+      }),
+    );
+    renderPanel();
+    const toggle = screen.getByRole("button", { name: /browse history/i });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(screen.getByText("2026-08-07")).toBeInTheDocument());
+    // Close and reopen: every open re-reads, and this time the read fails.
+    fireEvent.click(toggle);
+    daysOk = false;
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(
+        screen.getByText(`showing recorded days from ${clk(1)}; couldn't refresh (HTTP 500): 500`, { exact: false }),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByText("2026-08-07")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    daysOk = true;
+    fireEvent.click(screen.getByRole("button", { name: /retry/i }));
+    await waitFor(() => expect(screen.queryByText(/couldn't refresh/)).toBeNull());
+    expect(screen.getByText("2026-08-07")).toBeInTheDocument();
   });
 
   it("a genuinely empty history reads as empty, with no error", async () => {

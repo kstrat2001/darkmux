@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { fetchJson, loadFailureText, type FetchResult } from "../../lib/fetcher";
+import { fetchJson, loadFailureText, staleReadText } from "../../lib/fetcher";
+import { useKeptRead } from "../../hooks/useKeptRead";
 import { queryKeys } from "../../lib/queryKeys";
 import type { FlowDay } from "../../types/generated/FlowDay";
 import type { FlowDaysResponse } from "../../types/generated/FlowDaysResponse";
@@ -144,8 +145,10 @@ export function CatalogPanel({ label }: { label?: ReactNode } = {}) {
   // itself, which never caches across opens. Until BOTH have answered the
   // panel is loading, never empty: a section with no answer yet has no rows
   // and no failure to show.
-  const days = daysQuery.data;
-  const missions = missionsQuery.data;
+  // Each section keeps its last good read: a failed re-read (every open
+  // re-reads, and so does retry) marks it stale rather than replacing it.
+  const days = useKeptRead(daysQuery.data);
+  const missions = useKeptRead(missionsQuery.data);
 
   return (
     <div className="catalog-anchor" ref={anchorRef}>
@@ -178,7 +181,7 @@ export function CatalogPanel({ label }: { label?: ReactNode } = {}) {
       </button>
       {open && (
         <div className="catpanel" id="catpanel">
-          {!days || !missions ? (
+          {!daysQuery.data || !missionsQuery.data ? (
             // (#2862) Not one of the issue's two named surfaces (a small
             // history-browsing dropdown, not a page) — still no bare
             // "loading…" text; a shimmer bar the size of a real `.cathdr`
@@ -223,8 +226,8 @@ function CatalogContent({
   onDay,
   onMission,
 }: {
-  days: FetchResult<FlowDaysResponse>;
-  missions: FetchResult<FlowMissionsResponse>;
+  days: KeptRead<FlowDaysResponse>;
+  missions: KeptRead<FlowMissionsResponse>;
   onRetryDays: () => void;
   onRetryMissions: () => void;
   onLive: () => void;
@@ -247,43 +250,64 @@ function CatalogContent({
         <div className="cd">● live</div>
         <div className="cs">now-ish on present machines</div>
       </button>
-      {missions.ok ? (
-        <MissionRows missions={missions.data.missions} onMission={onMission} />
-      ) : (
-        <CatalogFailure header="missions" what="missions" failure={missions} onRetry={onRetryMissions} />
-      )}
-      {days.ok ? (
-        <DayRows days={days.data.days} onDay={onDay} />
-      ) : (
-        <CatalogFailure header="days" what="recorded days" failure={days} onRetry={onRetryDays} />
-      )}
+      <CatalogSection header="missions" what="missions" read={missions} onRetry={onRetryMissions}>
+        {(m) => <MissionRows missions={m.missions} onMission={onMission} />}
+      </CatalogSection>
+      <CatalogSection header="days" what="recorded days" read={days} onRetry={onRetryDays}>
+        {(d) => <DayRows days={d.days} onDay={onDay} />}
+      </CatalogSection>
     </>
   );
 }
 
-/** A section whose read failed: its header, the failure as text, and a
- *  retry. The panel does not poll, so without the button the only way to
- *  ask again is to close and reopen it. */
-function CatalogFailure({
+type Failure = { status: number | null; message: string };
+type KeptRead<T> = { good: T | null; failure: Failure | null };
+
+/** One section of the panel, by the state of its read:
+ *  - never read successfully, and the read failed: its header and the
+ *    failure, with a retry;
+ *  - a re-read failed after a good one: the rows from that good read, under
+ *    a line saying how old they are and why the refresh failed, with a retry;
+ *  - otherwise its rows (which say so themselves when there are none).
+ *  The panel does not poll, so without the retry the only way to ask again is
+ *  to close and reopen it. */
+function CatalogSection<T extends { generated_at_ms: number }>({
   header,
   what,
-  failure,
+  read,
   onRetry,
+  children,
 }: {
   header: string;
   what: string;
-  failure: { status: number | null; message: string };
+  read: KeptRead<T>;
   onRetry: () => void;
+  children: (data: T) => ReactNode;
 }) {
-  return (
-    <div data-state="error">
-      <div className="cathdr">{header}</div>
-      <div className="catempty" role="alert">
-        {loadFailureText(what, failure)}
+  const retry = (
+    <button type="button" className="catretry" title={`retry: read ${what} again`} onClick={onRetry}>
+      ↻ retry
+    </button>
+  );
+  if (read.good === null) {
+    return (
+      <div data-state="error">
+        <div className="cathdr">{header}</div>
+        <div className="catempty" role="alert">
+          {read.failure ? loadFailureText(what, read.failure) : null}
+        </div>
+        {retry}
       </div>
-      <button type="button" className="catretry" title={`retry: read ${what} again`} onClick={onRetry}>
-        ↻ retry
-      </button>
+    );
+  }
+  if (read.failure === null) return <>{children(read.good)}</>;
+  return (
+    <div data-state="stale">
+      <div className="catempty" role="status">
+        {staleReadText(what, read.good.generated_at_ms, read.failure)}
+      </div>
+      {retry}
+      {children(read.good)}
     </div>
   );
 }

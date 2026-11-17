@@ -3388,9 +3388,11 @@ body {
   font: calc(12px * var(--fs-scale))/1.4 -apple-system, sans-serif;
   padding: 8px 9px;
 }
-/* A section whose read failed: the failure line, then a retry with the
-   mission lens's retry button look (`.missionlens .evbtn`). */
-.catpanel [data-state="error"] .catempty {
+/* A section whose read failed (or whose re-read failed, over the rows it
+   still shows): the failure line, then a retry with the mission lens's retry
+   button look (`.missionlens .evbtn`). */
+.catpanel [data-state="error"] .catempty,
+.catpanel [data-state="stale"] .catempty {
   color: var(--fg);
   overflow-wrap: anywhere;
 }

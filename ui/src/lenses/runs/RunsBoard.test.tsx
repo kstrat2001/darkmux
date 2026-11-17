@@ -6,13 +6,15 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RunsBoard } from "./RunsBoard";
 import { todayUTC } from "../../lib/flow";
 import { useHashRoute } from "../../lib/useHashRoute";
+import { queryKeys } from "../../lib/queryKeys";
+import { clk } from "../../lib/format";
 
 function renderBoard(
   initialKind: "all" | "mission" | "dispatch" | "lab" = "all",
   initialRun: string | null = null,
   initialMachineKey: string | null = null,
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
 ) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
       <RunsBoard initialKind={initialKind} initialLab={initialRun} initialMachineKey={initialMachineKey} />
@@ -412,6 +414,44 @@ describe("RunsBoard", () => {
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(/^couldn't load runs \(HTTP 500\): 500/);
     expect(screen.queryByText(/no runs recorded yet/i)).toBeNull();
+    // Nothing was read, so nothing on screen may claim a count: no kind bar
+    // reading "all 0", no "Showing 0 runs".
+    expect(document.querySelector(".runsbar")).toBeNull();
+    expect(screen.queryByText(/showing \d+ runs?/i)).toBeNull();
+  });
+
+  it("a failed poll after a good read keeps the last good runs, marked stale with the failure", async () => {
+    mockFetch(true, true);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderBoard("all", null, null, queryClient);
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    const allCount = document.querySelector('[data-arg="all"] .runchipn')!.textContent;
+
+    mockFetch(false, true);
+    await act(() => queryClient.refetchQueries({ queryKey: queryKeys.runs() }));
+
+    // The fixture's read time is its `generated_at_ms` (1), shown in local time.
+    await waitFor(() =>
+      expect(screen.getByText(`showing runs from ${clk(1)}; couldn't refresh (HTTP 500): 500`, { exact: false })).toBeInTheDocument(),
+    );
+    expect(screen.getByText("m1")).toBeInTheDocument();
+    expect(document.querySelector('[data-arg="all"] .runchipn')!.textContent).toBe(allCount);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText(/no runs recorded yet/i)).toBeNull();
+  });
+
+  it("the next good poll clears the stale notice", async () => {
+    mockFetch(true, true);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderBoard("all", null, null, queryClient);
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    mockFetch(false, true);
+    await act(() => queryClient.refetchQueries({ queryKey: queryKeys.runs() }));
+    await waitFor(() => expect(screen.getByText(/couldn't refresh/)).toBeInTheDocument());
+    mockFetch(true, true);
+    await act(() => queryClient.refetchQueries({ queryKey: queryKeys.runs() }));
+    await waitFor(() => expect(screen.queryByText(/couldn't refresh/)).toBeNull());
+    expect(screen.getByText("m1")).toBeInTheDocument();
   });
 
   it("a genuinely empty /runs still reads as no runs recorded yet, with no error", async () => {
