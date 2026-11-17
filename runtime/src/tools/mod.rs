@@ -479,8 +479,10 @@ impl Tool {
             kind: "function".into(),
             function: FunctionDef {
                 name: self.name().into(),
-                description: workspace::naming_root(self.description()),
-                parameters: schema_naming_root(self.parameters_schema()),
+                // (contract 6) The same text on every backend: the model is
+                // shown `/workspace` wherever the sandbox puts it.
+                description: self.description().into(),
+                parameters: self.parameters_schema(),
             },
         }
     }
@@ -506,17 +508,6 @@ impl Tool {
 
 }
 
-/// A parameters schema with its descriptions naming this run's workspace
-/// root ([`workspace::naming_root`]); unchanged under the default root.
-fn schema_naming_root(schema: serde_json::Value) -> serde_json::Value {
-    match schema {
-        serde_json::Value::String(s) => serde_json::Value::String(workspace::naming_root(&s)),
-        serde_json::Value::Array(items) => items.into_iter().map(schema_naming_root).collect(),
-        serde_json::Value::Object(map) => map.into_iter().map(|(k, v)| (k, schema_naming_root(v))).collect(),
-        other => other,
-    }
-}
-
 /// Dispatch a tool by name with raw JSON args. Returns the string the
 /// runtime should put back into the conversation as a `role: tool`
 /// message. Tool-execution errors are converted to a returned error
@@ -531,6 +522,15 @@ fn schema_naming_root(schema: serde_json::Value) -> serde_json::Value {
 /// what shape is expected. Reduces wasted-turn cycles where the
 /// agent keeps emitting args that don't match the tool contract.
 pub fn dispatch(name: &str, raw_args: &str) -> ToolRun {
+    let mut run = dispatch_unmapped(name, raw_args);
+    // (#3112) A host path a tool hands back (a command's output, an error
+    // naming a file) is named as the path the model was shown.
+    run.result = workspace::to_model(&run.result);
+    run
+}
+
+/// [`dispatch`] before what it hands back is mapped to the model's paths.
+fn dispatch_unmapped(name: &str, raw_args: &str) -> ToolRun {
     match Tool::from_name(name) {
         Some(tool) => match tool.execute(raw_args) {
             Ok(run) => run,
@@ -654,13 +654,16 @@ fn execute_bash(raw_args: &str, workspace_root: &Path) -> Result<String> {
     // marker below, so a user command that happens to exit 124 isn't
     // mislabeled as a timeout when the wrapper was never used.
     let used_timeout = has_timeout_command();
+    // (#3112) The model names the workspace as `/workspace`; a sandbox on
+    // the host sees it at its host path.
+    let command = workspace::to_host(&args.command, workspace_root);
     let mut cmd = if used_timeout {
         let mut c = Command::new("timeout");
-        c.arg(format!("{timeout_secs}")).arg(shell).arg("-c").arg(&args.command);
+        c.arg(format!("{timeout_secs}")).arg(shell).arg("-c").arg(&command);
         c
     } else {
         let mut c = Command::new(shell);
-        c.arg("-c").arg(&args.command);
+        c.arg("-c").arg(&command);
         c
     };
     cmd.current_dir(workspace_root);

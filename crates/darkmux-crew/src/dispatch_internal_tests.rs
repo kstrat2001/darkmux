@@ -6522,18 +6522,22 @@ S(("127.0.0.1", port), H).serve_forever()
 
     /// (#3112 step 2) Under a backend that sees each mount at its host path
     /// (Seatbelt), the dispatch tells the runtime where its workspace and
-    /// out-dir are, reads its prompt and runs the injected runtime from
-    /// there, and points the caches there. Under Docker none of it changes.
+    /// out-dir are, and where its other model-facing mounts are (a mod's
+    /// attachments, the cache: `DARKMUX_RUNTIME_PATHS`, so the runtime maps
+    /// the container paths the model is shown), reads its prompt and runs
+    /// the injected runtime from there, and points the caches there. Under
+    /// Docker none of it changes.
     #[test]
     fn a_backend_that_cannot_place_mounts_gets_host_paths_everywhere() {
         use darkmux_sandbox::{DockerBackend, SeatbeltBackend};
         let root = tempfile::TempDir::new().unwrap();
         let real = root.path().canonicalize().unwrap();
-        for d in ["ws", "out", "cache"] {
+        for d in ["ws", "out", "cache", "mod"] {
             std::fs::create_dir(root.path().join(d)).unwrap();
         }
         std::fs::write(root.path().join("darkmux-runtime"), "").unwrap();
         let mut cfg = argv_config_with_base_url(None);
+        cfg.mod_attachment_mounts = vec![(root.path().join("mod"), "/darkmux-mods/k/attachments".to_string())];
         cfg.workspace = root.path().join("ws");
         cfg.host_out = root.path().join("out");
         cfg.cache_dir = Some(root.path().join("cache"));
@@ -6549,12 +6553,18 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(env(&seatbelt, "DARKMUX_RUNTIME_WORKSPACE"), Some(at("ws")));
         assert_eq!(env(&seatbelt, "DARKMUX_RUNTIME_OUT_DIR"), Some(at("out")));
         assert_eq!(env(&seatbelt, "CARGO_HOME"), Some(at("cache/cargo")));
+        let paths: Vec<(String, String)> = serde_json::from_str(&env(&seatbelt, "DARKMUX_RUNTIME_PATHS").unwrap()).unwrap();
+        assert_eq!(
+            paths,
+            [("/darkmux-mods/k/attachments".to_string(), at("mod")), ("/darkmux-cache".to_string(), at("cache"))]
+        );
         assert_eq!(seatbelt.entrypoint, Some(at("darkmux-runtime")));
         assert_eq!(prompt(&seatbelt), Some(at("out/.prompt.txt")));
 
         let docker = dispatch_policy_for(&cfg, &DockerBackend);
         assert_eq!(env(&docker, "DARKMUX_RUNTIME_WORKSPACE"), None);
         assert_eq!(env(&docker, "DARKMUX_RUNTIME_OUT_DIR"), None);
+        assert_eq!(env(&docker, "DARKMUX_RUNTIME_PATHS"), None);
         assert_eq!(env(&docker, "CARGO_HOME"), Some("/darkmux-cache/cargo".to_string()));
         assert_eq!(docker.entrypoint.as_deref(), Some("/darkmux-runtime"));
         assert_eq!(prompt(&docker).as_deref(), Some("/darkmux-out/.prompt.txt"));
@@ -8026,11 +8036,11 @@ S(("127.0.0.1", port), H).serve_forever()
         );
     }
 
-    /// (#3112 review) A `${WORKSPACE_ROOT}` still in the message when the
-    /// dispatch writes its prompt file (a step with no workdir, whose
-    /// workspace is a fresh tempdir; a CLI `dispatch` message) names that
-    /// workspace where the sandbox sees it, through `selected()`. Under
-    /// `DARKMUX_SANDBOX=seatbelt` (on a Mac) it is the tempdir's own path.
+    /// (#3112) A `${WORKSPACE_ROOT}` still in the message when the dispatch
+    /// writes its prompt file (a step with no workdir, whose workspace is a
+    /// fresh tempdir; a CLI `dispatch` message) is `/workspace` under every
+    /// sandbox, `DARKMUX_SANDBOX=seatbelt` (on a Mac) included: the model is
+    /// never shown the host path, and the runtime maps `/workspace` to it.
     #[test]
     #[serial]
     fn the_prompt_file_names_the_actual_workspace_for_the_placeholder() {
@@ -8049,23 +8059,30 @@ S(("127.0.0.1", port), H).serve_forever()
         unsafe {
             match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
         }
-        assert_eq!(seatbelt, format!("look in `{}/src`", ws.path().canonicalize().unwrap().display()));
+        assert_eq!(seatbelt, "look in `/workspace/src`");
     }
 
-    /// (#3112 review) A split-gitdir checkout is named where the sandbox
-    /// sees it: `/workspace/<child>` in a container, unchanged; the
-    /// checkout's own host path in a sandbox on the host.
+    /// (#3112) A split-gitdir checkout is named as the model sees it,
+    /// `/workspace/<child>`, under every sandbox: a sandbox on the host
+    /// (`DARKMUX_SANDBOX=seatbelt`, on a Mac) included.
     #[test]
-    fn a_split_gitdir_checkout_is_named_where_the_sandbox_sees_it() {
-        use darkmux_sandbox::BackendKind;
+    #[serial]
+    fn a_split_gitdir_checkout_is_named_under_the_workspace_the_model_sees() {
         let root = TempDir::new().unwrap();
         let child = root.path().join("src-a");
         std::fs::create_dir_all(&child).unwrap();
-        assert_eq!(seen_path_for(Some(BackendKind::Docker), root.path(), &child), "/workspace/src-a");
-        assert_eq!(seen_path_for(Some(BackendKind::Docker), root.path(), root.path()), "/workspace");
-        let real = root.path().canonicalize().unwrap();
-        assert_eq!(seen_path_for(Some(BackendKind::Seatbelt), root.path(), &child), real.join("src-a").display().to_string());
-        assert_eq!(seen_path_for(Some(BackendKind::Seatbelt), root.path(), root.path()), real.display().to_string());
+        assert_eq!(container_path_for(root.path(), &child), "/workspace/src-a");
+        assert_eq!(container_path_for(root.path(), root.path()), "/workspace");
+        if !darkmux_sandbox::SeatbeltBackend::available() {
+            return;
+        }
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
+        let seatbelt = (container_path_for(root.path(), &child), container_path_for(root.path(), root.path()));
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        assert_eq!(seatbelt, ("/workspace/src-a".to_string(), "/workspace".to_string()));
     }
 
     /// (#3112 review) The origin records the sandbox it ran in, and a resume

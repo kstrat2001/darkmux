@@ -182,13 +182,12 @@ struct Dispatch {
 fn prepare_dispatch(argv: &[String]) -> Result<Dispatch, Refusal> {
     let mut args = parse_run_args(argv, std::env::var("DARKMUX_RESUME_CHECKPOINT").ok())?;
     let (model, prompt) = required_model_and_prompt(args.model.take(), args.prompt.take())?;
-    // (#3112 step 2) A role's prompt names `/workspace` too (`--system`), so
-    // it is renamed the same way as the default; byte-identical under it.
-    // (#3112 review) So does a user's message: a mission config written
-    // before `${WORKSPACE_ROOT}` says `/workspace`. The same rule for both, at
-    // a path boundary only, and byte-identical under the default root.
-    let system = args.system.take().unwrap_or_else(default_system_prompt);
-    let (system_prompt, prompt) = tools::workspace::named_prompts(&system, &prompt, &tools::workspace::root());
+    // (contract 6) The system prompt and the user's message are sent as the
+    // host passed them: the bytes it hashed into `system_sha256`. They name
+    // the workspace `/workspace` on every backend; the tools map that path
+    // to where this sandbox sees it (`tools::workspace::placements`).
+    let system_prompt = args.system.take().unwrap_or_else(default_system_prompt);
+    tools::workspace::extra_placements().map_err(|e| Refusal::new(format!("error: {e:#}")))?;
 
     // (#2386) The finding-key identity this dispatch mints under, plus the
     // brief it was given. `create_finding` returns the real key

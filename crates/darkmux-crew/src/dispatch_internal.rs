@@ -218,16 +218,11 @@ fn git_checkout(workdir: &Path, found: &darkmux_types::workdir::SplitGitdir) -> 
 /// both the operator warning and the model-facing note name a path the
 /// reader can actually see. `volume_mounts` above mounts the
 /// workdir at `/workspace`, so a checkout AT the workdir is `/workspace`
-/// and one one level under it is `/workspace/<child>`.
+/// and one one level under it is `/workspace/<child>`. (#3112) The same
+/// under a sandbox on the host: the model is shown `/workspace` there too,
+/// and the runtime maps it to the host path.
 pub(crate) fn container_path_for(workdir: &Path, checkout: &Path) -> String {
-    seen_path_for(darkmux_sandbox::selected().ok(), workdir, checkout)
-}
-
-/// (#3112 review) [`container_path_for`] under `kind`: beneath where the
-/// sandbox sees the workdir (`/workspace` in a container, the workdir's own
-/// host path in a sandbox on the host).
-pub(crate) fn seen_path_for(kind: Option<darkmux_sandbox::BackendKind>, workdir: &Path, checkout: &Path) -> String {
-    let root = darkmux_sandbox::seen_at(kind, workdir, "/workspace");
+    let root = "/workspace".to_string();
     match checkout.strip_prefix(workdir) {
         Ok(rel) if rel.as_os_str().is_empty() => root,
         Ok(rel) => format!("{root}/{}", rel.display()),
@@ -2698,12 +2693,15 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
     // (#3112 step 2) Where the sandbox sees the workspace and the out-dir.
     let (ws_at, out_at) = (backend.place(&mounts[0]), backend.place(&mounts[1]));
     mounts.extend(workdir_git_read_only_mount(config.workdir_git_read_only.as_deref()));
-    mounts.extend(mod_attachment_mounts(&config.mod_attachment_mounts));
+    let attachments = mod_attachment_mounts(&config.mod_attachment_mounts);
+    let cache = config.cache_dir.as_deref().map(|c| cache_mount_placed(c, backend));
+    // (#3112) The other mounts a model is shown, where this sandbox sees them.
+    let elsewhere = placed_elsewhere(attachments.iter().chain(cache.iter().map(|(m, _)| m)), backend);
+    mounts.extend(attachments);
     // (#3561) A sandbox on the host's managed Node, read-only where it is.
     mounts.extend(crate::contained_command::toolchain_mounts(&config.toolchain));
     let mut env: Vec<(String, String)> = config.toolchain.path.iter().map(|p| ("PATH".to_string(), p.clone())).collect();
-    if let Some(cache) = &config.cache_dir {
-        let (mount, cache_env) = cache_mount_placed(cache, backend);
+    if let Some((mount, cache_env)) = cache {
         mounts.push(mount);
         env.extend(cache_env);
     }
@@ -2715,6 +2713,7 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
     if out_at != mounts[1].at {
         env.push(("DARKMUX_RUNTIME_OUT_DIR".to_string(), out_at.clone()));
     }
+    env.extend(runtime_paths_env(&elsewhere));
     let injected = config.runtime_binary.as_deref().filter(|_| config.inject).map(runtime_injection_mount);
     let entrypoint = injected.as_ref().map(|m| backend.place(m));
     mounts.extend(injected);
@@ -2742,6 +2741,20 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
         // first (`darkmux runtime run …`).
         command: config.runtime_leading_args.iter().cloned().chain(runtime_args(config, &out_at)).collect(),
     }
+}
+
+/// (#3112) Each of `mounts` that `backend` places away from its container
+/// path, as `(container path, where the sandbox sees it)`.
+fn placed_elsewhere<'a>(mounts: impl Iterator<Item = &'a Mount>, backend: &dyn darkmux_sandbox::SandboxBackend) -> Vec<(String, String)> {
+    mounts.map(|m| (m.at.clone(), backend.place(m))).filter(|(at, seen)| at != seen).collect()
+}
+
+/// (#3112) `DARKMUX_RUNTIME_PATHS`, the runtime's map from the container
+/// paths a model is shown to where this sandbox sees them (a JSON array of
+/// pairs), when any mount is placed elsewhere; nothing in a container.
+fn runtime_paths_env(elsewhere: &[(String, String)]) -> Option<(String, String)> {
+    let json = serde_json::to_string(elsewhere).ok()?;
+    (!elsewhere.is_empty()).then(|| ("DARKMUX_RUNTIME_PATHS".to_string(), json))
 }
 
 /// `KEY=value` as its two halves (a value may hold `=`).
@@ -7956,13 +7969,12 @@ fn materialize_dirs(
 ///
 /// Then, in order: this dispatch's own origin stamp, any staged resume
 /// checkpoint, and the prompt file.
-/// (#3112 review) The message as the prompt file carries it: a
-/// `${WORKSPACE_ROOT}` still in it (a step with no workdir, whose workspace
-/// is a fresh tempdir; a CLI `dispatch` message: the placeholder is
-/// darkmux's in any dispatch message) names `workspace` where the
-/// configured sandbox sees it. A message without it is unchanged.
-fn prompt_file_text(message: &str, workspace: &Path) -> String {
-    crate::step_kinds::builtins::expand_workspace_root(message, darkmux_sandbox::selected().ok(), Some(workspace))
+/// (#3112) The message as the prompt file carries it: a `${WORKSPACE_ROOT}`
+/// still in it (a CLI `dispatch` message: the placeholder is darkmux's in
+/// any dispatch message) names the workspace as the model sees it,
+/// `/workspace`, under every sandbox. A message without it is unchanged.
+fn prompt_file_text(message: &str, _workspace: &Path) -> String {
+    crate::step_kinds::builtins::expand_workspace_root(message)
 }
 
 fn prepare_host_out(

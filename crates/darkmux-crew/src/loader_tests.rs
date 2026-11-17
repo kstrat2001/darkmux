@@ -443,10 +443,10 @@
 /// sentence verbatim (`runtime/src/tools/workspace.rs`
 /// `TOOL_BENCH_WORKSPACE_SENTENCE`), because the runtime crate cannot read
 /// `templates/`. This keeps the shipped role and that copy in step: if the
-/// role's wording changes, both change together, and the runtime's rename
-/// test keeps checking what actually ships.
+/// role's wording changes, both change together, and the runtime's test
+/// keeps checking what actually ships.
 #[test]
-fn the_tool_bench_role_still_names_the_workspace_the_runtime_renames() {
+fn the_tool_bench_role_still_names_the_workspace_the_runtime_maps() {
     let role = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/tool-bench.md"));
     let runtime_test = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../runtime/src/tools/workspace.rs"));
     let held = runtime_test
@@ -455,5 +455,5 @@ fn the_tool_bench_role_still_names_the_workspace_the_runtime_renames() {
         .and_then(|rest| rest.strip_suffix("\";"))
         .expect("the runtime's test holds the sentence");
     assert!(held.contains("`/workspace`"), "{held}");
-    assert!(role.lines().any(|l| l == held), "tool-bench.md no longer carries the sentence the runtime test renames: {held}");
+    assert!(role.lines().any(|l| l == held), "tool-bench.md no longer carries the sentence the runtime test holds: {held}");
 }

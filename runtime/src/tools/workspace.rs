@@ -43,46 +43,125 @@ pub fn root() -> PathBuf {
     }
 }
 
-/// Model-facing text with [`DEFAULT_WORKSPACE`] named as this run's
-/// [`root`]: byte-identical when the root is the default (contract 6), so
-/// a container's tool definitions never change.
-pub fn naming_root(text: &str) -> String {
-    naming(text, &root())
+/// (#3112) Env: the mounts other than the workspace and the out-dir that a
+/// sandbox on the host sees away from their container path, as a JSON array
+/// of `[container path, host path]` pairs (a mod's attachments, the shared
+/// toolchain cache). Never set for a container.
+pub const PATHS_ENV: &str = "DARKMUX_RUNTIME_PATHS";
+
+/// The pairs [`PATHS_ENV`] names, none when it is unset or empty, or why
+/// it does not parse.
+pub fn extra_placements() -> Result<Vec<(String, String)>> {
+    match std::env::var(PATHS_ENV) {
+        Ok(v) if !v.is_empty() => serde_json::from_str(&v)
+            .with_context(|| format!("{PATHS_ENV} is not a JSON array of [container path, host path] pairs")),
+        _ => Ok(Vec::new()),
+    }
 }
 
-/// (#3112 review) The role's `--system` text and the user's message as the
-/// model reads them: both with `/workspace` named as `root` (this run's
-/// [`root`] in production), the same path-boundary rule for each.
-pub fn named_prompts(system: &str, prompt: &str, root: &Path) -> (String, String) {
-    (naming(system, root), naming(prompt, root))
+/// Where this run sees each mount a model is told about, as `(the path the
+/// model is shown, the path on this machine)`: the workspace at `root`, the
+/// out-dir, and [`extra_placements`]. Only the mounts placed away from their
+/// container path, so none in a container.
+///
+/// The model is shown the container path on every backend (contract 6: one
+/// system prompt, one set of tool descriptions, whatever the sandbox; and no
+/// host path, which names the user's home folder, in a request body). The
+/// runtime maps between the two: [`to_host`] for a command the model wrote,
+/// [`on_host`] for a path a file tool is given, [`to_model`] for what a tool
+/// hands back.
+pub fn placements(root: &Path) -> Vec<(String, String)> {
+    let out = crate::trajectory::out_base().to_string_lossy().into_owned();
+    let mut all = vec![
+        (DEFAULT_WORKSPACE.to_string(), root.to_string_lossy().into_owned()),
+        (crate::trajectory::RUNTIME_OUT_BASE.to_string(), out),
+    ];
+    all.extend(extra_placements().unwrap_or_default());
+    all.retain(|(at, host)| is_placed_elsewhere(at, host));
+    all
 }
 
-/// `text` with [`DEFAULT_WORKSPACE`] named as `root`, wherever it is the
-/// path itself (#3112 review): preceded by the start or a character that
-/// cannot be part of a path, and followed by the end, `/`, or a character
-/// that cannot continue a name. `/workspace2`, `/workspaces`, `/workspace_x`
-/// and `/data/workspace` are other paths and are left alone.
-fn naming(text: &str, root: &Path) -> String {
-    if root.as_os_str() == DEFAULT_WORKSPACE {
+/// A pair worth mapping: two different absolute paths, neither of them `/`.
+fn is_placed_elsewhere(at: &str, host: &str) -> bool {
+    at != host && [at, host].iter().all(|p| p.len() > 1 && p.starts_with('/'))
+}
+
+/// `text` (a command the model wrote) with every path it names that the
+/// model was shown ([`placements`]) named where it is on this machine.
+/// Unchanged in a container.
+pub fn to_host(text: &str, root: &Path) -> String {
+    rename(text, &placements(root))
+}
+
+/// `text` (what a tool hands back) with every host path of a mount
+/// ([`placements`] under this run's [`root`]), as given or resolved
+/// (`/var` is `/private/var` on macOS), named as the path the model was
+/// shown. Unchanged in a container.
+pub fn to_model(text: &str) -> String {
+    let mut back: Vec<(String, String)> = Vec::new();
+    for (at, host) in placements(&root()) {
+        back.extend(resolved(&host).map(|real| (real, at.clone())));
+        back.push((host, at));
+    }
+    back.retain(|(host, at)| is_placed_elsewhere(host, at));
+    rename(text, &back)
+}
+
+/// `host` with its links resolved, when that is another path.
+fn resolved(host: &str) -> Option<String> {
+    let real = Path::new(host).canonicalize().ok()?.to_string_lossy().into_owned();
+    (real != host).then_some(real)
+}
+
+/// A path a file tool was given, on this machine: one under the workspace
+/// the model was shown (`/workspace/...`) is under `root`; any other is
+/// absolute as given or relative to `root`. Unchanged in a container.
+pub fn on_host(input: &str, root: &Path) -> PathBuf {
+    let path = Path::new(input);
+    match path.strip_prefix(DEFAULT_WORKSPACE) {
+        Ok(rest) if root != Path::new(DEFAULT_WORKSPACE) => root.join(rest),
+        _ => root.join(path),
+    }
+}
+
+/// `text` with each `from` of `pairs` written as its `to`, wherever it is
+/// the path itself (#3112 review): preceded by the start or a character
+/// that cannot be part of a path, and followed by the end, `/`, or a
+/// character that cannot continue a name. `/workspace2`, `/workspaces`,
+/// `/workspace_x` and `/data/workspace` are other paths and are left alone.
+/// One pass, the longest `from` first where two start at one place, so a
+/// replacement is never itself rewritten.
+fn rename(text: &str, pairs: &[(String, String)]) -> String {
+    if pairs.is_empty() {
         return text.to_string();
     }
-    let root = root.to_string_lossy();
+    let mut longest_first: Vec<&(String, String)> = pairs.iter().collect();
+    longest_first.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
     let mut out = String::with_capacity(text.len());
     let mut from = 0;
-    while let Some(found) = text[from..].find(DEFAULT_WORKSPACE) {
-        let at = from + found;
-        let end = at + DEFAULT_WORKSPACE.len();
-        // The boundary is read from the whole text, never the slice after
-        // the last match: in `/workspace/workspace` the second one follows
-        // an `e`, a path character, so it is a directory inside.
-        let before_ok = text[..at].chars().next_back().is_none_or(|c| !is_path_char(c));
-        let after_ok = text[end..].chars().next().is_none_or(|c| c == '/' || !is_name_char(c));
-        out.push_str(&text[from..at]);
-        out.push_str(if before_ok && after_ok { &root } else { DEFAULT_WORKSPACE });
-        from = end;
+    for (at, _) in text.match_indices('/') {
+        if at < from {
+            continue;
+        }
+        if let Some((name, to)) = longest_first.iter().find(|(name, _)| names_path_at(text, at, name)) {
+            out.push_str(&text[from..at]);
+            out.push_str(to);
+            from = at + name.len();
+        }
     }
     out.push_str(&text[from..]);
     out
+}
+
+/// Whether `text` names the path `name` itself at byte `at`. The boundary
+/// is read from the whole text, never the slice after the last match: in
+/// `/workspace/workspace` the second one follows an `e`, a path character,
+/// so it is a directory inside.
+fn names_path_at(text: &str, at: usize, name: &str) -> bool {
+    let end = at + name.len();
+    text[at..].starts_with(name)
+        && text[..at].chars().next_back().is_none_or(|c| !is_path_char(c))
+        && text[end..].chars().next().is_none_or(|c| c == '/' || !is_name_char(c))
 }
 
 /// A character that can continue a file name (`/workspace2`, `/workspace_x`).
@@ -109,11 +188,7 @@ pub fn resolve_read(input: &str, workspace_root: &Path) -> Result<PathBuf> {
         return Err(anyhow!("path is empty"));
     }
 
-    let initial = if Path::new(input).is_absolute() {
-        PathBuf::from(input)
-    } else {
-        workspace_root.join(input)
-    };
+    let initial = on_host(input, workspace_root);
 
     let canonical = initial
         .canonicalize()
@@ -124,9 +199,9 @@ pub fn resolve_read(input: &str, workspace_root: &Path) -> Result<PathBuf> {
         .with_context(|| format!("workspace root unavailable: {workspace_root:?}"))?;
 
     if !canonical.starts_with(&canonical_root) {
-        return Err(anyhow!(
-            "path escapes workspace: {input} → {canonical:?}"
-        ));
+        // Where it leads is outside every mount, so on a host it is a host
+        // path, which a model is never shown: the path as given says which.
+        return Err(anyhow!("path escapes workspace: {input}"));
     }
 
     Ok(canonical)
@@ -145,11 +220,7 @@ pub fn resolve_write(input: &str, workspace_root: &Path) -> Result<PathBuf> {
         return Err(anyhow!("path is empty"));
     }
 
-    let initial = if Path::new(input).is_absolute() {
-        PathBuf::from(input)
-    } else {
-        workspace_root.join(input)
-    };
+    let initial = on_host(input, workspace_root);
 
     let filename = initial
         .file_name()
@@ -169,9 +240,7 @@ pub fn resolve_write(input: &str, workspace_root: &Path) -> Result<PathBuf> {
         .with_context(|| format!("workspace root unavailable: {workspace_root:?}"))?;
 
     if !canonical_parent.starts_with(&canonical_root) {
-        return Err(anyhow!(
-            "write parent escapes workspace: {input} → {canonical_parent:?}"
-        ));
+        return Err(anyhow!("write parent escapes workspace: {input}"));
     }
 
     let target = canonical_parent.join(filename);
@@ -250,48 +319,27 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
 
-    /// (#3112 step 2) Under the default root, model-facing text is byte
-    /// for byte what it was (contract 6); under another, every mention of
-    /// `/workspace` names that root.
-    #[test]
-    fn model_facing_text_names_the_root_only_when_it_moved() {
-        let text = "runs with cwd=/workspace; paths inside /workspace/...";
-        assert_eq!(naming(text, Path::new(DEFAULT_WORKSPACE)), text);
-        assert_eq!(
-            naming(text, Path::new("/Users/op/ws")),
-            "runs with cwd=/Users/op/ws; paths inside /Users/op/ws/..."
-        );
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
     }
 
-    /// (#3112 review) A user's message is renamed like `--system`: a mission
-    /// config copied before `${WORKSPACE_ROOT}` says "mounted at
-    /// `/workspace/<source>`". The runtime's entry renames both, through
-    /// this one function.
+    /// (#3112) A command the model wrote names the workspace where this
+    /// sandbox sees it; in a container nothing changes.
     #[test]
-    fn the_users_message_is_renamed_like_the_system_prompt() {
-        let (system, prompt) = named_prompts(
-            "work in /workspace",
-            "the repository is mounted at `/workspace/<source>`, not /workspace2",
-            Path::new("/Users/op/ws"),
-        );
-        assert_eq!(system, "work in /Users/op/ws");
-        assert_eq!(prompt, "the repository is mounted at `/Users/op/ws/<source>`, not /workspace2");
-        let same = named_prompts("a /workspace", "b /workspace/x", Path::new(DEFAULT_WORKSPACE));
-        assert_eq!(same, ("a /workspace".to_string(), "b /workspace/x".to_string()));
-        let entry = include_str!("../lib.rs");
-        assert!(
-            entry.contains("tools::workspace::named_prompts(&system, &prompt, &tools::workspace::root())"),
-            "the runtime's entry must rename both prompts"
-        );
+    #[serial_test::serial(runtime_workspace_env)]
+    fn a_command_names_the_workspace_where_the_sandbox_sees_it() {
+        std::env::remove_var(PATHS_ENV);
+        let text = "cd /workspace && cat /workspace/src/x.rs";
+        assert_eq!(to_host(text, Path::new(DEFAULT_WORKSPACE)), text);
+        assert_eq!(to_host(text, Path::new("/Users/op/ws")), "cd /Users/op/ws && cat /Users/op/ws/src/x.rs");
     }
 
-    /// (#3112 review) `/workspace` is renamed only where it is the path
-    /// itself, at a boundary on both sides: never inside `/workspace2`,
-    /// `/workspaces`, `/workspace_x` or `/data/workspace`.
+    /// (#3112 review) A path is renamed only where it is the path itself, at
+    /// a boundary on both sides: never inside `/workspace2`, `/workspaces`,
+    /// `/workspace_x` or `/data/workspace`.
     #[test]
-    fn workspace_is_renamed_only_at_a_path_boundary() {
-        let root = Path::new("/Users/op/ws");
-        let renamed = |t: &str| naming(t, root);
+    fn a_path_is_renamed_only_at_a_path_boundary() {
+        let renamed = |t: &str| rename(t, &pairs(&[("/workspace", "/Users/op/ws")]));
         assert_eq!(renamed("/workspace"), "/Users/op/ws");
         assert_eq!(renamed("at `/workspace/<source>`."), "at `/Users/op/ws/<source>`.");
         assert_eq!(renamed("cd /workspace && ls /workspace/src"), "cd /Users/op/ws && ls /Users/op/ws/src");
@@ -305,39 +353,107 @@ mod tests {
         assert_eq!(renamed("/workspace2/workspace"), "/workspace2/workspace");
     }
 
-    /// (#3112 review) Line 3 of `templates/builtin/roles/tool-bench.md`.
-    pub(crate) const TOOL_BENCH_WORKSPACE_SENTENCE: &str = "You are an assistant operating inside a container. A working directory is mounted at `/workspace` and you have tools to read files, search file contents, run shell commands, and write or edit files.";
-
-    /// (#3112 review) A shipped role whose frozen prompt says the working
-    /// directory is mounted at `/workspace` (`tool-bench`) reaches the model
-    /// naming the host-seen root under a sandbox on the host: the runtime
-    /// renames its `--system` text (`naming_root`), so the frozen text itself
-    /// never changes. Byte-identical under the default root.
+    /// One pass, longest first: a replacement is never rewritten by a
+    /// shorter pair, and a host path inside a longer one (`/var/...` in
+    /// `/private/var/...`) is left alone.
     #[test]
-    fn a_shipped_role_prompt_naming_workspace_is_renamed_to_the_root() {
-        // The shipped sentence, verbatim. It is held here rather than read
-        // from `templates/`, which is outside this crate: the PR-diff mutation
-        // job copies only `runtime/`. `darkmux-crew`'s
-        // `the_tool_bench_role_still_names_the_workspace_the_runtime_renames`
-        // keeps the two in step.
-        let role = TOOL_BENCH_WORKSPACE_SENTENCE;
-        assert_eq!(naming(role, Path::new(DEFAULT_WORKSPACE)), role);
-        let renamed = naming(role, Path::new("/Users/op/ws"));
-        assert!(!renamed.contains("/workspace") && renamed.contains("`/Users/op/ws`"), "{renamed}");
-        // The role reaches the runtime as `--system`, which the runtime's
-        // entry (`lib.rs` since #3558) renames before anything reads it.
-        let entry = include_str!("../lib.rs");
-        assert!(
-            entry.contains("tools::workspace::named_prompts(&system, &prompt, &tools::workspace::root())"),
-            "the runtime's entry must rename the `--system` text"
+    fn renaming_is_one_pass_longest_first() {
+        let back = pairs(&[("/var/t/ws", "/workspace"), ("/private/var/t/ws", "/workspace"), ("/workspace", "/x")]);
+        assert_eq!(rename("/private/var/t/ws/a and /var/t/ws/b", &back), "/workspace/a and /workspace/b");
+        let nested = pairs(&[("/workspace", "/h/ws"), ("/workspace/.git", "/h/git")]);
+        assert_eq!(rename("/workspace/.git/HEAD /workspace/a", &nested), "/h/git/HEAD /h/ws/a");
+    }
+
+    /// (#3112) What a tool hands back names each mount where the model was
+    /// shown it, the host path as given or resolved; the out-dir and the
+    /// extra mounts too. In a container nothing changes.
+    #[test]
+    #[serial_test::serial(runtime_workspace_env)]
+    fn what_a_tool_hands_back_names_the_paths_the_model_was_shown() {
+        let ws = tempfile::tempdir().unwrap();
+        let host = ws.path().display().to_string();
+        let real = ws.path().canonicalize().unwrap().display().to_string();
+        let text = format!("pwd: {real}\nfile: {host}/a.rs\nout: /h/out/x\nmods: /h/mods/k/f\nother: /etc/hosts");
+        std::env::remove_var(WORKSPACE_ENV);
+        std::env::remove_var(PATHS_ENV);
+        std::env::remove_var(crate::trajectory::OUT_DIR_ENV);
+        assert_eq!(to_model(&text), text, "a container's text is unchanged");
+        std::env::set_var(WORKSPACE_ENV, &host);
+        std::env::set_var(crate::trajectory::OUT_DIR_ENV, "/h/out");
+        std::env::set_var(PATHS_ENV, r#"[["/darkmux-mods/k","/h/mods/k"]]"#);
+        let mapped = to_model(&text);
+        std::env::remove_var(WORKSPACE_ENV);
+        std::env::remove_var(PATHS_ENV);
+        std::env::remove_var(crate::trajectory::OUT_DIR_ENV);
+        assert_eq!(
+            mapped,
+            "pwd: /workspace\nfile: /workspace/a.rs\nout: /darkmux-out/x\nmods: /darkmux-mods/k/f\nother: /etc/hosts"
         );
     }
 
-    /// (#3112 step 2) The root is the env override when set and non-empty,
-    /// else `/workspace`; the tool definitions the model sees follow it.
+    /// Only two different absolute paths make a pair: never `/`, which
+    /// would rename every path, and never a relative one.
+    #[test]
+    fn a_pair_is_two_different_absolute_paths_neither_the_filesystem_root() {
+        assert!(is_placed_elsewhere("/workspace", "/Users/op/ws"));
+        for (at, host) in [("/workspace", "/workspace"), ("/workspace", "/"), ("/", "/h"), ("/workspace", "ws"), ("", "/h")] {
+            assert!(!is_placed_elsewhere(at, host), "{at:?} {host:?}");
+        }
+    }
+
+    /// (#3112) A malformed [`PATHS_ENV`] is said, never read as no pairs.
     #[test]
     #[serial_test::serial(runtime_workspace_env)]
-    fn the_root_and_the_tool_definitions_follow_the_env_override() {
+    fn a_malformed_paths_env_is_refused() {
+        std::env::set_var(PATHS_ENV, "not json");
+        let err = extra_placements().unwrap_err();
+        std::env::remove_var(PATHS_ENV);
+        assert!(format!("{err:#}").contains(PATHS_ENV), "{err:#}");
+        assert!(extra_placements().unwrap().is_empty());
+    }
+
+    /// (#3112) A file tool's `/workspace/...` is under the root; any other
+    /// path is as given or relative to the root.
+    #[test]
+    fn a_file_tools_path_is_under_the_root() {
+        let root = Path::new("/Users/op/ws");
+        assert_eq!(on_host("/workspace/a/b.rs", root), Path::new("/Users/op/ws/a/b.rs"));
+        assert_eq!(on_host("a/b.rs", root), Path::new("/Users/op/ws/a/b.rs"));
+        assert_eq!(on_host("/Users/op/ws/a", root), Path::new("/Users/op/ws/a"));
+        assert_eq!(on_host("/workspace2/a", root), Path::new("/workspace2/a"));
+        let container = Path::new(DEFAULT_WORKSPACE);
+        assert_eq!(on_host("/workspace/a", container), Path::new("/workspace/a"));
+        assert_eq!(on_host("a", container), Path::new("/workspace/a"));
+    }
+
+    /// (#3112 review) Line 3 of `templates/builtin/roles/tool-bench.md`.
+    pub(crate) const TOOL_BENCH_WORKSPACE_SENTENCE: &str = "You are an assistant operating inside a container. A working directory is mounted at `/workspace` and you have tools to read files, search file contents, run shell commands, and write or edit files.";
+
+    /// (#3112) A shipped role whose frozen prompt says the working directory
+    /// is mounted at `/workspace` (`tool-bench`) reaches the model as
+    /// written on every backend: the runtime's entry sends `--system` as
+    /// given, and a command naming `/workspace` runs where the sandbox sees
+    /// it. The sentence is held here rather than read from `templates/`,
+    /// which is outside this crate (the PR-diff mutation job copies only
+    /// `runtime/`); `darkmux-crew`'s
+    /// `the_tool_bench_role_still_names_the_workspace_the_runtime_maps` keeps
+    /// the two in step.
+    #[test]
+    fn a_shipped_role_prompt_naming_workspace_reaches_the_model_as_written() {
+        let entry = include_str!("../lib.rs");
+        assert!(
+            entry.contains("let system_prompt = args.system.take().unwrap_or_else(default_system_prompt);"),
+            "the runtime's entry sends `--system` as given"
+        );
+        assert!(TOOL_BENCH_WORKSPACE_SENTENCE.contains("`/workspace`"));
+    }
+
+    /// (#3112 step 2) The root is the env override when set and non-empty,
+    /// else `/workspace`; the tool definitions the model sees name
+    /// `/workspace` whichever it is (contract 6).
+    #[test]
+    #[serial_test::serial(runtime_workspace_env)]
+    fn the_root_follows_the_env_override_and_the_tool_definitions_do_not() {
         std::env::remove_var(WORKSPACE_ENV);
         assert_eq!(root(), Path::new(DEFAULT_WORKSPACE));
         let read = serde_json::to_string(&crate::tools::Tool::Read.to_tool_def()).unwrap();
@@ -346,11 +462,9 @@ mod tests {
         assert_eq!(root(), Path::new(DEFAULT_WORKSPACE), "empty is unset");
         std::env::set_var(WORKSPACE_ENV, "/Users/op/ws");
         assert_eq!(root(), Path::new("/Users/op/ws"));
-        let read = serde_json::to_string(&crate::tools::Tool::Read.to_tool_def()).unwrap();
-        let bash = serde_json::to_string(&crate::tools::Tool::Bash.to_tool_def()).unwrap();
+        let moved = serde_json::to_string(&crate::tools::Tool::Read.to_tool_def()).unwrap();
         std::env::remove_var(WORKSPACE_ENV);
-        assert!(read.contains("/Users/op/ws/") && !read.contains("/workspace"), "{read}");
-        assert!(bash.contains("cwd=/Users/op/ws") && !bash.contains("/workspace"), "{bash}");
+        assert_eq!(moved, read);
     }
 
     /// Create a fresh tempdir to serve as the workspace root for one
