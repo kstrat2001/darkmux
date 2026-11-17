@@ -379,16 +379,19 @@ fn fields_count(v: &Value) -> (Value, Value, Value) {
     (json!(correct), json!(expected), json!(names))
 }
 
-/// The detail beyond the basics. Host figures need busy samples: with none
-/// they are null, never zero.
 /// Whether every stream's tokens were billed: a rate over only some of the
 /// generation is not quoted.
 fn all_streams_billed(stats: &Value) -> bool {
     stats.get("checks").and_then(|c| c.get("all_streams_billed")) != Some(&Value::Bool(false))
 }
 
-pub fn detail_from(manifest: &Value, stats: &Value, names: &[String]) -> Value {
-    let sampled = stats.get("samples_busy").and_then(Value::as_u64).is_some_and(|n| n > 0);
+/// The detail beyond the basics. Host figures describe the machine that
+/// served the run, or are null: null for a run another machine served
+/// (`hardware`, the stack's), whatever this machine's telemetry read while
+/// it ran, and null with no busy samples, never zero.
+pub fn detail_from(manifest: &Value, stats: &Value, names: &[String], hardware: darkmux_types::Hardware) -> Value {
+    let served_here = hardware == darkmux_types::Hardware::SubmittingMachine;
+    let sampled = served_here && stats.get("samples_busy").and_then(Value::as_u64).is_some_and(|n| n > 0);
     let host = |v: Value| if sampled { v } else { Value::Null };
     let thermal = stats.get("thermal_states_busy").and_then(Value::as_object).map(|states| {
         let mut kept: Vec<(&String, u64)> = states
@@ -551,7 +554,7 @@ pub fn bundle_run(run_id: &str, manifest: &Value, stats: &Value, ran_by: &RanBy,
         "peakMemoryGb": null,
         "startedAt": started.map(iso_utc),
         "stack": with_reply_cap(stack.to_json(), manifest),
-        "detail": detail_from(manifest, stats, names),
+        "detail": detail_from(manifest, stats, names, stack.hardware),
         "criteria": criteria_from(manifest),
     })
 }
@@ -1144,9 +1147,9 @@ fn endpoint_hardware(
 /// overlapped a local one (on this machine, in another process) can read
 /// busy, and the note then misfires; it asks a person to look, nothing more.
 pub fn hardware_check(hardware: darkmux_types::Hardware, stats: &Value) -> Option<String> {
-    let duty = stats.get("gpu_duty_pct").and_then(Value::as_f64)?;
+    let duty = machine_reading(stats, "gpu_duty_pct")?;
     let busy = stats.get("samples_busy").and_then(Value::as_u64)?;
-    let watts = |key: &str| stats.get(key).and_then(Value::as_f64);
+    let watts = |key: &str| machine_reading(stats, key);
     let (line, idle_w) = (crate::lab::stats::BUSY_GPU_PCT, crate::lab::stats::IDLE_GPU_W);
     match hardware {
         darkmux_types::Hardware::SubmittingMachine if busy == 0 && watts("gpu_w_max").is_some_and(|w| w <= idle_w) => Some(format!(
@@ -1157,6 +1160,13 @@ pub fn hardware_check(hardware: darkmux_types::Hardware, stats: &Value) -> Optio
         }),
         _ => None,
     }
+}
+
+/// This machine's own reading of `key` over a run's window: from
+/// `this_machine`, where `run stats` keeps it for a run another machine
+/// served, or else the run's own figure.
+fn machine_reading(stats: &Value, key: &str) -> Option<f64> {
+    stats.pointer(&format!("/this_machine/{key}")).and_then(Value::as_f64).or_else(|| stats.get(key).and_then(Value::as_f64))
 }
 
 /// (#3361) Each run states the eval workload it used, proven against the

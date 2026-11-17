@@ -121,14 +121,26 @@ fn every_failed_check_raises_a_flag() {
     r.throttled_samples = 1;
     r.result = Some("error".into());
     r.verify_ungated = true;
+    r.hardware = Some(darkmux_types::Hardware::Unknown);
     assert_eq!(
         flags(&r),
         vec![
             "RUNTIME-ERROR", "VERDICT", "UNBILLED", "STREAMS", "REST", "NO-TELEM", "NO-FLOW",
-            "CHARS", "RATCHET", "THROTTLE", "UNGATED"
+            "CHARS", "RATCHET", "THROTTLE", "UNGATED", "ELSEWHERE"
         ]
     );
     assert!(flags(&run("clean", "pass")).is_empty());
+}
+
+/// A run another machine served is flagged: its host columns are empty
+/// because they are not its own, not because nothing was read.
+#[test]
+fn a_run_served_elsewhere_raises_its_own_flag() {
+    let mut r = run("a", "pass");
+    r.hardware = Some(darkmux_types::Hardware::Unknown);
+    assert_eq!(flags(&r), vec!["ELSEWHERE"]);
+    r.hardware = Some(darkmux_types::Hardware::SubmittingMachine);
+    assert!(flags(&r).is_empty());
 }
 
 /// (#2833) `verify_ungated` alone raises exactly one flag, on an otherwise

@@ -646,7 +646,8 @@ fn a_run_that_crossed_midnight_reads_both_days_files() {
             // The shape the manifest actually writes — `{passed, details}`,
             // not a bare string.
             "verify": {"passed": true, "details": "verify command exited 0"},
-            "ok": true, "session_id": "sid-1"
+            "ok": true, "session_id": "sid-1",
+            "model_hardware": [{"model": "m", "from": "managed", "hardware": "submitting-machine"}]
         })
         .to_string(),
     )
@@ -1565,4 +1566,158 @@ fn with_no_first_output_mark_decode_and_first_token_are_null_not_guessed() {
     assert_eq!(m.decode_tok_per_s, None, "one stream unmarked: its split is unknown, so the run's is");
     assert_eq!(m.prefill_ms_billed, None);
     assert_eq!(m.first_token_ms_median, Some(2_000), "the marked stream's wait is still a measurement");
+}
+
+// ---------------------------------------------------------------------------
+// Whose machine the host figures describe
+// ---------------------------------------------------------------------------
+
+/// A finished run of `model` that billed 800 tokens over 8 s, while this
+/// machine's GPU read busy throughout (its own work, or another run's), with
+/// `snapshot` as the manifest's `model_hardware` (no manifest when `None`).
+fn busy_run(model: &str, snapshot: Option<serde_json::Value>) -> RunStats {
+    let start = 1_000 * MIN;
+    let run = tempfile::TempDir::new().unwrap();
+    let traj = format!(
+        "{}{}{}{}",
+        line(serde_json::json!({"type": "dispatch.start", "ts": start, "model": model})),
+        stream(1, start + 1_000, Some(start + 9_000)),
+        completed(1, Some(800), 0),
+        line(serde_json::json!({"type": "dispatch.complete", "ts": start + 10_000, "result": "stop", "wall_ms": 10_000})),
+    );
+    std::fs::write(run.path().join("trajectory.jsonl"), traj).unwrap();
+    if let Some(snap) = snapshot {
+        let manifest = serde_json::json!({"schema_version": 7, "ok": true, "model_hardware": snap});
+        std::fs::write(run.path().join("manifest.json"), manifest.to_string()).unwrap();
+    }
+    let flows = tempfile::TempDir::new().unwrap();
+    let body = format!("{}{}", telem(start + 2_000, 96, 40.0), telem(start + 6_000, 97, 44.0));
+    flow_file(flows.path(), "d.jsonl", &body, start + MIN);
+    compute_from_dir(run.path(), flows.path()).unwrap()
+}
+
+/// The host figures a run would publish as its own.
+fn attributed(s: &RunStats) -> Vec<(&'static str, bool)> {
+    vec![
+        ("gpu_w_busy", s.gpu_w_busy.is_some()),
+        ("gpu_w_max", s.gpu_w_max.is_some()),
+        ("cpu_w_busy", s.cpu_w_busy.is_some()),
+        ("pkg_w_busy", s.pkg_w_busy.is_some()),
+        ("gpu_duty_pct", s.gpu_duty_pct.is_some()),
+        ("pkg_j_per_1k_tokens", s.pkg_j_per_1k_tokens.is_some()),
+        ("thermal_states_busy", !s.thermal_states_busy.is_empty()),
+        ("cpu_speed_limit_min", s.cpu_speed_limit_min.is_some()),
+        ("mem_pct_busy_max", s.mem_pct_busy_max.is_some()),
+    ]
+}
+
+fn served(from: &str, hardware: Option<&str>) -> serde_json::Value {
+    let mut entry = serde_json::json!({"model": "m", "from": from, "endpoint": "e"});
+    if let Some(h) = hardware {
+        entry["hardware"] = h.into();
+    }
+    if from == "provider" {
+        entry["provider"] = "Anthropic API".into();
+    }
+    serde_json::json!([entry])
+}
+
+/// A hosted seat's run while this machine's GPU was busy with something
+/// else (a parallel local lab run): the watts, energy per token and thermal
+/// states are this machine's, never the run's. They are kept apart, and
+/// each withheld figure says why.
+#[test]
+fn a_hosted_run_reports_no_host_figures_as_its_own() {
+    let s = busy_run("m", Some(served("provider", Some("unknown"))));
+    assert_eq!(s.hardware, Some(darkmux_types::Hardware::Unknown));
+    for (field, present) in attributed(&s) {
+        assert!(!present, "{field} is this machine's, not the hosted run's");
+        let why = s.host_unmeasured.get(field).unwrap_or_else(|| panic!("{field} says why it is absent"));
+        assert!(why.contains("another machine served"), "{field}: {why}");
+    }
+    assert_eq!((s.busy_ms, s.pkg_j_busy, s.throttled_samples), (None, None, 0));
+    let mine = s.this_machine.as_ref().expect("this machine's own readings are kept");
+    assert_eq!((mine.gpu_w_busy, mine.gpu_w_max, mine.gpu_duty_pct), (Some(42.0), Some(44.0), Some(100.0)));
+    assert_eq!(mine.pkg_w_busy, Some(47.0));
+    assert_eq!(mine.thermal_states_busy.get("nominal"), Some(&2));
+    assert_eq!(s.tok_per_s, Some(100.0), "the run's own work is still measured");
+}
+
+/// A remote peer (another Mac's endpoint, declared `unknown`) is the same.
+#[test]
+fn a_remote_peer_run_reports_no_host_figures_as_its_own() {
+    let s = busy_run("m", Some(served("endpoint", Some("unknown"))));
+    assert_eq!(s.hardware, Some(darkmux_types::Hardware::Unknown));
+    assert!(attributed(&s).iter().all(|(_, present)| !present), "{:?}", attributed(&s));
+    assert!(s.this_machine.is_some());
+}
+
+/// A run this machine served keeps every figure, and nothing is set apart.
+#[test]
+fn a_local_run_keeps_its_host_figures() {
+    for snap in [served("managed", Some("submitting-machine")), served("endpoint", Some("submitting-machine"))] {
+        let s = busy_run("darkmux:m", Some(snap));
+        assert_eq!(s.hardware, Some(darkmux_types::Hardware::SubmittingMachine));
+        assert!(attributed(&s).iter().all(|(_, present)| *present), "{:?}", attributed(&s));
+        assert_eq!(s.pkg_j_per_1k_tokens, Some(470.0), "47 W over 8 s for 800 tokens");
+        assert!(s.this_machine.is_none());
+        assert!(!s.unreconciled().iter().any(|c| c.contains("which machine")), "{:?}", s.unreconciled());
+    }
+}
+
+/// A run that did not record which machine served it (from before darkmux
+/// recorded it, or an endpoint that declared none) keeps the figures, and
+/// says plainly that they are this machine's and the run's only if it
+/// served the model.
+#[test]
+fn a_run_with_unrecorded_hardware_says_its_host_figures_are_this_machines() {
+    for s in [busy_run("m", None), busy_run("m", Some(served("endpoint", None)))] {
+        assert_eq!(s.hardware, None);
+        assert!(attributed(&s).iter().all(|(_, present)| *present), "{:?}", attributed(&s));
+        assert!(s.this_machine.is_none());
+        assert!(s.unreconciled().iter().any(|c| c.contains("did not record which machine served")), "{:?}", s.unreconciled());
+    }
+}
+
+/// The run's model is found by id or identifier, with or without darkmux's
+/// namespace; a snapshot that names another model still decides when every
+/// entry agrees, and decides nothing when they disagree.
+#[test]
+fn the_runs_model_is_found_in_the_snapshot() {
+    use darkmux_types::Hardware::{SubmittingMachine, Unknown};
+    let entry = |model: &str, identifier: Option<&str>, hardware: &str| {
+        let mut e = serde_json::json!({"model": model, "from": "endpoint", "hardware": hardware});
+        if let Some(i) = identifier {
+            e["identifier"] = i.into();
+        }
+        serde_json::from_value::<crate::lab::manifest::ModelHardware>(e).unwrap()
+    };
+    let mixed = [entry("a", None, "unknown"), entry("b", Some("b-id"), "submitting-machine")];
+    assert_eq!(served_hardware(Some(&mixed), Some("darkmux:a")), Some(Unknown));
+    assert_eq!(served_hardware(Some(&mixed), Some("b-id")), Some(SubmittingMachine));
+    assert_eq!(served_hardware(Some(&mixed), Some("c")), None, "the entries disagree, so nothing is decided");
+    let agree = [entry("a", None, "unknown"), entry("b", None, "unknown")];
+    assert_eq!(served_hardware(Some(&agree), Some("flint")), Some(Unknown), "every entry says the same");
+    assert_eq!(served_hardware(Some(&[]), Some("a")), None);
+    assert_eq!(served_hardware(None, Some("a")), None);
+}
+
+/// With no telemetry in the window there is nothing of this machine's to
+/// keep apart, and nothing to list as withheld.
+#[test]
+fn a_hosted_run_without_telemetry_keeps_nothing_apart() {
+    let mut s = stats("", 10_000);
+    attribute_host(&mut s, Some(darkmux_types::Hardware::Unknown));
+    assert_eq!(s.hardware, Some(darkmux_types::Hardware::Unknown));
+    assert_eq!(s.this_machine, None);
+    assert!(s.host_unmeasured.is_empty(), "{:?}", s.host_unmeasured);
+}
+
+/// The unrecorded-hardware caveat is about host figures, so a run with no
+/// telemetry (no host figures at all) does not carry it.
+#[test]
+fn unrecorded_hardware_is_no_caveat_without_host_figures() {
+    let s = stats("", 10_000);
+    assert_eq!(s.hardware, None);
+    assert!(!s.unreconciled().iter().any(|c| c.contains("which machine")), "{:?}", s.unreconciled());
 }

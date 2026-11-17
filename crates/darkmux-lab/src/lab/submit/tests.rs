@@ -217,16 +217,16 @@ fn a_rate_over_part_of_the_generation_is_not_quoted() {
     assert_eq!(run["darkmuxVersion"], Value::Null);
     // (Argon review) Decode speed is a rate over the generation too.
     s["decode_tok_per_s"] = json!(80.0);
-    assert_eq!(detail_from(&manifest(), &s, &[])["decodeTokensPerSecond"], Value::Null);
+    assert_eq!(detail_from(&manifest(), &s, &[], darkmux_types::Hardware::SubmittingMachine)["decodeTokensPerSecond"], Value::Null);
     s["checks"]["all_streams_billed"] = json!(true);
-    assert_eq!(detail_from(&manifest(), &s, &[])["decodeTokensPerSecond"], json!(80.0));
+    assert_eq!(detail_from(&manifest(), &s, &[], darkmux_types::Hardware::SubmittingMachine)["decodeTokensPerSecond"], json!(80.0));
 }
 
 #[test]
 fn host_figures_need_busy_samples() {
     let mut s = stats();
     s["samples_busy"] = json!(0);
-    let d = detail_from(&manifest(), &s, &[]);
+    let d = detail_from(&manifest(), &s, &[], darkmux_types::Hardware::SubmittingMachine);
     for k in ["packageWatts", "gpuWatts", "thermalStates", "throttledSamples"] {
         assert_eq!(d[k], Value::Null, "{k}");
     }
@@ -1310,4 +1310,49 @@ fn the_git_user_name_is_the_one_git_reads_there() {
     darkmux_types::host_git::fixture::git(dir.path(), &["config", "user.name", "Repo Owner"]);
     assert_eq!(git_user_name_in(dir.path()), Some("Repo Owner".to_string()));
     assert_eq!(git_user_name_in(&dir.path().join("missing")), None, "git cannot run there");
+}
+
+/// The detail fields that describe the machine a run was served on.
+const HOST_DETAIL: [&str; 9] = [
+    "packageWatts",
+    "cpuWatts",
+    "gpuWatts",
+    "gpuBusyPct",
+    "joulesPer1kTokens",
+    "memoryPressureMaxPct",
+    "thermalStates",
+    "cpuSpeedLimitMinPct",
+    "throttledSamples",
+];
+
+/// A run another machine served publishes none of this machine's host
+/// figures, whatever its telemetry read while it ran (a parallel local run
+/// keeps the GPU busy): the bundle says `unknown`, so its watts, energy per
+/// token and thermal states are null. The run's own work figures stay.
+#[test]
+fn a_run_served_elsewhere_publishes_no_host_figures() {
+    let mut elsewhere = stack();
+    elsewhere.hardware = Unknown;
+    let far = bundle_run("far", &manifest(), &stats(), &RanBy::default(), &elsewhere, &[]);
+    for k in HOST_DETAIL {
+        assert_eq!(far["detail"][k], Value::Null, "{k}");
+    }
+    assert_eq!((&far["detail"]["turns"], &far["detail"]["completionTokens"]), (&json!(12), &json!(9000)));
+    let here = bundle_run("here", &manifest(), &stats(), &RanBy::default(), &stack(), &[]);
+    assert_eq!(here["detail"]["joulesPer1kTokens"], json!(410.3), "this machine's run keeps its figures");
+    let fixture = json!({ "name": "pepper-grinder", "version": "2" });
+    let bundle = assemble("kstrat2001/pepper-grinder", &"a".repeat(40), &fixture, vec![far, here]).unwrap();
+    assert_eq!(site_refusals(&bundle), Vec::<String>::new());
+}
+
+/// `run stats` keeps this machine's readings apart for a run another machine
+/// served (`this_machine`), and the cross-check still reads them there.
+#[test]
+fn the_gpu_cross_check_reads_this_machines_readings_when_the_run_withheld_them() {
+    let withheld = json!({
+        "samples_busy": 30, "gpu_duty_pct": null, "gpu_w_busy": null, "gpu_w_max": null,
+        "this_machine": { "gpu_duty_pct": 60.5, "gpu_w_busy": 31.2, "gpu_w_max": 44.0 },
+    });
+    let e = hardware_check(Unknown, &withheld).expect("this machine's GPU was busy while stated elsewhere");
+    assert!(e.contains("60.5%") && e.contains("31.2 W"), "{e}");
 }

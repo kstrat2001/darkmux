@@ -136,11 +136,7 @@ pub fn flags(s: &RunStats) -> Vec<&'static str> {
     if !c.rest_within_wall {
         f.push("REST");
     }
-    if !c.have_telemetry_samples {
-        f.push("NO-TELEM");
-    } else if !c.telemetry_covers_run {
-        f.push("TELEM-GAP");
-    }
+    telemetry_flags(s, &mut f);
     if !c.have_flow_records {
         f.push("NO-FLOW");
     }
@@ -163,7 +159,21 @@ pub fn flags(s: &RunStats) -> Vec<&'static str> {
     if s.verify_ungated {
         f.push("UNGATED");
     }
+    // Another machine served the run: its host columns are empty because
+    // this machine's telemetry is not its own, not because none was read.
+    if s.hardware == Some(darkmux_types::Hardware::Unknown) {
+        f.push("ELSEWHERE");
+    }
     f
+}
+
+/// Whether host telemetry landed in the run's window, and covered it.
+fn telemetry_flags(s: &RunStats, f: &mut Vec<&'static str>) {
+    if !s.checks.have_telemetry_samples {
+        f.push("NO-TELEM");
+    } else if !s.checks.telemetry_covers_run {
+        f.push("TELEM-GAP");
+    }
 }
 
 /// Run ids in `runs` whose `[started_at_unix_ms, +wall_ms]` window overlaps

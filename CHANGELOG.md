@@ -181,6 +181,25 @@ darkmux release.
 
 ### Fixed
 
+- **Run stats 2.5.0: a run another machine served no longer reports this machine's power as its own.**
+  A hosted-seat or remote-peer lab run, while this machine's GPU was busy (a parallel local lab run),
+  reported this machine's watts, energy per 1k tokens and thermal states as the run's, and `lab
+  submit` published them in a bundle marked `stack.hardware: "unknown"`. On a host with no GPU
+  utilization reading (Omarchy), a sample taken while the run's model stream was open counts as busy,
+  so it happened on every such run with telemetry. `run stats` now
+  reads which machine served the run's model from the run manifest's `model_hardware` snapshot and
+  adds `hardware` (`submitting-machine`, `unknown`, or `null` when the run did not record it). For
+  `unknown`, every host power, energy and thermal figure is `null` (or empty, or 0 for
+  `throttled_samples`), each listed in `host_unmeasured` with the reason, and the new `this_machine`
+  object keeps this machine's own readings over the window (no energy per token: this machine's watts
+  against another machine's tokens measure nothing). The text view prints "not measured for this
+  run", the set table flags `ELSEWHERE`, and a run with `hardware: null` and telemetry carries a
+  caveat that its host figures are this machine's. `lab submit` publishes null for every host detail
+  field of a run whose bundle says `unknown`, including a run `--hardware unknown` corrects. Additive
+  to the `run stats --json` shape; the meaning of the host fields narrows to "the machine that served
+  the run". The submit bundle's shape and format version are unchanged (those fields were already
+  nullable).
+
 - **A mission step waiting its turn reads waiting, not running (#3195).** Steps admitted together
   behind one slot (an endpoint with no `limits.concurrent_calls` runs its calls one at a time), or a
   local step waiting for its wave's model (a later wave, or its own wave's load), all read running from
