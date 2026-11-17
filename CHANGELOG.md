@@ -18,7 +18,7 @@ darkmux release.
 
 - **Seatbelt sandboxes are held to a process and a memory limit, and the memory limit is a setting
   (#3112).** New setting `sandbox.memory` (CONFIG 2.11, `DARKMUX_SANDBOX_MEMORY`; Docker's size syntax,
-  at least `6m`, default `4g`, written by `init`): the memory every sandbox may hold (a dispatch, a
+  from `6m` to `262144g`, default `4g`, written by `init`): the memory every sandbox may hold (a dispatch, a
   contained command, a client preview), under Docker and Seatbelt alike. `darkmux config set
   sandbox.memory 16g` changes it; a value that is not such a size (`lots`, `0`, a negative) is refused
   by `config set`, at every entry point's preflight and by doctor's new `sandbox memory` row, which shows

@@ -952,7 +952,7 @@ mod tests {
         set_at(f.path(), "sandbox.memory", "16g").unwrap();
         let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(f.path()).unwrap()).unwrap();
         assert_eq!(cfg.sandbox.unwrap().memory.as_deref(), Some("16g"));
-        for bad in ["lots", "0", "-1g"] {
+        for bad in ["lots", "0", "-1g", "262145g"] {
             let err = set_at(f.path(), "sandbox.memory", bad).unwrap_err().to_string();
             assert!(err.contains("sandbox.memory") && err.contains(&format!("`{bad}`")) && err.contains("a whole number followed by k, m or g"), "{err}");
             assert!(std::fs::read_to_string(f.path()).unwrap().contains("\"16g\""), "{bad} was written");

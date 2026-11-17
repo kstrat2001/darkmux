@@ -148,6 +148,24 @@ fn a_memory_limit_that_is_not_a_size_is_refused() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("`four gigs` is not a size"), "{out:?}");
 }
 
+/// A program that dies by a signal the memory watch did not send keeps the
+/// shell's own notice of it, as it did before the watch.
+#[test]
+#[serial_test::serial]
+fn a_program_killed_by_its_own_signal_keeps_the_shells_notice() {
+    if !SeatbeltBackend::available() {
+        return;
+    }
+    let _state = StateDir::new();
+    for (signal, code, notice) in [("SEGV", 139, "Segmentation fault: 11"), ("ABRT", 134, "Abort trap: 6")] {
+        let limits = Limits { memory: Some("512m".into()), pids: Some(64) };
+        let (mut cmd, _) = SeatbeltBackend.run(&perl("darkmux-limits-signal", limits, &format!("kill(\"{signal}\", $$);")));
+        let out = cmd.output().unwrap();
+        assert_eq!(out.status.code(), Some(code), "{signal}: {out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains(notice), "{signal}: {out:?}");
+    }
+}
+
 /// A memory limit Docker would read as no limit (`0`) is refused by both
 /// backends before anything runs, Docker's without calling `docker`.
 #[test]

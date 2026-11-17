@@ -473,7 +473,7 @@ use std::path::Path;
 //           serve`, and removed on shutdown. An older binary refuses a
 //           config carrying it.
 //   2.11 (#3112): additive `sandbox.memory` (`DARKMUX_SANDBOX_MEMORY`; a
-//           size in Docker's syntax, at least `6m`, default `4g`), the memory
+//           size in Docker's syntax, `6m` to `262144g`, default `4g`), the memory
 //           every sandbox may hold before it is stopped, under Docker and
 //           Seatbelt alike. Written by `init`. An older binary refuses a
 //           config carrying it.
@@ -1484,7 +1484,7 @@ pub struct SandboxConfig {
     /// syntax (`crate::size::SANDBOX_MEMORY_FORM`). Default `4g`
     /// (`DARKMUX_SANDBOX_MEMORY`). Docker holds it in the container's cgroup;
     /// Seatbelt watches the sandbox's resident memory once a second. A value
-    /// that is not a size of at least 6m refuses every entry point.
+    /// that is not a size from 6m to 262144g refuses every entry point.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub memory: Option<String>,
     #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
     #[schemars(skip)]

@@ -151,7 +151,11 @@ mkdir -m 700 "$d/tmp" && printf '%s' "$2" > "$d/profile.sb" && printf '%s' "$3" 
 /// ([`sweep!`]), so one that moved to a group of its own (`setpgid`, as a
 /// runtime's tool command does) ends too. Only one that started a session of
 /// its own (`setsid`) is not reached: unlike a container's, this sandbox
-/// does not end everything in it.
+/// does not end everything in it. What the shell itself says about how its
+/// program ended ("Segmentation fault: 11", "Abort trap: 6", "Killed: 9")
+/// is kept in `$d/notice` and passed on, except when the memory watch
+/// stopped the program ([`WATCH`]): then its reason, written to `$d/limit`,
+/// is the last line instead of the shell's "Killed: 9".
 const LAUNCH: &str = r#"wd=$1; pids=$2; mem=$3; memtext=$4; shift 4
 echo $$ > "$d/pid" && ps -o lstart= -p $$ > "$d/started" || exit 125
 {GUARD} "$$" </dev/null >/dev/null 2>&1 &
@@ -169,9 +173,9 @@ if [ -n "$pids" ]; then
 fi
 { ( exec 2>&3 3>&-
   [ -z "$nproc" ] || ulimit -u "$nproc" || { echo "seatbelt: could not limit the sandbox to $nproc processes" >&2; exit 125; }
-  exec /usr/bin/sandbox-exec -f "$d/profile.sb" "$@" ); } 3>&2 2>/dev/null
+  exec /usr/bin/sandbox-exec -f "$d/profile.sb" "$@" ); } 3>&2 2>"$d/notice"
 rc=$?
-[ ! -f "$d/limit" ] || cat "$d/limit" >&2
+if [ -f "$d/limit" ]; then cat "$d/limit" >&2; else cat "$d/notice" >&2 2>/dev/null; fi
 g=$$
 "#;
 

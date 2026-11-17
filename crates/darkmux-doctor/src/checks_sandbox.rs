@@ -45,7 +45,8 @@ pub(crate) fn sandbox_memory_row(value: &str, source: Source) -> Check {
         status: Status::Pass,
         message: format!(
             "`{value}` ({}, from {from}): a sandbox whose processes hold more is stopped. \
-             `darkmux config set sandbox.memory <size>` changes it",
+             `darkmux config set sandbox.memory <size>` changes it; a running `darkmux client serve` \
+             keeps the value it started with for its previews until it is restarted",
             darkmux_types::size::human_bytes(bytes)
         ),
         hint: None,
@@ -304,6 +305,7 @@ mod tests {
         let default = sandbox_memory_row("4g", Source::BuiltIn);
         assert_eq!(default.status, Status::Pass);
         assert!(default.message.contains("`4g` (4 GiB, from the built-in default)"), "{}", default.message);
+        assert!(default.message.contains("`darkmux client serve` keeps the value it started with"), "{}", default.message);
         let config = sandbox_memory_row("16g", Source::Config);
         assert!(config.message.contains("16 GiB, from `sandbox.memory` in config.json"), "{}", config.message);
         let env = sandbox_memory_row("8g", Source::Env);

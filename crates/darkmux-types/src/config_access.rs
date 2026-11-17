@@ -4061,7 +4061,7 @@ mod tests {
         assert!(env_bad.contains("DARKMUX_SANDBOX_MEMORY") && env_bad.contains("`lots` is not a size"), "{env_bad}");
         unsafe { std::env::remove_var(k) };
         drop(guard);
-        for bad in ["0", "-1g", "lots"] {
+        for bad in ["0", "-1g", "lots", "262145g"] {
             let _guard = set_config_for_test(with(bad));
             let problem = sandbox_memory_problem().unwrap_or_else(|| panic!("{bad} was accepted")).to_string();
             assert!(problem.contains("config.json key `sandbox.memory`"), "{problem}");
