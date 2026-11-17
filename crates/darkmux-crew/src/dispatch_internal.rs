@@ -6838,6 +6838,15 @@ fn admit_container_start(
 /// everything the container needs before its `dispatch.start`, then the run
 /// itself ([`run_container`]), which owns the bookends.
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
+    // A stopped run starts nothing: no container, no model call, and no
+    // record (an execution that never started opens no `dispatch.start`, as
+    // a `dispatch.map` item the stop kept from starting opens none). Every
+    // host-side caller comes through here, so a crawl unit's next draw, a lab
+    // repeat or a mission step that reaches it after the stop is refused
+    // before anything is spawned.
+    if darkmux_types::interrupt::is_set() {
+        bail!("{}: the dispatch of role `{}` did not start", darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL, opts.role_id);
+    }
     // (#2947) Bad enum config refuses FIRST: before the daemon nudge, the
     // ack gate, any session id or flow record. Every host-side dispatch
     // (radio, acp, mission steps, crawl units, lab providers, the fleet
