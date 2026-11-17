@@ -913,6 +913,14 @@ fn no_test_outside_the_root_tests_dir_resolves_the_darkmux_binary() {
     ] {
         assert!(files.iter().any(|p| p.ends_with(expected)), "the walk over {roots:?} missed {expected}");
     }
+    // Positive control: the scan fires on each form it exists to catch, so a
+    // typo in a token cannot switch the guard off.
+    for planted in [
+        concat!("    let mut cmd = Command::", "cargo", "_bin(\"dark", "mux\").unwrap();"),
+        concat!("    let bin = env!(\"CARGO_BIN_EXE_", "darkmux\");"),
+    ] {
+        assert_eq!(code_lines_naming("planted.rs", planted, &TOKENS).len(), 1, "the scan missed: {planted}");
+    }
     let offenders: Vec<String> = files
         .iter()
         .flat_map(|path| {
