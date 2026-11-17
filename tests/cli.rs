@@ -8141,6 +8141,106 @@ fn crawl_dry_run_prunes_the_rules_the_launch_did_not_select() {
     assert_ne!(all_out, one_out, "`--param rules=` must change the minted graph");
 }
 
+/// (#3631) A `rules=` name the document declares no task for is refused at
+/// preflight, naming the input, the unknown value and the closest declared
+/// rule. Before this, the name pruned every rule task silently and the dry
+/// run exited 0 with nothing planned.
+#[test]
+fn crawl_dry_run_refuses_a_rule_the_document_does_not_declare() {
+    let workdir = TempDir::new().unwrap();
+    let app = workdir.path().join("app");
+    let lib = workdir.path().join("lib");
+    write_app_repo(&app, "^1.0.0");
+    write_lib_repo(&lib, "1.2.0");
+    let spec_path = workdir.path().join("workspace.json");
+    write_workspace_spec(&spec_path, workdir.path(), &app, &lib);
+
+    let out = crawl_dry_run(&workdir, &spec_path, &["--param", "rules=swallowed-eror"]);
+    assert!(!out.status.success(), "an unknown rule must refuse the dry run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("`rules`"), "the refusal names the input:\n{stderr}");
+    assert!(stderr.contains("`swallowed-eror`"), "and the unknown value:\n{stderr}");
+    assert!(stderr.contains("`swallowed-error`"), "and the closest declared rule:\n{stderr}");
+    assert!(!workdir.path().join("missions").exists(), "a refused dry run mints nothing");
+}
+
+/// The review document's own launch, as the ACP panel synthesizes it.
+fn review_launch_with_rules(home: &TempDir, workdir: &TempDir, rules: &str, dry_run: bool) -> std::process::Output {
+    let app = workdir.path().join("app");
+    write_app_repo(&app, "^1.0.0");
+    let spec_path = workdir.path().join("workspace.json");
+    fs::write(
+        &spec_path,
+        serde_json::json!({
+            "name": "review-unknown-rule",
+            "sources": [{"id": "app", "path": app.to_string_lossy(), "ref": "main"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let diff_path = workdir.path().join("d.diff");
+    fs::write(&diff_path, "").unwrap();
+    let mut args = vec![
+        "mission".to_string(),
+        "launch".to_string(),
+        "review".to_string(),
+        "--param".to_string(),
+        format!("workspace={}", spec_path.display()),
+        "--param".to_string(),
+        format!("diff_file={}", diff_path.display()),
+        "--param".to_string(),
+        format!("rules={rules}"),
+    ];
+    if dry_run {
+        args.push("--dry-run".to_string());
+    }
+    darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", home.path().join("flows"))
+        .env("DARKMUX_LMS_BIN", "/usr/bin/false")
+        .env("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:9")
+        .args(&args)
+        .output()
+        .expect("mission launch review runs")
+}
+
+#[test]
+fn review_dry_run_refuses_an_unknown_rule_naming_the_closest_one() {
+    let home = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+    let out = review_launch_with_rules(&home, &workdir, "test-gap,no-such-rule", true);
+    assert!(!out.status.success(), "an unknown rule must refuse the dry run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("`rules`") && stderr.contains("`no-such-rule`"), "{stderr}");
+    assert!(stderr.contains("the closest is `"), "the refusal suggests a declared rule:\n{stderr}");
+    assert!(!stderr.contains("`test-gap` is"), "a declared rule beside it is not refused:\n{stderr}");
+    assert_nothing_minted(&home);
+}
+
+/// The real launch is refused at the same preflight, before anything mints.
+#[test]
+fn review_real_launch_refuses_an_unknown_rule_before_any_mint() {
+    let home = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+    let out = review_launch_with_rules(&home, &workdir, "test-gapp", false);
+    assert!(!out.status.success(), "an unknown rule must refuse the real launch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("`test-gapp`") && stderr.contains("`test-gap`"), "{stderr}");
+    assert_nothing_minted(&home);
+}
+
+/// Every declared rule, and the explicitly empty selection (the operator's
+/// own no-op), still pass the preflight.
+#[test]
+fn review_dry_run_accepts_declared_rules_and_an_empty_selection() {
+    for rules in ["swallowed-error,test-gap", ""] {
+        let home = TempDir::new().unwrap();
+        let workdir = TempDir::new().unwrap();
+        let out = review_launch_with_rules(&home, &workdir, rules, true);
+        assert!(out.status.success(), "rules={rules:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
 /// (#2310 P4c-2 item 4 — proven structurally) A SYNTHETIC config (not
 /// `review`, not any name the launcher's source recognizes) proves the
 /// `"ignored": true` input-declaration flag is honored by ANY config, not

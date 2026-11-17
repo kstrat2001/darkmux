@@ -613,14 +613,10 @@ pub fn launch(
     // pruned by the same mechanism with its own reason (`not_selected`), so
     // the graph a run shows is exactly the rules that will run — see
     // [`rule_selection`].
-    let selection = rule_selection(&collected);
+    // (#3631) A selected name no task declares is refused here, before
+    // anything mints, in the dry run and the real launch alike.
     let config_as_declared: &MissionConfig = &config_owned;
-    let (config_pruned, prune_report) = match &selection {
-        Some(wanted) => mission_config::prune::prune_with_selection(config_as_declared, &|task| {
-            task_declares_rule(task).is_none_or(|rule| wanted.contains(&rule))
-        }),
-        None => mission_config::prune::prune_disabled(config_as_declared),
-    };
+    let (config_pruned, prune_report) = prune_for_launch(config_as_declared, &collected)?;
     let config: &MissionConfig = &config_pruned;
 
     // (#1284 review round 1, consider 11) A config whose graph uses the
@@ -3137,6 +3133,63 @@ fn rule_selection(
 ) -> Option<std::collections::BTreeSet<String>> {
     let csv = collected.get("rules").and_then(|v| v.as_str())?;
     Some(csv.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+}
+
+/// The document this launch mints from: `enabled: false` pruned, and, when
+/// `--param rules=` is set, every rule task it does not name. A named rule
+/// no task declares is refused ([`check_rules_declared`]) rather than
+/// pruning the rest silently.
+fn prune_for_launch(
+    config: &MissionConfig,
+    collected: &BTreeMap<String, serde_json::Value>,
+) -> Result<(MissionConfig, mission_config::prune::PruneReport)> {
+    let Some(wanted) = rule_selection(collected) else {
+        return Ok(mission_config::prune::prune_disabled(config));
+    };
+    check_rules_declared(config, &wanted)?;
+    Ok(mission_config::prune::prune_with_selection(config, &|task| {
+        task_declares_rule(task).is_none_or(|rule| wanted.contains(&rule))
+    }))
+}
+
+/// (#3631) Refuse a `--param rules=` name that no task in the declared
+/// document (disabled tasks included) is for. Without this, the name
+/// matches nothing, every rule task is pruned as `not_selected`, and the
+/// launch plans no rule at all while exiting 0. Each unknown name is listed
+/// with its closest declared rule (the one suggester,
+/// `darkmux_types::user_files::closest`).
+fn check_rules_declared(config: &MissionConfig, wanted: &std::collections::BTreeSet<String>) -> Result<()> {
+    let declared: std::collections::BTreeSet<String> =
+        config.phases.iter().flat_map(|p| &p.tasks).filter_map(task_declares_rule).collect();
+    let unknown: Vec<String> =
+        wanted.iter().filter(|w| !declared.contains(*w)).map(|w| unknown_rule_line(w, &declared)).collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "mission launch: input `rules` names a rule config \"{}\" does not declare:\n{}\n\
+         Declared rules: {}. Refused rather than pruned: an unknown name selects no task, so the \
+         launch would plan none of the rules you meant.",
+        config.id,
+        unknown.join("\n"),
+        declared_rules_list(&declared),
+    )
+}
+
+/// One refused name: `` `<name>` is not declared; the closest is `<rule>` ``.
+fn unknown_rule_line(name: &str, declared: &std::collections::BTreeSet<String>) -> String {
+    let hint = darkmux_types::user_files::closest(name, declared.iter().map(String::as_str))
+        .map(|c| format!("; the closest is `{c}`"))
+        .unwrap_or_default();
+    format!("  `{name}` is not declared{hint}")
+}
+
+/// The declared rules as a refusal lists them, or `(none)`.
+fn declared_rules_list(declared: &std::collections::BTreeSet<String>) -> String {
+    if declared.is_empty() {
+        return "(none)".to_string();
+    }
+    declared.iter().map(|d| format!("`{d}`")).collect::<Vec<_>>().join(", ")
 }
 
 // (#2310 P4c-2 item 0) `crawl_plan_step_overrides` + `param_as_u64`, which
@@ -9931,6 +9984,66 @@ mod tests {
             !mission_config::unreferenced_inputs(&pruned, LAUNCHER_CONSUMED_INPUTS).is_empty(),
             "and a fully-pruned one is NOT — which is why the launcher passes the declared document"
         );
+    }
+
+    // ─── #3631: a `rules=` name no task declares is refused, never pruned ───
+
+    fn shipped_config(file: &str) -> mission_config::MissionConfig {
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("templates/builtin/mission-configs").join(file),
+        )
+        .expect("the config is shipped");
+        serde_json::from_str(&raw).expect("parses")
+    }
+
+    fn rules_param(csv: &str) -> BTreeMap<String, serde_json::Value> {
+        BTreeMap::from([("rules".to_string(), serde_json::Value::String(csv.to_string()))])
+    }
+
+    #[test]
+    fn an_unknown_rule_is_refused_naming_each_with_its_closest_declared_rule() {
+        let config = shipped_config("review.json");
+        let err = prune_for_launch(&config, &rules_param("test-gap, swallowed-eror,test-gapp"))
+            .expect_err("an unknown rule is refused")
+            .to_string();
+        assert!(err.contains("input `rules`") && err.contains("\"review\""), "{err}");
+        assert!(err.contains("`swallowed-eror` is not declared; the closest is `swallowed-error`"), "{err}");
+        assert!(err.contains("`test-gapp` is not declared; the closest is `test-gap`"), "{err}");
+        assert!(!err.contains("`test-gap` is not declared"), "a declared rule is never listed: {err}");
+        assert!(err.contains("Declared rules: `existing-solution`"), "{err}");
+    }
+
+    #[test]
+    fn declared_rules_and_an_empty_selection_prune_as_before() {
+        let config = shipped_config("review.json");
+        let (_, one) = prune_for_launch(&config, &rules_param("test-gap")).expect("a declared rule passes");
+        let (_, none) = prune_for_launch(&config, &rules_param("")).expect("the explicit no-op passes");
+        let (_, all) = prune_for_launch(&config, &BTreeMap::new()).expect("no selection passes");
+        assert!(none.pruned.len() > one.pruned.len(), "the empty selection prunes every rule task");
+        assert!(one.pruned.len() > all.pruned.len(), "one rule prunes the others");
+    }
+
+    /// A rule whose task the document disables is still declared: naming it
+    /// is not a typo, and its task is pruned as `disabled`, as before.
+    #[test]
+    fn a_disabled_rule_task_still_counts_as_declared() {
+        let mut config = shipped_config("crawl.json");
+        let task = config
+            .phases
+            .iter_mut()
+            .flat_map(|p| p.tasks.iter_mut())
+            .find(|t| task_declares_rule(t).as_deref() == Some("swallowed-error"))
+            .expect("crawl declares swallowed-error");
+        task.enabled = Some(false);
+        assert!(prune_for_launch(&config, &rules_param("swallowed-error")).is_ok());
+    }
+
+    #[test]
+    fn a_document_with_no_rule_tasks_refuses_any_named_rule() {
+        let config = shipped_config("coder-phase.json");
+        let err = prune_for_launch(&config, &rules_param("swallowed-error")).expect_err("refused").to_string();
+        assert!(err.contains("`swallowed-error` is not declared\n"), "no closest to name: {err}");
+        assert!(err.contains("Declared rules: (none)."), "{err}");
     }
 
     // ─── #2595 review round 2: `--timeout`'s OMITTED half must not clobber
