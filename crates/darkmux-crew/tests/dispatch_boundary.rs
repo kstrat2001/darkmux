@@ -28,7 +28,8 @@
 //!   atomically; a re-created file is a new file to XProtect, the reason
 //!   `tests/cli.rs::stable_cli_fakes` does the same). `docker` is found on
 //!   `PATH`, `lms` through `DARKMUX_LMS_BIN`. The fake `docker run` plays the
-//!   container: it copies a scripted trajectory into the mounted out-dir,
+//!   container: it reads the secret off stdin (or, scripted, exits without
+//!   reading it), copies a scripted trajectory into the mounted out-dir,
 //!   sources an optional run script (to sleep, or to change what `lms ps`
 //!   reports mid-run), prints scripted stdout/stderr and exits with a
 //!   scripted code. Every call's argv is logged NUL-separated, one file per
@@ -55,8 +56,10 @@
 //!   succeeds, so only that a kill was ISSUED, by name, is pinned.
 //! - The `?` arms that need an I/O fault or a race to fire: a workspace-name
 //!   collision, the origin stamp, the checkpoint staging and prompt writes,
-//!   the container spawn, the secret write to a container that closed its
-//!   stdin, `wait_with_output` itself failing.
+//!   the container spawn, `wait_with_output` itself failing. (The secret
+//!   write to a container that closed its stdin IS reached: a secret larger
+//!   than a pipe holds makes it fail every time, not only when the race
+//!   goes that way.)
 //! - A sampler heartbeat lost to another process's steal of the sampler lock.
 //!
 //! Every test runs in a process of its own (`own_process!`) and `#[serial]`:
@@ -127,6 +130,7 @@ case "$1" in
   create) echo fakecid; exit 0 ;;
   cp) for last; do :; done; printf '#!/bin/sh\n' > "$last"; exit 0 ;;
   run)
+    if [ -f "$state/run-refuses-stdin" ]; then exit 1; fi
     case " $* " in *" -i "*) cat > "$state/docker.stdin" ;; esac
     out=""
     for a; do case "$a" in *:/darkmux-out) out="${a%:/darkmux-out}" ;; esac; done
@@ -1576,6 +1580,34 @@ fn a_tool_granting_role_on_a_hosted_endpoint_runs_in_the_container_with_the_secr
     assert_eq!(sp["bounds"]["turn_delay_ms"]["source"], "forced-agentic-remote");
     assert!(rig.lms_log().iter().all(|l| l == "ps --json"), "no residency for a hosted brain: {:?}", rig.lms_log());
     assert!(!arg_after(&argv, "--system").unwrap().contains("PIN-IDENTITY-MARKER"), "identity never leaves the machine");
+}
+
+/// (#2233, #2247) The secret write is the one `?` between the spawn and the
+/// threads that watch the container, so when it fails the kill guard is all
+/// that stops a container that may still be up. Arming the guard late, or
+/// disarming it early, leaves no kill here while every other test stays
+/// green. The secret is larger than a pipe holds (64 KiB on Linux and macOS)
+/// and under Linux's 128 KiB limit on one environment string, so the write
+/// blocks until the container's end of the pipe closes and then fails, every
+/// time, instead of landing in the pipe's buffer.
+#[test]
+#[serial]
+fn a_secret_write_the_container_refuses_kills_the_container_by_name() {
+    own_process!();
+    let mut rig = Rig::new();
+    rig.env().set("PIN_HOSTED_KEY", "k".repeat(96 * 1024));
+    hosted_profiles(&rig, "http://127.0.0.1:9/v1");
+    rig.fake("run-refuses-stdin", "");
+    let (res, _) = run(&rig, rig.opts());
+    let err = res.expect_err("a secret the container never read fails the dispatch");
+    assert!(format!("{err:#}").contains("writing remote auth header to container stdin"), "{err:#}");
+    assert!(rig.stdin_blob().is_none(), "the fake container never read its stdin");
+    assert_eq!(
+        rig.docker_verbs(),
+        vec!["image inspect", "run --rm", "kill darkmux-dispatch-boundary.solo.adhoc.coder.pin"],
+        "the run, then the armed guard's kill by name"
+    );
+    assert_eq!(bookends(&rig), vec!["dispatch.start", "dispatch.error"]);
 }
 
 #[test]
