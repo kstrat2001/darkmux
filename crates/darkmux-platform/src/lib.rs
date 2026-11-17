@@ -209,6 +209,20 @@ pub trait Platform: Send + Sync {
     /// the platform has no reader.
     fn process_group(&self, pid: u32) -> Option<u32>;
 
+    /// Whether process `pid` is one of the processes of a sandbox on the
+    /// host led by one of `leaders` (its launchers): the leader, every
+    /// process in its group or session, and every descendant of any of those
+    /// ([`sandbox_members`] of the process table). `None` when the process
+    /// table cannot be read. What tells sandboxed work from the operator's
+    /// own processes when both connect from this machine's loopback.
+    fn in_sandbox_of(&self, pid: u32, leaders: &[u32]) -> Option<bool>;
+
+    /// The file name of the executable process `pid` runs
+    /// (`com.docker.backend`), or its command name where the executable
+    /// cannot be read; `None` for no such process, or where the platform
+    /// has no reader.
+    fn process_name(&self, pid: u32) -> Option<String>;
+
     /// (#3544) Who signed running process `pid`: its developer team and
     /// bundle id, when it is an app darkmux can name by its signature (valid
     /// now, from a team certificate under Apple's anchor, with the hardened
@@ -313,6 +327,32 @@ pub const CONTAINER_ENGINE_TEAMS: &[(&str, &str)] = &[
     ("2Q6FHJR3H3", "Rancher Desktop"),
     ("HYSCB8KRL2", "Podman"),
 ];
+
+/// The processes that carry a container's connection to this machine's
+/// loopback, by executable name: a connection held by one is a container's,
+/// never the operator's, whatever address it comes from. Docker Desktop's
+/// `com.docker.backend` was seen holding one on 2026-11-17 (Docker Desktop
+/// 4.x on macOS 26: `host.docker.internal` from an `alpine` container to a
+/// listener on the Mac's 127.0.0.1, which saw the peer as 127.0.0.1). The
+/// rest are the forwarders each engine documents: Docker Desktop's earlier
+/// network stack (`vpnkit`, `vpnkit-bridge`, `com.docker.vpnkit`), Docker
+/// Engine's userland proxy (`docker-proxy`), Podman's host network
+/// (`gvproxy`) and Lima's host agent (`limactl`, which Colima and Rancher
+/// Desktop run). A name here only ever makes a caller look remote.
+pub const CONTAINER_FORWARDERS: &[&str] =
+    &["com.docker.backend", "com.docker.vpnkit", "vpnkit", "vpnkit-bridge", "docker-proxy", "gvproxy", "limactl"];
+
+/// Whether a process named `name` forwards container traffic
+/// ([`CONTAINER_FORWARDERS`]).
+pub fn is_container_forwarder(name: &str) -> bool {
+    CONTAINER_FORWARDERS.contains(&name)
+}
+
+/// Whether `pid` is among the members of any of `leaders`' sandboxes in the
+/// process `table` ([`Platform::in_sandbox_of`]).
+pub(crate) fn in_sandbox_of_table(pid: u32, leaders: &[u32], table: &[(u32, u32, u32, u32)]) -> bool {
+    leaders.iter().any(|&leader| sandbox_members(leader, table).contains(&pid))
+}
 
 /// The container engine `team` signs for, if it is one
 /// ([`CONTAINER_ENGINE_TEAMS`]).

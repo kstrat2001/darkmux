@@ -128,6 +128,14 @@ impl Platform for OtherPlatform {
         None
     }
 
+    fn in_sandbox_of(&self, _pid: u32, _leaders: &[u32]) -> Option<bool> {
+        None
+    }
+
+    fn process_name(&self, _pid: u32) -> Option<String> {
+        None
+    }
+
     fn secret_store(&self) -> crate::SecretStore {
         crate::SecretStore::PrivateFile
     }

@@ -215,6 +215,16 @@ impl Platform for MacPlatform {
         crate::unix_process_group(pid)
     }
 
+    /// The process table from libproc ([`Platform::tcp_listeners_held_by`]'s).
+    fn in_sandbox_of(&self, pid: u32, leaders: &[u32]) -> Option<bool> {
+        process_table().map(|table| crate::in_sandbox_of_table(pid, leaders, &table))
+    }
+
+    /// `proc_pidpath`, which answers for another user's process too.
+    fn process_name(&self, pid: u32) -> Option<String> {
+        process_path(pid).ok()?.file_name().map(|n| n.to_string_lossy().into_owned())
+    }
+
     /// (#3453) The XDG layout, read from this process's environment.
     fn xdg_data_home(&self) -> Option<std::path::PathBuf> {
         crate::xdg_data_home_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))

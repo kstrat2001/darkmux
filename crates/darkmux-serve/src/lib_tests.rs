@@ -2257,7 +2257,7 @@
     /// thing for the test to say, since the production loopback path always
     /// has a peer address.
     fn loopback_peer() -> ConnectInfo<SocketAddr> {
-        ConnectInfo("127.0.0.1:5555".parse::<SocketAddr>().unwrap())
+        ConnectInfo(crate::local_peer::operator("127.0.0.1:5555".parse::<SocketAddr>().unwrap()))
     }
 
     #[tokio::test]
@@ -2730,7 +2730,7 @@
             "tailscale-app-capabilities",
         ];
         assert_eq!(PROXY_HEADERS.len(), EXPECTED.len(), "a header was added or removed: update this list on purpose");
-        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let lo: SocketAddr = crate::local_peer::operator("127.0.0.1:5000".parse().unwrap());
         let bound: SocketAddr = "127.0.0.1:8765".parse().unwrap();
         assert!(is_local_at(Some(lo), &headers_with(&[("Host", "localhost:8765")]), Some(bound)), "the inverse: no proxy header is local");
         for h in EXPECTED {
@@ -2752,8 +2752,8 @@
     #[test]
     fn is_local_request_needs_a_loopback_peer_and_no_proxy_header() {
         let named = headers_with(&[("Host", "localhost:8765")]);
-        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let v6: SocketAddr = "[::1]:5000".parse().unwrap();
+        let lo: SocketAddr = crate::local_peer::operator("127.0.0.1:5000".parse().unwrap());
+        let v6: SocketAddr = crate::local_peer::operator("[::1]:5000".parse().unwrap());
         let remote: SocketAddr = "100.64.0.7:5000".parse().unwrap();
         assert!(is_local_request(Some(lo), &named));
         assert!(is_local_request(Some(v6), &named));
@@ -2879,7 +2879,7 @@
     #[tokio::test]
     #[serial_test::serial]
     async fn auth_on_an_ipv4_mapped_loopback_peer_is_local() {
-        let mapped = ConnectInfo("[::ffff:127.0.0.1]:5555".parse::<SocketAddr>().unwrap());
+        let mapped = ConnectInfo(crate::local_peer::operator("[::ffff:127.0.0.1]:5555".parse::<SocketAddr>().unwrap()));
         let status = bare_router_status(&[("Host", "localhost")], mapped).await;
         assert_ne!(status, StatusCode::UNAUTHORIZED, "a v4-mapped loopback peer is this machine");
     }
@@ -2887,7 +2887,7 @@
     #[test]
     fn an_ipv4_mapped_loopback_peer_is_local_and_a_mapped_remote_is_not() {
         let h = headers_with(&[("Host", "localhost")]);
-        assert!(is_local_request(Some("[::ffff:127.0.0.1]:5000".parse().unwrap()), &h));
+        assert!(is_local_request(Some(crate::local_peer::operator("[::ffff:127.0.0.1]:5000".parse().unwrap())), &h));
         assert!(!is_local_request(Some("[::ffff:100.64.0.7]:5000".parse().unwrap()), &h));
     }
 
@@ -2895,7 +2895,7 @@
     /// or without the bound port; a different port or name is not this daemon.
     #[test]
     fn the_host_rule_accepts_the_bind_address_and_only_its_port() {
-        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let lo: SocketAddr = crate::local_peer::operator("127.0.0.1:5000".parse().unwrap());
         let bound: Option<SocketAddr> = Some("100.64.0.5:8765".parse().unwrap());
         let ok = |host: &str| is_local_at(Some(lo), &headers_with(&[("Host", host)]), bound);
         for host in ["100.64.0.5", "100.64.0.5:8765", "localhost", "localhost:8765", "[::1]:8765", "127.0.0.1:8765"] {
@@ -2912,7 +2912,7 @@
 
     #[test]
     fn two_host_headers_are_not_local() {
-        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let lo: SocketAddr = crate::local_peer::operator("127.0.0.1:5000".parse().unwrap());
         let two = headers_with(&[("Host", "localhost"), ("Host", "attacker.example")]);
         assert!(!is_local_at(Some(lo), &two, None));
         assert!(!is_local_at(Some(lo), &axum::http::HeaderMap::new(), None), "no Host is not local");
@@ -5039,7 +5039,7 @@
             for from in ["10.0.0.9:5555", "127.0.0.1:5555"] {
                 let app = build_router_local(PathBuf::new());
                 let mut req = Request::builder().uri(format!("/flow/{today}/stream")).header("host", "localhost").body(Body::empty()).unwrap();
-                req.extensions_mut().insert(ConnectInfo(from.parse::<SocketAddr>().unwrap()));
+                req.extensions_mut().insert(ConnectInfo(crate::local_peer::operator(from.parse::<SocketAddr>().unwrap())));
                 let mut body = app.oneshot(req).await.unwrap().into_body().into_data_stream();
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 let record = format!(

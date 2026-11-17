@@ -2541,3 +2541,83 @@ fn the_overlay_tool_is_looked_for_where_each_platform_installs_it() {
     assert_eq!(fake.overlay_tool_locations(), ["/x/t"]);
     assert!(crate::fake::FakePlatform::default().overlay_tool_locations().is_empty());
 }
+
+// ── whose process a loopback peer is ────────────────────────────────────
+
+/// A process is in a sandbox on the host when it is one of a leader's
+/// members (`sandbox_members`): the leader, its group or session, or a
+/// descendant. A process outside every leader's is not; neither is anything
+/// when no sandbox runs.
+#[test]
+fn a_process_is_in_a_host_sandbox_when_it_is_one_of_a_leaders_members() {
+    let table = [
+        (1, 0, 1, 1),         // launchd / init
+        (50, 1, 50, 50),      // the operator's shell
+        (51, 50, 51, 50),     // the operator's CLI
+        (100, 50, 100, 100),  // a sandbox's launcher
+        (101, 100, 100, 100), // its program
+        (102, 101, 102, 102), // a descendant in a session of its own
+    ];
+    for pid in [100, 101, 102] {
+        assert!(crate::in_sandbox_of_table(pid, &[300, 100], &table), "{pid} is the sandbox's");
+    }
+    assert!(!crate::in_sandbox_of_table(51, &[100], &table), "the operator's CLI is not");
+    assert!(!crate::in_sandbox_of_table(50, &[100], &table), "the leader's parent is not");
+    assert!(!crate::in_sandbox_of_table(101, &[], &table), "no sandbox runs");
+    let fake = FakePlatform { process_table: Some(table.to_vec()), ..Default::default() };
+    assert_eq!(fake.in_sandbox_of(101, &[100]), Some(true));
+    assert_eq!(FakePlatform::default().in_sandbox_of(101, &[100]), None, "no table, no answer");
+    assert_eq!(OtherPlatform.in_sandbox_of(101, &[100]), None);
+}
+
+/// This host's strategy reads its own process table: a child started as
+/// the leader of a session of its own (as a Seatbelt launcher is) is in
+/// that leader's sandbox, and this test's own process is not.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_host_tells_a_sandbox_leaders_session_from_this_process() {
+    let mut cmd = std::process::Command::new("/bin/sleep");
+    cmd.arg("5");
+    crate::in_a_session_of_its_own(&mut cmd);
+    let mut child = cmd.spawn().unwrap();
+    let leader = child.id();
+    let here = std::process::id();
+    let answers = (current().in_sandbox_of(leader, &[leader]), current().in_sandbox_of(here, &[leader]));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(answers, (Some(true), Some(false)));
+}
+
+/// The container engines' forwarders are named; an ordinary program, or a
+/// name that only contains one, is not.
+#[test]
+fn a_container_forwarder_is_known_by_its_executable_name() {
+    for name in ["com.docker.backend", "vpnkit", "docker-proxy", "gvproxy", "limactl"] {
+        assert!(crate::is_container_forwarder(name), "{name}");
+    }
+    for name in ["curl", "Google Chrome Helper", "darkmux", "com.docker.backend.evil", ""] {
+        assert!(!crate::is_container_forwarder(name), "{name}");
+    }
+}
+
+/// A process's name is its executable link's file name, a deleted binary's
+/// mark dropped; with no link to read (another user's process), its `comm`.
+#[test]
+fn a_linux_process_is_named_by_its_executable_else_its_command_name() {
+    use crate::linux::name_from_exe_or_comm as name;
+    assert_eq!(name(Some("/usr/bin/docker-proxy".into()), || None), Some("docker-proxy".into()));
+    assert_eq!(name(Some("/tmp/x/curl (deleted)".into()), || None), Some("curl".into()));
+    assert_eq!(name(None, || Some("docker-proxy\n".into())), Some("docker-proxy".into()));
+    assert_eq!(name(None, || Some("\n".into())), None);
+    assert_eq!(name(None, || None), None);
+}
+
+/// This host's strategy names this test's own executable.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_host_names_a_processs_executable() {
+    let exe = std::env::current_exe().unwrap();
+    let want = exe.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(current().process_name(std::process::id()), Some(want));
+    assert_eq!(OtherPlatform.process_name(1), None);
+}

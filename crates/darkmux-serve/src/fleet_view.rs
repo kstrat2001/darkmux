@@ -2420,7 +2420,7 @@ pub(crate) mod tests {
             req = req.header(*k, *v);
         }
         let mut req = req.body(Body::empty()).unwrap();
-        req.extensions_mut().insert(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
+        req.extensions_mut().insert(ConnectInfo(crate::local_peer::operator(peer.parse::<std::net::SocketAddr>().unwrap())));
         let res = app.oneshot(req).await.unwrap();
         (res.status().as_u16(), axum::body::to_bytes(res.into_body(), 1 << 22).await.unwrap().to_vec())
     }

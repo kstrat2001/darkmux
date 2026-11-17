@@ -47,6 +47,11 @@ pub struct FakePlatform {
     pub held_listeners_reads: std::sync::Mutex<std::collections::VecDeque<bool>>,
     /// `(pid, group)` pairs [`Platform::process_group`] answers.
     pub process_groups: Vec<(u32, u32)>,
+    /// The `(pid, ppid, pgid, sid)` table [`Platform::in_sandbox_of`] reads;
+    /// `None`: it cannot be read.
+    pub process_table: Option<Vec<(u32, u32, u32, u32)>>,
+    /// `(pid, name)` pairs [`Platform::process_name`] answers.
+    pub process_names: Vec<(u32, String)>,
     /// `(pid, app)` pairs [`Platform::signed_app`] names; any other pid is unsigned.
     pub signed_apps: Vec<(u32, crate::SignedApp)>,
     /// What [`Platform::ask_allow`] answers.
@@ -89,6 +94,8 @@ impl Default for FakePlatform {
             held_listeners: Vec::new(),
             held_listeners_reads: Default::default(),
             process_groups: Vec::new(),
+            process_table: None,
+            process_names: Vec::new(),
             signed_apps: Vec::new(),
             allow_answer: crate::AllowAnswer::NoDialog("a fake platform shows no dialog".to_string()),
             node_release_platform: None,
@@ -234,6 +241,14 @@ impl Platform for FakePlatform {
 
     fn process_group(&self, pid: u32) -> Option<u32> {
         self.process_groups.iter().find(|(p, _)| *p == pid).map(|(_, g)| *g)
+    }
+
+    fn in_sandbox_of(&self, pid: u32, leaders: &[u32]) -> Option<bool> {
+        self.process_table.as_ref().map(|table| crate::in_sandbox_of_table(pid, leaders, table))
+    }
+
+    fn process_name(&self, pid: u32) -> Option<String> {
+        self.process_names.iter().find(|(p, _)| *p == pid).map(|(_, n)| n.clone())
     }
 
     fn secret_store(&self) -> crate::SecretStore {

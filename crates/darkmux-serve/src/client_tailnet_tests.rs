@@ -24,7 +24,7 @@ fn forwarded() -> HeaderMap {
 }
 
 fn loopback() -> Option<SocketAddr> {
-    Some(SocketAddr::from(([127, 0, 0, 1], 5555)))
+    Some(crate::local_peer::operator(SocketAddr::from(([127, 0, 0, 1], 5555))))
 }
 
 const BOUND: Option<SocketAddr> = None;

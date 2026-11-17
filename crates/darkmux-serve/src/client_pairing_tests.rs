@@ -538,7 +538,7 @@ const SHARED_PEER_PORTS: u16 = 40_000;
 /// `Host` naming the listener (each added only when the test set none).
 async fn call(h: &Harness, mut req: Request<Body>) -> (u16, Value) {
     if req.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>().is_none() {
-        req.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+        req.extensions_mut().insert(axum::extract::ConnectInfo(crate::local_peer::operator(SocketAddr::from(([127, 0, 0, 1], 5555)))));
     }
     if !req.headers().contains_key(axum::http::header::HOST) {
         req.headers_mut().insert(axum::http::header::HOST, BOUND.parse().unwrap());
@@ -638,7 +638,7 @@ fn forged_pair(headers: &[(&str, &str)], content_type: &str) -> Request<Body> {
     }
     let mut req = b.body(Body::from(pair_body().to_string())).unwrap();
     req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+        .insert(axum::extract::ConnectInfo(crate::local_peer::operator(SocketAddr::from(([127, 0, 0, 1], 5555)))));
     req
 }
 
@@ -1523,7 +1523,7 @@ async fn tailscale_is_asked_one_call_at_a_time() {
         let req = get("/client/whoami", &with_token(&from_addr(forwarded(Some(SAM)), addr), Some(&auth)));
         let router = router(h.state.clone());
         let mut req = req;
-        req.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+        req.extensions_mut().insert(axum::extract::ConnectInfo(crate::local_peer::operator(SocketAddr::from(([127, 0, 0, 1], 5555)))));
         calls.push(tokio::spawn(async move { router.oneshot(req).await.unwrap().status() }));
     }
     for c in calls {
@@ -1920,7 +1920,7 @@ fn pair_from(port: u16, code: &str) -> Request<Body> {
     body["code"] = code.into();
     let mut req = post("/client/pair", None, body);
     req.headers_mut().insert(axum::http::header::HOST, BOUND.parse().unwrap());
-    req.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], port))));
+    req.extensions_mut().insert(axum::extract::ConnectInfo(crate::local_peer::operator(SocketAddr::from(([127, 0, 0, 1], port)))));
     req
 }
 
@@ -8375,7 +8375,7 @@ async fn a_template_becomes_a_fresh_local_project_named_for_the_bot() {
 /// `req` through the router with `state` in place of the harness's, sent
 /// as this machine's app sends it.
 async fn call_with(state: ClientServerState, mut req: Request<Body>) -> (u16, Value) {
-    req.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+    req.extensions_mut().insert(axum::extract::ConnectInfo(crate::local_peer::operator(SocketAddr::from(([127, 0, 0, 1], 5555)))));
     req.headers_mut().insert(axum::http::header::HOST, BOUND.parse().unwrap());
     let resp = router(state).oneshot(req).await.unwrap();
     let code = resp.status().as_u16();
@@ -8953,13 +8953,19 @@ fn slow_admission(h: &mut Harness, ms: u64) {
 async fn a_disconnect_during_admission_never_leaves_a_run_with_no_runner() {
     let mut h = harness();
     let token = paired(&h).await;
-    slow_admission(&mut h, 400);
+    let admitting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = admitting.clone();
+    h.state.role_known = Arc::new(move |_role| {
+        seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        Ok(true)
+    });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     h.state.bound = Some(addr);
     let app = router(h.state.clone());
     let server = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
+        axum::serve(listener, crate::local_peer::make_service(app)).await
     });
     let body = work_for("coder").to_string();
     let request = format!(
@@ -8969,9 +8975,16 @@ async fn a_disconnect_during_admission_never_leaves_a_run_with_no_runner() {
     );
     let mut socket = std::net::TcpStream::connect(addr).unwrap();
     std::io::Write::write_all(&mut socket, request.as_bytes()).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Hang up once admission has begun (the connection is judged first).
+    for _ in 0..500 {
+        if admitting.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(admitting.load(std::sync::atomic::Ordering::SeqCst), "admission began");
     drop(socket);
-    // Admission ends at 400 ms; the run itself is instant. Both are waited
+    // Admission ends 400 ms after it began; the run itself is instant. Both are waited
     // for, bounded, never assumed done after a fixed sleep.
     let mut ids: Vec<String> = Vec::new();
     for _ in 0..500 {
@@ -8996,7 +9009,7 @@ async fn work_still_being_admitted_when_the_stop_begins_is_refused() {
     let token = paired(&h).await;
     slow_admission(&mut h, 300);
     let mut req = post("/client/work", Some(&token), work_for("coder"));
-    req.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+    req.extensions_mut().insert(axum::extract::ConnectInfo(crate::local_peer::operator(SocketAddr::from(([127, 0, 0, 1], 5555)))));
     req.headers_mut().insert(axum::http::header::HOST, BOUND.parse().unwrap());
     let app = router(h.state.clone());
     let asked = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
