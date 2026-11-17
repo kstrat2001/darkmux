@@ -59,7 +59,6 @@
   "crates/darkmux-crew/src/mods.rs::create": 11,
   "crates/darkmux-crew/src/mods.rs::create_from_emission": 12,
   "crates/darkmux-crew/src/mods.rs::strip_kit_source_prefix": 16,
-  "crates/darkmux-crew/src/power_policy.rs::BatteryGovernor::on_sample": 14,
   "crates/darkmux-crew/src/records_emitted.rs::aggregate_records_emitted": 22,
   "crates/darkmux-crew/src/records_emitted.rs::day_stem_to_epoch_days": 12,
   "crates/darkmux-crew/src/records_emitted.rs::records_emitted_for_mission": 15,

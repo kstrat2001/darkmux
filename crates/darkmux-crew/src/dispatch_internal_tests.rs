@@ -388,6 +388,16 @@
         assert!(src.contains("pacer.on_tick(thermal_elapsed_ms, &self.host_out, &others, &caller, env)"), "the pacer tick");
         assert!(src.contains("let others = self.governors.other_pacing();"), "derived from the pair");
         assert!(!src.contains("OtherPacing {"), "no second derivation of what the governors hold");
+        // And the other direction: the pair is told whether the pacer holds a
+        // pause, so neither governor writes a release over it (`pace_file`'s
+        // rule). Passing a constant here compiles and leaves every scenario
+        // green, because no scenario reaches the sampler.
+        let tick = &src[src.find("self.governors.tick(").expect("the governor tick")..];
+        let tick = &tick[..tick.find(");").expect("call end")];
+        assert!(
+            tick.contains("self.budget_pacer.as_ref().is_some_and(crate::budget::BudgetPacer::is_pausing)"),
+            "the governor tick must carry the pacer's live pause: {tick}"
+        );
     }
 
     /// (3rd review #4) The container pre-start gate (hosted brain or a
@@ -17243,6 +17253,69 @@ S(("127.0.0.1", port), H).serve_forever()
         .to_string();
         assert!(err.contains("ghost"), "{err}");
         assert!(err.contains("lms ls"), "{err}");
+    }
+
+    /// Run the preflight's production load ([`super::load_at_ctx_bounded`])
+    /// against a fake `lms` whose `case "$1"` arms are `arms`.
+    #[cfg(unix)]
+    fn load_with_fake_lms(arms: &str, n_ctx: u32) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("lms");
+        std::fs::write(&bin, format!("#!/bin/sh\ncase \"$1\" in\n{arms}\nesac\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A fresh executable's first exec can be slow on macOS; pay it here,
+        // not inside the load's deadline.
+        assert!(std::process::Command::new(&bin).status().unwrap().success());
+        let prev = std::env::var_os("DARKMUX_LMS_BIN");
+        // SAFETY: #[serial] on every caller; restored below.
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
+        let out = super::load_at_ctx_bounded("m", "darkmux:m", n_ctx);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+        out
+    }
+
+    /// (#1135 class) A load LM Studio finishes at less context than asked
+    /// is an error naming the instance, what was asked and what it got,
+    /// never a dispatch that runs truncated.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_load_that_lands_below_the_asked_context_is_an_error() {
+        let err = load_with_fake_lms(
+            r#"  load) exit 0 ;;
+  ps) echo '[{"identifier":"darkmux:m","modelKey":"m","contextLength":4096}]' ;;
+  ls) echo '[{"modelKey":"m","type":"llm","maxContextLength":131072}]' ;;"#,
+            32768,
+        )
+        .expect_err("LM Studio holds it at 4096, not the 32768 asked");
+        let err = format!("{err:#}");
+        for part in ["darkmux:m", "4096", "32768", "n_ctx"] {
+            assert!(err.contains(part), "names {part}: {err}");
+        }
+    }
+
+    /// The same load at (or above) the asked context is a success: LM
+    /// Studio reporting more context than asked is no shortfall.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_load_that_lands_at_or_above_the_asked_context_is_ok() {
+        for resolved in [32768, 40960] {
+            load_with_fake_lms(
+                &format!(
+                    r#"  load) exit 0 ;;
+  ps) echo '[{{"identifier":"darkmux:m","modelKey":"m","contextLength":{resolved}}}]' ;;"#
+                ),
+                32768,
+            )
+            .unwrap_or_else(|e| panic!("resolved {resolved}: {e:#}"));
+        }
     }
 
 // ── (#1609) Namespace contract: darkmux never unloads user state ────────────
