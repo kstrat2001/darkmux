@@ -437,6 +437,14 @@ impl Rec {
         }
     }
 
+    /// (#1135 class) The `max_context` `revision`'s manifest states, in
+    /// tokens, or `None` when it states none or cannot be read.
+    pub fn context_limit(&self, revision: &str) -> Option<u64> {
+        let dir = self.model_dir(revision).ok()?;
+        let text = std::fs::read_to_string(dir.join(format!("{revision}.json"))).ok()?;
+        pulled_revision(revision, &text)?.max_context.map(u64::from)
+    }
+
     /// The server darkmux runs for `model` on `endpoint`: rec's
     /// `<runtime>/rec-mlx serve flint` with the model's `engine_args` first and
     /// darkmux's own flags after them (the model directory and its manifest,
@@ -586,6 +594,20 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         Rec::at(bin.to_string_lossy().into_owned(), Some(data))
+    }
+
+    /// (#1135 class) A revision's maximum context is its manifest's
+    /// `max_context`; a manifest that states none, or a revision rec does
+    /// not hold, states none.
+    #[test]
+    fn context_limit_is_the_manifests_max_context() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rec = fake_install(dir.path(), "0.1.0", "");
+        assert_eq!(rec.context_limit("flint-int4"), Some(262_144));
+        assert_eq!(rec.context_limit("flint-int8"), None, "not held");
+        let manifest = dir.path().join("share/rec/models/fdc852/flint-int4.json");
+        std::fs::write(&manifest, r#"{"model_id":"flint-int4"}"#).unwrap();
+        assert_eq!(rec.context_limit("flint-int4"), None, "states none");
     }
 
     const RUNNING: &str = r#"{"engine":"mlx","ready":true,"version":"0.1.0","model":"flint","revision":"flint-int4","endpoint":"http://127.0.0.1:11500/v1","context":262144}"#;

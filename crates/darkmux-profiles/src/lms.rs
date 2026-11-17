@@ -509,7 +509,7 @@ fn load_names_of(v: &serde_json::Value) -> Vec<String> {
     path.into_iter().chain(variants).collect()
 }
 
-fn meta_from_json(v: &serde_json::Value) -> Option<ModelMeta> {
+pub(crate) fn meta_from_json(v: &serde_json::Value) -> Option<ModelMeta> {
     let model_key = v.get("modelKey").and_then(|s| s.as_str())?.to_string();
     Some(ModelMeta {
         model_key,
