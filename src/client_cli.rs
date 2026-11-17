@@ -154,7 +154,7 @@ fn describe(p: &PendingRequest, now: u64) -> String {
                 "\n  tailnet: {}\n  approve only if {} itself shows code {} (a program on this Mac can name any device). \
                  If you are not pairing a device now, Deny.",
                 darkmux_serve::client_tailnet::described(t),
-                safe(&t.device.name),
+                darkmux_serve::client_tailnet::shown_name(&t.device.name),
                 safe(&p.code)
             )
         })
@@ -320,8 +320,8 @@ fn on_its_own(auto: Option<&cp::SigningIdentity>) -> String {
 /// (#3560) What `client list` adds for a pairing made through the tailnet
 /// entry: the user and device it is answered from there.
 fn over_the_tailnet(t: Option<&darkmux_serve::client_tailnet::TailnetIdentity>) -> String {
-    let safe = darkmux_platform::display_safe;
-    t.map(|t| format!(", over the tailnet as {} from {}", safe(&t.login), safe(&t.device.name))).unwrap_or_default()
+    let shown = darkmux_serve::client_tailnet::shown_name;
+    t.map(|t| format!(", over the tailnet as {} from {}", shown(&t.login), shown(&t.device.name))).unwrap_or_default()
 }
 
 /// `darkmux doctor`'s row for client workspaces no paired client owns.
@@ -504,6 +504,29 @@ mod tests {
         let shown = listed(&store, 200, "x");
         assert!(shown.contains(&format!("{name}  (paired 0s ago, over the tailnet as sam@example.com from sams-iphone)")), "{shown}");
         assert!(!shown.contains("nPHONE1CNTRL"), "{shown}");
+    }
+
+    /// (#3626) `client approve` and `client list` show a device's own long
+    /// tailnet names cut at the same limit as the serve log does, wherever a
+    /// name appears, so what follows each name stays on screen.
+    #[test]
+    fn approve_and_list_bound_a_remote_device_s_long_names() {
+        use darkmux_serve::client_tailnet::NAME_COLUMNS;
+        // The names' own characters, which no fixed word here uses.
+        let name_columns = |s: &str| {
+            darkmux_flow::hooks::display_columns(&s.chars().filter(|c| matches!(c, '長' | 'ŋ' | '\u{301}' | '…')).collect::<String>())
+        };
+        let mut long = sams_phone();
+        long.login = "長".repeat(200);
+        long.device.name = "ŋ\u{301}".repeat(300);
+        let (_d, store, _ids) = store_with(&["AAA"]);
+        store.update(|f| { f.pending[0].tailnet = Some(long.clone()); Ok(()) }).unwrap();
+        // Shown three times: the user, and the device twice.
+        let shown = describe(&cp::list_pending(&store, 200).unwrap()[0], 200);
+        assert!(name_columns(&shown) <= 3 * NAME_COLUMNS && shown.matches('…').count() == 3, "{}: {shown}", name_columns(&shown));
+        assert!(shown.contains("itself shows code AAA"), "{shown}");
+        let listed = over_the_tailnet(Some(&long));
+        assert!(name_columns(&listed) <= 2 * NAME_COLUMNS && listed.matches('…').count() == 2, "{}: {listed}", name_columns(&listed));
     }
 
     fn statuses(store: &ClientStore) -> Vec<cp::PendingStatus> {

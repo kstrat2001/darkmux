@@ -2581,6 +2581,7 @@ pub(crate) fn bound_reason_width(s: &str, budget: usize) -> String {
         w += cw;
         tail_start = idx;
     }
+    let tail_start = past_zero_width(s, tail_start);
 
     if tail_start <= head_end {
         // The head and tail windows would overlap — a defensive floor,
@@ -2606,6 +2607,13 @@ pub(crate) fn bound_reason_width(s: &str, budget: usize) -> String {
     }
 }
 
+/// (#3626) The first byte at or after `from` in `s` that starts a
+/// character taking a column: a tail cut there never begins with a
+/// combining mark, which would draw on the `…` before it.
+fn past_zero_width(s: &str, from: usize) -> usize {
+    from + s[from..].chars().take_while(|c| display_width(*c) == 0).map(char::len_utf8).sum::<usize>()
+}
+
 /// Sanitize `s` (see [`sanitize_reason_text`]) and then bound it to
 /// [`REJECTION_REASON_RAW_BUDGET`] rendered columns (see
 /// [`bound_reason_width`]). Sanitizing before bounding (not after)
@@ -2614,7 +2622,18 @@ pub(crate) fn bound_reason_width(s: &str, budget: usize) -> String {
 /// multi-byte sequence at the wrong point relative to the stripped
 /// characters.
 fn truncate_reason(s: &str) -> String {
-    bound_reason_width(&sanitize_reason_text(s), REJECTION_REASON_RAW_BUDGET)
+    bounded_for_display(s, REJECTION_REASON_RAW_BUDGET)
+}
+
+/// (#3626) Untrusted text `s` as one line of terminal output may show it:
+/// sanitized ([`sanitize_reason_text`]: no control, format, blank-glyph or
+/// variation-selector character, whitespace runs collapsed) and then
+/// bounded to `columns` display columns, cut in the middle at a `…`
+/// ([`bound_reason_width`]). Exported so another crate printing text a
+/// remote party chose asks the same width question as this one, with no
+/// width table of its own (see [`display_columns`]).
+pub fn bounded_for_display(s: &str, columns: usize) -> String {
+    bound_reason_width(&sanitize_reason_text(s), columns)
 }
 
 /// Extract up to [`MAX_REJECTION_REASONS`] per-record rejection reason
@@ -8043,6 +8062,21 @@ mod tests {
     /// ever retuned. Red-proved: reverting to a raw byte-offset slice on
     /// either cut panics on these inputs with "byte index N is not a
     /// char boundary".
+    /// (#3626) A combining mark applies to the character before it, so a
+    /// tail that began with one would draw it on the `…` itself (struck
+    /// through, circled, accented) and disguise the cut. The tail starts on
+    /// a character that takes a column; the head keeps its own marks.
+    #[test]
+    fn bound_reason_width_never_puts_a_combining_mark_on_the_cut() {
+        for mark in ['\u{301}', '\u{336}', '\u{20DD}'] {
+            let text = format!("n{mark}").repeat(300);
+            let out = bound_reason_width(&text, 40);
+            let (head, tail) = out.split_once('…').expect("cut");
+            assert!(tail.chars().next().is_some_and(|c| display_width(c) > 0), "U+{:04X}: {out:?}", mark as u32);
+            assert!(head.ends_with(mark) && display_columns(&out) <= 40, "U+{:04X}: {out:?}", mark as u32);
+        }
+    }
+
     #[test]
     fn truncate_reason_never_panics_on_a_multibyte_char_straddling_the_cut() {
         let ellipsis_w = display_width('…');
