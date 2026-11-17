@@ -388,6 +388,16 @@
         assert!(src.contains("pacer.on_tick(thermal_elapsed_ms, &self.host_out, &others, &caller, env)"), "the pacer tick");
         assert!(src.contains("let others = self.governors.other_pacing();"), "derived from the pair");
         assert!(!src.contains("OtherPacing {"), "no second derivation of what the governors hold");
+        // And the other direction: the pair is told whether the pacer holds a
+        // pause, so neither governor writes a release over it (`pace_file`'s
+        // rule). Passing a constant here compiles and leaves every scenario
+        // green, because no scenario reaches the sampler.
+        let tick = &src[src.find("self.governors.tick(").expect("the governor tick")..];
+        let tick = &tick[..tick.find(");").expect("call end")];
+        assert!(
+            tick.contains("self.budget_pacer.as_ref().is_some_and(crate::budget::BudgetPacer::is_pausing)"),
+            "the governor tick must carry the pacer's live pause: {tick}"
+        );
     }
 
     /// (3rd review #4) The container pre-start gate (hosted brain or a
