@@ -2346,52 +2346,87 @@ fn bool_param(collected: &BTreeMap<String, serde_json::Value>, key: &str) -> boo
     }
 }
 
-/// (#1959) `--dry-run`'s report for any generic step-graph config
-/// (everything except `crawl`/`review`, which route to their own
-/// dedicated dry-run reports before this function's caller is even
-/// reached). Prints the resolved inputs, then the phase → task → step
-/// structure `config.phases` declares — the SAME document `interpret`
-/// would build a real graph from, just read and rendered instead of
-/// minted.
+/// (#1959) `--dry-run`'s report: the resolved inputs, then the phase →
+/// task → step structure `config.phases` declares — the SAME document
+/// `interpret` would build a real graph from, just read and rendered
+/// instead of minted.
 fn print_dry_run_graph(config: &MissionConfig, collected: &BTreeMap<String, serde_json::Value>) {
-    println!("darkmux mission launch {} --dry-run — nothing minted", config.id);
-    println!("resolved inputs:");
+    let report = dry_run_report(config, collected);
+    print!("{report}");
+    #[cfg(test)]
+    LAST_DRY_RUN_REPORT.with(|r| *r.borrow_mut() = Some(report));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// (#2513) The report [`print_dry_run_graph`] last printed on this
+    /// thread, so an in-process test of a dry run can read the plan it
+    /// printed. `launch` runs synchronously on the caller's thread.
+    static LAST_DRY_RUN_REPORT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// (#2513) Take the report the last dry run on this thread printed, or
+/// `None` when none printed since the last take.
+#[cfg(test)]
+pub(crate) fn take_last_dry_run_report() -> Option<String> {
+    LAST_DRY_RUN_REPORT.with(|r| r.borrow_mut().take())
+}
+
+/// The full text [`print_dry_run_graph`] prints.
+fn dry_run_report(config: &MissionConfig, collected: &BTreeMap<String, serde_json::Value>) -> String {
+    format!(
+        "darkmux mission launch {} --dry-run — nothing minted\n{}{}",
+        config.id,
+        dry_run_inputs_section(config, collected),
+        dry_run_graph_section(config)
+    )
+}
+
+/// The `resolved inputs:` section of a dry run's report.
+fn dry_run_inputs_section(config: &MissionConfig, collected: &BTreeMap<String, serde_json::Value>) -> String {
+    let mut out = String::from("resolved inputs:\n");
     if collected.is_empty() {
-        println!("  (none)");
-    } else {
-        for (k, v) in collected {
-            let rendered = match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            let launcher_supplied = config.inputs.iter().any(|i| i.is_launcher_supplied() && i.name == *k);
-            let note = if launcher_supplied { " (example id: a real launch mints a fresh one)" } else { "" };
-            println!("  {k} = {rendered}{note}");
-        }
+        out.push_str("  (none)\n");
     }
-    println!("graph:");
+    for (k, v) in collected {
+        let rendered = match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let launcher_supplied = config.inputs.iter().any(|i| i.is_launcher_supplied() && i.name == *k);
+        let note = if launcher_supplied { " (example id: a real launch mints a fresh one)" } else { "" };
+        out.push_str(&format!("  {k} = {rendered}{note}\n"));
+    }
+    out
+}
+
+/// The `graph:` section of a dry run's report.
+fn dry_run_graph_section(config: &MissionConfig) -> String {
+    let mut out = String::from("graph:\n");
     if config.phases.is_empty() {
-        println!("  (no phases)");
-        return;
+        out.push_str("  (no phases)\n");
     }
     for phase in &config.phases {
         let label = phase.display_name.as_deref().unwrap_or(&phase.id);
-        println!("  phase {label} ({} task(s))", phase.tasks.len());
+        out.push_str(&format!("  phase {label} ({} task(s))\n", phase.tasks.len()));
         for task in &phase.tasks {
-            let task_label = task.display_name.as_deref().unwrap_or(&task.id);
-            let deps = if task.depends_on.is_empty() {
-                String::new()
-            } else {
-                format!(" depends_on={:?}", task.depends_on)
-            };
-            let reads = if task.reads.is_empty() { String::new() } else { format!(" reads={:?}", task.reads) };
-            let role = task.role_id.as_deref().map(|r| format!(" role={r}")).unwrap_or_default();
-            println!("    task {task_label}{role}{deps}{reads}");
-            for step in &task.steps {
-                println!("      step {} [{}]", step.id, step.kind);
-            }
+            out.push_str(&dry_run_task_lines(task));
         }
     }
+    out
+}
+
+/// One task's line in a dry run's graph, then a line per step.
+fn dry_run_task_lines(task: &mission_config::TaskConfig) -> String {
+    let task_label = task.display_name.as_deref().unwrap_or(&task.id);
+    let deps = if task.depends_on.is_empty() { String::new() } else { format!(" depends_on={:?}", task.depends_on) };
+    let reads = if task.reads.is_empty() { String::new() } else { format!(" reads={:?}", task.reads) };
+    let role = task.role_id.as_deref().map(|r| format!(" role={r}")).unwrap_or_default();
+    let mut out = format!("    task {task_label}{role}{deps}{reads}\n");
+    for step in &task.steps {
+        out.push_str(&format!("      step {} [{}]\n", step.id, step.kind));
+    }
+    out
 }
 
 /// Parse `--input <file.json>` (a flat object) and `--param key=value`
@@ -6279,6 +6314,55 @@ mod tests {
         assert_eq!(exit, 0);
         assert!(all_mission_ids().is_empty(), "a dry run must mint no mission");
         let _ = guard;
+    }
+
+    /// (#2513) The dry-run report, byte for byte: every branch the renderer
+    /// takes (a launcher-supplied input, a string and a non-string value, a
+    /// phase's display name, a task's role, depends_on and reads, a task
+    /// with none of them), plus the empty config's `(none)`/`(no phases)`.
+    #[test]
+    fn the_dry_run_report_renders_inputs_then_the_graph() {
+        let config: MissionConfig = serde_json::from_value(serde_json::json!({
+            "id": "golden",
+            "name": "golden",
+            "inputs": [{ "name": "mission_id" }, { "name": "target" }],
+            "phases": [{
+                "id": "p1",
+                "display_name": "Plan",
+                "tasks": [
+                    { "id": "t0", "steps": [{ "id": "s0", "kind": "procedural.shell" }] },
+                    {
+                        "id": "t1", "role_id": "coder", "depends_on": ["t0"], "reads": ["t0"],
+                        "steps": [{ "id": "s1", "kind": "plan.sites" }, { "id": "s2", "kind": "dispatch.unit" }]
+                    }
+                ]
+            }]
+        }))
+        .unwrap();
+        let mut collected = BTreeMap::new();
+        collected.insert("mission_id".to_string(), serde_json::json!("m-1"));
+        collected.insert("target".to_string(), serde_json::json!("a.rs"));
+        collected.insert("draws".to_string(), serde_json::json!(3));
+        assert_eq!(
+            dry_run_report(&config, &collected),
+            "darkmux mission launch golden --dry-run — nothing minted\n\
+             resolved inputs:\n\
+             \x20 draws = 3\n\
+             \x20 mission_id = m-1 (example id: a real launch mints a fresh one)\n\
+             \x20 target = a.rs\n\
+             graph:\n\
+             \x20 phase Plan (2 task(s))\n\
+             \x20   task t0\n\
+             \x20     step s0 [procedural.shell]\n\
+             \x20   task t1 role=coder depends_on=[\"t0\"] reads=[\"t0\"]\n\
+             \x20     step s1 [plan.sites]\n\
+             \x20     step s2 [dispatch.unit]\n"
+        );
+        let empty: MissionConfig = serde_json::from_value(serde_json::json!({ "id": "e", "name": "e" })).unwrap();
+        assert_eq!(
+            dry_run_report(&empty, &BTreeMap::new()),
+            "darkmux mission launch e --dry-run — nothing minted\nresolved inputs:\n  (none)\ngraph:\n  (no phases)\n"
+        );
     }
 
     /// (F8) The live shape: `review --dry-run` with `workspace=<a directory>`
