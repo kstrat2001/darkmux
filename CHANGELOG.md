@@ -200,10 +200,14 @@ darkmux release.
   the run". The submit bundle's shape and format version are unchanged (those fields were already
   nullable). Both `run stats` and `lab submit` pick the run's snapshot entry by the name the run sent:
   `darkmux:<id>` is the managed model and a bare name the endpoint's, so a profile listing the same
-  model managed here and on a peer is no longer decided by its order. A name several entries match
-  decides nothing (`run stats` reads `hardware: null`; `lab submit` asks for `--hardware`). In a set, a
-  run served elsewhere no longer counts as overlapping a local run (it draws nothing on this machine's
-  meter), and an energy cost withheld because of it says so.
+  model managed here and on a peer is no longer decided by its order. Several entries a name matches
+  decide when they agree on the machine (one hosted id on two providers, the same managed model listed
+  twice), and decide nothing when they disagree (`run stats` reads `hardware: null`; `lab submit`
+  takes `--hardware` under the same contradiction checks as one entry, and otherwise asks for it). A run
+  from before the snapshot reads the registry by the same rule. `run stats` adds `compactor_calls_here`
+  for a run served elsewhere: its compactor calls to a model this machine served (`null` when a call's
+  model is not placed by the snapshot). In a set, a run served elsewhere with none no longer counts as
+  overlapping a local run, and an energy cost withheld because of a run served elsewhere says so.
 
 - **A mission step waiting its turn reads waiting, not running (#3195).** Steps admitted together
   behind one slot (an endpoint with no `limits.concurrent_calls` runs its calls one at a time), or a

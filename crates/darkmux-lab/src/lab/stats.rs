@@ -399,6 +399,13 @@ pub struct RunStats {
     /// was doing meanwhile is still on record; never the run's figures.
     /// `None` for every other run, and with no telemetry in the window.
     pub this_machine: Option<MachineReadings>,
+    /// (2.5.0) For a run another machine served: how many of its compactor
+    /// calls (`compaction.call`) went to a model the snapshot says this
+    /// machine served, the run's own draw on this machine. `Some(0)` when
+    /// it made none; `None` when a call's model is one the snapshot does
+    /// not place (darkmux cannot say where it ran), and for every run this
+    /// machine served or did not record.
+    pub compactor_calls_here: Option<u64>,
 
     /// This session's flow records inside the scanned window. A provenance
     /// count, bounded by the same window as everything else here.
@@ -491,23 +498,40 @@ pub struct MachineReadings {
 }
 
 /// (2.5.0) Which machine served a run's model, from the run's own
-/// `model_hardware` snapshot: the entry the dispatched name `model` is
-/// ([`crate::lab::manifest::snapshot_entry`]), or, when no entry names it,
-/// the answer every entry agrees on. `None` when the run recorded no
-/// snapshot, the entry declared no hardware, several entries match the
-/// name, or the entries disagree. Never read from the registry as it is
-/// now: that is not the run's record.
+/// `model_hardware` snapshot: what the entries the dispatched name `model`
+/// could be ([`crate::lab::manifest::snapshot_matches`]) agree on, or, when
+/// no entry names it, what every entry agrees on. `None` when the run
+/// recorded no snapshot, an entry declared no hardware, or the entries
+/// disagree. Never read from the registry as it is now: that is not the
+/// run's record.
 pub(crate) fn served_hardware(
     snapshot: Option<&[crate::lab::manifest::ModelHardware]>,
     model: Option<&str>,
 ) -> Option<darkmux_types::Hardware> {
-    use crate::lab::manifest::SnapshotMatch;
     let snapshot = snapshot?;
-    match crate::lab::manifest::snapshot_entry(snapshot, model.unwrap_or_default()) {
-        SnapshotMatch::One(e) => e.hardware,
-        SnapshotMatch::Several => None,
-        SnapshotMatch::None => agreed(snapshot.iter().map(|e| e.hardware)),
+    let matches = crate::lab::manifest::snapshot_matches(snapshot, model.unwrap_or_default());
+    match matches.is_empty() {
+        true => agreed(snapshot.iter().map(|e| e.hardware)),
+        false => agreed(matches.into_iter().map(|e| e.hardware)),
     }
+}
+
+/// (2.5.0) How many of the run's compactor calls went to a model the
+/// snapshot says this machine served; `None` when one went to a model it
+/// does not place. Only the entries naming the model count: a compactor
+/// outside the profile is not placed by what the profile's models say.
+pub(crate) fn compactor_calls_here(trajectory: &str, snapshot: Option<&[crate::lab::manifest::ModelHardware]>) -> Option<u64> {
+    use darkmux_trajectory::event::{parse_line, TrajectoryEvent};
+    let mut here = 0;
+    for line in trajectory.lines() {
+        let Some(TrajectoryEvent::CompactionCall(c)) = parse_line(line) else { continue };
+        let named = crate::lab::manifest::snapshot_matches(snapshot?, &c.requested_model);
+        match agreed(named.into_iter().map(|e| e.hardware))? {
+            darkmux_types::Hardware::SubmittingMachine => here += 1,
+            darkmux_types::Hardware::Unknown => {}
+        }
+    }
+    Some(here)
 }
 
 /// The one value every item is, when there is at least one.
@@ -1009,10 +1033,21 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
     let run_id = run_dir.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
     let mut stats = derive_stats(run_id, &fold, flows, verify, ok);
     stats.verify_ungated = verify_ungated;
-    let snapshot = manifest.as_ref().and_then(|m| m.model_hardware.as_deref());
-    let hardware = served_hardware(snapshot, stats.model.as_deref());
-    attribute_host(&mut stats, hardware);
+    attribute_run(&mut stats, run_dir, manifest.as_ref().and_then(|m| m.model_hardware.as_deref()));
     Ok(stats)
+}
+
+/// (2.5.0) Which machine served the run, from its snapshot, and for a run
+/// served elsewhere, its compactor calls on this machine.
+fn attribute_run(stats: &mut RunStats, run_dir: &Path, snapshot: Option<&[crate::lab::manifest::ModelHardware]>) {
+    let hardware = served_hardware(snapshot, stats.model.as_deref());
+    attribute_host(stats, hardware);
+    if hardware == Some(darkmux_types::Hardware::Unknown) {
+        // Read again only for a run served elsewhere: the fold keeps no
+        // compactor model names.
+        let trajectory = std::fs::read_to_string(run_dir.join(darkmux_trajectory::TRAJECTORY_FILE)).unwrap_or_default();
+        stats.compactor_calls_here = compactor_calls_here(&trajectory, snapshot);
+    }
 }
 
 pub(crate) fn derive_stats(
@@ -1135,6 +1170,7 @@ pub(crate) fn derive_stats(
         // `derive_stats` does not read.
         hardware: None,
         this_machine: None,
+        compactor_calls_here: None,
         flow_records_in_window: flows.records_for_session,
         flow_scan: flows.scan.clone(),
         checks: RunChecks {

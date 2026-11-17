@@ -83,6 +83,7 @@
       "telemetry_max_gap_ms": null,
       "hardware": null,
       "this_machine": null,
+      "compactor_calls_here": null,
       "flow_records_in_window": 0,
       "flow_scan": {
         "files_total": 0,
@@ -189,6 +190,7 @@
       "telemetry_max_gap_ms": null,
       "hardware": null,
       "this_machine": null,
+      "compactor_calls_here": null,
       "flow_records_in_window": 0,
       "flow_scan": {
         "files_total": 0,
@@ -383,6 +385,7 @@
         "telemetry_max_gap_ms": null,
         "hardware": null,
         "this_machine": null,
+        "compactor_calls_here": null,
         "flow_records_in_window": 0,
         "flow_scan": {
           "files_total": 0,

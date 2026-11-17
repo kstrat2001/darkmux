@@ -1011,41 +1011,98 @@ impl ServedBy {
 /// a managed model or a listed host only: an endpoint's declaration today is
 /// not the run's. A model the registry does not list reads as LM Studio's,
 /// as before. `dispatched` is the model name the run sent, namespace and
-/// all, which picks the snapshot entry
-/// ([`crate::lab::manifest::snapshot_entry`]); a name several entries match
-/// takes the flag, and without one is refused, naming what to pass.
+/// all: it picks the snapshot entries, or with none the registry's models
+/// (`current`, from [`profile_models_named`]), that it could be
+/// ([`crate::lab::manifest::by_wire_name`]). Each answers by the rules above;
+/// several that agree decide ([`one_answer`]).
 pub fn served_by(
     run_id: &str,
     dispatched: &str,
     snapshot: Option<&[crate::lab::manifest::ModelHardware]>,
-    current: Option<&darkmux_types::ProfileModel>,
+    current: &[darkmux_types::ProfileModel],
     flag: Option<darkmux_types::Hardware>,
 ) -> std::result::Result<ServedBy, String> {
-    use crate::lab::manifest::SnapshotMatch;
     let model_id = model_id_from(Some(dispatched)).unwrap_or_default();
-    let entry = match snapshot.map(|s| crate::lab::manifest::snapshot_entry(s, dispatched)) {
-        Some(SnapshotMatch::Several) => return ambiguous_hardware(run_id, &model_id, flag),
-        Some(SnapshotMatch::One(e)) => Some(e),
-        Some(SnapshotMatch::None) | None => None,
+    let entries = snapshot.map(|s| crate::lab::manifest::snapshot_matches(s, dispatched)).unwrap_or_default();
+    let answers: Vec<_> = match (entries.is_empty(), current.is_empty()) {
+        (false, _) => entries.iter().map(|e| served_by_entry(run_id, &model_id, Some(e), None, flag)).collect(),
+        (true, false) => current.iter().map(|m| served_by_entry(run_id, &model_id, None, Some(m), flag)).collect(),
+        (true, true) => vec![served_by_entry(run_id, &model_id, None, None, flag)],
     };
-    served_by_entry(run_id, &model_id, entry, current, flag)
+    one_answer(run_id, &model_id, answers, flag.is_some())
 }
 
-/// A dispatched name that several models of the run's profile match: the
-/// flag says which machine served it, and without one the run is refused.
-fn ambiguous_hardware(
+/// The `n_ctx` every one of `models` declares, when they agree.
+fn agreed_n_ctx(models: &[darkmux_types::ProfileModel]) -> Option<u64> {
+    let first = models.first()?.n_ctx;
+    models.iter().all(|m| m.n_ctx == first).then_some(first).flatten().map(u64::from)
+}
+
+/// The models of a profile a dispatched name could be, by the same rule
+/// as the run's snapshot: the wire name's kind first.
+pub fn profile_models_named(models: &[darkmux_types::ProfileModel], dispatched: &str) -> Vec<darkmux_types::ProfileModel> {
+    use darkmux_types::HardwareBasis;
+    let managed = |m: &darkmux_types::ProfileModel| {
+        matches!(m.endpoint.as_ref().map_or(HardwareBasis::Managed, |e| e.hardware_basis()), HardwareBasis::Managed)
+    };
+    crate::lab::manifest::by_wire_name(models, dispatched, |m, id| m.id == id || m.identifier.as_deref() == Some(id), managed)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+/// One run's machine from what each model it could be answered, each
+/// under the same `--hardware` guards as a single one. One answer stands
+/// as it is. With a flag, the models it does not contradict decide (each
+/// answers the flag's value), and when it contradicts every one the first
+/// refusal stands. Without one, every model must answer and agree.
+fn one_answer(
     run_id: &str,
     model_id: &str,
-    flag: Option<darkmux_types::Hardware>,
+    mut answers: Vec<std::result::Result<ServedBy, String>>,
+    flagged: bool,
 ) -> std::result::Result<ServedBy, String> {
-    match flag {
-        Some(f) => Ok(ServedBy::fixed(f, None, false)),
-        None => Err(format!(
-            "{run_id}: {model_id} names more than one model of the run's profile, so its record does not say which \
-             machine served it. Pass --hardware submitting-machine (this machine served it) or --hardware unknown \
-             (another machine did)"
-        )),
+    if answers.len() == 1 {
+        return answers.remove(0);
     }
+    let mut ok = Vec::new();
+    let mut first_refusal = None;
+    for answer in answers {
+        match answer {
+            Ok(by) => ok.push(by),
+            Err(why) => {
+                first_refusal.get_or_insert(why);
+            }
+        }
+    }
+    match first_refusal {
+        Some(why) if ok.is_empty() => Err(why),
+        Some(_) if !flagged => Err(ambiguous(run_id, model_id)),
+        _ => merged(&ok).ok_or_else(|| ambiguous(run_id, model_id)),
+    }
+}
+
+/// Several answers as one, when they name one machine: the provider and
+/// correction they share, and LM Studio's provenance only when every one
+/// is a managed model.
+fn merged(answers: &[ServedBy]) -> Option<ServedBy> {
+    let first = answers.first()?;
+    let all = |same: &dyn Fn(&ServedBy) -> bool| answers.iter().all(same);
+    all(&|a| a.hardware == first.hardware).then(|| ServedBy {
+        hardware: first.hardware,
+        provider: all(&|a| a.provider == first.provider).then(|| first.provider.clone()).flatten(),
+        lmstudio: all(&|a| a.lmstudio),
+        corrected: all(&|a| a.corrected == first.corrected).then_some(first.corrected).flatten(),
+    })
+}
+
+/// The refusal for a name whose models do not agree on a machine.
+fn ambiguous(run_id: &str, model_id: &str) -> String {
+    format!(
+        "{run_id}: {model_id} names more than one model of the run's profile, and they do not agree on which machine \
+         served it. Pass --hardware submitting-machine (this machine served it) or --hardware unknown (another \
+         machine did); --hardware applies to every run of a submit, so submit this run in a `lab submit` of its own"
+    )
 }
 
 /// [`served_by`] for the run's own snapshot entry, when it has one.
@@ -1472,14 +1529,13 @@ impl Machine {
         let mut served = Vec::new();
         let mut refused = Vec::new();
         for input in inputs {
-            let model_id = input.model_id().unwrap_or_default();
             let dispatched = input.stats.get("model").and_then(Value::as_str).unwrap_or_default();
             let snapshot = input
                 .manifest
                 .get("model_hardware")
                 .and_then(|v| serde_json::from_value::<Vec<crate::lab::manifest::ModelHardware>>(v.clone()).ok());
-            let current = self.profile_model(&input.manifest, &model_id);
-            match served_by(&input.run_id, dispatched, snapshot.as_deref(), current.as_ref(), stated.hardware) {
+            let current = self.profile_models(&input.manifest, dispatched);
+            match served_by(&input.run_id, dispatched, snapshot.as_deref(), &current, stated.hardware) {
                 Ok(by) => served.push(by),
                 Err(why) => refused.push(why),
             }
@@ -1503,7 +1559,9 @@ impl Machine {
         let started = input.started();
         let mut why = Vec::new();
         let model_id = input.model_id().unwrap_or_default();
-        let profile_model = self.profile_model(&input.manifest, &model_id);
+        let dispatched = input.stats.get("model").and_then(Value::as_str).unwrap_or_default();
+        // The context the profile's models give, when every one it could be agrees.
+        let profile_n_ctx = agreed_n_ctx(&self.profile_models(&input.manifest, dispatched));
         if let Some(was) = served.corrected {
             why.push(format!("--hardware {} corrects the recorded {}", served.hardware.as_str(), was.as_str()));
         }
@@ -1533,7 +1591,7 @@ impl Machine {
             model: (!model_id.is_empty()).then(|| model_id.clone()),
             weights_hash,
             quant: engine.quant,
-            context_length: recorded_n_ctx(&input.manifest).or_else(|| profile_model.and_then(|m| m.n_ctx).map(u64::from)),
+            context_length: recorded_n_ctx(&input.manifest).or(profile_n_ctx),
             cpu_cores: self.config.cpu_clusters.clone(),
             gpu_cores: self.config.gpu_cores,
             model_id: self.config.model_id.clone(),
@@ -1587,10 +1645,12 @@ impl Machine {
         Ok((provenance, weights_hash, weights_changed))
     }
 
-    /// The model as the run's profile declares it, when it does.
-    fn profile_model(&self, manifest: &Value, model_id: &str) -> Option<darkmux_types::ProfileModel> {
-        let profile = self.registry.as_ref()?.profiles.get(manifest.get("profile").and_then(Value::as_str)?)?;
-        profile.models.iter().find(|m| m.id == model_id || m.identifier.as_deref() == Some(model_id)).cloned()
+    /// The models of the run's profile its dispatched name could be.
+    fn profile_models(&self, manifest: &Value, dispatched: &str) -> Vec<darkmux_types::ProfileModel> {
+        let Some(profile) = self.registry.as_ref().and_then(|r| r.profiles.get(manifest.get("profile").and_then(Value::as_str)?)) else {
+            return Vec::new();
+        };
+        profile_models_named(&profile.models, dispatched)
     }
 
     /// The darkmux that ran it: stated, recorded in the manifest, or the

@@ -194,41 +194,35 @@ pub struct ModelHardware {
     pub endpoint: Option<String>,
 }
 
-/// Which entry of a run's `model_hardware` snapshot a dispatched model is.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SnapshotMatch<'a> {
-    One(&'a ModelHardware),
-    /// Several entries match and nothing chooses between them.
-    Several,
-    None,
-}
-
-/// The snapshot entry for `dispatched`, the model name the run sent. The
-/// wire name says which kind of entry it is: `darkmux:<id>` is a managed
-/// model (darkmux's namespace in LM Studio), a bare name an endpoint's. An
-/// entry of that kind with that id or identifier is taken; with none, the
-/// name without the namespace is matched against every entry. Either way
-/// one match decides and several decide nothing, so a profile listing the
-/// same model managed here and on a peer is never decided by its order.
-pub fn snapshot_entry<'a>(snapshot: &'a [ModelHardware], dispatched: &str) -> SnapshotMatch<'a> {
-    let (id, managed) = match dispatched.strip_prefix("darkmux:") {
+/// Every item a dispatched model name could be. The wire name says which
+/// kind: `darkmux:<id>` is a managed model (darkmux's namespace in LM
+/// Studio), a bare name an endpoint's. The items of that kind that `names`
+/// the id are taken; with none, every item naming the id without the
+/// namespace. Several can come back (a profile may list one id twice):
+/// the caller decides from what they say, never from their order.
+pub fn by_wire_name<'a, T>(
+    items: &'a [T],
+    dispatched: &str,
+    names: impl Fn(&T, &str) -> bool,
+    managed: impl Fn(&T) -> bool,
+) -> Vec<&'a T> {
+    let (id, wire_managed) = match dispatched.strip_prefix("darkmux:") {
         Some(id) => (id, true),
         None => (dispatched, false),
     };
-    let names = |e: &&ModelHardware| e.model == id || e.identifier.as_deref() == Some(id);
-    let of_kind = one_of(snapshot.iter().filter(names).filter(|e| (e.from == HardwareFrom::Managed) == managed));
-    match of_kind {
-        SnapshotMatch::None => one_of(snapshot.iter().filter(names)),
-        decided => decided,
-    }
+    let named: Vec<&T> = items.iter().filter(|t| names(t, id)).collect();
+    let of_kind: Vec<&T> = named.iter().copied().filter(|t| managed(t) == wire_managed).collect();
+    if of_kind.is_empty() { named } else { of_kind }
 }
 
-fn one_of<'a>(mut found: impl Iterator<Item = &'a ModelHardware>) -> SnapshotMatch<'a> {
-    match (found.next(), found.next()) {
-        (None, _) => SnapshotMatch::None,
-        (Some(e), None) => SnapshotMatch::One(e),
-        (Some(_), Some(_)) => SnapshotMatch::Several,
-    }
+/// The snapshot entries a dispatched model name could be ([`by_wire_name`]).
+pub fn snapshot_matches<'a>(snapshot: &'a [ModelHardware], dispatched: &str) -> Vec<&'a ModelHardware> {
+    by_wire_name(
+        snapshot,
+        dispatched,
+        |e, id| e.model == id || e.identifier.as_deref() == Some(id),
+        |e| e.from == HardwareFrom::Managed,
+    )
 }
 
 /// (#3397) The model a run's replies say answered, from its trajectory's

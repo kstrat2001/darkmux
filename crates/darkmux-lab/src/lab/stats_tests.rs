@@ -1762,3 +1762,71 @@ fn a_name_several_entries_match_decides_nothing() {
         "the stripped name, when exactly one entry matches it"
     );
 }
+
+/// The `model_hardware` snapshot a run on profile `p` of `registry` records.
+fn snapshot_of(registry: serde_json::Value) -> serde_json::Value {
+    let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(registry).unwrap();
+    reg.materialize_endpoints();
+    serde_json::to_value(crate::lab::manifest::model_hardware_of(&reg.profiles["p"])).unwrap()
+}
+
+/// (#3644 re-review) A profile may list one id twice. When every entry the
+/// name matches says the same machine, that is the answer: one hosted id
+/// on two providers, or one id on two peers, is still served elsewhere, and
+/// the same managed model listed twice is still this machine's.
+#[test]
+fn entries_that_agree_decide_even_when_several_match() {
+    use darkmux_types::Hardware::{SubmittingMachine, Unknown};
+    let providers = snapshot_of(serde_json::json!({
+        "profiles": {"p": {"models": [{"id": "qwen3", "n_ctx": 32768},
+            {"id": "claude-opus-4", "endpoint": "anthropic"}, {"id": "claude-opus-4", "endpoint": "router"}]}},
+        "endpoints": {"anthropic": {"url": "https://api.anthropic.com/v1"}, "router": {"url": "https://openrouter.ai/api/v1"}}}));
+    let hosted = busy_run("claude-opus-4", Some(providers));
+    assert_eq!(hosted.hardware, Some(Unknown));
+    assert_eq!((hosted.pkg_w_busy, hosted.pkg_j_per_1k_tokens), (None, None));
+    let peers = snapshot_of(serde_json::json!({
+        "profiles": {"p": {"models": [{"id": "qwen3", "n_ctx": 32768},
+            {"id": "qwen3.8", "endpoint": "lms"}, {"id": "qwen3.8", "endpoint": "splash"}]}},
+        "endpoints": {"lms": {"url": "http://studio.local:1234/v1", "hardware": "unknown"},
+            "splash": {"url": "http://studio.local:8080/v1", "hardware": "unknown"}}}));
+    let peer = busy_run("qwen3.8", Some(peers));
+    assert_eq!(peer.hardware, Some(Unknown));
+    assert_eq!(peer.pkg_w_busy, None);
+    let twice = serde_json::json!([
+        {"model": "qwen3", "from": "managed", "hardware": "submitting-machine"},
+        {"model": "qwen3", "from": "managed", "hardware": "submitting-machine"},
+    ]);
+    let here = busy_run("darkmux:qwen3", Some(twice));
+    assert_eq!(here.hardware, Some(SubmittingMachine));
+    assert_eq!(here.pkg_w_busy, Some(47.0));
+}
+
+/// A run another machine served whose compactor ran on a model this
+/// machine served drew on this machine; its records say how many calls.
+/// A compactor model the snapshot does not name cannot be placed.
+#[test]
+fn a_hosted_runs_compactor_calls_on_this_machine_are_counted() {
+    let call = |model: &str| line(serde_json::json!({"type": "compaction.call", "generation": 1, "ts": 5, "requested_model": model}));
+    let snap: Vec<crate::lab::manifest::ModelHardware> = serde_json::from_value(serde_json::json!([
+        {"model": "claude-opus-4", "from": "provider", "hardware": "unknown", "provider": "Anthropic API"},
+        {"model": "qwen3-4b", "from": "managed", "hardware": "submitting-machine"},
+    ]))
+    .unwrap();
+    let traj = |calls: &[&str]| calls.iter().map(|m| call(m)).collect::<String>();
+    assert_eq!(compactor_calls_here(&traj(&[]), Some(&snap)), Some(0));
+    assert_eq!(compactor_calls_here(&traj(&["darkmux:qwen3-4b", "darkmux:qwen3-4b"]), Some(&snap)), Some(2));
+    assert_eq!(compactor_calls_here(&traj(&["claude-opus-4"]), Some(&snap)), Some(0), "a compactor also served elsewhere");
+    assert_eq!(compactor_calls_here(&traj(&["default-compactor"]), Some(&snap)), None, "a model the record does not place");
+    assert_eq!(compactor_calls_here(&traj(&["darkmux:qwen3-4b"]), None), None);
+    assert_eq!(compactor_calls_here(&traj(&[]), None), Some(0), "no compaction, no local model work");
+}
+
+/// `compactor_calls_here` is read for a run another machine served, and
+/// only there: a local run's model work is this machine's anyway.
+#[test]
+fn compactor_calls_here_is_read_only_for_a_run_served_elsewhere() {
+    let hosted = busy_run("m", Some(served("provider", Some("unknown"))));
+    assert_eq!(hosted.compactor_calls_here, Some(0));
+    let local = busy_run("darkmux:m", Some(served("managed", Some("submitting-machine"))));
+    assert_eq!(local.compactor_calls_here, None);
+}

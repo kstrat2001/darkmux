@@ -993,7 +993,7 @@ fn profile_model(json: Value) -> darkmux_types::ProfileModel {
 #[test]
 fn hardware_precedence_is_registry_then_flag_then_snapshot() {
     let flint = [snap("flint", HardwareFrom::Endpoint, Some(SubmittingMachine))];
-    let at = |s: Option<&[ModelHardware]>, cur: Option<&darkmux_types::ProfileModel>, flag| served_by("r1", "flint", s, cur, flag);
+    let at = |s: Option<&[ModelHardware]>, cur: Option<&darkmux_types::ProfileModel>, flag| served_by("r1", "flint", s, cur.map(std::slice::from_ref).unwrap_or_default(), flag);
     assert_eq!(at(Some(&flint), None, None).unwrap().hardware, SubmittingMachine, "the snapshot with no flag");
     let corrected = at(Some(&flint), None, Some(Unknown)).unwrap();
     assert_eq!((corrected.hardware, corrected.corrected), (Unknown, Some(SubmittingMachine)), "the flag corrects the snapshot");
@@ -1363,7 +1363,7 @@ fn the_gpu_cross_check_reads_this_machines_readings_when_the_run_withheld_them()
 #[test]
 fn the_wire_name_picks_the_snapshot_entry_and_an_ambiguous_one_needs_a_flag() {
     let both = [snap("qwen3", HardwareFrom::Managed, Some(SubmittingMachine)), snap("qwen3", HardwareFrom::Endpoint, Some(Unknown))];
-    let at = |name: &str, s: &[ModelHardware], flag| served_by("r1", name, Some(s), None, flag);
+    let at = |name: &str, s: &[ModelHardware], flag| served_by("r1", name, Some(s), &[], flag);
     assert_eq!(at("qwen3", &both, None).unwrap().hardware, Unknown, "a bare name is the endpoint's");
     let here = at("darkmux:qwen3", &both, None).unwrap();
     assert_eq!((here.hardware, here.lmstudio), (SubmittingMachine, true), "the namespaced name is the managed one");
@@ -1371,4 +1371,66 @@ fn the_wire_name_picks_the_snapshot_entry_and_an_ambiguous_one_needs_a_flag() {
     let e = at("qwen3", &two, None).unwrap_err();
     assert!(e.contains("more than one model") && e.contains("--hardware"), "{e}");
     assert_eq!(at("qwen3", &two, Some(Unknown)).unwrap().hardware, Unknown, "the flag decides what the record cannot");
+}
+
+/// (#3644 re-review) Several snapshot entries that agree decide, with the
+/// same `--hardware` guards as one entry; entries that disagree take the
+/// flag, still refusing one that contradicts every entry, and the refusal
+/// says the flag applies to every run of a submit.
+#[test]
+fn several_entries_agree_or_take_a_flag_under_the_same_guards() {
+    let prov = |m: &str| snap(m, HardwareFrom::Provider, Some(Unknown));
+    let at = |name: &str, s: &[ModelHardware], flag| served_by("r1", name, Some(s), &[], flag);
+    let providers = [snap("qwen3", HardwareFrom::Managed, Some(SubmittingMachine)), prov("claude-opus-4"), prov("claude-opus-4")];
+    let by = at("claude-opus-4", &providers, None).unwrap();
+    assert_eq!((by.hardware, by.provider.as_deref()), (Unknown, Some("Anthropic API")));
+    assert!(at("claude-opus-4", &providers, Some(SubmittingMachine)).unwrap_err().contains("contradicts"));
+    let peers = [snap("q", HardwareFrom::Endpoint, Some(Unknown)), snap("q", HardwareFrom::Endpoint, Some(Unknown))];
+    assert_eq!(at("q", &peers, None).unwrap().hardware, Unknown);
+    assert!(at("q", &peers, Some(SubmittingMachine)).unwrap_err().contains("contradicts"));
+    let managed = [snap("qwen3", HardwareFrom::Managed, Some(SubmittingMachine)), snap("qwen3", HardwareFrom::Managed, Some(SubmittingMachine))];
+    let here = at("darkmux:qwen3", &managed, None).unwrap();
+    assert_eq!((here.hardware, here.lmstudio), (SubmittingMachine, true));
+    assert!(at("darkmux:qwen3", &managed, Some(Unknown)).unwrap_err().contains("contradicts"));
+    let split = [snap("q", HardwareFrom::Endpoint, Some(Unknown)), snap("q", HardwareFrom::Endpoint, Some(SubmittingMachine))];
+    let e = at("q", &split, None).unwrap_err();
+    assert!(e.contains("more than one model") && e.contains("every run of a submit"), "{e}");
+    assert_eq!(at("q", &split, Some(Unknown)).unwrap().hardware, Unknown);
+    assert_eq!(at("q", &split, Some(SubmittingMachine)).unwrap().hardware, SubmittingMachine);
+    let hosted_or_peer = [prov("q"), snap("q", HardwareFrom::Endpoint, None)];
+    assert_eq!(at("q", &hosted_or_peer, Some(Unknown)).unwrap().hardware, Unknown);
+    let e = at("q", &hosted_or_peer, None).unwrap_err();
+    assert!(e.contains("more than one model"), "one model answered and one could not: undecided, {e}");
+    let both_refuse = [prov("q"), prov("q")];
+    assert!(at("q", &both_refuse, Some(SubmittingMachine)).is_err());
+}
+
+/// (#3644 re-review) A run from before the snapshot reads the registry by
+/// the same rule: the wire name's kind first, so a peer's run of a model
+/// also listed as managed is not read as this machine's, and the flag can
+/// say which machine served it.
+#[test]
+fn a_run_before_the_snapshot_reads_the_registry_by_the_wire_name() {
+    let reg: darkmux_types::ProfileRegistry = {
+        let mut r: darkmux_types::ProfileRegistry = serde_json::from_value(json!({
+            "profiles": {"p": {"models": [{"id": "qwen3", "n_ctx": 32768}, {"id": "qwen3", "endpoint": "studio"}]}},
+            "endpoints": {"studio": {"url": "http://studio.local:1234/v1", "hardware": "unknown"}}}))
+        .unwrap();
+        r.materialize_endpoints();
+        r
+    };
+    let models = &reg.profiles["p"].models;
+    let peer = profile_models_named(models, "qwen3");
+    assert_eq!(peer.len(), 1);
+    assert!(peer[0].endpoint.is_some(), "the bare name is the endpoint's");
+    let managed = profile_models_named(models, "darkmux:qwen3");
+    assert!(managed.len() == 1 && managed[0].endpoint.is_none());
+    assert!(served_by("r1", "qwen3", None, &peer, None).unwrap_err().contains("--hardware"), "the record cannot say; the flag can");
+    assert_eq!(served_by("r1", "qwen3", None, &peer, Some(Unknown)).unwrap().hardware, Unknown);
+    assert_eq!(served_by("r1", "darkmux:qwen3", None, &managed, None).unwrap().hardware, SubmittingMachine);
+    // Several registry models the name could be answer together, never the first alone.
+    let hosted_then_peer = [profile_model(json!({"id": "q", "endpoint": "claude"})), profile_model(json!({"id": "q", "endpoint": "studio"}))];
+    let r = served_by("r1", "q", None, &hosted_then_peer, None);
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(served_by("r1", "q", None, &hosted_then_peer, Some(SubmittingMachine)).unwrap().hardware, SubmittingMachine);
 }

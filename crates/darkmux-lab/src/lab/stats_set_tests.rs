@@ -316,9 +316,17 @@ fn a_run_served_elsewhere_is_not_an_overlapping_consumer() {
     local.pkg_w_busy = Some(40.0);
     let mut hosted = run("b", "pass");
     hosted.hardware = Some(darkmux_types::Hardware::Unknown);
+    hosted.compactor_calls_here = Some(0);
     hosted.started_at_unix_ms = Some(1_050_000);
     hosted.wall_ms = 100_000;
     assert!(overlapping(&[local.clone(), hosted.clone()]).is_empty());
+    // A compactor on this machine, or records that cannot say, make it a
+    // consumer again.
+    for here in [Some(1), None] {
+        let mut drew = hosted.clone();
+        drew.compactor_calls_here = here;
+        assert_eq!(overlapping(&[local.clone(), drew]).len(), 2, "{here:?}");
+    }
     let s = summarize(&[local, hosted]);
     assert!(s.flagged.iter().all(|(_, f)| !f.contains(&"OVERLAP")), "{:?}", s.flagged);
     assert_eq!(s.pkg_w_busy.map(|r| r.median), Some(40.0), "the local run's power still counts");

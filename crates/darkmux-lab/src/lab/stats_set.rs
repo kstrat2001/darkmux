@@ -213,13 +213,15 @@ fn telemetry_flags(s: &RunStats, f: &mut Vec<&'static str>) {
 /// hits measured then were stale copies or the clean owner they were copied
 /// from.
 ///
-/// A run another machine served (`hardware: unknown`) is no consumer here:
-/// its model's work draws nothing on this machine's meter, so overlapping
-/// it does not make a local run's energy the host's draw claimed twice.
+/// A run another machine served (`hardware: unknown`) whose records show
+/// no model work on this machine (`compactor_calls_here == Some(0)`) is no
+/// consumer here: overlapping it does not make a local run's energy the
+/// host's draw claimed twice. One that compacted on a model this machine
+/// served, or whose records cannot say, still is.
 pub fn overlapping(runs: &[RunStats]) -> std::collections::BTreeSet<String> {
     let mut windows: Vec<(&str, u64, u64)> = runs
         .iter()
-        .filter(|s| !served_elsewhere(s))
+        .filter(|s| !(served_elsewhere(s) && s.compactor_calls_here == Some(0)))
         .filter_map(|s| s.started_at_unix_ms.map(|from| (s.run.as_str(), from, from.saturating_add(s.wall_ms))))
         .collect();
     windows.sort_by_key(|(_, from, _)| *from);

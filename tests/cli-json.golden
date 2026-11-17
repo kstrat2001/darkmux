@@ -1111,6 +1111,7 @@ RunStats
   telemetry_max_gap_ms: uint64 | null
   hardware: Hardware | null
   this_machine: MachineReadings | null
+  compactor_calls_here: uint64 | null
   flow_records_in_window: uint
   flow_scan: FlowScan
   checks: RunChecks
