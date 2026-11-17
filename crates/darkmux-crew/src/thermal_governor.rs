@@ -947,6 +947,12 @@ pub struct ThermalGovernor {
     /// path being a DIRECTORY, say) says so ONCE rather than either
     /// staying silent for a whole mission or printing on every episode.
     ladder_persist_error_reported: bool,
+    /// Another writer of the pace file (the battery governor or the budget
+    /// pacer) held a live pause when this tick began. Set only for the
+    /// duration of [`Self::on_sample_beside`]; while it is set this
+    /// governor's releases (a duty-cycle instruction or a plain resume)
+    /// write nothing. See `pace_file`'s module doc for the rule.
+    others_pausing: bool,
 }
 
 impl ThermalGovernor {
@@ -978,6 +984,7 @@ impl ThermalGovernor {
             ladder_state_file: None,
             bands,
             ladder_persist_error_reported: false,
+            others_pausing: false,
         }
     }
 
@@ -1352,17 +1359,21 @@ impl ThermalGovernor {
     /// GENUINE thermal pause — the case where deferring is actually safe,
     /// because thermal's own pause already satisfies "stop the run."
     ///
-    /// This is race-free, not just usually-right: `dispatch_internal.rs`'s
-    /// sampler loop calls `thermal_governor.on_sample` and THEN
-    /// `battery_governor.on_sample` synchronously in the same single-
-    /// threaded tick, before anything sleeps or any external reader gets
-    /// to poll the file. So on any tick where thermal only duty-cycles
-    /// (heartbeats or transitions with `pause: false`), the battery
-    /// governor's OWN call on that SAME tick runs immediately after and,
-    /// if the charge is below floor, writes `pause: true` last — the file
-    /// on disk at the end of every tick is whichever governor most
-    /// recently had something to enforce, never a stale write from one
-    /// governor sitting unchallenged for multiple ticks.
+    /// Gating the stand-down is only half of sharing the file. The other
+    /// half is that this governor's duty cycle must not write `pause: false`
+    /// over the battery's live pause: the battery governor re-stamps a held
+    /// pause only on its own heartbeat (a quarter of `max_pause_ms`, 225 s
+    /// by default), so a duty-cycle write would leave the file reading
+    /// `pause: false` until that heartbeat came due, and the run would take
+    /// turns below the floor all that time. The rule is `pace_file`'s module
+    /// doc: a release is never written over another writer's live pause.
+    /// `GovernorPair::tick` hands
+    /// this governor the battery's and the pacer's live state
+    /// ([`Self::on_sample_beside`]), its releases write nothing while either
+    /// holds a pause, and whichever writer lets go last writes the release,
+    /// restoring the duty-cycle instruction. That holds for every write, not
+    /// only for the file as a tick leaves it, which matters because the
+    /// runtime polls on its own cadence.
     pub fn is_pausing(&self) -> bool {
         matches!(self.state, State::Paused | State::OperatorHold | State::Broken)
     }
@@ -1478,6 +1489,28 @@ impl ThermalGovernor {
         self.config.max_pause_ms != 0 && self.pause_episode_ms >= self.config.max_pause_ms
     }
 
+    /// [`Self::on_sample`] beside the pace file's other writers, the way the
+    /// live sampler calls it (through `governor_tick::GovernorPair::tick`).
+    /// `others_pausing` is whether the battery governor or the budget pacer
+    /// held a live pause when this tick began. Every decision is made exactly
+    /// as [`Self::on_sample`] makes it, events included; only the RELEASES
+    /// (a duty-cycle instruction or a plain resume) are not written, because
+    /// writing either over a live pause lets the run take turns it must not
+    /// take. This governor's own pauses are always written.
+    pub fn on_sample_beside(
+        &mut self,
+        thermal: Option<&ThermalSample>,
+        elapsed_ms: u64,
+        host_out: &Path,
+        stop_file: Option<&Path>,
+        others_pausing: bool,
+    ) -> Option<ThermalEvent> {
+        self.others_pausing = others_pausing;
+        let event = self.on_sample(thermal, elapsed_ms, host_out, stop_file);
+        self.others_pausing = false;
+        event
+    }
+
     /// Feed one thermal sample. `elapsed_ms` is the wall time since the
     /// previous sample — the sampler's own cadence in production
     /// (`TELEMETRY_SAMPLE_INTERVAL`), injectable here so tests drive a
@@ -1571,12 +1604,7 @@ impl ThermalGovernor {
                         if self.ms_since_stamp >= self.restamp_interval_ms() || self.real_age_past_interval()
                         {
                             self.mark_stamped();
-                            write_pace_file_with_delay(
-                                host_out,
-                                "thermal-duty-cycle",
-                                &self.last_known_state,
-                                self.current_duty_delay_ms,
-                            );
+                            self.write_duty_cycle(host_out, &self.last_known_state);
                         }
                     }
                     State::Idle => {
@@ -1680,12 +1708,7 @@ impl ThermalGovernor {
                     self.state = State::DutyCycle;
                     self.duty_hold_accum_ms = 0;
                     self.mark_stamped();
-                    write_pace_file_with_delay(
-                        host_out,
-                        "thermal-duty-cycle",
-                        &thermal.state,
-                        self.current_duty_delay_ms,
-                    );
+                    self.write_duty_cycle(host_out, &thermal.state);
                     return Some(ThermalEvent::DutyCycleEntered {
                         state: thermal.state.clone(),
                         delay_ms: self.current_duty_delay_ms,
@@ -1696,7 +1719,7 @@ impl ThermalGovernor {
                     self.state = State::Idle;
                     self.duty_hold_accum_ms = 0;
                     self.mark_stamped();
-                    write_pace_file(host_out, false, "thermal", &thermal.state);
+                    self.write_resume(host_out, &thermal.state);
                     return Some(ThermalEvent::DutyCycleExited { state: thermal.state.clone() });
                 }
                 // No transition this tick — heartbeat the duty-cycle
@@ -1706,12 +1729,7 @@ impl ThermalGovernor {
                     && (self.ms_since_stamp >= self.restamp_interval_ms() || self.real_age_past_interval())
                 {
                     self.mark_stamped();
-                    write_pace_file_with_delay(
-                        host_out,
-                        "thermal-duty-cycle",
-                        &thermal.state,
-                        self.current_duty_delay_ms,
-                    );
+                    self.write_duty_cycle(host_out, &thermal.state);
                 }
                 None
             }
@@ -1779,15 +1797,10 @@ impl ThermalGovernor {
                     // 2 disarmed there is nowhere to land but `Idle`.
                     if self.bands.duty().is_some_and(|d| d.contains(reading)) {
                         self.state = State::DutyCycle;
-                        write_pace_file_with_delay(
-                            host_out,
-                            "thermal-duty-cycle",
-                            &thermal.state,
-                            self.current_duty_delay_ms,
-                        );
+                        self.write_duty_cycle(host_out, &thermal.state);
                     } else {
                         self.state = State::Idle;
-                        write_pace_file(host_out, false, "thermal", &thermal.state);
+                        self.write_resume(host_out, &thermal.state);
                     }
                     return Some(ThermalEvent::Resumed { state: thermal.state.clone() });
                 }
@@ -1857,6 +1870,25 @@ impl ThermalGovernor {
         self.mark_stamped();
         write_pace_file(host_out, true, "thermal", state);
         Some(ThermalEvent::Paused { state: state.to_string() })
+    }
+
+    /// Write this governor's duty-cycle instruction (`pause: false` with
+    /// the current turn delay), unless another writer holds a live pause:
+    /// the duty cycle lets the run take turns, so writing it over that pause
+    /// would release it. The heartbeat accounting still advances; the writer
+    /// that lets go last restores this instruction (`pace_file::release`).
+    fn write_duty_cycle(&self, host_out: &Path, state: &str) {
+        if !self.others_pausing {
+            write_pace_file_with_delay(host_out, "thermal-duty-cycle", state, self.current_duty_delay_ms);
+        }
+    }
+
+    /// Write `pause: false` as this governor lets go of the file, under the
+    /// same rule as [`Self::write_duty_cycle`].
+    fn write_resume(&self, host_out: &Path, state: &str) {
+        if !self.others_pausing {
+            write_pace_file(host_out, false, "thermal", state);
+        }
     }
 
     /// The `reason` string for the terminal-state heartbeat re-stamp at
@@ -4819,9 +4851,11 @@ mod tests {
             .lines()
             .find(|l| l.trim_start().starts_with("let thermal_pausing ="))
             .unwrap_or_else(|| panic!("{} no longer computes a thermal_pausing gate", path.display()));
+        // The call spans several lines; take it from its opening to its
+        // closing `);`.
         let call = source
-            .lines()
-            .find(|l| l.contains("self.battery.on_sample("))
+            .find("self.battery.on_sample")
+            .map(|at| &source[at..at + source[at..].find(");").unwrap_or(source.len() - at)])
             .unwrap_or_else(|| panic!("{} no longer calls the battery governor", path.display()));
 
         assert!(
@@ -4842,6 +4876,64 @@ mod tests {
             "…and the gate must actually REACH the call — computing it and passing something \
              else is the same outage. Call line found:\n{call}"
         );
+    }
+
+    // ── A release is never written over another writer's live pause ──
+
+    /// Beside another writer's live pause, every thermal decision still
+    /// happens (events included), but none of its releases reach the file:
+    /// not the duty-cycle entry, its heartbeat (with a reading or without),
+    /// its exit, nor a resume from a thermal pause. Its own pause is written.
+    #[test]
+    fn beside_a_live_pause_the_duty_cycle_and_resumes_write_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::pace_file::write(dir.path(), true, "battery", "45%");
+        let mut gov = ThermalGovernor::new(cfg_tier4_disabled());
+        let interval = gov.restamp_interval_ms();
+        let tick = |gov: &mut ThermalGovernor, reading: Option<&str>| {
+            let s = reading.map(|r| sample(r, 100));
+            gov.on_sample_beside(s.as_ref(), 2000, dir.path(), None, true)
+        };
+        let battery_held = |what: &str| {
+            let v = read_pace(dir.path());
+            assert_eq!((v["pause"].as_bool(), v["reason"].as_str()), (Some(true), Some("battery")), "{what}: {v}");
+        };
+
+        let mut entered = false;
+        for _ in 0..40 {
+            entered |= matches!(tick(&mut gov, Some("fair")), Some(ThermalEvent::DutyCycleEntered { .. }));
+        }
+        assert!(entered && gov.duty_cycle().is_some(), "the duty cycle engaged");
+        battery_held("duty-cycle entry");
+        for _ in 0..(interval / 2000 + 2) {
+            tick(&mut gov, Some("fair"));
+        }
+        battery_held("duty-cycle heartbeat");
+        for _ in 0..(interval / 2000 + 2) {
+            tick(&mut gov, None);
+        }
+        battery_held("duty-cycle heartbeat across a reading gap");
+        let mut exited = false;
+        for _ in 0..40 {
+            exited |= matches!(tick(&mut gov, Some("nominal")), Some(ThermalEvent::DutyCycleExited { .. }));
+        }
+        assert!(exited, "the duty cycle ended");
+        battery_held("duty-cycle exit");
+
+        assert!(matches!(tick(&mut gov, Some("serious")), Some(ThermalEvent::Paused { .. })));
+        assert_eq!(read_pace(dir.path())["reason"], "thermal", "its own pause is always written");
+        let mut resumed = false;
+        for _ in 0..40 {
+            resumed |= matches!(tick(&mut gov, Some("nominal")), Some(ThermalEvent::Resumed { .. }));
+        }
+        assert!(resumed, "the pause resumed");
+        assert_eq!(read_pace(dir.path())["pause"], true, "the resume wrote nothing over the live pause");
+
+        // Alone again, the same governor writes its releases as before.
+        for _ in 0..40 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+        }
+        assert_eq!(read_pace(dir.path())["turn_delay_ms"], serde_json::json!(gov.current_duty_delay_ms));
     }
 
     // ── (#2774 round-3 C8) One event, one reason word, in BOTH artifacts ──
