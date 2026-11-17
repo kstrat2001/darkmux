@@ -181,6 +181,22 @@ darkmux release.
 
 ### Fixed
 
+- **Flow records: lab runs stay off hooks, a failed write is said, and the audit trail's gaps stay
+  visible.** Found by the 2026-11-17 layer review. A hook rule that matched everything delivered a lab
+  run's records off the machine; hooks now drop them by the same rule that keeps them off the fleet hub
+  (contract 3). A flow record that could not be written (a full disk, a read-only volume, a flows dir
+  under a regular file) vanished without a trace when no audit, Redis or hooks sink was set; the local
+  sink now says it on stderr once per day file per process, naming the file and the OS error, and the
+  work still runs. A tee says a failing child once per process instead of once per record. `darkmux
+  doctor` gains `flow records writable`, which fails when the flows dir cannot be written. A dropped
+  audit write is no longer visible only until UTC midnight: doctor's `audit write integrity` and `flow
+  integrity-check` read the `audit.write_failed` breadcrumbs over every day the audit trail covers, and
+  `flow integrity-check --json` gains `dropped_writes` (additive). An audit day file emptied or cut to
+  whitespace now restarts its chain with a restart sidecar and is flagged `chain_restarted` (before the
+  next write too), and doctor warns on a restart even with nothing set aside. **Exit code change:** `flow
+  integrity-check` exits **3** when every chain verifies but the trail is incomplete (a restarted chain
+  or a recorded dropped write); it used to exit 0. A break still exits 2.
+
 - **A mission step waiting its turn reads waiting, not running (#3195).** Steps admitted together
   behind one slot (an endpoint with no `limits.concurrent_calls` runs its calls one at a time), or a
   local step waiting for its wave's model (a later wave, or its own wave's load), all read running from

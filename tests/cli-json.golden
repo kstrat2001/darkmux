@@ -313,6 +313,10 @@ DrainOutput
   timed_out: boolean
   lock_held_rules: uint[]
 DriftKind = "done-not-finalized" | "all-phases-terminal-none-complete" | "mission-terminal-live-step" | "mission-terminal-open-phase" | "phase-terminal-live-step" | "stale-active" | "running-phase-execution-dead" | "planned-phase-nothing-advances"
+DroppedAuditWrites
+  day: string
+  path: string
+  count: uint64
 EdgeKind = "contains" | "depends_on"
 EndpointAuth
   type?: EndpointAuthType | null
@@ -530,6 +534,7 @@ InputJson
   default: any
 IntegrityCheckOutput
   reports: IntegrityReport[]
+  dropped_writes: DroppedAuditWrites[]
 IntegrityReport
   path: string
   records_checked: uint64

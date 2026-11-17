@@ -215,24 +215,32 @@ pub fn first_refusal(key: &str) -> bool {
 /// result (`let _ = record(..)`), and a refused liveness bookend would otherwise vanish without a
 /// trace.
 fn report_refusal(action: &FlowAction, refusal: &anyhow::Error) {
-    if !first_refusal(&format!("flow-write-refused:{}", action.as_str())) {
+    say_once(&format!("flow-write-refused:{}", action.as_str()), || {
+        format!("darkmux: flow record refused ({refusal}); further refusals of `{}` are not repeated", action.as_str())
+    });
+}
+
+/// Print the line `line` builds on stderr, the first time `key` is seen in this process
+/// ([`first_refusal`]). Every flow-write failure is said through here, so none repeats per record.
+fn say_once(key: &str, line: impl FnOnce() -> String) {
+    if !first_refusal(key) {
         return;
     }
-    let line = format!("darkmux: flow record refused ({refusal}); further refusals of `{}` are not repeated", action.as_str());
+    let line = line();
     eprintln!("{line}");
     #[cfg(test)]
-    REFUSALS_SAID.with(|said| said.borrow_mut().push(line));
+    LINES_SAID.with(|said| said.borrow_mut().push(line));
 }
 
 #[cfg(test)]
 thread_local! {
-    static REFUSALS_SAID: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    static LINES_SAID: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The refusal lines this test thread said.
+/// The lines this test thread said through [`say_once`].
 #[cfg(test)]
-pub(crate) fn refusals_said() -> Vec<String> {
-    REFUSALS_SAID.with(|said| said.borrow().clone())
+pub(crate) fn lines_said() -> Vec<String> {
+    LINES_SAID.with(|said| said.borrow().clone())
 }
 
 /// File-based flow sink: appends to per-day JSONL files under
@@ -275,6 +283,44 @@ fn local_sink_dir() -> PathBuf {
     flows_dir()
 }
 
+/// Say on stderr, once per day file per process, that the local sink cannot
+/// write `path`. The local sink is in every sink setup, and in the default one
+/// (no audit, Redis or hooks) it is the only sink, so nothing else would say
+/// it; callers discard `record`'s result so a failed write never fails their
+/// work. Without this a full disk or an unwritable flows dir drops every record,
+/// the dispatch bookends included, without a trace.
+fn report_local_write_failure(path: &Path, err: &anyhow::Error) {
+    say_once(&format!("flow-local-write-failed:{}", path.display()), || {
+        format!(
+            "darkmux: flow records cannot be written to {}: {err:#}. The work goes on, but its records \
+             are lost until this is fixed; `darkmux doctor` checks the flows directory. Further failures \
+             writing this file are not repeated.",
+            path.display()
+        )
+    });
+}
+
+/// Why the local sink could not write a day file under `dir`, `None` when it
+/// can. `darkmux doctor` asks this of the flows dir. The probe does what a
+/// day's first record does: it creates a file there (and removes it). A dir
+/// not yet created is judged at its nearest existing ancestor, where the
+/// first write creates it; the probe never creates a directory itself.
+pub fn flows_dir_write_problem(dir: &Path) -> Option<String> {
+    let existing = dir.ancestors().find(|a| a.exists())?;
+    if !existing.is_dir() {
+        return Some(format!("{} is not a directory", existing.display()));
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let probe = existing.join(format!(".darkmux-write-probe-{}-{nanos}", std::process::id()));
+    match fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            None
+        }
+        Err(e) => Some(format!("cannot create a file in {}: {e}", existing.display())),
+    }
+}
+
 impl FlowSink for LocalFileSink {
     // NOTE (#507): LocalFileSink still resolves its directory per write
     // (via `local_sink_dir()` — `flows_dir()` in production builds),
@@ -293,7 +339,7 @@ impl FlowSink for LocalFileSink {
         let dir = local_sink_dir();
         let day = day_utc_now();
         let path = dir.join(format!("{day}.jsonl"));
-        record_at(record, &path)
+        record_at(record, &path).inspect_err(|e| report_local_write_failure(&path, e))
     }
 
     fn info(&self) -> SinkInfo {
@@ -373,21 +419,6 @@ fn audit_dir_default() -> PathBuf {
         return darkmux_types::paths::test_isolated_dir("audit");
     }
     resolved.root.join("audit")
-}
-
-/// (#877) Count `audit.write_failed` breadcrumbs in TODAY's local flow file.
-/// Each one is a record the AuditFileSink dropped: the hash chain is INCOMPLETE
-/// for it, even though `flow integrity-check` still validates the surviving
-/// chain as clean (the next record re-derives `prev_hash` from the file tail).
-/// `darkmux doctor` surfaces this count so a dropped audit write is DETECTABLE
-/// instead of vanishing into stderr. Best-effort: a missing/unreadable flow
-/// file → 0 (nothing to report).
-pub fn count_audit_write_failures_today() -> usize {
-    let path = flows_dir().join(format!("{}.jsonl", day_utc_now()));
-    reader::day_file_records(&path)
-        .iter()
-        .filter(|v| reader::action_of(v) == Some(FlowAction::AuditWriteFailed))
-        .count()
 }
 
 /// BLAKE3 hash-chained audit sink — edits are detected by `darkmux flow
@@ -1441,10 +1472,11 @@ pub(crate) fn assert_silent_peer_reaches_command_phase(port: u16) {
     );
 }
 
-/// Whether a record's `session_id` names a lab run: such a record stays off
-/// the fleet hub (#3074, contract 3). Applied by `hub_route::hub_stream_for`,
+/// Whether a record's `session_id` names a lab run: such a record stays on
+/// this machine (#3074, contract 3). Applied by `hub_route::hub_stream_for`,
 /// the one rule both the live write ([`RedisSink`]'s `persist`) and the
-/// outage backfill use.
+/// outage backfill use, and by `hooks::hook_match`, so no hook rule delivers
+/// one.
 pub fn is_lab_session(session_id: Option<&str>) -> bool {
     session_id
         .and_then(|wire| darkmux_types::session_id::SessionId::parse(wire).ok())
@@ -1961,10 +1993,13 @@ impl TeeSink {
             error: err_msg.to_string(),
         }));
         if let Err(e) = local.write(&bc) {
-            eprintln!(
-                "flow::TeeSink: audit-failure breadcrumb ALSO failed to write to the \
-                 local sink: {e:#} (original audit-write failure is unrecorded durably)"
-            );
+            say_once("flow-tee-breadcrumb-failed", || {
+                format!(
+                    "flow::TeeSink: audit-failure breadcrumb ALSO failed to write to the \
+                     local sink: {e:#} (original audit-write failure is unrecorded durably; \
+                     further failures are not repeated)"
+                )
+            });
         }
     }
 }
@@ -1979,9 +2014,10 @@ impl FlowSink for TeeSink {
         let mut audit_err: Option<String> = None;
         for (i, sink) in self.sinks.iter().enumerate() {
             if let Err(e) = sink.write(record) {
-                eprintln!(
-                    "flow::TeeSink: sink #{i} write failed: {e:#}"
-                );
+                // Once per child per process: a full disk fails every record.
+                say_once(&format!("flow-tee-child-failed:{i}"), || {
+                    format!("flow::TeeSink: sink #{i} write failed: {e:#} (further failures of this sink are not repeated)")
+                });
                 // (#877) An AUDIT-sink failure is a compliance gap — capture it
                 // for the durable breadcrumb below.
                 if sink.info().kind == AUDIT_SINK_KIND {
@@ -2629,14 +2665,97 @@ mod tests {
         let grow = unread(FlowAction::MissionGrow);
         assert!(record_via(&Never, &grow).is_err());
         assert!(record_via(&Never, &grow).is_err());
-        let said = crate::refusals_said();
+        let said = crate::lines_said();
         assert_eq!(said.len(), 1, "once per action: {said:?}");
         assert!(said[0].contains("mission.grow") && said[0].contains("unread payload"), "{said:?}");
 
         assert!(record_via(&Never, &unread(FlowAction::HookFired)).is_err());
-        let said = crate::refusals_said();
+        let said = crate::lines_said();
         assert_eq!(said.len(), 2, "another action is said again: {said:?}");
         assert!(said[1].contains("hook.fired"), "{said:?}");
+    }
+
+    /// A day file the local sink cannot write is said on stderr once per
+    /// process, naming the file and the OS error, and the write still
+    /// returns its error (the caller's work is not failed by it). The
+    /// default setup is the bare local sink, with no tee to say anything.
+    #[serial_test::serial]
+    #[test]
+    fn a_local_write_failure_is_said_once_naming_the_file_and_the_os_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("a-regular-file");
+        std::fs::write(&blocker, "").unwrap();
+        let flows = blocker.join("flows");
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", &flows) };
+        let sink = LocalFileSink::new();
+        let first = sink.write(&minimal_record());
+        let second = sink.write(&minimal_record());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+        assert!(first.is_err() && second.is_err(), "the failure is still returned to the caller");
+        let file = flows.join(format!("{}.jsonl", day_utc_now())).display().to_string();
+        let said = crate::lines_said();
+        let about: Vec<&String> = said.iter().filter(|l| l.contains(&file)).collect();
+        assert_eq!(about.len(), 1, "said once, naming the day file: {said:?}");
+        assert!(about[0].contains("os error"), "the OS error is named: {about:?}");
+    }
+
+    /// The doctor's flows-dir probe names a path the local sink could not
+    /// write under, and passes a writable one, existing or not yet created,
+    /// leaving nothing behind.
+    #[test]
+    fn the_flows_dir_probe_names_what_blocks_a_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("a-regular-file");
+        std::fs::write(&blocker, "").unwrap();
+        let problem = flows_dir_write_problem(&blocker.join("flows")).expect("a dir under a regular file is not writable");
+        assert!(problem.contains(&blocker.display().to_string()) && problem.contains("not a directory"), "{problem}");
+        assert_eq!(flows_dir_write_problem(&blocker), Some(format!("{} is not a directory", blocker.display())));
+
+        let existing = tmp.path().join("flows");
+        std::fs::create_dir(&existing).unwrap();
+        assert_eq!(flows_dir_write_problem(&existing), None);
+        assert_eq!(std::fs::read_dir(&existing).unwrap().count(), 0, "the probe leaves nothing behind");
+        assert_eq!(flows_dir_write_problem(&tmp.path().join("not-yet").join("flows")), None, "created on the first write");
+        assert!(!tmp.path().join("not-yet").exists(), "the probe creates no directory");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let read_only = tmp.path().join("read-only");
+            std::fs::create_dir(&read_only).unwrap();
+            std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let problem = flows_dir_write_problem(&read_only);
+            std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let problem = problem.expect("a read-only dir is not writable");
+            assert!(problem.contains(&read_only.display().to_string()) && problem.contains("os error"), "{problem}");
+        }
+    }
+
+    /// A tee says a failing child once per process, not once per record: a
+    /// full disk would otherwise print a line for every record written.
+    #[test]
+    fn a_tee_says_a_failing_child_once() {
+        struct Failing;
+        impl FlowSink for Failing {
+            fn persist(&self, _record: crate::CheckedRecord<'_>) -> Result<()> {
+                Err(anyhow::anyhow!("no space left on device (test)"))
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Failing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let tee = TeeSink::new(vec![Arc::new(Failing), Arc::new(Failing)]);
+        for _ in 0..3 {
+            assert!(tee.write(&minimal_record()).is_err());
+        }
+        let said: Vec<String> = crate::lines_said().into_iter().filter(|l| l.contains("no space left")).collect();
+        assert_eq!(said.len(), 2, "once per failing child: {said:?}");
     }
 
     /// The verbs behind `mission.pause`, `mission.resume` and `phase.added`
@@ -3463,33 +3582,6 @@ mod tests {
             }
         }
         assert_eq!(dir, tmp.path().join("flows"));
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn count_audit_write_failures_today_counts_only_breadcrumbs() {
-        // (#877) Locks the action-string contract END TO END: the breadcrumb
-        // emit literal (`emit_audit_failure_breadcrumb`) and the scanner literal
-        // (`count_audit_write_failures_today`) are independent strings — this
-        // catches them drifting apart. `DARKMUX_FLOWS_DIR` env wins `flows_dir()`.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
-        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path()) };
-        let path = tmp.path().join(format!("{}.jsonl", day_utc_now()));
-        let lines = [
-            r#"{"action":"audit.write_failed","category":"audit","level":"error"}"#,
-            r#"{"action":"dispatch.complete","category":"work","level":"info"}"#, // ignored
-            "not valid json",                                                     // ignored — no panic
-            r#"{"action":"audit.write_failed","category":"audit","level":"error"}"#,
-        ];
-        std::fs::write(&path, lines.join("\n")).unwrap();
-        assert_eq!(count_audit_write_failures_today(), 2);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
-                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
-            }
-        }
     }
 
     #[test]
@@ -6490,18 +6582,108 @@ mod tests {
     #[test]
     fn integrity_exit_code_is_zero_when_every_chain_verified() {
         let r = vec![report(true), report(true)];
-        assert_eq!(crate::integrity::integrity_exit_code(&r), 0);
+        assert_eq!(crate::integrity::integrity_exit_code(&r, &[]), 0);
     }
 
     #[test]
     fn integrity_exit_code_is_two_for_a_genuine_break() {
         let r = vec![report(true), report(false)];
-        assert_eq!(crate::integrity::integrity_exit_code(&r), 2);
+        assert_eq!(crate::integrity::integrity_exit_code(&r, &[]), 2);
     }
 
     #[test]
     fn integrity_exit_code_is_zero_for_no_files() {
-        assert_eq!(crate::integrity::integrity_exit_code(&[]), 0);
+        assert_eq!(crate::integrity::integrity_exit_code(&[], &[]), 0);
+    }
+
+    /// A chain that verifies but is incomplete (it restarted, or the tee
+    /// recorded a dropped write) exits 3, so a cron job on a non-zero exit
+    /// fires; a break still exits 2 whatever else holds.
+    #[test]
+    fn integrity_exit_code_is_three_for_a_restart_or_a_dropped_write() {
+        let restarted = crate::integrity::IntegrityReport { chain_restarted: true, ..report(true) };
+        let dropped = [crate::integrity::DroppedAuditWrites { day: "2026-11-17".into(), path: "x".into(), count: 1 }];
+        assert_eq!(crate::integrity::integrity_exit_code(&[report(true), restarted.clone()], &[]), 3);
+        assert_eq!(crate::integrity::integrity_exit_code(&[report(true)], &dropped), 3);
+        assert_eq!(crate::integrity::integrity_exit_code(&[], &dropped), 3, "a day with no audit file at all");
+        assert_eq!(crate::integrity::integrity_exit_code(&[restarted, report(false)], &dropped), 2);
+    }
+
+    /// A day file cut to 0 bytes is a restart, before the next write and
+    /// after it: every file this sink writes starts with its header.
+    #[test]
+    fn a_day_file_cut_to_zero_bytes_is_a_chain_restart() {
+        let (_t, path) = torn_chain(3);
+        std::fs::File::create(&path).unwrap();
+        let before = integrity_check_file(&path).unwrap();
+        assert!(before.chain_valid && before.chain_restarted, "an emptied file says so before any write: {before:?}");
+
+        append_one(&path, "after");
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "{report:?}");
+        assert_eq!(report.records_checked, 1);
+        assert!(report.chain_restarted, "the reseed over an emptied file says so: {report:?}");
+        assert_eq!(crate::integrity::integrity_exit_code(&[report], &[]), 3);
+    }
+
+    /// A day file cut to whitespace is a restart too.
+    #[test]
+    fn a_day_file_cut_to_whitespace_is_a_chain_restart() {
+        let (_t, path) = torn_chain(2);
+        std::fs::write(&path, b"\n\n").unwrap();
+        assert!(integrity_check_file(&path).unwrap().chain_restarted);
+        append_one(&path, "after");
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid && report.chain_restarted, "{report:?}");
+    }
+
+    /// A day file only just created, empty because its creator has not
+    /// written yet (another process won the lock), is not a restart; nor is
+    /// a brand-new file.
+    #[test]
+    fn a_just_created_day_file_is_not_a_chain_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let created = tmp.path().join("created.jsonl");
+        std::fs::File::create(&created).unwrap();
+        let md = std::fs::metadata(&created).unwrap();
+        assert!(md.created().is_ok(), "this filesystem records creation times, which the check relies on");
+        assert!(!integrity_check_file(&created).unwrap().chain_restarted);
+        append_one(&created, "first");
+        let fresh = tmp.path().join("fresh.jsonl");
+        append_one(&fresh, "first");
+        for path in [&created, &fresh] {
+            let report = integrity_check_file(path).unwrap();
+            assert!(report.chain_valid && !report.chain_restarted, "{report:?}");
+            assert!(torn_sidecars(path).is_empty(), "{report:?}");
+        }
+    }
+
+    /// A dropped audit write stays reported while the audit trail covers its
+    /// day, not only until UTC midnight; a day older than the trail, and a
+    /// line that merely mentions the action, are not counted.
+    #[test]
+    fn dropped_audit_writes_are_read_over_the_days_the_audit_trail_covers() {
+        let flows = tempfile::tempdir().unwrap();
+        let audit = tempfile::tempdir().unwrap();
+        let crumb = r#"{"ts":"t","action":"audit.write_failed","category":"audit","level":"error"}"#;
+        let mention = r#"{"ts":"t","action":"operator.note","handle":"audit.write_failed","payload":{"action":"audit.write_failed"}}"#;
+        let write = |day: &str, lines: &[&str]| std::fs::write(flows.path().join(format!("{day}.jsonl")), lines.join("\n")).unwrap();
+        write("2026-11-09", &[crumb]);
+        write("2026-11-12", &[crumb, mention, "not json", crumb]);
+        write("2026-11-17", &[crumb]);
+        std::fs::write(flows.path().join("notes.jsonl"), crumb).unwrap();
+
+        let today_only = crate::integrity::dropped_audit_writes_in(flows.path(), audit.path(), "2026-11-17");
+        assert_eq!(today_only.iter().map(|d| (d.day.as_str(), d.count)).collect::<Vec<_>>(), vec![("2026-11-17", 1)], "no audit files: today");
+
+        std::fs::write(audit.path().join("2026-11-10.jsonl"), "").unwrap();
+        let spanned = crate::integrity::dropped_audit_writes_in(flows.path(), audit.path(), "2026-11-17");
+        assert_eq!(
+            spanned.iter().map(|d| (d.day.as_str(), d.count)).collect::<Vec<_>>(),
+            vec![("2026-11-12", 2), ("2026-11-17", 1)],
+            "from the oldest audit day on, a day with no audit file of its own included"
+        );
+        assert_eq!(spanned[0].path, flows.path().join("2026-11-12.jsonl").display().to_string());
     }
 
     /// The write side of the same refusal: the audit sink will not extend a

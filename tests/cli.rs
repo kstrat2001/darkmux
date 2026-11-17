@@ -7452,6 +7452,69 @@ fn integrity_check_reports_a_header_without_the_marker_as_a_break_at_line_1() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("--strict"));
 }
 
+/// Through the real binary: a day file cut to 0 bytes, and a dropped audit
+/// write the local flow files recorded on an earlier day, each make
+/// `flow integrity-check` exit 3 (chains verify, the trail is incomplete),
+/// and `--json` names the dropped writes.
+#[test]
+fn integrity_check_exits_3_for_an_emptied_day_file_and_for_a_dropped_write() {
+    let audit = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let check = |args: &[&str]| {
+        darkmux_cmd()
+            .env("DARKMUX_AUDIT_DIR", audit.path())
+            .env("DARKMUX_FLOWS_DIR", flows.path())
+            .args(["flow", "integrity-check"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let emptied = audit.path().join("2026-01-02.jsonl");
+    fs::write(&emptied, "x").unwrap();
+    fs::File::create(&emptied).unwrap();
+    let out = check(&[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("chain restarted"), "{stdout}");
+
+    fs::remove_file(&emptied).unwrap();
+    assert_eq!(check(&[]).status.code(), Some(0), "an empty audit dir with no breadcrumbs is clean");
+    fs::write(audit.path().join("2026-01-01.jsonl"), "").unwrap();
+    fs::write(
+        flows.path().join("2026-01-02.jsonl"),
+        "{\"ts\":\"2026-01-02T00:00:00Z\",\"action\":\"audit.write_failed\",\"category\":\"audit\",\"level\":\"error\"}\n",
+    )
+    .unwrap();
+    let out = check(&[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("1 audit write(s) dropped on 2026-01-02"), "{stdout}");
+    let out = check(&["--json"]);
+    assert_eq!(out.status.code(), Some(3));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dropped_writes"][0]["day"], "2026-01-02", "{v}");
+    assert_eq!(v["dropped_writes"][0]["count"], 1, "{v}");
+}
+
+/// Through the real binary: a flows dir that cannot be written is said on
+/// stderr, naming the day file and the OS error. The default sink setup (no
+/// audit, Redis or hooks) is the bare local sink.
+#[test]
+fn an_unwritable_flows_dir_is_said_on_stderr() {
+    let tmp = TempDir::new().unwrap();
+    let blocker = tmp.path().join("a-regular-file");
+    fs::write(&blocker, "").unwrap();
+    let out = darkmux_cmd()
+        .env("DARKMUX_FLOWS_DIR", blocker.join("flows"))
+        .args(["flow", "note", "--text", "probe"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let said: Vec<&str> = stderr.lines().filter(|l| l.contains("flow records cannot be written to")).collect();
+    assert_eq!(said.len(), 1, "{stderr}");
+    assert!(said[0].contains(&blocker.display().to_string()) && said[0].contains("os error"), "{stderr}");
+}
+
 /// (#2093, folded into `flow status` by #1959's flow-hooks-family
 /// retirement) `darkmux flow status` wires the hooks section end-to-end:
 /// parses, dispatches, and prints valid JSON naming the resolved

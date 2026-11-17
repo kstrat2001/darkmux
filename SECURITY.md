@@ -136,6 +136,20 @@ frame:
   `darkmux doctor` name the sidecar. Anyone with write access can produce the
   same file shape, so a sidecar is a signal to look, not a finding.
 
+  A day file whose chain **starts over** is flagged, not passed: one cut to a
+  header-shaped prefix (its bytes go to a `<day>.jsonl.torn-restart-<ts>`
+  sidecar), one cut to whitespace, and one emptied to 0 bytes (an empty restart
+  sidecar; the file is flagged before the next write too). An emptied file is
+  told apart from one just created by its timestamps (modified after it was
+  born), so on a filesystem that records no creation time, or after someone
+  resets the modification time, an emptied file reads as new. `flow
+  integrity-check` exits **3** for a restart: every chain verifies, but it does
+  not cover the whole day. It exits 3 as well when the local flow files record
+  a **dropped audit write** (`audit.write_failed`, left when the audit sink
+  could not write a record) on any day the audit trail covers, since the chain
+  itself cannot show a record that never reached it; `darkmux doctor` names
+  those days. A break (exit 2) wins over both.
+
   **Whole-file deletion is undetectable**, because each per-day file seeds its
   own chain and nothing records which files should exist.
 
