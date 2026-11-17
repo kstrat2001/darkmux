@@ -15442,12 +15442,15 @@ fn doctor_keeps_its_rows_and_withholds_the_execution_surface_from_a_remote_viewe
     assert!(remote.contains("lms binary"), "{remote}");
     assert!(remote.contains("→"), "remedies stay: {remote}");
     let local = console_run(&["doctor", "-v"], false, &listener);
-    // The fixture's wrong-typed `runtime.max_turns` makes config.json fail
-    // the typed load, so this machine's `fleet trust` row names the value in
-    // its parse error; the remote form above names it nowhere.
-    for s in ["8766", "/opt/fake-wrongtype-path", "/opt/fake"] {
+    for s in ["8766", "/opt/fake"] {
         assert!(local.contains(s), "this machine reads `{s}` in doctor:\n{local}");
     }
+    // The fixture's wrong-typed `runtime.max_turns` makes config.json fail
+    // the typed load, and the `fleet trust` row names that parse error by
+    // type and position, never the value, on this machine too: a
+    // wrong-typed value may be a pasted credential.
+    assert!(local.contains("does not parse"), "{local}");
+    assert!(!local.contains("/opt/fake-wrongtype-path"), "the wrong-typed value is quoted nowhere:\n{local}");
     assert!(names_tmpdir(&local), "this machine reads its temp directory:\n{local}");
 }
 

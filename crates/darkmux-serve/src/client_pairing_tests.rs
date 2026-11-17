@@ -2235,6 +2235,18 @@ fn clients_json_refuses_unknown_keys() {
     );
 }
 
+/// A key written twice in the store reads, through a `Value`, as its last
+/// copy alone: a pairing silently dropped. It refuses instead, naming the
+/// file and the key.
+#[test]
+fn a_store_with_a_key_written_twice_is_refused_naming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("clients.json");
+    std::fs::write(&path, r#"{"schema_version":"1.3","pending":[],"clients":[],"pending":[]}"#).unwrap();
+    let err = ClientStore::at(path.clone()).read().unwrap_err().to_string();
+    assert!(err.contains("clients.json") && err.contains("duplicate key `pending`"), "{err}");
+}
+
 #[test]
 fn a_1_0_store_is_read_with_its_scopes_dropped() {
     let dir = tempfile::tempdir().unwrap();

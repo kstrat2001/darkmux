@@ -51,7 +51,7 @@ fn paths(keys: &[KeyIssue]) -> Vec<&str> {
 fn closest_of(k: &KeyIssue) -> Option<&str> {
     match &k.issue {
         Issue::Unknown { closest, .. } => closest.as_deref(),
-        Issue::Retired(_) | Issue::Removed(_) | Issue::WrongType { .. } | Issue::Missing { .. } | Issue::Rule(_) | Issue::Duplicate => None,
+        Issue::Retired(_) | Issue::Removed(_) | Issue::WrongType { .. } | Issue::Missing { .. } | Issue::Rule(_) | Issue::Duplicate(_) => None,
     }
 }
 
@@ -424,7 +424,7 @@ fn a_comment_key_inside_a_map_is_an_entry_not_a_note() {
 
 fn refused_paths(fp: &FileProblem) -> Vec<String> {
     match &fp.problem {
-        Problem::Keys(keys) => keys.iter().filter(|k| k.issue == Issue::Duplicate).map(|k| k.path.clone()).collect(),
+        Problem::Keys(keys) => keys.iter().filter(|k| matches!(k.issue, Issue::Duplicate(_))).map(|k| k.path.clone()).collect(),
         other => panic!("expected key issues, got {other:?}"),
     }
 }
@@ -456,6 +456,66 @@ fn a_duplicate_key_is_refused_at_every_depth() {
         "role_profiles":{"coder":"x","coder":"y","coder":"z"}}"#;
     let found = config_check_text(Path::new("config.json"), text).refusal.expect("refused");
     assert_eq!(refused_paths(&found), ["redis.port", "hooks.rules[0].file", "role_profiles.coder"]);
+}
+
+fn repeats(fp: &FileProblem) -> Vec<(&str, Repeat)> {
+    match &fp.problem {
+        Problem::Keys(keys) => keys
+            .iter()
+            .filter_map(|k| match k.issue {
+                Issue::Duplicate(r) => Some((k.path.as_str(), r)),
+                _ => None,
+            })
+            .collect(),
+        other => panic!("expected key issues, got {other:?}"),
+    }
+}
+
+/// A repeated `_comment` is a note written twice, a common idiom, and the
+/// typed load accepts it (it lands in the overflow): it is not refused, at
+/// the top level or nested.
+#[test]
+fn a_repeated_comment_note_is_not_refused() {
+    for text in [r#"{"_comment":"a","machine_id":"x","_comment":"b"}"#, r#"{"redis":{"_comment":"a","enabled":true,"_comment":"b"}}"#] {
+        assert!(serde_json::from_str::<crate::config::DarkmuxConfig>(text).is_ok(), "precondition: it loads: {text}");
+        assert_eq!(config_check_text(Path::new("config.json"), text).refusal, None, "{text}");
+    }
+}
+
+/// Each repeat is named for what it costs. A repeated struct field fails
+/// the typed load; a repeated map entry or unknown key loads with only the
+/// last copy used, which is still a silent mistake, so it is refused, and
+/// said truthfully.
+#[test]
+fn each_repeat_is_named_for_what_it_costs() {
+    let entry = r#"{"role_profiles":{"coder":"p","coder":"q"}}"#;
+    let loaded: crate::config::DarkmuxConfig = serde_json::from_str(entry).expect("precondition: a repeated map entry loads");
+    assert_eq!(loaded.role_profiles.as_ref().and_then(|m| m.get("coder")).map(String::as_str), Some("q"), "the last copy is used");
+    let text = r#"{"machine_id":"a","role_profiles":{"coder":"p","coder":"q"},"zz":1,"zz":2,"machine_id":"b"}"#;
+    let found = config_check_text(Path::new("config.json"), text).refusal.expect("refused");
+    assert_eq!(repeats(&found), [("machine_id", Repeat::Field), ("role_profiles.coder", Repeat::Entry), ("zz", Repeat::Entry)]);
+    let msg = found.to_string();
+    assert!(msg.contains("duplicate key `machine_id`: it is written more than once in the same object, so the file fails to load"), "{msg}");
+    assert!(msg.contains("duplicate key `role_profiles.coder`: it is written more than once in the same object, and only the last copy is used"), "{msg}");
+}
+
+/// A kind whose loader reads a `serde_json::Value` first (the registry, a
+/// rule) keeps the last copy of every key, a named field included.
+#[test]
+fn a_kind_read_through_a_value_names_every_repeat_as_last_copy() {
+    let text = r#"{"redis": {"host": "a", "host": "b"}}"#;
+    for (kind, want) in [(UserFileKind::Profiles, Repeat::Entry), (UserFileKind::Rule, Repeat::Entry), (UserFileKind::Role, Repeat::Field)] {
+        let fp = check_text::<Probe>(kind, Path::new("/x/f.json"), text, &no_retired).expect("refused");
+        assert_eq!(repeats(&fp), [("redis.host", want)], "{kind:?}");
+    }
+}
+
+/// A repeat inside a free-form value (no schema below it) keeps its last
+/// copy, and so does one beside a refused unknown key.
+#[test]
+fn a_repeat_inside_a_free_value_is_a_last_copy_entry() {
+    let fp = check_text::<Probe>(UserFileKind::Role, Path::new("/x/f.json"), r#"{"anything": {"k": 1, "k": 2}}"#, &no_retired).expect("refused");
+    assert_eq!(repeats(&fp), [("anything.k", Repeat::Entry)]);
 }
 
 /// Every user file kind goes through the one check, so every kind refuses it.
@@ -506,6 +566,9 @@ fn a_load_error_keeps_its_shape_and_loses_every_quoted_value() {
     assert_eq!(without_values("unknown variant `x`, there are no variants"), "an unknown variant, there are no variants");
     assert_eq!(without_values("missing field `id` and string \"unterminated"), "missing field `id` and a string");
     assert_eq!(without_values("unknown field `zz`, expected `a`"), "unknown field `zz`, expected `a`");
+    // A value holding the delimiter itself: the closing one is the last.
+    let inside = "unknown variant `a`, expected b hunter2`, expected `x` or `y` at line 1 column 9";
+    assert_eq!(without_values(inside), "an unknown variant, expected `x` or `y` at line 1 column 9");
 }
 
 /// (review C1) A capability vector's keys are the `Capability` tokens: a

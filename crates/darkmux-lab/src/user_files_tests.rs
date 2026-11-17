@@ -5,7 +5,7 @@
 
 use super::*;
 use darkmux_types::test_isolation::IsolatedState;
-use darkmux_types::user_files::{duplicate_keys, key_issues, no_retired, open_objects, with_duplicate_key, Reach, UserFileKind};
+use darkmux_types::user_files::{key_issues, no_retired, open_objects, text_key_issues, with_duplicate_key, Issue, Reach, Repeat, UserFileKind};
 use serde_json::{json, Value};
 
 fn quick_q() -> Value {
@@ -408,9 +408,15 @@ where
     gate_agrees_with_loader_on_text::<T>(name, base, failures);
 }
 
+/// How many repeats the text guard saw named as failing the load, and as
+/// keeping the last copy, so a guard that exercised only one kind fails.
+static REPEATS_SEEN: [std::sync::atomic::AtomicUsize; 2] = [std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)];
+
 /// The same promise for what a `Value` cannot hold: `base` with a key
-/// written twice in each of its objects. A text the gate passes must load
-/// from that text with serde, the way every loader reads a file.
+/// written twice in each of its objects, read the way a typed loader reads
+/// a file. What the gate says a repeat costs must be what serde does: a
+/// repeat named as failing the load fails it, and one named as keeping the
+/// last copy (or not refused at all, a note) loads.
 fn gate_agrees_with_loader_on_text<T>(name: &str, base: &Value, failures: &mut Vec<String>)
 where
     T: schemars::JsonSchema + serde::de::DeserializeOwned + 'static,
@@ -424,9 +430,20 @@ where
     for p in objects {
         let (text, key) = with_duplicate_key(base, &p);
         let doc: Value = serde_json::from_str(&text).unwrap();
-        let passed = duplicate_keys(&text).is_empty() && key_issues::<T>(&doc, &no_retired).is_empty();
-        if let (true, Err(e)) = (passed, serde_json::from_str::<T>(&text)) {
-            failures.push(format!("{name}: the gate passed `{key}` written twice, serde refused it ({e})"));
+        let issues = text_key_issues::<T>(&text, &doc, &no_retired, true);
+        let repeat = issues.iter().find_map(|k| match k.issue {
+            Issue::Duplicate(r) => Some(r),
+            _ => None,
+        });
+        let loaded = serde_json::from_str::<T>(&text);
+        match (repeat, &loaded) {
+            (Some(Repeat::Field), Ok(_)) => failures.push(format!("{name}: `{key}` written twice is named as failing the load, but it loads")),
+            (Some(Repeat::Entry), Err(e)) => failures.push(format!("{name}: `{key}` written twice is named as keeping the last copy, but serde refused it ({e})")),
+            (None, Err(e)) if issues.is_empty() => failures.push(format!("{name}: the gate passed `{key}` written twice, serde refused it ({e})")),
+            _ => {}
+        }
+        if let Some(r) = repeat {
+            REPEATS_SEEN[usize::from(r == Repeat::Entry)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -469,6 +486,8 @@ fn whatever_the_gate_passes_the_typed_load_accepts() {
     gate_agrees_with_loader::<WorkspaceSpec>("workspace spec", &spec, &mut failures);
     failures.truncate(20);
     assert!(failures.is_empty(), "{failures:#?}");
+    let [fields, entries] = REPEATS_SEEN.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(fields > 0 && entries > 0, "the text guard saw {fields} repeated field(s) and {entries} repeated entr(ies); both must be exercised");
 }
 
 /// (review C3) Every workload and fixture key a released darkmux had and

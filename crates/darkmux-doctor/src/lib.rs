@@ -2148,7 +2148,7 @@ fn user_file_hint(p: &darkmux_types::user_files::FileProblem) -> String {
         Problem::Newer { .. } => {
             "upgrade darkmux to the version that wrote it; until then every command that starts work refuses it at preflight".to_string()
         }
-        Problem::Keys(keys) if keys.iter().any(|k| k.issue == Issue::Duplicate) => duplicate_key_hint(p.kind, unloaded),
+        Problem::Keys(keys) if keys.iter().any(|k| matches!(k.issue, Issue::Duplicate(_))) => duplicate_key_hint(keys, unloaded),
         Problem::Keys(keys) if keys.iter().any(|k| matches!(k.issue, Issue::WrongType { .. } | Issue::Missing { .. })) => {
             format!("fix each value named and add each missing key; until then {unloaded}")
         }
@@ -2174,16 +2174,14 @@ fn unloaded_words(kind: darkmux_types::user_files::UserFileKind) -> &'static str
     }
 }
 
-/// The fix for a key written twice, and what it does meanwhile: a kind
-/// whose loader reads the document leniently (the registry, a rule)
-/// silently keeps the last copy; every other kind's typed load refuses the
-/// whole file (`unloaded`).
-fn duplicate_key_hint(kind: darkmux_types::user_files::UserFileKind, unloaded: &str) -> String {
-    use darkmux_types::user_files::UserFileKind;
-    let meanwhile = match kind {
-        UserFileKind::Profiles | UserFileKind::Rule => "only the last copy of each is read",
-        _ => unloaded,
-    };
+/// The fix for a key written twice, and what it does meanwhile: a repeated
+/// struct field fails the typed load (`unloaded`); a repeated map entry or
+/// unknown key, or any key of a file read through a `serde_json::Value`,
+/// loads with only the last copy used.
+fn duplicate_key_hint(keys: &[darkmux_types::user_files::KeyIssue], unloaded: &str) -> String {
+    use darkmux_types::user_files::{Issue, Repeat};
+    let fails = keys.iter().any(|k| k.issue == Issue::Duplicate(Repeat::Field));
+    let meanwhile = if fails { unloaded } else { "the file loads with only the last copy of each used" };
     format!("delete all but one copy of each duplicate key; until then {meanwhile}")
 }
 
@@ -17729,6 +17727,22 @@ mod user_file_key_tests {
         let hint = rows[0].hint.clone().unwrap_or_default();
         assert!(hint.contains("delete") && hint.contains("every setting falls back to its default"), "{hint}");
         assert!(!hint.contains("it does nothing"), "{hint}");
+    }
+
+    /// A repeated map entry loads with only the last copy used, so its fix
+    /// says that, never that the file fails to load.
+    #[test]
+    fn a_duplicate_map_entry_is_a_fail_row_whose_fix_says_the_last_copy_is_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"role_profiles": {"coder": "p", "coder": "q"}}"#).unwrap();
+        let problem = darkmux_types::user_files::config_json_problem_at(&path).expect("a duplicate entry is a problem");
+        let rows = user_file_key_rows(&[problem], &[]);
+        assert_eq!(rows[0].status, Status::Fail);
+        assert!(rows[0].message.contains("duplicate key `role_profiles.coder`") && rows[0].message.contains("only the last copy is used"), "{}", rows[0].message);
+        let hint = rows[0].hint.clone().unwrap_or_default();
+        assert!(hint.contains("delete") && hint.contains("only the last copy of each used"), "{hint}");
+        assert!(!hint.contains("falls back") && !hint.contains("fails to load"), "{hint}");
     }
 
     /// (review C2) A file name cannot forge a doctor line either.

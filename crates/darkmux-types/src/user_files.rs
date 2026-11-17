@@ -30,9 +30,11 @@
 //! reaches preflight stderr, doctor and the daemon's log.
 //!
 //! **So is a key written twice in one object** ([`Issue::Duplicate`], at any
-//! depth): a typed load refuses the whole document over it, and a lenient
-//! one keeps only the last copy. A `serde_json::Value` hides it, so
-//! [`check_text_and`] reads the text itself ([`duplicate_keys`]).
+//! depth). A `serde_json::Value` hides it, so [`check_text_and`] reads the
+//! text itself ([`duplicate_paths`]). What it costs depends on where it is
+//! ([`Repeat`]): a repeated struct field fails the whole typed load, while a
+//! repeated map entry or unknown key loads with only the last copy used.
+//! A repeated [`COMMENT_KEY`] where it is a note is not refused.
 //!
 //! **One mechanism, derived from the type.** Each file kind's valid keys and
 //! value types are its Rust type's derived JSON schema
@@ -133,6 +135,15 @@ impl UserFileKind {
         }
     }
 
+    /// Whether the kind's loader reads its type straight from the file's
+    /// text, so a repeated struct field fails the load. The registry and
+    /// user rules are read through a `serde_json::Value` first (to
+    /// quarantine an entry, to merge onto the embedded rule), which keeps
+    /// the last copy of every key instead.
+    pub fn typed_load(self) -> bool {
+        !matches!(self, UserFileKind::Profiles | UserFileKind::Rule)
+    }
+
     /// The entry points whose preflight checks this kind. A dispatch reads
     /// the config, the registry and the role library (skills route roles);
     /// a mission launch adds mission configs and rules; a lab run adds
@@ -222,10 +233,22 @@ pub enum Issue {
     /// A value the schema accepts but its consumer refuses: the rule it
     /// breaks, named with the step and key.
     Rule(String),
-    /// A key written more than once in one object. A typed load refuses the
-    /// whole document over it (`config.json` falls back to every default),
-    /// and a lenient one silently keeps the last copy.
-    Duplicate,
+    /// A key written more than once in one object; [`Repeat`] says what
+    /// that costs.
+    Duplicate(Repeat),
+}
+
+/// What a key written twice costs when the file loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Repeat {
+    /// A field the schema names, read by a typed load: serde refuses the
+    /// whole document over it (`config.json` falls back to every default,
+    /// a user role is replaced by its builtin).
+    Field,
+    /// A map entry, an unknown key, a free-form value's key, or any key of
+    /// a file read through a `serde_json::Value` (the registry, a rule):
+    /// the file loads and only the last copy is used, silently.
+    Entry,
 }
 
 impl fmt::Display for KeyIssue {
@@ -237,7 +260,12 @@ impl fmt::Display for KeyIssue {
             Issue::WrongType { expected, got } => write!(f, "`{}` must be {expected}, got {got}", self.path),
             Issue::Missing { expected } if expected.is_empty() => write!(f, "missing required key `{}`", self.path),
             Issue::Missing { expected } => write!(f, "missing required key `{}` ({expected})", self.path),
-            Issue::Duplicate => write!(f, "duplicate key `{}`: it is written more than once in the same object; keep one", self.path),
+            Issue::Duplicate(Repeat::Field) => {
+                write!(f, "duplicate key `{}`: it is written more than once in the same object, so the file fails to load; keep one", self.path)
+            }
+            Issue::Duplicate(Repeat::Entry) => {
+                write!(f, "duplicate key `{}`: it is written more than once in the same object, and only the last copy is used; keep one", self.path)
+            }
         }
     }
 }
@@ -273,11 +301,73 @@ pub fn key_issues<T: JsonSchema + 'static>(doc: &Value, retired: RetiredLookup<'
 /// (a mission step's `config`): every issue's path is written from the
 /// larger document's root. `retired` looks paths up from `doc`'s own root.
 pub fn key_issues_at<T: JsonSchema + 'static>(doc: &Value, retired: RetiredLookup<'_>, prefix: &str) -> Vec<KeyIssue> {
+    walk_issues::<T>(doc, retired, prefix, Repeats::default())
+}
+
+/// [`key_issues`] of the document `text` parses to, plus each key it writes
+/// twice ([`Issue::Duplicate`]). `typed_load`: whether the file's loader
+/// reads `T` from the text itself; a loader that reads a `serde_json::Value`
+/// first keeps the last copy of every key.
+pub fn text_key_issues<T>(text: &str, doc: &Value, retired: RetiredLookup<'_>, typed_load: bool) -> Vec<KeyIssue>
+where
+    T: JsonSchema + serde::de::DeserializeOwned + 'static,
+{
+    let found = duplicates(text);
+    let costs = if typed_load { repeat_costs::<T>(doc, &found) } else { found.iter().map(|d| (d.path.clone(), Some(Repeat::Entry))).collect() };
+    walk_issues::<T>(doc, retired, "", Repeats { paths: costs, typed_load })
+}
+
+/// What each repeat costs a typed load, found by trying it: the document
+/// with that one key written twice is read as `T`. Whether serde refuses a
+/// repeat is not in the schema (a field read through a lenient value keeps
+/// the last copy, like a map entry), so it is asked. `None` for every
+/// repeat when the document fails to load without any (the walk then
+/// judges by the schema).
+fn repeat_costs<T: serde::de::DeserializeOwned>(doc: &Value, found: &[Dup]) -> BTreeMap<String, Option<Repeat>> {
+    let loads = serde_json::from_value::<T>(doc.clone()).is_ok();
+    found
+        .iter()
+        .map(|d| {
+            let cost = loads.then(|| match repeated_text(doc, &d.object, &d.key) {
+                Some(text) if serde_json::from_str::<T>(&text).is_err() => Repeat::Field,
+                _ => Repeat::Entry,
+            });
+            (d.path.clone(), cost)
+        })
+        .collect()
+}
+
+/// `doc` as JSON text with `key` of the object at the JSON pointer `object`
+/// written a second time, with its value: a text a `Value` cannot hold.
+fn repeated_text(doc: &Value, object: &str, key: &str) -> Option<String> {
+    const SENTINEL: &str = "__repeated_key_sentinel__";
+    let mut copy = doc.clone();
+    let map = copy.pointer_mut(object)?.as_object_mut()?;
+    let value = map.get(key)?.clone();
+    map.insert(SENTINEL.to_string(), value);
+    Some(copy.to_string().replace(&format!("\"{SENTINEL}\""), &serde_json::to_string(key).ok()?))
+}
+
+fn walk_issues<T: JsonSchema + 'static>(doc: &Value, retired: RetiredLookup<'_>, prefix: &str, repeats: Repeats) -> Vec<KeyIssue> {
     let schema = schema_of::<T>();
     let root = schema.as_ref();
-    let mut walker = Walker { root, retired, out: Vec::new() };
+    let mut walker = Walker { root, retired, out: Vec::new(), repeats };
     walker.walk(&[root], doc, prefix, "");
+    // A repeat the walk never reached sits inside a free-form value (or one
+    // already refused for its type): serde keeps its last copy, unless a
+    // trial said otherwise.
+    let unreached = std::mem::take(&mut walker.repeats.paths);
+    walker.out.extend(unreached.into_iter().map(|(path, cost)| KeyIssue { path, issue: Issue::Duplicate(cost.unwrap_or(Repeat::Entry)) }));
     walker.out
+}
+
+/// The keys a document's text writes twice, by display path, not yet
+/// placed by the walk, each with what a trial load found it costs (`None`:
+/// no trial could say, so the schema decides).
+#[derive(Default)]
+struct Repeats {
+    paths: BTreeMap<String, Option<Repeat>>,
+    typed_load: bool,
 }
 
 /// The keys `T`'s object schema names at its top level, sorted.
@@ -348,6 +438,7 @@ struct Walker<'a, 'r> {
     root: &'a Value,
     retired: RetiredLookup<'r>,
     out: Vec<KeyIssue>,
+    repeats: Repeats,
 }
 
 /// The `anyOf`/`oneOf`/`allOf` branches of a node.
@@ -542,6 +633,7 @@ impl<'a> Walker<'a, '_> {
         }
         for (key, value) in map {
             let p = join_display(path, key);
+            self.place_repeat(&shape, key, &p);
             match (shape.named.get(key.as_str()), &shape.others) {
                 (Some(subs), _) => self.walk(subs, value, &p, &join(bare, key)),
                 (None, Others::Map(_)) if !self.key_fits(&shape, key) => self.refuse_map_key(&shape, path, p, key),
@@ -553,6 +645,20 @@ impl<'a> Walker<'a, '_> {
                 (None, Others::Refused) => self.refuse(&shape, path, p, &join(bare, key), key),
             }
         }
+    }
+
+    /// When `key` (at `p`) is written twice, what that costs. A note
+    /// ([`COMMENT_KEY`] where the shape names its keys) is not refused.
+    /// Otherwise the trial load's answer stands; without one, a field the
+    /// shape names fails a typed load and anything else keeps its last copy.
+    fn place_repeat(&mut self, shape: &ObjectShape<'a>, key: &str, p: &str) {
+        let Some(tried) = self.repeats.paths.remove(p) else { return };
+        let named = shape.named.contains_key(key);
+        if !named && matches!(shape.others, Others::Refused) && key == COMMENT_KEY {
+            return;
+        }
+        let by_schema = if named && self.repeats.typed_load { Repeat::Field } else { Repeat::Entry };
+        self.out.push(KeyIssue { path: p.to_string(), issue: Issue::Duplicate(tried.unwrap_or(by_schema)) });
     }
 
     /// Whether a map key fits the map's `propertyNames` (always, without).
@@ -746,7 +852,9 @@ fn next_quoted_value(text: &str) -> Option<(usize, usize, &'static str)> {
     let string = text.find(STRING).map(|at| (at, at + STRING.len() + escaped_string_len(&text[at + STRING.len()..]), "a string"));
     let variant = text.find(VARIANT).map(|at| {
         let body = &text[at + VARIANT.len()..];
-        let len = ["`, expected", "`, there are no variants"].iter().filter_map(|t| body.find(t)).min().map_or(body.len(), |i| i + 1);
+        // The value may itself contain the delimiter, so the closing one is
+        // the last: serde's own text after it never repeats it.
+        let len = ["`, expected", "`, there are no variants"].iter().find_map(|t| body.rfind(t)).map_or(body.len(), |i| i + 1);
         (at, at + VARIANT.len() + len, "an unknown variant")
     });
     [string, variant].into_iter().flatten().min_by_key(|(at, _, _)| *at)
@@ -962,7 +1070,7 @@ impl fmt::Display for FileProblem {
 /// (the first copy of an id is the one that loads). [`Reach::Effective`]
 /// checks only those; [`Reach::Every`] checks all, noting on a shadowed copy
 /// which file shadows it.
-pub fn check_tiered<T: JsonSchema + 'static>(
+pub fn check_tiered<T: JsonSchema + serde::de::DeserializeOwned + 'static>(
     kind: UserFileKind,
     docs: &[(String, PathBuf)],
     retired: RetiredLookup<'_>,
@@ -993,7 +1101,7 @@ pub fn check_tiered<T: JsonSchema + 'static>(
 }
 
 /// Check one document's text against `T`. `None` when it is clean.
-pub fn check_text<T: JsonSchema + 'static>(
+pub fn check_text<T: JsonSchema + serde::de::DeserializeOwned + 'static>(
     kind: UserFileKind,
     path: &Path,
     text: &str,
@@ -1007,7 +1115,7 @@ pub fn check_text<T: JsonSchema + 'static>(
 pub type ExtraIssues<'a> = &'a dyn Fn(&Value) -> Vec<KeyIssue>;
 
 /// [`check_text`] plus `extra`: issues about a shape the schema cannot say.
-pub fn check_text_and<T: JsonSchema + 'static>(
+pub fn check_text_and<T: JsonSchema + serde::de::DeserializeOwned + 'static>(
     kind: UserFileKind,
     path: &Path,
     text: &str,
@@ -1016,19 +1124,18 @@ pub fn check_text_and<T: JsonSchema + 'static>(
 ) -> Option<FileProblem> {
     let problem = match serde_json::from_str::<Value>(text) {
         Err(e) => Problem::NotJson(e.to_string()),
-        Ok(doc) => doc_problem::<T>(kind, &doc, duplicate_keys(text), retired, extra)?,
+        Ok(doc) => doc_problem::<T>(kind, text, &doc, retired, extra)?,
     };
     Some(FileProblem { kind, path: path.to_path_buf(), problem, note: None })
 }
 
-/// What is wrong with a parsed document, `None` when it is clean.
-/// `duplicates` are the keys its text writes twice, which the parsed
-/// document no longer shows. A marker newer than the binary's ends the
-/// check: its keys are not judged.
-fn doc_problem<T: JsonSchema + 'static>(
+/// What is wrong with the document `text` parses to (`doc`), `None` when it
+/// is clean. A marker newer than the binary's ends the check: its keys are
+/// not judged.
+fn doc_problem<T: JsonSchema + serde::de::DeserializeOwned + 'static>(
     kind: UserFileKind,
+    text: &str,
     doc: &Value,
-    duplicates: Vec<KeyIssue>,
     retired: RetiredLookup<'_>,
     extra: ExtraIssues<'_>,
 ) -> Option<Problem> {
@@ -1036,28 +1143,54 @@ fn doc_problem<T: JsonSchema + 'static>(
     if let Some(file_version) = crate::data_version::newer(doc, known) {
         return Some(Problem::Newer { file_version, known: known.to_string() });
     }
-    let mut keys = duplicates;
-    keys.extend(key_issues::<T>(doc, retired));
+    let mut keys = text_key_issues::<T>(text, doc, retired, kind.typed_load());
     keys.extend(extra(doc));
     (!keys.is_empty()).then_some(Problem::Keys(keys))
 }
 
-/// Every key `text` writes more than once in one object, at any depth, once
-/// each, in document order. A `serde_json::Value` keeps only the last copy,
-/// so this reads the text itself. Text that is not JSON has none (its
-/// parse error is reported instead).
-pub fn duplicate_keys(text: &str) -> Vec<KeyIssue> {
+/// The display path of every key `text` writes more than once in one
+/// object, at any depth, once each, in document order. A
+/// `serde_json::Value` keeps only the last copy, so this reads the text
+/// itself. Text that is not JSON has none (its parse error is reported
+/// instead).
+pub fn duplicate_paths(text: &str) -> Vec<String> {
+    duplicates(text).into_iter().map(|d| d.path).collect()
+}
+
+/// One key a document's text writes twice: its display path, and the JSON
+/// pointer of its object and the key itself (to try the repeat alone).
+struct Dup {
+    path: String,
+    object: String,
+    key: String,
+}
+
+fn duplicates(text: &str) -> Vec<Dup> {
     let mut found = Vec::new();
     let mut de = serde_json::Deserializer::from_str(text);
-    let _ = serde::de::DeserializeSeed::deserialize(DuplicateScan { path: String::new(), found: &mut found }, &mut de);
-    found.into_iter().map(|path| KeyIssue { path, issue: Issue::Duplicate }).collect()
+    let scan = DuplicateScan { path: String::new(), pointer: String::new(), found: &mut found };
+    let _ = serde::de::DeserializeSeed::deserialize(scan, &mut de);
+    found
+}
+
+/// A refusal for every key `text` writes twice, for a document a loader
+/// reads through a `serde_json::Value` (so the last copy is used), `None`
+/// when there is none: the check a reader that is not one of the
+/// [`UserFileKind`]s runs before it trusts the parsed document.
+pub fn duplicate_refusal(text: &str) -> Option<String> {
+    let lines: Vec<String> = duplicate_paths(text)
+        .into_iter()
+        .map(|path| KeyIssue { path, issue: Issue::Duplicate(Repeat::Entry) }.to_string())
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("; "))
 }
 
 /// One value of a document being scanned for duplicate keys: its display
-/// path, and where each duplicate's path goes.
+/// path, its JSON pointer, and where each duplicate goes.
 struct DuplicateScan<'f> {
     path: String,
-    found: &'f mut Vec<String>,
+    pointer: String,
+    found: &'f mut Vec<Dup>,
 }
 
 impl<'de> serde::de::DeserializeSeed<'de> for DuplicateScan<'_> {
@@ -1091,9 +1224,9 @@ impl<'de> serde::de::Visitor<'de> for DuplicateScan<'_> {
         Ok(())
     }
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-        let DuplicateScan { path, found } = self;
+        let DuplicateScan { path, pointer, found } = self;
         for i in 0.. {
-            let item = DuplicateScan { path: format!("{path}[{i}]"), found: &mut *found };
+            let item = DuplicateScan { path: format!("{path}[{i}]"), pointer: format!("{pointer}/{i}"), found: &mut *found };
             if seq.next_element_seed(item)?.is_none() {
                 break;
             }
@@ -1101,16 +1234,17 @@ impl<'de> serde::de::Visitor<'de> for DuplicateScan<'_> {
         Ok(())
     }
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
-        let DuplicateScan { path, found } = self;
+        let DuplicateScan { path, pointer, found } = self;
         let mut seen: BTreeMap<String, usize> = BTreeMap::new();
         while let Some(key) = map.next_key::<String>()? {
             let at = join_display(&path, &key);
-            let count = seen.entry(key).or_default();
+            let below = format!("{pointer}/{}", key.replace('~', "~0").replace('/', "~1"));
+            let count = seen.entry(key.clone()).or_default();
             *count += 1;
             if *count == 2 {
-                found.push(at.clone());
+                found.push(Dup { path: at.clone(), object: pointer.clone(), key });
             }
-            map.next_value_seed(DuplicateScan { path: at, found: &mut *found })?;
+            map.next_value_seed(DuplicateScan { path: at, pointer: below, found: &mut *found })?;
         }
         Ok(())
     }
@@ -1134,12 +1268,12 @@ fn read_bounded(path: &Path) -> std::io::Result<String> {
 }
 
 /// Check the file at `path` against `T`. `None` when it is clean or absent.
-pub fn check_path<T: JsonSchema + 'static>(kind: UserFileKind, path: &Path, retired: RetiredLookup<'_>) -> Option<FileProblem> {
+pub fn check_path<T: JsonSchema + serde::de::DeserializeOwned + 'static>(kind: UserFileKind, path: &Path, retired: RetiredLookup<'_>) -> Option<FileProblem> {
     check_path_and::<T>(kind, path, retired, &|_| Vec::new())
 }
 
 /// [`check_path`] plus `extra` ([`check_text_and`]).
-pub fn check_path_and<T: JsonSchema + 'static>(
+pub fn check_path_and<T: JsonSchema + serde::de::DeserializeOwned + 'static>(
     kind: UserFileKind,
     path: &Path,
     retired: RetiredLookup<'_>,
@@ -1186,7 +1320,7 @@ pub fn is_operator_state(path: &Path) -> bool {
 
 /// Check every `*.json` file directly in `dir` against `T`, in name order.
 /// An absent directory has nothing to check.
-pub fn check_dir<T: JsonSchema + 'static>(kind: UserFileKind, dir: &Path, retired: RetiredLookup<'_>) -> Vec<FileProblem> {
+pub fn check_dir<T: JsonSchema + serde::de::DeserializeOwned + 'static>(kind: UserFileKind, dir: &Path, retired: RetiredLookup<'_>) -> Vec<FileProblem> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut paths: Vec<PathBuf> = entries
         .flatten()
@@ -1216,12 +1350,9 @@ pub fn open_objects<T: JsonSchema>() -> Vec<String> {
 /// a `serde_json::Value` cannot hold, for tests of the duplicate-key refusal.
 #[cfg(any(test, feature = "test-support"))]
 pub fn with_duplicate_key(doc: &Value, pointer: &str) -> (String, String) {
-    const SENTINEL: &str = "__duplicate_key_sentinel__";
-    let mut copy = doc.clone();
-    let object = copy.pointer_mut(pointer).and_then(Value::as_object_mut).expect("an object at the pointer");
-    let (key, value) = object.iter().next().map(|(k, v)| (k.clone(), v.clone())).expect("a key to repeat");
-    object.insert(SENTINEL.to_string(), value);
-    let text = copy.to_string().replace(&format!("\"{SENTINEL}\""), &serde_json::to_string(&key).expect("a key"));
+    let object = doc.pointer(pointer).and_then(Value::as_object).expect("an object at the pointer");
+    let key = object.keys().next().expect("a key to repeat").clone();
+    let text = repeated_text(doc, pointer, &key).expect("the repeat's text");
     let mut path = String::new();
     let mut at = doc;
     for segment in pointer.split('/').skip(1) {

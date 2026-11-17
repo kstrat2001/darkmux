@@ -483,7 +483,9 @@ fn config_timeout_seconds_zero_is_refused_in_its_string_form_too() {
 
 /// A garbage (non-numeric, non-parseable) `timeout_seconds` must error
 /// loudly by name, matching `draws`'s and `no_progress_turns`'s own
-/// convention — never silently read as absent.
+/// convention — never silently read as absent. The key is named; the value
+/// is named by its type only, as every user-file refusal does (a value may
+/// be a pasted credential).
 #[test]
 fn config_timeout_seconds_garbage_value_is_refused_by_name() {
     let step = unit_step(serde_json::json!({
@@ -493,7 +495,8 @@ fn config_timeout_seconds_garbage_value_is_refused_by_name() {
     let msg = format!("{err:#}");
     assert!(msg.contains("`config.timeout_seconds` must be"), "{msg}");
     assert!(msg.contains("non-negative integer"), "{msg}");
-    assert!(msg.contains("soon"), "the offending value is named: {msg}");
+    assert!(msg.contains("got a string that does not fit"), "the offending value's type is named: {msg}");
+    assert!(!msg.contains("soon"), "the value itself is never quoted: {msg}");
 }
 
 /// (#2595 review round 2, CONSIDER 6) An unresolved `{{template}}` in a
