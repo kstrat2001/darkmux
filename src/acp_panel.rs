@@ -2942,41 +2942,31 @@ pub(crate) mod tests {
 
     /// The end the operator actually cares about: the params the panel
     /// synthesizes make `mission launch review --dry-run` resolve every
-    /// input and mint the graph. Stubbed home/profiles/`lms` — no model,
-    /// no network, no mutation of the operator's real state.
+    /// input and reach the dry-run graph, minting nothing.
+    ///
+    /// (#2513) In process, through the same `mission_launch::launch` call
+    /// the CLI makes (its `--dry-run` only appends `dry_run=true`), so the
+    /// outcome depends on the code alone. Spawning the built binary from a
+    /// unit test made it depend on whether `target/debug/darkmux` happened
+    /// to exist: cargo sets `CARGO_BIN_EXE_darkmux` for integration tests
+    /// only. Every state destination is pinned under a throwaway root.
     #[test]
     #[serial_test::serial]
     fn the_panel_synthesized_params_dry_run_green() {
-        use assert_cmd::prelude::*;
+        let state = darkmux_types::test_isolation::IsolatedState::new();
+        std::fs::write(state.join("profiles.json"), r#"{"profiles":{},"default_profile":null}"#).unwrap();
         let repo = temp_repo(2);
-        let home = tempfile::TempDir::new().unwrap();
-        std::fs::write(home.path().join("profiles.json"), r#"{"profiles":{},"default_profile":null}"#).unwrap();
         let synth = match synthesize_diff_launch_inputs(&embedded_review(), repo.path()).unwrap() {
             DiffLaunchInputs::Ready(s) => s,
             _ => panic!("expected Ready"),
         };
-        let mut cmd = std::process::Command::cargo_bin("darkmux").unwrap();
-        darkmux_types::test_isolation::neutralize_state_vars(&mut cmd);
-        cmd.args(["mission", "launch", "review"]);
-        for p in synth.params() {
-            cmd.args(["--param", p]);
-        }
-        let out = cmd
-            .arg("--dry-run")
-            .env("DARKMUX_HOME", home.path())
-            .env("DARKMUX_FLOWS_DIR", home.path().join("flows"))
-            .env("DARKMUX_PROFILES", home.path().join("profiles.json"))
-            .env("DARKMUX_LMS_BIN", "/usr/bin/true")
-            .output()
-            .expect("mission launch review --dry-run runs");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(out.status.success(), "dry run must be green.\nstdout:\n{stdout}\nstderr:\n{stderr}");
-        assert!(stdout.contains("plan.sites"), "the graph must mint the plan steps:\n{stdout}");
-        assert!(
-            !stdout.contains("diff_file") || stdout.contains("diff_file = "),
-            "diff_file must resolve, never be reported missing:\n{stdout}"
-        );
+        let mut params = synth.params().to_vec();
+        params.push("dry_run=true".to_string());
+        let exit = crate::mission_launch::launch("review", None, &params, None)
+            .unwrap_or_else(|e| panic!("the panel's params must dry-run green: {e:#}"));
+        assert_eq!(exit, 0);
+        let minted = std::fs::read_dir(crate::crew::loader::missions_dir()).map(|rd| rd.count()).unwrap_or(0);
+        assert_eq!(minted, 0, "a dry run must mint no mission");
     }
 
 }

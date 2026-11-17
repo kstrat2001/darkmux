@@ -528,9 +528,9 @@ fn darkmux_cmd_keeps_a_child_out_of_the_process_home() {
     );
 }
 
-/// Every `.rs` file under `tests/`, recursively. Sorted, so a failure
-/// message is stable run to run.
-fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
+/// Every `.rs` file under `rel` (a path relative to this crate's root),
+/// recursively. Sorted, so a failure message is stable run to run.
+fn rust_sources_under(rel: &str) -> Vec<std::path::PathBuf> {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let entries = fs::read_dir(dir)
             .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
@@ -543,11 +543,16 @@ fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
             }
         }
     }
-    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests"));
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
     let mut out = Vec::new();
-    walk(root, &mut out);
+    walk(&root, &mut out);
     out.sort();
     out
+}
+
+/// Every `.rs` file under `tests/`, recursively.
+fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
+    rust_sources_under("tests")
 }
 
 /// (#2184/#2710) The structural half of the fix: a source-scanning
@@ -838,6 +843,68 @@ fn every_darkmux_spawn_in_the_tests_dir_goes_through_an_isolating_helper() {
 }
 
 // ===== DARKMUX-SPAWN-HELPERS: END (#2184) ============================
+
+/// The source roots whose code compiles into unit tests: the root crate's
+/// `src/` and every workspace crate's `crates/<name>/src/`.
+fn unit_test_source_roots() -> Vec<String> {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut roots = vec!["src".to_string()];
+    for entry in fs::read_dir(manifest.join("crates")).expect("reading crates/") {
+        let name = entry.expect("dir entry").file_name().to_string_lossy().to_string();
+        if manifest.join("crates").join(&name).join("src").is_dir() {
+            roots.push(format!("crates/{name}/src"));
+        }
+    }
+    roots.sort();
+    roots
+}
+
+/// The code lines (comments skipped) of `src` that contain any of `tokens`,
+/// as `rel:line: text`.
+fn code_lines_naming(rel: &str, src: &str, tokens: &[&str]) -> Vec<String> {
+    src.lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim_start().starts_with("//") && tokens.iter().any(|t| l.contains(t)))
+        .map(|(i, l)| format!("  {rel}:{}: {}", i + 1, l.trim()))
+        .collect()
+}
+
+/// (#2513) No unit test resolves the darkmux binary. Cargo sets
+/// `CARGO_BIN_EXE_darkmux` for integration targets only, so a unit test
+/// that asks for it gets `assert_cmd`'s fallback: a lookup of
+/// `target/debug/darkmux` that passes or panics on whether an earlier
+/// build happened to leave that file behind. A unit test drives the code
+/// in process; a test that needs the binary lives under `tests/`.
+#[test]
+fn no_unit_test_source_resolves_the_darkmux_binary() {
+    // Split with `concat!` so these lines do not name the binary
+    // themselves and trip the spawn guard above.
+    const TOKENS: [&str; 2] = [concat!("cargo", "_bin"), concat!("CARGO_BIN_EXE_", "darkmux")];
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let roots = unit_test_source_roots();
+    let files: Vec<std::path::PathBuf> = roots.iter().flat_map(|r| rust_sources_under(r)).collect();
+    // Anti-vacuity: the walk must reach the root crate and a workspace crate.
+    for expected in ["src/acp_panel.rs", "crates/darkmux-types/src/test_isolation.rs"] {
+        assert!(files.iter().any(|p| p.ends_with(expected)), "the walk over {roots:?} missed {expected}");
+    }
+    let offenders: Vec<String> = files
+        .iter()
+        .flat_map(|path| {
+            let rel = path.strip_prefix(manifest).unwrap_or(path).display().to_string();
+            let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {rel}: {e}"));
+            code_lines_naming(&rel, &src, &TOKENS)
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "(#2513) {} line(s) outside tests/ resolve the darkmux binary. A unit test never gets \
+         `{}`, so this passes or fails on whether `target/debug/darkmux` \
+         happens to exist. Drive the code in process, or move the test under tests/:\n{}",
+        offenders.len(),
+        TOKENS[1],
+        offenders.join("\n")
+    );
+}
 
 fn fixture_json() -> &'static str {
     r#"{
