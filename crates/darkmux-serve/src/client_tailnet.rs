@@ -478,10 +478,12 @@ fn same_identity(asked: &TailnetIdentity, polling: &TailnetIdentity) -> Option<P
 /// screen.
 pub const NAME_COLUMNS: usize = 40;
 
-/// (#3626) One tailnet name (a user, device or host name, which a paired
-/// device chooses for itself) as darkmux shows it: display-safe, on one
-/// line, and at most [`NAME_COLUMNS`] display columns, cut in the middle at
-/// a `…` so its start and end both show.
+/// (#3626) One name a device chose for itself (its tailnet user, device
+/// or host name, or the device name its app sent with a pairing request) as
+/// darkmux shows it: display-safe, on one line, and at most
+/// [`NAME_COLUMNS`] display columns, cut in the middle at a `…` so its
+/// start and end both show (see `darkmux_flow::hooks::bounded_for_display`
+/// for the cut).
 pub fn shown_name(name: &str) -> String {
     darkmux_flow::hooks::bounded_for_display(&darkmux_platform::display_safe(name), NAME_COLUMNS)
 }

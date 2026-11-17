@@ -161,7 +161,7 @@ fn describe(p: &PendingRequest, now: u64) -> String {
         .unwrap_or_default();
     format!(
         "  device: {}\n  code:   {}\n  age:    {}{tailnet}",
-        darkmux_platform::display_safe(&p.device_name),
+        darkmux_serve::client_tailnet::shown_name(&p.device_name),
         darkmux_platform::display_safe(&p.code),
         age(now, p.created)
     )
@@ -507,8 +507,9 @@ mod tests {
     }
 
     /// (#3626) `client approve` and `client list` show a device's own long
-    /// tailnet names cut at the same limit as the serve log does, wherever a
-    /// name appears, so what follows each name stays on screen.
+    /// names (its tailnet names, and the device name its app sent) cut at the
+    /// same limit as the serve log does, wherever a name appears, so what
+    /// follows each name stays on screen.
     #[test]
     fn approve_and_list_bound_a_remote_device_s_long_names() {
         use darkmux_serve::client_tailnet::NAME_COLUMNS;
@@ -520,10 +521,16 @@ mod tests {
         long.login = "長".repeat(200);
         long.device.name = "ŋ\u{301}".repeat(300);
         let (_d, store, _ids) = store_with(&["AAA"]);
-        store.update(|f| { f.pending[0].tailnet = Some(long.clone()); Ok(()) }).unwrap();
-        // Shown three times: the user, and the device twice.
+        store.update(|f| {
+            f.pending[0].tailnet = Some(long.clone());
+            f.pending[0].device_name = "長".repeat(64);
+            Ok(())
+        }).unwrap();
+        // Four names: the app's device name, the user, and the device twice.
         let shown = describe(&cp::list_pending(&store, 200).unwrap()[0], 200);
-        assert!(name_columns(&shown) <= 3 * NAME_COLUMNS && shown.matches('…').count() == 3, "{}: {shown}", name_columns(&shown));
+        assert!(name_columns(&shown) <= 4 * NAME_COLUMNS && shown.matches('…').count() == 4, "{}: {shown}", name_columns(&shown));
+        let device = shown.lines().next().unwrap();
+        assert!(name_columns(device) <= NAME_COLUMNS && device.starts_with("  device: 長"), "{device}");
         assert!(shown.contains("itself shows code AAA"), "{shown}");
         let listed = over_the_tailnet(Some(&long));
         assert!(name_columns(&listed) <= 2 * NAME_COLUMNS && listed.matches('…').count() == 2, "{}: {listed}", name_columns(&listed));

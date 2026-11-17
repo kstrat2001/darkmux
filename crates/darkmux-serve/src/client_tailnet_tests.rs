@@ -420,6 +420,9 @@ fn a_tailnet_name_is_bounded_by_display_columns_with_a_visible_cut() {
         ("a stack of combining marks", format!("a{}", "\u{301}".repeat(1000))),
         ("emoji", "😀".repeat(100)),
         ("emoji presentation selectors", "☺\u{FE0F}".repeat(100)),
+        ("flags", "🇺🇸".repeat(30)),
+        ("skin tones", "👋🏽".repeat(30)),
+        ("one heavily marked last character", format!("{}{}", "a".repeat(NAME_COLUMNS), "\u{301}".repeat(200))),
     ];
     for (what, name) in &over {
         let shown = shown_name(name);
@@ -429,6 +432,12 @@ fn a_tailnet_name_is_bounded_by_display_columns_with_a_visible_cut() {
         // U+FE0F turns a 1-column character into a 2-column emoji, which a
         // per-character column count does not see: none may survive.
         assert!(!shown.contains('\u{FE0F}'), "{what}: {shown}");
+        // The end shows too: the name's last character that takes a column
+        // is after the cut, unless it is the name's only one.
+        let (_, end) = shown.split_once('…').expect("cut");
+        let mut bases = name.chars().filter(|c| display_columns(&c.to_string()) > 0);
+        let last = bases.clone().next_back().expect("a base");
+        assert!(end.contains(last) || bases.nth(1).is_none(), "{what}: {shown}");
     }
 }
 

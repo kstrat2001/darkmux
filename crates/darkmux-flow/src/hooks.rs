@@ -2503,14 +2503,134 @@ fn display_width(c: char) -> usize {
     unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
-/// Rendered column width of a whole string (see [`display_width`]).
+/// Rendered column width of a whole string (see [`display_width`]), with
+/// regional indicators counted as a terminal draws them (see [`Piece`]).
 ///
 /// Exported so a consumer in another crate can assert the geometry of a
 /// row it prints WITHOUT taking its own `unicode-width` dependency — the
 /// width question has exactly one answer in this workspace, and a second
 /// dependency edge would be a second place for it to drift.
 pub fn display_columns(s: &str) -> usize {
-    s.chars().map(display_width).sum()
+    pieces(s).map(|p| p.columns).sum()
+}
+
+/// (#3626) One character of text being cut: where it starts, the columns
+/// it adds, whether it draws on the character before it (`joins`: a
+/// combining mark, joiner or selector, or anything below), and whether it
+/// is bound to that character so a cut between them would show something
+/// the text does not hold (`binds`: the second regional indicator of a
+/// flag, a skin-tone modifier, or a character after a joiner).
+///
+/// Regional indicators pair from the start of each run, as a terminal
+/// pairs them. The first of a pair counts 2 columns and the second 0, so a
+/// flag is 2 and a lone indicator, which some terminals draw 2 wide, is
+/// never undercounted.
+struct Piece {
+    at: usize,
+    columns: usize,
+    joins: bool,
+    binds: bool,
+}
+
+fn is_regional_indicator(c: char) -> bool {
+    matches!(c, '\u{1F1E6}'..='\u{1F1FF}')
+}
+
+fn is_emoji_modifier(c: char) -> bool {
+    matches!(c, '\u{1F3FB}'..='\u{1F3FF}')
+}
+
+/// `s` as [`Piece`]s, in order.
+fn pieces(s: &str) -> impl Iterator<Item = Piece> + '_ {
+    let mut prev = None;
+    let mut indicators = 0usize;
+    s.char_indices().map(move |(at, c)| {
+        let indicator = is_regional_indicator(c);
+        let p = piece(at, prev, c, indicator && indicators % 2 == 1);
+        indicators = if indicator { indicators + 1 } else { 0 };
+        prev = Some(c);
+        p
+    })
+}
+
+/// The [`Piece`] for `c` at `at`, after `prev`; `second_of_flag` when it
+/// completes a pair of regional indicators.
+fn piece(at: usize, prev: Option<char>, c: char, second_of_flag: bool) -> Piece {
+    let after = prev.is_some();
+    let binds = after && (second_of_flag || is_emoji_modifier(c) || prev == Some('\u{200D}'));
+    let columns = match (is_regional_indicator(c), second_of_flag) {
+        (true, true) => 0,
+        (true, false) => 2,
+        _ => display_width(c),
+    };
+    Piece { at, columns, joins: binds || (after && display_width(c) == 0), binds }
+}
+
+/// How many characters a cut `columns` wide may hold (see
+/// [`REJECTION_REASON_CHARS_PER_COLUMN`]).
+fn chars_for(columns: usize) -> usize {
+    columns.saturating_mul(REJECTION_REASON_CHARS_PER_COLUMN)
+}
+
+/// Whether all of `s` fits in `columns` columns and [`chars_for`] that
+/// many characters; stops at the first piece that does not.
+fn fits(s: &str, columns: usize) -> bool {
+    let mut width = 0usize;
+    for (n, p) in pieces(s).enumerate() {
+        width += p.columns;
+        if width > columns || n + 1 > chars_for(columns) {
+            return false;
+        }
+    }
+    true
+}
+
+/// How many of `pieces`, in order, fit in `columns` columns and
+/// [`chars_for`] that many characters.
+fn fitting<'a>(pieces: impl Iterator<Item = &'a Piece>, columns: usize) -> usize {
+    let (mut width, mut n) = (0usize, 0usize);
+    for p in pieces {
+        if width + p.columns > columns || n + 1 > chars_for(columns) {
+            break;
+        }
+        width += p.columns;
+        n += 1;
+    }
+    n
+}
+
+/// Where the head of a cut ends: as much of the start as fits in
+/// `columns`, backed off so it never ends between two bound pieces.
+fn head_end(pieces: &[Piece], columns: usize, len: usize) -> usize {
+    let mut end = fitting(pieces.iter(), columns);
+    while end > 0 && pieces.get(end).is_some_and(|p| p.binds) {
+        end -= 1;
+    }
+    pieces.get(end).map_or(len, |p| p.at)
+}
+
+/// The tail of a cut: as much of the end as fits in `columns`, starting on
+/// a piece that does not join the one before it.
+fn tail_range(pieces: &[Piece], columns: usize, len: usize) -> std::ops::Range<usize> {
+    let start = pieces.len() - fitting(pieces.iter().rev(), columns);
+    if start == pieces.len() {
+        return len..len;
+    }
+    match (start..pieces.len()).find(|&i| !pieces[i].joins) {
+        Some(i) => pieces[i].at..len,
+        None => last_character(pieces, columns, len),
+    }
+}
+
+/// The tail when the end of the text is one character carrying more than
+/// the tail holds: that character and as many of its marks as fit.
+fn last_character(pieces: &[Piece], columns: usize, len: usize) -> std::ops::Range<usize> {
+    let base = pieces.iter().rposition(|p| !p.joins).unwrap_or(0);
+    let n = fitting(pieces[base..].iter(), columns);
+    match n {
+        0 => len..len,
+        _ => pieces[base].at..pieces.get(base + n).map_or(len, |p| p.at),
+    }
 }
 
 /// Truncate already-SANITIZED text `s` to at most `budget` rendered
@@ -2538,14 +2658,19 @@ pub fn display_columns(s: &str) -> usize {
 /// the panic class a raw byte-offset slice invites (#2196 fix-round MUST
 /// FIX 2: a naive `&s[..N]` on a byte offset that lands mid-character
 /// panics with "byte index N is not a char boundary").
+///
+/// (#3626) Both cuts fall only between whole emoji ([`Piece`]): never
+/// inside a flag's pair of regional indicators, between an emoji and its
+/// skin tone, or after a joiner, and the tail never starts with a
+/// character that draws on the one before it (a combining mark, a joiner,
+/// a selector), which would land on the `…`. When the end of `s` is one
+/// character carrying more marks than the tail holds, the tail is that
+/// character with as many of its marks as fit.
 pub(crate) fn bound_reason_width(s: &str, budget: usize) -> String {
     // (#2196 fix-round 3, MUST FIX F) Both budgets are enforced: columns
     // AND characters. A width-only bound does not bound anything a
     // receiver cares about — see [`REJECTION_REASON_CHARS_PER_COLUMN`].
-    let char_budget = budget.saturating_mul(REJECTION_REASON_CHARS_PER_COLUMN);
-    let total_width: usize = s.chars().map(display_width).sum();
-    let total_chars = s.chars().count();
-    if total_width <= budget && total_chars <= char_budget {
+    if fits(s, budget) {
         return s.to_string();
     }
     let ellipsis_width = display_width('…');
@@ -2556,62 +2681,18 @@ pub(crate) fn bound_reason_width(s: &str, budget: usize) -> String {
         return "…".to_string();
     }
     let tail_budget = REJECTION_REASON_TAIL_RESERVE.min((budget - ellipsis_width) / 2);
-    let head_budget = budget - ellipsis_width - tail_budget;
-    let head_char_budget = head_budget.saturating_mul(REJECTION_REASON_CHARS_PER_COLUMN);
-    let tail_char_budget = tail_budget.saturating_mul(REJECTION_REASON_CHARS_PER_COLUMN);
-
-    let mut head_end = s.len();
-    let mut w = 0usize;
-    for (n, (idx, c)) in s.char_indices().enumerate() {
-        let cw = display_width(c);
-        if w + cw > head_budget || n + 1 > head_char_budget {
-            head_end = idx;
-            break;
-        }
-        w += cw;
-    }
-
-    let mut tail_start = s.len();
-    let mut w = 0usize;
-    for (n, (idx, c)) in s.char_indices().rev().enumerate() {
-        let cw = display_width(c);
-        if w + cw > tail_budget || n + 1 > tail_char_budget {
-            break;
-        }
-        w += cw;
-        tail_start = idx;
-    }
-    let tail_start = past_zero_width(s, tail_start);
-
-    if tail_start <= head_end {
-        // The head and tail windows would overlap — a defensive floor,
-        // not a live branch. (#2196 fix-round 3) The character ceiling
-        // added above does NOT make it live, which is worth writing down
-        // because it looks like it should: a first pass at this claimed
-        // zero-width text would let the windows meet, and the test
-        // written to pin that disproved it. Both arms are closed at the
-        // shipped constants (head 93 cols / 372 chars, tail 24 cols / 96
-        // chars, budget 118 cols / 472 chars):
-        //   * Overlap implies `total_chars <= 372 + 96 = 468`, but a
-        //     CHARACTER-triggered cut needs `total_chars > 472`. 468 < 472.
-        //   * Overlap also implies the two windows cover the whole string
-        //     (counting the overlap twice), so `total_width <= 93 + 24 =
-        //     117`, but a WIDTH-triggered cut needs `total_width > 118`.
-        // No input can satisfy either, so no test is written against this
-        // arm — a test that cannot fail is worse than none. Kept anyway
-        // so a future constant change degrades to a correct head-only cut
-        // instead of re-emitting the overlap region twice.
+    let pieces: Vec<Piece> = pieces(s).collect();
+    let head_end = head_end(&pieces, budget - ellipsis_width - tail_budget, s.len());
+    let tail = tail_range(&pieces, tail_budget, s.len());
+    if tail.start < head_end {
+        // The head and tail would overlap: show the head alone rather
+        // than the overlap twice. Reached when the text is one character
+        // carrying more marks than the cut holds, so the tail's
+        // [`last_character`] is the character the head already shows.
         format!("{}…", &s[..head_end])
     } else {
-        format!("{}…{}", &s[..head_end], &s[tail_start..])
+        format!("{}…{}", &s[..head_end], &s[tail])
     }
-}
-
-/// (#3626) The first byte at or after `from` in `s` that starts a
-/// character taking a column: a tail cut there never begins with a
-/// combining mark, which would draw on the `…` before it.
-fn past_zero_width(s: &str, from: usize) -> usize {
-    from + s[from..].chars().take_while(|c| display_width(*c) == 0).map(char::len_utf8).sum::<usize>()
 }
 
 /// Sanitize `s` (see [`sanitize_reason_text`]) and then bound it to
@@ -8049,19 +8130,6 @@ mod tests {
         assert_eq!(out, "x cursor-write failures: 0");
     }
 
-    /// (#2196 fix-round MUST FIX 2, extended in fix-round 2 for the
-    /// head+tail split MUST FIX C introduced) `bound_reason_width` walks
-    /// `char_indices` from BOTH ends — forward for the head cut, in
-    /// reverse for the tail cut — so every candidate cut point is a
-    /// UTF-8 char boundary BY CONSTRUCTION in both directions. Pins that
-    /// against exactly the inputs a naive byte-offset slice panics on: a
-    /// multi-byte character straddling the HEAD cut point, and an
-    /// all-wide-CJK reason (every character multi-byte) straddling BOTH
-    /// cut points at once. Numbers are derived from the real constants,
-    /// not hardcoded, so this stays correct if the budget/tail-reserve is
-    /// ever retuned. Red-proved: reverting to a raw byte-offset slice on
-    /// either cut panics on these inputs with "byte index N is not a
-    /// char boundary".
     /// (#3626) A combining mark applies to the character before it, so a
     /// tail that began with one would draw it on the `…` itself (struck
     /// through, circled, accented) and disguise the cut. The tail starts on
@@ -8077,6 +8145,96 @@ mod tests {
         }
     }
 
+    /// (#3626) When the end of the text is one character carrying more
+    /// marks than the tail has room for, the tail still shows that
+    /// character, with as many of its marks as fit, rather than nothing.
+    #[test]
+    fn bound_reason_width_keeps_the_end_when_it_is_one_heavily_marked_character() {
+        let text = format!("{}{}", "a".repeat(40), "\u{301}".repeat(200));
+        let out = bound_reason_width(&text, 40);
+        let (head, tail) = out.split_once('…').expect("cut");
+        assert!(head.starts_with('a') && tail.starts_with('a'), "{out:?}");
+        assert!(display_columns(&out) <= 40, "{out:?}");
+        // Text that is that one character alone shows it once, not twice.
+        let out = bound_reason_width(&format!("a{}", "\u{301}".repeat(1000)), 40);
+        assert!(out.ends_with('…') && out.matches('a').count() == 1, "{out:?}");
+    }
+
+    /// (#3626) A flag is two columns, and so is a lone regional indicator,
+    /// which some terminals draw two wide.
+    #[test]
+    fn display_columns_counts_flags_and_lone_regional_indicators_as_two() {
+        assert_eq!(display_columns("🇺🇸"), 2);
+        assert_eq!(display_columns("🇺"), 2);
+        assert_eq!(display_columns("🇺🇸🇯"), 4);
+        assert_eq!(display_columns("a🇯🇵b"), 4);
+    }
+
+    /// The flags `s` shows: regional indicators paired from the start of
+    /// each run, as a terminal pairs them; a lone one is its own entry.
+    fn flags_shown(s: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut run = String::new();
+        for c in s.chars().chain(['\0']) {
+            if ('\u{1F1E6}'..='\u{1F1FF}').contains(&c) {
+                run.push(c);
+                continue;
+            }
+            let chars: Vec<char> = run.chars().collect();
+            out.extend(chars.chunks(2).map(|pair| pair.iter().collect::<String>()));
+            run.clear();
+        }
+        out
+    }
+
+    /// (#3626) The cut never splits a flag, a skin tone or a joined emoji:
+    /// a flag cut in half pairs its other half with the next indicator and
+    /// shows a flag the text never had (🇺🇸🇺🇸 cut after one indicator reads
+    /// 🇸🇺), and a lone indicator may be drawn two columns wide. Each run of
+    /// indicators pairs from its start, and the tail never begins with a
+    /// modifier, a joiner, a selector or a second half.
+    #[test]
+    fn bound_reason_width_cuts_only_between_whole_emoji() {
+        let zwj = '\u{200D}';
+        let cases = [
+            "🇺🇸".repeat(30),
+            format!("a{}", "🇺🇸".repeat(30)),
+            format!("🇺{}", "🇸🇺".repeat(30)),
+            format!("{}🇯🇵", "🇺🇸".repeat(29)),
+            "👋🏽".repeat(30),
+            format!("a{}", "👍🏿".repeat(30)),
+            format!("👨{zwj}👩{zwj}👧").repeat(10),
+            "☺\u{FE0F}".repeat(50),
+        ];
+        for text in &cases {
+            let out = bound_reason_width(text, 40);
+            let (head, tail) = out.split_once('…').expect("cut");
+            assert!(display_columns(&out) <= 40, "{} columns: {out}", display_columns(&out));
+            let had = flags_shown(text);
+            for flag in flags_shown(&out) {
+                assert!(had.contains(&flag), "{flag} is not a flag of {text}: {out}");
+            }
+            let first = tail.chars().next().expect("a tail");
+            assert!(display_width(first) > 0 && !('\u{1F3FB}'..='\u{1F3FF}').contains(&first), "tail starts {first:?}: {out}");
+            assert!(!head.ends_with(zwj), "{out}");
+            let cut_before = text[head.len()..].chars().next().expect("a cut");
+            assert!(!('\u{1F3FB}'..='\u{1F3FF}').contains(&cut_before), "the head drops a skin tone: {out}");
+        }
+    }
+
+    /// (#2196 fix-round MUST FIX 2, extended in fix-round 2 for the
+    /// head+tail split MUST FIX C introduced) `bound_reason_width` walks
+    /// `char_indices` from BOTH ends — forward for the head cut, in
+    /// reverse for the tail cut — so every candidate cut point is a
+    /// UTF-8 char boundary BY CONSTRUCTION in both directions. Pins that
+    /// against exactly the inputs a naive byte-offset slice panics on: a
+    /// multi-byte character straddling the HEAD cut point, and an
+    /// all-wide-CJK reason (every character multi-byte) straddling BOTH
+    /// cut points at once. Numbers are derived from the real constants,
+    /// not hardcoded, so this stays correct if the budget/tail-reserve is
+    /// ever retuned. Red-proved: reverting to a raw byte-offset slice on
+    /// either cut panics on these inputs with "byte index N is not a
+    /// char boundary".
     #[test]
     fn truncate_reason_never_panics_on_a_multibyte_char_straddling_the_cut() {
         let ellipsis_w = display_width('…');
