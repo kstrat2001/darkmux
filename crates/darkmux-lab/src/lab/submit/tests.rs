@@ -1448,3 +1448,21 @@ fn a_flint_run_before_the_snapshot_names_its_managed_flint_model() {
     assert_eq!(named.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["flint-int4"]);
     assert_eq!(served_by("r1", "flint", None, &named, None).unwrap().hardware, SubmittingMachine);
 }
+
+/// (Operator, 2026-11-17) A run that recorded no hardware has its host
+/// figures withheld by `run stats`, so even a `--hardware
+/// submitting-machine` submit publishes them as null.
+#[test]
+fn a_run_stats_withheld_publishes_null_even_as_this_machines() {
+    let mut s = stats();
+    for k in ["pkg_w_busy", "cpu_w_busy", "gpu_w_busy", "gpu_duty_pct", "pkg_j_per_1k_tokens", "mem_pct_busy_max", "cpu_speed_limit_min"] {
+        s[k] = Value::Null;
+    }
+    s["thermal_states_busy"] = json!({});
+    s["throttled_samples"] = json!(0);
+    s["this_machine"] = json!({"pkg_w_busy": 31.26, "gpu_w_busy": 24.95});
+    let run = bundle_run("r", &manifest(), &s, &RanBy::default(), &stack(), &[]);
+    for k in HOST_DETAIL.into_iter().filter(|k| *k != "throttledSamples") {
+        assert_eq!(run["detail"][k], Value::Null, "{k}");
+    }
+}

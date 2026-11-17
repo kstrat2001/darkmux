@@ -174,16 +174,18 @@ fn a_run_served_elsewhere_says_its_host_figures_were_not_measured() {
     assert!(!t.contains("38 W") && !t.contains("energy  "), "this machine's draw is never printed as the run's: {t}");
 }
 
-/// A run that did not record which machine served it prints its figures
-/// with the caveat that they are this machine's.
+/// A run that recorded no hardware prints no power line of its own: it
+/// says why its readings are not attributed.
 #[test]
-fn a_run_with_unrecorded_hardware_prints_the_caveat() {
+fn a_run_with_unrecorded_hardware_says_its_host_figures_were_not_measured() {
     let mut s = run("r");
     s.hardware = None;
     let t = run_text(&s);
-    assert!(t.contains("package 38 W"), "{t}");
-    let caveats = t.find("not reconciled").expect("caveat block");
-    assert!(t[caveats..].contains("did not record which machine served its model"), "{t}");
+    assert!(
+        t.contains("power        not measured for this run: it recorded no hardware, so this machine's readings can't be attributed to it"),
+        "{t}"
+    );
+    assert!(!t.contains("package 38 W"), "{t}");
 }
 
 /// The caveats print beneath the figures, and only when a check failed.

@@ -21,6 +21,7 @@ fn run(name: &str, verify: &str) -> RunStats {
             streams_terminated: true,
             ..Default::default()
         },
+        hardware: Some(darkmux_types::Hardware::SubmittingMachine),
         ..Default::default()
     }
 }
@@ -141,6 +142,8 @@ fn a_run_served_elsewhere_raises_its_own_flag() {
     assert_eq!(flags(&r), vec!["ELSEWHERE"]);
     r.hardware = Some(darkmux_types::Hardware::SubmittingMachine);
     assert!(flags(&r).is_empty());
+    r.hardware = None;
+    assert_eq!(flags(&r), vec!["NO-HW"], "a run that recorded no hardware");
 }
 
 /// (#2833) `verify_ungated` alone raises exactly one flag, on an otherwise
@@ -320,6 +323,9 @@ fn a_run_served_elsewhere_is_not_an_overlapping_consumer() {
     hosted.started_at_unix_ms = Some(1_050_000);
     hosted.wall_ms = 100_000;
     assert!(overlapping(&[local.clone(), hosted.clone()]).is_empty());
+    let mut unrecorded = hosted.clone();
+    unrecorded.hardware = None;
+    assert!(overlapping(&[local.clone(), unrecorded]).is_empty(), "a run with no hardware and no local compaction");
     // A compactor on this machine, or records that cannot say, make it a
     // consumer again.
     for here in [Some(1), None] {
@@ -335,7 +341,8 @@ fn a_run_served_elsewhere_is_not_an_overlapping_consumer() {
 /// Both reasons, when both hold; none leaves the generic one.
 #[test]
 fn the_energy_reason_names_every_cause() {
-    assert_eq!(energy_withheld_reason(0, 0), None);
-    let both = energy_withheld_reason(2, 1).unwrap();
-    assert!(both.starts_with("2 run(s) have overlapping") && both.contains("; 1 run(s) were served by another machine"), "{both}");
+    assert_eq!(energy_withheld_reason(0, 0, 0), None);
+    let all = energy_withheld_reason(2, 1, 3).unwrap();
+    assert!(all.starts_with("2 run(s) have overlapping") && all.contains("; 1 run(s) were served by another machine"), "{all}");
+    assert!(all.ends_with("; 3 run(s) recorded no hardware (NO-HW), so this machine's readings can't be attributed to them"), "{all}");
 }

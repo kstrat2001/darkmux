@@ -387,24 +387,27 @@ pub struct RunStats {
     /// seat, another Mac): every host power, energy and thermal figure above
     /// is absent, each listed in `host_unmeasured`, because this machine's
     /// telemetry does not describe the machine that did the work; a parallel
-    /// local run can keep this machine busy throughout. The sample counts,
-    /// `busy_basis` and `telemetry_max_gap_ms` still describe the telemetry
-    /// that was read. `None` when the run
-    /// did not record it (a run from before run manifest 1.3, or an endpoint
-    /// that declared no `hardware`): the figures are this machine's, and
-    /// `unreconciled` says so.
+    /// local run can keep this machine busy throughout. `None` when the run
+    /// did not record it (a run from before run manifest 1.3, an endpoint
+    /// that declared no `hardware`, or snapshot entries that disagree): the
+    /// same figures are absent, because this machine's readings cannot be
+    /// attributed to a run that does not say where its model ran. The
+    /// sample counts, `busy_basis` and `telemetry_max_gap_ms` still describe
+    /// the telemetry that was read.
     pub hardware: Option<darkmux_types::Hardware>,
     /// (2.5.0) This machine's own readings over the run's window, for a run
-    /// another machine served (`hardware: unknown`), so what this machine
-    /// was doing meanwhile is still on record; never the run's figures.
-    /// `None` for every other run, and with no telemetry in the window.
+    /// this machine is not known to have served (`hardware` is `unknown` or
+    /// `None`), so what this machine was doing meanwhile is still on record;
+    /// never the run's figures. `None` for a run this machine served, and
+    /// with no telemetry in the window.
     pub this_machine: Option<MachineReadings>,
-    /// (2.5.0) For a run another machine served: how many of its
-    /// compactions (each `compaction.start`, answered or not) went to a
-    /// model the snapshot says this machine served, the run's own draw on
-    /// this machine. `Some(0)` when it made none; `None` when a call's model is one the snapshot does
-    /// not place (darkmux cannot say where it ran), and for every run this
-    /// machine served or did not record.
+    /// (2.5.0) For a run this machine is not known to have served
+    /// (`hardware` is `unknown` or `None`): how many of its compactions
+    /// (each `compaction.start`, answered or not) went to a model the
+    /// snapshot says this machine served, the run's own draw on this
+    /// machine. `Some(0)` when it made none; `None` when one's model is one
+    /// the snapshot does not place (darkmux cannot say where it ran), and for
+    /// every run this machine served.
     pub compactor_calls_here: Option<u64>,
 
     /// This session's flow records inside the scanned window. A provenance
@@ -457,8 +460,8 @@ impl RunStats {
         out
     }
 
-    /// The caveats about the host figures: whether telemetry covered the
-    /// run, and whether the run recorded which machine served it.
+    /// The caveats about the host figures: whether telemetry landed in the
+    /// run's window, and covered it.
     fn host_caveats(&self, out: &mut Vec<&'static str>) {
         let c = &self.checks;
         if !c.have_telemetry_samples {
@@ -467,12 +470,6 @@ impl RunStats {
         }
         if !c.telemetry_covers_run {
             out.push("host telemetry does not cover the whole run; busy time and energy are withheld");
-        }
-        if self.hardware.is_none() {
-            out.push(
-                "the run did not record which machine served its model, so the host figures are this machine's, \
-                 and the run's only if it served the model",
-            );
         }
     }
 }
@@ -561,7 +558,20 @@ fn agreed(mut all: impl Iterator<Item = Option<darkmux_types::Hardware>>) -> Opt
 /// Why a host figure is absent from a run another machine served.
 const SERVED_ELSEWHERE: &str = "another machine served the run's model (hardware: unknown), so this machine's telemetry does not describe it";
 
-/// The host figures withheld from a run another machine served.
+/// Why a host figure is absent from a run that recorded no hardware.
+const NO_HARDWARE: &str = "this run recorded no hardware, so this machine's readings can't be attributed to it";
+
+/// Why this machine's readings are not the run's, or `None` when this
+/// machine served it.
+pub(crate) fn not_attributed(hardware: Option<darkmux_types::Hardware>) -> Option<&'static str> {
+    match hardware {
+        Some(darkmux_types::Hardware::SubmittingMachine) => None,
+        Some(darkmux_types::Hardware::Unknown) => Some(SERVED_ELSEWHERE),
+        None => Some(NO_HARDWARE),
+    }
+}
+
+/// The host figures withheld from a run this machine is not known to have served.
 const WITHHELD_ELSEWHERE: [&str; 15] = [
     "gpu_w_busy",
     "gpu_w_max",
@@ -580,18 +590,19 @@ const WITHHELD_ELSEWHERE: [&str; 15] = [
     "fan_rpm_max_busy",
 ];
 
-/// (2.5.0) Record which machine served the run, and for a run another
-/// machine served, move this machine's readings out of the run's figures.
+/// (2.5.0) Record which machine served the run, and for a run this
+/// machine is not known to have served, move this machine's readings out
+/// of the run's figures.
 fn attribute_host(stats: &mut RunStats, hardware: Option<darkmux_types::Hardware>) {
     stats.hardware = hardware;
-    if hardware == Some(darkmux_types::Hardware::Unknown) && stats.checks.have_telemetry_samples {
-        stats.this_machine = Some(withhold_host(stats));
+    if let Some(why) = not_attributed(hardware).filter(|_| stats.checks.have_telemetry_samples) {
+        stats.this_machine = Some(withhold_host(stats, why));
     }
 }
 
 /// This machine's readings, taken out of `s`, with the energy built on them
 /// cleared and each withheld figure listed in `host_unmeasured`.
-fn withhold_host(s: &mut RunStats) -> MachineReadings {
+fn withhold_host(s: &mut RunStats, why: &str) -> MachineReadings {
     let kept = MachineReadings {
         gpu_w_busy: s.gpu_w_busy.take(),
         gpu_w_max: s.gpu_w_max.take(),
@@ -608,7 +619,7 @@ fn withhold_host(s: &mut RunStats) -> MachineReadings {
     };
     (s.pkg_j_busy, s.pkg_j_per_1k_tokens, s.pkg_j_per_1k_reasoning_chars) = (None, None, None);
     for field in WITHHELD_ELSEWHERE {
-        s.host_unmeasured.insert(field.to_string(), SERVED_ELSEWHERE.to_string());
+        s.host_unmeasured.insert(field.to_string(), why.to_string());
     }
     kept
 }
@@ -1056,13 +1067,13 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
 }
 
 /// (2.5.0) Which machine served the run, from its snapshot, and for a run
-/// served elsewhere, its compactor calls on this machine.
+/// this machine is not known to have served, its compactions here.
 fn attribute_run(stats: &mut RunStats, run_dir: &Path, snapshot: Option<&[crate::lab::manifest::ModelHardware]>) {
     let hardware = served_hardware(snapshot, stats.model.as_deref());
     attribute_host(stats, hardware);
-    if hardware == Some(darkmux_types::Hardware::Unknown) {
-        // Read again only for a run served elsewhere: the fold keeps no
-        // compactor model names.
+    if not_attributed(hardware).is_some() {
+        // Read again only for such a run: the fold keeps no compactor
+        // model names.
         let trajectory = std::fs::read_to_string(run_dir.join(darkmux_trajectory::TRAJECTORY_FILE)).unwrap_or_default();
         stats.compactor_calls_here = compactor_calls_here(&trajectory, snapshot);
     }

@@ -124,11 +124,19 @@ pub fn run_text(s: &crate::lab::stats::RunStats) -> String {
 
 /// The host telemetry lines: power, energy and thermal state where package
 /// power was read, and the board sensors wherever they were; for a run
-/// another machine served, one line saying they were not measured.
+/// this machine is not known to have served, one line saying why they were
+/// not measured.
 fn host_text(s: &crate::lab::stats::RunStats, out: &mut String) {
-    if s.hardware == Some(darkmux_types::Hardware::Unknown) {
-        p!(out, "power        not measured for this run: another machine served its model (hardware: unknown)");
-        return;
+    match s.hardware {
+        Some(darkmux_types::Hardware::Unknown) => {
+            p!(out, "power        not measured for this run: another machine served its model (hardware: unknown)");
+            return;
+        }
+        None => {
+            p!(out, "power        not measured for this run: it recorded no hardware, so this machine's readings can't be attributed to it");
+            return;
+        }
+        Some(darkmux_types::Hardware::SubmittingMachine) => {}
     }
     if let Some(pkg) = s.pkg_w_busy {
         power_text(s, pkg, out);

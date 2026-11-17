@@ -1665,17 +1665,23 @@ fn a_local_run_keeps_its_host_figures() {
     }
 }
 
+/// (Operator, 2026-11-17: "withhold those runs that don't have hardware")
 /// A run that did not record which machine served it (from before darkmux
-/// recorded it, or an endpoint that declared none) keeps the figures, and
-/// says plainly that they are this machine's and the run's only if it
-/// served the model.
+/// recorded it, or an endpoint that declared none) gets none of this
+/// machine's figures as its own: they are withheld, each with the reason,
+/// and kept apart under `this_machine`.
 #[test]
-fn a_run_with_unrecorded_hardware_says_its_host_figures_are_this_machines() {
+fn a_run_with_unrecorded_hardware_withholds_its_host_figures() {
     for s in [busy_run("m", None), busy_run("m", Some(served("endpoint", None)))] {
         assert_eq!(s.hardware, None);
-        assert!(attributed(&s).iter().all(|(_, present)| *present), "{:?}", attributed(&s));
-        assert!(s.this_machine.is_none());
-        assert!(s.unreconciled().iter().any(|c| c.contains("did not record which machine served")), "{:?}", s.unreconciled());
+        for (field, present) in attributed(&s) {
+            assert!(!present, "{field} cannot be attributed to a run with no hardware");
+            let why = s.host_unmeasured.get(field).unwrap_or_else(|| panic!("{field} says why it is absent"));
+            assert_eq!(why, "this run recorded no hardware, so this machine's readings can't be attributed to it");
+        }
+        assert_eq!(s.this_machine.as_ref().and_then(|m| m.pkg_w_busy), Some(47.0), "this machine's readings are kept apart");
+        assert_eq!(s.compactor_calls_here, Some(0), "no compaction: no model work on this machine");
+        assert!(!s.unreconciled().iter().any(|c| c.contains("which machine")), "{:?}", s.unreconciled());
     }
 }
 
@@ -1713,13 +1719,13 @@ fn a_hosted_run_without_telemetry_keeps_nothing_apart() {
     assert!(s.host_unmeasured.is_empty(), "{:?}", s.host_unmeasured);
 }
 
-/// The unrecorded-hardware caveat is about host figures, so a run with no
-/// telemetry (no host figures at all) does not carry it.
+/// With no telemetry, a run with no hardware has nothing to withhold.
 #[test]
-fn unrecorded_hardware_is_no_caveat_without_host_figures() {
-    let s = stats("", 10_000);
-    assert_eq!(s.hardware, None);
-    assert!(!s.unreconciled().iter().any(|c| c.contains("which machine")), "{:?}", s.unreconciled());
+fn unrecorded_hardware_without_telemetry_withholds_nothing() {
+    let mut s = stats("", 10_000);
+    attribute_host(&mut s, None);
+    assert_eq!((s.hardware, s.this_machine.as_ref()), (None, None));
+    assert!(s.host_unmeasured.is_empty(), "{:?}", s.host_unmeasured);
 }
 
 /// (#3644 review) A profile can list the same model twice: managed on this
@@ -1821,14 +1827,16 @@ fn a_hosted_runs_compactor_calls_on_this_machine_are_counted() {
     assert_eq!(compactor_calls_here(&traj(&[]), None), Some(0), "no compaction, no local model work");
 }
 
-/// `compactor_calls_here` is read for a run another machine served, and
-/// only there: a local run's model work is this machine's anyway.
+/// `compactor_calls_here` is read for a run this machine is not known to
+/// have served, and only there: a local run's model work is this
+/// machine's anyway.
 #[test]
 fn compactor_calls_here_is_read_only_for_a_run_served_elsewhere() {
     let hosted = busy_run("m", Some(served("provider", Some("unknown"))));
     assert_eq!(hosted.compactor_calls_here, Some(0));
     let local = busy_run("darkmux:m", Some(served("managed", Some("submitting-machine"))));
     assert_eq!(local.compactor_calls_here, None);
+    assert_eq!(busy_run("m", None).compactor_calls_here, Some(0), "read for a run with no hardware too");
 }
 
 /// (#3644 third review) The runtime writes `compaction.call` only for a
