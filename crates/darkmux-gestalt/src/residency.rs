@@ -17,7 +17,7 @@
 
 use crate::desired::Placement;
 use crate::facts::ResidentFact;
-use crate::ownership::{ctx_sufficient, is_darkmux_owned};
+use crate::ownership::{ctx_sufficient, is_darkmux_owned, is_own_instance};
 use serde::{Deserialize, Serialize};
 
 /// What acquiring `Placement` should do about the current residents.
@@ -61,7 +61,10 @@ pub enum ResidencyDecision {
 /// doomed second load reach the host's own OOM guardrail (#1271).
 ///
 /// A seat dispatches to its placement's own identifier, so only the resident
-/// whose identifier equals it is judged for Reuse (#3074 B10): judging a
+/// [`is_own_instance`] names as that identifier's instance is judged for
+/// Reuse (#3074 B10). A `darkmux:` identifier matches by itself, so a
+/// variant or path id finds its own load whatever key LM Studio lists it
+/// under; an opt-out identifier also needs the modelKey. Judging a
 /// different `darkmux:` copy of the same modelKey would report Reuse for an
 /// instance the dispatch never reaches. With no exact copy, another
 /// darkmux-owned copy of the key is never reusable and is never left beside
@@ -71,8 +74,10 @@ pub enum ResidencyDecision {
 /// lease holds.
 ///
 /// A resident counts as darkmux's own when its identifier is in the
-/// `darkmux:` namespace OR equals the exact identifier THIS placement loads
+/// `darkmux:` namespace OR is the exact identifier THIS placement loads
 /// under, which covers an explicit alias, the documented namespace opt-out.
+/// An alias equal to the resident's own key is LM Studio's default name for
+/// a load made without one, so that resident is foreign.
 ///
 /// Ownership partitions BEFORE matching (absolute ownership, 2026-07-10,
 /// #1274): foreign residents are never candidates, only facts, and a foreign
@@ -81,7 +86,7 @@ pub enum ResidencyDecision {
 /// [`ResidencyDecision::ForeignDuplicate`].
 pub fn decide_residency(residents: &[ResidentFact], p: &Placement) -> ResidencyDecision {
     let same_key = || residents.iter().filter(|r| r.model_key == p.model_key);
-    let exact = same_key().find(|r| r.identifier == p.identifier);
+    let exact = residents.iter().find(|r| is_own_instance(&r.identifier, &r.model_key, &p.model_key, &p.identifier));
     let other_owned = same_key().find(|r| is_darkmux_owned(&r.identifier));
     if let Some(found) = exact {
         return if ctx_sufficient(found.ctx, p.min_ctx) {
@@ -296,6 +301,58 @@ mod tests {
         assert_eq!(
             decide_residency(&residents, &p),
             ResidencyDecision::Reuse { identifier: "darkmux:m".into(), resident_ctx: 100_000 }
+        );
+    }
+
+    // A variant or path id loads under `darkmux:<id>`, and LM Studio may
+    // report the instance's `modelKey` as the base key (inferred: no
+    // recorded `lms ps` row for such a load). The namespaced identifier is
+    // exact, so it alone names darkmux's own instance.
+
+    #[test]
+    fn a_variant_id_reuses_its_own_load_reported_under_the_base_key() {
+        let residents = vec![resident("darkmux:qwen/qwen3.8-27b@4bit", "qwen/qwen3.8-27b", 262_144)];
+        let p = placement("qwen/qwen3.8-27b@4bit", 262_144, None);
+        assert_eq!(
+            decide_residency(&residents, &p),
+            ResidencyDecision::Reuse { identifier: "darkmux:qwen/qwen3.8-27b@4bit".into(), resident_ctx: 262_144 }
+        );
+    }
+
+    #[test]
+    fn a_path_id_reconciles_its_own_undersized_load() {
+        let residents =
+            vec![resident("darkmux:lmstudio-community/Qwen3-Coder-30B-MLX-4bit", "qwen3-coder-30b", 4_096)];
+        let p = placement("lmstudio-community/Qwen3-Coder-30B-MLX-4bit", 32_768, None);
+        assert_eq!(
+            decide_residency(&residents, &p),
+            ResidencyDecision::Reconcile {
+                stale_identifier: "darkmux:lmstudio-community/Qwen3-Coder-30B-MLX-4bit".into(),
+                stale_ctx: 4_096,
+            }
+        );
+    }
+
+    #[test]
+    fn an_opt_out_identifier_on_another_model_is_not_ours() {
+        // A bare identifier is not namespaced, so the model key still has
+        // to match: `custom` serving another model is not this placement's.
+        let residents = vec![resident("custom", "phi-4", 32_768)];
+        let p = placement("devstral", 32_768, Some("custom"));
+        assert_eq!(decide_residency(&residents, &p), ResidencyDecision::LoadFresh);
+    }
+
+    #[test]
+    fn a_load_named_by_its_own_key_is_never_ours() {
+        // LM Studio names a load made without an identifier (its app, a bare
+        // `lms load`) by the model key. An opt-out identifier equal to that
+        // key cannot tell darkmux's instance from the operator's, so the
+        // operator's load is a foreign duplicate, never reused or reconciled.
+        let residents = vec![resident("devstral", "devstral", 4_096)];
+        let p = placement("devstral", 32_768, Some("devstral"));
+        assert_eq!(
+            decide_residency(&residents, &p),
+            ResidencyDecision::ForeignDuplicate { foreign_identifier: "devstral".into() }
         );
     }
 }

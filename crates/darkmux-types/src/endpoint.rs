@@ -2320,4 +2320,39 @@ mod tests {
         assert!(refused[0].to_string().contains("`flint` endpoint"), "{}", refused[0]);
         assert!(!r.needs_lmstudio(), "a Flint model and binding need no LM Studio");
     }
+
+    /// LM Studio names a load made without an identifier (its app, a bare
+    /// `lms load`) by the model key, so an opt-out `identifier` equal to that
+    /// key collides with the operator's own load of the model. Refused at
+    /// preflight naming the key and the fix; a namespaced or distinct
+    /// identifier, or none, passes.
+    #[test]
+    fn an_identifier_equal_to_the_bare_model_key_is_refused() {
+        let r = registry(
+            r#"{"profiles":{"p":{"models":[
+                {"id":"qwen/qwen3.8-27b","n_ctx":8192,"identifier":"qwen/qwen3.8-27b"},
+                {"id":"qwen/qwen3.8-27b@4bit","n_ctx":8192,"identifier":"qwen/qwen3.8-27b"},
+                {"id":"qwen/qwen3.8-27b@8bit","n_ctx":8192,"identifier":"qwen/qwen3.8-27b@8bit"},
+                {"id":"darkmux:phi-4","n_ctx":8192,"identifier":"phi-4"},
+                {"id":"qwen/qwen3.8-27b","n_ctx":8192,"identifier":"darkmux:qwen/qwen3.8-27b"},
+                {"id":"qwen/qwen3.8-27b","n_ctx":8192,"identifier":"my-qwen"},
+                {"id":"qwen/qwen3.8-27b","n_ctx":8192},
+                {"id":"hosted","endpoint":"hosted","identifier":"hosted"}]}},
+                "endpoints":{"hosted":{"url":"https://h.example/v1"}}}"#,
+        );
+        let models = &r.profiles["p"].models;
+        for (i, key) in [(0, "qwen/qwen3.8-27b"), (1, "qwen/qwen3.8-27b"), (2, "qwen/qwen3.8-27b@8bit"), (3, "phi-4")] {
+            let why = models[i].identifier_problem().unwrap_or_else(|| panic!("model {i}: refused"));
+            for n in [&format!("`{key}`")[..], "LM Studio", "darkmux:"] {
+                assert!(why.contains(n), "model {i}: expected {n:?} in: {why}");
+            }
+        }
+        for (i, m) in models.iter().enumerate().skip(4) {
+            assert_eq!(m.identifier_problem(), None, "model {i}");
+        }
+        let invalid = crate::config_enum::colliding_identifiers(&r);
+        let paths: Vec<String> = invalid.iter().map(|v| v.set_in.to_string()).collect();
+        assert_eq!(paths, (0..4).map(|i| format!("profiles.json key `profiles.p.models[{i}].identifier`")).collect::<Vec<_>>());
+        assert!(invalid.iter().all(|v| v.valid.contains("darkmux:")), "the fix names a namespaced identifier");
+    }
 }

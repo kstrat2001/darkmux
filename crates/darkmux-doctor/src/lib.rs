@@ -4252,6 +4252,8 @@ fn endpoints_status(
     invalid.extend(darkmux_types::config_enum::invalid_endpoint_hosts(registry));
     invalid.extend(darkmux_types::config_enum::misplaced_endpoint_hardware(registry));
     invalid.extend(darkmux_types::config_enum::invalid_engine_args(registry));
+    // An `identifier` that is LM Studio's name for a load made without one.
+    invalid.extend(darkmux_types::config_enum::colliding_identifiers(registry));
     // (#3453) rec runs one Flint server per machine.
     invalid.extend(darkmux_types::config_enum::extra_flint_endpoints(registry));
     // Two servers cannot listen on one port.
@@ -12448,6 +12450,18 @@ mod tests {
         let c = endpoints_status(&bad, &[], &mut no_spend, REGISTRY);
         assert_eq!(c.status, Status::Fail, "{}", c.message);
         assert!(c.message.contains("profiles.p.models[0].engine_args") && c.message.contains("--host"), "{}", c.message);
+    }
+
+    /// An LM Studio model's `identifier` equal to its model key, which every
+    /// preflight refuses, is Fail here too, naming its path.
+    #[test]
+    fn an_identifier_equal_to_the_model_key_fails() {
+        let bad = materialized(r#"{"profiles":{"p":{"models":[{"id":"phi-4","n_ctx":8,"identifier":"phi-4"}]}}}"#);
+        let c = endpoints_status(&bad, &[], &mut no_spend, REGISTRY);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("profiles.p.models[0].identifier") && c.message.contains("`phi-4`"), "{}", c.message);
+        let ok = materialized(r#"{"profiles":{"p":{"models":[{"id":"phi-4","n_ctx":8,"identifier":"darkmux:phi-4"}]}}}"#);
+        assert_eq!(endpoints_status(&ok, &[], &mut no_spend, REGISTRY).status, Status::Pass);
     }
 
     /// (#3453) A Flint endpoint is labeled as a server darkmux starts, and a

@@ -38,6 +38,8 @@ pub mod registry_write;
 /// every unmanaged endpoint whose host it cannot read unambiguously
 /// (`config_enum::invalid_endpoint_hosts`), every profile model's `engine_args`
 /// that cannot be used as written (`config_enum::invalid_engine_args`, #3448),
+/// every LM Studio model's `identifier` equal to the model key LM Studio names
+/// a load made without one (`config_enum::colliding_identifiers`),
 /// a utility binding on a server darkmux starts (Tensorfold, Flint), whose jobs
 /// do not start servers (`config_enum::utility_on_engine_server`), a second
 /// Flint endpoint (`config_enum::extra_flint_endpoints`, #3453: rec runs one
@@ -78,6 +80,7 @@ pub fn preflight_with(
                 refusal.invalid.extend(config_enum::invalid_endpoint_hosts(&loaded.registry));
                 refusal.invalid.extend(config_enum::misplaced_endpoint_hardware(&loaded.registry));
                 refusal.invalid.extend(config_enum::invalid_engine_args(&loaded.registry));
+                refusal.invalid.extend(config_enum::colliding_identifiers(&loaded.registry));
                 refusal.invalid.extend(config_enum::utility_on_engine_server(&loaded.registry));
                 refusal.invalid.extend(config_enum::extra_flint_endpoints(&loaded.registry));
                 refusal
@@ -253,6 +256,22 @@ mod user_file_tests {
                 "endpoints": {"studio": {"url": "http://studio.local:8080/v1", "hardware": "unknown"}}}"#,
         );
         assert_eq!(crate::preflight_with(Scope::LabRun, Some(&clean)), Ok(()));
+    }
+
+    /// An LM Studio model's `identifier` equal to its model key is the name LM
+    /// Studio gives the operator's own load of it: every dispatching
+    /// preflight refuses it, naming the key path and a namespaced fix.
+    #[test]
+    #[serial_test::serial] // the preflight reads DARKMUX_DEFAULT_ENGINE, which a sibling test sets
+    fn an_identifier_equal_to_the_model_key_is_refused_by_every_dispatching_preflight() {
+        let (_d, path) = write(r#"{"profiles": {"p": {"models": [{"id": "qwen/q@4bit", "n_ctx": 1, "identifier": "qwen/q"}]}}}"#);
+        for scope in [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun] {
+            let msg = crate::preflight_with(scope, Some(&path)).expect_err("refused").to_string();
+            assert!(msg.contains("profiles.json key `profiles.p.models[0].identifier`"), "{msg}");
+            assert!(msg.contains("`qwen/q`") && msg.contains("darkmux:qwen/q@4bit"), "{msg}");
+        }
+        let (_d, clean) = write(r#"{"profiles": {"p": {"models": [{"id": "qwen/q@4bit", "n_ctx": 1, "identifier": "my-q"}]}}}"#);
+        assert_eq!(crate::preflight_with(Scope::Dispatch, Some(&clean)), Ok(()));
     }
 
     #[test]

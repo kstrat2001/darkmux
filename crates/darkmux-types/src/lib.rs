@@ -428,6 +428,33 @@ impl ProfileModel {
         self.engine_args.iter().find_map(|arg| reserved_engine_arg(arg))
     }
 
+    /// Why this model's explicit `identifier` cannot be used on LM Studio,
+    /// or `None`. LM Studio names a load made without an identifier (one from
+    /// its app, a bare `lms load`) by its model key, so an `identifier` equal
+    /// to the model's bare key, or to a variant's base key
+    /// (`qwen/qwen3.8-27b` for `qwen/qwen3.8-27b@4bit`), is the name of the
+    /// operator's own load of it: darkmux could not tell its instance from
+    /// that one and would reuse, reload or unload it (contract 4), and
+    /// `darkmux machine eject`, which unloads only the `darkmux:` namespace,
+    /// could not reclaim darkmux's own. A path id's key is not known here,
+    /// so only these two spellings are refused.
+    pub fn identifier_problem(&self) -> Option<String> {
+        let identifier = self.identifier.as_deref()?;
+        if !matches!(self.endpoint_kind(), Ok(EndpointKind::Managed(ManagedBackend::Lmstudio))) {
+            return None;
+        }
+        let key = self.id.strip_prefix("darkmux:").unwrap_or(&self.id);
+        let base = key.split_once('@').map_or(key, |(base, _)| base);
+        (identifier == key || identifier == base).then(|| {
+            format!(
+                "`identifier` is `{identifier}`, the model key LM Studio names a load of this model made without an \
+                 identifier (from its app, or a bare `lms load`), so darkmux could not tell its own instance from \
+                 that one and `darkmux machine eject` could not reclaim it. Use `darkmux:{key}`, an identifier \
+                 distinct from the model key, or no `identifier` (darkmux then loads under `darkmux:{key}`)"
+            )
+        })
+    }
+
     /// (#2902 step 4) THE n_ctx rule: a managed model must declare the window
     /// it is loaded at. The one predicate `require_n_ctx`, the registry's
     /// validation and every placement path share.

@@ -638,6 +638,27 @@ pub fn invalid_engine_args(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> 
     out
 }
 
+/// Every profile model whose explicit `identifier` collides with the name LM
+/// Studio gives a load made without one (`ProfileModel::identifier_problem`).
+/// Refused at every dispatching preflight and Fail in doctor, naming
+/// `profiles.<p>.models[<i>].identifier`.
+pub fn colliding_identifiers(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
+    let mut out = Vec::new();
+    for (pname, profile) in &reg.profiles {
+        for (i, m) in profile.models.iter().enumerate() {
+            if let Some(why) = m.identifier_problem() {
+                out.push(InvalidSetting {
+                    set_in: SetIn::Profiles(format!("profiles.{pname}.models[{i}].identifier")),
+                    problem: why,
+                    valid: "a `darkmux:`-prefixed identifier, one distinct from the model key, or no `identifier`"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
 /// (#3448, #3453) The utility binding (`internal.utility`) on a server
 /// darkmux starts (Tensorfold, Flint): the utility jobs (compaction, radio
 /// routing) send to LM Studio or to an endpoint darkmux only sends to, and do
