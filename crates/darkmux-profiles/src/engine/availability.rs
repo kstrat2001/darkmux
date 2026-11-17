@@ -456,7 +456,7 @@ impl EngineAnswer for LmStudioAnswer {
             // Off but on this machine: a dispatch starts the server (#3578).
             return if self.server_up { Availability::resident() } else { Availability::startable() };
         }
-        self.from_catalog(&key)
+        self.by_catalog(&key)
     }
 
     fn residents(&self) -> Option<Vec<LoadedModel>> {
@@ -466,7 +466,7 @@ impl EngineAnswer for LmStudioAnswer {
 
 impl LmStudioAnswer {
     /// Not resident: `startable` when LM Studio has the model downloaded.
-    fn from_catalog(&self, key: &str) -> Availability {
+    fn by_catalog(&self, key: &str) -> Availability {
         match &self.catalog {
             Err(e) => {
                 Availability::unknown(format!("LM Studio did not list its downloaded models: {e}"))
