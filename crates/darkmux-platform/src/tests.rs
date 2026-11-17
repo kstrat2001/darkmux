@@ -2621,3 +2621,26 @@ fn the_host_names_a_processs_executable() {
     assert_eq!(current().process_name(std::process::id()), Some(want));
     assert_eq!(OtherPlatform.process_name(1), None);
 }
+
+/// A look at a port's connections that hangs is no answer within its
+/// bound, never a wait without end; one that answers is read.
+#[cfg(unix)]
+#[test]
+fn a_hung_connection_listing_is_no_answer_within_its_bound() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::TempDir::new().unwrap();
+    let stub = |name: &str, body: &str| {
+        let p = dir.path().join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        p
+    };
+    let hung = stub("hung", "exec /bin/sleep 3");
+    let started = std::time::Instant::now();
+    let answer = crate::macos::lsof_established_with(&hung, 8767, std::time::Duration::from_millis(300));
+    assert_eq!(answer, None, "a hung lsof is no answer");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "within its bound: {:?}", started.elapsed());
+    let answers = stub("answers", "printf 'p7\\nn127.0.0.1:5000->127.0.0.1:8767\\n'");
+    let out = crate::macos::lsof_established_with(&answers, 8767, std::time::Duration::from_secs(5)).unwrap();
+    assert_eq!(crate::peers_from_lsof_fpn(&out, "127.0.0.1:8767".parse().unwrap()), vec![("127.0.0.1:5000".parse().unwrap(), 7)]);
+}

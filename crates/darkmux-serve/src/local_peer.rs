@@ -27,21 +27,43 @@
 //! read auth is on), and the client listener refuses it. Failing toward
 //! showing less is the doctrine every other local check here follows.
 //!
-//! **Cost.** One socket-table read ([`darkmux_platform::Platform::tcp_peers_of`],
-//! one `lsof` on macOS, about 75 ms; `/proc` on Linux) per round, and a
-//! round answers every connection accepted before it began
-//! ([`holders_of`]), so a burst of connections costs one read, not one
-//! each. Then one process-table read, skipped when no host sandbox runs.
-//! A connection is judged once, on its first request; its later requests
-//! read the verdict. A peer address is the operator's only while its
-//! connection lasts ([`Verdict`]'s drop), so a port another process reuses
-//! later inherits nothing.
+//! **A second line, not the barrier.** This check catches sandboxed work
+//! that stays where darkmux put it. It does not stop code trying to get
+//! past it: the barrier is the sandbox's own network profile, which keeps
+//! a sandbox off darkmux's ports. Read every residual below as reachable
+//! unless that profile refuses it.
 //!
-//! **What it cannot tell.** A sandboxed process that started a session of
-//! its own and whose parents back to the sandbox have all exited (a
-//! double-fork daemon) has nothing marking it as the sandbox's
-//! (`sandbox_members`), so it reads as the operator. So does the operator's
-//! own browser, when sandboxed code has the system open a URL in it.
+//! **Cost.** One socket-table read ([`darkmux_platform::Platform::tcp_peers_of`],
+//! one `lsof` on macOS, about 75 ms; `/proc` on Linux) per round. At most
+//! one round runs per listener, on a task of its own and outside every
+//! lock, and it answers every connection accepted before it began
+//! ([`Rounds`]), so a burst of connections costs one read, not one each.
+//! A read that hangs is no answer: `lsof` is bounded at 5 s as `netstat`
+//! is, a connection waits at most [`JUDGE_BOUND`] for its round, and one
+//! that times out reads as remote. Then one process-table read and one
+//! `ps` per Seatbelt sandbox recorded, both skipped when no host sandbox
+//! runs. A request a proxy forwarded costs no lookup. A connection is
+//! judged once, on its first request; its later requests read the verdict.
+//! A peer address is the operator's only while its connection lasts
+//! ([`Verdict`]'s drop), so a port another process reuses later inherits
+//! nothing.
+//!
+//! **What it cannot tell.**
+//! - A sandboxed process that double-forks and starts a session of its own
+//!   (`setsid`), with every parent back to the sandbox gone, has nothing
+//!   marking it as the sandbox's (`sandbox_members`), so it reads as the
+//!   operator. This was proven under a real `sandbox-exec`: three lines of
+//!   perl, then `curl` to `/health`, got this machine's answer. The
+//!   kernel's own mark (`sandbox_check`) survives `setsid`, but it marks
+//!   browsers' network helpers and other apps' sandboxed processes too, so
+//!   it cannot decide alone.
+//! - The operator's own browser, when sandboxed code has the system open a
+//!   URL in it, is the operator's browser.
+//! - An app the sandbox wrote and had the system open (LaunchServices'
+//!   `open` of a `.app`) runs outside the sandbox, as this user, and reads
+//!   as the operator.
+//! - Another user's process on this machine is never the operator: the
+//!   socket lookup cannot see it, so it reads as remote.
 
 use axum::extract::connect_info::{Connected, IntoMakeServiceWithConnectInfo};
 use axum::extract::{ConnectInfo, Request};
@@ -254,7 +276,7 @@ async fn judge_peer(mut req: Request, next: Next) -> Response {
 async fn verdict_of(conn: &PeerConn) -> PeerProcess {
     let kind = match conn.local {
         None => PeerProcess::Unknown("the connection's own address could not be read"),
-        Some(local) => match holders_of(local, conn.remote, conn.accepted).await {
+        Some(local) => match ROUNDS.holders_of(local, conn.remote, conn.accepted).await {
             None => PeerProcess::Unknown("this machine's connections could not be read"),
             Some(holders) => judged_now(holders).await,
         },
@@ -275,35 +297,139 @@ async fn judged_now(holders: Vec<u32>) -> PeerProcess {
     .unwrap_or(PeerProcess::Unknown("the lookup did not finish"))
 }
 
+/// What reads every connection to the listener at an address, `(peer,
+/// pid)` ([`darkmux_platform::Platform::tcp_peers_of`]); `None`: no answer.
+pub(crate) type PeersReader =
+    Arc<dyn Fn(SocketAddr) -> Option<Vec<(SocketAddr, u32)>> + Send + Sync>;
+
+/// How long a connection waits for its round: as long as one socket-table
+/// read may take (the platform bounds `lsof` and `netstat` at 5 s). One
+/// that has not answered by then is no answer, so its caller is remote.
+const JUDGE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// One read of the connections to a listener: when it began, and every
-/// `(peer, pid)` it found.
+/// `(peer, pid)` it found (`None`: the read gave no answer).
 struct Round {
     started: Instant,
-    peers: Vec<(SocketAddr, u32)>,
+    peers: Option<Vec<(SocketAddr, u32)>>,
 }
 
-/// The latest round for each listener address; one round runs at a time.
-static ROUNDS: LazyLock<tokio::sync::Mutex<HashMap<SocketAddr, Round>>> =
-    LazyLock::new(Default::default);
+/// One listener's rounds: the latest that finished (each waiter is told
+/// when the next one does) and when the one running now began.
+struct ListenerRounds {
+    latest: tokio::sync::watch::Sender<Option<Arc<Round>>>,
+    running: Option<Instant>,
+}
 
-/// Every process holding the other end of `remote`'s connection to the
-/// listener at `local`, accepted at `accepted`: from the latest round when
-/// it began after the connection was accepted (so the connection was in the
-/// table it read), else from a new one. `None` when the table cannot be read.
-async fn holders_of(local: SocketAddr, remote: SocketAddr, accepted: Instant) -> Option<Vec<u32>> {
-    let local = canonical(local);
-    let mut rounds = ROUNDS.lock().await;
-    if !rounds.get(&local).is_some_and(|r| r.started >= accepted) {
-        let started = Instant::now();
-        let peers =
-            tokio::task::spawn_blocking(move || darkmux_platform::current().tcp_peers_of(local))
+/// The rounds of every listener: at most one read runs per listener, off
+/// the async workers and outside every lock, and each connection waits for
+/// the first round that began after it was accepted, at most `bound`.
+pub(crate) struct Rounds {
+    read: PeersReader,
+    bound: std::time::Duration,
+    listeners: Mutex<HashMap<SocketAddr, ListenerRounds>>,
+}
+
+/// What a connection does next: read a round's answer, or wait for the
+/// next round to finish.
+enum Step {
+    Ready(Arc<Round>),
+    Wait(tokio::sync::watch::Receiver<Option<Arc<Round>>>),
+}
+
+impl Rounds {
+    pub(crate) fn new(read: PeersReader, bound: std::time::Duration) -> Arc<Self> {
+        Arc::new(Rounds {
+            read,
+            bound,
+            listeners: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Every process holding the other end of `remote`'s connection to the
+    /// listener at `local`, accepted at `accepted`, from the first round
+    /// that began after it was accepted (so the connection was in the table
+    /// it read). `None` when that round gives no answer or does not finish
+    /// within the bound.
+    pub(crate) async fn holders_of(
+        self: &Arc<Self>,
+        local: SocketAddr,
+        remote: SocketAddr,
+        accepted: Instant,
+    ) -> Option<Vec<u32>> {
+        let round = tokio::time::timeout(self.bound, self.round_after(canonical(local), accepted))
+            .await
+            .ok()?;
+        Some(holders_in(round.peers.as_ref()?, remote))
+    }
+
+    /// The first round at `local` that began at or after `accepted`.
+    async fn round_after(self: &Arc<Self>, local: SocketAddr, accepted: Instant) -> Arc<Round> {
+        loop {
+            let mut finished = match self.next_step(local, accepted) {
+                Step::Ready(round) => return round,
+                Step::Wait(finished) => finished,
+            };
+            let _ = finished.changed().await;
+        }
+    }
+
+    /// The latest round when it began after `accepted`; else a wait for the
+    /// next, starting one when none runs.
+    fn next_step(self: &Arc<Self>, local: SocketAddr, accepted: Instant) -> Step {
+        let mut listeners = self.listeners.lock().unwrap_or_else(|p| p.into_inner());
+        let at = listeners.entry(local).or_insert_with(|| ListenerRounds {
+            latest: tokio::sync::watch::channel(None).0,
+            running: None,
+        });
+        if let Some(round) = at.latest.borrow().clone().filter(|r| r.started >= accepted) {
+            return Step::Ready(round);
+        }
+        let finished = at.latest.subscribe();
+        if at.running.is_none() {
+            let started = Instant::now();
+            at.running = Some(started);
+            self.start_round(local, started);
+        }
+        Step::Wait(finished)
+    }
+
+    /// Reads `local`'s connections on a task of its own, so it ends and
+    /// frees the listener's next round whether or not anyone still waits.
+    fn start_round(self: &Arc<Self>, local: SocketAddr, started: Instant) {
+        let rounds = self.clone();
+        tokio::spawn(async move {
+            let read = rounds.read.clone();
+            let peers = tokio::task::spawn_blocking(move || read(local))
                 .await
                 .ok()
-                .flatten()?;
-        rounds.insert(local, Round { started, peers });
+                .flatten();
+            let mut listeners = rounds.listeners.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(at) = listeners.get_mut(&local) {
+                at.running = None;
+                at.latest
+                    .send_replace(Some(Arc::new(Round { started, peers })));
+            }
+        });
     }
-    Some(holders_in(&rounds.get(&local)?.peers, remote))
+
+    /// (Test support) Whether a round has run or runs at `local`.
+    #[cfg(test)]
+    pub(crate) fn has_read(&self, local: SocketAddr) -> bool {
+        let listeners = self.listeners.lock().unwrap_or_else(|p| p.into_inner());
+        listeners
+            .get(&canonical(local))
+            .is_some_and(|at| at.running.is_some() || at.latest.borrow().is_some())
+    }
 }
+
+/// This process's rounds, read from this machine's socket table.
+static ROUNDS: LazyLock<Arc<Rounds>> = LazyLock::new(|| {
+    Rounds::new(
+        Arc::new(|local| darkmux_platform::current().tcp_peers_of(local)),
+        JUDGE_BOUND,
+    )
+});
 
 /// The pids holding `remote` among a round's `(peer, pid)` pairs, each once.
 fn holders_in(peers: &[(SocketAddr, u32)], remote: SocketAddr) -> Vec<u32> {

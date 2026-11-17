@@ -316,14 +316,103 @@ async fn a_proxied_request_costs_no_lookup() {
         body_of(&raw)["fleet_token_set"].is_null(),
         "proxied is remote: {raw}"
     );
-    assert!(
-        !ROUNDS.lock().await.contains_key(&canonical(addr)),
-        "no round ran"
-    );
+    assert!(!ROUNDS.has_read(addr), "no round ran");
     let here = health_from_here("127.0.0.1", port).await;
     assert!(here["fleet_token_set"].is_boolean(), "{here}");
     assert!(
-        ROUNDS.lock().await.contains_key(&canonical(addr)),
+        ROUNDS.has_read(addr),
         "the inverse: a request that may be local is looked up"
+    );
+}
+
+/// A peer at 127.0.0.1:50000 held by pid 9, read by `read` after `delay`.
+fn reader(
+    delay: std::time::Duration,
+    stuck_at: Option<SocketAddr>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+) -> PeersReader {
+    Arc::new(move |local| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(if Some(local) == stuck_at {
+            std::time::Duration::from_secs(3)
+        } else {
+            delay
+        });
+        Some(vec![("127.0.0.1:50000".parse().unwrap(), 9)])
+    })
+}
+
+/// A read that hangs is no answer once the bound passes, for the connection
+/// that started it and for one waiting on it alike, and it holds up no other
+/// listener's round meanwhile.
+#[tokio::test]
+async fn a_hung_read_is_no_answer_within_the_bound_and_holds_up_no_other_listener() {
+    let (stuck, free): (SocketAddr, SocketAddr) = (
+        "127.0.0.1:1".parse().unwrap(),
+        "127.0.0.1:2".parse().unwrap(),
+    );
+    let peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rounds = Rounds::new(
+        reader(std::time::Duration::ZERO, Some(stuck), calls),
+        std::time::Duration::from_millis(400),
+    );
+    let begun = Instant::now();
+    let (a, b) = (rounds.clone(), rounds.clone());
+    let first = tokio::spawn(async move { a.holders_of(stuck, peer, begun).await });
+    let waiter = tokio::spawn(async move { b.holders_of(stuck, peer, begun).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        rounds.holders_of(free, peer, Instant::now()).await,
+        Some(vec![9]),
+        "another listener answers"
+    );
+    assert!(
+        begun.elapsed() < std::time::Duration::from_millis(350),
+        "while the hung read runs: {:?}",
+        begun.elapsed()
+    );
+    assert_eq!(first.await.unwrap(), None, "the hung read is no answer");
+    assert_eq!(waiter.await.unwrap(), None, "nor for one waiting on it");
+    assert!(
+        begun.elapsed() < std::time::Duration::from_secs(2),
+        "within the bound: {:?}",
+        begun.elapsed()
+    );
+}
+
+/// Connections accepted before a round began share its one read.
+#[tokio::test]
+async fn connections_waiting_together_share_one_read() {
+    let local: SocketAddr = "127.0.0.1:3".parse().unwrap();
+    let peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rounds = Rounds::new(
+        reader(std::time::Duration::from_millis(100), None, calls.clone()),
+        std::time::Duration::from_secs(5),
+    );
+    let accepted = Instant::now();
+    let waiting: Vec<_> = (0..5)
+        .map(|_| {
+            let r = rounds.clone();
+            tokio::spawn(async move { r.holders_of(local, peer, accepted).await })
+        })
+        .collect();
+    for w in waiting {
+        assert_eq!(w.await.unwrap(), Some(vec![9]));
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one read"
+    );
+    assert_eq!(
+        rounds.holders_of(local, peer, Instant::now()).await,
+        Some(vec![9])
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a connection accepted after it gets a read of its own"
     );
 }
