@@ -52,6 +52,7 @@ use schemars::JsonSchema;
 use serde_json::Value;
 
 use crate::config_enum::Scope;
+use crate::unicode_tables::{in_ranges, DEFAULT_IGNORABLE, STRICT_RIGHT_TO_LEFT};
 
 /// Every kind of user file darkmux reads. The owner of each kind's Rust
 /// type runs the check (`darkmux-types` for config, `darkmux-profiles` for
@@ -763,21 +764,34 @@ fn segment(key: &str) -> String {
 /// fillers) written as a `\u{..}` escape, so a terminal shows it instead of
 /// acting on it.
 ///
-/// For readable prose, the joiners (ZWJ, ZWNJ) and the direction marks (LRM,
-/// RLM, ALM) are kept: real text needs them (an emoji family, Persian, Hebrew
-/// or Arabic next to Latin). A mark CAN change how the text around it is laid
-/// out (`5 / 500` between two RLMs displays as `500 / 5`) and a joiner is
-/// invisible, so text the operator must verify exactly (an approval prompt, a
-/// command about to run, an id to compare) uses [`escape_text_strict`].
+/// For readable prose, the joiners (ZWJ, ZWNJ), the direction marks (LRM,
+/// RLM, ALM), the variation selectors and the right-to-left letters are kept:
+/// real text needs them (an emoji family or presentation, Persian, Hebrew or
+/// Arabic next to Latin). They CAN change how the text around them is laid
+/// out (`5 / 500` between two RLMs, or between two Hebrew letters, displays
+/// as `500 / 5`), so text the operator must verify exactly (an approval
+/// prompt, a command about to run, an id to compare) uses
+/// [`escape_text_strict`].
 pub fn escape_text(text: &str) -> String {
     escape_with(text, is_invisible_format)
 }
 
 /// [`escape_text`] for text the operator must verify character for
-/// character: the joiners and direction marks are escaped too, so what is
-/// shown is laid out in the order it is stored and holds nothing unseen.
+/// character. It also escapes every Default_Ignorable_Code_Point (the
+/// joiners, marks, variation selectors, U+034F and the rest: nothing that
+/// takes no space is left unseen) and every character of bidi class R, AL
+/// or AN (Hebrew, Arabic and the Arabic-Indic digits: right-to-left letters
+/// reorder the neutral text between them). What remains is laid out left to
+/// right in the order it is stored. Hebrew or Arabic in an approval shows as
+/// `\u{..}` escapes; that is the price of reading it exactly. The tables are
+/// Unicode 16.0.0 (`unicode_tables`).
 pub fn escape_text_strict(text: &str) -> String {
-    escape_with(text, |c| is_invisible_format(c) || is_joiner_or_mark(c))
+    escape_with(text, is_strict_escaped)
+}
+
+/// What [`escape_text_strict`] escapes beyond control characters.
+fn is_strict_escaped(c: char) -> bool {
+    is_invisible_format(c) || in_ranges(c, DEFAULT_IGNORABLE) || in_ranges(c, STRICT_RIGHT_TO_LEFT)
 }
 
 fn escape_with(text: &str, invisible: impl Fn(char) -> bool) -> String {
@@ -791,12 +805,6 @@ fn escape_with(text: &str, invisible: impl Fn(char) -> bool) -> String {
         }
     }
     out
-}
-
-/// The joiners and direction marks [`escape_text`] keeps for prose and
-/// [`escape_text_strict`] escapes: ZWNJ, ZWJ, LRM, RLM and ALM.
-fn is_joiner_or_mark(c: char) -> bool {
-    matches!(c, '\u{200C}'..='\u{200F}' | '\u{061C}')
 }
 
 /// [`escape_text`] for text printed whole, a block a model, a peer or an

@@ -821,3 +821,56 @@ fn escape_text_escapes_shorthand_musical_and_hangul_fillers() {
         assert_eq!(escape_text_strict(&text), want);
     }
 }
+
+/// Every Default_Ignorable_Code_Point (Unicode 16.0.0: 4174 of them) is
+/// escaped by the strict variant: `src/ma<U+034F>in.rs` cannot show as
+/// `src/main.rs`. Walks every code point.
+#[test]
+fn escape_text_strict_escapes_every_default_ignorable_code_point() {
+    let mut ignorable = 0u32;
+    for cp in 0..=0x10FFFFu32 {
+        let Some(c) = char::from_u32(cp) else { continue };
+        if !in_ranges(c, DEFAULT_IGNORABLE) {
+            continue;
+        }
+        ignorable += 1;
+        let text = c.to_string();
+        assert_eq!(escape_text_strict(&text), format!("\\u{{{cp:x}}}"), "U+{cp:04X}");
+    }
+    assert_eq!(ignorable, 4174, "Unicode 16.0.0 has 4174 Default_Ignorable_Code_Points");
+    for cp in [0x34F, 0x17B4, 0x17B5, 0x180B, 0x180D, 0x180F, 0xFE00, 0xFE0F, 0xE0080, 0xE0FFF, 0x200D, 0x61C] {
+        assert!(in_ranges(char::from_u32(cp).unwrap(), DEFAULT_IGNORABLE), "U+{cp:04X}");
+    }
+    assert_eq!(escape_text_strict("src/ma\u{34f}in.rs"), "src/ma\\u{34f}in.rs");
+}
+
+/// A visible right-to-left character on both sides of `5 / 500` would lay
+/// it out as `500 / 5`, so approval text escapes every character of bidi
+/// class R, AL and AN: a Hebrew letter, an Arabic letter, an Arabic-Indic
+/// digit.
+#[test]
+fn escape_text_strict_escapes_right_to_left_characters() {
+    assert_eq!(escape_text_strict("\u{5d0}5 / 500\u{5d0}"), "\\u{5d0}5 / 500\\u{5d0}");
+    assert_eq!(escape_text_strict("\u{661}5 / 500\u{661}"), "\\u{661}5 / 500\\u{661}");
+    assert_eq!(escape_text_strict("\u{627}x"), "\\u{627}x");
+    for (cp, _) in STRICT_RIGHT_TO_LEFT {
+        assert!(escape_text_strict(&char::from_u32(*cp).unwrap().to_string()).starts_with("\\u{"), "U+{cp:04X}");
+    }
+}
+
+/// Only control, invisible and right-to-left characters are escaped: every
+/// other code point, Latin, CJK, emoji and all, prints as itself. Walks
+/// every code point.
+#[test]
+fn escape_text_strict_leaves_every_other_character_unchanged() {
+    for cp in 0..=0x10FFFFu32 {
+        let Some(c) = char::from_u32(cp) else { continue };
+        let special = c.is_control() || is_invisible_format(c) || in_ranges(c, DEFAULT_IGNORABLE) || in_ranges(c, STRICT_RIGHT_TO_LEFT);
+        let text = c.to_string();
+        let shown = escape_text_strict(&text);
+        assert_eq!(shown != text, special, "U+{cp:04X}");
+    }
+    for table in [DEFAULT_IGNORABLE, STRICT_RIGHT_TO_LEFT] {
+        assert!(table.windows(2).all(|w| w[0].1 < w[1].0) && table.iter().all(|(a, b)| a <= b), "sorted, disjoint");
+    }
+}
