@@ -56,7 +56,11 @@
 //! most one real compile plus five fast blocked-then-no-op waits
 //! instead of racing. Set `DARKMUX_E2E_BIN=<path>` to point at an
 //! already-built binary and skip the build step entirely (e.g. a CI
-//! job that built the release binary in an earlier step).
+//! job that built the release binary in an earlier step). It must be
+//! built outside the test build: `cargo test` rebuilds the binary in its
+//! profile's folder (`target/debug`, or `target/release` under `--release`)
+//! with `test-support`, which ignores
+//! `DARKMUX_REDIS_URL`, and `boot` refuses such a binary (#3155).
 //!
 //! ## Out of scope (v1)
 //!
@@ -70,7 +74,7 @@
 //!   tests if needed via `#[serial_test::serial]`.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -624,6 +628,11 @@ impl FleetHarness {
 
     fn boot_inner(specs: Vec<NodeSpec>, redis_source: RedisSource) -> Result<Self, String> {
         build_darkmux_release()?;
+        // (#3155) Before any fixture: a binary that ignores the Redis URL
+        // fails here, naming why. Red-proved by hand: without this call,
+        // a test-support binary fails e2e_hub_catch_up 40s later, blaming
+        // the daemon's catch-up tick.
+        refuse_unless_the_harness_binary_honors_redis()?;
         let tempdir =
             tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
 
@@ -855,12 +864,112 @@ fn darkmux_release_binary() -> PathBuf {
 /// `Command` applies `.env` and `.env_remove` in call order, so a pin
 /// applied first would be erased.
 fn darkmux_release_cmd() -> Command {
-    let mut cmd = Command::new(darkmux_release_binary());
+    darkmux_cmd_at(&darkmux_release_binary())
+}
+
+/// A `Command` for the darkmux binary at `bin`, with every darkmux state
+/// variable stripped (same contract as [`darkmux_release_cmd`]).
+fn darkmux_cmd_at(bin: &Path) -> Command {
+    let mut cmd = Command::new(bin);
     darkmux_types::test_isolation::neutralize_state_vars(&mut cmd);
     cmd
 }
 
+/// The binary cargo builds for this test target. It is compiled with the
+/// package's dev-dependency features, so darkmux-flow's `test-support` is on.
+fn test_build_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_darkmux"))
+}
+
+/// [`refuse_a_binary_that_ignores_redis`] for the binary every node runs,
+/// asked once per process.
+fn refuse_unless_the_harness_binary_honors_redis() -> Result<(), String> {
+    static CHECKED: OnceLock<Result<(), String>> = OnceLock::new();
+    CHECKED.get_or_init(|| refuse_a_binary_that_ignores_redis(&darkmux_release_binary())).clone()
+}
+
+/// (#3155) Refuse a darkmux binary that ignores `DARKMUX_REDIS_URL`.
+///
+/// A build with darkmux-flow's `test-support` feature removes that variable
+/// before its flow sink is built, by design, so a daemon spawned from it
+/// never writes the hub: every hub assertion then fails blaming the daemon,
+/// or passes for nothing. `cargo test` rebuilds the binary in its profile's
+/// folder (`target/debug`, or `target/release` under `--release`) with
+/// that feature, so a `DARKMUX_E2E_BIN` pointed there is swapped for one
+/// mid-run. The binary is asked directly: `darkmux flow status --json`
+/// lists the sinks the process actually built. The URL names a refused
+/// loopback port, so the reachability probe fails at once.
+fn refuse_a_binary_that_ignores_redis(bin: &Path) -> Result<(), String> {
+    let scratch = tempfile::tempdir().map_err(|e| format!("redis-honoring probe tempdir: {e}"))?;
+    let out = darkmux_cmd_at(bin)
+        .args(["flow", "status", "--json"])
+        .env("HOME", scratch.path())
+        .env("DARKMUX_HOME", scratch.path().join("home"))
+        .env("DARKMUX_FLOWS_DIR", scratch.path().join("flows"))
+        .env("DARKMUX_REDIS_URL", format!("redis://127.0.0.1:{}", darkmux_flow::refused_redis_port()))
+        .output()
+        .map_err(|e| format!("running {} flow status: {e}", bin.display()))?;
+    let honored = redis_sink_active(&String::from_utf8_lossy(&out.stdout)).map_err(|e| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        format!("asking {} for its flow sinks: {e} (stderr: {})", bin.display(), stderr.trim())
+    })?;
+    if honored {
+        return Ok(());
+    }
+    Err(format!(
+        "{} ignores DARKMUX_REDIS_URL: it was built with darkmux-flow's `test-support` feature, \
+         which removes that variable by design, so its daemons would never write the hub. \
+         `cargo test` rebuilds the binary in its profile's folder (target/debug, or target/release \
+         under --release) with that feature; point DARKMUX_E2E_BIN at a binary built outside \
+         the test build, in a profile the test run does not rebuild (#3155)",
+        bin.display()
+    ))
+}
+
 // ===== DARKMUX-SPAWN-HELPERS: END (#2710) ============================
+
+/// Whether `darkmux flow status --json` output lists a Redis sink among
+/// the sinks the process built.
+fn redis_sink_active(status_json: &str) -> Result<bool, String> {
+    let status: serde_json::Value =
+        serde_json::from_str(status_json).map_err(|e| format!("flow status output is not JSON: {e}"))?;
+    let kinds = status
+        .pointer("/sinks/active_kinds")
+        .and_then(|k| k.as_array())
+        .ok_or("flow status output has no sinks.active_kinds list")?;
+    Ok(kinds.iter().any(|k| k == "Redis"))
+}
+
+#[cfg(test)]
+mod redis_honoring_binary_tests {
+    use super::*;
+
+    /// (#3155) The binary `cargo test` builds carries `test-support`, which
+    /// scrubs `DARKMUX_REDIS_URL` by design. A daemon run from it never
+    /// writes the hub, so the harness must refuse it before any node boots,
+    /// naming why, rather than let a hub assertion fail 40 seconds later
+    /// blaming the daemon.
+    #[test]
+    fn a_test_support_build_is_refused_before_any_daemon_starts() {
+        let bin = test_build_binary();
+        assert!(bin.is_file(), "cargo's test-build binary is missing at {}", bin.display());
+        let err = refuse_a_binary_that_ignores_redis(&bin)
+            .expect_err("a test-support binary ignores DARKMUX_REDIS_URL, so the harness must refuse it");
+        for named in ["test-support", "DARKMUX_E2E_BIN", "DARKMUX_REDIS_URL"] {
+            assert!(err.contains(named), "the refusal must name {named}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_sink_list_decides_whether_redis_is_honored() {
+        let tee = r#"{"sinks":{"active_kinds":["LocalFile","Redis"]}}"#;
+        let local = r#"{"sinks":{"active_kinds":["LocalFile"]}}"#;
+        assert_eq!(redis_sink_active(tee), Ok(true));
+        assert_eq!(redis_sink_active(local), Ok(false));
+        assert!(redis_sink_active("").is_err(), "empty output is not a sink list");
+        assert!(redis_sink_active(r#"{"sinks":{}}"#).is_err(), "a status with no sink list proves nothing");
+    }
+}
 
 fn spawn_redis(
     workdir: &std::path::Path,
