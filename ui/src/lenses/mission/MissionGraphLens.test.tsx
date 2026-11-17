@@ -900,3 +900,34 @@ describe("(#2868) header chip parity with the runs board", () => {
     });
   }
 });
+
+// (#3195) The server marks a step admitted but not yet dispatching with
+// `waiting: true` beside its scheduler word `running`. The lens shows it
+// waiting, ring and word, not running with a timer.
+describe("(#3195) a step the server marks waiting", () => {
+  it("renders waiting, not running", async () => {
+    const graph = {
+      ...RUNNING_GRAPH,
+      nodes: [
+        { id: "p1", label: "Review", kind: "phase", status: "running", depth: 0 },
+        {
+          id: "u4",
+          label: "unit-u4",
+          kind: "task",
+          status: "waiting",
+          parentId: "p1",
+          depth: 0,
+          steps: [{ id: "u4-step", label: "Dispatch", kind: "dispatch.internal", status: "running", waiting: true }],
+        },
+      ],
+      edges: [{ id: "e1", source: "p1", target: "u4", kind: "contains" }],
+    } as MissionGraph;
+    mockFetch({ graph });
+    renderLens();
+    await waitFor(() => expect(document.querySelector(".steprow")).not.toBeNull());
+    const row = document.querySelector(".steprow")!;
+    expect(row.classList.contains("s-waiting")).toBe(true);
+    expect(row.querySelector(".mn-step-meter .waiting")?.textContent).toBe("waiting");
+    expect(row.querySelector(".gen")).toBeNull();
+  });
+});

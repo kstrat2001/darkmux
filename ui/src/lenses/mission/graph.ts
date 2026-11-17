@@ -29,9 +29,9 @@ import { ACTION, CATEGORY, SOURCE, byTime, byTimeNewestFirst, isAfter, isAsOf, e
 import { lifecycleAt, type LifecyclePhase, type LifecyclePolicy } from "../../lib/lifecycle";
 import { currentRun, groupOfRecords } from "../../lib/runRef";
 import type { GraphEdge } from "../../types/generated/GraphEdge";
-import type { GraphNode } from "../../types/generated/GraphNode";
+import type { GraphNode as WireGraphNode } from "../../types/generated/GraphNode";
 import type { GraphNodeStatus } from "../../types/generated/GraphNodeStatus";
-import type { MissionGraph } from "../../types/generated/MissionGraph";
+import type { MissionGraph as WireMissionGraph } from "../../types/generated/MissionGraph";
 import type { MissionStatus } from "../../types/generated/MissionStatus";
 import type { StepRow } from "../../types/generated/StepRow";
 
@@ -39,10 +39,26 @@ import type { StepRow } from "../../types/generated/StepRow";
 //
 // Generated from the server's own structs (`bun run types:regen`). `GraphStep`
 // is the server's `StepRow`, renamed here because this lens has a `StepRow`
-// component of its own.
+// component of its own. (#3195) Its `status` may also read `waiting`: the
+// lens shows a step the server marks `waiting` (see {@link shownGraph}), or
+// whose `step.queue.wait` it folded, as waiting rather than running.
 
-export type { GraphEdge, GraphNode, MissionGraph };
-export type GraphStep = StepRow;
+export type { GraphEdge };
+export type GraphStep = Omit<StepRow, "status"> & { status: StepRow["status"] | "waiting" };
+export type GraphNode = Omit<WireGraphNode, "steps"> & { steps?: GraphStep[] };
+export type MissionGraph = Omit<WireMissionGraph, "nodes"> & { nodes: GraphNode[] };
+
+/** (#3195) The server's snapshot as the lens shows it: a step it marks
+ *  `waiting` (running by the scheduler's word, but admitted and not yet
+ *  dispatching) reads `waiting`. Every other step keeps the server's word. */
+export function shownGraph(g: WireMissionGraph): MissionGraph {
+  if (!g.nodes.some((n) => (n.steps || []).some((s) => s.waiting))) return g;
+  return { ...g, nodes: g.nodes.map((n) => (n.steps ? { ...n, steps: n.steps.map(shownStep) } : n)) };
+}
+
+function shownStep(s: StepRow): GraphStep {
+  return s.waiting && s.status === "running" ? { ...s, status: "waiting" } : s;
+}
 
 export const COL_W = 260;
 /** (#2104) A task card that carries step rows. Measured on the real
@@ -339,6 +355,9 @@ export interface StepMetrics {
    *  ends only on its `step.complete`/`step.error`: a dispatch terminal is
    *  one execution's end (a map step holds one per item), not the step's. */
   stepBookended?: boolean;
+  /** (#3195) When a step that waited for its slot was admitted: its own
+   *  span starts when it takes the slot, the mission's clock from here. */
+  waitFromTs?: number;
   /** (#3017) The receive key ({@link receiveKey}) of the newest terminal
    *  folded: what tells a retry (a start received AFTER the step ended) from
    *  a sibling start of the same attempt. */
@@ -463,7 +482,7 @@ function attemptBeats(t: { n: number; lastKey: number; ours: boolean }, best: { 
 
 const METRIC_KEYS: readonly (keyof StepMetrics)[] = [
   "tokRun", "tokUtilityRun", "tokFinal", "tokUtilityFinal", "turnRun", "turnFinal", "turnsEnded", "toolRun", "toolFinal",
-  "startTs", "endTs", "endKey", "endFailed", "lastTs", "stepBookended",
+  "startTs", "endTs", "endKey", "endFailed", "lastTs", "stepBookended", "waitFromTs",
 ];
 
 function sameMetrics(a: StepMetrics, b: StepMetrics): boolean {
@@ -514,6 +533,15 @@ function foldSpan(
   }
 }
 
+/** (#3195) A step queued for its call slot has not started its work: its
+ *  span has no start while it waits, and starts when it takes the slot. */
+function foldQueue(next: StepMetrics, action: NormAction | undefined, recMs: number): void {
+  if (action === ACTION.StepQueueWait) {
+    next.waitFromTs = next.startTs || recMs;
+    next.startTs = 0;
+  } else if (action === ACTION.StepQueueResume && recMs) next.startTs = recMs;
+}
+
 /** (#3067) Fold one usage record's tokens into a step's running figures: the
  *  total, and the utility part named beside it. */
 function foldUsage(next: StepMetrics, usage: ReturnType<typeof usageContribution>): void {
@@ -547,6 +575,7 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
   const isTerminal = action === ACTION.StepComplete || action === ACTION.StepError || (!stepBookended && isDispatchTerminal(action));
 
   foldSpan(cur, next, { isStart, isTerminal, failed: action === ACTION.StepError || action === ACTION.DispatchError, recMs, key: receiveKey(rec) });
+  foldQueue(next, action, recMs);
 
   const fig = recordFigures(rec);
   const started = next.startTs > 0;
@@ -562,6 +591,21 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: NormRecord, idx: 
 
   if (sameMetrics(next, cur)) return metrics;
   return { ...metrics, [sid]: next };
+}
+
+/** The mission's span from its steps' metrics: the earliest start to the
+ *  latest end. (#3195) A step that waited for its slot counts from its
+ *  admission here: the mission's clock shows the whole, waits included,
+ *  while the step's own row shows only its work. */
+export function missionSpan(metrics: MetricsMap): { start: number; end: number } {
+  let start = 0;
+  let end = 0;
+  for (const m of Object.values(metrics)) {
+    const st = m.waitFromTs || m.startTs;
+    if (st) start = start ? Math.min(start, st) : st;
+    if (m.endTs) end = Math.max(end, m.endTs);
+  }
+  return { start, end };
 }
 
 /** `hasNoMetricsData` — the "this step reports no measurements yet" guard
@@ -662,6 +706,9 @@ export function missionTotals(metrics: MetricsMap): MissionTotals {
 
 const STATUS_ACTIONS: ReadonlyMap<NormAction, GraphNodeStatus | MissionStatus> = new Map<NormAction, GraphNodeStatus | MissionStatus>([
   [ACTION.StepStart, "running"],
+  // (#3195) A step queued for its call slot waits; it runs once it takes it.
+  [ACTION.StepQueueWait, "waiting"],
+  [ACTION.StepQueueResume, "running"],
   [ACTION.StepComplete, "complete"],
   [ACTION.StepError, "error"],
   [ACTION.PhaseStart, "running"],
@@ -674,6 +721,17 @@ const STATUS_ACTIONS: ReadonlyMap<NormAction, GraphNodeStatus | MissionStatus> =
 
 export function statusFromRecord(rec: NormRecord): GraphNodeStatus | MissionStatus | undefined {
   return rec.action === undefined ? undefined : STATUS_ACTIONS.get(rec.action);
+}
+
+const QUEUE_ACTIONS: ReadonlySet<NormAction> = new Set([ACTION.StepQueueWait, ACTION.StepQueueResume]);
+
+/** The status a record leaves a node or step in. The rank ratchet keeps the
+ *  page's word on a tie; a step's queue record (#3195) is the scheduler's
+ *  word on a step still open, so it moves `running` to `waiting` and back
+ *  (one rank), but never reopens a step that ended. */
+function advancedStatus(rec: NormRecord, oldStatus: string | undefined, newStatus: string): string | undefined {
+  if (rec.action !== undefined && QUEUE_ACTIONS.has(rec.action)) return statusRank(oldStatus) <= STATUS_RANK.running ? newStatus : oldStatus;
+  return keepPageStatus(oldStatus, newStatus) ? oldStatus : newStatus;
 }
 
 /** Whether `rec` is a step terminal naming an operator's stop: the step
@@ -698,7 +756,7 @@ export function applyFlowRecord(graph: MissionGraph, rec: NormRecord, idx: Graph
   if (!newStatus || !handle) return graph;
   if (rec.mission_id && rec.mission_id !== missionId) return graph;
 
-  const advance = (oldStatus: string | undefined): string | undefined => (keepPageStatus(oldStatus, newStatus) ? oldStatus : newStatus);
+  const advance = (oldStatus: string | undefined): string | undefined => advancedStatus(rec, oldStatus, newStatus);
 
   if (idx.nodeIds.has(handle)) {
     let changed = false;
@@ -868,9 +926,13 @@ export function hhmmss(ts: string | number): string {
 
 // ─── step meter (mission-graph.html: stepStartMs, stepMeterFor) ────────────
 
+/** (#3195) When the step's work began: the later of its records' start and
+ *  the snapshot's `startedTs`, the instant the scheduler saw its dispatch
+ *  begin. A record start can be the step's admission (a wait its records do
+ *  not name); the snapshot's can be stale behind a retry the records
+ *  restarted on. Either alone when it is the only one. */
 export function stepStartMs(step: GraphStep, m: StepMetrics | undefined): number {
-  if (m && m.startTs) return m.startTs;
-  return tsToMs(step.startedTs);
+  return Math.max(m?.startTs || 0, tsToMs(step.startedTs) || 0);
 }
 
 /** (#2269) The step's end, same precedence as {@link stepStartMs}: the
@@ -893,6 +955,9 @@ export interface StepMeter {
    * the step never started. Rendered muted on a finished row, where the
    * pulse — and with it the only time the row had — is gone. */
   wallMs: number;
+  /** (#3195) Admitted with its wave and waiting for its call slot: the row
+   *  says so in place of a timer, which starts when the step takes the slot. */
+  waiting: boolean;
 }
 
 /** Each step's run phase as of an instant (`stepPhasesAt`), by step id. */
@@ -969,11 +1034,18 @@ export function stepMeterFor(step: GraphStep, metrics: MetricsMap, now: number, 
   const show = isAiKind(step.kind) || d.has;
   const phase = phases.get(step.id);
   const generating = step.status === "running" && (phase === "open" || phase === "waiting");
+  const waiting = step.status === "waiting";
+  return { show: show || generating || waiting, tokens: d.tokens, turns: d.turns, tools: d.tools, generating, ...stepTimes(step, m, now, generating), waiting };
+}
+
+/** A step's pulse time (while generating) and wall time (start to its end,
+ *  or to now while it runs); `0` for a step with no start. */
+function stepTimes(step: GraphStep, m: StepMetrics | undefined, now: number, generating: boolean): Pick<StepMeter, "elapsedMs" | "wallMs"> {
   const startMs = stepStartMs(step, m);
   const elapsedMs = generating && startMs && now ? Math.max(0, now - startMs) : 0;
   const endMs = stepEndMs(step, m) || (step.status === "running" && now ? now : 0);
   const wallMs = startMs && endMs ? Math.max(0, endMs - startMs) : 0;
-  return { show: show || generating, tokens: d.tokens, turns: d.turns, tools: d.tools, generating, elapsedMs, wallMs };
+  return { elapsedMs, wallMs };
 }
 
 // ─── step row vocabulary (mission-graph.html: stepLead, stepSeat) ──────────

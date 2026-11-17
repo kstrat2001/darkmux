@@ -8187,6 +8187,7 @@
             label: "Dispatch".to_string(),
             kind: "dispatch.internal".to_string(),
             status: darkmux_crew::types::NodeStatus::Running,
+            waiting: false,
             started_ts: None,
             completed_ts: None,
             tokens_final: None,
@@ -8222,6 +8223,7 @@
             label: "Probe".to_string(),
             kind: "dispatch.map".to_string(),
             status: darkmux_crew::types::NodeStatus::Running,
+            waiting: false,
             started_ts: None,
             completed_ts: None,
             tokens_final: None,
@@ -8727,6 +8729,16 @@
             "the phase's ONLY task is waiting, nothing is genuinely running — the phase must not \
              launder back to `running` on the persisted-status tie (#2343): {phase_node:?}"
         );
+
+        // (#3195) The step row says it too: the step waits for its slot, by
+        // the same rule as its task, beside the scheduler's own word. The
+        // finished step does not wait, and its row carries no `waiting`.
+        let steps = task_node["steps"].as_array().unwrap();
+        let step = |id: &str| steps.iter().find(|s| s["id"] == id).cloned().unwrap_or_default();
+        assert_eq!(step("unit-0-collect")["status"], "running", "{steps:?}");
+        assert_eq!(step("unit-0-collect")["waiting"], true, "admitted, not dispatched: {steps:?}");
+        assert_eq!(step("unit-0-map")["status"], "complete");
+        assert!(step("unit-0-map").get("waiting").is_none(), "absent when it does not wait: {steps:?}");
     }
 
     /// (review-gate MF2a) The three production graph runners persist Step
