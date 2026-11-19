@@ -198,12 +198,14 @@ fn launcher() -> String {
 pub(crate) const CARRIED: &str = "DARKMUX_SANDBOX_ENV_";
 
 /// Perl that sets the program's environment to exactly the carried
-/// variables ([`CARRIED`]), each under its own name, plus the launcher's
+/// variables ([`CARRIED`]), each under its own name, in the order carried
+/// (so were a name carried twice, the later would win, as it does in
+/// [`SeatbeltBackend::launcher_environment`], which carries each once), plus the launcher's
 /// `PWD` when the policy names none, then runs its arguments as the
 /// program (`sandbox-exec` and what it runs), never through a shell. It
 /// starts with the launcher's own environment, so no policy variable
 /// reaches perl itself. No single quote: it runs inside one.
-const CARRY: &str = "my %e; for my $k (keys %ENV) { next unless $k =~ /^DARKMUX_SANDBOX_ENV_[0-9]+$/; my ($n, $v) = split(/=/, $ENV{$k}, 2); $e{$n} = $v if defined $v && length $n; } $e{PWD} = $ENV{PWD} if defined $ENV{PWD} && !exists $e{PWD}; %ENV = %e; exec { $ARGV[0] } @ARGV; exit 127;";
+const CARRY: &str = "my %e; for my $k (sort { substr($a, 20) <=> substr($b, 20) } grep { /^DARKMUX_SANDBOX_ENV_[0-9]+$/ } keys %ENV) { my ($n, $v) = split(/=/, $ENV{$k}, 2); $e{$n} = $v if defined $v && length $n; } $e{PWD} = $ENV{PWD} if defined $ENV{PWD} && !exists $e{PWD}; %ENV = %e; exec { $ARGV[0] } @ARGV; exit 127;";
 
 /// The launcher's guard ([`LAUNCH`]), its launcher's pid its argument: the
 /// group drained, then the session swept ([`sweep!`]).
@@ -230,6 +232,12 @@ const OURS: &str = r#"[ -f "$d/profile.sb" ]"#;
 /// does not match while the pid lives, the sandbox is [`UNDECIDED`], never
 /// gone.
 const ALIVE: &str = r#"pid=$(cat "$d/pid" 2>/dev/null) && kill -0 "$pid" 2>/dev/null && started=$(cat "$d/started" 2>/dev/null) && [ -n "$started" ] && { [ "utc:$(/usr/bin/env -i TZ=UTC0 /bin/ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ] || { case $started in utc:*) false ;; *) [ "$(/bin/ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ] ;; esac; }; }"#;
+
+/// Waits, at most 2.5 s, while `$d`'s launcher has recorded its pid but not
+/// yet its start (it writes them one after the other), so a stop, kill or
+/// remove landing between the two decides on both, never on the pid alone
+/// ([`UNDECIDED`], which would leave the sandbox to start and run).
+const SETTLE: &str = r#"i=0; while [ -f "$d/pid" ] && [ ! -s "$d/started" ] && [ "$i" -lt 50 ]; do sleep 0.05; i=$((i + 1)); done"#;
 
 /// Whether `$d`'s sandbox, which [`ALIVE`] did not find running, may still
 /// run: its pid lives and no record in the [`STARTED_PREFIX`] form says it
@@ -412,9 +420,9 @@ impl SeatbeltBackend {
     /// for the program alone ([`CARRY`]). A variable whose name is empty or
     /// holds `=` is not one a program could be given, and is dropped.
     fn launcher_environment(policy: &SandboxPolicy, dir: &Path) -> Vec<(String, String)> {
-        let carried = Self::environment(policy, dir).into_iter().filter(|(k, _)| !k.is_empty() && !k.contains('='));
+        let valid = Self::environment(policy, dir).into_iter().filter(|(k, _)| !k.is_empty() && !k.contains('='));
         std::iter::once(("PATH".to_string(), DEFAULT_PATH.to_string()))
-            .chain(carried.enumerate().map(|(i, (k, v))| (format!("{CARRIED}{i}"), format!("{k}={v}"))))
+            .chain(last_of_each(valid).into_iter().enumerate().map(|(i, (k, v))| (format!("{CARRIED}{i}"), format!("{k}={v}"))))
             .collect()
     }
 
@@ -488,26 +496,92 @@ impl SeatbeltBackend {
     }
 }
 
+/// `env` with each name once: its last value, in the place of its last
+/// naming, as a process given the same name twice (`Command::env`, a
+/// shell's `export`) keeps the later one.
+fn last_of_each(env: impl IntoIterator<Item = (String, String)>) -> Vec<(String, String)> {
+    let all: Vec<(String, String)> = env.into_iter().collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: Vec<(String, String)> = all.into_iter().rev().filter(|(k, _)| seen.insert(k.clone())).collect();
+    kept.reverse();
+    kept
+}
+
 /// Removes `$d`'s sandbox, killing it first if it runs; leaves alone a
 /// directory this backend did not write ([`OURS`]), and one whose sandbox
 /// may still run ([`UNDECIDED`]).
 fn remove_script() -> String {
-    format!("{OURS} || exit 0\nif {ALIVE}; then kill -KILL -- \"-$pid\" 2>/dev/null; g=$pid\n{DRAIN}elif {UNDECIDED}; then exit 0\nfi\nrm -rf \"$d\"; exit 0")
+    format!("{OURS} || exit 0\n{SETTLE}\nif {ALIVE}; then kill -KILL -- \"-$pid\" 2>/dev/null; g=$pid\n{DRAIN}elif {UNDECIDED}; then exit 0\nfi\nrm -rf \"$d\"; exit 0")
 }
 
 /// Lists the sandboxes under `$1`, skipping any directory this backend did
-/// not write ([`OURS`]).
+/// not write ([`OURS`]). A sandbox that may still run but cannot be shown
+/// to ([`UNDECIDED`]) is `undecided`: neither running (nothing may stop or
+/// kill it) nor exited ([`undecided_sandboxes`] names it with its remedy).
 fn list_script() -> String {
     format!(
         r#"r=$1; [ -d "$r" ] || exit 0
 for d in "$r"/*; do
   {OURS} || continue
-  if {{ {ALIVE}; }} || {{ {UNDECIDED}; }}; then s=running; elif [ -f "$d/pid" ]; then s=exited; else s=created; fi
+  if {ALIVE}; then s=running; elif {UNDECIDED}; then s=undecided; elif [ -f "$d/pid" ]; then s=exited; else s=created; fi
   printf 'N\t%s\t%s\n' "${{d##*/}}" "$s"
   sed 's/^/L	/' "$d/labels" 2>/dev/null
 done
 exit 0"#
     )
+}
+
+/// A sandbox that may still run but whose launcher cannot be shown to be
+/// the one it recorded ([`UNDECIDED`]: a live pid beside a start record from
+/// an older darkmux): darkmux neither stops nor removes it, since the pid
+/// may not be its own. Its remedy is the operator's ([`Undecided::remedy`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Undecided {
+    pub name: String,
+    pub dir: PathBuf,
+    /// The pid it recorded, when it reads.
+    pub pid: Option<u32>,
+}
+
+impl Undecided {
+    /// What the operator can do: look at the recorded pid, and when no
+    /// sandbox of it runs, remove the record darkmux keeps for it. darkmux
+    /// never kills a pid it cannot show is its own.
+    pub fn remedy(&self) -> String {
+        let pid = self.pid.map_or_else(|| "its recorded pid".to_string(), |p| format!("pid {p}"));
+        let look = self.pid.map_or_else(String::new, |p| format!(" (`ps -o pid,lstart,command -p {p}`)"));
+        format!(
+            "Seatbelt sandbox `{}` may still run a program an older darkmux started: its start record cannot be compared, so darkmux cannot show {pid} is its launcher and will neither stop nor remove it. If no sandbox of it runs{look}, remove its record: rm -rf {}",
+            self.name,
+            sh_quote(&self.dir.to_string_lossy())
+        )
+    }
+}
+
+/// The names the listing ([`list_script`]) marks `undecided`.
+pub(crate) fn undecided_in(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|l| l.strip_prefix("N\t")?.split_once('\t'))
+        .filter(|(_, state)| *state == "undecided")
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
+/// Every Seatbelt sandbox on this host that is [`Undecided`], from one
+/// listing bounded at 10 s; none when the listing gives no answer.
+pub fn undecided_sandboxes() -> Vec<Undecided> {
+    let root = canonical(&state_root());
+    let list = SeatbeltBackend::script(&list_script(), &[root.to_string_lossy().into_owned()], &[("PATH".into(), DEFAULT_PATH.into())]);
+    let Some(out) = darkmux_platform::output_within(list, std::time::Duration::from_secs(10)) else { return Vec::new() };
+    undecided_in(&String::from_utf8_lossy(&out.stdout))
+        .into_iter()
+        .map(|name| {
+            let dir = root.join(&name);
+            let pid = std::fs::read_to_string(dir.join("pid")).ok().and_then(|p| p.trim().parse().ok());
+            Undecided { name, dir, pid }
+        })
+        .collect()
 }
 
 /// `name`'s directory, or `None` when `name` could leave [`state_root`] (a
@@ -626,6 +700,7 @@ exec /bin/sh "$d/start.sh""#, &[], Self::launcher_script);
     fn stop(&self, handle: &SandboxHandle, grace: std::time::Duration) -> Command {
         let script = format!(
             r#"{OURS} && [ -f "$d/pid" ] || exit 0
+{SETTLE}
 if {ALIVE}; then
   kill -TERM -- "-$pid" 2>/dev/null
   i=0; while kill -0 "$pid" 2>/dev/null && [ "$i" -lt "$(($2 * 10))" ]; do sleep 0.1; i=$((i + 1)); done
@@ -639,7 +714,7 @@ rm -rf "$d"; exit 0"#
     }
 
     fn kill(&self, handle: &SandboxHandle) -> Command {
-        Self::on_dir(handle, &format!("{OURS} && {ALIVE} || exit 1\nkill -KILL -- \"-$pid\" || exit 1\ng=$pid\n{DRAIN}rm -rf \"$d\""), &[])
+        Self::on_dir(handle, &format!("{OURS} || exit 1\n{SETTLE}\n{ALIVE} || exit 1\nkill -KILL -- \"-$pid\" || exit 1\ng=$pid\n{DRAIN}rm -rf \"$d\""), &[])
     }
 
     fn remove(&self, handle: &SandboxHandle) -> Command {
@@ -899,6 +974,7 @@ mod tests {
         let stopped = SeatbeltBackend.stop(&handle, Duration::from_secs(1)).status().unwrap();
         let listing = String::from_utf8_lossy(&SeatbeltBackend.list(&Query::labeled("darkmux.host.pid")).output().unwrap().stdout).into_owned();
         let launchers = crate::host_leaders::host_sandbox_launchers();
+        let undecided = undecided_sandboxes();
         let (kept, alive) = (d.is_dir(), child.try_wait().unwrap().is_none());
         let _ = std::fs::write(d.join("started"), format!("{}\n", lstart_under(pid, &[("PATH", DEFAULT_PATH)])));
         let ended = SeatbeltBackend.remove(&handle).status().unwrap();
@@ -909,7 +985,9 @@ mod tests {
         drop(root);
         assert!(removed.success() && stopped.success());
         assert!(kept && alive, "remove or stop took a live sandbox for gone (dir kept {kept}, alive {alive})");
-        assert!(listing.contains("N\tdarkmux-older-record\trunning"), "{listing}");
+        assert!(listing.contains("N\tdarkmux-older-record\tundecided"), "{listing}");
+        assert_eq!(undecided.iter().map(|u| (u.name.as_str(), u.pid)).collect::<Vec<_>>(), [("darkmux-older-record", Some(pid))]);
+        assert!(!parse_listing(BackendKind::Seatbelt, &Query { stopped_too: false, ..Query::labeled("darkmux.host.pid") }, &listing).iter().any(|l| l.handle.id == "darkmux-older-record"), "never listed as running: nothing tries to kill it");
         assert_eq!(launchers, Some(vec![pid]));
         assert!(ended.success() && gone && !d.exists(), "a record that compares is still ended by remove");
     }
@@ -930,6 +1008,117 @@ mod tests {
             [("A", "1=2"), ("PATH", "/p"), ("BASH_FUNC_x%%", "() { :; }"), ("HOME", tmp.as_str()), ("TMPDIR", tmp.as_str())]
                 .map(|(k, v)| (k.to_string(), v.to_string()))
         );
+    }
+
+    /// A variable the policy names twice is carried once, its last value
+    /// (a preview's recipe naming `PATH` after the toolchain's), in the
+    /// place of its last naming.
+    #[test]
+    fn a_variable_named_twice_is_carried_once_with_its_last_value() {
+        let mut p = policy(Vec::new(), Network::None);
+        p.env = vec![("PATH".into(), "/toolchain".into()), ("A".into(), "1".into()), ("PATH".into(), "/recipe".into())];
+        let (cmd, _) = SeatbeltBackend.run(&p);
+        let tmp = canonical(&state_root().join("darkmux-dispatch-1/tmp")).to_string_lossy().into_owned();
+        assert_eq!(
+            SeatbeltBackend::program_environment(&cmd),
+            [("A", "1"), ("PATH", "/recipe"), ("HOME", tmp.as_str()), ("TMPDIR", tmp.as_str())].map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+    }
+
+    /// Run after run, the program gets the last value of a variable the
+    /// policy names twice, never one picked by chance.
+    #[test]
+    #[serial_test::serial]
+    fn a_program_always_gets_the_last_value_of_a_variable_named_twice() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let mut seen = Vec::new();
+        for n in 0..8 {
+            let mut p = policy(Vec::new(), Network::None);
+            p.env = vec![("PATH".into(), "/toolchain/bin:/usr/bin:/bin".into()), ("PATH".into(), "/recipe/bin:/usr/bin:/bin".into())];
+            p.entrypoint = Some("/bin/sh".into());
+            p.command = vec!["-c".into(), "printf %s \"$PATH\" > \"$TMPDIR/path\"; exec /bin/sleep 3".into()];
+            let (mut child, d, root) = running(p, &format!("darkmux-twice-{n}"));
+            let mut path = String::new();
+            for _ in 0..200 {
+                path = std::fs::read_to_string(d.join("tmp/path")).unwrap_or_default();
+                if !path.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = SeatbeltBackend.remove(&SandboxHandle { backend: BackendKind::Seatbelt, id: format!("darkmux-twice-{n}") }).status();
+            let _ = child.wait();
+            drop(root);
+            seen.push(path);
+        }
+        assert!(seen.iter().all(|p| p == "/recipe/bin:/usr/bin:/bin"), "{seen:?}");
+    }
+
+    /// A listing's `undecided` rows are named, and nothing else; the remedy
+    /// names the sandbox, the pid to look at and the one command that
+    /// removes its record, never a kill.
+    #[test]
+    fn an_undecided_sandbox_is_named_with_a_remedy_that_kills_nothing() {
+        let listing = "N\tdarkmux-a\trunning\nL\tk=v\nN\tdarkmux-b\tundecided\nN\tdarkmux-c\texited\nN\tdarkmux-d\tundecided\n";
+        assert_eq!(undecided_in(listing), ["darkmux-b", "darkmux-d"]);
+        let u = Undecided { name: "darkmux-b".into(), dir: PathBuf::from("/s/darkmux b"), pid: Some(4242) };
+        let remedy = u.remedy();
+        assert!(remedy.contains("`darkmux-b`") && remedy.contains("ps -o pid,lstart,command -p 4242"), "{remedy}");
+        assert!(remedy.ends_with("rm -rf '/s/darkmux b'"), "{remedy}");
+        assert!(!remedy.contains("kill"), "{remedy}");
+        let unread = Undecided { pid: None, ..u };
+        assert!(unread.remedy().contains("its recorded pid") && !unread.remedy().contains("ps -o"), "{}", unread.remedy());
+    }
+
+    /// The carry sets the carried variables in the order carried, by
+    /// number (the tenth after the ninth), so a later one always wins.
+    #[cfg(unix)]
+    #[test]
+    fn the_carry_sets_variables_in_the_order_carried() {
+        let mut cmd = Command::new("/usr/bin/perl");
+        cmd.args(["-e", CARRY, "/usr/bin/env"]).env_clear();
+        for n in 0..12 {
+            cmd.env(format!("{CARRIED}{n}"), format!("P={n}"));
+        }
+        let out = String::from_utf8_lossy(&cmd.output().unwrap().stdout).into_owned();
+        assert_eq!(out.lines().collect::<Vec<_>>(), ["P=11"], "{out}");
+    }
+
+    /// A stop that lands while a launcher has recorded its pid but not yet
+    /// its start waits for the start and stops it, never leaving it to run.
+    #[test]
+    #[serial_test::serial]
+    fn a_stop_between_the_pid_and_the_start_record_still_stops_the_sandbox() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let root = StateRoot::new();
+        let d = canonical(root.0.path()).join("darkmux-starting");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("profile.sb"), "(version 1)").unwrap();
+        let mut launcher = Command::new("/bin/sleep");
+        launcher.arg("30");
+        std::os::unix::process::CommandExt::process_group(&mut launcher, 0);
+        let mut launcher = launcher.spawn().unwrap();
+        let pid = launcher.id().to_string();
+        std::fs::write(d.join("pid"), format!("{pid}\n")).unwrap();
+        let record = Command::new(STARTED_READER[0]).args(&STARTED_READER[1..]).args(["-p", &pid]).output().unwrap();
+        let record = format!("{STARTED_PREFIX}{}\n", String::from_utf8_lossy(&record.stdout).trim_end_matches('\n'));
+        let late = d.join("started");
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::write(late, record).unwrap();
+        });
+        let stopped = SeatbeltBackend.stop(&SandboxHandle { backend: BackendKind::Seatbelt, id: "darkmux-starting".into() }, Duration::from_secs(1)).status().unwrap();
+        writer.join().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let ended = launcher.try_wait().unwrap().is_some();
+        let _ = launcher.kill();
+        let _ = launcher.wait();
+        assert!(stopped.success());
+        assert!(ended && !d.exists(), "the stop left the starting sandbox to run (ended {ended}, dir left {})", d.exists());
     }
 
     /// A policy's environment reaches the program and nothing the launcher
