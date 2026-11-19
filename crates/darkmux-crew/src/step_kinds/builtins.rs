@@ -1459,6 +1459,21 @@ pub struct MapItemResult {
     /// step's output.
     #[serde(skip)]
     pub stopped_at_cap: bool,
+    /// The item failed while the run was being stopped: its call was cut off
+    /// mid-flight, or its next attempt was never sent. Decided the moment the
+    /// item ended ([`MapItemResult::ended`]). Counted as stopped, never as a
+    /// failure of its own; never part of the step's output.
+    #[serde(skip)]
+    pub cut_by_stop: bool,
+}
+
+impl MapItemResult {
+    /// The item as it ended: marked [`Self::cut_by_stop`] when it failed
+    /// while the run was being stopped. Read here, as the item ends, so an
+    /// item that failed on its own before any stop keeps reading as failed.
+    fn ended(self) -> Self {
+        Self { cut_by_stop: !self.ok && darkmux_types::interrupt::is_set(), ..self }
+    }
 }
 
 fn u32_is_zero(n: &u32) -> bool {
@@ -1707,6 +1722,17 @@ fn resolve_map_collection(
 /// step-level `Err` — that's a single-dispatch step with downstream
 /// `depends_on` to protect; a map's whole point is surviving partial failure.)
 ///
+/// **A stop ends the map.** Once the run is stopped (an operator's signal,
+/// a host's shutdown, the run's wall-clock bound) no item starts and no
+/// attempt is sent, a retry included; a retry's backoff wakes on the stop.
+/// An item whose call was in flight ends the way a single dispatch does: the
+/// call is killed and the item's `dispatch.error` names the stop. Every item
+/// that started gets exactly one terminal (contract 2); an item the stop
+/// kept from starting opens none and is counted neither ok nor failed. The
+/// step then ends with an error carrying the interrupt marker, saying how
+/// many items did not run, which the scheduler reads as stopped (abandoned,
+/// naming the stop), never as a success.
+///
 /// **Empty-collection short-circuit.** An empty collection is a completed
 /// no-op: [`Self::residency`] returns `None` (so the wave loader never loads
 /// a model the step won't use — the #1442 property ported generically from
@@ -1802,15 +1828,21 @@ impl DispatchMapStepKind {
     /// total_tokens across every item. See the emission site in `run` for
     /// why the sum (not the per-item values) is what the mission graph's
     /// max-fold token meter must see.
+    ///
+    /// `items_in` is the whole collection; `ok_count` and `failed_count`
+    /// count only the items that ran to their own end, so an item a stop cut
+    /// off or kept from starting is neither (the step's own error says how
+    /// many, naming the stop).
     fn aggregate_record(
         session: &SessionId,
         step: &Step,
         model: &str,
         unmanaged: bool,
         results: &[MapItemResult],
+        items_in: usize,
     ) -> darkmux_flow::FlowRecord {
         let ok_count = results.iter().filter(|r| r.ok).count();
-        let failed_count = results.len() - ok_count;
+        let failed_count = results.iter().filter(|r| !r.ok && !r.cut_by_stop).count();
         let total_tokens: u64 = results.iter().filter_map(|r| r.total_tokens).sum();
         // (#1442) Summed per-item dispatch wall-clock — trivially additive
         // beside the summed tokens, so the aggregate stays self-describing for
@@ -1826,7 +1858,7 @@ impl DispatchMapStepKind {
                 darkmux_flow::Category::Work,
                 darkmux_flow::Stage::Dispatch,
                 darkmux_flow::Payload::StepResult(StepResultPayload {
-                    items_in: Some(results.len() as u64),
+                    items_in: Some(items_in as u64),
                     ok_count: Some(ok_count as u64),
                     failed_count: Some(failed_count as u64),
                     unmanaged: Some(unmanaged),
@@ -1998,7 +2030,12 @@ impl DispatchMapStepKind {
 
         let temperature = call.temperature();
         let mut results: Vec<MapItemResult> = Vec::with_capacity(items.len());
-        for (index, item) in items.iter().enumerate() {
+        // A stop ends the map: no item starts after it, so none opens a
+        // `dispatch.start` or sends a request the stop would kill (and the
+        // endpoint bill) a moment later. The items it kept from starting are
+        // not run, never failed ([`MapVerdict::of`]).
+        let not_stopped = |_: &(usize, &serde_json::Value)| !darkmux_types::interrupt::is_set();
+        for (index, item) in items.iter().enumerate().take_while(not_stopped) {
             // One item, one execution: its bookends, its usage records and
             // the budget records of its gate all name it.
             let execution = &ExecutionId::mint();
@@ -2053,7 +2090,8 @@ impl DispatchMapStepKind {
                         timeout_seconds, retry_on_empty, retry_on_error, ovr, &mut calls, limits.as_ref(),
                     )
                 }
-            };
+            }
+            .ended();
             // (#1442 gate C3) LIVE per-item emission when streaming.
             push(Self::item_record(session, execution, step, wire_model.as_ref(), endpoint.is_some(), &res), &mut batched);
             // (#1442 ship-2b, #1361 continuity) `telemetry.tokens` records
@@ -2126,12 +2164,12 @@ impl DispatchMapStepKind {
         // would render as the LARGEST single item, not the step's spend. The
         // aggregate's SUMMED total_tokens is >= every per-item value, so the
         // existing max-fold reads the true spend with zero viewer changes.
-        push(Self::aggregate_record(session, step, wire_model.as_ref(), endpoint.is_some(), &results), &mut batched);
+        push(Self::aggregate_record(session, step, wire_model.as_ref(), endpoint.is_some(), &results, items.len()), &mut batched);
 
         let output = serde_json::to_string(&results).context("serializing dispatch.map results")?;
         Ok(MapRun {
             outcome: StepOutcome { output, flow_records: batched, degraded: None },
-            verdict: MapVerdict::of(&results),
+            verdict: MapVerdict::of(&results, items.len()),
         })
     }
 }
@@ -2142,6 +2180,9 @@ impl DispatchMapStepKind {
 /// failing is a clean step.
 #[derive(Debug, PartialEq, Eq)]
 enum MapVerdict {
+    /// The run's stop ended the map before every item ran to its own end:
+    /// `cut` items were cut off, `not_run` never started.
+    Stopped { total: usize, cut: usize, not_run: usize },
     AllFailed { total: usize, first_error: String },
     Partial { failed: usize, total: usize },
     Clean,
@@ -2159,6 +2200,12 @@ impl MapRun {
     /// marked degraded when some did, unchanged when none did.
     fn into_outcome(self, step_id: &str) -> Result<StepOutcome> {
         match self.verdict {
+            // The interrupt marker is how the scheduler and the launcher tell
+            // a step the stop ended from one that failed on its own.
+            MapVerdict::Stopped { total, cut, not_run } => Err(anyhow!(
+                "{}: step `{step_id}` dispatch.map stopped with {not_run} of {total} item(s) not run and {cut} cut off",
+                darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL
+            )),
             MapVerdict::AllFailed { total, first_error } => Err(anyhow!(
                 "step `{step_id}` dispatch.map: all {total} item(s) failed; first error: {first_error}"
             )),
@@ -2172,9 +2219,14 @@ impl MapRun {
 }
 
 impl MapVerdict {
-    fn of(results: &[MapItemResult]) -> Self {
+    /// `results` are the items that started, of `total` in the collection.
+    fn of(results: &[MapItemResult], total: usize) -> Self {
+        let cut = results.iter().filter(|r| r.cut_by_stop).count();
+        let not_run = total - results.len();
+        if cut + not_run > 0 {
+            return MapVerdict::Stopped { total, cut, not_run };
+        }
         let failed = results.iter().filter(|r| !r.ok).count();
-        let total = results.len();
         match failed {
             0 => MapVerdict::Clean,
             n if n == total => MapVerdict::AllFailed {
@@ -2481,6 +2533,13 @@ fn map_item_token_payload(
 /// dispatch) never pay it.
 const RETRY_ON_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// The first check before every attempt of a map item, ahead of its budget
+/// gate: once the run was stopped no attempt is sent, a retry included. The
+/// error carries the interrupt marker.
+fn map_attempt_not_stopped() -> Result<()> {
+    darkmux_types::interrupt::bail_if_set("the dispatch.map item's next attempt was not sent")
+}
+
 /// (#3445) The failure of a map attempt that stopped at the item's
 /// `max_tokens` with no answer
 /// ([`SingleShotReply::hit_cap_with_no_answer`](crate::single_shot::SingleShotReply::hit_cap_with_no_answer)),
@@ -2528,21 +2587,22 @@ fn map_local_item(
     // (#3445) The loop ends with the last attempt's cap failure, if it was one.
     let capped = loop {
         // (#3035) A managed endpoint's window gate, then this item's dispatch
-        // cap reservation, before every attempt. Only a run stopped during a
-        // wait (or limits that cannot be used) ends the item, with nothing sent.
-        if let Some(l) = limits {
-            if let Err(e) = crate::budget::admit_endpoint(l.endpoint, l.caller) {
-                return MapItemResult {
-                    index,
-                    ok: false,
-                    content: String::new(),
-                    error: Some(format!("{e:#}")),
-                    served_model: None,
-                    wall_ms,
-                    retried: error_retries_used,
-                    ..MapItemResult::tokens_of(calls)
-                };
-            }
+        // cap reservation, before every attempt. A stopped run (before the
+        // attempt, or during a budget wait) or limits that cannot be used end
+        // the item, with nothing sent.
+        let admitted = map_attempt_not_stopped()
+            .and_then(|()| limits.map_or(Ok(()), |l| crate::budget::admit_endpoint(l.endpoint, l.caller)));
+        if let Err(e) = admitted {
+            return MapItemResult {
+                index,
+                ok: false,
+                content: String::new(),
+                error: Some(format!("{e:#}")),
+                served_model: None,
+                wall_ms,
+                retried: error_retries_used,
+                ..MapItemResult::tokens_of(calls)
+            };
         }
         let req = SingleShotRequest {
             base_url: None,
@@ -2627,7 +2687,8 @@ fn map_local_item(
                 error_budget -= 1;
                 error_retries_used += 1;
                 last_error = Some(format!("{e:#}"));
-                std::thread::sleep(RETRY_ON_ERROR_BACKOFF);
+                // A stop wakes it; the next attempt's gate then sends nothing.
+                darkmux_types::interrupt::sleep(RETRY_ON_ERROR_BACKOFF);
             }
         }
     };
@@ -2660,8 +2721,9 @@ fn map_local_item(
 /// own token cap bucket (#3035: `crate::budget`), then settles its real cost
 /// against the cap after the call. No attempt is ever skipped or clamped for
 /// budget: a breach warns, and an endpoint `wait` holds the attempt until
-/// there is room. Only a run stopped during a wait (Ctrl-C, `mission abort`)
-/// ends the item early, reported as its error, with nothing sent.
+/// there is room. Only a stopped run (Ctrl-C before an attempt, or Ctrl-C or
+/// `mission abort` during a wait) ends the item early, reported as its
+/// error, with nothing sent.
 #[allow(clippy::too_many_arguments)]
 fn map_hosted_item(
     index: usize,
@@ -2728,9 +2790,10 @@ fn map_hosted_item(
     // (#3445) The loop ends with the last attempt's cap failure, if it was one.
     let capped = loop {
         // (#2902 step 5, #3035) The endpoint's window gate. It may warn or,
-        // under `wait`, hold; only a run stopped during a wait (or limits
-        // that cannot be used) returns here, and then nothing is sent.
-        if let Err(e) = crate::budget::admit_endpoint(endpoint, caller) {
+        // under `wait`, hold; only a stopped run (before the attempt, or
+        // during a wait) or limits that cannot be used return here, and then
+        // nothing is sent.
+        if let Err(e) = map_attempt_not_stopped().and_then(|()| crate::budget::admit_endpoint(endpoint, caller)) {
             return MapItemResult {
                 index,
                 ok: false,
@@ -2820,7 +2883,8 @@ fn map_hosted_item(
                 error_budget -= 1;
                 error_retries_used += 1;
                 last_error = Some(format!("{e:#}"));
-                std::thread::sleep(RETRY_ON_ERROR_BACKOFF);
+                // A stop wakes it; the next attempt's gate then sends nothing.
+                darkmux_types::interrupt::sleep(RETRY_ON_ERROR_BACKOFF);
             }
         }
     };
@@ -6246,8 +6310,9 @@ mod tests {
             wall_ms: 0,
             retried: 0,
             stopped_at_cap: false,
+            cut_by_stop: false,
         }];
-        let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", false, &results);
+        let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", false, &results, results.len());
         assert_eq!(
             rec.session_id.as_deref(),
             Some(expected.as_str()),
@@ -6316,6 +6381,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
             stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("a reply with usage emits a record")).unwrap();
         assert_eq!(payload["total_tokens"], 4547);
@@ -6344,6 +6410,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
             stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&local, "m", "ep").expect("emits")).unwrap();
         assert_eq!(payload["index"], 3, "which item of the fan-out this was");
@@ -6370,6 +6437,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
             stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let execution = ExecutionId::mint();
         let rec = DispatchMapStepKind::item_record(&task_session(), &execution, &step, "m", false, &res);
@@ -6397,6 +6465,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
             stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let tok = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("emits")).unwrap();
         let item = DispatchMapStepKind::item_record(&task_session(), &ExecutionId::mint(), &step, "m", false, &res);
@@ -6427,6 +6496,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
             stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("a reply with usage emits a record")).unwrap();
         assert_eq!(payload["reasoning_tokens"], 1024);
@@ -6457,6 +6527,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
             stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("emits")).unwrap();
         assert_eq!(payload["reasoning_tokens"], 300);
@@ -6537,6 +6608,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
             stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("a total alone still emits")).unwrap();
         assert_eq!(payload["total_tokens"], 1521);
@@ -6565,6 +6637,7 @@ mod tests {
             wall_ms: 0,
             retried: 0,
             stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("a split alone still emits")).unwrap();
         assert_eq!(payload["total_tokens"], 42, "arithmetic on reported parts, not fabrication");
@@ -6597,12 +6670,12 @@ mod tests {
         // mission graph's max-fold token meter reads as the step's true
         // spend (any per-item value is <= the sum).
         let results = vec![
-            MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(100), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false },
-            MapItemResult { index: 1, ok: false, content: String::new(), error: Some("boom".to_string()), total_tokens: None, prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false },
-            MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false },
+            MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(100), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false, cut_by_stop: false },
+            MapItemResult { index: 1, ok: false, content: String::new(), error: Some("boom".to_string()), total_tokens: None, prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false, cut_by_stop: false },
+            MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false, cut_by_stop: false },
         ];
         let s = map_step(json!({}));
-        let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", true, &results);
+        let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", true, &results, results.len());
         let p = rec.payload_json();
         assert_eq!(p["kind"], "dispatch.map");
         assert_eq!(p["items_in"], 3);
@@ -6615,8 +6688,8 @@ mod tests {
             "any failed item raises the level"
         );
 
-        let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false }];
-        let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", false, &clean);
+        let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false, cut_by_stop: false }];
+        let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", false, &clean, clean.len());
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
         assert_eq!(rec.payload_json()["unmanaged"], false);
     }
@@ -6636,13 +6709,14 @@ mod tests {
             wall_ms: 0,
             retried: 0,
             stopped_at_cap: false,
+            cut_by_stop: false,
         }
     }
 
     fn run_of(results: &[MapItemResult]) -> MapRun {
         MapRun {
             outcome: StepOutcome { output: serde_json::to_string(results).unwrap(), flow_records: Vec::new(), degraded: None },
-            verdict: MapVerdict::of(results),
+            verdict: MapVerdict::of(results, results.len()),
         }
     }
 
@@ -7091,6 +7165,91 @@ mod tests {
         assert!(!results[0].ok);
         assert_eq!(results[0].retried, 0, "no retry budget — never retried");
         assert_eq!(calls.get(), 1, "exactly one call — the historical no-retry-on-error behavior");
+    }
+
+    /// An operator's stop that lands during a map's first model call ends
+    /// the map there. The item's retries are never sent, and no later item
+    /// opens a `dispatch.start` or calls the model: each would be a request
+    /// sent after the stop, killed about 100 ms later and billed. The item
+    /// that started gets exactly one terminal (contract 2): a `dispatch.error`
+    /// naming the stop when its call was cut off, its own `dispatch.complete`
+    /// when the call came back whole. The items never started are not
+    /// counted as failures, and the step ends stopped (its error carries the
+    /// interrupt marker and says how many items did not run), never as a
+    /// success. Local and hosted items alike.
+    #[test]
+    #[serial_test::serial]
+    fn a_stop_during_the_first_call_of_a_map_sends_nothing_more() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        let _state = darkmux_types::test_isolation::IsolatedState::new(); // budget records stay off the real flow sink
+        let marker = darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL;
+        for (arm, endpoint) in [("local", None), ("hosted", Some(json!({ "url": "https://example.com" })))] {
+            for call_cut in [true, false] {
+                let case = format!("{arm} item, call cut off: {call_cut}");
+                darkmux_types::interrupt::reset_for_test();
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let seen = Arc::clone(&calls);
+                let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    darkmux_types::interrupt::raise_for_test();
+                    if call_cut {
+                        // What the reap watchdog's kill of the in-flight request returns.
+                        return Err(anyhow!("hosted dispatch {marker}: the request was killed mid-flight"));
+                    }
+                    Ok(crate::single_shot::SingleShotReply {
+                        content: "answer".into(),
+                        model: None,
+                        counts: darkmux_trajectory::UsageCounts { total: Some(10), ..Default::default() },
+                        finish_reason: None,
+                    })
+                });
+                let mut config = json!({
+                    "model": "m",
+                    "user_template": "check {item}",
+                    "collection": ["a", "b", "c", "d", "e"],
+                    "retry_on_error": 2,
+                    "retry_on_empty": 2,
+                });
+                if let Some(ep) = &endpoint {
+                    config["endpoint"] = ep.clone();
+                }
+                let (tx, rx) = std::sync::mpsc::channel();
+                let ctx = StepRunCtx::new(crate::test_run(), Some(tx), Some(ovr), Arc::new(crate::step_kinds::ArtifactBus::new()));
+                let result = DispatchMapStepKind.run(&map_step(config), &empty_task(), &BTreeMap::new(), &ctx);
+                drop(ctx);
+                darkmux_types::interrupt::reset_for_test();
+                let records: Vec<darkmux_flow::FlowRecord> = rx
+                    .into_iter()
+                    .filter_map(|sig| match sig {
+                        crate::step_kinds::WaveSignal::Record(r) => Some(r),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "{case}: no model call after the stop");
+                let bookends: Vec<&darkmux_flow::FlowRecord> =
+                    records.iter().filter(|r| r.action.bookend().is_some()).collect();
+                let actions: Vec<&str> = bookends.iter().map(|r| r.action.as_str()).collect();
+                let terminal = if call_cut { "dispatch.error" } else { "dispatch.complete" };
+                assert_eq!(actions, ["dispatch.start", terminal], "{case}: one execution, opened and closed once");
+                if call_cut {
+                    assert_eq!(bookends[1].payload_json()["stop_reason"], "interrupted", "{case}: the terminal names the stop");
+                }
+                let aggregate = records
+                    .iter()
+                    .map(|r| r.payload_json())
+                    .find(|p| p["items_in"].is_u64())
+                    .unwrap_or_else(|| panic!("{case}: the map's aggregate record"));
+                let ok = u64::from(!call_cut);
+                assert_eq!(
+                    (aggregate["items_in"].as_u64(), aggregate["ok_count"].as_u64(), aggregate["failed_count"].as_u64()),
+                    (Some(5), Some(ok), Some(0)),
+                    "{case}: the items the stop kept from running are not failures"
+                );
+                let err = result.expect_err("a stopped map never ends as a success").to_string();
+                assert!(err.contains(marker) && err.contains("4 of 5 item(s) not run"), "{case}: {err}");
+            }
+        }
     }
 
     #[test]

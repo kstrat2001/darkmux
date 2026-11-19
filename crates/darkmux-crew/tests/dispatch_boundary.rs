@@ -1356,6 +1356,27 @@ fn an_error_after_start_closes_with_dispatch_error_and_reclaims_the_auto_workspa
     assert!(left.iter().any(|n| n.ends_with(".execution.lock")) && left.iter().any(|n| n.ends_with(".resume_origin.json")), "{left:?}");
 }
 
+/// A dispatch that reaches `dispatch()` after the run was stopped starts
+/// nothing: no `docker` call (no container spawn, no model call) and no
+/// record, since an execution that never started opens no `dispatch.start`
+/// (a `dispatch.map` item the stop kept from starting opens none either). A
+/// crawl unit's next draw after a clean draw, a lab repeat, a mission step
+/// already past the wave check: each would otherwise start one more container
+/// the tailer then kills at its first poll.
+#[test]
+#[serial]
+fn a_dispatch_after_a_stop_spawns_nothing_and_writes_no_record() {
+    own_process!();
+    let rig = Rig::new();
+    rig.container(ONE_TURN, ENVELOPE, "", 0);
+    darkmux_types::interrupt::raise_for_test();
+    let (res, _) = run(&rig, rig.opts());
+    let err = format!("{:#}", res.expect_err("a stopped run starts no dispatch"));
+    assert!(err.contains(darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL) && err.contains("did not start"), "{err}");
+    assert_eq!(rig.docker_verbs(), Vec::<String>::new(), "no docker call after the stop");
+    assert_eq!(rig.actions(), Vec::<String>::new(), "no record for an execution that never started");
+}
+
 #[test]
 #[serial]
 fn an_interrupt_mid_run_kills_the_container_and_closes_with_an_error() {
