@@ -33,9 +33,9 @@ is made by the commands that start work (`dispatch`, `mission launch`, `lab run`
 fleet submission, `serve`). A command with no preflight (a read such as
 `run list`) is never refused over the file: it prints the same problem as a
 `warning:` on stderr and runs. A numeric env var set to a value
-that does not read as its number (`DARKMUX_RUNTIME_MAX_TOKENS=50k`, a port above 65535) is refused
-the same way, naming the variable, what kind of value it holds and the accepted form; it is never read
-as unset. An unset or misspelled env var name, by contrast, is simply not read:
+that does not read as its number (`DARKMUX_RUNTIME_MAX_TOKENS=50k`, a port above 65535) is treated
+the same way (refused by a command that starts work, a `warning:` from any other), naming the variable,
+what kind of value it holds and the accepted form; it is never silently read as unset. An unset or misspelled env var name, by contrast, is simply not read:
 the environment is shared with every other program, so darkmux cannot tell a
 typo from somebody else's variable.
 

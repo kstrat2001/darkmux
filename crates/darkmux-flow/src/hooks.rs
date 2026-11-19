@@ -1126,12 +1126,14 @@ fn disabled_alone(r: &HookRule, e: &anyhow::Error) -> Option<&'static str> {
 /// brief read-cursor→POST→write-cursor window, so a probe an instant
 /// later can miss it); an empty result never proves the lock was free
 /// throughout the wait, only that it wasn't held at THIS instant.
+/// Rules are resolved one at a time and a refused one is skipped (no sink
+/// drains it, so it holds no lock), so it never blanks the report for the
+/// rest.
 pub fn rules_with_drain_lock_held_elsewhere(rules: &[HookRule], outbox_dir: &Path) -> Vec<usize> {
-    let Ok(resolved) = resolve_rules(rules, outbox_dir) else {
-        return Vec::new();
-    };
-    resolved
+    rules
         .iter()
+        .enumerate()
+        .filter_map(|(index, r)| resolve_one_rule(index, r, outbox_dir).ok())
         .filter(|r| matches!(darkmux_types::flock::try_lock_exclusive(&r.drain_lock_path), Ok(None)))
         .map(|r| r.index)
         .collect()
@@ -1306,6 +1308,25 @@ mod destination_tests {
         let sink = HookSink::new(&[typo, fine], tmp.path().to_path_buf(), Arc::new(Discard)).expect("the rest of the sink works");
         let indices: Vec<usize> = sink.rules.iter().map(|r| r.rule.index).collect();
         assert_eq!(indices, [1], "only the refused rule is disabled");
+    }
+
+    /// `flow drain`'s "lock held elsewhere" report names every good rule
+    /// whose drain lock another process holds, whatever a refused rule
+    /// beside it carries: a rule refused for its `match` keys (or a
+    /// `transform` that fails to load) is skipped, as the sink skips it,
+    /// not allowed to blank the report.
+    #[test]
+    fn a_refused_rule_does_not_blank_the_drain_lock_report() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = tmp.path().join("out");
+        let mut typo = rule(None, Some(out.to_str().unwrap()));
+        typo.r#match.as_mut().unwrap().extras.insert("levle".into(), serde_json::json!("error"));
+        let mut bad_transform = rule(None, Some(out.to_str().unwrap()));
+        bad_transform.transform = Some("no-such-adapter.jq".into());
+        let good = rule(None, Some(tmp.path().join("good").to_str().unwrap()));
+        let lock = resolve_one_rule(2, &good, tmp.path()).map(|r| r.drain_lock_path).unwrap_or_else(|e| panic!("{e:#}"));
+        let _held = darkmux_types::flock::try_lock_exclusive(&lock).unwrap().expect("this test holds the lock");
+        assert_eq!(rules_with_drain_lock_held_elsewhere(&[typo, bad_transform, good], tmp.path()), [2]);
     }
 }
 

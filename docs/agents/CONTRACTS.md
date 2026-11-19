@@ -409,7 +409,8 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    A numeric setting's env tier follows the same rule (`darkmux-types/src/numeric_env.rs`): a
    `DARKMUX_*` var a numeric accessor reads, set to a value that does not read as its number
    (`DARKMUX_RUNTIME_MAX_TOKENS=50k`), is refused by every preflight and failed by doctor, as the
-   same value in `config.json` is refused by the user-file gate. The refusal names the variable,
+   same value in `config.json` is refused by the user-file gate; a command with no preflight reads
+   it as unset and says so on stderr (`numeric_env::notices`, printed beside the config notice). The refusal names the variable,
    the value's kind (text, a number out of range) and the accepted form, never the value: an env
    var can hold a secret. `NUMERIC_ENV_VARS` is the list; a test fails on a var a numeric accessor
    reads that it lacks.

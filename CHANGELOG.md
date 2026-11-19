@@ -201,7 +201,8 @@ darkmux release.
   with one stderr line naming the rule and the key.
 - **A numeric `DARKMUX_*` env var that does not read as its number is refused, not ignored.**
   `DARKMUX_RUNTIME_MAX_TOKENS=50k` was read as unset (no cap), while the same value in `config.json` is
-  refused. Every entry point now refuses it at preflight and `darkmux doctor` fails it, naming the
+  refused. Every command that starts work now refuses it at preflight, every other command warns on
+  stderr, and `darkmux doctor` fails it, naming the
   variable, what kind of value it holds and the accepted form; the value itself is never printed. The
   older doctor warnings for `DARKMUX_TURN_DELAY_MS`, `DARKMUX_HOST_SAMPLER_INTERVAL_MS` and
   `DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL`, which quoted the value, are gone: each bad var gets

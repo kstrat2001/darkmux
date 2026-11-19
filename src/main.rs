@@ -203,6 +203,10 @@ fn refuse_retired_env(cmd: &Cmd) -> Result<()> {
     if let Some(notice) = darkmux_types::user_files::config_json_notice() {
         eprintln!("warning: {notice}");
     }
+    // A numeric env var that does not read, the same way.
+    for notice in darkmux_types::numeric_env::notices() {
+        eprintln!("warning: {notice}");
+    }
     Ok(())
 }
 

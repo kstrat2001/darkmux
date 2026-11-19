@@ -2407,9 +2407,9 @@ pub fn check_enum_settings() -> Vec<Check> {
 
 /// One Fail row per numeric env var set to a value that does not read
 /// (`darkmux_types::numeric_env`), with the line every preflight refuses
-/// with; no row otherwise. The accessor reads such a var as unset, so this
-/// and the preflight are where it surfaces. Names the value's kind, never
-/// the value.
+/// with; no row otherwise. The accessor reads such a var as unset, so this,
+/// the preflight and the warning every other command prints are where it
+/// surfaces. Names the value's kind, never the value.
 pub fn check_numeric_env() -> Vec<Check> {
     numeric_env_rows(&darkmux_types::numeric_env::bad_values())
 }
@@ -2420,7 +2420,11 @@ fn numeric_env_rows(bad: &[darkmux_types::config_enum::InvalidSetting]) -> Vec<C
         .map(|b| Check {
             name: b.set_in.to_string(),
             status: Status::Fail,
-            message: format!("{}. Every entry point refuses to start over it", b.problem),
+            message: format!(
+                "{}. Every command that starts work refuses to start over it; any other command reads it as \
+                 unset and warns on stderr",
+                b.problem
+            ),
             hint: Some(format!("valid: {}", b.valid)),
         })
         .collect()
@@ -11226,7 +11230,8 @@ mod tests {
         let row = r.checks.iter().find(|c| c.name == "env var DARKMUX_RUNTIME_MAX_TOKENS").expect("a row for the var");
         assert_eq!(row.status, Status::Fail, "{}", row.message);
         assert!(row.message.contains("set to text that is not an integer from 0 to 4294967295"), "{}", row.message);
-        assert!(row.message.contains("Every entry point refuses"), "{}", row.message);
+        assert!(row.message.contains("Every command that starts work refuses"), "{}", row.message);
+        assert!(row.message.contains("any other command reads it as unset and warns"), "{}", row.message);
         assert!(row.hint.as_deref().is_some_and(|h| h.contains("unset DARKMUX_RUNTIME_MAX_TOKENS")), "{:?}", row.hint);
         assert!(!format!("{} {:?}", row.message, row.hint).contains("50k"), "never the value");
         drop(_bad);
