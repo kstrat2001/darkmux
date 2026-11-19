@@ -14535,6 +14535,20 @@ fn a_command_with_no_preflight_warns_about_an_unreadable_numeric_env_var() {
     assert!(!String::from_utf8_lossy(&clean.stderr).contains("env var DARKMUX_"), "no warning when every var reads");
 }
 
+/// On a command that starts work the same warning precedes the refusal, so
+/// it must not claim the var is read as unset there: it says what each kind
+/// of command does, and the refusal follows. Never the value.
+#[test]
+fn a_command_that_starts_work_refuses_and_its_warning_agrees() {
+    let out = darkmux_cmd().env("DARKMUX_RUNTIME_MAX_TOKENS", "secret50k").args(["dispatch", "coder", "hi"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "refused: {stderr}");
+    assert!(stderr.contains("refusing to start"), "{stderr}");
+    assert!(stderr.contains("warning: env var DARKMUX_RUNTIME_MAX_TOKENS"), "{stderr}");
+    assert!(!stderr.contains("read as unset here"), "the warning must not contradict the refusal: {stderr}");
+    assert!(!stderr.contains("secret50k"), "never the value: {stderr}");
+}
+
 /// (4.0) A user file with a key its schema does not know is refused at
 /// preflight by every CLI entry point that consumes it, naming the file,
 /// the key and the closest valid key, before anything is minted. `PATH` is

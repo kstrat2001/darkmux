@@ -134,17 +134,18 @@ pub fn bad_values() -> Vec<InvalidSetting> {
     bad_in(crate::config_access::env_str)
 }
 
-/// What a command that runs no preflight prints about each [`bad_values`]
-/// entry: it reads the var as unset and runs, and a command that starts
-/// work refuses. Never the value.
+/// What every command prints about each [`bad_values`] entry, before any
+/// preflight: true on both kinds of command, since a command that starts
+/// work refuses after it, and any other reads the var as unset and runs.
+/// Never the value.
 pub fn notices() -> Vec<String> {
     bad_values().iter().map(notice).collect()
 }
 
 fn notice(bad: &InvalidSetting) -> String {
     format!(
-        "{bad}\n  read as unset here, so config.json or the default applies; a command that starts work \
-         refuses until it is fixed (`darkmux doctor` names the fix)"
+        "{bad}\n  a command that starts work refuses until it is fixed; any other command reads it as unset, \
+         so config.json or the default applies (`darkmux doctor` names the fix)"
     )
 }
 
