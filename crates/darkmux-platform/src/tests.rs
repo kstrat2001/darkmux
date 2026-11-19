@@ -2786,7 +2786,7 @@ fn a_port_held_on_the_ipv6_loopback_is_not_free() {
 fn the_port_probe_binds_without_listening() {
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let (held, accepted) = (std::sync::Mutex::new(Vec::new()), std::sync::Mutex::new(Vec::new()));
-    let outcomes = crate::port_free::bind_probe_holding(port, &|at| {
+    let outcomes = crate::port_free::bind_probe_holding(port, &|at, _| {
         held.lock().unwrap().push(at);
         let ip = match at.ip() {
             std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -2815,4 +2815,22 @@ fn a_port_left_in_time_wait_is_free() {
     drop(listener);
     drop(client);
     assert!(tcp_port_free(port));
+}
+
+/// The probe's socket is close-on-exec while it holds each address, as
+/// std's listener was: a child spawned on another thread during the probe
+/// (the daemon spawns them) must not inherit it and hold the port.
+#[test]
+fn the_port_probes_socket_is_not_inherited_by_a_child() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let inherited = std::sync::Mutex::new(Vec::new());
+    let held = std::sync::Mutex::new(0);
+    crate::port_free::bind_probe_holding(port, &|at, fd| {
+        *held.lock().unwrap() += 1;
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC == 0 {
+            inherited.lock().unwrap().push(at);
+        }
+    });
+    assert!(held.into_inner().unwrap() > 0, "the probe held an address");
+    assert_eq!(inherited.into_inner().unwrap(), Vec::<std::net::SocketAddr>::new(), "a probe socket a child would inherit");
 }

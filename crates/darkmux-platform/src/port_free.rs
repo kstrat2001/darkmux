@@ -48,11 +48,12 @@ pub fn bind_outcome(addr: IpAddr, result: &std::io::Result<()>) -> BindOutcome {
 /// Binds each of [`PROBED`] on `port` in turn, releasing each before the
 /// next.
 pub fn bind_probe(port: u16) -> Vec<BindOutcome> {
-    bind_probe_holding(port, &|_| {})
+    bind_probe_holding(port, &|_, _| {})
 }
 
-/// [`bind_probe`], calling `held` with each address while its bind holds it.
-pub(crate) fn bind_probe_holding(port: u16, held: &dyn Fn(SocketAddr)) -> Vec<BindOutcome> {
+/// [`bind_probe`], calling `held` with each address, and the probe's file
+/// descriptor, while its bind holds it.
+pub(crate) fn bind_probe_holding(port: u16, held: &dyn Fn(SocketAddr, i32)) -> Vec<BindOutcome> {
     PROBED.iter().map(|&ip| bind_outcome(ip, &bind_only(SocketAddr::new(ip, port), held))).collect()
 }
 
@@ -62,23 +63,42 @@ pub(crate) fn bind_probe_holding(port: u16, held: &dyn Fn(SocketAddr)) -> Vec<Bi
 /// this port's left in `TIME_WAIT` does not read as a holder. The socket
 /// closes on every path, when its `OwnedFd` drops.
 #[cfg(unix)]
-fn bind_only(at: SocketAddr, held: &dyn Fn(SocketAddr)) -> std::io::Result<()> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let family = if at.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
-    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
-    let socket = unsafe { OwnedFd::from_raw_fd(checked(fd)?) };
+fn bind_only(at: SocketAddr, held: &dyn Fn(SocketAddr, i32)) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let socket = probe_socket(if at.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 })?;
     let on: libc::c_int = 1;
     let on_len = std::mem::size_of_val(&on) as libc::socklen_t;
     let raw = socket.as_raw_fd();
     checked(unsafe { libc::setsockopt(raw, libc::SOL_SOCKET, libc::SO_REUSEADDR, (&on as *const libc::c_int).cast(), on_len) })?;
     checked(bind_raw(raw, at))?;
-    held(at);
+    held(at, raw);
     Ok(())
 }
 
+/// A TCP socket of `family`, close-on-exec as std's are, so a child spawned
+/// on another thread while the probe holds a port does not inherit it and
+/// hold the port: set atomically at creation where the type takes
+/// [`SOCKET_CLOEXEC`], and by `fcntl` straight after in every case (a
+/// no-op where creation set it).
+#[cfg(unix)]
+fn probe_socket(family: libc::c_int) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let fd = checked(unsafe { libc::socket(family, libc::SOCK_STREAM | SOCKET_CLOEXEC, 0) })?;
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    checked(unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
+    Ok(socket)
+}
+
+/// The socket type flag that makes a socket close-on-exec as it is created,
+/// on a kernel whose `socket(2)` takes one; macOS's does not.
+#[cfg(target_os = "linux")]
+const SOCKET_CLOEXEC: libc::c_int = libc::SOCK_CLOEXEC;
+#[cfg(all(unix, not(target_os = "linux")))]
+const SOCKET_CLOEXEC: libc::c_int = 0;
+
 /// No socket call of this kind where there is no libc: no answer, so busy.
 #[cfg(not(unix))]
-fn bind_only(_at: SocketAddr, _held: &dyn Fn(SocketAddr)) -> std::io::Result<()> {
+fn bind_only(_at: SocketAddr, _held: &dyn Fn(SocketAddr, i32)) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
