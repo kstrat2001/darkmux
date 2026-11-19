@@ -329,8 +329,6 @@ fn settled_len(path: &Path, file: &std::fs::File) -> Result<u64> {
 /// stays separate from this crate's own read/parse/append logic.
 #[cfg(unix)]
 fn audit_record_at_locked(record: &FlowRecord, path: &Path, file: &mut std::fs::File) -> Result<()> {
-    use std::io::{Seek, SeekFrom, Write as _};
-
     let file_len = settled_len(path, file)?;
 
     let (prev_hash, write_header) = determine_tail_hash(path, file, file_len)?;
@@ -349,12 +347,6 @@ fn audit_record_at_locked(record: &FlowRecord, path: &Path, file: &mut std::fs::
     let hash_hex = audit_hash_of(&to_write).context("computing audit hash")?;
     let line = format!("{hash_hex} {record_json}");
 
-    // Append (after seeking to end). flock holds. The header (fresh file)
-    // and the record line each carry their own `\n` and go out in ONE
-    // `write_all`, so a crash can tear the tail but can never leave a
-    // complete line without its terminator for the next append to glue onto.
-    file.seek(SeekFrom::End(0))
-        .with_context(|| format!("seek to end of {}", path.display()))?;
     let mut out = String::new();
     if let Some(header) = write_header {
         out.push_str(&header);
@@ -362,11 +354,23 @@ fn audit_record_at_locked(record: &FlowRecord, path: &Path, file: &mut std::fs::
     }
     out.push_str(&line);
     out.push('\n');
+    append_synced(path, file, &out)
+}
+
+/// Append `out` at the end of the locked audit file and sync it. flock
+/// holds. The header (fresh file) and the record line each carry their own
+/// `\n` and go out in ONE `write_all`, so a crash can tear the tail but can
+/// never leave a complete line without its terminator for the next append to
+/// glue onto.
+#[cfg(unix)]
+fn append_synced(path: &Path, file: &mut std::fs::File, out: &str) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write as _};
+    file.seek(SeekFrom::End(0))
+        .with_context(|| format!("seek to end of {}", path.display()))?;
     file.write_all(out.as_bytes())
         .with_context(|| format!("appending record to audit log {}", path.display()))?;
     file.sync_all()
-        .with_context(|| format!("syncing audit log {}", path.display()))?;
-    Ok(())
+        .with_context(|| format!("syncing audit log {}", path.display()))
 }
 
 /// `true` when `tail` (the bytes after the file's last `\n`) is a whole
