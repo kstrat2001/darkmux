@@ -2804,11 +2804,25 @@ fn runtime_host(url: &str) -> Option<RuntimeHost> {
         return None;
     }
     let hostport = darkmux_types::endpoint::url_host(url)?;
-    if let Some(v6) = hostport.strip_prefix('[') {
-        let (inside, _) = v6.split_once(']')?;
-        return inside.parse::<std::net::Ipv6Addr>().ok().map(|a| RuntimeHost::Ip(a.into()));
+    match hostport.strip_prefix('[') {
+        Some(v6) => bracketed_host(v6),
+        None => plain_host(&hostport),
     }
-    let host = hostport.split(':').next()?.to_ascii_lowercase();
+}
+
+/// An IPv6 literal's host, `v6` being what follows its `[`: the address up
+/// to `]`, with no zone (WHATWG refuses one). `None` when it does not read.
+fn bracketed_host(v6: &str) -> Option<RuntimeHost> {
+    let (inside, _) = v6.split_once(']')?;
+    inside.parse::<std::net::Ipv6Addr>().ok().map(|a| RuntimeHost::Ip(a.into()))
+}
+
+/// A host that is not an IPv6 literal, `hostport` with any `:port`:
+/// lowercased, an IPv4 address when it ends in a number ([`whatwg_ipv4`],
+/// `None` when that parser refuses it), else a name without one trailing
+/// dot. `None` for an empty host.
+fn plain_host(hostport: &str) -> Option<RuntimeHost> {
+    let host = hostport.split_once(':').map_or(hostport, |(h, _)| h).to_ascii_lowercase();
     if host.is_empty() {
         return None;
     }

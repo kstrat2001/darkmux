@@ -6731,6 +6731,29 @@ S(("127.0.0.1", port), H).serve_forever()
         assert!(!host_is_this_machine("http://mac-studio:1", None, own), "no name of its own, no name matches");
     }
 
+    /// Each way a URL's host reads, as the runtime reads it: an IPv6 literal
+    /// (none without its `]`, none with a zone), a name lowercased without
+    /// one trailing dot, an IPv4 address in a spelling WHATWG accepts (none
+    /// in one it refuses), nothing for an empty host, a backslash, a
+    /// character that is not printable ASCII, or no `scheme://`.
+    #[test]
+    fn a_urls_host_reads_as_the_runtime_reads_it() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let ip = |a: IpAddr| Some(RuntimeHost::Ip(a));
+        assert_eq!(runtime_host("http://[::1]:1/v1"), ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert_eq!(bracketed_host("::1"), None, "no closing bracket");
+        assert_eq!(bracketed_host("fe80::1%25lo0]:1"), None, "a zone");
+        assert_eq!(bracketed_host("not-an-address]"), None);
+        assert_eq!(runtime_host("http://Studio.Local.:1"), Some(RuntimeHost::Name("studio.local".into())));
+        assert_eq!(runtime_host("http://0x7f.1:1"), ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert_eq!(runtime_host("http://256.0.0.1:1"), None, "an IPv4 address WHATWG refuses");
+        assert_eq!(plain_host(":1"), None, "an empty host");
+        assert_eq!(plain_host("Host"), Some(RuntimeHost::Name("host".into())), "no port");
+        for refused in ["http://a\\b@127.0.0.1:1", "http://local host:1", "http://h\tx:1", "127.0.0.1:1"] {
+            assert_eq!(runtime_host(refused), None, "{refused}");
+        }
+    }
+
     /// This host's own addresses are its interfaces' unicast ones: the
     /// loopback, and never a multicast address, the limited broadcast, or
     /// the broadcast address of a subnet this host is on (which a socket can
