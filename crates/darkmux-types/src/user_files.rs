@@ -52,6 +52,7 @@ use schemars::JsonSchema;
 use serde_json::Value;
 
 use crate::config_enum::Scope;
+use crate::unicode_tables::{in_ranges, DEFAULT_IGNORABLE, STRICT_RIGHT_TO_LEFT};
 
 /// Every kind of user file darkmux reads. The owner of each kind's Rust
 /// type runs the check (`darkmux-types` for config, `darkmux-profiles` for
@@ -758,25 +759,91 @@ fn segment(key: &str) -> String {
 }
 
 /// `text` with every control character and every invisible format
-/// character (bidi overrides and isolates, zero-width marks, line and
-/// paragraph separators) written as a `\u{..}` escape, so a terminal shows
-/// it instead of acting on it.
+/// character (bidi embeddings, overrides and isolates, zero-width spaces and
+/// word joiners, line and paragraph separators, tag characters, blank
+/// fillers) written as a `\u{..}` escape, so a terminal shows it instead of
+/// acting on it.
+///
+/// For readable prose, the joiners (ZWJ, ZWNJ), the direction marks (LRM,
+/// RLM, ALM), the variation selectors and the right-to-left letters are kept:
+/// real text needs them (an emoji family or presentation, Persian, Hebrew or
+/// Arabic next to Latin). They CAN change how the text around them is laid
+/// out (`5 / 500` between two RLMs, or between two Hebrew letters, displays
+/// as `500 / 5`), so text the operator must verify exactly (an approval
+/// prompt, a command about to run, an id to compare) uses
+/// [`escape_text_strict`].
 pub fn escape_text(text: &str) -> String {
+    escape_with(text, is_invisible_format)
+}
+
+/// [`escape_text`] for text the operator must verify character for
+/// character. It also escapes every Default_Ignorable_Code_Point (the
+/// joiners, marks, variation selectors, U+034F and the rest: nothing that
+/// takes no space is left unseen) and every character of bidi class R, AL
+/// or AN (Hebrew, Arabic and the Arabic-Indic digits: right-to-left letters
+/// reorder the neutral text between them). What remains is laid out left to
+/// right in the order it is stored. Hebrew or Arabic in an approval shows as
+/// `\u{..}` escapes; that is the price of reading it exactly. The tables are
+/// Unicode 16.0.0 (`unicode_tables`).
+pub fn escape_text_strict(text: &str) -> String {
+    escape_with(text, is_strict_escaped)
+}
+
+/// What [`escape_text_strict`] escapes beyond control characters.
+fn is_strict_escaped(c: char) -> bool {
+    is_invisible_format(c) || in_ranges(c, DEFAULT_IGNORABLE) || in_ranges(c, STRICT_RIGHT_TO_LEFT)
+}
+
+fn escape_with(text: &str, invisible: impl Fn(char) -> bool) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() || is_invisible_format(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c if c.is_control() || invisible(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
             c => out.push(c),
         }
     }
     out
 }
 
-/// Unicode format characters a terminal acts on without showing them.
+/// [`escape_text`] for text printed whole, a block a model, a peer or an
+/// endpoint wrote (a kit, a reply, an error body): its lines and tabs are
+/// kept, so it still reads as written, and every other control and
+/// invisible format character in it is escaped, so it cannot move the
+/// cursor, clear the screen, set the title or the clipboard, or override
+/// the text's direction (the prose marks [`escape_text`] keeps still apply).
+/// A `\r\n` line end is a line end; a lone `\r` is escaped, since it
+/// would let one line overwrite another.
+pub fn escape_text_keeping_lines(text: &str) -> String {
+    let lines: Vec<String> = text
+        .replace("\r\n", "\n")
+        .split('\n')
+        .map(|line| line.split('\t').map(escape_text).collect::<Vec<_>>().join("\t"))
+        .collect();
+    lines.join("\n")
+}
+
+/// Unicode format characters a terminal acts on without showing them (see
+/// [`escape_text`] for the joiners and marks deliberately left out).
 fn is_invisible_format(c: char) -> bool {
-    matches!(c as u32, 0xAD | 0x61C | 0x180E | 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB)
+    matches!(
+        c as u32,
+        0xAD | 0x115F
+            | 0x1160
+            | 0x180E
+            | 0x200B
+            | 0x2028..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0x3164
+            | 0xFEFF
+            | 0xFFA0
+            | 0xFFF9..=0xFFFB
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0000..=0xE007F
+    )
 }
 
 fn join(parent: &str, key: &str) -> String {
