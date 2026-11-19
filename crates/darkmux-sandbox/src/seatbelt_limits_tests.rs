@@ -166,6 +166,42 @@ fn a_program_killed_by_its_own_signal_keeps_the_shells_notice() {
     }
 }
 
+/// (#3112) What `run` and `create` decide before planning, on every OS: a
+/// name that could leave the state root and a memory limit that is not one
+/// are refused; otherwise the directory and the launcher's limit arguments
+/// (pids, bytes, the limit as a person reads it; empty for none).
+#[test]
+#[serial_test::serial]
+fn a_plan_refuses_a_bad_name_or_memory_and_otherwise_carries_the_limits() {
+    let _state = StateDir::new();
+    let mut p = perl("darkmux-plan-1", Limits { memory: Some("64m".into()), pids: Some(8) }, "1;");
+    let (dir, limits) = SeatbeltBackend::planned(&p).unwrap_or_else(|_| panic!("a good policy was refused"));
+    assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("darkmux-plan-1"));
+    assert_eq!(limits, ["8".to_string(), (64u64 << 20).to_string(), "64 MiB".to_string()]);
+    p.limits = Limits::default();
+    assert!(matches!(SeatbeltBackend::planned(&p), Ok((_, l)) if l.iter().all(String::is_empty)));
+    let stderr = |cmd: Box<Command>| -> String { cmd.get_args().last().map(|a| a.to_string_lossy().into_owned()).unwrap_or_default() };
+    p.limits = Limits { memory: Some("lots".into()), pids: None };
+    let bad_memory = SeatbeltBackend::planned(&p).expect_err("`lots` is refused");
+    assert!(stderr(bad_memory).contains("`lots` is not a size"));
+    p.name = "../escape".into();
+    let bad_name = SeatbeltBackend::planned(&p).expect_err("an escaping name is refused");
+    assert_eq!(stderr(bad_name), "../escape");
+}
+
+/// (#3112) A created sandbox's start script runs the launcher with only
+/// the sandbox's environment, then its directory, working directory, the
+/// three limit arguments in order and the program, each one quoted.
+#[test]
+fn a_start_script_carries_the_limits_between_the_workdir_and_the_program() {
+    let mut p = perl("darkmux-start-1", Limits::default(), "print 1;");
+    p.workdir = Some("/w d".into());
+    let script = SeatbeltBackend::start_script(&p, Path::new("/s/darkmux-start-1"), ["8".into(), "67108864".into(), "64 MiB".into()]);
+    assert!(script.starts_with("exec /usr/bin/env -i "), "{script}");
+    assert!(script.ends_with(" sh '/s/darkmux-start-1' '/w d' '8' '67108864' '64 MiB' '/usr/bin/perl' '-e' 'print 1;'\n"), "{script}");
+    assert!(script.contains("'TMPDIR=/s/darkmux-start-1/tmp'"), "the sandbox's own tmp: {script}");
+}
+
 /// A memory limit Docker would read as no limit (`0`) is refused by both
 /// backends before anything runs, Docker's without calling `docker`.
 #[test]

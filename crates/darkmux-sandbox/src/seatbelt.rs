@@ -560,6 +560,36 @@ fn limit_args(limits: &Limits) -> Result<[String; 3], String> {
     Ok([pids, bytes.to_string(), darkmux_types::size::human_bytes(bytes)])
 }
 
+impl SeatbeltBackend {
+    /// What `run` and `create` need before they plan anything: the
+    /// sandbox's directory and the launcher's limit arguments, or the
+    /// command that refuses the policy (a name that could leave the state
+    /// root, a memory limit that is not one).
+    fn planned(policy: &SandboxPolicy) -> Result<(PathBuf, [String; 3]), Box<Command>> {
+        let dir = dir_of(&policy.name).ok_or_else(|| Box::new(refused(&policy.name)))?;
+        let limits = limit_args(&policy.limits).map_err(|why| Box::new(crate::failing(&why)))?;
+        Ok((dir, limits))
+    }
+
+    /// The start script a created sandbox runs: the launcher, with nothing
+    /// of the starting process's environment but the sandbox's own, its
+    /// directory, working directory, limits and program, each quoted.
+    fn start_script(policy: &SandboxPolicy, dir: &Path, limits: [String; 3]) -> String {
+        let env = Self::environment(policy, dir);
+        let launch_args: Vec<String> = [dir.to_string_lossy().into_owned(), policy.workdir.clone().unwrap_or_default()]
+            .into_iter()
+            .chain(limits)
+            .chain(Self::program(policy))
+            .collect();
+        format!(
+            "exec /usr/bin/env -i {} {SH} -c {} sh {}\n",
+            join(env.iter().map(|(k, v)| sh_quote(&format!("{k}={v}")))),
+            sh_quote(&format!("d=$1; shift\n{}", launcher())),
+            join(launch_args.iter().map(|a| sh_quote(a))),
+        )
+    }
+}
+
 impl SandboxBackend for SeatbeltBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Seatbelt
@@ -583,10 +613,9 @@ impl SandboxBackend for SeatbeltBackend {
 
     fn run(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle) {
         let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: policy.name.clone() };
-        let Some(dir) = dir_of(&policy.name) else { return (refused(&policy.name), handle) };
-        let limits = match limit_args(&policy.limits) {
-            Ok(limits) => limits,
-            Err(why) => return (crate::failing(&why), handle),
+        let (dir, limits) = match Self::planned(policy) {
+            Ok(planned) => planned,
+            Err(refusal) => return (*refusal, handle),
         };
         let _ = std::fs::create_dir_all(state_root());
         let mut args = vec![
@@ -606,24 +635,12 @@ impl SandboxBackend for SeatbeltBackend {
 
     fn create(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle) {
         let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: policy.name.clone() };
-        let Some(dir) = dir_of(&policy.name) else { return (refused(&policy.name), handle) };
-        let limits = match limit_args(&policy.limits) {
-            Ok(limits) => limits,
-            Err(why) => return (crate::failing(&why), handle),
+        let (dir, limits) = match Self::planned(policy) {
+            Ok(planned) => planned,
+            Err(refusal) => return (*refusal, handle),
         };
         let _ = std::fs::create_dir_all(state_root());
-        let env = Self::environment(policy, &dir);
-        let launch_args: Vec<String> = [dir.to_string_lossy().into_owned(), policy.workdir.clone().unwrap_or_default()]
-            .into_iter()
-            .chain(limits)
-            .chain(Self::program(policy))
-            .collect();
-        let start = format!(
-            "exec /usr/bin/env -i {} {SH} -c {} sh {}\n",
-            join(env.iter().map(|(k, v)| sh_quote(&format!("{k}={v}")))),
-            sh_quote(&format!("d=$1; shift\n{}", launcher())),
-            join(launch_args.iter().map(|a| sh_quote(a))),
-        );
+        let start = Self::start_script(policy, &dir, limits);
         let args = vec![dir.to_string_lossy().into_owned(), Self::profile(policy, &dir), Self::labels(policy), start];
         let cmd = Self::script(&format!("{PREPARE}printf '%s' \"$4\" > \"$d/start.sh\" || exit 125\n"), &args, &[("PATH".into(), DEFAULT_PATH.into())]);
         (cmd, handle)
