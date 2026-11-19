@@ -65,6 +65,7 @@ function mockFetch(runsOk = true, labRunsOk = true, labSource: Record<string, un
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
   // (#1900 QA nit) A shared belt-and-suspenders reset — several tests below
   // already reset `location.hash` themselves in a `finally`, but this makes
   // the "hash starts empty" assumption a property of the SUITE rather than
@@ -421,6 +422,10 @@ describe("RunsBoard", () => {
   });
 
   it("a failed poll after a good read keeps the last good runs, marked stale with the failure", async () => {
+    // Freeze the wall clock a minute after the fixture's read (`generated_at_ms`
+    // 1), so "from <time>" is a same-day time by construction.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1 + 60_000);
     mockFetch(true, true);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     renderBoard("all", null, null, queryClient);
@@ -438,6 +443,44 @@ describe("RunsBoard", () => {
     expect(document.querySelector('[data-arg="all"] .runchipn')!.textContent).toBe(allCount);
     expect(screen.queryByRole("alert")).toBeNull();
     expect(screen.queryByText(/no runs recorded yet/i)).toBeNull();
+    vi.useRealTimers();
+  });
+
+  // A kept row read while `/runs` is failing keeps its word and color, but
+  // nothing says a running run is still running: no pulse (the mission
+  // header's `lastKnownChip` rule).
+  it("a kept running row stops pulsing as live once the poll fails, and pulses again when it answers", async () => {
+    mockFetch(true, true);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderBoard("all", null, null, queryClient);
+    const badge = () => screen.getByText("d1").closest(".labrunrow")!.querySelector(".labbadge")!;
+    await waitFor(() => expect(badge()).toHaveAttribute("data-live", "beating"));
+
+    mockFetch(false, true);
+    await act(() => queryClient.refetchQueries({ queryKey: queryKeys.runs() }));
+    await waitFor(() => expect(badge()).toHaveAttribute("data-live", "stale"));
+    expect(badge()).toHaveTextContent(/running/i);
+    expect(badge().getAttribute("title")).toMatch(/last known status/i);
+
+    mockFetch(true, true);
+    await act(() => queryClient.refetchQueries({ queryKey: queryKeys.runs() }));
+    await waitFor(() => expect(badge()).toHaveAttribute("data-live", "beating"));
+  });
+
+  it("a remount while /runs is failing still shows the last good runs, marked stale, not 'couldn't load runs'", async () => {
+    mockFetch(true, true);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const first = renderBoard("all", null, null, queryClient);
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    mockFetch(false, true);
+    await act(() => queryClient.refetchQueries({ queryKey: queryKeys.runs() }));
+    await waitFor(() => expect(screen.getByText(/couldn't refresh/)).toBeInTheDocument());
+    first.unmount();
+
+    renderBoard("all", null, null, queryClient);
+    await waitFor(() => expect(screen.getByText(/couldn't refresh/)).toBeInTheDocument());
+    expect(screen.getByText("m1")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("the next good poll clears the stale notice", async () => {

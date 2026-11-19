@@ -1,4 +1,4 @@
-import { clk } from "./format";
+import { clkOn } from "./format";
 
 /**
  * The one typed fetch wrapper every query in this app goes through. Returns
@@ -24,10 +24,11 @@ export function loadFailureText(what: string, failure: { status: number | null; 
 }
 
 /** A refetch failed but an earlier read is still on screen: says how old
- *  that read is (its `generated_at_ms`, local time) and why the newest one
- *  failed, in the same wording as `loadFailureText`. */
-export function staleReadText(what: string, readAtMs: number, failure: { status: number | null; message: string }): string {
-  return `showing ${what} from ${clk(readAtMs)}; couldn't refresh${failureDetail(failure)}`;
+ *  that read is (its `generated_at_ms`, local time, with its date when that
+ *  is not `nowMs`'s day) and why the newest one failed, in the same wording
+ *  as `loadFailureText`. */
+export function staleReadText(what: string, readAtMs: number, failure: { status: number | null; message: string }, nowMs: number): string {
+  return `showing ${what} from ${clkOn(readAtMs, nowMs)}; couldn't refresh${failureDetail(failure)}`;
 }
 
 function failureDetail(failure: { status: number | null; message: string }): string {

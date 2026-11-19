@@ -30,6 +30,7 @@ import {
   runsAgo,
   runSubtitleParts,
   type SubtitlePart,
+  lastKnownChip,
   runChip,
   runDestination,
   MISSION_GRAPH_UNREACHABLE_NOTICE,
@@ -413,7 +414,7 @@ export function RunsBoard({
   });
   // The board polls: a failed poll keeps the last good runs on screen,
   // marked stale (`RunsStale`), rather than replacing them.
-  const runsRead = useKeptRead(runsQuery.data);
+  const runsRead = useKeptRead(queryKeys.runs(), runsQuery.data);
   const labRunsQuery = useQuery({
     queryKey: queryKeys.labRuns(),
     queryFn: () => fetchJson<LabRunsResponse>(labRunsSrc()),
@@ -642,12 +643,12 @@ export function RunsBoard({
         </div>
       )}
       {notice && <div className="labnotice">{notice}</div>}
-      <RunsStale read={runsRead} />
+      <RunsStale read={runsRead} nowMs={nowMs} />
       <div className="lablist">
         {shown.length ? (
           <>
             {shown.map((r) => (
-              <RunRow key={r.id} run={r} machine={machineLabels.get(r.id) ?? null} onActivate={() => activateRun(r)} />
+              <RunRow key={r.id} run={r} machine={machineLabels.get(r.id) ?? null} stale={runsRead.failure !== null} onActivate={() => activateRun(r)} />
             ))}
             {more > 0 && (
               <div
@@ -686,11 +687,11 @@ function RunsUnread({ failure }: { failure: Failure }) {
 
 /** The latest poll failed while earlier runs are on screen: says how old
  * they are and why the refresh failed. Renders nothing while reads succeed. */
-function RunsStale({ read }: { read: { good: RunsResponse | null; failure: Failure | null } }) {
+function RunsStale({ read, nowMs }: { read: { good: RunsResponse | null; failure: Failure | null }; nowMs: number }) {
   if (!read.failure || !read.good) return null;
   return (
     <div className="labnotice" data-state="stale" role="status">
-      {staleReadText("runs", read.good.generated_at_ms, read.failure)}
+      {staleReadText("runs", read.good.generated_at_ms, read.failure, nowMs)}
     </div>
   );
 }
@@ -854,7 +855,9 @@ function RunSubtitle({ parts }: { parts: SubtitlePart[] }) {
   ));
 }
 
-function RunRow({ run, machine, onActivate }: { run: Run; machine: string | null; onActivate: () => void }) {
+/** `stale`: the row comes from a kept read while `/runs` is failing, so its
+ * chip is the last known one (`lastKnownChip`): no live pulse. */
+function RunRow({ run, machine, stale, onActivate }: { run: Run; machine: string | null; stale: boolean; onActivate: () => void }) {
   const interactive = runDestination(run, missionGraphReachable()).kind !== "none";
   const ago = runsAgo(run);
   const subtitle = runSubtitleParts(run, machine);
@@ -878,7 +881,7 @@ function RunRow({ run, machine, onActivate }: { run: Run; machine: string | null
         : {})}
     >
       <div className="labrunmain">
-        <WorkStatus {...runChip(run)} className="labbadge" />
+        <WorkStatus {...(stale ? lastKnownChip(runChip(run)) : runChip(run))} className="labbadge" />
         <RunKindIcon kind={run.kind} />
         <span className="labruncrew">{run.id}</span>
         {ago && <span className="labrundir">{ago}</span>}

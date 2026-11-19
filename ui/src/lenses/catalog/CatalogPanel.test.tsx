@@ -33,6 +33,7 @@ function renderPanel(queryClient = new QueryClient({ defaultOptions: { queries: 
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
   window.location.hash = "";
 });
 
@@ -206,6 +207,10 @@ describe("CatalogPanel", () => {
   });
 
   it("a failed re-read after a good one keeps the days already shown, marked stale with the failure, and retry clears it", async () => {
+    // Freeze the wall clock a minute after the fixture's read (`generated_at_ms`
+    // 1), so "from <time>" is a same-day time by construction.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1 + 60_000);
     let daysOk = true;
     vi.stubGlobal(
       "fetch",
@@ -225,6 +230,7 @@ describe("CatalogPanel", () => {
     // Close and reopen: every open re-reads, and this time the read fails.
     fireEvent.click(toggle);
     daysOk = false;
+    vi.setSystemTime(1 + 65_000); // the cached read is stale now, so the reopen re-reads
     fireEvent.click(toggle);
     await waitFor(() =>
       expect(

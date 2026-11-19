@@ -147,8 +147,8 @@ export function CatalogPanel({ label }: { label?: ReactNode } = {}) {
   // and no failure to show.
   // Each section keeps its last good read: a failed re-read (every open
   // re-reads, and so does retry) marks it stale rather than replacing it.
-  const days = useKeptRead(daysQuery.data);
-  const missions = useKeptRead(missionsQuery.data);
+  const days = useKeptRead(queryKeys.flowDays(), daysQuery.data);
+  const missions = useKeptRead(queryKeys.flowMissions(), missionsQuery.data);
 
   return (
     <div className="catalog-anchor" ref={anchorRef}>
@@ -304,7 +304,7 @@ function CatalogSection<T extends { generated_at_ms: number }>({
   return (
     <div data-state="stale">
       <div className="catempty" role="status">
-        {staleReadText(what, read.good.generated_at_ms, read.failure)}
+        {staleReadText(what, read.good.generated_at_ms, read.failure, Date.now())}
       </div>
       {retry}
       {children(read.good)}
