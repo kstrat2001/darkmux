@@ -64,8 +64,8 @@ pub enum ResidencyDecision {
 /// [`is_own_instance`] names as that identifier's instance is judged for
 /// Reuse (#3074 B10). The default `darkmux:<id>` identifier matches by
 /// itself, so a variant or path id finds its own load whatever key LM Studio
-/// lists it under; an explicit identifier also needs the listed key (the
-/// wanted key or a variant's base key). Judging a
+/// lists it under; an explicit identifier also needs the listed key to be
+/// exactly the wanted key. Judging a
 /// different `darkmux:` copy of the same modelKey would report Reuse for an
 /// instance the dispatch never reaches. With no exact copy, another
 /// darkmux-owned copy of the key is never reusable and is never left beside
@@ -369,15 +369,16 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_identifier_on_a_variant_reuses_its_load_under_the_base_key() {
+    fn an_explicit_identifier_never_reuses_another_quantization_under_the_base_key() {
+        // The profile was `q@8bit` with `identifier: "darkmux:coder"`, then
+        // its id changed to `q@4bit`, while the 8bit load is resident and
+        // (if LM Studio lists a variant under its base key) listed as `q`.
+        // The base key cannot tell the two quantizations apart, so an
+        // explicit identifier needs the exact key: never the 8bit weights.
         for alias in ["darkmux:coder", "my-coder"] {
-            let residents = vec![resident(alias, "qwen/qwen3.8-27b", 262_144)];
-            let p = placement("qwen/qwen3.8-27b@4bit", 32_768, Some(alias));
-            assert_eq!(
-                decide_residency(&residents, &p),
-                ResidencyDecision::Reuse { identifier: alias.into(), resident_ctx: 262_144 },
-                "{alias}"
-            );
+            let residents = vec![resident(alias, "q", 262_144)];
+            let p = placement("q@4bit", 32_768, Some(alias));
+            assert_eq!(decide_residency(&residents, &p), ResidencyDecision::LoadFresh, "{alias}");
         }
     }
 }

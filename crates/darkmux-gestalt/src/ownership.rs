@@ -67,9 +67,12 @@ pub fn is_darkmux_owned(identifier: &str) -> bool {
 /// listed `modelKey` need not equal that id. An explicit identifier, inside
 /// the namespace or not, is not derived from the id: one left in place after
 /// the operator changed the model's `id` still names the old model's load.
-/// So the listed key must also be the wanted key or, for a variant, its base
-/// key ([`listed_key_matches`]); otherwise the dispatch would be answered by
-/// another model (the #1135 ghost).
+/// So the listed key must also be exactly the wanted key; otherwise the
+/// dispatch would be answered by another model (the #1135 ghost). A variant's
+/// base key is never enough: if LM Studio lists a variant's load under it,
+/// it cannot tell one quantization from another, so an explicit identifier
+/// on a variant id is refused at preflight (`ProfileModel::identifier_problem`)
+/// and a variant is found through its default identifier.
 ///
 /// A resident whose identifier equals its own listed key is never ours: that
 /// is the name LM Studio gives a load made without one (its app, a bare `lms
@@ -78,15 +81,7 @@ pub fn is_darkmux_owned(identifier: &str) -> bool {
 pub fn is_own_instance(resident_identifier: &str, resident_key: &str, wanted_key: &str, identifier: &str) -> bool {
     resident_identifier == identifier
         && resident_identifier != resident_key
-        && (identifier == namespaced_identifier(wanted_key, None) || listed_key_matches(resident_key, wanted_key))
-}
-
-/// Whether LM Studio's listed `modelKey` for a resident is `wanted_key`, or
-/// the base key of a variant `wanted_key` (`qwen/qwen3.8-27b` for
-/// `qwen/qwen3.8-27b@4bit`).
-pub fn listed_key_matches(resident_key: &str, wanted_key: &str) -> bool {
-    let wanted = bare_model_key(wanted_key);
-    resident_key == wanted || wanted.split_once('@').is_some_and(|(base, _)| resident_key == base)
+        && (identifier == namespaced_identifier(wanted_key, None) || resident_key == bare_model_key(wanted_key))
 }
 
 /// Does a model already loaded at `loaded_ctx` satisfy a placement that

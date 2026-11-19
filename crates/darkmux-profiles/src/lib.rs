@@ -262,18 +262,25 @@ mod user_file_tests {
     }
 
     /// An LM Studio model's `identifier` equal to its model key is the name LM
-    /// Studio gives the operator's own load of it: every dispatching
-    /// preflight refuses it, naming the key path and a namespaced fix.
+    /// Studio gives the operator's own load of it, and any explicit one on a
+    /// variant id cannot tell quantizations apart: every dispatching
+    /// preflight refuses both, naming the key path and the fix.
     #[test]
     #[serial_test::serial] // the preflight reads DARKMUX_DEFAULT_ENGINE, which a sibling test sets
     fn an_identifier_equal_to_the_model_key_is_refused_by_every_dispatching_preflight() {
-        let (_d, path) = write(r#"{"profiles": {"p": {"models": [{"id": "qwen/q@4bit", "n_ctx": 1, "identifier": "qwen/q"}]}}}"#);
+        let (_d, path) = write(
+            r#"{"profiles": {"p": {"models": [{"id": "qwen/q", "n_ctx": 1, "identifier": "qwen/q"},
+                {"id": "qwen/q@4bit", "n_ctx": 1, "identifier": "darkmux:coder"}]}}}"#,
+        );
         for scope in [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun] {
             let msg = crate::preflight_with(scope, Some(&path)).expect_err("refused").to_string();
             assert!(msg.contains("profiles.json key `profiles.p.models[0].identifier`"), "{msg}");
-            assert!(msg.contains("`qwen/q`") && msg.contains("darkmux:qwen/q@4bit"), "{msg}");
+            assert!(msg.contains("`qwen/q`") && msg.contains("darkmux:qwen/q"), "{msg}");
+            // An explicit identifier on a variant id: drop it for the default.
+            assert!(msg.contains("profiles.json key `profiles.p.models[1].identifier`"), "{msg}");
+            assert!(msg.contains("Drop the identifier") && msg.contains("`darkmux:qwen/q@4bit`"), "{msg}");
         }
-        let (_d, clean) = write(r#"{"profiles": {"p": {"models": [{"id": "qwen/q@4bit", "n_ctx": 1, "identifier": "my-q"}]}}}"#);
+        let (_d, clean) = write(r#"{"profiles": {"p": {"models": [{"id": "qwen/q", "n_ctx": 1, "identifier": "my-q"}]}}}"#);
         assert_eq!(crate::preflight_with(Scope::Dispatch, Some(&clean)), Ok(()));
     }
 

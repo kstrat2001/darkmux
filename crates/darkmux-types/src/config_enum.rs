@@ -639,7 +639,9 @@ pub fn invalid_engine_args(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> 
 }
 
 /// Every profile model whose explicit `identifier` collides with the name LM
-/// Studio gives a load made without one (`ProfileModel::identifier_problem`).
+/// Studio gives a load made without one, or is set on a variant id, where it
+/// cannot tell one quantization's load from another's
+/// (`ProfileModel::identifier_problem`).
 /// Refused at every dispatching preflight and Fail in doctor, naming
 /// `profiles.<p>.models[<i>].identifier`.
 pub fn colliding_identifiers(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
@@ -650,7 +652,8 @@ pub fn colliding_identifiers(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting
                 out.push(InvalidSetting {
                     set_in: SetIn::Profiles(format!("profiles.{pname}.models[{i}].identifier")),
                     problem: why,
-                    valid: "a `darkmux:`-prefixed identifier, one distinct from the model key, or no `identifier`"
+                    valid: "no `identifier` on a variant id; elsewhere a `darkmux:`-prefixed identifier, one \
+                            distinct from the model key, or no `identifier`"
                         .to_string(),
                 });
             }

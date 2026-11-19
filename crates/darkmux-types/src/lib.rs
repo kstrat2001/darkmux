@@ -366,6 +366,17 @@ fn reserved_engine_arg(arg: &str) -> Option<String> {
     ))
 }
 
+/// [`ProfileModel::identifier_problem`]'s refusal of an explicit
+/// `identifier` on the variant id `key` of base key `base`.
+fn variant_identifier_problem(key: &str, base: &str) -> String {
+    format!(
+        "`identifier` is set on `{key}`, a variant id: LM Studio may list a variant's load under its base key \
+         (`{base}`), so an explicit identifier cannot tell this variant's load from another quantization's and the \
+         wrong weights could answer. Drop the identifier; darkmux's default `darkmux:{key}` identifies the variant \
+         exactly"
+    )
+}
+
 impl ProfileModel {
     /// A model on the named endpoint `endpoint_json` declares (as an
     /// `endpoints` entry does), built without a registry.
@@ -432,21 +443,29 @@ impl ProfileModel {
     /// Why this model's explicit `identifier` cannot be used on LM Studio,
     /// or `None`. LM Studio names a load made without an identifier (one from
     /// its app, a bare `lms load`) by its model key, so an `identifier` equal
-    /// to the model's bare key, or to a variant's base key
-    /// (`qwen/qwen3.8-27b` for `qwen/qwen3.8-27b@4bit`), is the name of the
-    /// operator's own load of it: darkmux could not tell its instance from
-    /// that one and would reuse, reload or unload it (contract 4), and
-    /// `darkmux machine eject`, which unloads only the `darkmux:` namespace,
-    /// could not reclaim darkmux's own. A path id's key is not known here,
-    /// so only these two spellings are refused.
+    /// to the model's bare key is the name of the operator's own load of it:
+    /// darkmux could not tell its instance from that one and would reuse,
+    /// reload or unload it (contract 4), and `darkmux machine eject`, which
+    /// unloads only the `darkmux:` namespace, could not reclaim darkmux's own.
+    ///
+    /// Any explicit `identifier` on a variant id is refused. If LM Studio
+    /// lists a variant's load under its base key, an explicit identifier
+    /// cannot tell this variant's load from another quantization's (the
+    /// profile ran `@8bit` under it, then its id changed to `@4bit`), so the
+    /// wrong weights could answer. darkmux's default `darkmux:<id>` names the
+    /// variant exactly. A path id cannot be told from a key here; an explicit
+    /// identifier on one is matched with the listed key, so it reads as not
+    /// resident and its taken identifier is refused loudly, never reused.
     pub fn identifier_problem(&self) -> Option<String> {
         let identifier = self.identifier.as_deref()?;
         if !self.on_lmstudio() {
             return None;
         }
         let key = self.bare_key();
-        let base = key.split_once('@').map_or(key, |(base, _)| base);
-        (identifier == key || identifier == base).then(|| {
+        if let Some((base, _)) = key.split_once('@') {
+            return Some(variant_identifier_problem(key, base));
+        }
+        (identifier == key).then(|| {
             format!(
                 "`identifier` is `{identifier}`, the model key LM Studio names a load of this model made without an \
                  identifier (from its app, or a bare `lms load`), so darkmux could not tell its own instance from \

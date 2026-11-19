@@ -2409,4 +2409,31 @@ mod tests {
         assert!(found[1].0.contains("profiles.b.models[1].identifier"), "{found:?}");
         assert!(found[1].1.contains("`darkmux:y`") && found[1].1.contains("profiles.a.models[1]"), "{found:?}");
     }
+
+    /// An explicit `identifier` on a variant id cannot tell this variant's
+    /// load from another quantization's when LM Studio lists both under the
+    /// base key, so it is refused at preflight with the remedy: drop it, the
+    /// default `darkmux:<id>` names the variant exactly. The default, and an
+    /// explicit identifier on a non-variant id, pass.
+    #[test]
+    fn an_explicit_identifier_on_a_variant_id_is_refused() {
+        let r = registry(
+            r#"{"profiles":{"p":{"models":[
+                {"id":"q@4bit","n_ctx":8192,"identifier":"darkmux:coder"},
+                {"id":"darkmux:q@8bit","n_ctx":8192,"identifier":"my-coder"},
+                {"id":"q@4bit","n_ctx":8192},
+                {"id":"q","n_ctx":8192,"identifier":"darkmux:coder"}]}}}"#,
+        );
+        let models = &r.profiles["p"].models;
+        for (i, id) in [(0, "q@4bit"), (1, "q@8bit")] {
+            let why = models[i].identifier_problem().unwrap_or_else(|| panic!("model {i}: refused"));
+            for n in [&format!("`{id}`")[..], "variant", "Drop the identifier", &format!("`darkmux:{id}`")[..]] {
+                assert!(why.contains(n), "model {i}: expected {n:?} in: {why}");
+            }
+        }
+        assert_eq!(models[2].identifier_problem(), None);
+        assert_eq!(models[3].identifier_problem(), None);
+        let paths: Vec<String> = crate::config_enum::colliding_identifiers(&r).iter().map(|v| v.set_in.to_string()).collect();
+        assert_eq!(paths, (0..2).map(|i| format!("profiles.json key `profiles.p.models[{i}].identifier`")).collect::<Vec<_>>());
+    }
 }

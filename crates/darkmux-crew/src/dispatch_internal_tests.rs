@@ -24201,12 +24201,15 @@ fn decide_preflight_an_explicit_darkmux_identifier_on_another_model_is_not_reuse
     );
 }
 
+/// An explicit identifier on `q@4bit` never reuses another quantization's
+/// load listed under the base key `q` (the 8bit one the profile ran before
+/// its id changed).
 #[test]
-fn decide_preflight_an_explicit_identifier_on_a_variant_reuses_its_load() {
-    let l = [resident("darkmux:coder", "qwen/qwen3.8-27b", 262144)];
+fn decide_preflight_an_explicit_identifier_never_reuses_another_quantization() {
+    let l = [resident("darkmux:coder", "q", 262144)];
     assert_eq!(
-        decide_preflight("qwen/qwen3.8-27b@4bit", Some("darkmux:coder"), 32768, &l),
-        PreflightDecision::Reuse { identifier: "darkmux:coder".into(), resident_ctx: 262144 }
+        decide_preflight("q@4bit", Some("darkmux:coder"), 32768, &l),
+        PreflightDecision::LoadFresh { foreign_identifier: None }
     );
 }
 

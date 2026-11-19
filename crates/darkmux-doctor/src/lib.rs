@@ -12698,6 +12698,11 @@ mod tests {
         assert!(c.message.contains("profiles.p.models[0].identifier") && c.message.contains("`phi-4`"), "{}", c.message);
         let ok = materialized(r#"{"profiles":{"p":{"models":[{"id":"phi-4","n_ctx":8,"identifier":"darkmux:phi-4"}]}}}"#);
         assert_eq!(endpoints_status(&ok, &[], &mut no_spend, REGISTRY).status, Status::Pass);
+        // Any explicit identifier on a variant id fails, with the fix.
+        let variant = materialized(r#"{"profiles":{"p":{"models":[{"id":"q@4bit","n_ctx":8,"identifier":"darkmux:coder"}]}}}"#);
+        let c = endpoints_status(&variant, &[], &mut no_spend, REGISTRY);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("profiles.p.models[0].identifier") && c.message.contains("Drop the identifier"), "{}", c.message);
     }
 
     /// Two models with different ids under one `darkmux:` identifier, which
