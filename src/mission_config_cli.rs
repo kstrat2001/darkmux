@@ -39,7 +39,7 @@
 //!
 //! **`--param ROLE=PROFILE` is DEAD SURFACE on every config (#2523).** It
 //! is accepted, parsed, and then discarded — `show` neuters it (never
-//! stamping `launch override (--param)` provenance) and surfaces a warning.
+//! stamping the `overridden` provenance) and surfaces a warning.
 //! Role→profile overrides used to be converted into launch bindings on the
 //! review route alone, via the dedicated review launcher gated by
 //! `mission_launch::config_uses_review_kinds`; BOTH were deleted (#2310
@@ -958,9 +958,9 @@ fn effective_overrides_and_warnings(
     )
 }
 
-/// `--param ROLE=PROFILE` overrides, exactly as `mission launch --param
-/// <role>=<profile>` parses them (mirrors the now-deleted dedicated review
-/// launcher's own `collect_role_overrides`), except a malformed entry bails
+/// `--param ROLE=PROFILE` overrides, in the form the now-deleted dedicated
+/// review launcher's `collect_role_overrides` parsed (`mission launch` takes
+/// no such override today: it refuses an undeclared input), except a malformed entry bails
 /// immediately with a copy-pasteable example rather than being silently
 /// dropped — a
 /// `show` invocation with a typo'd override should never render as if the

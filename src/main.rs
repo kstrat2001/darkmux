@@ -2024,6 +2024,18 @@ fn print_init_detected(report: &init::InitReport) -> bool {
     matches!(outcome, init_detect::AddOutcome::Refused(_))
 }
 
+/// `init`'s `config:` line: completed, already present, or created.
+fn print_init_config(report: &init::InitReport, dry_run: bool) {
+    let Some(p) = report.config_path.as_ref() else { return };
+    if !report.config_completed.is_empty() {
+        println!("{}", init::config_completed_line(p, &report.config_completed, dry_run));
+    } else if report.config_already_present {
+        println!("config: already present at {}", p.display());
+    } else if report.config_created {
+        println!("config: created at {} (machine_id seeded — edit to set Redis, dirs, runtime knobs)", p.display());
+    }
+}
+
 fn cmd_init(opts: init::InitOptions) -> Result<i32> {
     let dry_run = opts.dry_run;
     let report = init::init(&opts)?;
@@ -2044,16 +2056,7 @@ fn cmd_init(opts: init::InitOptions) -> Result<i32> {
         }
         print_init_utility_model(&report, p);
     }
-    if let Some(p) = report.config_path.as_ref() {
-        if report.config_already_present {
-            println!("config: already present at {}", p.display());
-        } else if report.config_created {
-            println!(
-                "config: created at {} (machine_id seeded — edit to set Redis, dirs, runtime knobs)",
-                p.display()
-            );
-        }
-    }
+    print_init_config(&report, dry_run);
     println!(
         "skills targets: {}",
         report

@@ -227,6 +227,20 @@ darkmux release.
   that one row.
 - **`DARKMUX_VERBOSE=0` turns off `runtime.verbose: true`** for one shell, as env wins over
   `config.json` for every other setting.
+- **A loopback caller is this machine only when its process is not sandboxed work (#3645).** The viewer
+  daemon and `darkmux client serve` took any loopback request with a local `Host` and no proxy header for
+  the operator. A process in a sandbox on the host (a Seatbelt or Landlock dispatch's bash, a host-run
+  preview) and a container reaching `host.docker.internal` (Docker Desktop's `com.docker.backend` holds
+  that connection) arrive the same way, so they read every engagement's records and panels unredacted.
+  Each listener now looks up the process holding a loopback connection, once per connection: one in a
+  host sandbox, a container engine's forwarder, or one the lookup cannot find is not this machine. The
+  viewer answers it as a remote reader (redacted, the token required with `serve.read_auth` on) and
+  `client serve` refuses it. The first request on a new loopback connection takes one socket lookup
+  longer (about 75 ms on macOS); a lookup that does not answer within 5 s reads as remote. This is a
+  second line behind the sandbox's own network profile, not a barrier: a sandboxed process that
+  double-forks into a session of its own, or an app the sandbox has the system open, still reads as the
+  operator. **Behavior change:** another OS user's process on the same machine now reads as remote,
+  because the lookup cannot see it.
 - **Run stats 2.5.0: a run another machine served no longer reports this machine's power as its own.**
   A hosted-seat or remote-peer lab run, while this machine's GPU was busy (a parallel local lab run),
   reported this machine's watts, energy per 1k tokens and thermal states as the run's, and `lab

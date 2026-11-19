@@ -31,7 +31,7 @@ Local seats run on [LMStudio](https://lmstudio.ai/) (one downloaded model minimu
 darkmux profile scan                  # match your downloaded models into profiles
 darkmux lab characterize              # "QA my Mac": smoke workload in, verdict out
 darkmux dispatch coder "add a smoke test for src/lib.rs"
-darkmux mission launch review         # your working-tree diff, reviewed by a local crew
+darkmux radio "review this branch"    # its committed changes, reviewed by a local crew (asks first)
 darkmux serve                         # live fleet view at http://localhost:8765
 ```
 

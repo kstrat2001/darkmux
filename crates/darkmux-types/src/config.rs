@@ -1844,7 +1844,9 @@ pub struct ServeConfig {
     /// Whether a READ that is not from this machine needs the serve token.
     /// Default `false`: reads are open to whatever reaches the daemon (the
     /// tailnet, behind `tailscale serve`). When `true`, a request is exempt
-    /// only if it arrives on loopback with no reverse-proxy header, and
+    /// only if it arrives on loopback with no reverse-proxy header from a
+    /// process outside every sandbox on the host (`darkmux-serve`'s
+    /// `local_peer`), and
     /// `darkmux serve` refuses to start unless a token resolves. A
     /// non-loopback bind requires it. Never governs execution (#2988).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub read_auth: Option<bool>,

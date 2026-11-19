@@ -636,11 +636,15 @@ pub fn synthesize_diff_launch_inputs(config: &MissionConfig, cwd: &Path) -> Resu
     std::fs::write(&spec_path, serde_json::to_vec_pretty(&spec)?)
         .with_context(|| format!("writing the synthesized workspace spec {}", spec_path.display()))?;
 
-    synthesized.params = vec![
+    // Only the inputs the config declares: a launch refuses an undeclared one.
+    synthesized.params = [
         format!("{DIFF_FILE_KEY}={}", diff_path.display()),
         format!("{WORKSPACE_KEY}={}", spec_path.display()),
         format!("head_sha={head}"),
-    ];
+    ]
+    .into_iter()
+    .filter(|p| p.split_once('=').is_some_and(|(k, _)| is_declared_input(config, k)))
+    .collect();
     let mut notes: Vec<String> = Vec::new();
     if fallback_to_last_commit {
         notes.push("no base branch found; reviewing only the last commit.".to_string());
@@ -1774,6 +1778,20 @@ pub(crate) mod tests {
         }
     }
 
+    /// A launch refuses an input its config does not declare, so a copy that
+    /// declares `diff_file` but not `workspace` or `head_sha` is handed only
+    /// the diff, and its launch resolves.
+    #[test]
+    #[serial_test::serial]
+    fn only_the_inputs_a_config_declares_are_synthesized() {
+        let repo = temp_repo(2);
+        let mut copy = embedded_review();
+        copy.inputs.retain(|i| i.name != "workspace" && i.name != "head_sha");
+        let prepared = ready(prepare_launch(&copy, Vec::new(), repo.path()).unwrap());
+        assert_eq!(prepared.synthesized_keys(), ["diff_file"]);
+        assert!(crate::mission_launch::resolve_inputs(&copy, None, &prepared.params).is_ok(), "{:?}", prepared.params);
+    }
+
     #[test]
     #[serial_test::serial]
     fn a_prepared_review_names_the_inputs_it_synthesized_and_a_supplied_one_names_none() {
@@ -2220,11 +2238,12 @@ pub(crate) mod tests {
             )],
         );
         let tmp = std::env::temp_dir();
-        // A NON-EMPTY args string — if injection had run anyway (ignoring
-        // the collision), the reading task would see THIS value instead
-        // of the document's own task output.
-        let out = run_ephemeral(&cfg, &["args=this-should-be-ignored".to_string()], &tmp, None).expect("ephemeral run succeeds, no duplicate-id bail");
+        let out = run_ephemeral(&cfg, &[], &tmp, None).expect("ephemeral run succeeds, no duplicate-id bail");
         assert_eq!(out.text.trim(), "got: operator-owned-value");
+        // The document owns the task, so it reads no panel text: an `args`
+        // value would be dropped, and is refused instead of ignored.
+        let refused = run_ephemeral(&cfg, &["args=this-would-be-dropped".to_string()], &tmp, None).unwrap();
+        assert!(!refused.success && refused.text.contains("input `args` is not declared"), "{}", refused.text);
     }
 
     // ── (#1684 QA finding — CONSIDER 7) validate() runs before interpret ──

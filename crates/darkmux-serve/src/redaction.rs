@@ -946,7 +946,7 @@ mod tests {
     }
 
     fn peer(addr: &str) -> axum::extract::ConnectInfo<std::net::SocketAddr> {
-        axum::extract::ConnectInfo(addr.parse().unwrap())
+        axum::extract::ConnectInfo(crate::local_peer::operator(addr.parse().unwrap()))
     }
 
     async fn get(app: axum::Router, path: &str, from: &str) -> (u16, String) {
