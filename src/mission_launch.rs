@@ -3768,6 +3768,20 @@ fn resolve_gate_step_id(
 /// itself. Packet 3's generic runner is expected to apply this SAME
 /// declaration-driven lookup to hold ANY graph's declared gate step,
 /// rather than reimplementing coder-phase's own hardcoded logic.
+/// The command the coder-phase gate suggests for re-running QA on its
+/// worktree. `review` takes the change as `diff_file` and the tree as a
+/// `workspace` spec FILE (a directory is refused), so the command names both
+/// and says what each must hold; it never names an input `review` does not
+/// declare, which a launch refuses.
+fn review_rerun_command(workdir: &Path) -> String {
+    format!(
+        "darkmux mission launch review --param diff_file=<diff> --param workspace=<spec> \
+         (<diff>: the worktree's change as a unified diff; <spec>: a workspace spec whose one source is \
+         the path {})",
+        workdir.display()
+    )
+}
+
 fn coder_phase_gate_outcome(
     mission_id: &str,
     handles: &CoderPhaseHandles,
@@ -3911,9 +3925,8 @@ fn coder_phase_gate_outcome(
         println!(
             "  {}",
             style::dim(&format!(
-                "re-run QA after fixing:  darkmux mission launch review --param worktree={} \
-                 --param diff_file=<diff>",
-                handles.workdir.display()
+                "re-run QA after fixing:  {}",
+                review_rerun_command(&handles.workdir)
             ))
         );
         println!(
@@ -3956,11 +3969,7 @@ fn coder_phase_gate_outcome(
             )
         );
         println!("  {}", style::dim("inspect the review output above, then either:"));
-        println!(
-            "  {} darkmux mission launch review --param worktree={} --param diff_file=<diff>",
-            style::dim("→ re-run QA: "),
-            handles.workdir.display()
-        );
+        println!("  {} {}", style::dim("→ re-run QA: "), review_rerun_command(&handles.workdir));
         println!(
             "  {} darkmux mission finalize {mission_id}",
             style::dim("→ or adjudicate manually and finalize: ")

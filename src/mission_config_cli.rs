@@ -958,9 +958,9 @@ fn effective_overrides_and_warnings(
     )
 }
 
-/// `--param ROLE=PROFILE` overrides, exactly as `mission launch --param
-/// <role>=<profile>` parses them (mirrors the now-deleted dedicated review
-/// launcher's own `collect_role_overrides`), except a malformed entry bails
+/// `--param ROLE=PROFILE` overrides, in the form the now-deleted dedicated
+/// review launcher's `collect_role_overrides` parsed (`mission launch` takes
+/// no such override today: it refuses an undeclared input), except a malformed entry bails
 /// immediately with a copy-pasteable example rather than being silently
 /// dropped — a
 /// `show` invocation with a typo'd override should never render as if the

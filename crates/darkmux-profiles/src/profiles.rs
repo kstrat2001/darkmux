@@ -345,9 +345,11 @@ pub fn get_profile<'a>(reg: &'a ProfileRegistry, name: &str) -> Result<&'a Profi
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RoleProfileSource {
-    /// (#1475 packet 3) The role was bound by a per-run launch override
-    /// (`mission launch review --param <role>=<profile>`) — highest precedence,
-    /// above the `role_profiles` map and `default_profile`.
+    /// (#1475 packet 3) The role was bound by a profile the run itself names:
+    /// a task's or step's `profile_name` (`review`'s `mod_seat_profile` input
+    /// reaches its seat this way). Highest precedence, above the
+    /// `role_profiles` map and `default_profile`. `mission launch` takes no
+    /// `--param <role>=<profile>` override (an undeclared input is refused).
     Overridden,
     /// The role was bound to this profile by the `role_profiles` map.
     Mapped,

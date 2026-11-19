@@ -292,3 +292,18 @@ fn an_unknown_mod_seat_profile_names_the_closest_defined_profile() {
     assert!(err.contains("the closest is `deep`"), "{err}");
     assert!(env.minted_nothing());
 }
+
+/// The coder-phase gate's re-run command names only inputs `review`
+/// declares (it named `worktree`, which a launch refuses).
+#[test]
+fn the_gates_review_rerun_command_names_only_declared_inputs() {
+    let review = shipped("review.json");
+    let line = review_rerun_command(std::path::Path::new("/wt/x"));
+    let keys: Vec<&str> =
+        line.split("--param ").skip(1).filter_map(|p| p.split_once('=').map(|(k, _)| k)).collect();
+    assert!(!keys.is_empty(), "{line}");
+    for key in keys {
+        assert!(review.inputs.iter().any(|i| i.name == key), "`{key}` is not a `review` input: {line}");
+    }
+    assert!(line.contains("/wt/x"), "{line}");
+}
