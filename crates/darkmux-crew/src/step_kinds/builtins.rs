@@ -3011,10 +3011,11 @@ impl StepKind for DispatchMapStepKind {
 /// `DARKMUX_STEP_INPUT_<SANITIZED-DEP-ID>` (non-alphanumeric bytes in
 /// the dependency id become `_`) so a shell step can consume prior
 /// output without darkmux having to parse the command's own
-/// substitution syntax. An output the environment cannot carry (over
-/// 64 KiB, or past 256 KiB for all of a step's inputs together) is written
-/// whole to `$DARKMUX_STEP_INPUTS_DIR/<SANITIZED-DEP-ID>` instead, and its
-/// variable holds a note naming that file; see [`export_step_inputs`].
+/// substitution syntax. Every output is also written whole to
+/// `$DARKMUX_STEP_INPUTS_DIR/<SANITIZED-DEP-ID>`, and one the environment
+/// cannot carry (over 64 KiB, or past 256 KiB for all of a step's inputs
+/// together) has its variable UNSET, so a command reads it from that file;
+/// see [`export_step_inputs`].
 /// `DARKMUX_BIN` is exported too — the absolute path
 /// of the darkmux running the mission, for a command that has to call
 /// darkmux back. A non-zero exit is a loud `Err` carrying stdout
@@ -3206,109 +3207,139 @@ impl StepKind for ProceduralShellStepKind {
     fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
         let cfg: ShellConfig = load(step, ConfigKind::ProceduralShell)?;
         let cwd = resolve_shell_cwd(step, task, &cfg)?;
-
-        let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(&cfg.command);
-        if let Some(cwd) = &cwd {
-            cmd.current_dir(cwd);
-        }
-        // (#3074) Declared values first, so the darkmux-set variables below
-        // (`DARKMUX_STEP_INPUT_*`, `DARKMUX_BIN`) win over a clashing name.
-        for (name, value) in cfg.env.iter().flatten() {
-            match value {
-                serde_json::Value::String(text) => cmd.env(name, text),
-                other => cmd.env(name, other.to_string()),
-            };
-        }
-        // Held until the command has finished: it owns the files an input
-        // too large for the environment was written to.
+        let mut cmd = shell_command(&cfg, cwd.as_deref());
+        // Held until the command has finished: it owns the files the inputs
+        // were written to.
         let _inputs_dir = export_step_inputs(step, &mut cmd, input)?;
-        // (#2310 P4e) `DARKMUX_BIN` — THIS darkmux, by absolute path, so a
-        // step command that has to ask darkmux something (`review`'s
-        // wait step polls `mod list --for`) calls the binary running the
-        // mission rather than whatever `darkmux` on `PATH` resolves to. A
-        // step spawned from `cargo run`, from a worktree's `target/`, or
-        // from a launcher whose `PATH` carries no darkmux at all would
-        // otherwise fail on a name lookup that has nothing to do with the
-        // step's own work. Set only when `current_exe` resolves; a command
-        // written as `"${DARKMUX_BIN:-darkmux}"` still works when it does
-        // not.
-        //
-        // (#2310 P4e review, item 8) Two cases where this is set but not
-        // the darkmux an operator means, both of which the fallback CANNOT
-        // rescue because the variable is present, just wrong:
-        //
-        //  - **Under `cargo test`** it is the TEST HARNESS binary, not
-        //    darkmux. A step command that shells out to it gets a test
-        //    runner. Harmless for the in-process kind tests (which only
-        //    read the variable), and the integration tests that exercise a
-        //    real command set `DARKMUX_BIN` themselves to
-        //    `assert_cmd::cargo::cargo_bin("darkmux")` — but a future test
-        //    that lets this default through would be testing the harness.
-        //  - **After an in-place reinstall** (`cargo install` renames, but
-        //    a `cp` over a running binary does not) `current_exe` can name
-        //    a path that no longer exists. The command then fails on a
-        //    missing file rather than falling back to `PATH`.
-        //
-        // Both are narrower than the failure this closes (a `PATH` with no
-        // darkmux on it at all, which is the ordinary case for a worktree
-        // build), so it stays — named here rather than silently inherited.
-        if let Ok(exe) = std::env::current_exe() {
-            cmd.env("DARKMUX_BIN", exe);
-        }
-
+        export_darkmux_bin(&mut cmd);
         // (#2361, swarm S4-4) BOUNDED, in its own process group, and
         // registered with the child registry — see
         // `crate::bounded_command`'s module doc. An unbounded `.output()`
         // here pinned the mission Active with no way for a caught
         // SIGTERM/SIGINT to reach the child.
         let timeout = crate::bounded_command::configured_timeout();
-        match crate::bounded_command::run_bounded(cmd, timeout) {
-            crate::bounded_command::Bounded::Finished { success, code, stdout, stderr } => {
-                if !success {
-                    anyhow::bail!(
-                        "step `{}`: command exited with {:?}\nstdout: {}\nstderr: {}",
-                        step.id,
-                        code,
-                        String::from_utf8_lossy(&stdout),
-                        String::from_utf8_lossy(&stderr),
-                    );
-                }
-                Ok(StepOutcome {
-                    output: String::from_utf8_lossy(&stdout).to_string(),
-                    flow_records: Vec::new(),
-                    degraded: None,
-                })
-            }
-            // A killed command produced no output this step could hand on,
-            // so — unlike `mods.gate`, where a hung `test_command` is
-            // recorded as gate DATA — this is a step error naming the bound.
-            crate::bounded_command::Bounded::TimedOut { seconds } => anyhow::bail!(
-                "step `{}`: command exceeded {seconds}s and was killed \
-                 (`runtime.step_command_timeout_seconds`)",
-                step.id
-            ),
-            crate::bounded_command::Bounded::Interrupted => anyhow::bail!(
-                "step `{}`: interrupted before the command finished; the child was killed",
-                step.id
-            ),
-            // (#2532) The resolved working directory is NAMED here. A spawn
-            // that fails because the directory vanished between resolution
-            // and `fork` renders `No such file or directory` — byte-identical
-            // to `sh` itself being missing, which is exactly the confusion
-            // this change exists to end. `<inherited>` when nothing was set
-            // (the ambient tier), so the message never implies a `cwd` the
-            // step did not have.
-            crate::bounded_command::Bounded::SpawnFailed(e) => {
-                let where_ = cwd
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "<inherited from the process>".to_string());
-                Err(anyhow::Error::new(e))
-                    .with_context(|| format!("step `{}`: spawning shell command in {where_}", step.id))
-            }
+        let (ran, cut) = crate::bounded_command::run_bounded_with_cuts(cmd, timeout);
+        shell_outcome(step, cwd.as_deref(), ran, cut)
+    }
+}
+
+/// The `sh -c` command a `procedural.shell` step runs, in `cwd` when one
+/// was resolved, with the step's declared `env`.
+fn shell_command(cfg: &ShellConfig, cwd: Option<&std::path::Path>) -> std::process::Command {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(&cfg.command);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    // (#3074) Declared values first, so the darkmux-set variables
+    // (`DARKMUX_STEP_INPUT_*`, `DARKMUX_BIN`) set after this win over a
+    // clashing name.
+    for (name, value) in cfg.env.iter().flatten() {
+        match value {
+            serde_json::Value::String(text) => cmd.env(name, text),
+            other => cmd.env(name, other.to_string()),
+        };
+    }
+    cmd
+}
+
+/// (#2310 P4e) `DARKMUX_BIN` — THIS darkmux, by absolute path, so a
+/// step command that has to ask darkmux something (`review`'s
+/// wait step polls `mod list --for`) calls the binary running the
+/// mission rather than whatever `darkmux` on `PATH` resolves to. A
+/// step spawned from `cargo run`, from a worktree's `target/`, or
+/// from a launcher whose `PATH` carries no darkmux at all would
+/// otherwise fail on a name lookup that has nothing to do with the
+/// step's own work. Set only when `current_exe` resolves; a command
+/// written as `"${DARKMUX_BIN:-darkmux}"` still works when it does
+/// not.
+///
+/// (#2310 P4e review, item 8) Two cases where this is set but not
+/// the darkmux an operator means, both of which the fallback CANNOT
+/// rescue because the variable is present, just wrong:
+///
+///  - **Under `cargo test`** it is the TEST HARNESS binary, not
+///    darkmux. A step command that shells out to it gets a test
+///    runner. Harmless for the in-process kind tests (which only
+///    read the variable), and the integration tests that exercise a
+///    real command set `DARKMUX_BIN` themselves to
+///    `assert_cmd::cargo::cargo_bin("darkmux")` — but a future test
+///    that lets this default through would be testing the harness.
+///  - **After an in-place reinstall** (`cargo install` renames, but
+///    a `cp` over a running binary does not) `current_exe` can name
+///    a path that no longer exists. The command then fails on a
+///    missing file rather than falling back to `PATH`.
+///
+/// Both are narrower than the failure this closes (a `PATH` with no
+/// darkmux on it at all, which is the ordinary case for a worktree
+/// build), so it stays — named here rather than silently inherited.
+fn export_darkmux_bin(cmd: &mut std::process::Command) {
+    if let Ok(exe) = std::env::current_exe() {
+        cmd.env("DARKMUX_BIN", exe);
+    }
+}
+
+/// What a `procedural.shell` step's bounded run means for the step. A
+/// non-zero exit, a timeout, an interrupt and a failed spawn are step
+/// errors; a finished command's stdout is the step's output, marked
+/// degraded when the output cap cut it.
+fn shell_outcome(
+    step: &Step,
+    cwd: Option<&std::path::Path>,
+    ran: crate::bounded_command::Bounded,
+    cut: crate::bounded_command::OutputCut,
+) -> Result<StepOutcome> {
+    use crate::bounded_command::Bounded;
+    match ran {
+        Bounded::Finished { success: false, code, stdout, stderr } => bail!(
+            "step `{}`: command exited with {:?}\nstdout: {}\nstderr: {}",
+            step.id,
+            code,
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr),
+        ),
+        Bounded::Finished { stdout, .. } => Ok(StepOutcome {
+            output: String::from_utf8_lossy(&stdout).to_string(),
+            flow_records: Vec::new(),
+            degraded: cut_output_reason(step, cut.stdout),
+        }),
+        // A killed command produced no output this step could hand on,
+        // so — unlike `mods.gate`, where a hung `test_command` is
+        // recorded as gate DATA — this is a step error naming the bound.
+        Bounded::TimedOut { seconds } => bail!(
+            "step `{}`: command exceeded {seconds}s and was killed \
+             (`runtime.step_command_timeout_seconds`)",
+            step.id
+        ),
+        Bounded::Interrupted => bail!(
+            "step `{}`: interrupted before the command finished; the child was killed",
+            step.id
+        ),
+        // (#2532) The resolved working directory is NAMED here. A spawn
+        // that fails because the directory vanished between resolution
+        // and `fork` renders `No such file or directory` — byte-identical
+        // to `sh` itself being missing, which is exactly the confusion
+        // this change exists to end. `<inherited>` when nothing was set
+        // (the ambient tier), so the message never implies a `cwd` the
+        // step did not have.
+        Bounded::SpawnFailed(e) => {
+            let where_ = cwd.map_or_else(|| "<inherited from the process>".to_string(), |p| p.display().to_string());
+            Err(anyhow::Error::new(e)).with_context(|| format!("step `{}`: spawning shell command in {where_}", step.id))
         }
     }
+}
+
+/// The degraded reason for a step whose stdout lost `cut` bytes to the
+/// output cap: its output is incomplete, so the run must not read Clean.
+fn cut_output_reason(step: &Step, cut: u64) -> Option<String> {
+    (cut > 0).then(|| {
+        format!(
+            "step `{}`: the command wrote more than the {}-byte output cap; {cut} bytes were cut from the \
+             middle of its stdout, so the step's output is incomplete",
+            step.id,
+            crate::bounded_command::OUTPUT_CAP_BYTES
+        )
+    })
 }
 
 /// The most bytes of one dependency's output a `procedural.shell` command
@@ -3322,68 +3353,83 @@ const STEP_INPUT_ENV_MAX_BYTES: usize = 64 * 1024;
 /// command's own text also spend.
 const STEP_INPUT_ENV_TOTAL_BYTES: usize = 256 * 1024;
 
-/// The dependencies whose output goes to a file instead of the environment:
-/// any over `per` bytes, and, in dependency order, any that would take the
-/// values kept in the environment past `total` bytes.
-fn inputs_for_files(input: &BTreeMap<String, String>, per: usize, total: usize) -> std::collections::BTreeSet<&str> {
+/// The dependencies whose output is too large for the environment: any over
+/// `per` bytes, and, in dependency order, any that would take the values
+/// kept in the environment past `total` bytes.
+fn inputs_too_large_for_env(input: &BTreeMap<String, String>, per: usize, total: usize) -> std::collections::BTreeSet<&str> {
     let mut used = 0;
-    let mut files = std::collections::BTreeSet::new();
+    let mut too_large = std::collections::BTreeSet::new();
     for (dep_id, output) in input {
         if output.len() > per || used + output.len() > total {
-            files.insert(dep_id.as_str());
+            too_large.insert(dep_id.as_str());
         } else {
             used += output.len();
         }
     }
-    files
+    too_large
 }
 
-/// Export each dependency's output to `cmd` as `DARKMUX_STEP_INPUT_<KEY>`.
-/// One the environment cannot carry ([`inputs_for_files`]) is written whole
-/// to `$DARKMUX_STEP_INPUTS_DIR/<KEY>` instead, and its variable holds a
-/// note naming that file, so a spawn never fails on the size of an input.
-/// The returned directory owns those files and must outlive the command.
+/// A directory darkmux created, owner-only, for one shell step's inputs;
+/// removed with everything in it when dropped.
+struct StepInputsDir(std::path::PathBuf);
+
+impl Drop for StepInputsDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Hand each dependency's output to `cmd`. Every one, whatever its size, is
+/// written to `$DARKMUX_STEP_INPUTS_DIR/<KEY>` (a fresh 0700 directory,
+/// each file 0600). Each that fits the environment
+/// ([`inputs_too_large_for_env`]) is also `DARKMUX_STEP_INPUT_<KEY>`; one
+/// that does not has that variable UNSET, never filled with something else,
+/// so `${VAR:?}` fails loudly and a spawn never fails on an input's size.
+/// The returned directory must outlive the command.
 fn export_step_inputs(
     step: &Step,
     cmd: &mut std::process::Command,
     input: &BTreeMap<String, String>,
-) -> Result<Option<tempfile::TempDir>> {
-    let to_files = inputs_for_files(input, STEP_INPUT_ENV_MAX_BYTES, STEP_INPUT_ENV_TOTAL_BYTES);
-    let dir = match to_files.is_empty() {
-        true => None,
-        false => Some(
-            tempfile::Builder::new()
-                .prefix("darkmux-step-inputs-")
-                .tempdir()
-                .with_context(|| format!("step `{}`: creating a directory for inputs too large for the environment", step.id))?,
-        ),
-    };
+) -> Result<Option<StepInputsDir>> {
+    if input.is_empty() {
+        return Ok(None);
+    }
+    let base = std::env::temp_dir().join(format!("darkmux-step-inputs-{}-{}", std::process::id(), unix_nanos()));
+    let dir = StepInputsDir(
+        crate::exclusive_fs::create_dir_exclusive_unique_0700(&base)
+            .with_context(|| format!("step `{}`: creating a directory for its inputs", step.id))?,
+    );
+    let too_large = inputs_too_large_for_env(input, STEP_INPUT_ENV_MAX_BYTES, STEP_INPUT_ENV_TOTAL_BYTES);
     for (dep_id, output) in input {
-        let name = format!("DARKMUX_STEP_INPUT_{}", sanitize_env_key(dep_id));
-        match &dir {
-            Some(dir) if to_files.contains(dep_id.as_str()) => cmd.env(name, write_step_input(step, dir.path(), dep_id, output)?),
-            _ => cmd.env(name, output),
-        };
+        let key = sanitize_env_key(dep_id);
+        crate::exclusive_fs::write_file_refusing_symlinks_0600(&dir.0.join(&key), output.as_bytes())
+            .map_err(|e| anyhow!("step `{}`: writing the output of `{dep_id}` for its command: {e}", step.id))?;
+        let name = format!("DARKMUX_STEP_INPUT_{key}");
+        if too_large.contains(dep_id.as_str()) {
+            cmd.env_remove(&name);
+            eprintln!("{}", unset_input_warning(step, dep_id, output.len(), &name, &key));
+        } else {
+            cmd.env(&name, output);
+        }
     }
-    if let Some(dir) = &dir {
-        cmd.env("DARKMUX_STEP_INPUTS_DIR", dir.path());
-    }
-    Ok(dir)
+    cmd.env("DARKMUX_STEP_INPUTS_DIR", &dir.0);
+    Ok(Some(dir))
 }
 
-/// Write one dependency's output to `<dir>/<KEY>`; the note its variable
-/// holds in place of the value.
-fn write_step_input(step: &Step, dir: &std::path::Path, dep_id: &str, output: &str) -> Result<String> {
-    let path = dir.join(sanitize_env_key(dep_id));
-    std::fs::write(&path, output)
-        .with_context(|| format!("step `{}`: writing the output of `{dep_id}` to {}", step.id, path.display()))?;
-    Ok(format!(
-        "[darkmux: the output of `{dep_id}` is {} bytes, more than a step command's environment carries \
-         ({STEP_INPUT_ENV_MAX_BYTES} bytes for one input, {STEP_INPUT_ENV_TOTAL_BYTES} for all of them); \
-         it is in the file {}]",
-        output.len(),
-        path.display()
-    ))
+/// Nanoseconds since the epoch, for a directory name; `0` on a clock set
+/// before 1970 (the exclusive create steps past a taken name either way).
+fn unix_nanos() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+}
+
+/// What darkmux says on stderr when an input's variable is left unset.
+fn unset_input_warning(step: &Step, dep_id: &str, len: usize, name: &str, key: &str) -> String {
+    format!(
+        "darkmux: step `{}`: the output of `{dep_id}` is {len} bytes, more than a step command's environment \
+         carries ({STEP_INPUT_ENV_MAX_BYTES} bytes for one input, {STEP_INPUT_ENV_TOTAL_BYTES} for all of them), \
+         so `{name}` is unset; the command reads it from \"$DARKMUX_STEP_INPUTS_DIR/{key}\"",
+        step.id
+    )
 }
 
 fn sanitize_env_key(id: &str) -> String {
@@ -4672,22 +4718,72 @@ mod tests {
 
     /// A dependency's output larger than the environment can carry (2 MiB,
     /// past macOS's 1 MiB argument-plus-environment limit and Linux's
-    /// 128 KiB per variable) reaches the command in a file, and the step's
-    /// spawn does not fail. Its variable holds a note naming the file.
+    /// 128 KiB per variable) reaches the command whole in its file, its
+    /// variable is unset rather than filled with anything else, and the
+    /// step's spawn does not fail.
     #[test]
     // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
     #[serial_test::serial]
     fn procedural_shell_hands_an_input_too_large_for_the_environment_over_in_a_file() {
         let big = format!("first-line\n{}\nlast-line", "z".repeat(2 * 1024 * 1024));
         let input = BTreeMap::from([("upstream-step".to_string(), big.clone())]);
-        let command = r#"f="$DARKMUX_STEP_INPUTS_DIR/UPSTREAM_STEP"; printf 'bytes=%s\n' "$(wc -c < "$f" | tr -d ' ')"; tail -n 1 "$f"; echo; printf '%s' "$DARKMUX_STEP_INPUT_UPSTREAM_STEP""#;
+        let command = r#"f="$DARKMUX_STEP_INPUTS_DIR/UPSTREAM_STEP"; printf 'bytes=%s\n' "$(wc -c < "$f" | tr -d ' ')"; tail -n 1 "$f"; echo; printf 'var=%s' "${DARKMUX_STEP_INPUT_UPSTREAM_STEP-unset}""#;
         let s = step("s1", "procedural.shell", json!({"command": command}));
         let out = ProceduralShellStepKind
             .run(&s, &empty_task(), &input, &crate::step_kinds::StepRunCtx::for_test())
             .expect("a large input must not fail the step's spawn");
         assert!(out.output.contains(&format!("bytes={}", big.len())), "the file holds the whole input: {}", out.output);
         assert!(out.output.contains("last-line"), "{}", out.output);
-        assert!(out.output.contains("is in the file") && out.output.contains("UPSTREAM_STEP"), "the variable names the file: {}", out.output);
+        assert!(out.output.ends_with("var=unset"), "the variable is unset, not a stand-in: {}", out.output);
+    }
+
+    /// The reviewer's case: a 100 KiB failing log reaches the next step. Its
+    /// variable is unset, so `${VAR:?}` fails the step loudly instead of a
+    /// stand-in value passing a `grep` for the failure; the file has it.
+    #[test]
+    // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
+    #[serial_test::serial]
+    fn procedural_shell_an_unset_large_input_fails_a_required_reference_and_its_file_has_it() {
+        let log = format!("{}\ntest result: FAILED\n", "ok line\n".repeat(100 * 1024 / 8));
+        let input = BTreeMap::from([("tests".to_string(), log)]);
+        let ctx = crate::step_kinds::StepRunCtx::for_test();
+        let required = step("s1", "procedural.shell", json!({"command": r#"printf %s "${DARKMUX_STEP_INPUT_TESTS:?}" | grep -c FAILED"#}));
+        let err = ProceduralShellStepKind.run(&required, &empty_task(), &input, &ctx).unwrap_err();
+        assert!(err.to_string().contains("DARKMUX_STEP_INPUT_TESTS"), "the shell names the unset variable: {err}");
+        let from_file = step("s2", "procedural.shell", json!({"command": r#"grep -c FAILED "$DARKMUX_STEP_INPUTS_DIR/TESTS""#}));
+        let out = ProceduralShellStepKind.run(&from_file, &empty_task(), &input, &ctx).unwrap();
+        assert_eq!(out.output.trim(), "1");
+    }
+
+    /// An input that fits is both its variable and its file, byte for byte.
+    #[test]
+    // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
+    #[serial_test::serial]
+    fn procedural_shell_writes_every_input_to_its_file_as_well_as_the_environment() {
+        let input = BTreeMap::from([("upstream-step".to_string(), "value-from-upstream\nsecond line".to_string())]);
+        let command = r#"[ "$(cat "$DARKMUX_STEP_INPUTS_DIR/UPSTREAM_STEP")" = "$DARKMUX_STEP_INPUT_UPSTREAM_STEP" ] && printf same"#;
+        let s = step("s1", "procedural.shell", json!({"command": command}));
+        let out = ProceduralShellStepKind.run(&s, &empty_task(), &input, &crate::step_kinds::StepRunCtx::for_test()).unwrap();
+        assert_eq!(out.output, "same");
+    }
+
+    /// The inputs directory is owner-only (0700) and each file in it 0600,
+    /// whatever the umask: another local user on a shared `/tmp` reads
+    /// nothing. Dropping the handle removes the directory.
+    #[test]
+    #[cfg(unix)]
+    fn step_inputs_are_owner_only_and_removed_after_the_command() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let input = BTreeMap::from([("dep".to_string(), "secret".to_string())]);
+        let mut cmd = std::process::Command::new("true");
+        let dir = export_step_inputs(&step("s1", "procedural.shell", json!({})), &mut cmd, &input).unwrap().expect("a directory");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir.0), 0o700, "the directory");
+        assert_eq!(mode(&dir.0.join("DEP")), 0o600, "the file");
+        let path = dir.0.clone();
+        drop(dir);
+        assert!(!path.exists(), "removed after the command");
+        assert!(export_step_inputs(&step("s1", "procedural.shell", json!({})), &mut cmd, &BTreeMap::new()).unwrap().is_none(), "no inputs, no directory");
     }
 
     /// A shell step whose command writes past the output cap (2 MB against
@@ -4704,13 +4800,14 @@ mod tests {
         assert!(out.output.len() <= cap + 512, "kept {} bytes", out.output.len());
         assert!(out.output.starts_with("start\n") && out.output.ends_with("verdict: ok"), "head and tail survive");
         assert!(out.output.contains(&format!("cut {} bytes from the middle of stdout", "start\n".len() + 2_000_000 + "\nverdict: ok".len() - cap)), "no cut note");
+        assert!(out.degraded.is_some(), "an incomplete output is recorded as degraded");
     }
 
-    /// An input over the per-input limit goes to a file; so does, in
-    /// dependency order, one that would take the environment's values past
-    /// the total; an input at either limit exactly stays in the environment.
+    /// An input over the per-input limit is too large for the environment;
+    /// so is, in dependency order, one that would take the environment's
+    /// values past the total; an input at either limit exactly fits.
     #[test]
-    fn inputs_too_large_for_the_environment_are_picked_for_files() {
+    fn inputs_too_large_for_the_environment_are_picked() {
         let input = BTreeMap::from([
             ("a".to_string(), "x".repeat(4)),
             ("b".to_string(), "x".repeat(5)),
@@ -4718,27 +4815,55 @@ mod tests {
             ("d".to_string(), "x".repeat(2)),
             ("e".to_string(), "x".to_string()),
         ]);
-        let files: Vec<_> = inputs_for_files(&input, 4, 7).into_iter().collect();
-        assert_eq!(files, ["b", "c"], "b is over 4; c would make 8 of 7; d makes 6, e makes 7 exactly");
-        assert!(inputs_for_files(&input, 5, 16).is_empty(), "everything fits: 16 of 16");
-        let per_only: Vec<_> = inputs_for_files(&input, 4, 100).into_iter().collect();
+        let too_large: Vec<_> = inputs_too_large_for_env(&input, 4, 7).into_iter().collect();
+        assert_eq!(too_large, ["b", "c"], "b is over 4; c would make 8 of 7; d makes 6, e makes 7 exactly");
+        assert!(inputs_too_large_for_env(&input, 5, 16).is_empty(), "everything fits: 16 of 16");
+        let per_only: Vec<_> = inputs_too_large_for_env(&input, 4, 100).into_iter().collect();
         assert_eq!(per_only, ["b"], "the per-input limit applies with room left in the total");
     }
 
     /// Many inputs that each fit, but not all together (twenty of 60 KiB,
-    /// past macOS's 1 MiB limit), do not fail the step's spawn either: the
-    /// ones past the total reach the command in files.
+    /// past macOS's 1 MiB limit), do not fail the step's spawn either: all
+    /// twenty are files, the first four are variables, the rest are unset.
     #[test]
     // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
     #[serial_test::serial]
-    fn procedural_shell_moves_inputs_past_the_environments_total_to_files() {
+    fn procedural_shell_unsets_inputs_past_the_environments_total() {
         let input: BTreeMap<String, String> = (0..20).map(|i| (format!("dep-{i:02}"), "y".repeat(60 * 1024))).collect();
-        let command = r#"printf '%s ' "${#DARKMUX_STEP_INPUT_DEP_00}"; ls "$DARKMUX_STEP_INPUTS_DIR" | wc -l | tr -d ' '"#;
+        let command = r#"printf '%s %s ' "${#DARKMUX_STEP_INPUT_DEP_03}" "${DARKMUX_STEP_INPUT_DEP_04-unset}"; ls "$DARKMUX_STEP_INPUTS_DIR" | wc -l | tr -d ' '"#;
         let s = step("s1", "procedural.shell", json!({"command": command}));
         let out = ProceduralShellStepKind
             .run(&s, &empty_task(), &input, &crate::step_kinds::StepRunCtx::for_test())
             .expect("many inputs must not fail the step's spawn");
-        assert_eq!(out.output.trim(), format!("{} 16", 60 * 1024), "the first four stay in the environment, sixteen go to files");
+        assert_eq!(out.output.trim(), format!("{} unset 20", 60 * 1024));
+    }
+
+    /// Each way a bounded run ends, as the step sees it: the output, marked
+    /// degraded only when the cap cut stdout; and an error naming what
+    /// happened for a failed exit, a timeout, an interrupt and a spawn.
+    #[test]
+    fn shell_outcome_maps_every_bounded_result() {
+        use crate::bounded_command::{Bounded, OutputCut};
+        let s = step("s1", "procedural.shell", json!({}));
+        let finished = |success| Bounded::Finished { success, code: Some(if success { 0 } else { 3 }), stdout: b"out".to_vec(), stderr: b"err".to_vec() };
+        let ok = shell_outcome(&s, None, finished(true), OutputCut::default()).unwrap();
+        assert_eq!((ok.output.as_str(), ok.degraded), ("out", None));
+        let only_stderr_cut = shell_outcome(&s, None, finished(true), OutputCut { stdout: 0, stderr: 9 }).unwrap();
+        assert_eq!(only_stderr_cut.degraded, None, "stderr is not the step's output");
+        let cut = shell_outcome(&s, None, finished(true), OutputCut { stdout: 42, stderr: 0 }).unwrap();
+        let reason = cut.degraded.expect("a cut output is degraded");
+        assert!(reason.contains("42 bytes") && reason.contains(&crate::bounded_command::OUTPUT_CAP_BYTES.to_string()), "{reason}");
+        let failed = shell_outcome(&s, None, finished(false), OutputCut::default()).unwrap_err().to_string();
+        assert!(failed.contains("exited with Some(3)") && failed.contains("stdout: out") && failed.contains("stderr: err"), "{failed}");
+        let timed_out = shell_outcome(&s, None, Bounded::TimedOut { seconds: 7 }, OutputCut::default()).unwrap_err().to_string();
+        assert!(timed_out.contains("exceeded 7s") && timed_out.contains("step_command_timeout_seconds"), "{timed_out}");
+        let interrupted = shell_outcome(&s, None, Bounded::Interrupted, OutputCut::default()).unwrap_err().to_string();
+        assert!(interrupted.contains("interrupted"), "{interrupted}");
+        let gone = || Bounded::SpawnFailed(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let inherited = format!("{:#}", shell_outcome(&s, None, gone(), OutputCut::default()).unwrap_err());
+        assert!(inherited.contains("<inherited from the process>"), "{inherited}");
+        let named = format!("{:#}", shell_outcome(&s, Some(std::path::Path::new("/gone/dir")), gone(), OutputCut::default()).unwrap_err());
+        assert!(named.contains("/gone/dir"), "{named}");
     }
 
     /// (#2310 P4e) A step command that has to call darkmux back gets the

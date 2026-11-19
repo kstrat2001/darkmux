@@ -190,7 +190,7 @@ url: https://github.com/kstrat2001/darkmux/pull/1749</code></pre>
     "kind": "procedural.shell",
     "gate": "operator",
     "config": {
-      "command": "PR=$(echo \"$DARKMUX_STEP_INPUT_GATHER\" | grep '^pr:' | sed -E 's/^pr: #([0-9]+).*/\\1/')\n[ -n \"$PR\" ] || exit 1\ngh pr review \"$PR\" --approve --body \"Approved via darkmux panel.\""
+      "command": "PR=$(grep '^pr:' \"$DARKMUX_STEP_INPUTS_DIR/GATHER\" | sed -E 's/^pr: #([0-9]+).*/\\1/')\n[ -n \"$PR\" ] || exit 1\ngh pr review \"$PR\" --approve --body \"Approved via darkmux panel.\""
     }
   }]
 }</code></pre>
@@ -203,11 +203,11 @@ url: https://github.com/kstrat2001/darkmux/pull/1749</code></pre>
     "kind": "procedural.shell",
     "gate": "operator",
     "config": {
-      "command": "PR=$(echo \"$DARKMUX_STEP_INPUT_GATHER\" | grep '^pr:' | sed -E 's/^pr: #([0-9]+).*/\\1/')\n[ -n \"$PR\" ] || exit 1\ngh pr merge \"$PR\" --squash"
+      "command": "PR=$(grep '^pr:' \"$DARKMUX_STEP_INPUTS_DIR/GATHER\" | sed -E 's/^pr: #([0-9]+).*/\\1/')\n[ -n \"$PR\" ] || exit 1\ngh pr merge \"$PR\" --squash"
     }
   }]
 }</code></pre>
-    <p>Both extract the PR number back out of <code>gather</code>'s OWN already-fetched output (a single source of truth: no second <code>gh pr view</code> call, and the number the executor acts on is provably the same one the dialog just showed) rather than re-reading the raw panel args. The full configs (<code>id</code>, <code>schema_version</code>, <code>cmd</code>, <code>inputs</code>, <code>panel</code>) wrap around these two tasks the exact same way <code>pr-info.json</code> does above.</p>
+    <p>Both extract the PR number back out of <code>gather</code>'s OWN already-fetched output, read from its file in <code>$DARKMUX_STEP_INPUTS_DIR</code>, which holds it whole at any size (the <code>$DARKMUX_STEP_INPUT_GATHER</code> variable is unset for an output too large for the environment; see <a href="missions.html#shell-step-inputs">the missions guide</a>) (a single source of truth: no second <code>gh pr view</code> call, and the number the executor acts on is provably the same one the dialog just showed) rather than re-reading the raw panel args. The full configs (<code>id</code>, <code>schema_version</code>, <code>cmd</code>, <code>inputs</code>, <code>panel</code>) wrap around these two tasks the exact same way <code>pr-info.json</code> does above.</p>
     <p>The <code>[ -n "$PR" ] || exit 1</code> line guards against an empty extraction: <code>gh pr view ""</code> and <code>gh pr merge "" --squash</code> both silently fall back to resolving the CURRENT branch's PR rather than erroring, so if you tune <code>gather</code>'s output format and the <code>grep</code>/<code>sed</code> pattern above stops matching, this line is what stands between "nothing happened" and "the session branch's own PR got merged instead of the one the dialog showed."</p>
   </div>
 </section>

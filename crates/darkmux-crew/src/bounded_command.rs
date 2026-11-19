@@ -77,8 +77,28 @@ enum DrainSource {
     Err(std::process::ChildStderr),
 }
 
-fn snapshot(buf: &std::sync::Mutex<CappedStream>, name: &str) -> Vec<u8> {
-    buf.lock().map(|b| b.to_bytes(name)).unwrap_or_default()
+/// A stream's kept bytes and how many the cap cut, read under one lock so
+/// the two always agree.
+fn snapshot(buf: &std::sync::Mutex<CappedStream>, name: &str) -> (Vec<u8>, u64) {
+    buf.lock().map(|b| (b.to_bytes(name), b.cut())).unwrap_or_default()
+}
+
+/// How many bytes the output cap cut from each stream of a finished
+/// command; zero for a stream that fit, and for every other outcome.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OutputCut {
+    pub stdout: u64,
+    pub stderr: u64,
+}
+
+/// How every cut note begins, so a reader that fails on cut text (a JSON
+/// parse) can say the text was cut rather than only that it is malformed.
+pub const CUT_NOTE_PREFIX: &str = "[darkmux cut ";
+
+/// Whether `text` carries a cut note: it is a bounded command's output that
+/// lost its middle to [`OUTPUT_CAP_BYTES`].
+pub fn carries_cut_note(text: &str) -> bool {
+    text.contains(CUT_NOTE_PREFIX)
 }
 
 /// The most bytes of each stream (stdout, stderr) a bounded command keeps.
@@ -150,7 +170,7 @@ impl CappedStream {
 /// The in-band note standing where a stream's middle was cut.
 fn cut_note(cut: u64, name: &str, cap: usize) -> String {
     format!(
-        "\n[darkmux cut {cut} bytes from the middle of {name}: a step command keeps the first and last \
+        "\n{CUT_NOTE_PREFIX}{cut} bytes from the middle of {name}: a step command keeps the first and last \
          bytes of each stream, up to a {cap}-byte cap]\n"
     )
 }
@@ -245,18 +265,24 @@ pub fn configured_timeout() -> Duration {
 /// business) for the same reason `run_security_bounded` does: the runner
 /// owns the BOUND, not the command.
 pub fn run_bounded(cmd: Command, timeout: Duration) -> Bounded {
+    run_bounded_with_cuts(cmd, timeout).0
+}
+
+/// [`run_bounded`], also saying how many bytes the output cap cut from each
+/// stream, for a caller that records an incomplete output as such.
+pub fn run_bounded_with_cuts(cmd: Command, timeout: Duration) -> (Bounded, OutputCut) {
     // (#3074) A signal that landed before this spawn must stop the command
     // from ever starting; the poll in `spawn_and_poll` only notices it after
     // the child is already running.
     if darkmux_types::interrupt::is_set() {
-        return Bounded::Interrupted;
+        return (Bounded::Interrupted, OutputCut::default());
     }
     spawn_and_poll(cmd, timeout, OUTPUT_CAP_BYTES)
 }
 
 /// [`run_bounded`]'s spawn, drain and poll loop, keeping at most `cap`
 /// bytes of each stream.
-fn spawn_and_poll(mut cmd: Command, timeout: Duration, cap: usize) -> Bounded {
+fn spawn_and_poll(mut cmd: Command, timeout: Duration, cap: usize) -> (Bounded, OutputCut) {
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -276,7 +302,7 @@ fn spawn_and_poll(mut cmd: Command, timeout: Duration, cap: usize) -> Bounded {
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return Bounded::SpawnFailed(e),
+        Err(e) => return (Bounded::SpawnFailed(e), OutputCut::default()),
     };
     let pid = child.id();
     darkmux_types::child_registry::register(pid);
@@ -339,31 +365,28 @@ fn spawn_and_poll(mut cmd: Command, timeout: Duration, cap: usize) -> Bounded {
                     kill_group(pid);
                     sweep_group(pid);
                 }
-                break Bounded::Finished {
-                    success: status.success(),
-                    code: status.code(),
-                    stdout: snapshot(&out_buf, "stdout"),
-                    stderr: snapshot(&err_buf, "stderr"),
-                };
+                let ((stdout, out_cut), (stderr, err_cut)) = (snapshot(&out_buf, "stdout"), snapshot(&err_buf, "stderr"));
+                let finished = Bounded::Finished { success: status.success(), code: status.code(), stdout, stderr };
+                break (finished, OutputCut { stdout: out_cut, stderr: err_cut });
             }
             Ok(None) => {}
             // The child is unwaitable (already reaped by something else) —
             // treat it as finished-unknown rather than spinning forever.
             Err(e) => {
-                break Bounded::SpawnFailed(e);
+                break (Bounded::SpawnFailed(e), OutputCut::default());
             }
         }
         if darkmux_types::interrupt::is_set() {
             kill_group(pid);
             let _ = child.wait();
             sweep_group(pid);
-            break Bounded::Interrupted;
+            break (Bounded::Interrupted, OutputCut::default());
         }
         if started.elapsed() >= timeout {
             kill_group(pid);
             let _ = child.wait();
             sweep_group(pid);
-            break Bounded::TimedOut { seconds: timeout.as_secs() };
+            break (Bounded::TimedOut { seconds: timeout.as_secs() }, OutputCut::default());
         }
         std::thread::sleep(POLL);
     };
@@ -915,7 +938,7 @@ mod tests {
             "printf OUT-HEAD; head -c {BODY} /dev/zero | tr '\\0' x; printf OUT-TAIL; \
              printf ERR-HEAD >&2; head -c {BODY} /dev/zero | tr '\\0' y >&2; printf ERR-TAIL >&2"
         );
-        let Bounded::Finished { success: true, stdout, stderr, .. } = spawn_and_poll(sh(&script), Duration::from_secs(60), CAP) else {
+        let Bounded::Finished { success: true, stdout, stderr, .. } = spawn_and_poll(sh(&script), Duration::from_secs(60), CAP).0 else {
             panic!("expected a successful Finished");
         };
         for (bytes, name, head, tail) in [(&stdout, "stdout", "OUT-HEAD", "OUT-TAIL"), (&stderr, "stderr", "ERR-HEAD", "ERR-TAIL")] {
@@ -927,6 +950,20 @@ mod tests {
             assert!(text.contains(&format!("cut {cut} bytes from the middle of {name}")), "{name} has no cut note: {}", &text[..200.min(text.len())]);
             assert!(text.contains(&format!("{CAP}-byte cap")), "{name}'s note does not name the cap");
         }
+    }
+
+    /// The cut each stream took is reported alongside the output, and
+    /// agrees with its note; a stream that fit reports none.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn the_cut_is_reported_per_stream() {
+        let (out, cut) = spawn_and_poll(sh("head -c 100 /dev/zero; printf small >&2"), Duration::from_secs(30), 64);
+        assert!(matches!(out, Bounded::Finished { success: true, .. }), "{out:?}");
+        assert_eq!(cut, OutputCut { stdout: 36, stderr: 0 });
+        let Bounded::Finished { stdout, .. } = out else { unreachable!() };
+        assert!(carries_cut_note(&String::from_utf8_lossy(&stdout)));
+        assert!(!carries_cut_note("plain output"));
     }
 
     /// The stream never holds more than its cap while a command writes
