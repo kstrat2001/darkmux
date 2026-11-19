@@ -3,7 +3,8 @@ import { RunKindIcon } from "../../components/RunKindIcon";
 import { Shimmer } from "../../components/Placeholder";
 import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { fetchJson } from "../../lib/fetcher";
+import { fetchJson, loadFailureText, staleReadText, type FetchResult } from "../../lib/fetcher";
+import { useKeptRead } from "../../hooks/useKeptRead";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { missionGraphReachable } from "../../lib/source";
@@ -29,6 +30,7 @@ import {
   runsAgo,
   runSubtitleParts,
   type SubtitlePart,
+  lastKnownChip,
   runChip,
   runDestination,
   MISSION_GRAPH_UNREACHABLE_NOTICE,
@@ -410,6 +412,9 @@ export function RunsBoard({
     queryFn: () => fetchJson<RunsResponse>(runsSrc()),
     refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
   });
+  // The board polls: a failed poll keeps the last good runs on screen,
+  // marked stale (`RunsStale`), rather than replacing them.
+  const runsRead = useKeptRead(queryKeys.runs(), runsQuery.data);
   const labRunsQuery = useQuery({
     queryKey: queryKeys.labRuns(),
     queryFn: () => fetchJson<LabRunsResponse>(labRunsSrc()),
@@ -421,10 +426,7 @@ export function RunsBoard({
   // lab run with a representative session opens the shared session view;
   // only a run without one keeps its own record page. `location.replace`,
   // so Back does not land on the redirect and bounce forward again.
-  const labRunRow =
-    labRunDir && runsQuery.data?.ok
-      ? runsQuery.data.data.runs.find((r) => r.kind === "lab" && r.id === labRunDir)
-      : undefined;
+  const labRunRow = labRunRowOf(runsRead.good, labRunDir);
   const labRunDest = labRunRow ? runDestination(labRunRow, missionGraphReachable()) : null;
   const labRunRedirect = labRunDest?.kind === "hash" ? labRunDest.hash : null;
   useEffect(() => {
@@ -484,7 +486,7 @@ export function RunsBoard({
   // shows.
   const keyCtx = useMachineKeyContext(pinRecords, daemonBacked ? flowWindow.settled : !day.loading, daemonBacked);
 
-  const allRuns = useMemo(() => (runsQuery.data?.ok ? (runsQuery.data.data.runs ?? NO_RUNS) : NO_RUNS), [runsQuery.data]);
+  const allRuns = useMemo(() => runsOf(runsRead.good), [runsRead.good]);
   const index = useMemo(() => machineIndex(allRuns, keyCtx.ctx, sel.machine), [allRuns, keyCtx.ctx, sel.machine]);
   // Windows are minutes wide at their narrowest, so a once-a-minute clock keeps
   // the facet counts from recomputing on every poll.
@@ -586,9 +588,10 @@ export function RunsBoard({
     );
   }
 
-  const labConfigured = labRunsQuery.data.ok ? labRunsQuery.data.data.configured !== false : false;
-  const labDir = labRunsQuery.data.ok ? labRunsQuery.data.data.dir : null;
-  const labDirExists = labRunsQuery.data.ok ? labRunsQuery.data.data.exists : null;
+  // No read of `/runs` has ever succeeded: say so, and draw no kind bar or
+  // count, since any number there would claim "zero runs".
+  const unread = neverRead(runsRead);
+  if (unread) return <RunsUnread failure={unread} />;
 
   // The filter bar speaks in values; the hash carries machine KEYS. A value
   // that is already selected keeps the key it arrived with, so an unresolved
@@ -612,12 +615,10 @@ export function RunsBoard({
 
   const notice =
     kind === "lab"
-      ? labSourceNotice({
-          hasLabRuns: allRuns.some((r) => r.kind === "lab"),
-          configured: labConfigured,
-          dir: labDir,
-          dirExists: labDirExists,
-        })
+      ? labSourceNotice(
+          allRuns.some((r) => r.kind === "lab"),
+          labRunsQuery.data,
+        )
       : null;
 
   const machineLabels = runsMultiMachine(filtered) ? runMachineLabels(filtered) : NO_MACHINE_LABELS;
@@ -642,11 +643,12 @@ export function RunsBoard({
         </div>
       )}
       {notice && <div className="labnotice">{notice}</div>}
+      <RunsStale read={runsRead} nowMs={nowMs} />
       <div className="lablist">
         {shown.length ? (
           <>
             {shown.map((r) => (
-              <RunRow key={r.id} run={r} machine={machineLabels.get(r.id) ?? null} onActivate={() => activateRun(r)} />
+              <RunRow key={r.id} run={r} machine={machineLabels.get(r.id) ?? null} stale={runsRead.failure !== null} onActivate={() => activateRun(r)} />
             ))}
             {more > 0 && (
               <div
@@ -661,32 +663,80 @@ export function RunsBoard({
             )}
           </>
         ) : (
-          <div className="none">
-            {filtering
-              ? "no runs match these filters. Remove a filter, or Clear all."
-              : `no ${kind === "all" ? "" : `${kind} `}runs recorded yet.`}
-          </div>
+          <RunsEmpty filtering={filtering} kind={kind} />
         )}
       </div>
     </div>
   );
 }
 
+/** The board when `/runs` has never answered: the failure (status and
+ * reason) under the header, and nothing else. "no runs recorded yet", a kind
+ * bar of zeros or "Showing 0 runs" would each tell the operator nothing ran
+ * when the daemon simply did not answer. The next poll retries. */
+function RunsUnread({ failure }: { failure: Failure }) {
+  return (
+    <div data-state="error">
+      <div className="stagehdr">runs</div>
+      <div className="none" role="alert">
+        {loadFailureText("runs", failure)}
+      </div>
+    </div>
+  );
+}
+
+/** The latest poll failed while earlier runs are on screen: says how old
+ * they are and why the refresh failed. Renders nothing while reads succeed. */
+function RunsStale({ read, nowMs }: { read: { good: RunsResponse | null; failure: Failure | null }; nowMs: number }) {
+  if (!read.failure || !read.good) return null;
+  return (
+    <div className="labnotice" data-state="stale" role="status">
+      {staleReadText("runs", read.good.generated_at_ms, read.failure, nowMs)}
+    </div>
+  );
+}
+
+type Failure = { status: number | null; message: string };
+
+/** The lab run a `lab=<dir>` deep link names, from the kept `/runs` read. */
+function labRunRowOf(good: RunsResponse | null, labRunDir: string | null | undefined): Run | undefined {
+  if (!labRunDir || !good) return undefined;
+  return good.runs.find((r) => r.kind === "lab" && r.id === labRunDir);
+}
+
+/** The runs a kept read holds, or none before any good read. */
+function runsOf(good: RunsResponse | null): Run[] {
+  return good?.runs ?? NO_RUNS;
+}
+
+/** The failure to show in place of the board when `/runs` has never
+ * answered; null once any read has succeeded (a later failure is stale, not
+ * unread) or while no read has failed. */
+function neverRead(read: { good: RunsResponse | null; failure: Failure | null }): Failure | null {
+  return read.good ? null : read.failure;
+}
+
+/** The list's empty state, for a read that succeeded with no matching runs. */
+function RunsEmpty({ filtering, kind }: { filtering: boolean; kind: RunsKind }) {
+  return (
+    <div className="none">
+      {filtering ? "no runs match these filters. Remove a filter, or Clear all." : `no ${kind === "all" ? "" : `${kind} `}runs recorded yet.`}
+    </div>
+  );
+}
+
 /** The reasons the lab tab can be empty,
- * each with a different remedy: no source wired, a dir not created yet, or a
- * genuinely empty lab. */
-function labSourceNotice(s: {
-  hasLabRuns: boolean;
-  configured: boolean;
-  dir: string | null;
-  dirExists: boolean | null;
-}): string | null {
-  if (s.hasLabRuns) return null;
-  const at = s.dir ? ` (${s.dir})` : "";
-  if (!s.configured) {
+ * each with a different remedy: the read failed, no source wired, a dir not
+ * created yet, or a genuinely empty lab. A failed `/lab/runs` read is named
+ * as one, never read as "no source wired". */
+function labSourceNotice(hasLabRuns: boolean, lab: FetchResult<LabRunsResponse>): string | null {
+  if (hasLabRuns) return null;
+  if (!lab.ok) return loadFailureText("lab runs", lab);
+  const at = lab.data.dir ? ` (${lab.data.dir})` : "";
+  if (lab.data.configured === false) {
     return "this daemon has no lab-run source wired: darkmux doctor shows the resolved dirs.lab and where it came from.";
   }
-  if (s.dirExists === false) return `the configured lab dir does not exist yet${at}: it appears with the first run.`;
+  if (lab.data.exists === false) return `the configured lab dir does not exist yet${at}: it appears with the first run.`;
   return `no lab runs found under the configured lab dir${at}.`;
 }
 
@@ -805,7 +855,9 @@ function RunSubtitle({ parts }: { parts: SubtitlePart[] }) {
   ));
 }
 
-function RunRow({ run, machine, onActivate }: { run: Run; machine: string | null; onActivate: () => void }) {
+/** `stale`: the row comes from a kept read while `/runs` is failing, so its
+ * chip is the last known one (`lastKnownChip`): no live pulse. */
+function RunRow({ run, machine, stale, onActivate }: { run: Run; machine: string | null; stale: boolean; onActivate: () => void }) {
   const interactive = runDestination(run, missionGraphReachable()).kind !== "none";
   const ago = runsAgo(run);
   const subtitle = runSubtitleParts(run, machine);
@@ -829,7 +881,7 @@ function RunRow({ run, machine, onActivate }: { run: Run; machine: string | null
         : {})}
     >
       <div className="labrunmain">
-        <WorkStatus {...runChip(run)} className="labbadge" />
+        <WorkStatus {...(stale ? lastKnownChip(runChip(run)) : runChip(run))} className="labbadge" />
         <RunKindIcon kind={run.kind} />
         <span className="labruncrew">{run.id}</span>
         {ago && <span className="labrundir">{ago}</span>}

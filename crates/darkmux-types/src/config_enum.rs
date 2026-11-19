@@ -638,6 +638,71 @@ pub fn invalid_engine_args(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> 
     out
 }
 
+/// Every profile model whose explicit `identifier` collides with the name LM
+/// Studio gives a load made without one, or is set on a variant id, where it
+/// cannot tell one quantization's load from another's
+/// (`ProfileModel::identifier_problem`).
+/// Refused at every dispatching preflight and Fail in doctor, naming
+/// `profiles.<p>.models[<i>].identifier`.
+pub fn colliding_identifiers(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
+    let mut out = Vec::new();
+    for (pname, profile) in &reg.profiles {
+        for (i, m) in profile.models.iter().enumerate() {
+            if let Some(why) = m.identifier_problem() {
+                out.push(InvalidSetting {
+                    set_in: SetIn::Profiles(format!("profiles.{pname}.models[{i}].identifier")),
+                    problem: why,
+                    valid: "no `identifier` on a variant id; elsewhere a `darkmux:`-prefixed identifier, one \
+                            distinct from the model key, or no `identifier`"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Every profile model whose `darkmux:` identifier (explicit, or its default
+/// `darkmux:<id>`) a model with a different id already loads under
+/// (`ProfileModel::darkmux_load_name`). Either model's dispatch would read the
+/// other's load as its own, the #1135 ghost. The same id in several profiles
+/// shares its identifier by design. Refused at every dispatching preflight and
+/// Fail in doctor, naming `profiles.<p>.models[<i>].identifier` and the model
+/// that has the identifier first.
+pub fn shared_darkmux_identifiers(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
+    let mut first: std::collections::BTreeMap<String, (String, &str)> = std::collections::BTreeMap::new();
+    let mut out = Vec::new();
+    for (pname, profile) in &reg.profiles {
+        for (i, m) in profile.models.iter().enumerate() {
+            let Some((identifier, key)) = m.darkmux_load_name() else { continue };
+            let at = format!("profiles.{pname}.models[{i}]");
+            match first.get(&identifier) {
+                Some((other_at, other_key)) if *other_key != key => {
+                    out.push(shared_identifier(&at, &identifier, other_at, other_key));
+                }
+                Some(_) => {}
+                None => {
+                    first.insert(identifier, (at, key));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn shared_identifier(at: &str, identifier: &str, other_at: &str, other_key: &str) -> InvalidSetting {
+    InvalidSetting {
+        set_in: SetIn::Profiles(format!("{at}.identifier")),
+        problem: format!(
+            "this model loads under `{identifier}`, which `{other_at}` (model `{other_key}`) also loads under, so \
+             each would read the other's load as its own and a dispatch could be answered by the wrong model"
+        ),
+        valid: "one `darkmux:` identifier per model id: give this model its own `identifier`, or none (darkmux then \
+                loads under `darkmux:<id>`)"
+            .to_string(),
+    }
+}
+
 /// (#3448, #3453) The utility binding (`internal.utility`) on a server
 /// darkmux starts (Tensorfold, Flint): the utility jobs (compaction, radio
 /// routing) send to LM Studio or to an endpoint darkmux only sends to, and do
@@ -885,7 +950,9 @@ pub fn preflight(scope: Scope) -> Result<(), PreflightRefusal> {
         .flat_map(crate::config_access::enum_bad_values)
         .collect();
     let files = crate::user_files::config_json_problems();
-    PreflightRefusal { scope, bad, invalid: Vec::new(), files }.into_result()
+    // (#3112) Every scope can start a sandbox (`runtime.sandbox`'s scopes).
+    let invalid = crate::config_access::sandbox_memory_problem().into_iter().collect();
+    PreflightRefusal { scope, bad, invalid, files }.into_result()
 }
 
 /// Look up a registered setting by its dotted key.

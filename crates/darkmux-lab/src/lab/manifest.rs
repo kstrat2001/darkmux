@@ -194,6 +194,44 @@ pub struct ModelHardware {
     pub endpoint: Option<String>,
 }
 
+/// Every item a dispatched model name could be. The wire name says which
+/// kind: `darkmux:<id>` is a managed model (darkmux's namespace in LM
+/// Studio), a bare name an endpoint's. The items of that kind that `names`
+/// the id are taken; with none, every item naming the id without the
+/// namespace. Several can come back (a profile may list one id twice):
+/// the caller decides from what they say, never from their order.
+pub fn by_wire_name<'a, T>(
+    items: &'a [T],
+    dispatched: &str,
+    names: impl Fn(&T, &str) -> bool,
+    managed: impl Fn(&T) -> bool,
+) -> Vec<&'a T> {
+    let (id, wire_managed) = match dispatched.strip_prefix("darkmux:") {
+        Some(id) => (id, true),
+        None => (dispatched, false),
+    };
+    let named: Vec<&T> = items.iter().filter(|t| names(t, id)).collect();
+    let of_kind: Vec<&T> = named.iter().copied().filter(|t| managed(t) == wire_managed).collect();
+    if of_kind.is_empty() { named } else { of_kind }
+}
+
+/// The snapshot entries a dispatched model name could be ([`by_wire_name`]).
+/// A managed Flint server answers to `flint` whatever its model's id (rec
+/// has no `--name`), so that name also names every managed entry: the
+/// snapshot does not record which managed engine an entry ran on, and
+/// every managed entry is this machine's, so reading them together never
+/// changes the answer. An endpoint's model with the literal id `flint` is
+/// still taken first, by the wire name's kind.
+pub fn snapshot_matches<'a>(snapshot: &'a [ModelHardware], dispatched: &str) -> Vec<&'a ModelHardware> {
+    let managed = |e: &ModelHardware| e.from == HardwareFrom::Managed;
+    let names = |e: &ModelHardware, id: &str| {
+        e.model == id
+            || e.identifier.as_deref() == Some(id)
+            || (id == darkmux_profiles::engine::flint::SERVED_NAME && managed(e))
+    };
+    by_wire_name(snapshot, dispatched, names, managed)
+}
+
 /// (#3397) The model a run's replies say answered, from its trajectory's
 /// `model.completed` events (`reported_model`): the one name they agree on,
 /// `None` when they named none, or more than one. A compactor's calls are

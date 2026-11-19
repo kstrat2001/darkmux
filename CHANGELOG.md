@@ -16,6 +16,24 @@ darkmux release.
 
 ### Added
 
+- **Seatbelt sandboxes are held to a process and a memory limit, and the memory limit is a setting
+  (#3112).** New setting `sandbox.memory` (CONFIG 2.11, `DARKMUX_SANDBOX_MEMORY`; Docker's size syntax,
+  from `6m` to `262144g`, default `4g`, written by `init`): the memory every sandbox may hold (a dispatch, a
+  contained command, a client preview), under Docker and Seatbelt alike. `darkmux config set
+  sandbox.memory 16g` changes it; a value that is not such a size (`lots`, `0`, a negative) is refused
+  by `config set`, at every entry point's preflight and by doctor's new `sandbox memory` row, which shows
+  the value in effect and where it came from. Docker holds it in the container's cgroup. Seatbelt, which
+  has no kernel memory ceiling on macOS, adds up the sandbox's resident memory once a second and stops
+  it (exit 137) when it is over, its last stderr line saying what it used, the limit and the setting.
+  Seatbelt also holds a sandbox's processes with `RLIMIT_NPROC`: macOS counts that per user, so the
+  sandbox may start about 512 processes beyond what you ran when it started, room it shares with every
+  other process of yours (another sandbox or a parallel build can use it up, and a fork then fails with
+  a bare "Resource temporarily unavailable"). Landlock holds neither. An older darkmux refuses a config
+  carrying `sandbox.memory`.
+- **The runtime's file tools never read past their cap and never wait on a named pipe.** `read` reads
+  at most its 1 MB cap, `search` at most the first 1 MB of each file (naming the files it cut), `edit`
+  and `create_finding` refuse a file over 16 MB unread, and every file tool (and the detector's code
+  hash) refuses a named pipe, socket or device at its one open instead of blocking the dispatch.
 - **Setup finds the engines darkmux can start, adds one on request, and says when none is usable (#3569).**
   darkmux now looks for installed engines it can run work on: rec's Flint (rec 0.1.0 with a runtime and
   a pulled revision), Tensorfold (a 1.2.x release that lists a model), LM Studio with a downloaded model,
@@ -200,6 +218,38 @@ darkmux release.
   hashes it, and the runtime sends the prompt exactly as passed. A container run is unchanged. The
   model still sees the workspace's true host path under a sandbox on the host, so request bodies
   there still carry the path (under your home folder), including those sent to a hosted endpoint.
+- **Run stats 2.5.0: a run another machine served no longer reports this machine's power as its own.**
+  A hosted-seat or remote-peer lab run, while this machine's GPU was busy (a parallel local lab run),
+  reported this machine's watts, energy per 1k tokens and thermal states as the run's, and `lab
+  submit` published them in a bundle marked `stack.hardware: "unknown"`. On a host with no GPU
+  utilization reading (Omarchy), a sample taken while the run's model stream was open counts as busy,
+  so it happened on every such run with telemetry. `run stats` now
+  reads which machine served the run's model from the run manifest's `model_hardware` snapshot and
+  adds `hardware` (`submitting-machine`, `unknown`, or `null` when the run did not record it). For
+  `unknown` and for `null`, every host power, energy and thermal figure is `null` (or empty, or 0 for
+  `throttled_samples`), each listed in `host_unmeasured` with the reason, and the new `this_machine`
+  object keeps this machine's own readings over the window (no energy per token: this machine's watts
+  against another machine's tokens measure nothing). **This withholds the host figures of every run
+  that recorded no hardware**: runs from before run manifest 1.3, and runs on an endpoint that declared
+  no `hardware` (set `"hardware"` on the endpoint for later runs). The text view prints "not measured
+  for this run" with the reason, and the set table flags `ELSEWHERE` or `NO-HW`. `lab submit` publishes
+  null for every host detail field of a run whose bundle says `unknown`, including a run `--hardware
+  unknown` corrects, and of a run `run stats` withheld them from. Additive
+  to the `run stats --json` shape; the meaning of the host fields narrows to "the machine that served
+  the run". The submit bundle's shape and format version are unchanged (those fields were already
+  nullable). Both `run stats` and `lab submit` pick the run's snapshot entry by the name the run sent:
+  `darkmux:<id>` is the managed model and a bare name the endpoint's, so a profile listing the same
+  model managed here and on a peer is no longer decided by its order. Several entries a name matches
+  decide when they agree on the machine (one hosted id on two providers, the same managed model listed
+  twice), and decide nothing when they disagree (`run stats` reads `hardware: null`; `lab submit`
+  takes `--hardware` under the same contradiction checks as one entry, and otherwise asks for it). A run
+  from before the snapshot reads the registry by the same rule, and `flint` (the name a managed Flint
+  server always answers to) names the managed Flint model. `run stats` adds `compactor_calls_here` for a
+  run whose figures are withheld: its compactions on a model this machine served, each `compaction.start`
+  counting whether or not a reply followed (`null` when one's model is not placed by the snapshot). In
+  a set, a run whose figures are withheld (`ELSEWHERE` or `NO-HW`) with no compaction here no longer
+  counts as overlapping a local run, and an energy cost withheld because of one says why.
+
 - **A step command's output is bounded, not only its time.** `procedural.shell`, the `mods.gate`
   `test_command`, lab verify commands and grader suites kept everything a command wrote; a chatty one
   could fill memory within the 600 s default bound. Each stream now keeps its first 768 KiB and last

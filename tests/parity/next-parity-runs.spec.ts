@@ -57,6 +57,12 @@ function goldenStageText(label: string): string {
 // `data-state="pending"` skeleton.
 const SETTLED = '[data-state="data"]';
 
+// A blank daemon 404s `/runs`, and a board whose `/runs` was never read
+// settles as a failure (`RunsUnread`, `data-state="error"`), never as an
+// empty `data` board: the red-prove waits for that, so it also pins that a
+// dead daemon is not shown as "no runs".
+const BLANK_SETTLED = '[data-state="error"]';
+
 test.describe("next-parity: runs board (Packet 3)", () => {
   test.beforeAll(() => {
     mkdirSync(GALLERY_DIR, { recursive: true });
@@ -160,20 +166,20 @@ test.describe("next-parity: runs board red-prove (harness self-test)", () => {
     installBlankRoutes(page);
 
     await page.goto("/index.html#lens=runs");
-    await expect(page.locator(SETTLED)).toBeAttached({ timeout: 15000 });
+    await expect(page.locator(BLANK_SETTLED)).toBeAttached({ timeout: 15000 });
     const blankAll = await extractStageOnlyText(page);
     expect(blankAll, "blank-route extraction must NOT match the real runs.txt golden").not.toBe(goldenStageText("runs"));
 
     await page.goto("/index.html#lens=runs&kind=mission");
-    await expect(page.locator(SETTLED)).toBeAttached({ timeout: 15000 });
+    await expect(page.locator(BLANK_SETTLED)).toBeAttached({ timeout: 15000 });
     expect(await extractStageOnlyText(page)).not.toBe(goldenStageText("runs-kind-mission"));
 
     await page.goto("/index.html#lens=runs&kind=dispatch");
-    await expect(page.locator(SETTLED)).toBeAttached({ timeout: 15000 });
+    await expect(page.locator(BLANK_SETTLED)).toBeAttached({ timeout: 15000 });
     expect(await extractStageOnlyText(page)).not.toBe(goldenStageText("runs-kind-dispatch"));
 
     await page.goto("/index.html#lens=runs&kind=lab");
-    await expect(page.locator(SETTLED)).toBeAttached({ timeout: 15000 });
+    await expect(page.locator(BLANK_SETTLED)).toBeAttached({ timeout: 15000 });
     expect(await extractStageOnlyText(page)).not.toBe(goldenStageText("runs-kind-lab"));
   });
 });

@@ -240,6 +240,9 @@ fn run_on(
     let after_sandbox = checks.iter().position(|c| c.name == checks_sandbox::SANDBOX_CHECK_NAME).map_or(checks.len(), |i| i + 1);
     let runtimes: Vec<Check> = checks_sandbox::managed_runtimes_on(&sandbox, platform);
     checks.splice(after_sandbox..after_sandbox, runtimes);
+    // (#3112) What every sandbox may hold (`sandbox.memory`), after the
+    // sandbox's own rows.
+    checks.push(checks_sandbox::check_sandbox_memory());
     // (#2947) `None` when a thermal threshold is bad config; that value's
     // own enum-settings row reports it.
     checks.extend(check_thermal_governor());
@@ -4389,6 +4392,10 @@ fn endpoints_status(
     invalid.extend(darkmux_types::config_enum::invalid_endpoint_hosts(registry));
     invalid.extend(darkmux_types::config_enum::misplaced_endpoint_hardware(registry));
     invalid.extend(darkmux_types::config_enum::invalid_engine_args(registry));
+    // An `identifier` that is LM Studio's name for a load made without one.
+    invalid.extend(darkmux_types::config_enum::colliding_identifiers(registry));
+    // Two models with different ids under one `darkmux:` identifier.
+    invalid.extend(darkmux_types::config_enum::shared_darkmux_identifiers(registry));
     // (#3453) rec runs one Flint server per machine.
     invalid.extend(darkmux_types::config_enum::extra_flint_endpoints(registry));
     // Two servers cannot listen on one port.
@@ -12706,6 +12713,35 @@ mod tests {
         assert!(c.message.contains("profiles.p.models[0].engine_args") && c.message.contains("--host"), "{}", c.message);
     }
 
+    /// An LM Studio model's `identifier` equal to its model key, which every
+    /// preflight refuses, is Fail here too, naming its path.
+    #[test]
+    fn an_identifier_equal_to_the_model_key_fails() {
+        let bad = materialized(r#"{"profiles":{"p":{"models":[{"id":"phi-4","n_ctx":8,"identifier":"phi-4"}]}}}"#);
+        let c = endpoints_status(&bad, &[], &mut no_spend, REGISTRY);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("profiles.p.models[0].identifier") && c.message.contains("`phi-4`"), "{}", c.message);
+        let ok = materialized(r#"{"profiles":{"p":{"models":[{"id":"phi-4","n_ctx":8,"identifier":"darkmux:phi-4"}]}}}"#);
+        assert_eq!(endpoints_status(&ok, &[], &mut no_spend, REGISTRY).status, Status::Pass);
+        // Any explicit identifier on a variant id fails, with the fix.
+        let variant = materialized(r#"{"profiles":{"p":{"models":[{"id":"q@4bit","n_ctx":8,"identifier":"darkmux:coder"}]}}}"#);
+        let c = endpoints_status(&variant, &[], &mut no_spend, REGISTRY);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("profiles.p.models[0].identifier") && c.message.contains("Drop the identifier"), "{}", c.message);
+    }
+
+    /// Two models with different ids under one `darkmux:` identifier, which
+    /// every preflight refuses, are Fail here too, naming the path.
+    #[test]
+    fn a_darkmux_identifier_shared_by_two_models_fails() {
+        let bad = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"old","n_ctx":8,"identifier":"darkmux:coder"},{"id":"new","n_ctx":8,"identifier":"darkmux:coder"}]}}}"#,
+        );
+        let c = endpoints_status(&bad, &[], &mut no_spend, REGISTRY);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("profiles.p.models[1].identifier") && c.message.contains("`darkmux:coder`"), "{}", c.message);
+    }
+
     /// (#3453) A Flint endpoint is labeled as a server darkmux starts, and a
     /// second Flint endpoint, which every preflight refuses, is Fail here
     /// too, naming its path.
@@ -13258,8 +13294,10 @@ mod tests {
         //
         // (#3569) 84: `checks_installed::check_installed_engines` joined
         // beside the Flint row.
+        // (#3112) 85: `checks_sandbox::check_sandbox_memory` joined after
+        // the sandbox's own rows.
         let expected =
-            84 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            85 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

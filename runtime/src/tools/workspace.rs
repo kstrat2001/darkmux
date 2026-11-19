@@ -188,20 +188,167 @@ pub fn resolve_write(input: &str, workspace_root: &Path) -> Result<PathBuf> {
     Ok(target)
 }
 
-/// (#3074) Open and write to a file with `O_NOFOLLOW` so a symlink planted
-/// at the final component (e.g. via a TOCTOU race) is rejected atomically
-/// by the kernel without following it.
+/// A path a tool refused because it is not a regular file: a directory, a
+/// named pipe, a socket or a device. A named pipe with no writer blocks a
+/// plain open for reading (and one with no reader an open for writing) for
+/// ever, and a tool call has no deadline, so every file tool opens with
+/// `O_NONBLOCK` and refuses anything but a regular file before it reads or
+/// writes a byte.
+#[derive(Debug)]
+pub struct NotRegular {
+    pub path: PathBuf,
+    pub kind: &'static str,
+}
+
+impl std::fmt::Display for NotRegular {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} is {}, not a regular file; read, edit, write and search work only on regular files", self.path, self.kind)
+    }
+}
+
+impl std::error::Error for NotRegular {}
+
+/// A file a tool that takes a whole file refused, unread, for its size.
+#[derive(Debug)]
+pub struct TooLarge {
+    pub path: PathBuf,
+    pub size: u64,
+    pub cap: u64,
+}
+
+impl std::fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} is {} bytes, over the {}-byte limit of a tool that takes a whole file; work on it with `bash` instead",
+            self.path, self.size, self.cap
+        )
+    }
+}
+
+impl std::error::Error for TooLarge {}
+
+/// What a file is, in words, when it is not a regular file.
 #[cfg(unix)]
-pub fn write_file_nofollow(path: &Path, content: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
+fn irregular_kind(file_type: std::fs::FileType) -> Option<&'static str> {
+    use std::os::unix::fs::FileTypeExt;
+    let kinds = [
+        (file_type.is_file(), ""),
+        (file_type.is_dir(), "a directory"),
+        (file_type.is_fifo(), "a named pipe (FIFO)"),
+        (file_type.is_socket(), "a socket"),
+        (file_type.is_char_device(), "a character device"),
+        (file_type.is_block_device(), "a block device"),
+    ];
+    match kinds.iter().find(|(is, _)| *is) {
+        Some((_, "")) => None,
+        Some((_, kind)) => Some(kind),
+        None => Some("not a regular file"),
+    }
+}
+
+#[cfg(not(unix))]
+fn irregular_kind(file_type: std::fs::FileType) -> Option<&'static str> {
+    (!file_type.is_file()).then_some(if file_type.is_dir() { "a directory" } else { "not a regular file" })
+}
+
+/// `Err(NotRegular)` when `meta` is not a regular file's.
+fn regular(path: &Path, meta: &std::fs::Metadata) -> Result<()> {
+    match irregular_kind(meta.file_type()) {
+        Some(kind) => Err(NotRegular { path: path.to_path_buf(), kind }.into()),
+        None => Ok(()),
+    }
+}
+
+/// `options` plus `O_NOFOLLOW` (a symlink planted at the final component,
+/// e.g. by a TOCTOU race, is refused by the kernel without following it,
+/// #3074) and `O_NONBLOCK` (a named pipe swapped in after a check cannot
+/// block the open; a regular file ignores it).
+fn no_follow_no_block(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+    }
+    #[cfg(not(unix))]
+    {
+        options
+    }
+}
+
+/// Open `path` for reading, refusing anything but a regular file before a
+/// byte is read: the file and its size when it was opened.
+fn open_regular(path: &Path) -> Result<(std::fs::File, u64)> {
+    let file = no_follow_no_block(std::fs::OpenOptions::new().read(true))
         .open(path)
         .with_context(|| format!("opening {path:?} with O_NOFOLLOW"))?;
+    let meta = file.metadata().with_context(|| format!("stat {path:?}"))?;
+    regular(path, &meta)?;
+    Ok((file, meta.len()))
+}
+
+/// What [`read_regular`] read of a file: at most its first `cap` bytes,
+/// whether that is the whole file, and its size (what it held when opened,
+/// or more if it grew while being read).
+#[derive(Debug)]
+pub struct FileStart {
+    pub bytes: Vec<u8>,
+    pub whole: bool,
+    pub size: u64,
+}
+
+/// At most the first `cap` bytes of the regular file at `path`, never
+/// holding more than that (and one byte to tell whether there is more).
+pub fn read_regular(path: &Path, cap: u64) -> Result<FileStart> {
+    let (file, size) = open_regular(path)?;
+    read_capped(file, size, cap, path)
+}
+
+/// At most the first `cap` bytes of `file`, whose size at its open was
+/// `size`.
+fn read_capped(file: std::fs::File, size: u64, cap: u64, path: &Path) -> Result<FileStart> {
+    use std::io::Read;
+    let mut bytes = Vec::with_capacity(size.min(cap) as usize);
+    file.take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {path:?}"))?;
+    let whole = bytes.len() as u64 <= cap;
+    let size = size.max(bytes.len() as u64);
+    bytes.truncate(cap as usize);
+    Ok(FileStart { bytes, whole, size })
+}
+
+/// The whole of the regular file at `path`, refused unread ([`TooLarge`])
+/// when it is over `cap` bytes.
+pub fn read_whole_regular_bytes(path: &Path, cap: u64) -> Result<Vec<u8>> {
+    let (file, size) = open_regular(path)?;
+    if size > cap {
+        return Err(TooLarge { path: path.to_path_buf(), size, cap }.into());
+    }
+    let start = read_capped(file, size, cap, path)?;
+    if !start.whole {
+        return Err(TooLarge { path: path.to_path_buf(), size: start.size, cap }.into());
+    }
+    Ok(start.bytes)
+}
+
+/// [`read_whole_regular_bytes`] as text.
+pub fn read_whole_regular(path: &Path, cap: u64) -> Result<String> {
+    String::from_utf8(read_whole_regular_bytes(path, cap)?).with_context(|| format!("reading {path:?}: not UTF-8 text"))
+}
+
+/// Open and write to a regular file, never through a symlink at the final
+/// component and never blocking on, or writing to, a named pipe or device
+/// ([`no_follow_no_block`], [`NotRegular`]). A named pipe already there is
+/// named as one (an open of one with no reader would fail with `ENXIO`).
+pub fn write_file_nofollow(path: &Path, content: &[u8]) -> Result<()> {
+    use std::io::Write;
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.file_type().is_symlink() {
+            regular(path, &meta)?;
+        }
+    }
+    let mut file = open_regular_for_write(path)?;
     file.write_all(content)
         .with_context(|| format!("writing to {path:?}"))?;
     file.flush()
@@ -209,32 +356,14 @@ pub fn write_file_nofollow(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-pub fn write_file_nofollow(path: &Path, content: &[u8]) -> Result<()> {
-    std::fs::write(path, content)
-        .with_context(|| format!("writing to {path:?}"))
-}
-
-/// Open and read a file with `O_NOFOLLOW` to guarantee symlinks are not followed on read.
-#[cfg(unix)]
-pub fn read_file_nofollow(path: &Path) -> Result<String> {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+/// Open `path` to write it whole, refusing what the open finds if it is
+/// not a regular file (one swapped in after any earlier check).
+fn open_regular_for_write(path: &Path) -> Result<std::fs::File> {
+    let file = no_follow_no_block(std::fs::OpenOptions::new().write(true).create(true).truncate(true))
         .open(path)
         .with_context(|| format!("opening {path:?} with O_NOFOLLOW"))?;
-    let mut s = String::new();
-    file.read_to_string(&mut s)
-        .with_context(|| format!("reading {path:?}"))?;
-    Ok(s)
-}
-
-#[cfg(not(unix))]
-pub fn read_file_nofollow(path: &Path) -> Result<String> {
-    std::fs::read_to_string(path)
-        .with_context(|| format!("reading {path:?}"))
+    regular(path, &file.metadata().with_context(|| format!("stat {path:?}"))?)?;
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -533,15 +662,48 @@ mod tests {
         let _ = fs::remove_file(&outside);
     }
 
+    /// A file of exactly the cap is whole; one byte more is not, and is
+    /// cut to the cap. The whole-file reader takes the first and refuses
+    /// the second.
     #[test]
-    fn read_file_nofollow_refuses_to_read_through_symlink() {
+    fn a_file_of_exactly_the_cap_is_whole_and_one_byte_more_is_not() {
+        let ws = fresh_workspace();
+        let (at, over) = (ws.path().join("at"), ws.path().join("over"));
+        fs::write(&at, vec![b'a'; 64]).unwrap();
+        fs::write(&over, vec![b'a'; 65]).unwrap();
+        let exact = read_regular(&at, 64).unwrap();
+        assert!(exact.whole && exact.bytes.len() == 64 && exact.size == 64);
+        let more = read_regular(&over, 64).unwrap();
+        assert!(!more.whole && more.bytes.len() == 64 && more.size == 65);
+        assert_eq!(read_whole_regular_bytes(&at, 64).unwrap().len(), 64);
+        let err = read_whole_regular_bytes(&over, 64).unwrap_err();
+        assert!(err.downcast_ref::<TooLarge>().is_some(), "{err:#}");
+    }
+
+    /// A named pipe that has a reader opens for writing at once: the check
+    /// after the open, not the one before it, is what refuses it.
+    #[test]
+    fn the_write_open_refuses_a_named_pipe_that_has_a_reader() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let ws = fresh_workspace();
+        let pipe = ws.path().join("p");
+        let c = std::ffi::CString::new(pipe.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let _reader = fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&pipe).unwrap();
+        let err = open_regular_for_write(&pipe).unwrap_err();
+        assert!(err.downcast_ref::<NotRegular>().is_some(), "{err:#}");
+        assert!(err.to_string().contains("named pipe"), "{err:#}");
+    }
+
+    #[test]
+    fn read_regular_refuses_to_read_through_symlink() {
         let ws = fresh_workspace();
         let outside = ws.path().parent().unwrap().join("read-target.txt");
         fs::write(&outside, b"original").unwrap();
         let link = ws.path().join("link-to-read.txt");
         symlink(&outside, &link).unwrap();
 
-        let err = read_file_nofollow(&link).unwrap_err();
+        let err = read_regular(&link, 1024).unwrap_err();
         assert!(
             err.to_string().contains("O_NOFOLLOW")
                 || format!("{err:?}").contains("Too many levels of symbolic links")

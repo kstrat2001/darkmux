@@ -21,6 +21,7 @@ fn run(name: &str, verify: &str) -> RunStats {
             streams_terminated: true,
             ..Default::default()
         },
+        hardware: Some(darkmux_types::Hardware::SubmittingMachine),
         ..Default::default()
     }
 }
@@ -121,14 +122,28 @@ fn every_failed_check_raises_a_flag() {
     r.throttled_samples = 1;
     r.result = Some("error".into());
     r.verify_ungated = true;
+    r.hardware = Some(darkmux_types::Hardware::Unknown);
     assert_eq!(
         flags(&r),
         vec![
             "RUNTIME-ERROR", "VERDICT", "UNBILLED", "STREAMS", "REST", "NO-TELEM", "NO-FLOW",
-            "CHARS", "RATCHET", "THROTTLE", "UNGATED"
+            "CHARS", "RATCHET", "THROTTLE", "UNGATED", "ELSEWHERE"
         ]
     );
     assert!(flags(&run("clean", "pass")).is_empty());
+}
+
+/// A run another machine served is flagged: its host columns are empty
+/// because they are not its own, not because nothing was read.
+#[test]
+fn a_run_served_elsewhere_raises_its_own_flag() {
+    let mut r = run("a", "pass");
+    r.hardware = Some(darkmux_types::Hardware::Unknown);
+    assert_eq!(flags(&r), vec!["ELSEWHERE"]);
+    r.hardware = Some(darkmux_types::Hardware::SubmittingMachine);
+    assert!(flags(&r).is_empty());
+    r.hardware = None;
+    assert_eq!(flags(&r), vec!["NO-HW"], "a run that recorded no hardware");
 }
 
 /// (#2833) `verify_ungated` alone raises exactly one flag, on an otherwise
@@ -269,4 +284,65 @@ fn each_condition_raises_its_flag_alone() {
     assert_eq!(only(|r| r.checks.telemetry_covers_run = false), vec!["TELEM-GAP"]);
     assert_eq!(only(|r| r.checks.have_flow_records = false), vec!["NO-FLOW"]);
     assert_eq!(only(|r| r.checks.policy_consistent = Some(false)), vec!["POLICY"]);
+}
+
+/// (#3644 review) A run another machine served has no energy on this
+/// machine's meter: the set's energy cost is withheld saying that, not
+/// that a run failed to record it.
+#[test]
+fn energy_withheld_for_a_run_served_elsewhere_says_so() {
+    let local = costed("a", "pass", 100_000, 90_000, 3_000.0);
+    let mut hosted = run("b", "pass");
+    hosted.hardware = Some(darkmux_types::Hardware::Unknown);
+    let s = summarize(&[local, hosted]);
+    assert_eq!(s.cost_per_success.pkg_joules, None);
+    assert_eq!(
+        s.cost_per_success.withheld,
+        vec![
+            "GPU busy time: 1 run(s) were served by another machine (ELSEWHERE), so this machine's meter does not hold their energy"
+                .to_string(),
+            "package energy: 1 run(s) were served by another machine (ELSEWHERE), so this machine's meter does not hold their energy"
+                .to_string(),
+        ]
+    );
+}
+
+/// (#3644 review) A run another machine served draws nothing on this
+/// machine's meter, so overlapping it in time does not make a local run's
+/// energy "the whole host's draw, claimed twice": no OVERLAP, and the local
+/// run's power stays in the set's figures.
+#[test]
+fn a_run_served_elsewhere_is_not_an_overlapping_consumer() {
+    let mut local = costed("a", "pass", 100_000, 90_000, 3_000.0);
+    local.started_at_unix_ms = Some(1_000_000);
+    local.wall_ms = 100_000;
+    local.pkg_w_busy = Some(40.0);
+    let mut hosted = run("b", "pass");
+    hosted.hardware = Some(darkmux_types::Hardware::Unknown);
+    hosted.compactor_calls_here = Some(0);
+    hosted.started_at_unix_ms = Some(1_050_000);
+    hosted.wall_ms = 100_000;
+    assert!(overlapping(&[local.clone(), hosted.clone()]).is_empty());
+    let mut unrecorded = hosted.clone();
+    unrecorded.hardware = None;
+    assert!(overlapping(&[local.clone(), unrecorded]).is_empty(), "a run with no hardware and no local compaction");
+    // A compactor on this machine, or records that cannot say, make it a
+    // consumer again.
+    for here in [Some(1), None] {
+        let mut drew = hosted.clone();
+        drew.compactor_calls_here = here;
+        assert_eq!(overlapping(&[local.clone(), drew]).len(), 2, "{here:?}");
+    }
+    let s = summarize(&[local, hosted]);
+    assert!(s.flagged.iter().all(|(_, f)| !f.contains(&"OVERLAP")), "{:?}", s.flagged);
+    assert_eq!(s.pkg_w_busy.map(|r| r.median), Some(40.0), "the local run's power still counts");
+}
+
+/// Both reasons, when both hold; none leaves the generic one.
+#[test]
+fn the_energy_reason_names_every_cause() {
+    assert_eq!(energy_withheld_reason(0, 0, 0), None);
+    let all = energy_withheld_reason(2, 1, 3).unwrap();
+    assert!(all.starts_with("2 run(s) have overlapping") && all.contains("; 1 run(s) were served by another machine"), "{all}");
+    assert!(all.ends_with("; 3 run(s) recorded no hardware (NO-HW), so this machine's readings can't be attributed to them"), "{all}");
 }

@@ -1,3 +1,5 @@
+import { clkOn } from "./format";
+
 /**
  * The one typed fetch wrapper every query in this app goes through. Returns
  * a DISCRIMINATED RESULT rather than throwing — a lens component checks
@@ -12,6 +14,27 @@
 export type FetchResult<T> =
   | { ok: true; data: T }
   | { ok: false; status: number | null; message: string };
+
+/** A failed read, as a view states it in place of the data it could not
+ *  get: `couldn't load <what> (HTTP <n>): <message>`. The status is left out
+ *  when there was none (the daemon never answered). Same wording as the
+ *  event log's own failure line. */
+export function loadFailureText(what: string, failure: { status: number | null; message: string }): string {
+  return `couldn't load ${what}${failureDetail(failure)}`;
+}
+
+/** A refetch failed but an earlier read is still on screen: says how old
+ *  that read is (its `generated_at_ms`, local time, with its date when that
+ *  is not `nowMs`'s day) and why the newest one failed, in the same wording
+ *  as `loadFailureText`. */
+export function staleReadText(what: string, readAtMs: number, failure: { status: number | null; message: string }, nowMs: number): string {
+  return `showing ${what} from ${clkOn(readAtMs, nowMs)}; couldn't refresh${failureDetail(failure)}`;
+}
+
+function failureDetail(failure: { status: number | null; message: string }): string {
+  const status = failure.status !== null ? ` (HTTP ${failure.status})` : "";
+  return `${status}: ${failure.message}`;
+}
 
 export async function fetchJson<T>(path: string, init?: RequestInit): Promise<FetchResult<T>> {
   let response: Response;
