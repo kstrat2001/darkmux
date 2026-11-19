@@ -804,6 +804,8 @@ fn the_runtime_subcommand_runs_inside_a_seatbelt_sandbox() {
     std::env::set_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV, state.path());
     let backend = SeatbeltBackend;
 
+    // The model endpoint, the one host service the dispatch is given (#3640).
+    let mock = Mock::start(tool_turns);
     let run_in_sandbox = |entrypoint: &Path, command: Vec<String>, mounts: Vec<Mount>, env: Vec<(String, String)>| {
         let policy = SandboxPolicy {
             name: format!("darkmux-runtime-parity-{}-{}", std::process::id(), command.len()),
@@ -814,7 +816,7 @@ fn the_runtime_subcommand_runs_inside_a_seatbelt_sandbox() {
             mounts,
             ports: Vec::new(),
             stdin: false,
-            host_services: Vec::new(),
+            host_services: vec![mock.port],
             refused_ports: Vec::new(),
             host_alias: None,
             user: None,
@@ -832,7 +834,6 @@ fn the_runtime_subcommand_runs_inside_a_seatbelt_sandbox() {
     let ws = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
     std::fs::write(ws.path().join("x.txt"), "hello\nworld\n").unwrap();
-    let mock = Mock::start(tool_turns);
     let mounts = vec![
         Mount { host: ws.path().to_path_buf(), at: "/workspace".to_string(), access: Access::ReadWrite },
         Mount { host: out.path().to_path_buf(), at: "/darkmux-out".to_string(), access: Access::ReadWrite },
@@ -856,6 +857,10 @@ fn the_runtime_subcommand_runs_inside_a_seatbelt_sandbox() {
     assert_eq!(envelope["result"], "stop", "{envelope}");
     assert_eq!(envelope["final_assistant"], "all done", "{envelope}");
     assert_eq!(mock.requests().len(), 5, "every model call left the sandbox");
+    // (contract 6) `--system` is sent as passed inside the sandbox too: the
+    // host hashed exactly that text.
+    let first: Value = serde_json::from_str(&mock.requests()[0].body).unwrap();
+    assert_eq!(first["messages"][0]["content"], "You are a test. Work in /workspace.", "the system prompt as hashed");
     assert_eq!(std::fs::read_to_string(ws.path().join("x.txt")).unwrap(), "bye\nworld\n", "the edit landed");
     assert_eq!(std::fs::read_to_string(ws.path().join("new.txt")).unwrap(), "made\n", "the write landed");
     let trajectory = std::fs::read_to_string(out.path().join(".darkmux-runtime/trajectory.jsonl")).unwrap();

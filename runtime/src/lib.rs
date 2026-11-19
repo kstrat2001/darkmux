@@ -182,13 +182,16 @@ struct Dispatch {
 fn prepare_dispatch(argv: &[String]) -> Result<Dispatch, Refusal> {
     let mut args = parse_run_args(argv, std::env::var("DARKMUX_RESUME_CHECKPOINT").ok())?;
     let (model, prompt) = required_model_and_prompt(args.model.take(), args.prompt.take())?;
-    // (#3112 step 2) A role's prompt names `/workspace` too (`--system`), so
-    // it is renamed the same way as the default; byte-identical under it.
-    // (#3112 review) So does a user's message: a mission config written
-    // before `${WORKSPACE_ROOT}` says `/workspace`. The same rule for both, at
-    // a path boundary only, and byte-identical under the default root.
-    let system = args.system.take().unwrap_or_else(default_system_prompt);
-    let (system_prompt, prompt) = tools::workspace::named_prompts(&system, &prompt, &tools::workspace::root());
+    // (contract 6) `--system` is sent byte for byte as the host passed it:
+    // the host hashed exactly that text into `dispatch.start`'s
+    // `system_sha256`, so it names the workspace where this sandbox sees it
+    // already (`darkmux-crew`'s `system_prompt_as_sent`). Only the built-in
+    // default, which no host hashed, is renamed here.
+    // (#3112 review) A user's message names `/workspace` too (a mission config
+    // written before `${WORKSPACE_ROOT}`): renamed at a path boundary only, and
+    // byte-identical under the default root.
+    let system_prompt = args.system.take().unwrap_or_else(|| tools::workspace::naming_root(&default_system_prompt()));
+    let prompt = tools::workspace::naming_root(&prompt);
 
     // (#2386) The finding-key identity this dispatch mints under, plus the
     // brief it was given. `create_finding` returns the real key

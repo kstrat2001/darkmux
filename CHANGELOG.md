@@ -211,6 +211,13 @@ darkmux release.
 
 ### Fixed
 
+- **A dispatch's recorded system-prompt hash is the hash of the bytes sent, under every sandbox.**
+  Under `seatbelt` or `landlock` the runtime renamed `/workspace` in the system prompt to the
+  workspace's host path after darkmux had hashed it, so `dispatch.start`'s `system_sha256` named
+  text the model never received. darkmux now writes that path into the system prompt before it
+  hashes it, and the runtime sends the prompt exactly as passed. A container run is unchanged. The
+  model still sees the workspace's true host path under a sandbox on the host, so request bodies
+  there still carry the path (under your home folder), including those sent to a hosted endpoint.
 - **Flow records: lab runs stay off hooks, a failed write is said, and the audit trail's gaps stay
   visible.** Found by the 2026-11-17 layer review. A hook rule that matched everything delivered a lab
   run's records off the machine; hooks now drop them by the same rule that keeps them off the fleet hub
