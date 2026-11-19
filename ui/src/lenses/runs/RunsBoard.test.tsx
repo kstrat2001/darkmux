@@ -6,13 +6,15 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RunsBoard } from "./RunsBoard";
 import { todayUTC } from "../../lib/flow";
 import { useHashRoute } from "../../lib/useHashRoute";
+import { queryKeys } from "../../lib/queryKeys";
+import { clk } from "../../lib/format";
 
 function renderBoard(
   initialKind: "all" | "mission" | "dispatch" | "lab" = "all",
   initialRun: string | null = null,
   initialMachineKey: string | null = null,
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
 ) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
       <RunsBoard initialKind={initialKind} initialLab={initialRun} initialMachineKey={initialMachineKey} />
@@ -63,6 +65,7 @@ function mockFetch(runsOk = true, labRunsOk = true, labSource: Record<string, un
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
   // (#1900 QA nit) A shared belt-and-suspenders reset — several tests below
   // already reset `location.hash` themselves in a `finally`, but this makes
   // the "hash starts empty" assumption a property of the SUITE rather than
@@ -404,10 +407,111 @@ describe("RunsBoard", () => {
     expect(window.location.hash).toBe("");
   });
 
-  it("degrades a /runs fetch failure to the empty-runs render (matches legacy's silent catch)", async () => {
+  // A failed read is never shown as empty: "no runs recorded yet" off a 500
+  // tells the operator nothing ran when the daemon simply did not answer.
+  it("a /runs fetch failure says it could not load runs, with the status, never 'no runs recorded yet'", async () => {
     mockFetch(false, true);
     renderBoard();
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/^couldn't load runs \(HTTP 500\): 500/);
+    expect(screen.queryByText(/no runs recorded yet/i)).toBeNull();
+    // Nothing was read, so nothing on screen may claim a count: no kind bar
+    // reading "all 0", no "Showing 0 runs".
+    expect(document.querySelector(".runsbar")).toBeNull();
+    expect(screen.queryByText(/showing \d+ runs?/i)).toBeNull();
+  });
+
+  it("a failed poll after a good read keeps the last good runs, marked stale with the failure", async () => {
+    // Freeze the wall clock a minute after the fixture's read (`generated_at_ms`
+    // 1), so "from <time>" is a same-day time by construction.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1 + 60_000);
+    mockFetch(true, true);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderBoard("all", null, null, queryClient);
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    const allCount = document.querySelector('[data-arg="all"] .runchipn')!.textContent;
+
+    mockFetch(false, true);
+    await act(() => queryClient.refetchQueries({ queryKey: queryKeys.runs() }));
+
+    // The fixture's read time is its `generated_at_ms` (1), shown in local time.
+    await waitFor(() =>
+      expect(screen.getByText(`showing runs from ${clk(1)}; couldn't refresh (HTTP 500): 500`, { exact: false })).toBeInTheDocument(),
+    );
+    expect(screen.getByText("m1")).toBeInTheDocument();
+    expect(document.querySelector('[data-arg="all"] .runchipn')!.textContent).toBe(allCount);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText(/no runs recorded yet/i)).toBeNull();
+    vi.useRealTimers();
+  });
+
+  // A kept row read while `/runs` is failing keeps its word and color, but
+  // nothing says a running run is still running: no pulse (the mission
+  // header's `lastKnownChip` rule).
+  it("a kept running row stops pulsing as live once the poll fails, and pulses again when it answers", async () => {
+    mockFetch(true, true);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderBoard("all", null, null, queryClient);
+    const badge = () => screen.getByText("d1").closest(".labrunrow")!.querySelector(".labbadge")!;
+    await waitFor(() => expect(badge()).toHaveAttribute("data-live", "beating"));
+
+    mockFetch(false, true);
+    await act(() => queryClient.refetchQueries({ queryKey: queryKeys.runs() }));
+    await waitFor(() => expect(badge()).toHaveAttribute("data-live", "stale"));
+    expect(badge()).toHaveTextContent(/running/i);
+    expect(badge().getAttribute("title")).toMatch(/last known status/i);
+
+    mockFetch(true, true);
+    await act(() => queryClient.refetchQueries({ queryKey: queryKeys.runs() }));
+    await waitFor(() => expect(badge()).toHaveAttribute("data-live", "beating"));
+  });
+
+  it("a remount while /runs is failing still shows the last good runs, marked stale, not 'couldn't load runs'", async () => {
+    mockFetch(true, true);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const first = renderBoard("all", null, null, queryClient);
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    mockFetch(false, true);
+    await act(() => queryClient.refetchQueries({ queryKey: queryKeys.runs() }));
+    await waitFor(() => expect(screen.getByText(/couldn't refresh/)).toBeInTheDocument());
+    first.unmount();
+
+    renderBoard("all", null, null, queryClient);
+    await waitFor(() => expect(screen.getByText(/couldn't refresh/)).toBeInTheDocument());
+    expect(screen.getByText("m1")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("the next good poll clears the stale notice", async () => {
+    mockFetch(true, true);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderBoard("all", null, null, queryClient);
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    mockFetch(false, true);
+    await act(() => queryClient.refetchQueries({ queryKey: queryKeys.runs() }));
+    await waitFor(() => expect(screen.getByText(/couldn't refresh/)).toBeInTheDocument());
+    mockFetch(true, true);
+    await act(() => queryClient.refetchQueries({ queryKey: queryKeys.runs() }));
+    await waitFor(() => expect(screen.queryByText(/couldn't refresh/)).toBeNull());
+    expect(screen.getByText("m1")).toBeInTheDocument();
+  });
+
+  it("a genuinely empty /runs still reads as no runs recorded yet, with no error", async () => {
+    mockFetch(true, true, {}, []);
+    renderBoard();
     await waitFor(() => expect(screen.getByText(/no runs recorded yet/i)).toBeInTheDocument());
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("a /lab/runs fetch failure says so on the lab tab, never 'no lab-run source wired'", async () => {
+    mockFetch(true, false, {}, NO_LAB_RUNS);
+    const { container } = renderBoard();
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    fireEvent.click(container.querySelector('[data-arg="lab"]')!);
+    await waitFor(() => expect(screen.getByText(/^couldn't load lab runs \(HTTP 500\): 500/)).toBeInTheDocument());
+    expect(screen.queryByText(/no lab-run source wired/i)).toBeNull();
+    expect(screen.queryByText(/no lab runs found/i)).toBeNull();
   });
 
   it("clicking a tracked mission row navigates in-app to #mission=<id> when a real daemon is behind the page (#1868)", async () => {

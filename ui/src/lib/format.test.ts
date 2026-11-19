@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { K_TO_M, MISSING, clkrange, compactDuration, compactThousands, fmtC, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote, shortModel } from "./format";
+import { K_TO_M, MISSING, clk, clkOn, clkrange, compactDuration, compactThousands, fmtC, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote, shortModel } from "./format";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -395,5 +395,21 @@ describe("shortModel", () => {
   it("renders an absent model as the empty string, never 'null'/'undefined'", () => {
     expect(shortModel(null)).toBe("");
     expect(shortModel(undefined)).toBe("");
+  });
+});
+
+describe("clkOn — a time that may not be today", () => {
+  // Anchored at local noon so a few minutes either side cannot cross local
+  // midnight in any real timezone; the day distance is the parameter.
+  const noon = new Date(2026, 10, 19, 12, 0, 0).getTime();
+
+  it("a time on the reference day is the bare time of day", () => {
+    expect(clkOn(noon - 5 * 60000, noon)).toBe(clk(noon - 5 * 60000));
+  });
+
+  it("a time on an earlier day carries its short date", () => {
+    const yesterday = noon - 13 * 3600000; // 23:00 the day before
+    expect(clkOn(yesterday, noon)).toBe(`${new Date(yesterday).toLocaleDateString([], { month: "short", day: "numeric" })} ${clk(yesterday)}`);
+    expect(clkOn(yesterday, noon)).toMatch(/^[A-Za-z]{3} \d{1,2} \d{2}:\d{2}:\d{2}$/);
   });
 });
