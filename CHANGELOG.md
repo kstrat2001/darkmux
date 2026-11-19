@@ -199,6 +199,25 @@ darkmux release.
 
 ### Fixed
 
+- **Text a model, a peer or an endpoint wrote can no longer drive your terminal.** `mod list` and
+  `mod show` (a kit a local seat wrote through `create_mod`), `finding list` and `finding show`,
+  `run list` (its rows, the `--usage` breakdown and an endpoint's `reported model`), `run show`,
+  `mission show`, the fleet rows of `mission status`, `radio` (the answer, the command it asks you to
+  confirm, and its failure lines), `dispatch`'s human output (the model's reply), the QA review and
+  `mission debrief` lines, `doctor`'s rows, `lab run`, `lab characterize`, `lab tune` and `lab submit`,
+  and the `Error:` line any failing command ends with (an interrupted run's too) all
+  print an escape sequence, a C1 control or a bidirectional override or isolate as text (`\u{1b}`)
+  instead of passing it to the terminal, so none of them can set the window title, clear the screen
+  or write the clipboard. Lines and tabs still read as written, and a column cell is held to its
+  display width. For readable prose, emoji joined with ZWJ and the direction marks Hebrew and Arabic
+  need are kept (a mark or a right-to-left letter can still change how nearby text is laid out).
+  What you approve or must check exactly is shown strictly, so it reads left to right in the order
+  it will run: every default-ignorable character (joiners, marks, variation selectors) and every
+  right-to-left letter or Arabic-Indic digit shows as `\u{..}`. That covers the command `radio` asks
+  you to confirm, the editor's run and sign-off dialogs (now one fenced block, so markdown in a
+  step's output shows as typed), a mission's sign-off prompt, and `init --add-engine`'s question.
+  Invisible tag characters and blank fillers are shown. `--json` output is unchanged. Found by the
+  2026-11-17 layer review.
 - **A mission step waiting its turn reads waiting, not running (#3195).** Steps admitted together
   behind one slot (an endpoint with no `limits.concurrent_calls` runs its calls one at a time), or a
   local step waiting for its wave's model (a later wave, or its own wave's load), all read running from

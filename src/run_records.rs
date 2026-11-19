@@ -93,32 +93,42 @@ fn inspect_run(run: &str) -> Result<i32> {
 }
 
 fn print_inspection(report: &workloads::types::InspectionReport) {
-    println!("run:         {}", report.run_id);
-    println!("workload:    {}", report.workload_id);
-    println!("wall:        {}s", report.walltime_ms / 1000);
+    for line in inspection_lines(report) {
+        println!("{line}");
+    }
+}
+
+/// What `run show` prints for a lab run. A note or a verify detail can quote
+/// what the run's own commands printed, which the model's code wrote, so
+/// every text field is escaped (`escape_text`): an escape sequence in it is
+/// shown, never acted on.
+fn inspection_lines(report: &workloads::types::InspectionReport) -> Vec<String> {
+    use darkmux_types::user_files::escape_text as shown;
+    let mut lines = vec![
+        format!("run:         {}", shown(&report.run_id)),
+        format!("workload:    {}", shown(&report.workload_id)),
+        format!("wall:        {}s", report.walltime_ms / 1000),
+    ];
     // (#2094 finding 7) Shown next to wall so a rested run's wall clock is
     // never misread as a slow model. Milliseconds, because a seconds display
     // can round a real rest down to "0s". `0` means the run predates the
     // field or took no rests.
     if report.rest_ms > 0 {
-        println!("rest:        {}ms", report.rest_ms);
+        lines.push(format!("rest:        {}ms", report.rest_ms));
     }
-    println!("turns:       {}", report.turns);
-    println!("compactions: {}", report.compactions);
-    println!("verify:      {}", verify_line(report.verify.as_ref()));
-    if let Some(m) = report.mode {
-        println!(
-            "mode:        {}",
-            match m {
-                workloads::types::RunMode::Fast => "fast",
-                workloads::types::RunMode::Slow => "slow",
-            }
-        );
-    }
-    println!("notes:");
-    for n in &report.notes {
-        println!("  - {n}");
-    }
+    lines.push(format!("turns:       {}", report.turns));
+    lines.push(format!("compactions: {}", report.compactions));
+    lines.push(format!("verify:      {}", shown(&verify_line(report.verify.as_ref()))));
+    lines.extend(report.mode.map(|m| {
+        let word = match m {
+            workloads::types::RunMode::Fast => "fast",
+            workloads::types::RunMode::Slow => "slow",
+        };
+        format!("mode:        {word}")
+    }));
+    lines.push("notes:".to_string());
+    lines.extend(report.notes.iter().map(|n| format!("  - {}", shown(n))));
+    lines
 }
 
 /// (#2494) The workload's OWN result, distinct from the dispatch path's `ok`.
@@ -158,6 +168,27 @@ fn stats_runs(runs: &[String], baseline: &[String], json: bool) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A verify detail and a note quoting command output that holds an OSC 0
+    /// title, a screen clear and an OSC 52 clipboard write print as text.
+    #[test]
+    fn run_show_prints_a_hostile_verify_detail_and_note_inert() {
+        let hostile = "\x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}";
+        let report = workloads::types::InspectionReport {
+            run_id: "r1".into(),
+            workload_id: "w".into(),
+            walltime_ms: 2000,
+            turns: 3,
+            compactions: 0,
+            rest_ms: 0,
+            mode: None,
+            verify: Some(workloads::types::VerifyReport { passed: false, details: format!("test failed{hostile}") }),
+            notes: vec![format!("verify: fail: {hostile}"), "café 日本語".into()],
+        };
+        let lines = inspection_lines(&report);
+        assert!(lines.iter().all(|l| !l.chars().any(|c| c.is_control() || c == '\u{202e}')), "{lines:?}");
+        assert_eq!(lines.last().unwrap(), "  - café 日本語");
+    }
 
     #[test]
     fn verify_line_says_not_checked_rather_than_omitting_it() {
