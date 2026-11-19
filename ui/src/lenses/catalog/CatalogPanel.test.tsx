@@ -3,6 +3,8 @@ import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { CatalogPanel } from "./CatalogPanel";
 import { todayUTC } from "./format";
+import { queryKeys } from "../../lib/queryKeys";
+import { clk } from "../../lib/format";
 
 function jsonResponse(body: unknown, status = 200) {
   return Promise.resolve(new Response(JSON.stringify(body), { status }));
@@ -21,8 +23,7 @@ function stubFetch(handlers: { days?: unknown; missions?: unknown; daysStatus?: 
   );
 }
 
-function renderPanel() {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderPanel(queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
   return render(
     <QueryClientProvider client={queryClient}>
       <CatalogPanel />
@@ -32,6 +33,7 @@ function renderPanel() {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
   window.location.hash = "";
 });
 
@@ -143,13 +145,140 @@ describe("CatalogPanel", () => {
     expect(window.location.hash).toBe("#mission=my-mission");
   });
 
-  it("treats a failed fetch on either endpoint as empty, matching legacy's Promise.allSettled swallow", async () => {
+  // A failed read is never shown as an empty history: "no recorded days yet"
+  // off a 500 tells the operator they have no history when the daemon simply
+  // did not answer.
+  it("a failed /flow-days read says it could not load, with the status and reason, never 'no recorded days yet'", async () => {
     stubFetch({ daysStatus: 500, missions: { missions: [], generated_at_ms: 0 } });
     renderPanel();
     screen.getByRole("button", { name: /browse history/i }).click();
-    await waitFor(() => expect(screen.getByText(/no recorded days yet/i)).toBeInTheDocument());
-    // The live row still renders — a failed days fetch doesn't blank the whole panel.
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/^couldn't load recorded days \(HTTP 500\): 500/);
+    expect(screen.queryByText(/no recorded days yet/i)).toBeNull();
+    // The live row still renders: a failed days fetch doesn't blank the whole panel.
     expect(screen.getByText("● live")).toBeInTheDocument();
+  });
+
+  it("a failed /flow-missions read says so, instead of silently dropping the missions section", async () => {
+    stubFetch({ missionsStatus: 503, days: { days: [{ date: "2026-08-07", records: 5, dispatches: 1, missions: [] }], generated_at_ms: 0 } });
+    renderPanel();
+    screen.getByRole("button", { name: /browse history/i }).click();
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/^couldn't load missions \(HTTP 503\): 503/);
+    // The days that did load still render.
+    expect(screen.getByText("2026-08-07")).toBeInTheDocument();
+  });
+
+  it("an unreachable daemon (no HTTP status) names the network error", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.reject(new TypeError("Failed to fetch"))),
+    );
+    renderPanel();
+    screen.getByRole("button", { name: /browse history/i }).click();
+    await waitFor(() => expect(screen.getAllByRole("alert")).toHaveLength(2));
+    expect(screen.getByText("couldn't load recorded days: Failed to fetch", { exact: false })).toBeInTheDocument();
+    expect(screen.queryByText(/HTTP/)).toBeNull();
+    expect(screen.queryByText(/no recorded days yet/i)).toBeNull();
+  });
+
+  it("retry re-reads a failed section and renders what it returns", async () => {
+    let daysOk = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith("/flow-days"))
+          return daysOk
+            ? jsonResponse({ days: [{ date: "2026-08-07", records: 5, dispatches: 1, missions: [] }], generated_at_ms: 0 })
+            : jsonResponse({}, 500);
+        return jsonResponse({ missions: [], generated_at_ms: 0 });
+      }),
+    );
+    renderPanel();
+    screen.getByRole("button", { name: /browse history/i }).click();
+    await screen.findByRole("alert");
+    daysOk = true;
+    fireEvent.click(screen.getByRole("button", { name: /retry/i }));
+    await waitFor(() => expect(screen.getByText("2026-08-07")).toBeInTheDocument());
+    expect(screen.queryByRole("alert")).toBeNull();
+    // Retry happens inside the panel: it must not close it.
+    expect(document.getElementById("catpanel")).toBeTruthy();
+  });
+
+  it("a failed re-read after a good one keeps the days already shown, marked stale with the failure, and retry clears it", async () => {
+    // Freeze the wall clock a minute after the fixture's read (`generated_at_ms`
+    // 1), so "from <time>" is a same-day time by construction.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1 + 60_000);
+    let daysOk = true;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith("/flow-days"))
+          return daysOk
+            ? jsonResponse({ days: [{ date: "2026-08-07", records: 5, dispatches: 1, missions: [] }], generated_at_ms: 1 })
+            : jsonResponse({}, 500);
+        return jsonResponse({ missions: [], generated_at_ms: 1 });
+      }),
+    );
+    renderPanel();
+    const toggle = screen.getByRole("button", { name: /browse history/i });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(screen.getByText("2026-08-07")).toBeInTheDocument());
+    // Close and reopen: every open re-reads, and this time the read fails.
+    fireEvent.click(toggle);
+    daysOk = false;
+    vi.setSystemTime(1 + 65_000); // the cached read is stale now, so the reopen re-reads
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(
+        screen.getByText(`showing recorded days from ${clk(1)}; couldn't refresh (HTTP 500): 500`, { exact: false }),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByText("2026-08-07")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    daysOk = true;
+    fireEvent.click(screen.getByRole("button", { name: /retry/i }));
+    await waitFor(() => expect(screen.queryByText(/couldn't refresh/)).toBeNull());
+    expect(screen.getByText("2026-08-07")).toBeInTheDocument();
+  });
+
+  it("a genuinely empty history reads as empty, with no error", async () => {
+    stubFetch({});
+    renderPanel();
+    screen.getByRole("button", { name: /browse history/i }).click();
+    await waitFor(() => expect(screen.getByText(/no recorded days yet/i)).toBeInTheDocument());
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText(/couldn't load/i)).toBeNull();
+  });
+
+  it("while either read is in flight it shows the loading placeholder, neither empty nor error", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>(() => {})),
+    );
+    renderPanel();
+    screen.getByRole("button", { name: /browse history/i }).click();
+    expect(await screen.findByRole("status", { name: "Loading history" })).toBeInTheDocument();
+    expect(screen.queryByText(/no recorded days yet/i)).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("stays loading while one read has answered and the other is still in flight", async () => {
+    const fetchSpy = vi.fn((input: RequestInfo | URL) =>
+      String(input).startsWith("/flow-days") ? jsonResponse({ days: [], generated_at_ms: 0 }) : new Promise<Response>(() => {}),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderPanel(queryClient);
+    screen.getByRole("button", { name: /browse history/i }).click();
+    // The /flow-days answer is in the cache: only /flow-missions is pending.
+    await waitFor(() => expect(queryClient.getQueryData(queryKeys.flowDays())).toBeDefined());
+    expect(screen.getByRole("status", { name: "Loading history" })).toBeInTheDocument();
+    expect(screen.queryByText(/no recorded days yet/i)).toBeNull();
   });
 
   // QA must-fix: legacy has THREE ways to close #catpanel
