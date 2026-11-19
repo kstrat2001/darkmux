@@ -1086,7 +1086,7 @@ pub struct ContainerSpec {
 /// it (the host's own), its program is the host's `/bin/sh`, and
 /// `spec.read_only` adds its toolchain and log, read-only.
 pub fn preview_policy(spec: &ContainerSpec) -> SandboxPolicy {
-    use darkmux_crew::dispatch_internal::{DOCKER_MEMORY, DOCKER_PIDS_LIMIT};
+    use darkmux_crew::dispatch_internal::DOCKER_PIDS_LIMIT;
     let mount = |host: &Path, at: &str, access| Mount {
         host: host.to_path_buf(),
         at: at.to_string(),
@@ -1101,7 +1101,8 @@ pub fn preview_policy(spec: &ContainerSpec) -> SandboxPolicy {
         image: spec.image.clone(),
         network: Network::Default,
         limits: Limits {
-            memory: Some(DOCKER_MEMORY.to_string()),
+            // (#3112) `sandbox.memory`, read when `client serve` starts.
+            memory: Some(darkmux_types::config_access::sandbox_memory()),
             pids: Some(DOCKER_PIDS_LIMIT),
         },
         labels: spec

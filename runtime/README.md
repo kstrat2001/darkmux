@@ -32,11 +32,13 @@ A container-bounded in-house runtime replaces both layers:
 
 | Tool | Signature | Notes |
 |---|---|---|
-| `search` | `{ pattern, path, max_results? }` | Literal substring match; recurses on dirs; auto-skips dependency/build/hidden dirs |
-| `read` | `{ path, offset, limit }` | Requires explicit offset+limit; `limit=0` reads full file from offset |
-| `edit` | `{ path, edits: [{old_string, new_string, replace_all?}] }` | Batched, atomic — any edit failing aborts the whole call without modifying the file |
+| `search` | `{ pattern, path, max_results? }` | Literal substring match; recurses on dirs; auto-skips dependency/build/hidden dirs; reads at most a file's first 1 MB (what `read` can show) and names the files it cut |
+| `read` | `{ path, offset, limit }` | Requires explicit offset+limit; `limit=0` reads full file from offset; never reads past its 1 MB cap |
+| `edit` | `{ path, edits: [{old_string, new_string, replace_all?}] }` | Batched, atomic — any edit failing aborts the whole call without modifying the file; refuses, unread, a file over 16 MB |
 | `write` | `{ path, content }` | Canonical |
 | `bash` | `{ command, timeout_seconds? }` | Runs with cwd=/workspace |
+
+Every file tool opens with `O_NOFOLLOW | O_NONBLOCK` and refuses anything but a regular file (a directory, a named pipe, a socket, a device) before it reads or writes a byte: a named pipe would otherwise block a call that has no deadline.
 
 Tool order in the request: `[Search, Read, Edit, Write, Bash]` — search first (positional preference).
 
