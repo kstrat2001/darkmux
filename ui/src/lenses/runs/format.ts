@@ -69,6 +69,16 @@ export function runChip(r: Run): RunChip {
   return { status, abandonReason: r.abandoned_reason, label: runStatusLabel(r), title: status === NOT_REPORTING_STATUS ? NOT_REPORTING_TITLE : undefined };
 }
 
+const LAST_KNOWN_TITLE = "last known status; the daemon's run list isn't answering";
+
+/** A chip from a kept `/runs` read while `/runs` is failing: its word and
+ *  color stand, but a running row loses the live treatment (no pulse, no
+ *  clock, no process readout), since nothing says it is still running. The
+ *  board's rows and the mission header both apply it. */
+export function lastKnownChip<C extends { title?: string }>(chip: C): C & { live: "stale" } {
+  return { ...chip, live: "stale", title: LAST_KNOWN_TITLE };
+}
+
 /** (5.0 R3) The status a row's badge keys its color and pulse on. It is the
  * run's own, except that a run recorded as running on a machine that is not
  * reporting (`Run.not_reporting`, decided once by the daemon: the fleet view
