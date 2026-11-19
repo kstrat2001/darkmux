@@ -98,6 +98,7 @@ impl WorkloadProvider for ScriptedProvider {
             duration_ms: 2_000,
             verify: s.verify.map(|passed| VerifyOutcome { passed, details: "scripted".into() }),
             error: if s.ok { None } else { Some("scripted error".into()) },
+            sandbox_read: None,
         })
     }
     fn inspect(&self, _: &LoadedWorkload, _: &Path) -> Result<InspectionReport> {
@@ -668,6 +669,7 @@ fn run_notes_name_an_unexplained_failure() {
         duration_ms: 61_999,
         verify: Some(VerifyOutcome { passed: false, details: "2 failing".into() }),
         error: None,
+        sandbox_read: None,
     };
     assert_eq!(run_notes("p", &r), ["provider=p", "wall=61s", "error: unknown", "verify=fail (2 failing)"]);
 }
@@ -739,6 +741,7 @@ fn an_escalated_run_is_counted_and_labeled_as_an_escalation_not_an_error() {
         duration_ms: 232_000,
         verify: None,
         error: Some("runtime exit: dispatching to model".into()),
+        sandbox_read: None,
     };
     let notes = run_notes("p", &r);
     assert_eq!(notes[2], "escalated: escalation_compaction_reread_loop");

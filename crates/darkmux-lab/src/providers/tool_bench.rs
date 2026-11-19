@@ -956,6 +956,9 @@ impl WorkloadProvider for ToolBenchProvider {
         _on_session_id: &mut dyn FnMut(&SessionId),
     ) -> Result<RunResult> {
         let wl = &loaded.manifest.workload;
+        // The run's one read of `runtime.sandbox`: every trial's dispatch
+        // runs in it, and the manifest records it.
+        let sandbox = darkmux_sandbox::selection();
         // (Also consider, second-round frontier review) `trials` still
         // silently clamps to `[1, 20]` rather than refusing loudly like
         // `taskTimeoutSeconds` below — a real inconsistency between two
@@ -1149,6 +1152,7 @@ impl WorkloadProvider for ToolBenchProvider {
                     timeout_override_seconds,
                     loaded,
                     &self.dispatch,
+                    &sandbox,
                 )?;
 
                 let trial_dir = run_dir.join("tasks").join(format!("{}-t{trial}", task.id));
@@ -1262,7 +1266,7 @@ impl WorkloadProvider for ToolBenchProvider {
             ok: Some(true),
             refused_artifacts: crate::providers::coding_task::refused_records(&refused_artifacts),
             // (#3112 review) The sandbox the trials ran in: a measured variable.
-            isolation: Some(crate::providers::coding_task::dispatch_isolation(darkmux_sandbox::selected())),
+            isolation: Some(crate::providers::coding_task::dispatch_isolation(sandbox.clone().map(|s| s.kind))),
             ..RunManifest::default()
         }
         .write(run_dir)?;
@@ -1307,6 +1311,7 @@ impl WorkloadProvider for ToolBenchProvider {
                 ),
             }),
             error: None,
+            sandbox_read: None,
         })
     }
 
@@ -1452,6 +1457,8 @@ fn dispatch_task(
     timeout_override_seconds: Option<u32>,
     loaded: &LoadedWorkload,
     dispatch_fn: &ToolBenchDispatchFn,
+    // The run's one read of `runtime.sandbox`, handed to the dispatch.
+    sandbox: &std::result::Result<darkmux_sandbox::Selection, String>,
     // (#2685) Returns the raw exit CODE, not a collapsed `ok` bool: the
     // shared infra predicate needs "did this exit non-zero" alongside what
     // the envelope carried, and `envelope_meta_with_exit` takes the code.
@@ -1491,7 +1498,7 @@ fn dispatch_task(
         force_container: false,
         max_completion_tokens: None,
         image: image.map(str::to_string),
-        sandbox: None,
+        sandbox: Some(sandbox.clone()),
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,

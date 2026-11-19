@@ -2187,7 +2187,12 @@ fn cmd_init(opts: init::InitOptions) -> Result<i32> {
                 .unwrap_or_else(|| "the profile registry".to_string());
             step(&format!("Edit {path} to point at a downloaded model (`lms ls` lists them)"));
         }
-        first_steps(darkmux_types::config_access::sandbox().ok(), darkmux_sandbox::selected().is_ok()).into_iter().for_each(&mut step);
+        first_steps(
+            darkmux_types::config_access::sandbox_with_source().ok().map(|(v, _)| v),
+            darkmux_sandbox::selection().is_ok(),
+        )
+        .into_iter()
+        .for_each(&mut step);
     }
     Ok(i32::from(add_refused))
 }

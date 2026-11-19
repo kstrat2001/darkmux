@@ -1122,25 +1122,34 @@ impl RunPlacement {
         let read = darkmux_sandbox::selection();
         Self {
             sandbox: read.clone().map(|s| s.kind),
-            tests_on_host: darkmux_types::config_access::tests_on_host(),
+            tests_on_host: darkmux_types::config_access::tests_on_host_with_source().0,
             read: Some(read),
         }
     }
 
-    /// The placement a run recorded in its manifest (`isolation`, written by
-    /// [`run_isolation`] from the run's own read): where a grade of that run
-    /// runs its suite, in the run itself and in a later regrade.
-    pub(crate) fn recorded(isolation: &crate::lab::manifest::RunIsolation) -> Self {
+    /// The placement a run recorded in its manifest (`isolation`): where a
+    /// grade of that run runs its suite, in the run itself and in a later
+    /// regrade. `read` is the run's own read when the grade runs in the same
+    /// process (its Docker remedies); `None` for a regrade.
+    ///
+    /// A manifest from before this record was taken from the run's own read
+    /// (5.11) wrote `isolation` from a read at the END of the run, so a
+    /// missing `sandbox` says only that the setting was refused when the
+    /// manifest was written, which is what the refusal says.
+    pub(crate) fn recorded(isolation: &crate::lab::manifest::RunIsolation, read: Option<darkmux_sandbox::Selection>) -> Self {
         let sandbox = match &isolation.sandbox {
             Some(value) => serde_json::from_value::<darkmux_sandbox::BackendKind>(serde_json::Value::String(value.clone()))
                 .map_err(|_| format!("the run recorded `runtime.sandbox` `{value}`, which this darkmux does not know")),
-            None => Err("`runtime.sandbox` was refused when this run started".to_string()),
+            None => Err("the run's manifest records no `runtime.sandbox` (the setting was refused when the manifest was \
+                         written), so its tests have no recorded sandbox to run in"
+                .to_string()),
         };
-        Self { sandbox, tests_on_host: isolation.tests.as_deref() == Some("host"), read: None }
+        let read = read.filter(|r| sandbox.as_ref().is_ok_and(|k| *k == r.kind)).map(Ok);
+        Self { sandbox, tests_on_host: isolation.tests.as_deref() == Some("host"), read }
     }
 
     /// The read's selection, when there is one and it was not refused.
-    fn selection(&self) -> Option<darkmux_sandbox::Selection> {
+    pub(crate) fn read_selection(&self) -> Option<darkmux_sandbox::Selection> {
         self.read.as_ref().and_then(|r| r.as_ref().ok().copied())
     }
 }
@@ -1154,10 +1163,10 @@ impl TestRunner {
             return Ok(Self::host());
         }
         let sandbox = placement.sandbox.clone().map_err(|why| anyhow::anyhow!(why))?;
-        let read = placement.selection();
+        let read = placement.read_selection();
         let image = contained_command::lab_test_image_in(sandbox, loaded.manifest.workload.image.as_deref(), read)?;
         Ok(Self {
-            placement: Placement::Container(image),
+            placement: Placement::Container(image, sandbox),
             user: contained_command::lab_test_user_in(sandbox)?,
             sandbox: Some(sandbox),
             read,
@@ -1173,7 +1182,7 @@ impl TestRunner {
     /// Seatbelt sandbox's own canonical path), or the host path.
     pub(crate) fn view(&self, tree: &Path) -> String {
         match (&self.placement, self.sandbox) {
-            (Placement::Container(_), Some(kind)) => darkmux_sandbox::backend_of(kind).place(&darkmux_sandbox::Mount {
+            (Placement::Container(..), Some(kind)) => darkmux_sandbox::backend_of(kind).place(&darkmux_sandbox::Mount {
                 host: tree.to_path_buf(),
                 at: "/workspace".to_string(),
                 access: darkmux_sandbox::Access::ReadWrite,
@@ -1459,6 +1468,7 @@ pub(crate) fn finish_run(f: FinishInputs<'_>, d: &Dispatched) -> Result<RunResul
         duration_ms: f.duration_ms,
         verify: f.verify,
         error: d.error(),
+        sandbox_read: f.placement.read_selection(),
     })
 }
 
@@ -1844,7 +1854,7 @@ mod tests {
         assert_eq!((seatbelt.sandbox.as_deref(), seatbelt.tests, seatbelt.image_not_used), (Some("seatbelt"), None, None));
         assert_eq!(dispatch_isolation(Err("bad".into())).sandbox, None);
         let src = include_str!("tool_bench.rs");
-        assert!(src.contains("isolation: Some(crate::providers::coding_task::dispatch_isolation(darkmux_sandbox::selected()))"));
+        assert!(src.contains("isolation: Some(crate::providers::coding_task::dispatch_isolation(sandbox.clone().map(|s| s.kind)))"));
     }
 
     /// (#3112 review) Where a run's tests ran is a measured variable: the
@@ -3078,7 +3088,7 @@ mod tests {
         let (prompt, plan) = host.unwrap();
         assert_eq!(prompt, format!("Fix {}/bug.py", sandbox.canonicalize().unwrap().display()));
         let runner = plan.expect("a verify plan").runner;
-        assert_eq!((runner.placement, runner.sandbox), (Placement::Container("host".into()), Some(BackendKind::Seatbelt)));
+        assert_eq!((runner.placement, runner.sandbox), (Placement::Container("host".into(), darkmux_sandbox::BackendKind::Seatbelt), Some(BackendKind::Seatbelt)));
     }
 
     /// The run's dispatch runs in the backend its prompt was written for.
@@ -3091,60 +3101,15 @@ mod tests {
         assert_eq!(opts.map(|o| o.sandbox).ok().flatten(), Some(Err("refused here".to_string())), "the run's own read, a refusal included");
     }
 
-    /// A coding-task run reads its placement settings once, in
-    /// `RunPlacement::read`: `runtime.sandbox` (what counts as a read is
-    /// derived from darkmux-sandbox's own source,
-    /// `darkmux_sandbox::setting_reads`, however it is spelled here) and
-    /// `runtime.tests_on_host`. Its prompt, verify runner, dispatch and
-    /// manifest take that value; the grader takes it back from the manifest
-    /// and reads the settings only for a run that recorded none
-    /// (`placement_of`, through `RunPlacement::read`); a crawl unit reads
-    /// the sandbox once for its paths and its dispatch; the crew's lab-test
-    /// helpers read neither.
+    /// A coding-task run hands its dispatch its own read, and a crawl unit
+    /// its unit's; where else the workspace may read the setting is the
+    /// workspace guard's (`tests/sandbox_setting_reads.rs`).
     #[test]
-    fn a_coding_task_run_reads_the_sandbox_setting_once() {
-        use darkmux_sandbox::setting_reads::reads_in;
-        const ENTRIES: [&str; 2] = ["resolved_runtime_image", "host_runtime_status"];
-        // A function's span, to `close` (its indentation's closing brace).
-        let body = |src: &str, start: &str, close: &str| -> std::ops::Range<usize> {
-            let at = src.find(start).unwrap_or_else(|| panic!("{start}"));
-            at..at + src[at..].find(close).unwrap()
-        };
-        let tests_on_host = |src: &str| -> Vec<usize> {
-            src.match_indices("tests_on_host(")
-                .map(|(i, _)| i)
-                .filter(|&i| !src[..i].ends_with('.') && !src[..i].ends_with("fn ") && !src[..i].ends_with('_'))
-                .collect()
-        };
-        let full = include_str!("coding_task.rs");
-        let src = &full[..full.find("\nmod tests {").expect("the test module")];
-        let read = body(src, "    pub(crate) fn read() -> Self {", "\n    }\n");
-        let reads = reads_in(src, &ENTRIES);
-        assert!(reads.len() == 1 && read.contains(&reads[0].0), "coding_task.rs reads runtime.sandbox outside RunPlacement::read: {reads:?}");
-        let on_host = tests_on_host(src);
-        assert!(on_host.len() == 1 && read.contains(&on_host[0]), "coding_task.rs reads runtime.tests_on_host outside RunPlacement::read: {on_host:?}");
+    fn a_run_hands_its_dispatch_its_own_read() {
+        let src = include_str!("coding_task.rs");
         assert!(src.contains("            placement.read.clone(),\n        )\n        .and_then(dispatch_via_internal)?;"), "the dispatch is handed the run's read");
-
-        // Its tests are in their own file, so all of mod.rs is production.
-        let grade = include_str!("../lab/grade/mod.rs");
-        assert_eq!(reads_in(grade, &ENTRIES), Vec::new(), "the grader reads runtime.sandbox");
-        assert_eq!(tests_on_host(grade), Vec::<usize>::new(), "the grader reads runtime.tests_on_host");
-        assert_eq!(grade.matches("RunPlacement::read").count(), 1, "the grader's one fresh read is placement_of's fallback");
-
         let unit = include_str!("../crawl/unit_step.rs");
-        let unit = &unit[..unit.find("\nmod tests").unwrap_or(unit.len())];
-        let unit_reads = reads_in(unit, &ENTRIES);
-        let context = body(unit, "\nfn unit_context(", "\n}\n");
-        assert!(unit_reads.len() == 1 && context.contains(&unit_reads[0].0), "a crawl unit reads runtime.sandbox outside unit_context: {unit_reads:?}");
         assert!(unit.contains("sandbox: Some(ctx.sandbox.clone()),"), "the unit's dispatch is handed the unit's read");
-
-        let crew = include_str!("../../../darkmux-crew/src/contained_command.rs");
-        let crew = &crew[..crew.find("\n#[cfg(test)]").unwrap_or(crew.len())];
-        for f in ["pub fn lab_test_image_in", "pub fn lab_test_user_in"] {
-            let at = crew.find(f).unwrap_or_else(|| panic!("{f}"));
-            let b = &crew[at..at + crew[at..].find("\n}\n").unwrap()];
-            assert_eq!(reads_in(b, &ENTRIES), Vec::new(), "{f} reads the setting");
-        }
     }
 
     /// The grader places a run's suite where the run recorded its own tests
@@ -3163,12 +3128,21 @@ mod tests {
             env::set_var("DARKMUX_TESTS_ON_HOST", "false");
         }
         let recorded = |sandbox: Option<&str>, tests: Option<&str>| {
-            crate::lab::grade::placement_of_for_test(Some(&RunIsolation { sandbox: sandbox.map(str::to_string), tests: tests.map(str::to_string), image_not_used: None }))
+            crate::lab::grade::placement_of_for_test(Some(&RunIsolation { sandbox: sandbox.map(str::to_string), tests: tests.map(str::to_string), image_not_used: None }), None)
         };
         let seatbelt = recorded(Some("seatbelt"), Some("seatbelt"));
         let host = recorded(Some("seatbelt"), Some("host"));
         let refused = recorded(None, None);
-        let unrecorded = crate::lab::grade::placement_of_for_test(None);
+        let unrecorded = crate::lab::grade::placement_of_for_test(None, None);
+        // And the suite runs there: the runner built from the record spawns
+        // in Seatbelt, not `docker run ... host`, under the Docker setting.
+        let tmp = TempDir::new().unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let runner = TestRunner::for_workload(&loaded, &seatbelt).unwrap();
+        let tree = tmp.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let run = contained_command::Run { command: "true", tree: &tree, workdir: "", mounts: &[], user: None, name_prefix: "darkmux-test" };
+        let program = contained_command::command(&runner.placement, &run).map(|(cmd, _)| cmd.get_program().to_string_lossy().into_owned());
         unsafe {
             for (k, v) in &saved {
                 match v {
@@ -3178,8 +3152,22 @@ mod tests {
             }
         }
         assert_eq!((seatbelt.sandbox, seatbelt.tests_on_host), (Ok(BackendKind::Seatbelt), false));
+        assert_eq!(runner.placement, Placement::Container("host".into(), BackendKind::Seatbelt));
+        // Grading in the run's own process keeps the run's read, for its
+        // Docker remedies, when it is the read the record came from.
+        let docker = darkmux_sandbox::Selection { kind: BackendKind::Docker, source: darkmux_types::config_access::Source::Env };
+        let in_run = |sandbox: &str| {
+            crate::lab::grade::placement_of_for_test(
+                Some(&RunIsolation { sandbox: Some(sandbox.into()), tests: None, image_not_used: None }),
+                Some(docker),
+            )
+            .read_selection()
+        };
+        assert_eq!(in_run("docker"), Some(docker));
+        assert_eq!(in_run("seatbelt"), None, "a read of another backend is not this run's");
+        assert_ne!(program.unwrap(), "docker", "a regrade ran its suite in Docker");
         assert_eq!((host.sandbox, host.tests_on_host), (Ok(BackendKind::Seatbelt), true));
-        assert!(refused.sandbox.unwrap_err().contains("refused when this run started"));
+        assert!(refused.sandbox.unwrap_err().contains("refused when the manifest was written"));
         assert_eq!((unrecorded.sandbox, unrecorded.tests_on_host), (Ok(BackendKind::Docker), false), "no record: the settings now");
     }
 
@@ -3226,13 +3214,13 @@ mod tests {
     #[test]
     fn verify_paths_name_the_sandbox_as_the_placement_sees_it() {
         let sandbox = Path::new("/tmp/sb");
-        let contained = TestRunner { placement: Placement::Container("img".into()), user: None, sandbox: Some(darkmux_sandbox::BackendKind::Docker), read: None };
+        let contained = TestRunner { placement: Placement::Container("img".into(), darkmux_sandbox::BackendKind::Docker), user: None, sandbox: Some(darkmux_sandbox::BackendKind::Docker), read: None };
         assert_eq!(contained.view(sandbox), "/workspace");
         // (#3112 review) A Seatbelt sandbox sees the tree at its own
         // (canonical) path, so `${SANDBOX}` and a grader's report path name
         // where the tree is, not Docker's `/workspace`.
         let real = tempfile::TempDir::new().unwrap();
-        let seatbelt = TestRunner { placement: Placement::Container("host".into()), user: None, sandbox: Some(darkmux_sandbox::BackendKind::Seatbelt), read: None };
+        let seatbelt = TestRunner { placement: Placement::Container("host".into(), darkmux_sandbox::BackendKind::Seatbelt), user: None, sandbox: Some(darkmux_sandbox::BackendKind::Seatbelt), read: None };
         assert_eq!(seatbelt.view(real.path()), real.path().canonicalize().unwrap().display().to_string());
         assert_eq!(TestRunner::host().view(sandbox), "/tmp/sb");
         assert_eq!(verify_workdir(Some("${SANDBOX_DIR}/app"), "/workspace").unwrap(), "app");
@@ -3250,7 +3238,7 @@ mod tests {
     /// still recorded); a timeout fails; only an interrupt is an error.
     #[test]
     fn a_verify_that_never_ran_fails_and_says_why() {
-        let docker_runner = TestRunner { placement: Placement::Container("img".into()), user: None, sandbox: Some(darkmux_sandbox::BackendKind::Docker), read: None };
+        let docker_runner = TestRunner { placement: Placement::Container("img".into(), darkmux_sandbox::BackendKind::Docker), user: None, sandbox: Some(darkmux_sandbox::BackendKind::Docker), read: None };
         let never = contained_command::NotRun("Unable to find image".into());
         let (passed, details, output) = verify_result(Err(never), "npm test", &docker_runner).unwrap();
         assert!(!passed && details.contains("Unable to find image") && details.contains("runtime.tests_on_host"), "{details}");
@@ -3283,7 +3271,7 @@ mod tests {
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
         assert_eq!(
             TestRunner::for_workload(&loaded, &placed(darkmux_sandbox::BackendKind::Docker)).unwrap().placement,
-            Placement::Container("node:22-bookworm-slim".into())
+            Placement::Container("node:22-bookworm-slim".into(), darkmux_sandbox::BackendKind::Docker)
         );
         // (#3112) A refused `runtime.sandbox` refuses the run's tests by
         // name, never falling back to Docker.
@@ -3313,7 +3301,7 @@ mod tests {
         );
         spec.verify.as_mut().unwrap().cwd = Some("app".into());
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        let contained = |_: &LoadedWorkload| Ok(TestRunner { placement: Placement::Container("node:22-bookworm-slim".into()), user: None, sandbox: Some(darkmux_sandbox::BackendKind::Docker), read: None });
+        let contained = |_: &LoadedWorkload| Ok(TestRunner { placement: Placement::Container("node:22-bookworm-slim".into(), darkmux_sandbox::BackendKind::Docker), user: None, sandbox: Some(darkmux_sandbox::BackendKind::Docker), read: None });
         let plan = verify_plan(&loaded, &sandbox, contained).unwrap();
         let outcome = run_verify_command(plan.as_ref(), &run_dir, &sandbox).unwrap().unwrap();
         let output = fs::read_to_string(run_dir.join("verify-output.txt")).unwrap();

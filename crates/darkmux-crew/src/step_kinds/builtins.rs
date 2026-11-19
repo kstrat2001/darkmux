@@ -4576,7 +4576,7 @@ mod tests {
     }
 
     /// (#3112 review) The production wiring: `dispatch.internal` expands the
-    /// placeholder through `selected()`, never leaving it for the model, and
+    /// placeholder through its one read (`selection()`), never leaving it for the model, and
     /// hands that same backend to the dispatch (`DispatchOpts::sandbox`), so
     /// it runs where its message says. Under Docker (a test build's default)
     /// it is `/workspace`; under `DARKMUX_SANDBOX=seatbelt` (on a Mac) the

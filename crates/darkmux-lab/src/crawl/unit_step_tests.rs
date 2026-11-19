@@ -3399,7 +3399,7 @@ fn a_unit_naming_a_rule_no_longer_declared_is_refused() {
     }
 }
 
-/// (#3112 review) The production wiring, through `selected()`: under
+/// (#3112 review) The production wiring, through the unit's one read: under
 /// `DARKMUX_SANDBOX=seatbelt` (on a Mac) a unit's dispatch is briefed with
 /// the tree's own path and stamps it as `context.root`; under Docker (a test
 /// build's default) it says `/workspace` and stamps nothing.

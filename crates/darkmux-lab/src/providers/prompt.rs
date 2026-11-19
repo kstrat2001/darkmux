@@ -202,6 +202,7 @@ pub(crate) fn finish_run(f: &FinishInputs<'_>, d: &Dispatched) -> Result<RunResu
         duration_ms: f.duration_ms,
         verify,
         error: d.error(),
+        sandbox_read: None,
     })
 }
 

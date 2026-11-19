@@ -168,7 +168,10 @@ fn run_on(
         .as_ref()
         .ok()
         .filter(|k| k.on_host())
-        .map(|k| darkmux_crew::dispatch_internal::host_runtime_status(*k));
+        .map(|k| {
+            let way_back = darkmux_sandbox::way_back_to_docker_given(darkmux_sandbox::setting_value(*k), sandbox_source);
+            darkmux_crew::dispatch_internal::host_runtime_status(*k, way_back)
+        });
     let sandbox_row = checks_sandbox::sandbox_row(
         &sandbox,
         sandbox_source,

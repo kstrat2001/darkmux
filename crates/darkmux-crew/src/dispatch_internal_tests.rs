@@ -7068,9 +7068,9 @@ S(("127.0.0.1", port), H).serve_forever()
         let way_back = "darkmux config set runtime.sandbox docker";
         for kind in [darkmux_sandbox::BackendKind::Seatbelt, darkmux_sandbox::BackendKind::Landlock] {
             let refusals = [
-                host_runtime_for(kind, Some("rust:latest"), None, &at_start, darkmux_sandbox::way_back_to_docker(kind)).unwrap_err(),
-                host_runtime_for(kind, None, None, &executable_at_start(Err(std::io::Error::other("gone"))), darkmux_sandbox::way_back_to_docker(kind)).unwrap_err(),
-                host_runtime_for(kind, None, Some(root.path().join("nope").into_os_string()), &at_start, darkmux_sandbox::way_back_to_docker(kind)).unwrap_err(),
+                host_runtime_for(kind, Some("rust:latest"), None, &at_start, darkmux_sandbox::way_back_to_docker_given(darkmux_sandbox::setting_value(kind), darkmux_types::config_access::Source::Config)).unwrap_err(),
+                host_runtime_for(kind, None, None, &executable_at_start(Err(std::io::Error::other("gone"))), darkmux_sandbox::way_back_to_docker_given(darkmux_sandbox::setting_value(kind), darkmux_types::config_access::Source::Config)).unwrap_err(),
+                host_runtime_for(kind, None, Some(root.path().join("nope").into_os_string()), &at_start, darkmux_sandbox::way_back_to_docker_given(darkmux_sandbox::setting_value(kind), darkmux_types::config_access::Source::Config)).unwrap_err(),
             ];
             let named = format!("`runtime.sandbox` is `{}`", darkmux_sandbox::setting_value(kind));
             for err in refusals.iter().map(|e| format!("{e:#}")) {
@@ -7078,7 +7078,7 @@ S(("127.0.0.1", port), H).serve_forever()
                 assert!(!err.contains("DARKMUX_SANDBOX=") && !err.contains("cargo build"), "{err}");
             }
             assert!(format!("{:#}", refusals[0]).contains("--image rust:latest"));
-            assert_eq!(host_runtime_for(kind, None, None, &at_start, darkmux_sandbox::way_back_to_docker(kind)).unwrap().program, exe.canonicalize().unwrap());
+            assert_eq!(host_runtime_for(kind, None, None, &at_start, darkmux_sandbox::way_back_to_docker_given(darkmux_sandbox::setting_value(kind), darkmux_types::config_access::Source::Config)).unwrap().program, exe.canonicalize().unwrap());
         }
     }
 
@@ -7388,54 +7388,12 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(carried.unwrap(), darkmux_sandbox::BackendKind::Seatbelt);
     }
 
-    /// A container dispatch reads `runtime.sandbox` once, in
-    /// `dispatch_sandbox`, and everything after takes that value: the resume
-    /// check, the origin stamp, the prompt, the runtime image and its Docker
-    /// remedies, the model URLs and the launch.
-    ///
-    /// What counts as a read is derived, not listed: every function of
-    /// darkmux-sandbox that reaches the setting, directly or through another
-    /// of its functions (`darkmux_sandbox::setting_reads`), however it is
-    /// spelled here (`darkmux_sandbox::f(`, imported bare, renamed on
-    /// import), and the types crate's accessors. The scan covers these
-    /// files' own text: a helper elsewhere in this crate that reads the
-    /// setting is caught only by its own file's scan below, so a new file on
-    /// the dispatch path joins the list.
-    ///
-    /// In dispatch_internal.rs the reads are confined to `dispatch_sandbox`
-    /// and two entries outside the dispatch path, each its own caller's one
-    /// read (`resolved_runtime_image`, for containers beside a dispatch;
-    /// `host_runtime_status`, for doctor), and nothing in the file calls
-    /// those two.
+    /// A container dispatch launches in the backend it resolved, never one
+    /// read again; where else the workspace may read the setting is the
+    /// workspace guard's (`tests/sandbox_setting_reads.rs`).
     #[test]
-    fn a_container_dispatch_reads_the_sandbox_setting_once() {
-        use darkmux_sandbox::setting_reads::reads_in;
-        const ENTRIES: [&str; 2] = ["resolved_runtime_image", "host_runtime_status"];
-        let production = |full: &'static str, end: &str| &full[..full.find(end).unwrap_or(full.len())];
-        let body_of = |src: &'static str, name: &str| {
-            let at = src.find(&format!("\nfn {name}(")).or_else(|| src.find(&format!("\npub fn {name}("))).unwrap_or_else(|| panic!("fn {name}"));
-            at..at + src[at..].find("\n}\n").unwrap()
-        };
-        let dispatch = production(include_str!("dispatch_internal.rs"), "\nmod tests;");
-        let allowed: Vec<_> = std::iter::once("dispatch_sandbox").chain(ENTRIES).map(|f| body_of(dispatch, f)).collect();
-        let stray: Vec<_> = reads_in(dispatch, &[]).into_iter().filter(|(at, _)| !allowed.iter().any(|r| r.contains(at))).collect();
-        assert!(stray.is_empty(), "dispatch_internal.rs reads the sandbox setting outside dispatch_sandbox: {stray:?}");
-        let in_resolver = reads_in(&dispatch[allowed[0].clone()], &[]);
-        assert_eq!(in_resolver.len(), 1, "dispatch_sandbox reads it once: {in_resolver:?}");
-        let entry_calls: Vec<_> = reads_in(dispatch, &ENTRIES).into_iter().filter(|(_, n)| ENTRIES.contains(&n.as_str())).collect();
-        assert!(entry_calls.is_empty(), "the dispatch reaches a reading entry: {entry_calls:?}");
-
-        let step = production(include_str!("step_kinds/builtins.rs"), "\n#[cfg(test)]");
-        assert_eq!(reads_in(step, &ENTRIES).len(), 1, "a dispatch.internal step reads the setting once, for its message and its DispatchOpts");
-        let crew_helpers = include_str!("contained_command.rs");
-        for (name, text) in [
-            ("brief_refs.rs", production(include_str!("brief_refs.rs"), "\n#[cfg(test)]").to_string()),
-            ("role_inputs.rs", include_str!("role_inputs.rs").to_string()),
-            ("lab_test_image_in", crew_helpers[body_of(crew_helpers, "lab_test_image_in")].to_string()),
-            ("lab_test_user_in", crew_helpers[body_of(crew_helpers, "lab_test_user_in")].to_string()),
-        ] {
-            assert_eq!(reads_in(&text, &ENTRIES), Vec::new(), "{name} reads the sandbox setting");
-        }
+    fn a_container_dispatch_launches_in_the_backend_it_resolved() {
+        let dispatch = include_str!("dispatch_internal.rs");
         assert!(dispatch.contains("spawn_container(&argv_config, run_backend(&run.image), opts.max_turns_override)?"));
     }
 
@@ -25037,7 +24995,7 @@ fn a_dispatch_on_the_host_listening_beyond_the_loopback_is_stopped() {
     let seatbelt = |name: &str| darkmux_sandbox::SandboxHandle { backend: darkmux_sandbox::BackendKind::Seatbelt, id: name.into() };
     let wide = Listening::on("0.0.0.0");
     let stop = DispatchStop::new(seatbelt("darkmux-dispatch-b3559-wide"));
-    let watch = watch_dispatch_listeners(&stop.sandbox, wide.child.id(), &stop);
+    let watch = watch_dispatch_listeners(&stop.sandbox, wide.child.id(), &stop, String::new());
     assert!(watch.is_some(), "a sandbox on the host is watched");
     let deadline = Instant::now() + crate::sandbox_listeners::CHECK_EVERY * 5;
     while !stop.is_requested() && Instant::now() < deadline {
@@ -25049,11 +25007,11 @@ fn a_dispatch_on_the_host_listening_beyond_the_loopback_is_stopped() {
 
     let near = Listening::on("127.0.0.1");
     let stop = DispatchStop::new(seatbelt("darkmux-dispatch-b3559-near"));
-    let watch = watch_dispatch_listeners(&stop.sandbox, near.child.id(), &stop);
+    let watch = watch_dispatch_listeners(&stop.sandbox, near.child.id(), &stop, String::new());
     thread::sleep(crate::sandbox_listeners::CHECK_EVERY * 2 + Duration::from_millis(200));
     drop(watch);
     assert_eq!(stop.reason(), None, "a loopback listener stopped the dispatch");
-    assert!(watch_dispatch_listeners(&docker_sandbox("darkmux-dispatch-b3559"), near.child.id(), &stop).is_none(), "a container is not watched");
+    assert!(watch_dispatch_listeners(&docker_sandbox("darkmux-dispatch-b3559"), near.child.id(), &stop, String::new()).is_none(), "a container is not watched");
 }
 
 /// (#3559) `dispatch()` starts the listener watch once the sandbox and its
@@ -25065,7 +25023,7 @@ fn dispatch_watches_its_listeners_from_spawn_to_the_wait() {
     let full = include_str!("dispatch_internal.rs");
     let src = &full[..full.rfind("mod tests;").unwrap()];
     let pos = |needle: &str| src.find(needle).unwrap_or_else(|| panic!("{needle}"));
-    let started = pos("let listener_watch = watch_dispatch_listeners(&launched.sandbox, launched.child.id(), &local_stop);");
+    let started = pos("let listener_watch = watch_dispatch_listeners(&launched.sandbox, launched.child.id(), &local_stop, run.sandbox.way_back_to_docker());");
     assert!(pos("let local_stop = DispatchStop::new(launched.sandbox.clone());") < started);
     assert!(started < pos("let output = match launched.child.wait_with_output() {"));
     let ended = pos("drop(listener_watch);");

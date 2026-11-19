@@ -5785,13 +5785,15 @@ impl DispatchStop {
 /// the address and port, as any stop scoped to a dispatch does. `leader` is
 /// the process the backend's command started (its launcher, which leads
 /// the sandbox's process group). `None` for a container.
+/// `way_back` is the dispatch's own way back to Docker, from its one read.
 fn watch_dispatch_listeners(
     sandbox: &darkmux_sandbox::SandboxHandle,
     leader: u32,
     local_stop: &DispatchStop,
+    way_back: String,
 ) -> Option<crate::sandbox_listeners::ListenerWatch> {
     let stop = local_stop.clone();
-    crate::sandbox_listeners::watch(sandbox, leader, "a dispatch", move |why| stop.request(why))
+    crate::sandbox_listeners::watch(sandbox, leader, "a dispatch", way_back, move |why| stop.request(why))
 }
 
 /// The terminal record's payload and level for a container dispatch: a clean
@@ -7231,6 +7233,9 @@ struct ContainerRun {
     /// written (a first use fetches it, recorded on the run's session);
     /// empty in a container.
     toolchain: darkmux_sandbox::toolchain::Toolchain,
+    /// The dispatch's one read of `runtime.sandbox` ([`dispatch_sandbox`]),
+    /// for every message after the launch (the listener watch's way back).
+    sandbox: darkmux_sandbox::Selection,
 }
 
 /// The one read of `runtime.sandbox` for a container dispatch: the read
@@ -7323,6 +7328,7 @@ fn prepare_container_run(
         lease,
         leased_job,
         toolchain: Default::default(),
+        sandbox,
     })
 }
 
@@ -7787,9 +7793,12 @@ fn host_runtime_for(
 /// run, as `darkmux doctor` checks it: the same choice and identity check a
 /// dispatch makes ([`host_runtime`]), `Ok` naming the program, `Err` the
 /// refusal.
-pub fn host_runtime_status(kind: darkmux_sandbox::BackendKind) -> std::result::Result<String, String> {
+///
+/// `way_back` is the caller's way back to Docker, from its own read of the
+/// setting ([`darkmux_sandbox::way_back_to_docker_given`]).
+pub fn host_runtime_status(kind: darkmux_sandbox::BackendKind, way_back: String) -> std::result::Result<String, String> {
     let at_start = EXECUTABLE_AT_START.get_or_init(|| executable_at_start(std::env::current_exe()));
-    host_runtime_for(kind, None, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start, darkmux_sandbox::way_back_to_docker(kind))
+    host_runtime_for(kind, None, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start, way_back)
         .map(|r| std::iter::once(r.program.display().to_string()).chain(r.leading_args).collect::<Vec<_>>().join(" "))
         .map_err(|e| format!("{e:#}"))
 }
@@ -8555,7 +8564,7 @@ fn supervise_container(
     let local_stop = DispatchStop::new(launched.sandbox.clone());
     let (_observer_guards, threads) = spawn_observers(opts, execution, run, &launched, &local_stop)?;
     // (#3559) Watched while it runs, ended right after the wait.
-    let listener_watch = watch_dispatch_listeners(&launched.sandbox, launched.child.id(), &local_stop);
+    let listener_watch = watch_dispatch_listeners(&launched.sandbox, launched.child.id(), &local_stop, run.sandbox.way_back_to_docker());
     panic_after_guard_spawn_if_asked();
 
     let output = match launched.child.wait_with_output() {
@@ -14752,7 +14761,7 @@ fn check_docker_preflight(explicit: Option<&str>, remedy: Option<String>) -> Res
 /// Docker remedy; a run that already read it uses
 /// [`resolved_runtime_image_with`].
 pub fn resolved_runtime_image() -> Result<String> {
-    resolved_runtime_image_with(darkmux_sandbox::docker_remedy())
+    resolved_runtime_image_with(darkmux_sandbox::selection().ok().and_then(|s| s.docker_remedy()))
 }
 
 /// (#906, #3355 review) [`resolved_runtime_image`] with the Docker remedy of

@@ -55,9 +55,6 @@ serial_test = "3.1"
 # tests never read the operator's real ~/.darkmux/config.json (e.g. default_role
 # / runtime-agents-dir / templates-dir resolution). Dev-dep only; off in release.
 darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
-# The derived list of functions that read `runtime.sandbox`, for the guard
-# that a run reads it once.
-darkmux-sandbox = { path = "../darkmux-sandbox", features = ["test-support"] }
 # (#1355 review round) Route this crate's test build's process-global
 # `darkmux_flow::record()` writes into a per-process temp dir instead of the
 # operator's real ~/.darkmux/flows (and scrub DARKMUX_REDIS_URL before the

@@ -307,6 +307,10 @@ pub(crate) struct RunResult {
     /// on purpose to hand the work to a higher tier. `ok` is false then, but
     /// `error` stays `None`: an escalation is not an error.
     pub escalation: Option<String>,
+    /// The run's own read of `runtime.sandbox`, when it made one (a
+    /// coding-task run): its grader, in the same process, names the run's
+    /// Docker remedies from it instead of reading the setting again.
+    pub sandbox_read: Option<darkmux_sandbox::Selection>,
 }
 
 impl RunResult {

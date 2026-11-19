@@ -21,11 +21,6 @@ darkmux-platform = { path = "../darkmux-platform" }
 # A handle is stored in records a reaper or a resume reads back.
 serde = { version = "1.0", features = ["derive"] }
 
-[features]
-# The derived list of functions that read `runtime.sandbox`
-# (`setting_reads`), for other crates' guard tests.
-test-support = []
-
 [dev-dependencies]
 serial_test = "3.1"
 # A test build reads no operator config (the types crate's test isolation).

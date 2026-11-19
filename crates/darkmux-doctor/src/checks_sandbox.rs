@@ -41,8 +41,12 @@ pub(crate) fn undecided_row(found: &[darkmux_sandbox::seatbelt::Undecided]) -> O
 /// The sandbox `runtime.sandbox` resolves to here, as every entry point
 /// that starts one resolves it, and the tier that decided.
 pub(crate) fn configured() -> (Result<BackendKind, String>, Source) {
-    let source = darkmux_types::config_access::sandbox_with_source().map_or(Source::BuiltIn, |(_, s)| s);
-    (darkmux_sandbox::selected(), source)
+    // One read: the backend and its tier together. A refused value still
+    // names its tier (from the types crate's accessor), for the remedy.
+    match darkmux_sandbox::selection() {
+        Ok(s) => (Ok(s.kind), s.source),
+        Err(why) => (Err(why), darkmux_types::config_access::sandbox_with_source().map_or(Source::BuiltIn, |(_, s)| s)),
+    }
 }
 
 /// (#3112) The row's name for `sandbox.memory`.

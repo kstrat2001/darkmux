@@ -1193,7 +1193,7 @@ pub struct RuntimeBehaviorConfig {
     /// decides (`darkmux_platform::Platform::default_sandbox`): Seatbelt on a
     /// Mac with `sandbox-exec`, Landlock on a Linux whose kernel has what it
     /// needs, Docker elsewhere. Resolved through
-    /// `config_access::sandbox()`; an unregistered value refuses every entry
+    /// `config_access::sandbox_with_source()`; an unregistered value refuses every entry
     /// point. Not written by `init`, for the `container_user` reason.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub sandbox: Option<String>,
     /// (#906, 2.6) Run a lab run's verify command and grader suites, which
@@ -1201,7 +1201,7 @@ pub struct RuntimeBehaviorConfig {
     /// instead of in a container with no network and only the tree mounted.
     /// An opt-in (default `false`): only the operator decides that code a
     /// model wrote may run with their privileges. Resolved through
-    /// `config_access::tests_on_host()`.
+    /// `config_access::tests_on_host_with_source()`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub tests_on_host: Option<bool>,
     /// (#2107, #1833, #2108) Cadence, in milliseconds, of `darkmux serve`'s
     /// daemon-side continuous host sampler — the background thread that

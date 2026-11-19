@@ -1069,6 +1069,10 @@ pub(crate) fn record(
 /// `raw` is the verify command's own verdict, for a run the gate skipped.
 /// Every graded run is recorded, a gate or prompt that failed included: the
 /// verdict is then a fail that says why.
+///
+/// `read` is the run's own read of `runtime.sandbox` (its Docker remedies);
+/// where the suite runs is the run's recorded placement either way.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply(
     run_dir: &Path,
     fixture: &Path,
@@ -1077,6 +1081,7 @@ pub(crate) fn apply(
     raw: Option<&crate::workloads::types::VerifyOutcome>,
     loaded: &crate::workloads::types::LoadedWorkload,
     gate: Result<Option<WorkGateResult>>,
+    read: Option<darkmux_sandbox::Selection>,
 ) -> Result<Option<WorkGateResult>> {
     let Some(spec) = loaded
         .manifest
@@ -1094,7 +1099,7 @@ pub(crate) fn apply(
         .as_ref()
         .and_then(|v| v.coverage_min_pct);
     let (ungraded, tests_added) = ungraded_verdict(spec, coverage, raw, gate);
-    let placement = placement_of(RunManifest::read(run_dir).ok().as_ref());
+    let placement = placement_of(RunManifest::read(run_dir).ok().as_ref(), read);
     let graded = match (crate::providers::coding_task::graded_prompt(loaded), Runner::for_workload(loaded, &placement)) {
         (Ok(prompt), Ok(runner)) => grade_run(run_dir, spec, &prompt, fixture, result, dispatch, &runner)?,
         (Err(e), _) => cannot_grade(&anyhow!("resolving the prompt: {e:#}")),
@@ -1207,7 +1212,7 @@ fn grade_kept(run_dir: &Path, manifest: &RunManifest, fixture: Option<&Path>) ->
     let spec = declared_grade(&loaded)?;
     let fixture_dir = run_fixture(run_dir, manifest, fixture)?;
     let result = kept_result(run_dir, manifest)?;
-    let (prompt, runner) = prompt_and_runner(&loaded, &placement_of(Some(manifest)))?;
+    let (prompt, runner) = prompt_and_runner(&loaded, &placement_of(Some(manifest), None))?;
     try_grade_run(run_dir, spec, &prompt, &fixture_dir, &result, &kept_dispatch(manifest), &runner)
 }
 
@@ -1245,22 +1250,27 @@ fn prompt_and_runner(
 /// the run's dispatch, or before a regrade) never moves them. A run that
 /// recorded no placement (written before the record existed) is placed by
 /// the settings now, the one fresh read here.
-fn placement_of(manifest: Option<&RunManifest>) -> crate::providers::coding_task::RunPlacement {
-    placement_of_isolation(manifest.and_then(|m| m.isolation.as_ref()))
+fn placement_of(
+    manifest: Option<&RunManifest>,
+    read: Option<darkmux_sandbox::Selection>,
+) -> crate::providers::coding_task::RunPlacement {
+    placement_of_isolation(manifest.and_then(|m| m.isolation.as_ref()), read)
 }
 
 fn placement_of_isolation(
     isolation: Option<&crate::lab::manifest::RunIsolation>,
+    read: Option<darkmux_sandbox::Selection>,
 ) -> crate::providers::coding_task::RunPlacement {
     use crate::providers::coding_task::RunPlacement;
-    isolation.map_or_else(RunPlacement::read, RunPlacement::recorded)
+    isolation.map_or_else(RunPlacement::read, |i| RunPlacement::recorded(i, read))
 }
 
 #[cfg(test)]
 pub(crate) fn placement_of_for_test(
     isolation: Option<&crate::lab::manifest::RunIsolation>,
+    read: Option<darkmux_sandbox::Selection>,
 ) -> crate::providers::coding_task::RunPlacement {
-    placement_of_isolation(isolation)
+    placement_of_isolation(isolation, read)
 }
 
 /// The workload's `verify.grade`, which a regrade needs.
