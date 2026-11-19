@@ -2219,7 +2219,8 @@ pub struct HookMatch {
     /// permits exactly one flattened field per struct, so a genuinely
     /// nested second field would collide with this one). See
     /// [`HookMatch::payload_predicates`] for the accessor that reads
-    /// them back out.
+    /// them back out. Any other key here is a typo the config gate refuses
+    /// (`user_files::hook_match_issues`): dropped, it would widen the rule.
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -2242,14 +2243,40 @@ impl HookMatch {
     /// field, e.g. `{"action": "dispatch.tool", "payload.tool_name":
     /// "create_finding", "payload.ok": true}` yields `("tool_name",
     /// "create_finding")` and `("ok", true)`. A remaining `extras` key that
-    /// does NOT start with `payload.` is unrelated forward-compat overflow
-    /// and is not a predicate — see the struct doc.
+    /// does NOT start with `payload.` is not a predicate; the config gate
+    /// refuses it (see the field doc).
     pub fn payload_predicates(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
         self.extras
             .iter()
-            .filter_map(|(k, v)| k.strip_prefix("payload.").map(|rest| (rest, v)))
+            .filter_map(|(k, v)| k.strip_prefix(PAYLOAD_PREDICATE_PREFIX).map(|rest| (rest, v)))
+    }
+
+    /// Whether `key` is valid in a hook rule's `match`: a field this struct
+    /// names, a `payload.<path>` predicate with a path, or a `_comment` note.
+    /// THE rule: the config gate (`user_files::hook_match_issues`) refuses
+    /// any other key, and the hooks sink disables a rule that carries one,
+    /// since it would be dropped and widen the rule.
+    pub fn is_match_key(key: &str, fields: &[String]) -> bool {
+        let predicate = key.strip_prefix(PAYLOAD_PREDICATE_PREFIX).is_some_and(|path| !path.is_empty());
+        predicate || key == crate::user_files::COMMENT_KEY || fields.iter().any(|f| f == key)
+    }
+
+    /// The keys this struct names, the `fields` [`Self::is_match_key`] takes.
+    pub fn field_names() -> Vec<String> {
+        crate::user_files::top_level_keys::<HookMatch>()
+    }
+
+    /// Every key this match carries that [`Self::is_match_key`] refuses: the
+    /// named fields are never in `extras`, so these are its typos.
+    pub fn refused_keys(&self) -> Vec<&str> {
+        let fields = Self::field_names();
+        self.extras.keys().map(String::as_str).filter(|k| !Self::is_match_key(k, &fields)).collect()
     }
 }
+
+/// The key form a hook rule's `match` takes beside the fields it names: a
+/// predicate on the record's payload ([`HookMatch::payload_predicates`]).
+pub const PAYLOAD_PREDICATE_PREFIX: &str = "payload.";
 
 /// A machine's declared fleet position. Its one consumer is
 /// `darkmux_doctor::viewer_link_base`: `Standalone` (default) makes viewer
