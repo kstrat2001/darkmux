@@ -81,6 +81,11 @@ pub struct InitReport {
     pub config_path: Option<PathBuf>,
     pub config_created: bool,
     pub config_already_present: bool,
+    /// The dotted keys `init` added to a config that already existed but
+    /// lacked them (a `config set` before the first `init` leaves a one-key
+    /// file), each with its default; the operator's own keys are kept. Empty
+    /// when nothing was missing or the file is not a JSON object.
+    pub config_completed: Vec<String>,
     pub skills_targets: Vec<PathBuf>,
     pub skills_installed: Vec<String>,
     pub skills_overwritten: Vec<String>,
@@ -127,10 +132,11 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
 
     // 1b) Bootstrap the config file (#661). Same never-overwrite discipline as
     //     the profile registry — the operator's config edits outrank a re-run.
-    let (config_path, config_created) = bootstrap_config(opts.dry_run)?;
+    let (config_path, config_created, config_completed) = bootstrap_config(opts.dry_run)?;
     report.config_already_present = !config_created;
     report.config_path = Some(config_path.clone());
     report.config_created = config_created;
+    report.config_completed = config_completed;
 
     // 1c) (#316, ENGINES.md 9.2) Which engine answers on this machine, recorded
     //     as `default_engine` while none was chosen yet (`may_detect`), or
@@ -501,13 +507,7 @@ fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Opt
     }
     let available = match engine::lmstudio().catalog() {
         Ok(v) => v,
-        Err(e) => {
-            return Err(format!(
-                "could not ask LM Studio what is downloaded ({e:#}). Install LM Studio and enable its \
-                 command-line tool (`~/.lmstudio/bin/lms bootstrap`), download a model, then re-run \
-                 `darkmux init`."
-            ))
-        }
+        Err(e) => return Err(catalog_failure_reason(&format!("{e:#}"))),
     };
     let loaded: Vec<String> = engine::lmstudio().loaded()
         .map(|v| v.into_iter().map(|m| m.model).collect())
@@ -519,6 +519,20 @@ fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Opt
     let filled = fill_placeholder_models(&text, &id).expect("placeholder was present");
     write_registry(registry_path, Some(&text), &filled)?;
     Ok(Some(id))
+}
+
+/// Why the worker fill could not ask LM Studio, in operator words. A spawn
+/// error for a missing `lms` already names the fix
+/// (`gestalt_host::lms_host::spawn_capped`), so the install line is added
+/// only when the error does not carry it: said once, never twice.
+fn catalog_failure_reason(error: &str) -> String {
+    let fix = if error.contains("lms bootstrap") {
+        ""
+    } else {
+        " Install LM Studio and enable its command-line tool (`~/.lmstudio/bin/lms bootstrap`), or point darkmux \
+         at it: `darkmux config set lms_bin <path>`."
+    };
+    format!("could not ask LM Studio what is downloaded ({error}).{fix} Then download a model and re-run `darkmux init`.")
 }
 
 /// (#316, ENGINES.md 9.2 step 5) The worker model on an OpenAI-compatible
@@ -1036,27 +1050,45 @@ fn user_profile_registry_path() -> Result<PathBuf> {
 /// operator tunes the file rather than hunting hidden code-defaults. The
 /// integration features (`redis`, `audit`) are written as `enabled: false`
 /// blocks with their sub-defaults populated (the full surface is discoverable
-/// and one flip from on). Skip-if-exists (never overwrites, even under
-/// `--force`: the operator's config edits outrank a re-run). Returns
-/// `(path, created)`; `created` is `true` in dry-run to report the intent.
+/// and one flip from on). Returns `(path, created, completed)`; `created` is
+/// `true` in dry-run to report the intent.
+///
+/// An existing file is never overwritten, even under `--force`: the
+/// operator's values outrank a re-run. It is **completed** instead
+/// ([`complete_config`]): a `config set` before the first `init` leaves a
+/// one-key file, and `init` used to stop at "already present" there, so the
+/// full default and `machine_id` were never written. Completing adds only the
+/// keys the file lacks, so it is the same visible config whichever command
+/// ran first.
 ///
 /// The write target routes through `paths::resolve(ForceUser).config`, so it
 /// honors the `DARKMUX_HOME` bootstrap pointer and lands where the runtime
 /// reads.
-fn bootstrap_config(dry_run: bool) -> Result<(PathBuf, bool)> {
-    use darkmux_types::config::DarkmuxConfig;
+fn bootstrap_config(dry_run: bool) -> Result<(PathBuf, bool, Vec<String>)> {
     use darkmux_types::paths::{ResolveScope, resolve};
 
     let config_path = resolve(ResolveScope::ForceUser).config;
     if config_path.exists() {
-        return Ok((config_path, false));
+        let completed = complete_config(&config_path, dry_run)?;
+        return Ok((config_path, false, completed));
     }
     if dry_run {
-        return Ok((config_path, true));
+        return Ok((config_path, true, Vec::new()));
     }
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
+    write_config(&config_path, &default_config()?)?;
+    Ok((config_path, true, Vec::new()))
+}
+
+/// The config `init` writes on this machine: the defaults, `machine_id`
+/// seeded from the computer name, and the hooks and audit directories under
+/// a non-default `DARKMUX_HOME`.
+fn default_config() -> Result<Value> {
+    use darkmux_types::config::DarkmuxConfig;
+    use darkmux_types::paths::{ResolveScope, resolve};
+
     let mut cfg = DarkmuxConfig::with_defaults();
     if let Some(name) = computer_name() {
         cfg.machine_id = Some(name);
@@ -1071,10 +1103,64 @@ fn bootstrap_config(dry_run: bool) -> Result<(PathBuf, bool)> {
             audit.dir = Some(resolved_paths.root.join("audit").display().to_string());
         }
     }
-    let mut json = serde_json::to_string_pretty(&cfg).context("serializing config.json")?;
+    serde_json::to_value(&cfg).context("serializing config.json")
+}
+
+fn write_config(path: &Path, value: &Value) -> Result<()> {
+    let mut json = serde_json::to_string_pretty(value).context("serializing config.json")?;
     json.push('\n');
-    fs::write(&config_path, json).with_context(|| format!("writing {}", config_path.display()))?;
-    Ok((config_path, true))
+    fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+}
+
+/// The `config:` line for a config `init` completed: how many defaults it
+/// added (or would add, on a dry run), whether `machine_id` was among them,
+/// and that the operator's own values were kept.
+pub fn config_completed_line(path: &Path, added: &[String], dry_run: bool) -> String {
+    let verb = if dry_run { "would add" } else { "added" };
+    let seeded = if added.iter().any(|k| k == "machine_id") { ", machine_id seeded" } else { "" };
+    format!(
+        "config: completed at {}: {verb} {} default setting(s) it was missing{seeded}; your own values were kept",
+        path.display(),
+        added.len()
+    )
+}
+
+/// Add every default the existing config at `path` lacks, keeping each of
+/// the operator's own values (a key already present is never replaced, at
+/// any depth), and return the dotted keys added. A file `config set` would
+/// also refuse to rewrite (not a JSON object, written by a newer darkmux, a
+/// key written twice) is left as it is: doctor names its problem. A dry run
+/// returns what it would add and writes nothing.
+fn complete_config(path: &Path, dry_run: bool) -> Result<Vec<String>> {
+    let Ok(mut existing) = crate::config_cmd::load_object_for_write(path) else {
+        return Ok(Vec::new());
+    };
+    let added = add_missing_keys(&mut existing, &default_config()?, "");
+    if !added.is_empty() && !dry_run {
+        write_config(path, &existing)?;
+    }
+    Ok(added)
+}
+
+/// Copy each key of `defaults` that `target` lacks into it, descending into
+/// objects both sides hold, and return the dotted paths copied. A key
+/// `target` holds with any other value is the operator's and is left alone.
+fn add_missing_keys(target: &mut Value, defaults: &Value, prefix: &str) -> Vec<String> {
+    let (Some(target), Some(defaults)) = (target.as_object_mut(), defaults.as_object()) else {
+        return Vec::new();
+    };
+    let mut added = Vec::new();
+    for (key, default) in defaults {
+        let path = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+        match target.get_mut(key) {
+            None => {
+                target.insert(key.clone(), default.clone());
+                added.push(path);
+            }
+            Some(own) => added.extend(add_missing_keys(own, default, &path)),
+        }
+    }
+    added
 }
 
 /// The friendly machine name to seed `machine_id` with, so the operator gets a
@@ -1459,6 +1545,21 @@ mod tests {
         assert!(cfg.extras.is_empty(), "example must use only documented keys");
     }
 
+    #[test]
+    fn add_missing_keys_adds_only_what_is_absent_and_names_each() {
+        let mut own = serde_json::json!({ "a": 1, "b": { "x": "mine" }, "c": "not-an-object" });
+        let defaults = serde_json::json!({ "a": 9, "b": { "x": "d", "y": 2 }, "c": { "z": 3 }, "d": false });
+        let added = add_missing_keys(&mut own, &defaults, "");
+        assert_eq!(added, ["b.y", "d"]);
+        assert_eq!(own, serde_json::json!({ "a": 1, "b": { "x": "mine", "y": 2 }, "c": "not-an-object", "d": false }));
+        let line = config_completed_line(Path::new("/c.json"), &["machine_id".to_string(), "d".to_string()], true);
+        assert_eq!(
+            line,
+            "config: completed at /c.json: would add 2 default setting(s) it was missing, machine_id seeded; your own \
+             values were kept"
+        );
+    }
+
     #[serial_test::serial]
     #[test]
     fn bootstrap_config_writes_full_personalized_and_skips_if_exists() {
@@ -1468,7 +1569,7 @@ mod tests {
         unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()); }
 
         // First run writes the full self-documenting default config.
-        let (path, created) = bootstrap_config(false).unwrap();
+        let (path, created, _) = bootstrap_config(false).unwrap();
         assert!(created, "fresh config is created");
         assert_eq!(path, tmp.path().join("config.json"));
         let cfg: DarkmuxConfig = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -1519,9 +1620,10 @@ mod tests {
         assert!(cfg.dirs.is_none(), "derived dirs are surfaced by doctor, not frozen");
 
         // Second run never overwrites — returns (same path, false).
-        let (path2, created2) = bootstrap_config(false).unwrap();
+        let (path2, created2, completed2) = bootstrap_config(false).unwrap();
         assert_eq!(path2, path);
         assert!(!created2, "existing config is left untouched");
+        assert!(completed2.is_empty(), "a full config has nothing to complete: {completed2:?}");
 
         unsafe {
             match prev {
@@ -1538,7 +1640,7 @@ mod tests {
         let prev = std::env::var("DARKMUX_HOME").ok();
         unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()); }
 
-        let (path, created) = bootstrap_config(true).unwrap();
+        let (path, created, _) = bootstrap_config(true).unwrap();
         assert!(created, "dry-run reports the intent to create");
         assert!(!path.exists(), "dry-run writes nothing");
 

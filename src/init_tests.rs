@@ -369,18 +369,73 @@ fn a_dry_run_over_an_existing_install_reports_it_present_and_touches_nothing() {
     assert_eq!(env.lms_calls(), "ps --json\n");
 }
 
+/// An operator's own value is never replaced, even with `--force`: a re-run
+/// only adds the defaults the file is missing.
 #[test]
 #[serial_test::serial]
-fn an_existing_config_is_never_overwritten_even_with_force() {
+fn an_existing_configs_values_are_never_overwritten_even_with_force() {
     darkmux_types::run_in_own_process!();
     let env = InitEnv::new();
     env.lms(&[model("tiny-llm", TINY, "llm")], &[]);
-    fs::write(env.config(), "{ \"machine_id\": \"operator-named\" }\n").unwrap();
+    fs::write(env.config(), "{ \"machine_id\": \"operator-named\", \"redis\": { \"port\": 7000 } }\n").unwrap();
 
     let r = init(&InitOptions { force: true, ..opts() }).unwrap();
 
     assert!(r.config_already_present && !r.config_created);
-    assert_eq!(fs::read_to_string(env.config()).unwrap(), "{ \"machine_id\": \"operator-named\" }\n");
+    let cfg: Value = serde_json::from_str(&fs::read_to_string(env.config()).unwrap()).unwrap();
+    assert_eq!(cfg["machine_id"], "operator-named");
+    assert_eq!(cfg["redis"]["port"], 7000, "a nested value of the operator's is kept");
+    assert_eq!(cfg["redis"]["enabled"], false, "the block's missing default is added beside it");
+}
+
+/// `config set` before `init` leaves a one-key file. `init` completes it with
+/// every default it lacks and the seeded `machine_id`, keeping the key the
+/// operator set, and says what it added.
+#[test]
+#[serial_test::serial]
+fn a_partial_config_is_completed_with_the_defaults_it_lacks() {
+    darkmux_types::run_in_own_process!();
+    let env = InitEnv::new();
+    env.lms(&[model("tiny-llm", TINY, "llm")], &[]);
+    fs::write(env.config(), "{\n  \"lms_bin\": \"/opt/lms\"\n}\n").unwrap();
+
+    let r = init(&opts()).unwrap();
+
+    assert!(r.config_already_present && !r.config_created);
+    assert!(r.config_completed.contains(&"machine_id".to_string()), "{:?}", r.config_completed);
+    assert!(r.config_completed.iter().any(|k| k.starts_with("redis")), "{:?}", r.config_completed);
+    assert!(!r.config_completed.contains(&"lms_bin".to_string()), "the operator's own key is not added");
+    let cfg: darkmux_types::config::DarkmuxConfig =
+        serde_json::from_str(&fs::read_to_string(env.config()).unwrap()).unwrap();
+    assert_eq!(cfg.lms_bin.as_deref(), Some("/opt/lms"));
+    assert!(cfg.machine_id.as_deref().is_some_and(|m| !m.is_empty() && m != "my-machine"), "{:?}", cfg.machine_id);
+    assert_eq!(cfg.redis.as_ref().and_then(|x| x.enabled), Some(false));
+    assert!(cfg.schema_version.is_some());
+
+    // A second run has nothing left to add and writes nothing.
+    let before = fs::read_to_string(env.config()).unwrap();
+    let again = init(&opts()).unwrap();
+    assert!(again.config_completed.is_empty(), "{:?}", again.config_completed);
+    assert_eq!(fs::read_to_string(env.config()).unwrap(), before);
+}
+
+/// A dry run says what it would add and writes nothing; a file that is not a
+/// JSON object is left for the operator (doctor names the problem).
+#[test]
+#[serial_test::serial]
+fn a_dry_run_or_an_unreadable_config_is_not_completed() {
+    darkmux_types::run_in_own_process!();
+    let env = InitEnv::new();
+    env.lms(&[model("tiny-llm", TINY, "llm")], &[]);
+    fs::write(env.config(), "{\"lms_bin\": \"/opt/lms\"}\n").unwrap();
+    let r = init(&InitOptions { dry_run: true, ..opts() }).unwrap();
+    assert!(r.config_completed.contains(&"machine_id".to_string()), "{:?}", r.config_completed);
+    assert_eq!(fs::read_to_string(env.config()).unwrap(), "{\"lms_bin\": \"/opt/lms\"}\n");
+
+    fs::write(env.config(), "not json\n").unwrap();
+    let r = init(&opts()).unwrap();
+    assert!(r.config_completed.is_empty());
+    assert_eq!(fs::read_to_string(env.config()).unwrap(), "not json\n");
 }
 
 // ── fill_worker_model, through init ───────────────────────────────────────
@@ -469,12 +524,31 @@ fn an_unreachable_lms_leaves_both_bindings_and_names_the_fix() {
 
     let reason = r.worker_model_unfilled_reason.expect("a reason");
     assert!(reason.starts_with("could not ask LM Studio what is downloaded"), "{reason}");
-    assert!(reason.contains("lms bootstrap"), "{reason}");
+    assert_eq!(reason.matches("lms bootstrap").count(), 1, "the fix is said once: {reason}");
+    assert!(reason.contains("darkmux config set lms_bin <path>"), "{reason}");
+    assert!(!reason.contains("config.json"), "no hand edit: {reason}");
     assert_eq!(r.worker_model_filled, None);
     // The utility half stays quiet: the worker already reported lms.
     assert_eq!(r.utility_model_filled, None);
     assert_eq!(r.utility_model_unfilled_reason, None);
     assert_eq!(env.read_registry(), EXAMPLE_PROFILES_JSON);
+}
+
+/// An `lms_bin` whose file is named `lms` but is missing gets its fix from
+/// the spawn error itself; init's own reason must not say it a second time.
+#[test]
+#[serial_test::serial]
+fn a_missing_lms_binary_names_the_fix_once() {
+    darkmux_types::run_in_own_process!();
+    let mut env = InitEnv::new();
+    let missing = env.stub.path().join("absent").join("lms");
+    env.set("DARKMUX_LMS_BIN", missing.into_os_string());
+
+    let reason = init(&opts()).unwrap().worker_model_unfilled_reason.expect("a reason");
+
+    assert_eq!(reason.matches("lms bootstrap").count(), 1, "the fix is said once: {reason}");
+    assert!(reason.contains("darkmux config set lms_bin <path>"), "{reason}");
+    assert!(!reason.contains("config.json"), "no hand edit: {reason}");
 }
 
 #[test]

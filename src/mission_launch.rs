@@ -427,6 +427,7 @@ pub(crate) fn resolve_inputs(
     params: &[String],
 ) -> Result<ResolvedInputs> {
     let mut collected = collect_inputs(input_file, params)?;
+    refuse_undeclared_inputs(config, &collected)?;
     let operator_supplied: std::collections::BTreeSet<String> = collected.keys().cloned().collect();
     apply_input_defaults(config, &mut collected);
     refuse_bad_inputs(config, &collected)?;
@@ -503,84 +504,12 @@ pub fn launch(
 
     let ResolvedInputs { collected, operator_supplied } = resolve_inputs(config, input_file, params)?;
 
-    // (#2310 P4f review, CONSIDER 3) `mod_seat_profile` names the profile
-    // `review`'s optional endpoint create-mod seat dispatches to. A name
-    // that matches NO defined profile does not fail — it silently becomes
-    // the machine's `default_profile`, because
-    // `ProfileRegistry::resolve_active` falls back by design (so a
-    // machine-agnostic caller can name a profile each machine may or may
-    // not define, and that function's own doc tells the caller to "detect a
-    // fallback and surface it"). Nothing here surfaced it: the operator
-    // asked for a hosted cloud seat, got their local default, and every
-    // flow record still said `handle: coder`. That is a silent substitution
-    // of the operator's stated intent (#44), and it is worth more here than
-    // elsewhere because the whole POINT of this input is that the seat is a
-    // different TIER — the failure is invisible in the graph, in the
-    // records, and in the delivered review.
-    //
-    // Checked BEFORE the dry-run print below, so `--dry-run` is where a
-    // runner's typo surfaces rather than mid-run. Keyed on the input NAME:
-    // any config declaring `mod_seat_profile` gets the same check, which is
-    // honest — there is exactly one such config today, and a generic
-    // "this input names a profile" declaration is a schema change to make
-    // when a second one exists, not before.
-    if let Some(seat) = collected.get("mod_seat_profile").and_then(|v| v.as_str()) {
-        if !seat.trim().is_empty() {
-            let loaded = darkmux_profiles::profiles::load_registry(
-                collected.get("profiles").and_then(|v| v.as_str()),
-            )
-            .context(
-                "mission launch: `mod_seat_profile` was supplied, but the profile registry could \
-                 not be read, so the name cannot be verified",
-            )?;
-            if !loaded.registry.profiles.contains_key(seat) {
-                let mut defined: Vec<&str> =
-                    loaded.registry.profiles.keys().map(String::as_str).collect();
-                defined.sort_unstable();
-                let listed = if defined.is_empty() {
-                    "  (the registry defines no profiles)".to_string()
-                } else {
-                    defined.iter().map(|d| format!("  {d}")).collect::<Vec<_>>().join("\n")
-                };
-                bail!(
-                    "mission launch: `mod_seat_profile={seat}` names no profile in the registry.\n\
-                     Defined profiles:\n{listed}\n\
-                     Run `darkmux profile list` to see them. This is refused rather than resolved \
-                     to the default profile: the endpoint create-mod seat exists to put this task \
-                     on a DIFFERENT tier, and quietly running it on the default would look \
-                     identical in the graph and in every flow record."
-                );
-            }
-        }
-    }
-
-    // (#1284 review round 1, consider 2; consequence rewritten silent-miss
-    // audit 2026-09-06) A supplied input the config never declared is a
-    // TYPO'D key — the previous wording ("it still shapes the derived
-    // instance id") went stale under #1503, which mints `mission_id` from
-    // a random token (`mint_run_id`) with no dependency on `collected` at
-    // all. The TRUE consequence: the undeclared value is still carried
-    // into `collected` (printed as `resolved inputs:` on a dry run, and
-    // hashed whole into `spec_fingerprint` → `Mission.spec.
-    // inputs_fingerprint`), while `apply_input_defaults` — which only
-    // ever checks `collected.contains_key`, never "did the operator mean
-    // this" — fills the config's ACTUAL declared input (e.g. `rules`)
-    // with its document DEFAULT, because the typo'd key never touched it.
-    // A misspelled `--param rulez=only-this-one-rule` therefore runs the
-    // config's full default rule set, silently. Warn loudly; don't block
-    // (a config author may deliberately accept undeclared pass-through
-    // values).
-    //
-    // (#1959) `dry_run` is exempt — it's a LAUNCHER-level flag (the CLI's
-    // `--dry-run`, injected as a synthetic param), not a config-declared
-    // input, same category as `mission_id` being launcher-supplied rather
-    // than operator-declared. Every config would otherwise warn on every
-    // dry run, since none of them declare it.
-    for key in collected.keys() {
-        if key != "dry_run" && !config.inputs.iter().any(|i| i.name == *key) {
-            eprintln!("{}", style::warn(&undeclared_param_warning(config_id, key, config)));
-        }
-    }
+    // Launch inputs that name something (a profile, a role) must name one
+    // that exists: refused here, before the `--dry-run` short-circuit and
+    // before anything mints, so a dry run surfaces the same refusal a real
+    // launch would. An undeclared input was already refused by
+    // `resolve_inputs` (contract 9: never a warning and a default).
+    refuse_bad_launch_overrides(config, &collected)?;
 
     // (#1685) If the config's graph references the reserved
     // `__panel_args__` task id (the SAME convention the ACP ephemeral
@@ -2374,8 +2303,22 @@ fn dry_run_report(config: &MissionConfig, collected: &BTreeMap<String, serde_jso
         "darkmux mission launch {} --dry-run — nothing minted\n{}{}",
         config.id,
         dry_run_inputs_section(config, collected),
-        dry_run_graph_section(config)
+        dry_run_graph_section(config, &dry_run_role_overrides(config, collected))
     )
+}
+
+/// (#3634) The role each task will dispatch after this launch's overrides,
+/// keyed by task id: the same [`build_launch_params`] a real launch applies,
+/// so the dry run's graph shows the `role=` a real run would use.
+fn dry_run_role_overrides(
+    config: &MissionConfig,
+    collected: &BTreeMap<String, serde_json::Value>,
+) -> BTreeMap<String, String> {
+    build_launch_params(config, &BTreeMap::new(), collected, None)
+        .task_overrides
+        .into_iter()
+        .filter_map(|(task, o)| o.role_id.map(|role| (task, role)))
+        .collect()
 }
 
 /// The `resolved inputs:` section of a dry run's report.
@@ -2397,7 +2340,7 @@ fn dry_run_inputs_section(config: &MissionConfig, collected: &BTreeMap<String, s
 }
 
 /// The `graph:` section of a dry run's report.
-fn dry_run_graph_section(config: &MissionConfig) -> String {
+fn dry_run_graph_section(config: &MissionConfig, roles: &BTreeMap<String, String>) -> String {
     let mut out = String::from("graph:\n");
     if config.phases.is_empty() {
         out.push_str("  (no phases)\n");
@@ -2406,18 +2349,19 @@ fn dry_run_graph_section(config: &MissionConfig) -> String {
         let label = phase.display_name.as_deref().unwrap_or(&phase.id);
         out.push_str(&format!("  phase {label} ({} task(s))\n", phase.tasks.len()));
         for task in &phase.tasks {
-            out.push_str(&dry_run_task_lines(task));
+            out.push_str(&dry_run_task_lines(task, roles.get(&task.id).map(String::as_str)));
         }
     }
     out
 }
 
-/// One task's line in a dry run's graph, then a line per step.
-fn dry_run_task_lines(task: &mission_config::TaskConfig) -> String {
+/// One task's line in a dry run's graph, then a line per step. `role` is
+/// this launch's override for the task, which wins over the document's.
+fn dry_run_task_lines(task: &mission_config::TaskConfig, role: Option<&str>) -> String {
     let task_label = task.display_name.as_deref().unwrap_or(&task.id);
     let deps = if task.depends_on.is_empty() { String::new() } else { format!(" depends_on={:?}", task.depends_on) };
     let reads = if task.reads.is_empty() { String::new() } else { format!(" reads={:?}", task.reads) };
-    let role = task.role_id.as_deref().map(|r| format!(" role={r}")).unwrap_or_default();
+    let role = role.or(task.role_id.as_deref()).map(|r| format!(" role={r}")).unwrap_or_default();
     let mut out = format!("    task {task_label}{role}{deps}{reads}\n");
     for step in &task.steps {
         out.push_str(&format!("      step {} [{}]\n", step.id, step.kind));
@@ -2465,6 +2409,7 @@ fn refuse_bad_inputs(config: &MissionConfig, collected: &BTreeMap<String, serde_
     if !missing.is_empty() {
         bail!("{}", missing_inputs_message(config, &missing));
     }
+    refuse_non_string_inputs(config, collected)?;
     refuse_non_whole_numbers(config, collected)?;
     refuse_bad_workspace_specs(config, collected)
 }
@@ -2639,38 +2584,191 @@ fn declared_inert_input_warning(config_id: &str, name: &str, has_default: bool) 
     }
 }
 
-/// (#1284 review round 1, consider 2; consequence rewritten + did-you-mean
-/// added, silent-miss audit 2026-09-06) The WARN text for one `--param`
-/// key the config never declared — extracted to a pure function (mirrors
-/// [`declared_inert_input_warning`] above) so both the wording and the
-/// suggestion are unit-testable without capturing the `eprintln!` this
-/// feeds at its one call site.
-///
-/// The consequence clause used to say the undeclared value "still shapes
-/// the derived instance id" — true before #1503, stale after: `mint_run_id`
-/// mints `mission_id` from a random token with no dependency on `collected`
-/// at all. The TRUE consequence: the value is still carried into
-/// `collected` (`resolved inputs:` on a dry run) and hashed whole into
-/// `spec_fingerprint` → `Mission.spec.inputs_fingerprint`, while
-/// `apply_input_defaults` — which only ever checks `collected.
-/// contains_key`, never "did the operator mean this" — fills whichever
-/// declared input the typo was aimed at with its document DEFAULT, since
-/// the typo never touches it. A misspelled `--param rulez=<csv>` against a
-/// config that declares `rules` therefore runs with the config's full
-/// default rule set, silently — the did-you-mean suffix (the one
-/// suggester, `darkmux_types::user_files::closest`) is what lets the
-/// operator catch this before the run, not after.
-fn undeclared_param_warning(config_id: &str, key: &str, config: &MissionConfig) -> String {
-    let declared_names = config.inputs.iter().map(|i| i.name.as_str());
-    let did_you_mean = darkmux_types::user_files::closest(key, declared_names)
-        .map(|near| format!(": did you mean `{near}`?"))
+/// Inputs the launcher itself supplies on every launch path, whatever a
+/// config declares: the CLI's `--dry-run` and `--force` arrive as
+/// `dry_run=true` / `force=true` params (`cmd_mission`).
+const LAUNCHER_FLAGS: &[&str] = &["dry_run", "force"];
+
+/// Whether `key` is an input this launch can consume: one the config
+/// declares, a launcher flag, or `args` on a config that reads it (its graph
+/// reads the panel's argument text, `mission_config::takes_panel_args`, or
+/// its `cmd` audit record takes the PR from it, `emit_launch_cmd_audit`).
+fn is_consumable_input(config: &MissionConfig, key: &str) -> bool {
+    config.inputs.iter().any(|i| i.name == key)
+        || LAUNCHER_FLAGS.contains(&key)
+        || (key == "args" && (mission_config::takes_panel_args(config) || config.cmd.is_some()))
+}
+
+/// Refuse a supplied input the config does not declare (contract 9: a value
+/// no entry point can consume is refused, never carried along with a
+/// warning). The value used to ride into the resolved inputs while the input
+/// it was meant for kept its document default, so a misspelled
+/// `--param rulez=<csv>` ran the full default rule set. Each refused key
+/// names its closest declared input (the one suggester,
+/// `darkmux_types::user_files::closest`), and the refusal lists every
+/// declared input. Shared by `mission launch` and the editor panel, which
+/// both resolve through [`resolve_inputs`].
+fn refuse_undeclared_inputs(config: &MissionConfig, collected: &BTreeMap<String, serde_json::Value>) -> Result<()> {
+    let refused: Vec<String> = collected
+        .keys()
+        .filter(|k| !is_consumable_input(config, k))
+        .map(|k| undeclared_input_line(config, k))
+        .collect();
+    if refused.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "mission launch: {}\n{}\nNothing was minted: fix the name, or declare the input in the config's `inputs`.",
+        refused.join("\n"),
+        declared_inputs_line(config)
+    )
+}
+
+/// One refused key: `` input `<key>` is not declared by config "<id>"; the closest is `<name>` ``.
+fn undeclared_input_line(config: &MissionConfig, key: &str) -> String {
+    let hint = darkmux_types::user_files::closest(key, config.inputs.iter().map(|i| i.name.as_str()))
+        .map(|near| format!("; the closest is `{near}`"))
         .unwrap_or_default();
-    format!(
-        "mission launch: input `{key}` is not declared by config \"{config_id}\"'s \
-         inputs{did_you_mean} — it is still carried into the resolved inputs and \
-         `Mission.spec`, but whichever declared input `{key}` was meant for keeps its document \
-         DEFAULT instead of your value, since the typo never reaches it. A misspelled `rules` \
-         param, for example, runs the config's full default rule set, silently"
+    format!("input `{key}` is not declared by config \"{}\"{hint}", config.id)
+}
+
+/// The config's declared inputs, as a refusal lists them.
+fn declared_inputs_line(config: &MissionConfig) -> String {
+    if config.inputs.is_empty() {
+        return format!("Config \"{}\" declares no inputs.", config.id);
+    }
+    let names: Vec<String> = config.inputs.iter().map(|i| format!("`{}`", i.name)).collect();
+    format!("Declared inputs: {}.", names.join(", "))
+}
+
+/// The inputs the launcher reads itself, as text (`as_str`). A value of any
+/// other JSON type reads as absent there, so it is refused instead
+/// ([`refuse_non_string_inputs`]).
+const LAUNCHER_STRING_INPUTS: &[&str] =
+    &["args", "base", "branch", "image", "mod_seat_profile", "profiles", "role", "rules", "workdir"];
+
+/// (#3635) Refuse a non-string value for an input the launcher reads as
+/// text. An `--input` file can carry any JSON type, and `as_str()` reads an
+/// array or a number as `None`, so `{"rules": ["x"]}` used to mean "no
+/// selection" and plan every rule. The refusal names the input, the JSON
+/// type it got and the shape it takes, never the value (it may be a pasted
+/// credential).
+fn refuse_non_string_inputs(config: &MissionConfig, collected: &BTreeMap<String, serde_json::Value>) -> Result<()> {
+    for name in LAUNCHER_STRING_INPUTS {
+        let Some(value) = collected.get(*name).filter(|v| !v.is_string()) else { continue };
+        bail!(
+            "mission launch: config \"{}\": input `{name}` takes {}, got {}. Nothing was minted.",
+            config.id,
+            string_input_shape(name),
+            json_type_phrase(value)
+        );
+    }
+    Ok(())
+}
+
+/// The shape a launcher-read text input takes, as a refusal names it.
+fn string_input_shape(name: &str) -> &'static str {
+    match name {
+        "rules" => "a string: a comma-separated list of rule ids (for example `\"test-gap,swallowed-error\"`)",
+        _ => "a string",
+    }
+}
+
+/// `a JSON array`, `a JSON number`, and so on.
+fn json_type_phrase(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "JSON null",
+        serde_json::Value::Bool(_) => "a JSON boolean",
+        serde_json::Value::Number(_) => "a JSON number",
+        serde_json::Value::String(_) => "a JSON string",
+        serde_json::Value::Array(_) => "a JSON array",
+        serde_json::Value::Object(_) => "a JSON object",
+    }
+}
+
+/// The launch inputs that name something (a profile, a role), checked
+/// against what exists before the `--dry-run` short-circuit and before
+/// anything mints.
+fn refuse_bad_launch_overrides(config: &MissionConfig, collected: &BTreeMap<String, serde_json::Value>) -> Result<()> {
+    refuse_unknown_mod_seat_profile(collected)?;
+    if collected.contains_key("role") && config_uses_coder_phase_kinds(config) {
+        let known: Vec<String> = crew::loader::load_roles()
+            .context("mission launch: `role` was supplied, but the role library could not be read to verify it")?
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        refuse_unknown_role_override(config, collected, &known)?;
+    }
+    Ok(())
+}
+
+/// (#3634) A coder-phase graph's `role=` override must name a role darkmux
+/// can dispatch. An unknown one used to dry-run green, with the graph still
+/// showing the document's own role, and nothing checked it before a real
+/// launch minted the mission. Only a graph using the coder-phase step kinds
+/// reads `role` ([`build_launch_params`]).
+fn refuse_unknown_role_override(
+    config: &MissionConfig,
+    collected: &BTreeMap<String, serde_json::Value>,
+    known: &[String],
+) -> Result<()> {
+    if !config_uses_coder_phase_kinds(config) {
+        return Ok(());
+    }
+    let Some(role) = collected.get("role").and_then(|v| v.as_str()) else { return Ok(()) };
+    if known.iter().any(|k| k == role) {
+        return Ok(());
+    }
+    let hint = darkmux_types::user_files::closest(role, known.iter().map(String::as_str))
+        .map(|c| format!("; the closest is `{c}`"))
+        .unwrap_or_default();
+    bail!(
+        "mission launch: `role={role}` names no role{hint}. `darkmux role list` shows the roles. \
+         Refused before anything was minted: the coder task would dispatch a role that does not exist."
+    )
+}
+
+/// (#2310 P4f review, CONSIDER 3) `mod_seat_profile` names the profile
+/// `review`'s optional endpoint create-mod seat dispatches to. A name that
+/// matches NO defined profile does not fail on its own: it silently becomes
+/// the machine's `default_profile`, because
+/// `ProfileRegistry::resolve_active` falls back by design. That is a silent
+/// substitution of the operator's stated intent (#44), worth more here than
+/// elsewhere because the whole POINT of this input is that the seat is a
+/// different TIER: the failure is invisible in the graph, in the records,
+/// and in the delivered review. Keyed on the input NAME, so any config
+/// declaring `mod_seat_profile` gets the same check. The refusal names the
+/// closest defined profile (#3634) and lists them all.
+fn refuse_unknown_mod_seat_profile(collected: &BTreeMap<String, serde_json::Value>) -> Result<()> {
+    let Some(seat) = collected.get("mod_seat_profile").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let loaded = darkmux_profiles::profiles::load_registry(collected.get("profiles").and_then(|v| v.as_str()))
+        .context(
+            "mission launch: `mod_seat_profile` was supplied, but the profile registry could not be read, so the \
+             name cannot be verified",
+        )?;
+    if loaded.registry.profiles.contains_key(seat) {
+        return Ok(());
+    }
+    let mut defined: Vec<&str> = loaded.registry.profiles.keys().map(String::as_str).collect();
+    defined.sort_unstable();
+    let hint = darkmux_types::user_files::closest(seat, defined.iter().copied())
+        .map(|c| format!("; the closest is `{c}`"))
+        .unwrap_or_default();
+    let listed = if defined.is_empty() {
+        "  (the registry defines no profiles)".to_string()
+    } else {
+        defined.iter().map(|d| format!("  {d}")).collect::<Vec<_>>().join("\n")
+    };
+    bail!(
+        "mission launch: `mod_seat_profile={seat}` names no profile in the registry{hint}.\n\
+         Defined profiles:\n{listed}\n\
+         Run `darkmux profile list` to see them. This is refused rather than resolved \
+         to the default profile: the endpoint create-mod seat exists to put this task \
+         on a DIFFERENT tier, and quietly running it on the default would look \
+         identical in the graph and in every flow record."
     )
 }
 
@@ -5094,6 +5192,7 @@ mod tests {
         "id": "util-probe",
         "name": "Utility Probe",
         "schema_version": "2.3",
+        "inputs": [{ "name": "profiles", "required": false }],
         "phases": [{
             "id": "p1",
             "tasks": [{
@@ -6277,7 +6376,13 @@ mod tests {
     #[serial_test::serial]
     fn different_inputs_produce_distinct_run_ids_and_distinct_spec_fingerprints() {
         let guard = LaunchTestGuard::new();
-        guard.write_config("freeform-test-mission", FREEFORM_CONFIG);
+        // `note` is declared (an undeclared input is refused) and ignored, so
+        // supplying it only varies the fingerprint.
+        let mut config: serde_json::Value = serde_json::from_str(FREEFORM_CONFIG).unwrap();
+        config["inputs"] = serde_json::json!([
+            { "name": "note", "required": false, "ignored": true, "ignored_reason": "it only varies the fingerprint" }
+        ]);
+        guard.write_config("freeform-test-mission", &config.to_string());
 
         launch("freeform-test-mission", None, &["note=first".to_string()], None).unwrap();
         launch("freeform-test-mission", None, &["note=second".to_string()], None).unwrap();
@@ -6633,56 +6738,6 @@ mod tests {
         assert_ne!(defaulted, unset);
     }
 
-    /// (silent-miss audit, 2026-09-06) `--param rulez=` against a config
-    /// declaring `rules` must name `rules` in a did-you-mean suggestion —
-    /// this is the exact typo class the previous "shapes the derived
-    /// instance id" wording (stale since #1503) gave no hint how to fix.
-    /// Also asserts the rewritten consequence clause names the true
-    /// effect (resolved inputs / `Mission.spec`, and the DEFAULT the
-    /// actually-declared input keeps) rather than the retired one.
-    #[test]
-    fn undeclared_param_warning_suggests_the_closest_declared_input() {
-        let input = |name: &str| mission_config::MissionInput {
-            name: name.to_string(),
-            description: None,
-            required: Some(false),
-            default: Some(serde_json::json!("all-rules")),
-            ignored: None,
-            ignored_reason: None,
-            whole_number: None,
-            extras: BTreeMap::new(),
-        };
-        let cfg = MissionConfig {
-            id: "review".to_string(),
-            name: "Review".to_string(),
-            description: None,
-            schema_version: None,
-            inputs: vec![input("rules"), input("workdir")],
-            phases: Vec::new(),
-            cmd: None,
-            outcome_from: None,
-            source_input: None,
-            ticket: None,
-            extras: BTreeMap::new(),
-        };
-
-        let warn = undeclared_param_warning("review", "rulez", &cfg);
-        assert!(warn.contains("did you mean `rules`?"), "{warn}");
-        assert!(warn.contains("`rulez`"), "{warn}");
-        assert!(
-            warn.contains("resolved inputs") && warn.contains("Mission.spec"),
-            "the rewritten consequence must name the TRUE effect: {warn}"
-        );
-        assert!(
-            warn.contains("document") && warn.contains("DEFAULT"),
-            "must say the actually-declared input keeps its default: {warn}"
-        );
-        assert!(
-            !warn.contains("derived instance id"),
-            "the stale #1503 consequence must be gone: {warn}"
-        );
-    }
-
     /// (review C5) Both shipped plan configs name their spec through the
     /// `workspace` input, and a clean spec passes the launch check.
     #[test]
@@ -6702,28 +6757,6 @@ mod tests {
         std::fs::write(&spec, r#"{"name": "w", "sources": [{"id": "a", "path": "/x"}], "sourcs": []}"#).unwrap();
         let err = refuse_bad_workspace_specs(&crawl.config, &collected).unwrap_err().to_string();
         assert!(err.contains("unknown key `sourcs`"), "{err}");
-    }
-
-    /// A config that declares no inputs has nothing to suggest, so the
-    /// warning carries no dangling "did you mean" with nothing after it.
-    #[test]
-    fn undeclared_param_warning_with_no_declared_inputs_has_no_did_you_mean_suffix() {
-        let cfg = MissionConfig {
-            id: "review".to_string(),
-            name: "Review".to_string(),
-            description: None,
-            schema_version: None,
-            inputs: Vec::new(),
-            phases: Vec::new(),
-            cmd: None,
-            outcome_from: None,
-            source_input: None,
-            ticket: None,
-            extras: BTreeMap::new(),
-        };
-
-        let warn = undeclared_param_warning("review", "zzz_totally_unrelated", &cfg);
-        assert!(!warn.contains("did you mean"), "{warn}");
     }
 
     // ── coder-phase wiring — registration only, never a live dispatch ──
@@ -10561,3 +10594,8 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "mission_launch_input_tests.rs"]
+mod input_tests;
+
