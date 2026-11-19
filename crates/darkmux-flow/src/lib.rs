@@ -6690,6 +6690,7 @@ mod tests {
     #[test]
     fn a_day_file_cut_to_zero_bytes_is_a_chain_restart() {
         let (_t, path) = torn_chain(3);
+        after_a_timestamp_tick();
         std::fs::File::create(&path).unwrap();
         let before = integrity_check_file(&path).unwrap();
         assert!(before.chain_valid && before.chain_restarted, "an emptied file says so before any write: {before:?}");
@@ -6700,6 +6701,18 @@ mod tests {
         assert_eq!(report.records_checked, 1);
         assert!(report.chain_restarted, "the reseed over an emptied file says so: {report:?}");
         assert_eq!(crate::integrity::integrity_exit_code(&[report], &[]), 3);
+
+        after_a_timestamp_tick();
+        std::fs::File::create(&path).unwrap();
+        assert!(integrity_check_file(&path).unwrap().chain_restarted, "emptied again, beside the first restart's sidecar");
+    }
+
+    /// Let the file-timestamp clock move on. Linux stamps files from a coarse
+    /// clock (one scheduler tick, at most 10 ms), so a file created and
+    /// emptied within one tick reads as just created. A real emptied day file
+    /// was emptied long after it was born; the fixture has to be too.
+    fn after_a_timestamp_tick() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     /// A day file cut to whitespace is a restart too.
@@ -6791,6 +6804,7 @@ mod tests {
         let write = |day: &str, lines: &[&str]| std::fs::write(flows.path().join(format!("{day}.jsonl")), lines.join("\n")).unwrap();
         write("2026-11-09", &[crumb]);
         write("2026-11-12", &[crumb, mention, "not json", crumb]);
+        write("2026-11-14", &[mention]);
         write("2026-11-17", &[crumb]);
         std::fs::write(flows.path().join("notes.jsonl"), crumb).unwrap();
 
@@ -6802,9 +6816,40 @@ mod tests {
         assert_eq!(
             spanned.iter().map(|d| (d.day.as_str(), d.count)).collect::<Vec<_>>(),
             vec![("2026-11-12", 2), ("2026-11-17", 1)],
-            "from the oldest audit day on, a day with no audit file of its own included"
+            "from the oldest audit day on, a day with no audit file of its own included, a day with none left out"
         );
         assert_eq!(spanned[0].path, flows.path().join("2026-11-12.jsonl").display().to_string());
+
+        std::fs::write(audit.path().join("2026-11-30.jsonl"), "").unwrap();
+        std::fs::remove_file(audit.path().join("2026-11-10.jsonl")).unwrap();
+        let future = crate::integrity::dropped_audit_writes_in(flows.path(), audit.path(), "2026-11-17");
+        assert_eq!(future.iter().map(|d| d.day.as_str()).collect::<Vec<_>>(), vec!["2026-11-17"], "an audit file dated later still covers today");
+    }
+
+    /// The process-wide reading uses the flows and audit dirs this process
+    /// resolves (`DARKMUX_FLOWS_DIR`, `DARKMUX_AUDIT_DIR`) and today's date.
+    #[serial_test::serial]
+    #[test]
+    fn dropped_audit_writes_reads_this_processs_dirs() {
+        let flows = tempfile::tempdir().unwrap();
+        let audit = tempfile::tempdir().unwrap();
+        let crumb = r#"{"ts":"t","action":"audit.write_failed","category":"audit","level":"error"}"#;
+        std::fs::write(flows.path().join(format!("{}.jsonl", day_utc_now())), crumb).unwrap();
+        let prev: Vec<(&str, Option<String>)> = ["DARKMUX_FLOWS_DIR", "DARKMUX_AUDIT_DIR"].iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        unsafe {
+            std::env::set_var("DARKMUX_FLOWS_DIR", flows.path());
+            std::env::set_var("DARKMUX_AUDIT_DIR", audit.path());
+        }
+        let dropped = crate::integrity::dropped_audit_writes();
+        unsafe {
+            for (k, v) in prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        assert_eq!(dropped.iter().map(|d| (d.day.clone(), d.count)).collect::<Vec<_>>(), vec![(day_utc_now(), 1)]);
     }
 
     /// The write side of the same refusal: the audit sink will not extend a

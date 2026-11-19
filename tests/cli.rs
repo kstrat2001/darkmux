@@ -7471,11 +7471,19 @@ fn integrity_check_exits_3_for_an_emptied_day_file_and_for_a_dropped_write() {
     };
     let emptied = audit.path().join("2026-01-02.jsonl");
     fs::write(&emptied, "x").unwrap();
+    // Emptied after it was born, as a real cut file is: Linux stamps files
+    // from a coarse clock (one tick, at most 10 ms), and a file created and
+    // emptied within one tick reads as just created.
+    std::thread::sleep(std::time::Duration::from_millis(50));
     fs::File::create(&emptied).unwrap();
     let out = check(&[]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(3), "{stdout}");
     assert!(stdout.contains("chain restarted"), "{stdout}");
+    assert_eq!(check(&["--path", emptied.to_str().unwrap()]).status.code(), Some(3), "one file, walked alone");
+    let fresh = audit.path().join("2026-01-03.jsonl");
+    fs::File::create(&fresh).unwrap();
+    assert_eq!(check(&["--path", fresh.to_str().unwrap()]).status.code(), Some(0), "another file's restart is not this one's");
 
     fs::remove_file(&emptied).unwrap();
     assert_eq!(check(&[]).status.code(), Some(0), "an empty audit dir with no breadcrumbs is clean");
@@ -7494,6 +7502,8 @@ fn integrity_check_exits_3_for_an_emptied_day_file_and_for_a_dropped_write() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["dropped_writes"][0]["day"], "2026-01-02", "{v}");
     assert_eq!(v["dropped_writes"][0]["count"], 1, "{v}");
+    let one_day = audit.path().join("2026-01-01.jsonl");
+    assert_eq!(check(&["--path", one_day.to_str().unwrap()]).status.code(), Some(0), "another day's drop is not this file's");
 }
 
 /// Through the real binary: a flows dir that cannot be written is said on

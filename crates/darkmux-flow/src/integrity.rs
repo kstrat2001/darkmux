@@ -419,6 +419,17 @@ fn holds_only_whitespace(bytes: &[u8]) -> bool {
     !bytes.is_empty() && bytes.iter().all(u8::is_ascii_whitespace)
 }
 
+/// Whether a day file the walk read no line from was cut, judged again under
+/// a shared lock on it, so no darkmux writer is partway through a write: on
+/// Linux a write moves the modification time before the size grows, and a
+/// stat taken in between reads exactly like an emptied file.
+fn lineless_file_is_cut(path: &Path) -> bool {
+    #[cfg(unix)]
+    let Ok(Some(_shared)) = darkmux_types::flock::lock_shared_existing(path) else { return false };
+    let stat = fs::metadata(path).ok();
+    fs::read(path).is_ok_and(|contents| lineless_file_was_cut(stat.as_ref(), &contents))
+}
+
 /// Whether a day file holding no line (its `contents`) was cut rather than
 /// just created: whitespace only, or emptied after its creation. `stat` is
 /// the file's metadata taken BEFORE `contents` was read, and its size must
@@ -631,8 +642,6 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
 }
 
 fn walk_chain(path: &Path) -> Result<IntegrityReport> {
-    // Taken before the read, for `lineless_file_was_cut`.
-    let stat = fs::metadata(path).ok();
     let contents = fs::read_to_string(path)
         .with_context(|| format!("reading audit log {}", path.display()))?;
     let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -646,7 +655,7 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
             break_reason: None,
             writer_schema_version: None,
             torn_tails: Vec::new(),
-            chain_restarted: lineless_file_was_cut(stat.as_ref(), contents.as_bytes()),
+            chain_restarted: lineless_file_is_cut(path),
         });
     }
 
@@ -844,7 +853,7 @@ pub struct DroppedAuditWrites {
 /// covers that day; archiving the audit files through that day retires it.
 pub fn dropped_audit_writes_in(flows_dir: &Path, audit_dir: &Path, today: &str) -> Vec<DroppedAuditWrites> {
     let oldest_audit_day = crate::reader::day_files(audit_dir).into_iter().next().map(|(day, _)| day);
-    let since = oldest_audit_day.filter(|day| day.as_str() < today).unwrap_or_else(|| today.to_string());
+    let since = oldest_audit_day.map_or_else(|| today.to_string(), |day| day.min(today.to_string()));
     crate::reader::day_files(flows_dir)
         .into_iter()
         .filter(|(day, _)| *day >= since)
