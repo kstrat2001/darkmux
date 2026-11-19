@@ -1149,8 +1149,9 @@ fn complete_config(path: &Path, dry_run: bool) -> Result<Vec<String>> {
 
 /// The keys completion never adds, because darkmux reads their absence
 /// differently from the value `init` writes on a fresh machine. Every other
-/// key `with_defaults` writes resolves the same absent or present (each
-/// accessor compared under an empty config and under `with_defaults`).
+/// key resolves the same absent or present: `init_completion_tests` reads
+/// every `config_access` accessor and enum setting with each key removed and
+/// fails on a new one that differs, and on an entry here that no longer does.
 /// - `machine_id`: absent, the machine is named by `hostname(1)`
 ///   (`resolve_machine_id`); the seeded computer name differs from it, so
 ///   adding one would rename an established machine on the fleet (roster
@@ -2158,3 +2159,7 @@ mod tests {
 #[cfg(test)]
 #[path = "init_tests.rs"]
 mod init_tests;
+
+#[cfg(test)]
+#[path = "init_completion_tests.rs"]
+mod init_completion_tests;
