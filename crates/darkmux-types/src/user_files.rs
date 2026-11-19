@@ -46,8 +46,11 @@
 //! A forward-compat `extras` overflow is marked `#[schemars(skip)]`: it
 //! catches unknown keys so a load survives them, it does not make them
 //! valid. A flattened map that IS the schema (a hook rule's `match`, whose
-//! extra keys are payload fields) keeps its `additionalProperties`, and
-//! `open_objects_are_declared` pins that set. [`COMMENT_KEY`] (`_comment`)
+//! extra keys are payload predicates) keeps its `additionalProperties`, and
+//! `open_objects_are_declared` pins that set. What the schema cannot say, that
+//! an extra `match` key must be a `payload.<path>` predicate, is checked
+//! beside it (`hook_match_issues`), so a typo there is refused too.
+//! [`COMMENT_KEY`] (`_comment`)
 //! is valid in every struct-shaped object, as a note for the reader.
 //!
 //! **One suggester.** [`closest`] is the only "did you mean" in darkmux: this
@@ -1492,11 +1495,43 @@ fn value_at<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
     path.split('.').try_fold(doc, |v, key| v.get(key))
 }
 
+/// Every key of a hook rule's `match` that
+/// [`crate::config::HookMatch::is_match_key`] refuses. The schema keeps
+/// `match` open for the predicates, so it cannot say this; the typed load
+/// drops such a key, and the rule then matches more than it says (a
+/// misspelled `level` matches every level).
+fn hook_match_issues(doc: &Value) -> Vec<KeyIssue> {
+    use crate::config::HookMatch;
+    let named = HookMatch::field_names();
+    let rules = doc.pointer("/hooks/rules").and_then(Value::as_array).into_iter().flatten();
+    let matches = rules.enumerate().filter_map(|(i, rule)| Some((format!("hooks.rules[{i}].match"), rule.get("match")?.as_object()?)));
+    let mut out = Vec::new();
+    for (parent, m) in matches {
+        let unknown = m.keys().filter(|k| !HookMatch::is_match_key(k, &named));
+        out.extend(unknown.map(|k| unknown_hook_match_key(&parent, k, &named)));
+    }
+    out
+}
+
+/// The refusal of `key` in the `match` at `parent`: the closest named field,
+/// or for a dotted key the payload predicate it may have meant
+/// (`paylod.ok` is `payload.ok`).
+fn unknown_hook_match_key(parent: &str, key: &str, named: &[String]) -> KeyIssue {
+    use crate::config::PAYLOAD_PREDICATE_PREFIX;
+    let path = key.split_once('.').map(|(_, path)| path).filter(|path| !path.is_empty());
+    let predicate = path.map(|path| format!("{PAYLOAD_PREDICATE_PREFIX}{path}"));
+    let candidates = named.iter().map(String::as_str).chain(predicate.as_deref());
+    let closest = closest(key, candidates).map(|c| join_display(parent, c));
+    let valid = named.iter().cloned().chain([format!("{PAYLOAD_PREDICATE_PREFIX}<field>")]).collect();
+    KeyIssue { path: join_display(parent, key), issue: Issue::Unknown { closest, valid } }
+}
+
 /// [`check_text`] of a `config.json`, with every retired key at a harmless
 /// value ([`crate::config::leftover_is_harmless`]) moved from the refusal to
 /// the warnings.
 pub fn config_check_text(path: &Path, text: &str) -> ConfigCheck {
-    let Some(mut found) = check_text::<crate::config::DarkmuxConfig>(UserFileKind::Config, path, text, &config_retired) else {
+    let checked = check_text_and::<crate::config::DarkmuxConfig>(UserFileKind::Config, path, text, &config_retired, &hook_match_issues);
+    let Some(mut found) = checked else {
         return ConfigCheck::default();
     };
     let mut warnings = Vec::new();

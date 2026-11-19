@@ -285,7 +285,7 @@ fn run_on(
         check_relative_home(),
         check_mission_envelope_readability(),
     ]);
-    let checks = [checks, check_enum_settings(), check_user_file_keys(), check_hooks(), eureka_checks()].concat();
+    let checks = [checks, check_enum_settings(), check_numeric_env(), check_user_file_keys(), check_hooks(), eureka_checks()].concat();
     DoctorReport { checks }
 }
 
@@ -2476,6 +2476,31 @@ pub fn check_enum_settings() -> Vec<Check> {
     rows
 }
 
+/// One Fail row per numeric env var set to a value that does not read
+/// (`darkmux_types::numeric_env`), with the line every preflight refuses
+/// with; no row otherwise. The accessor reads such a var as unset, so this,
+/// the preflight and the warning every other command prints are where it
+/// surfaces. Names the value's kind, never the value.
+pub fn check_numeric_env() -> Vec<Check> {
+    numeric_env_rows(&darkmux_types::numeric_env::bad_values())
+}
+
+/// The rows for `bad` ([`check_numeric_env`]).
+fn numeric_env_rows(bad: &[darkmux_types::config_enum::InvalidSetting]) -> Vec<Check> {
+    bad.iter()
+        .map(|b| Check {
+            name: b.set_in.to_string(),
+            status: Status::Fail,
+            message: format!(
+                "{}. Every command that starts work refuses to start over it; any other command reads it as \
+                 unset and warns on stderr",
+                b.problem
+            ),
+            hint: Some(format!("valid: {}", b.valid)),
+        })
+        .collect()
+}
+
 /// The Pass row for an enum setting with no bad value.
 fn enum_setting_pass_row(s: &darkmux_types::config_enum::EnumSetting) -> Check {
     if s.is_per_item() {
@@ -3071,25 +3096,8 @@ fn check_turn_delay() -> Check {
     };
     let ms = darkmux_types::config_access::turn_delay_ms();
     let timeout_ms = darkmux_types::config_access::inactivity_timeout_seconds().saturating_mul(1000);
-    // An env var IS set but did not parse as an integer — this is a
-    // config mistake, not silence, and it must say so rather than quietly
-    // reporting whatever lower tier resolved instead.
-    if let Some(raw) = env_raw.as_deref() {
-        if !env_parses {
-            return Check {
-                name: name.into(),
-                status: Status::Warn,
-                message: format!(
-                    "DARKMUX_TURN_DELAY_MS=`{raw}` is not an integer; using {ms}ms ({provenance})"
-                ),
-                hint: Some(
-                    "Set DARKMUX_TURN_DELAY_MS to a plain integer number of milliseconds \
-                     (e.g. `3000`), or unset it to fall through to config.json / the default."
-                        .into(),
-                ),
-            };
-        }
-    }
+    // An env var set but unparseable is `check_numeric_env`'s one Fail row
+    // (it never quotes the value); this row reports what resolved.
     if ms == 0 {
         return Check {
             name: name.into(),
@@ -3225,23 +3233,7 @@ fn check_host_sampler_interval() -> Check {
         "default"
     };
     let ms = darkmux_types::config_access::host_sampler_interval_ms();
-    if let Some(raw) = env_raw.as_deref() {
-        if !env_parses {
-            return Check {
-                name: name.into(),
-                status: Status::Warn,
-                message: format!(
-                    "DARKMUX_HOST_SAMPLER_INTERVAL_MS=`{raw}` is not an integer; using {ms}ms ({provenance})"
-                ),
-                hint: Some(
-                    "Set DARKMUX_HOST_SAMPLER_INTERVAL_MS to a plain integer number of \
-                     milliseconds (e.g. `5000`), or unset it to fall through to config.json / \
-                     the default."
-                        .into(),
-                ),
-            };
-        }
-    }
+    // An env var set but unparseable is `check_numeric_env`'s Fail row.
     if ms == 0 {
         return Check {
             name: name.into(),
@@ -3467,24 +3459,7 @@ fn check_generation_checkpoint_interval() -> Check {
     const CONSERVATIVE_TOKENS_PER_SECOND: f64 = 10.0;
     let tokens = darkmux_types::config_access::generation_checkpoint_interval_tokens()
         .unwrap_or(RUNTIME_BUILTIN_DEFAULT);
-    if let Some(raw) = env_raw.as_deref() {
-        if !env_parses {
-            return Check {
-                name: name.into(),
-                status: Status::Warn,
-                message: format!(
-                    "DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL=`{raw}` is not a positive \
-                     integer; using {tokens} ({provenance})"
-                ),
-                hint: Some(
-                    "Set DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL to a positive integer \
-                     token count (e.g. `4000`), or unset it to fall through to config.json / \
-                     the default."
-                        .into(),
-                ),
-            };
-        }
-    }
+    // An env var set but unparseable is `check_numeric_env`'s Fail row.
     if tokens == 0 {
         return Check {
             name: name.into(),
@@ -9146,40 +9121,30 @@ mod tests {
         }
     }
 
-    /// (#2094 finding 9) An env var set to garbage must not be silently
-    /// reported as `"from ... env"` — `config_access::turn_delay_ms()`
-    /// falls through to a lower tier on a parse failure, and provenance
-    /// claiming "env" while the resolved value came from config/default
-    /// is a doctor surface actively lying about where a number came from.
+    /// (#2094 finding 9) An env var set to garbage must not be reported as
+    /// `"from ... env"`: the accessor falls through to a lower tier. The
+    /// unparseable value is reported once, by the numeric-env Fail row
+    /// (`check_numeric_env`), which never quotes it; each knob's own row shows
+    /// the value that resolved, from the tier that resolved it, and does not
+    /// quote the value either.
     #[serial_test::serial]
     #[test]
-    fn check_turn_delay_unparseable_env_warns_and_names_the_raw_value() {
-        let prev_d = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_TURN_DELAY_MS", "3s");
-        }
-        let check = check_turn_delay();
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(
-            check.message.contains("DARKMUX_TURN_DELAY_MS") && check.message.contains("3s"),
-            "must name the raw unparseable value: {}",
-            check.message
-        );
-        assert!(
-            check.message.contains("not an integer"),
-            "must say WHY it's rejected, not just show a resolved number: {}",
-            check.message
-        );
-        assert!(
-            !check.message.contains("from DARKMUX_TURN_DELAY_MS env"),
-            "must NOT claim provenance is env when the env value didn't parse: {}",
-            check.message
-        );
-        unsafe {
-            match prev_d {
-                Some(v) => std::env::set_var("DARKMUX_TURN_DELAY_MS", v),
-                None => std::env::remove_var("DARKMUX_TURN_DELAY_MS"),
-            }
+    fn an_unparseable_knob_env_var_gets_one_fail_row_and_its_value_is_never_quoted() {
+        type Case = (&'static str, &'static str, fn() -> Check);
+        let cases: [Case; 3] = [
+            ("DARKMUX_TURN_DELAY_MS", "3s", check_turn_delay),
+            ("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "5s", check_host_sampler_interval),
+            ("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL", "4k", check_generation_checkpoint_interval),
+        ];
+        for (var, garbage, check) in cases {
+            let _bad = EnvGuard::set(var, garbage);
+            let row = check();
+            assert_eq!(row.status, Status::Pass, "{var}: the knob row reports the resolved value: {}", row.message);
+            assert!(!row.message.contains(garbage), "{var}: never the value: {}", row.message);
+            assert!(!row.message.contains(&format!("from {var} env")), "{var}: not env provenance: {}", row.message);
+            let fails: Vec<Check> = check_numeric_env().into_iter().filter(|c| c.name.contains(var)).collect();
+            assert_eq!(fails.len(), 1, "{var}: one Fail row: {fails:?}");
+            assert_eq!(fails[0].status, Status::Fail);
         }
     }
 
@@ -10829,34 +10794,6 @@ mod tests {
         }
     }
 
-    /// Mirrors `check_turn_delay_unparseable_env_warns_and_names_the_raw_value`
-    /// — a set-but-garbage env var must not be silently reported as "from
-    /// ... env" while the resolved value actually came from a lower tier.
-    #[serial_test::serial]
-    #[test]
-    fn check_host_sampler_interval_unparseable_env_warns_and_names_the_raw_value() {
-        let prev = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
-        unsafe { std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "5s") };
-        let check = check_host_sampler_interval();
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(
-            check.message.contains("DARKMUX_HOST_SAMPLER_INTERVAL_MS") && check.message.contains("5s"),
-            "must name the raw unparseable value: {}",
-            check.message
-        );
-        assert!(
-            !check.message.contains("from DARKMUX_HOST_SAMPLER_INTERVAL_MS env"),
-            "must NOT claim provenance is env when the env value didn't parse: {}",
-            check.message
-        );
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
-                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
-            }
-        }
-    }
-
     // ─── (#1769) summarize_audit_reports — Fail / Warn / Pass split ────────
     //
     // Pure-function tests: no filesystem, no `DARKMUX_AUDIT_DIR`. Each test
@@ -11397,6 +11334,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A numeric env var set to a value that does not read (the accessor
+    /// reads it as unset: `50k` meant no token cap) is a Fail row in the
+    /// whole doctor, naming the variable, the value's kind and the accepted
+    /// form, never the value.
+    #[test]
+    #[serial_test::serial]
+    fn the_whole_doctor_fails_a_numeric_env_var_that_does_not_read() {
+        use darkmux_sandbox::BackendKind;
+        let _bad = EnvGuard::set("DARKMUX_RUNTIME_MAX_TOKENS", "50k");
+        let r = with_isolated_darkmux_home(|| run_with((Ok(BackendKind::Seatbelt), darkmux_types::config_access::Source::Config)));
+        let row = r.checks.iter().find(|c| c.name == "env var DARKMUX_RUNTIME_MAX_TOKENS").expect("a row for the var");
+        assert_eq!(row.status, Status::Fail, "{}", row.message);
+        assert!(row.message.contains("set to text that is not an integer from 0 to 4294967295"), "{}", row.message);
+        assert!(row.message.contains("Every command that starts work refuses"), "{}", row.message);
+        assert!(row.message.contains("any other command reads it as unset and warns"), "{}", row.message);
+        assert!(row.hint.as_deref().is_some_and(|h| h.contains("unset DARKMUX_RUNTIME_MAX_TOKENS")), "{:?}", row.hint);
+        assert!(!format!("{} {:?}", row.message, row.hint).contains("50k"), "never the value");
+        drop(_bad);
+        assert!(check_numeric_env().is_empty(), "no row when every var reads");
     }
 
     /// (#2774 round-8 MF1, first half) `max_pause_ms = 0` means an

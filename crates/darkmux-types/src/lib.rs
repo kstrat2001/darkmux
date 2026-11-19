@@ -34,6 +34,7 @@ pub mod panel_audience;
 pub mod paths;
 pub mod profile_address;
 pub mod memory_pressure;
+pub mod numeric_env;
 pub mod residency_lease;
 pub mod residency_lock;
 pub mod residency_reservation;

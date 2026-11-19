@@ -223,7 +223,8 @@ fn pick_string(env_key: &str, cfg: Option<&str>, default: Option<&str>) -> Optio
 }
 
 /// Precedence for a parseable (numeric) setting. A set-but-unparseable env
-/// var falls through (matching today's `.parse().ok()` sites).
+/// var falls through here; every preflight refuses it and doctor fails it
+/// (`crate::numeric_env`, which lists every var read through this).
 fn pick_parsed<T: FromStr + Copy>(env_key: &str, cfg: Option<T>, default: Option<T>) -> Option<T> {
     env_str(env_key)
         .and_then(|s| s.parse::<T>().ok())

@@ -14588,6 +14588,40 @@ fn darkmux_home_of(cmd: &std::process::Command) -> std::path::PathBuf {
         .expect("the spawn helper sets DARKMUX_HOME")
 }
 
+/// A command that runs no preflight (a read such as `mission status`, or
+/// `darkmux acp`'s idle timer) reads a numeric env var that does not parse
+/// as unset. It still starts, but says so on stderr, naming the variable
+/// and the accepted form and never the value, as it does for a bad
+/// `config.json`; a command that starts work refuses instead.
+#[test]
+fn a_command_with_no_preflight_warns_about_an_unreadable_numeric_env_var() {
+    let out = darkmux_cmd().env("DARKMUX_MISSION_STALE_ACTIVE_DAYS", "2w").args(["mission", "status"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "a read still runs: {stderr}");
+    assert!(
+        stderr.contains("warning: env var DARKMUX_MISSION_STALE_ACTIVE_DAYS: set to text that is not a non-negative integer"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("a command that starts work refuses"), "{stderr}");
+    assert!(!stderr.contains("2w"), "never the value: {stderr}");
+    let clean = darkmux_cmd().args(["mission", "status"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&clean.stderr).contains("env var DARKMUX_"), "no warning when every var reads");
+}
+
+/// On a command that starts work the same warning precedes the refusal, so
+/// it must not claim the var is read as unset there: it says what each kind
+/// of command does, and the refusal follows. Never the value.
+#[test]
+fn a_command_that_starts_work_refuses_and_its_warning_agrees() {
+    let out = darkmux_cmd().env("DARKMUX_RUNTIME_MAX_TOKENS", "secret50k").args(["dispatch", "coder", "hi"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "refused: {stderr}");
+    assert!(stderr.contains("refusing to start"), "{stderr}");
+    assert!(stderr.contains("warning: env var DARKMUX_RUNTIME_MAX_TOKENS"), "{stderr}");
+    assert!(!stderr.contains("read as unset here"), "the warning must not contradict the refusal: {stderr}");
+    assert!(!stderr.contains("secret50k"), "never the value: {stderr}");
+}
+
 /// (4.0) A user file with a key its schema does not know is refused at
 /// preflight by every CLI entry point that consumes it, naming the file,
 /// the key and the closest valid key, before anything is minted. `PATH` is
