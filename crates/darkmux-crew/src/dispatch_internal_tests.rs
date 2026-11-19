@@ -2354,11 +2354,11 @@
         let prev = std::env::var("DARKMUX_TEST_3207_UTIL_KEY").ok();
         unsafe { std::env::set_var("DARKMUX_TEST_3207_UTIL_KEY", "util-secret") };
         let mut on = crate::dispatch::CompactionDispatchArgs { compactor_model: Some("mlx-util".into()), ..Default::default() };
-        let header = prepare_unmanaged_compactor(&mut on, &utility);
+        let header = prepare_unmanaged_compactor(&mut on, &utility, darkmux_sandbox::BackendKind::Docker);
         let mut no_window = utility.clone();
         no_window.n_ctx = None;
         let mut off = crate::dispatch::CompactionDispatchArgs { compactor_model: Some("mlx-util".into()), ..Default::default() };
-        let refused = prepare_unmanaged_compactor(&mut off, &no_window);
+        let refused = prepare_unmanaged_compactor(&mut off, &no_window, darkmux_sandbox::BackendKind::Docker);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_TEST_3207_UTIL_KEY", v),
@@ -4196,12 +4196,12 @@ S(("127.0.0.1", port), H).serve_forever()
         }
         assert!(matches!(own, crate::engine_dispatch::OwnRoute::Reuse(_)), "{own:?}");
         let brain = theirs.agentic_pm.as_ref().unwrap();
-        let (chat_url, _) = agentic_brain_flags(Some(brain));
+        let (chat_url, _) = agentic_brain_flags(Some(brain), darkmux_sandbox::BackendKind::Docker);
         assert!(chat_url.as_deref().is_some_and(|u| u.contains(":11500/v1/chat/completions")), "{chat_url:?}");
         assert!(brain.route_label().unwrap().contains("127.0.0.1:11500"), "{:?}", brain.route_label());
         assert_eq!(auth, Some(("Authorization".to_string(), "Bearer placeholder-key-for-tests".to_string())), "rec's key is handed on");
         assert!(matches!(mine_own, crate::engine_dispatch::OwnRoute::Free), "{mine_own:?}");
-        let (chat_url, _) = agentic_brain_flags(mine.agentic_pm.as_ref());
+        let (chat_url, _) = agentic_brain_flags(mine.agentic_pm.as_ref(), darkmux_sandbox::BackendKind::Docker);
         assert!(chat_url.as_deref().is_some_and(|u| u.contains(":8092/v1/chat/completions")), "{chat_url:?}");
         assert_eq!(mine_auth, None, "darkmux's own server takes no key");
     }
@@ -7112,6 +7112,7 @@ S(("127.0.0.1", port), H).serve_forever()
             image: "i".into(),
             run_image: "host".into(),
             host_runtime: Some(host),
+            kind: darkmux_sandbox::BackendKind::Seatbelt,
         };
         assert!(runtime_program(&image).is_ok(), "unchanged, the command is built");
         let staged = root.path().join("bin/.darkmux.new");
@@ -7171,6 +7172,7 @@ S(("127.0.0.1", port), H).serve_forever()
             darkmux_image: crate::runtime_image::ResolvedImage { reference: "r".into(), id: "r".into() },
             image: "i".into(),
             run_image: "i".into(),
+            kind: if host_runtime.is_some() { darkmux_sandbox::BackendKind::Seatbelt } else { darkmux_sandbox::BackendKind::Docker },
             host_runtime,
         };
         let host = HostRuntime { program: PathBuf::from("/real/darkmux"), leading_args: vec!["runtime".to_string()], started_as: None };
@@ -7240,6 +7242,67 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(url_for(url, BackendKind::Seatbelt), url);
         assert_eq!(url_for(url, BackendKind::Landlock), url);
         assert_eq!(url_for(url, BackendKind::Docker), "http://host.docker.internal:1234/v1");
+    }
+
+    /// Every model URL a dispatch hands its sandbox (the LM Studio base URL,
+    /// a hosted brain's chat URL, an unmanaged compactor's chat URL) is
+    /// written for the backend the dispatch resolved and launches, never for
+    /// `runtime.sandbox` read again: here the setting says `docker` while the
+    /// dispatch runs on the host, so loopback stays loopback.
+    #[test]
+    #[serial]
+    fn sandbox_urls_follow_the_resolved_backend_not_the_setting() {
+        use darkmux_sandbox::BackendKind;
+        let _state = darkmux_types::test_isolation::IsolatedState::new();
+        let keys = [darkmux_sandbox::SANDBOX_ENV, "DARKMUX_LMSTUDIO_URL"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: #[serial]; restored below.
+        unsafe {
+            std::env::set_var(darkmux_sandbox::SANDBOX_ENV, "docker");
+            std::env::set_var("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:1234");
+        }
+        let base = container_lmstudio_base_url(None, BackendKind::Seatbelt);
+        let pm = darkmux_types::ProfileModel::hosted_for_test("m", None, serde_json::json!({ "url": "http://127.0.0.1:8080/v1" }));
+        let brain = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        let (chat_url, _) = agentic_brain_flags(Some(&brain), BackendKind::Seatbelt);
+        let mut reg: darkmux_types::ProfileRegistry = serde_json::from_str(
+            r#"{"profiles":{},"endpoints":{"mlx":{"url":"http://127.0.0.1:8081/v1"}},
+                "internal":{"utility":{"id":"mlx-util","n_ctx":16384,"endpoint":"mlx"}}}"#,
+        )
+        .unwrap();
+        reg.materialize_endpoints();
+        let utility = crate::target::utility_target_in(&reg).unwrap().unwrap();
+        let mut compaction = crate::dispatch::CompactionDispatchArgs { compactor_model: Some("mlx-util".into()), ..Default::default() };
+        prepare_unmanaged_compactor(&mut compaction, &utility, BackendKind::Seatbelt).unwrap();
+        unsafe {
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        assert_eq!(base.as_deref(), Some("http://127.0.0.1:1234/v1"));
+        assert_eq!(chat_url.as_deref(), Some("http://127.0.0.1:8080/v1/chat/completions"));
+        assert_eq!(compaction.compactor_chat_url.as_deref(), Some("http://127.0.0.1:8081/v1/chat/completions"));
+    }
+
+    /// The launch path reads the backend once: from the resolved image, for
+    /// the spawn and for every URL, never from the setting again (a model
+    /// load can sit between the resolution and the launch).
+    #[test]
+    fn the_launch_path_never_reads_the_sandbox_setting_again() {
+        let src = include_str!("dispatch_internal.rs");
+        let body = |name: &str| {
+            let start = src.find(&format!("\nfn {name}(")).unwrap_or_else(|| panic!("fn {name} not found"));
+            let end = src[start + 1..].find("\n}\n").map(|i| start + 1 + i).unwrap();
+            &src[start..end]
+        };
+        for name in ["launch_container", "prepare_compactor", "container_run_config", "spawn_container", "prepare_unmanaged_compactor"] {
+            let b = body(name);
+            assert!(!b.contains("darkmux_sandbox::selected(") && !b.contains("darkmux_sandbox::backend("), "{name} re-reads the sandbox setting");
+        }
+        assert!(src.contains("spawn_container(&argv_config, run_backend(&run.image), opts.max_turns_override)?"));
     }
 
     /// (#2916 review M2) A job another machine submitted never mounts this
@@ -7332,7 +7395,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let prev = std::env::var_os("DARKMUX_LMSTUDIO_URL");
         // SAFETY: caller holds #[serial]; restored below.
         unsafe { std::env::set_var("DARKMUX_LMSTUDIO_URL", configured) };
-        let resolved = container_lmstudio_base_url(override_url);
+        let resolved = container_lmstudio_base_url(override_url, darkmux_sandbox::BackendKind::Docker);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_LMSTUDIO_URL", v),
@@ -7364,7 +7427,7 @@ S(("127.0.0.1", port), H).serve_forever()
         };
         let resolved = {
             let _guard = darkmux_types::config_access::set_config_for_test(cfg);
-            container_lmstudio_base_url(None)
+            container_lmstudio_base_url(None, darkmux_sandbox::BackendKind::Docker)
         };
         if let Some(v) = prev {
             unsafe { std::env::set_var("DARKMUX_LMSTUDIO_URL", v) };
@@ -9169,12 +9232,12 @@ S(("127.0.0.1", port), H).serve_forever()
             serde_json::json!({ "url": "https://h.example/v1", "dialect": "chat-completions-max-tokens" }),
         );
         let t = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
-        let (url, dialect) = super::agentic_brain_flags(Some(&t));
+        let (url, dialect) = super::agentic_brain_flags(Some(&t), darkmux_sandbox::BackendKind::Docker);
         assert_eq!(url.as_deref(), Some("https://h.example/v1/chat/completions"));
         assert_eq!(dialect, Some(darkmux_types::Dialect::ChatCompletionsMaxTokens));
-        assert_eq!(super::agentic_brain_flags(None), (None, None));
+        assert_eq!(super::agentic_brain_flags(None, darkmux_sandbox::BackendKind::Docker), (None, None));
         let mut config = base_argv_config();
-        (config.remote_chat_url, config.dialect) = super::agentic_brain_flags(Some(&t));
+        (config.remote_chat_url, config.dialect) = super::agentic_brain_flags(Some(&t), darkmux_sandbox::BackendKind::Docker);
         let argv = build_docker_run_argv(&config);
         assert!(argv.windows(2).any(|w| w[0] == "--dialect" && w[1] == "chat-completions-max-tokens"), "{argv:?}");
     }
@@ -9438,7 +9501,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let url_for = |endpoint: &str| {
             let pm = darkmux_types::ProfileModel::hosted_for_test("m", None, serde_json::json!({ "url": endpoint }));
             let t = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
-            super::agentic_brain_flags(Some(&t)).0.unwrap()
+            super::agentic_brain_flags(Some(&t), darkmux_sandbox::BackendKind::Docker).0.unwrap()
         };
         assert_eq!(url_for("http://127.0.0.1:8080/v1"), "http://host.docker.internal:8080/v1/chat/completions");
         assert_eq!(url_for("http://localhost:8080/v1"), "http://host.docker.internal:8080/v1/chat/completions");

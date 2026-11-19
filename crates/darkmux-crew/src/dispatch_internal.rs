@@ -3174,7 +3174,10 @@ fn runtime_endpoint_and_shape_args(config: &DockerRunConfig) -> Vec<String> {
 /// Before #2904 the flag was emitted only for the override, so an operator
 /// on a non-default port had it honored by single-shot calls but not by
 /// agentic dispatches, which kept dialing the runtime's `:1234` default.
-pub(crate) fn container_lmstudio_base_url(override_url: Option<&str>) -> Option<String> {
+pub(crate) fn container_lmstudio_base_url(
+    override_url: Option<&str>,
+    kind: darkmux_sandbox::BackendKind,
+) -> Option<String> {
     if let Some(url) = override_url {
         return Some(url.to_string());
     }
@@ -3188,7 +3191,7 @@ pub(crate) fn container_lmstudio_base_url(override_url: Option<&str>) -> Option<
         return None;
     }
     let base = darkmux_types::endpoint::lmstudio_v1_base(&configured);
-    Some(url_for_sandbox(&base))
+    Some(url_for(&base, kind))
 }
 
 /// (#2902) The `--dialect` the container gets for a target: only a declared
@@ -3210,26 +3213,19 @@ pub(crate) fn container_dialect_flag(t: &crate::target::Target) -> Option<darkmu
 /// recorded address stays the one the operator wrote.
 pub(crate) fn agentic_brain_flags(
     agentic: Option<&crate::target::Target>,
+    kind: darkmux_sandbox::BackendKind,
 ) -> (Option<String>, Option<darkmux_types::Dialect>) {
     match agentic {
-        Some(t) => (Some(url_for_sandbox(&t.chat_url)), container_dialect_flag(t)),
+        Some(t) => (Some(url_for(&t.chat_url, kind)), container_dialect_flag(t)),
         None => (None, None),
     }
 }
 
-/// (#3112 step 2) `url` as the sandbox dials it: unchanged under a backend
-/// whose sandbox shares this host's loopback (Seatbelt and Landlock run on
-/// the host itself), else [`loopback_to_docker_host`].
-fn url_for_sandbox(url: &str) -> String {
-    // A refused selection refuses the dispatch before any sandbox starts
-    // (`resolve_runtime_image`), so this URL is then never dialed: it is
-    // left as written.
-    match darkmux_sandbox::selected() {
-        Ok(kind) => url_for(url, kind),
-        Err(_) => url.to_string(),
-    }
-}
-
+/// (#3112 step 2) `url` as a `kind` sandbox dials it: unchanged under a
+/// backend whose sandbox shares this host's loopback (Seatbelt and Landlock
+/// run on the host itself), else [`loopback_to_docker_host`]. `kind` is the
+/// backend the dispatch resolved and launches (`RuntimeImage::kind`), never
+/// `runtime.sandbox` read again.
 fn url_for(url: &str, kind: darkmux_sandbox::BackendKind) -> String {
     if kind.on_host() {
         url.to_string()
@@ -7550,6 +7546,10 @@ struct RuntimeImage {
     /// (#3112 step 2) The runtime a Seatbelt or Landlock sandbox runs;
     /// `None` under Docker.
     host_runtime: Option<HostRuntime>,
+    /// The backend this image was resolved for: the one that launches the
+    /// dispatch ([`run_backend`]) and whose network the model URLs it is
+    /// handed are written for, read once.
+    kind: darkmux_sandbox::BackendKind,
 }
 
 /// (#3112) The runtime an on-host sandbox runs: a host program, the
@@ -7749,6 +7749,7 @@ fn host_runtime_image(kind: darkmux_sandbox::BackendKind, image_arg: Option<&str
         image: format!("host:{shown}"),
         run_image: "host".to_string(),
         host_runtime: Some(runtime),
+        kind,
     })
 }
 
@@ -7812,7 +7813,13 @@ fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool) -> Resul
             format!(" ({})", short_image_id(&darkmux_image.id))
         }
     );
-    Ok(RuntimeImage { inject, darkmux_image, image, run_image, host_runtime: None })
+    Ok(RuntimeImage { inject, darkmux_image, image, run_image, host_runtime: None, kind })
+}
+
+/// The backend that launches a dispatch on `image`: the one it was resolved
+/// for, never the setting read again (a model load can sit between them).
+fn run_backend(image: &RuntimeImage) -> &'static dyn darkmux_sandbox::SandboxBackend {
+    darkmux_sandbox::backend_of(image.kind)
 }
 
 /// Step 1, load the role manifest + .md prompt: the role, its assembled
@@ -8785,7 +8792,7 @@ fn launch_container(
     let DispatchCompaction { compaction, compactor_n_ctx, utility_model, unmanaged_compactor } =
         resolve_dispatch_compaction(&run.role, opts)?;
     let (compaction, mut compactor_auth, compactor_hold) =
-        prepare_compactor(opts, compaction, compactor_n_ctx, unmanaged_compactor.as_ref())?;
+        prepare_compactor(opts, compaction, compactor_n_ctx, unmanaged_compactor.as_ref(), run.image.kind)?;
     // (#3507) The compactor this run may call mid-run joins its lease.
     let local_compactor = compaction.compactor_model.as_deref().filter(|_| unmanaged_compactor.is_none());
     crate::lms_room::hold_dispatch_models(&run.lease, run.leased_job.as_deref(), local_compactor)?;
@@ -8833,7 +8840,7 @@ fn launch_container(
     )?;
     // (#2640) Wrapped at once: every path below that drops it un-waited
     // (an early `?`, a panic) still reaps the docker CLI.
-    let (spawned, sandbox) = spawn_container(&argv_config, opts.max_turns_override)?;
+    let (spawned, sandbox) = spawn_container(&argv_config, run_backend(&run.image), opts.max_turns_override)?;
     let mut child = ReapedChild(Some(spawned));
 
     // (#2131 review round 2, MUST-FIX 2 / NEW-2) Registered the moment
@@ -8975,6 +8982,7 @@ fn prepare_compactor(
     mut compaction: crate::dispatch::CompactionDispatchArgs,
     compactor_n_ctx: Option<u32>,
     unmanaged_compactor: Option<&crate::target::UtilityTarget>,
+    kind: darkmux_sandbox::BackendKind,
 ) -> Result<PreparedCompactor> {
     let mut compactor_auth: Option<(String, String)> = None;
     let hold = std::cell::RefCell::new(None);
@@ -8983,7 +8991,7 @@ fn prepare_compactor(
             // (#3207) An unmanaged utility endpoint: nothing is loaded, the
             // bare id goes on the wire, and the runtime's compactor client
             // dials that endpoint (as the container sees it).
-            compactor_auth = prepare_unmanaged_compactor(&mut compaction, utility)?;
+            compactor_auth = prepare_unmanaged_compactor(&mut compaction, utility, kind)?;
         } else if let Some(compactor_id) = compaction.compactor_model.clone() {
             let (load_window, used_fallback) =
                 apply_compactor_window(&mut compaction, compactor_n_ctx);
@@ -9070,7 +9078,7 @@ fn container_run_config(
     let agentic_pm = run.brain.agentic_pm.as_ref();
     let feedback_json = feedback_templates_json(&run.role);
     // (#2902) The container's hosted-brain flags, from the resolved target.
-    let agentic_brain = agentic_brain_flags(agentic_pm);
+    let agentic_brain = agentic_brain_flags(agentic_pm, run.image.kind);
     // (#2295) The attachment directories the briefed mods want readable
     // inside the container. Resolved off the SAME ref list the brief was
     // rendered from, so the paths the block names are the paths mounted.
@@ -9154,7 +9162,7 @@ fn container_run_config(
         dialect: agentic_brain.1,
         remote_needs_auth,
         compactor_needs_auth,
-        base_url_override: container_lmstudio_base_url(opts.model_base_url_override.as_deref()),
+        base_url_override: container_lmstudio_base_url(opts.model_base_url_override.as_deref(), run.image.kind),
         workspace_read_only: opts.workspace_read_only,
         workdir_git_read_only: read_only_git_dir(
             &run.workspace,
@@ -9185,6 +9193,7 @@ fn container_command(
 /// it with its output piped (and its stdin, when a secret rides it).
 fn spawn_container(
     argv_config: &DockerRunConfig,
+    backend: &dyn darkmux_sandbox::SandboxBackend,
     max_turns_override: Option<u32>,
 ) -> Result<(std::process::Child, darkmux_sandbox::SandboxHandle)> {
     // (#907) Validate the image ref before it reaches docker as a positional
@@ -9192,7 +9201,6 @@ fn spawn_container(
     // interpretation; this rejects malformed refs (leading `-`, whitespace,
     // control chars) so the contract is explicit, not just fence-dependent.
     preflight_docker_config(argv_config)?;
-    let backend = darkmux_sandbox::backend().map_err(|why| anyhow!(why))?;
     let (mut cmd, sandbox) = container_command(argv_config, backend);
 
     // TODO (#839): Network hardening — the runtime must reach host LMStudio
@@ -15655,9 +15663,10 @@ fn apply_compactor_residency(
 fn prepare_unmanaged_compactor(
     compaction: &mut crate::dispatch::CompactionDispatchArgs,
     utility: &crate::target::UtilityTarget,
+    kind: darkmux_sandbox::BackendKind,
 ) -> Result<Option<(String, String)>> {
     let compactor_id = compaction.compactor_model.clone().unwrap_or_default();
-    let chat_url = url_for_sandbox(&utility.chat_url);
+    let chat_url = url_for(&utility.chat_url, kind);
     match apply_unmanaged_compactor(compaction, &compactor_id, utility, chat_url) {
         Some(_refused) => Ok(None),
         None => remote_auth_header(&utility.endpoint),
