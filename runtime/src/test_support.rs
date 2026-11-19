@@ -718,3 +718,50 @@ mod self_tests {
             .expect("parse status code")
     }
 }
+
+/// What each test thread allocates, counted by a global allocator: the
+/// bytes it holds and the most it held at once. A tool runs on the thread
+/// that calls it, so [`peak_allocated_during`] is the most that call ever
+/// held, whatever other tests do on their own threads.
+pub(crate) mod thread_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static LIVE: Cell<isize> = const { Cell::new(0) };
+        static PEAK: Cell<isize> = const { Cell::new(0) };
+    }
+
+    struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc(layout) };
+            if !p.is_null() {
+                let _ = LIVE.try_with(|live| {
+                    live.set(live.get() + layout.size() as isize);
+                    let _ = PEAK.try_with(|peak| peak.set(peak.get().max(live.get())));
+                });
+            }
+            p
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) };
+            let _ = LIVE.try_with(|live| live.set(live.get() - layout.size() as isize));
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: Counting = Counting;
+
+    /// The most `f` held allocated at once on this thread, beyond what the
+    /// thread held when it started, and what it returned.
+    pub(crate) fn peak_allocated_during<T>(f: impl FnOnce() -> T) -> (usize, T) {
+        let start = LIVE.with(Cell::get);
+        PEAK.with(|peak| peak.set(start));
+        let out = f();
+        let peak = PEAK.with(Cell::get);
+        ((peak - start).max(0) as usize, out)
+    }
+}

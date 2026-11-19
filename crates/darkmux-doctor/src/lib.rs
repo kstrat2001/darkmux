@@ -240,6 +240,9 @@ fn run_on(
     let after_sandbox = checks.iter().position(|c| c.name == checks_sandbox::SANDBOX_CHECK_NAME).map_or(checks.len(), |i| i + 1);
     let runtimes: Vec<Check> = checks_sandbox::managed_runtimes_on(&sandbox, platform);
     checks.splice(after_sandbox..after_sandbox, runtimes);
+    // (#3112) What every sandbox may hold (`sandbox.memory`), after the
+    // sandbox's own rows.
+    checks.push(checks_sandbox::check_sandbox_memory());
     // (#2947) `None` when a thermal threshold is bad config; that value's
     // own enum-settings row reports it.
     checks.extend(check_thermal_governor());
@@ -13369,9 +13372,12 @@ mod tests {
         // (#3569) 84: `checks_installed::check_installed_engines` joined
         // beside the Flint row.
         //
-        // 85: `check_flows_dir_writable`, before the audit rows.
+        // (#3112) 85: `checks_sandbox::check_sandbox_memory` joined after
+        // the sandbox's own rows.
+        //
+        // 86: `check_flows_dir_writable`, before the audit rows.
         let expected =
-            85 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            86 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
