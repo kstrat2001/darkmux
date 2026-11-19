@@ -195,47 +195,6 @@ fn runtime_row(
     }
 }
 
-/// (#3112 review) The row naming user mission configs whose step messages
-/// say the container's `/workspace`, read from `darkmux`'s own mission-config
-/// directory.
-pub(crate) fn check_mission_config_workspace_paths() -> Check {
-    check_mission_config_workspace_paths_in(&darkmux_crew::loader::mission_configs_dir())
-}
-
-/// [`check_mission_config_workspace_paths`] over the `*.json` files in `dir`.
-pub(crate) fn check_mission_config_workspace_paths_in(dir: &std::path::Path) -> Check {
-    let name = "mission config workspace paths";
-    let mut found: Vec<String> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .filter_map(|p| {
-            let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).ok()?).ok()?;
-            let at = darkmux_crew::mission_config::workspace_paths::container_workspace_messages(&doc);
-            (!at.is_empty()).then(|| format!("{} ({})", p.display(), at.join(", ")))
-        })
-        .collect();
-    found.sort();
-    if found.is_empty() {
-        return Check { name: name.into(), status: Status::Pass, message: "no user mission config names `/workspace` in a step message".into(), hint: None };
-    }
-    Check {
-        name: name.into(),
-        status: Status::Warn,
-        message: format!(
-            "a step message names the container's `/workspace`: {}. Under a sandbox on the host the runtime renames it \
-             at run time, but only in the text the model reads",
-            found.join("; ")
-        ),
-        hint: Some(
-            "write `${WORKSPACE_ROOT}` in its place: the step names the tree where its sandbox sees it, `/workspace` in a container"
-                .into(),
-        ),
-    }
-}
-
 /// Where the value came from, for a person.
 fn from(source: Source) -> &'static str {
     match source {
@@ -262,27 +221,6 @@ pub(crate) fn docker_only(selected: &Result<BackendKind, String>, name: &str, pr
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// (#3112 review) A user mission config whose step message names the
-    /// container's `/workspace` is named, with the placeholder to use; a
-    /// directory with none, or none at all, passes.
-    #[test]
-    fn a_user_mission_config_naming_workspace_is_named_with_the_placeholder() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            dir.path().join("review-judged.json"),
-            r#"{"phases":[{"tasks":[{"steps":[{"config":{"message":"mounted at `/workspace/<source>`"}}]}]}]}"#,
-        )
-        .unwrap();
-        std::fs::write(dir.path().join("fine.json"), r#"{"message":"at `${WORKSPACE_ROOT}/<source>`"}"#).unwrap();
-        let c = check_mission_config_workspace_paths_in(dir.path());
-        assert_eq!(c.status, Status::Warn);
-        assert!(c.message.contains("review-judged.json") && !c.message.contains("fine.json"), "{}", c.message);
-        assert!(c.hint.as_deref().unwrap_or("").contains("${WORKSPACE_ROOT}"), "{:?}", c.hint);
-        std::fs::remove_file(dir.path().join("review-judged.json")).unwrap();
-        assert_eq!(check_mission_config_workspace_paths_in(dir.path()).status, Status::Pass);
-        assert_eq!(check_mission_config_workspace_paths_in(&dir.path().join("none")).status, Status::Pass);
-    }
 
     const MAC: Here = Here { on_host: Some(BackendKind::Seatbelt), landlock_abi: None };
 
