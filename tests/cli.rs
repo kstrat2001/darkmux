@@ -2027,7 +2027,7 @@ fn mission_config_show_review_param_override_is_reported_ignored_with_a_warning(
         })
         .expect("a reviewer task must be present");
     assert_ne!(
-        reviewer_role["provenance"], "launch override (--param)",
+        reviewer_role["provenance"], "overridden",
         "no launcher applies --param role overrides any more: {reviewer_role}"
     );
 }
@@ -2071,8 +2071,8 @@ fn mission_config_show_coder_phase_param_is_neutered_with_warning() {
         })
         .expect("coder task must be present");
     assert_ne!(
-        coder_role["provenance"], "launch override (--param)",
-        "a non-review-route config must never claim the launch-override provenance from --param"
+        coder_role["provenance"], "overridden",
+        "a non-review-route config must never claim the overridden provenance from --param"
     );
 }
 
