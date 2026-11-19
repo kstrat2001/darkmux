@@ -4212,6 +4212,12 @@ const RATE_LIMIT_BACKOFF_SECONDS: [u64; 3] = [30, 60, 120];
 /// `pub(crate)` (#1222 Phase B packet 2) — `single_shot.rs` reuses this
 /// hardened curl machinery (0600 secret-bearing config file, 429 backoff)
 /// for the local single-shot chat primitive.
+///
+/// Once the run is stopped no request is sent: the check runs before every
+/// attempt, and a stop during a backoff wakes it at once
+/// ([`darkmux_types::interrupt::sleep`]) rather than holding the stopped run
+/// for up to two minutes and then sending one more request. The error
+/// carries the interrupt marker and no failure class, so it is never charged.
 pub(crate) fn remote_chat_completion(
     url: &str,
     auth_header: Option<&(String, String)>,
@@ -4232,7 +4238,10 @@ pub(crate) fn remote_chat_completion(
                 "darkmux: hosted endpoint rate-limited or unavailable, retry {i}/{} in {delay}s",
                 attempts - 1
             );
-            std::thread::sleep(std::time::Duration::from_secs(delay));
+            darkmux_types::interrupt::sleep(std::time::Duration::from_secs(delay));
+        }
+        if darkmux_types::interrupt::is_set() {
+            anyhow::bail!("{}: the request to {url} was not sent", darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL);
         }
         match remote_chat_attempt(url, auth_header, body, timeout_seconds, progress.as_deref_mut()) {
             Ok(v) => return Ok(v),
@@ -7052,6 +7061,15 @@ fn admit_container_start(
 /// everything the container needs before its `dispatch.start`, then the run
 /// itself ([`run_container`]), which owns the bookends.
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
+    // A stopped run starts nothing: no container, no model call, and no
+    // record (an execution that never started opens no `dispatch.start`, as
+    // a `dispatch.map` item the stop kept from starting opens none). Every
+    // host-side caller comes through here, so a crawl unit's next draw, a lab
+    // repeat or a mission step that reaches it after the stop is refused
+    // before anything is spawned.
+    if darkmux_types::interrupt::is_set() {
+        bail!("{}: the dispatch of role `{}` did not start", darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL, opts.role_id);
+    }
     // (#2947) Bad enum config refuses FIRST: before the daemon nudge, the
     // ack gate, any session id or flow record. Every host-side dispatch
     // (radio, acp, mission steps, crawl units, lab providers, the fleet
@@ -11814,6 +11832,7 @@ impl DispatchSampler {
             thermal_elapsed_ms,
             &self.host_out,
             self.thermal_stop_file.as_deref(),
+            self.budget_pacer.as_ref().is_some_and(crate::budget::BudgetPacer::is_pausing),
         );
         // Every state change (pause/resume/breaker) is a
         // `dispatch.rest`-family flow record, so a slowed or stopped run
@@ -15955,6 +15974,7 @@ pub(crate) fn preflight_load(pm: &darkmux_types::ProfileModel, source: WindowSou
             *hold.borrow_mut() = Some(lease);
             Ok(())
         },
+        &|model_key| gate.host().and_then(|mut host| host.context_limit(model_key)),
     )?;
     Ok(hold.into_inner())
 }
@@ -15970,7 +15990,7 @@ fn ensure_model_resident(
     unload: &dyn Fn(&str) -> Result<()>,
     load: &dyn Fn(&str, &str, u32) -> Result<()>,
 ) -> Result<()> {
-    ensure_model_resident_from(pm, WindowSource::Profile, list, unload, load)
+    ensure_model_resident_from(pm, WindowSource::Profile, list, unload, load, &|_| None)
 }
 
 /// (#3083) Unload the stale instance a reload replaces. It can vanish between
@@ -15989,12 +16009,15 @@ fn unload_stale_for_reload(
     }
 }
 
+/// `limit` is the model's maximum context as the engine's catalog states it
+/// (`ModelHost::context_limit`), read only when the preflight would load.
 fn ensure_model_resident_from(
     pm: &darkmux_types::ProfileModel,
     source: WindowSource,
     list: &dyn Fn() -> Vec<darkmux_types::LoadedModel>,
     unload: &dyn Fn(&str) -> Result<()>,
     load: &dyn Fn(&str, &str, u32) -> Result<()>,
+    limit: &dyn Fn(&str) -> Option<u64>,
 ) -> Result<()> {
     // (#1282) This is a LOCAL load path (remote-brained dispatches skip it) —
     // a model without a declared `n_ctx` is a resolution error here, with the
@@ -16046,38 +16069,9 @@ fn ensure_model_resident_from(
     // that structurally through `OwnedTarget`; this legacy path unloads through
     // `Engine::unload`, which takes identifiers verbatim, so the guarantee has
     // to be restated here until the call moves to the `ModelHost` seam.
-    match decide_preflight(&pm.id, want_identifier, n_ctx, &loaded) {
-        PreflightDecision::Reuse { .. } => return Ok(()),
-        PreflightDecision::Reload { stale_identifier, stale_ctx } => {
-            eprintln!(
-                "darkmux dispatch: `{}` is resident at context {} but n_ctx={} is wanted \
-                 ({}); reloading at {} so the dispatch gets that context. (#1135)",
-                model_key,
-                stale_ctx,
-                n_ctx,
-                source.describe(),
-                n_ctx
-            );
-            unload_stale_for_reload(unload, &stale_identifier, n_ctx)?;
-        }
-        PreflightDecision::LoadFresh { foreign_identifier } => {
-            // (#1609) A foreign resident of the same model is NOT an error and
-            // NOT ours to remove — the contract is "surface a reason naming the
-            // blocking instance and suggest; never touch". darkmux loads its
-            // own namespaced copy alongside it, exactly as the gestalt planner
-            // already decides for a ForeignDuplicate.
-            if let Some(foreign) = foreign_identifier {
-                eprintln!(
-                    "darkmux dispatch: `{}` is already resident as `{}`, which darkmux \
-                     does not own and will not unload; loading darkmux's own copy at \
-                     n_ctx={} alongside it. Free the RAM yourself with `lms unload {}` \
-                     if that is not what you want. (#1609)",
-                    model_key, foreign, n_ctx, foreign
-                );
-            } else {
-                eprintln!("{}", loading_message(model_key, n_ctx, source));
-            }
-        }
+    let decision = decide_preflight(&pm.id, want_identifier, n_ctx, &loaded);
+    if !prepare_load(model_key, n_ctx, source, decision, unload, limit)? {
+        return Ok(());
     }
     match load(model_key, &identifier, n_ctx) {
         Ok(()) => Ok(()),
@@ -16125,6 +16119,73 @@ fn ensure_model_resident_from(
     }
 }
 
+/// What the residency preflight does before it loads, given its decision.
+/// `false` when the resident is reused (no load). Otherwise the model's
+/// own maximum context comes first (#1135 class): a profile asking more
+/// than the model takes is refused before anything is unloaded or loaded.
+/// Then the load is announced, and a reload's stale instance unloaded.
+fn prepare_load(
+    model_key: &str,
+    n_ctx: u32,
+    source: WindowSource,
+    decision: PreflightDecision,
+    unload: &dyn Fn(&str) -> Result<()>,
+    limit: &dyn Fn(&str) -> Option<u64>,
+) -> Result<bool> {
+    if matches!(decision, PreflightDecision::Reuse { .. }) {
+        return Ok(false);
+    }
+    darkmux_gestalt::refuse_beyond_limit(model_key, n_ctx, limit(model_key)).map_err(|e| load_error(e, model_key, n_ctx))?;
+    clear_for_load(model_key, n_ctx, source, decision, unload)?;
+    Ok(true)
+}
+
+/// [`prepare_load`]'s announcement, and a reload's unload of the stale
+/// instance.
+fn clear_for_load(
+    model_key: &str,
+    n_ctx: u32,
+    source: WindowSource,
+    decision: PreflightDecision,
+    unload: &dyn Fn(&str) -> Result<()>,
+) -> Result<()> {
+    match decision {
+        // `prepare_load` returns before a reuse reaches here.
+        PreflightDecision::Reuse { .. } => {}
+        PreflightDecision::Reload { stale_identifier, stale_ctx } => {
+            eprintln!(
+                "darkmux dispatch: `{}` is resident at context {} but n_ctx={} is wanted \
+                 ({}); reloading at {} so the dispatch gets that context. (#1135)",
+                model_key,
+                stale_ctx,
+                n_ctx,
+                source.describe(),
+                n_ctx
+            );
+            unload_stale_for_reload(unload, &stale_identifier, n_ctx)?;
+        }
+        PreflightDecision::LoadFresh { foreign_identifier } => {
+            // (#1609) A foreign resident of the same model is NOT an error and
+            // NOT ours to remove — the contract is "surface a reason naming the
+            // blocking instance and suggest; never touch". darkmux loads its
+            // own namespaced copy alongside it, exactly as the gestalt planner
+            // already decides for a ForeignDuplicate.
+            if let Some(foreign) = foreign_identifier {
+                eprintln!(
+                    "darkmux dispatch: `{}` is already resident as `{}`, which darkmux \
+                     does not own and will not unload; loading darkmux's own copy at \
+                     n_ctx={} alongside it. Free the RAM yourself with `lms unload {}` \
+                     if that is not what you want. (#1609)",
+                    model_key, foreign, n_ctx, foreign
+                );
+            } else {
+                eprintln!("{}", loading_message(model_key, n_ctx, source));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// (#1139) Load `model_key` under `identifier` at `n_ctx` through the local
 /// engine's bounded `ModelHost` port (#1276; `LmsHost` today) instead of the raw, uncapped
 /// `lms::load_with_identifier` (since removed; `Command::status`, which blocked indefinitely on
@@ -16143,7 +16204,10 @@ pub(crate) fn load_at_ctx_bounded(model_key: &str, identifier: &str, n_ctx: u32)
         .host()
         .expect("LM Studio has a load lifecycle");
     let deadline = Deadline::from_secs(darkmux_types::config_access::model_load_timeout_seconds());
-    map_load_result(host.load(model_key, identifier, n_ctx, deadline), model_key, n_ctx)
+    // (#1135 class) The context LM Studio reports for the load is checked
+    // against `n_ctx`: a load that landed below it is an error, never a
+    // dispatch that runs truncated.
+    map_load_result(darkmux_gestalt::load_verified(host.as_mut(), model_key, identifier, n_ctx, deadline), model_key, n_ctx)
 }
 
 /// (#1139) Map the bounded [`ModelHost::load`] outcome to an operator-actionable
@@ -16192,21 +16256,25 @@ fn map_load_result(
     model_key: &str,
     n_ctx: u32,
 ) -> Result<()> {
+    result.map(drop).map_err(|e| load_error(e, model_key, n_ctx))
+}
+
+/// [`map_load_result`]'s error: a failed load as the operator acts on it.
+fn load_error(e: darkmux_gestalt::HostError, model_key: &str, n_ctx: u32) -> anyhow::Error {
     use darkmux_gestalt::HostError;
-    match result {
-        Ok(_report) => Ok(()),
-        Err(HostError::InsufficientResources { detail }) => bail!(
+    match e {
+        HostError::InsufficientResources { detail } => anyhow!(
             "darkmux: model `{model_key}` could not load at n_ctx={n_ctx} — insufficient RAM \
              ({detail}). Free resources, lower the profile's n_ctx, or evict a resident \
              darkmux model (`darkmux machine eject`), then retry. (#1139)"
         ),
-        Err(HostError::Timeout { phase, waited }) => bail!(
+        HostError::Timeout { phase, waited } => anyhow!(
             "darkmux: model `{model_key}` load did not finish within the bounded {phase} \
              deadline ({waited:?}) — the load is likely stuck (wrong id, waiting on a \
              download, or a RAM-starved host). Raise DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS if \
              the machine is just slow. (#1139/#1276)"
         ),
-        Err(HostError::UnknownModel { model_key }) => bail!(
+        HostError::UnknownModel { model_key } => anyhow!(
             "darkmux: model `{model_key}` was not found by LMStudio at load time. Check the id \
              against `lms ls`; if it is not there, download it in LM Studio or point the \
              profile at a model you have. (#1139)"
@@ -16215,10 +16283,14 @@ fn map_load_result(
         // its own detail (a missing `lms`, a load error text). Guessing
         // "insufficient RAM" on top of it sent first-run users after the
         // wrong problem.
-        Err(HostError::CommandFailed { detail }) => bail!(
+        HostError::CommandFailed { detail } => anyhow!(
             "darkmux: loading `{model_key}` at n_ctx={n_ctx} failed: {detail} (#1139)"
         ),
-        Err(e) => bail!(
+        // (#1135 class) The context the load was asked for is more than the
+        // model takes, or more than it landed at: the error says which, and
+        // that the profile's `n_ctx` is what to change.
+        e @ (HostError::ContextBeyondModel { .. } | HostError::ContextShort { .. }) => anyhow!("darkmux: {e} (#1135)"),
+        e => anyhow!(
             "darkmux: loading `{model_key}` at n_ctx={n_ctx} failed: {e}. Likely insufficient \
              RAM or an LMStudio load error. (#1139)"
         ),

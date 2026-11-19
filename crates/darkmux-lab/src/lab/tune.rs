@@ -242,7 +242,8 @@ fn cluster_line(c: &ClusterStats) -> String {
 fn render_errored(out: &mut String, outcomes: &[RunOutcome]) {
     for o in outcomes {
         if let Some(e) = &o.provider_error {
-            p!(out, "✗ {} errored before completing: {e}", o.run_id);
+            // A provider error can quote an endpoint's reply: shown, not acted on.
+            p!(out, "✗ {} errored before completing: {}", o.run_id, darkmux_types::user_files::escape_text(e));
         }
     }
 }
@@ -416,6 +417,18 @@ mod tests {
             "darkmux tune: workload `w` profile `(default)` × 1 run(s), 0 completed\n\n(no runs completed)\n\
              ✗ test-0 errored before completing: boom\n"
         );
+    }
+
+    /// A provider error holding an OSC 0 title, a screen clear and an OSC 52
+    /// clipboard write prints as text.
+    #[test]
+    fn a_hostile_provider_error_prints_inert() {
+        let mut o = outcome(0);
+        o.ok = false;
+        o.provider_error = Some("endpoint said \x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}".into());
+        let text = render_report(&tune_report(vec![o]));
+        assert!(!text.chars().any(|c| (c.is_control() && c != '\n') || c == '\u{202e}'), "{text:?}");
+        assert!(text.contains("errored before completing: endpoint said \\u{1b}]0;owned"), "{text}");
     }
 
     #[test]

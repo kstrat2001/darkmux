@@ -1161,20 +1161,9 @@ pub enum PacerEvent {
 }
 
 /// What the other governors hold on the pace file this tick, so the pacer
-/// neither overwrites nor drops them.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct OtherPacing {
-    /// Thermal or battery holds a genuine pause: the pacer writes nothing.
-    pub pausing: bool,
-    /// Thermal is duty-cycling (`pause: false` with a turn delay):
-    /// `(turn_delay_ms, state)`. A pacer releasing its own pause writes this
-    /// instruction back rather than a bare `pause: false` (review C6).
-    pub duty_cycle: Option<(u64, String)>,
-}
-
-/// The duty-cycle `reason` the thermal governor writes, restored verbatim
-/// when the pacer lets go of the file during a duty-cycle episode.
-const THERMAL_DUTY_REASON: &str = "thermal-duty-cycle";
+/// neither overwrites nor drops them. One type for every writer of the file;
+/// see `pace_file`'s module doc for the rule it carries.
+pub use crate::pace_file::OtherPacing;
 
 /// The budget gate for a dispatch whose calls are made INSIDE the runtime
 /// container (an agentic-remote brain, #1187): the host cannot stand in
@@ -1377,18 +1366,7 @@ impl BudgetPacer {
         self.pausing = false;
         self.announced = None;
         let state = self.state();
-        if !others.pausing {
-            match &others.duty_cycle {
-                Some((delay, thermal_state)) => crate::pace_file::write_with_turn_delay(
-                    host_out,
-                    false,
-                    THERMAL_DUTY_REASON,
-                    thermal_state,
-                    Some(*delay),
-                ),
-                None => crate::pace_file::write(host_out, false, PACE_REASON, &state),
-            }
-        }
+        crate::pace_file::release(host_out, others, PACE_REASON, &state);
         resume_if_waited(&self.budget, caller, env, self.waited_ms.max(1));
         self.waited_ms = 0;
         Some(PacerEvent::Resumed { state })

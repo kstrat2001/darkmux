@@ -208,9 +208,9 @@ fn signal_exit_code() -> Option<i32> {
 /// exits `128 + signo`.
 ///
 /// (#2462 review) `main` returns `anyhow::Result<()>`, so an `Err` that
-/// propagates out of `run` is printed by std's own `Termination` impl as
-/// `Error: {err:?}` (anyhow's `Debug`, i.e. the message plus its `Caused
-/// by:` chain). `std::process::exit` runs BEFORE any of that. So a site
+/// propagates out of `run` is printed by `main`'s exit report
+/// (`multicall::Exit`) as `Error: {err:?}` (anyhow's `Debug`, i.e. the
+/// message plus its `Caused by:` chain), escaped. `std::process::exit` runs BEFORE any of that. So a site
 /// that force-exits on the way out of an error path throws the error text
 /// away entirely: the operator gets exit 130 and nothing else on stderr,
 /// and a `--json` orchestrator gets no diagnosis at all.
@@ -224,10 +224,10 @@ fn signal_exit_code() -> Option<i32> {
 /// `tests/cli.rs` sent the child's stderr to `/dev/null`; they capture it
 /// to a file and assert the text now.
 ///
-/// Formats with `{err:?}` and the `Error: ` prefix DELIBERATELY — that is
-/// byte-for-byte what std would have printed on the ordinary `?` return,
-/// so a signal-interrupted run says exactly what a non-interrupted failure
-/// says, plus the distinguishing exit code.
+/// Prints through [`crate::multicall::error_report`] DELIBERATELY: that is
+/// byte-for-byte what `main` prints on the ordinary `?` return (std's
+/// `Error: {err:?}`, escaped), so a signal-interrupted run says exactly what
+/// a non-interrupted failure says, plus the distinguishing exit code.
 pub(crate) fn report_reap_and_exit_on_signal(err: &anyhow::Error) {
     if !darkmux_types::interrupt::is_set() {
         return;
@@ -235,9 +235,17 @@ pub(crate) fn report_reap_and_exit_on_signal(err: &anyhow::Error) {
     // No operator stop (the run's own bound raised the flag): nothing exits
     // here, so the `Err` reaches `main`, which prints it once.
     if signal_exit_code().is_some() {
-        eprintln!("Error: {err:?}");
+        eprintln!("{}", signal_error_line(err));
     }
     reap_and_exit_on_signal();
+}
+
+/// The line [`report_reap_and_exit_on_signal`] prints for `err`: the same
+/// escaped `Error: …` line `main` prints ([`crate::multicall::error_report`]),
+/// so an endpoint's reply quoted in the error cannot drive the terminal on
+/// the signal path either.
+fn signal_error_line(err: &anyhow::Error) -> String {
+    crate::multicall::error_report(err)
 }
 
 /// RAII guard shared by every `darkmux mission launch` launcher (#2131):
@@ -1088,5 +1096,20 @@ mod tests {
              (an unjoined worker thread); `run_step_graph` never takes this shape (see the \
              companion test above), which is why production never sees it"
         );
+    }
+
+    /// The error a signal-interrupted run prints, holding an endpoint reply
+    /// with an OSC 0 title, a screen clear and an OSC 52 clipboard write,
+    /// is escaped, and a plain one reads as std's `Error: {err:?}`.
+    #[test]
+    fn the_signal_path_error_line_is_escaped() {
+        let err = anyhow::anyhow!("body \x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07")
+            .context("hosted dispatch interrupted by an operator signal");
+        let line = signal_error_line(&err);
+        assert!(line.starts_with("Error: hosted dispatch interrupted by an operator signal"), "{line:?}");
+        assert!(!line.chars().any(|c| c.is_control() && c != '\n'), "{line:?}");
+        assert!(line.contains("body \\u{1b}]0;owned\\u{7}"), "{line:?}");
+        let plain = anyhow::anyhow!("café");
+        assert_eq!(signal_error_line(&plain), format!("Error: {plain:?}"));
     }
 }

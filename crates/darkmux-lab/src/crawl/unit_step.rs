@@ -1374,7 +1374,11 @@ impl StepKind for DispatchUnitStepKind {
         let mut last_rest_ms = 0u64;
         let mut last_host = None;
 
-        for draw in 0..cfg.draws {
+        // No draw starts after the run's stop: the unit then ends stopped
+        // ([`unit_step_outcome`]), not after one more dispatch.
+        let mut draws_ran = 0usize;
+        for draw in (0..cfg.draws).take_while(no_stop_yet) {
+            draws_ran += 1;
             let (draw_session_id, draw_host_out) = if draw == 0 {
                 (ctx.session_id.clone(), host_out.clone())
             } else {
@@ -1633,17 +1637,47 @@ impl StepKind for DispatchUnitStepKind {
         // step reports a partial result.
         let degraded = unit_degraded_reason(&outcome_record.unit, &outcome_record.result);
 
-        Ok(StepOutcome {
-            output: darkmux_crew::step_output::Output::wrap(
-                darkmux_crew::step_output::labels::UNIT_OUTCOME,
-                outcome_record,
-                darkmux_crew::step_output::Producer::of(mission_id, &task.id, &step.id),
-            )
-            .to_output_string()?,
-            flow_records: Vec::new(),
+        unit_step_outcome(
+            outcome_record,
             degraded,
-        })
+            (draws_ran, cfg.draws),
+            darkmux_crew::step_output::Producer::of(mission_id, &task.id, &step.id),
+        )
     }
+}
+
+/// Whether the run has not been stopped: a draw may start.
+fn no_stop_yet(_draw: &usize) -> bool {
+    !darkmux_types::interrupt::is_set()
+}
+
+/// The unit's step outcome, from its `record`. When the run's stop kept some
+/// of its draws from starting (`draws_ran` of `draws`), the unit ends
+/// stopped instead, as one whose draw the stop cut off does: an `Err`
+/// carrying the interrupt marker and the outcome of the draws that ran,
+/// labeled interrupted, so the scheduler abandons the step naming the stop
+/// and the summary counts the unit interrupted.
+fn unit_step_outcome(
+    mut record: UnitOutcome,
+    degraded: Option<String>,
+    (draws_ran, draws): (usize, usize),
+    producer: darkmux_crew::step_output::Producer,
+) -> Result<StepOutcome> {
+    if draws_ran < draws {
+        record.result = INTERRUPTED_RESULT.to_string();
+        bail!(
+            "{}: `{DISPATCH_UNIT_KIND}`: unit `{}` stopped after {draws_ran} of {draws} draw(s); the rest were not run (outcome: {})",
+            darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL,
+            record.unit,
+            serde_json::to_string(&record).unwrap_or_default()
+        );
+    }
+    Ok(StepOutcome {
+        output: darkmux_crew::step_output::Output::wrap(darkmux_crew::step_output::labels::UNIT_OUTCOME, record, producer)
+            .to_output_string()?,
+        flow_records: Vec::new(),
+        degraded,
+    })
 }
 
 /// One draw's numbers: the envelope's own when the dispatch ran, else a
