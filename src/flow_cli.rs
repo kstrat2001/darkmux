@@ -137,7 +137,10 @@ pub enum FlowCmd {
     /// any chain is broken so CI/cron can flag it. A file from before 2.6.0
     /// (no `hash_format` on its header) is also reported as broken, at line
     /// 1: nothing in it is verified, which is not evidence of editing.
-    /// Archive it.
+    /// Archive it. Exits with status 3 when every chain verifies but the
+    /// trail is incomplete: a day file's chain restarted (it was emptied,
+    /// cut to whitespace, or its first line set aside), or the local flow
+    /// files record dropped audit writes over the days the trail covers.
     #[command(name = "integrity-check")]
     IntegrityCheck {
         /// Restrict the walk to a single file path. Useful when the
@@ -473,10 +476,12 @@ pub struct StrayDrainOutput {
     pub remaining_undelivered: usize,
 }
 
-/// `flow integrity-check --json`: one report per audit file checked.
+/// `flow integrity-check --json`: one report per audit file checked, and the
+/// audit writes the tee recorded as dropped over the days the walk covers.
 #[derive(Serialize, schemars::JsonSchema)]
 pub struct IntegrityCheckOutput<'a> {
     pub reports: &'a [flow::IntegrityReport],
+    pub dropped_writes: &'a [flow::DroppedAuditWrites],
 }
 
 fn run_drain(rule_filter: Option<usize>, max_seconds: u64, json: bool) -> Result<()> {
@@ -547,28 +552,58 @@ fn print_torn_tails(r: &flow::IntegrityReport) {
     }
 }
 
+/// What `flow integrity-check` walks: every audit file (or the one at `path`)
+/// and the dropped audit writes over the same days.
+fn integrity_walk(path: Option<&std::path::Path>) -> Result<(Vec<flow::IntegrityReport>, Vec<flow::DroppedAuditWrites>)> {
+    let reports = match path {
+        Some(p) => vec![flow::integrity_check_file(p)?],
+        None => flow::integrity_check_all()?,
+    };
+    Ok((reports, dropped_writes_for(path, flow::dropped_audit_writes())))
+}
+
+/// The dropped audit writes a walk reports: every one the audit trail's days
+/// hold, or, for `--path`, those of that file's day.
+fn dropped_writes_for(path: Option<&std::path::Path>, all: Vec<flow::DroppedAuditWrites>) -> Vec<flow::DroppedAuditWrites> {
+    let Some(path) = path else { return all };
+    let day = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".jsonl"));
+    all.into_iter().filter(|d| Some(d.day.as_str()) == day).collect()
+}
+
+/// One line per day the tee recorded dropped audit writes on: records that
+/// never reached the chain, which no walk of it can show.
+fn print_dropped_writes(dropped: &[flow::DroppedAuditWrites]) {
+    for d in dropped {
+        println!(
+            "{}",
+            darkmux_types::style::warn(&format!(
+                "⚠ {} audit write(s) dropped on {}: the chain is incomplete for them (breadcrumbs in {})",
+                d.count, d.day, d.path
+            ))
+        );
+    }
+}
+
 /// Render `darkmux flow integrity-check` to stdout. Walks the audit dir
 /// (or a single `--path`), recomputes each file's hash chain, reports
 /// pass/break per file. Exits with status 2 when any chain is broken
 /// (`chain_valid == false`), including a file whose header is not in the
 /// byte-hash format (a file from before 2.6.0: nothing in it is verified),
-/// so CI / cron / monitoring can flag it. The status decision itself lives
+/// so CI / cron / monitoring can flag it, and with status 3 when every chain
+/// verifies but the trail is incomplete (a restarted chain, or dropped audit
+/// writes the local flow files record). The status decision itself lives
 /// in `flow::integrity_exit_code`, which is unit tested.
 fn print_integrity_check(path: Option<std::path::PathBuf>, json: bool) -> Result<()> {
-    let reports = if let Some(p) = path {
-        vec![flow::integrity_check_file(&p)?]
-    } else {
-        flow::integrity_check_all()?
-    };
+    let (reports, dropped) = integrity_walk(path.as_deref())?;
 
-    let exit_code = flow::integrity_exit_code(&reports);
+    let exit_code = flow::integrity_exit_code(&reports, &dropped);
 
     use darkmux_types::style;
     if json {
         // (#776) machine-readable: force color off (defense-in-depth).
         style::set_colorize_override(Some(false));
-        cli_json::emit(&IntegrityCheckOutput { reports: &reports })?;
-    } else if reports.is_empty() {
+        cli_json::emit(&IntegrityCheckOutput { reports: &reports, dropped_writes: &dropped })?;
+    } else if reports.is_empty() && dropped.is_empty() {
         println!(
             "{}",
             style::dim(&format!(
@@ -594,7 +629,7 @@ fn print_integrity_check(path: Option<std::path::PathBuf>, json: bool) -> Result
             if r.chain_restarted {
                 println!(
                     "{}",
-                    style::warn("       chain restarted: the file's first line was set aside, so the chain above covers only what was written after")
+                    style::warn("       chain restarted: the file was found cut (emptied, whitespace only, or its first line set aside), so the chain above covers only what was written after")
                 );
             }
             if !r.chain_valid {
@@ -606,6 +641,7 @@ fn print_integrity_check(path: Option<std::path::PathBuf>, json: bool) -> Result
                 }
             }
         }
+        print_dropped_writes(&dropped);
     }
 
     match exit_code {
@@ -857,6 +893,18 @@ mod tests {
     use std::env;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    /// `integrity-check --path <day file>` reports that day's dropped audit
+    /// writes and no other day's; the full walk reports every day's.
+    #[test]
+    fn a_single_file_walk_reports_only_its_days_dropped_writes() {
+        let day = |d: &str| flow::DroppedAuditWrites { day: d.into(), path: format!("/flows/{d}.jsonl"), count: 1 };
+        let all = vec![day("2026-11-12"), day("2026-11-17")];
+        let one = dropped_writes_for(Some(std::path::Path::new("/audit/2026-11-17.jsonl")), all.clone());
+        assert_eq!(one, vec![day("2026-11-17")]);
+        assert!(dropped_writes_for(Some(std::path::Path::new("/audit/elsewhere.jsonl")), all.clone()).is_empty());
+        assert_eq!(dropped_writes_for(None, all.clone()), all);
+    }
 
     // (#1959 flow-hooks-family retirement) the retired `hooks status` sub-verb's render/JSON
     // tests moved to `darkmux-flow`'s `status::hooks_status_tests` — the

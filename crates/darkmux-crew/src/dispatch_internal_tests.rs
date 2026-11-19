@@ -6809,6 +6809,73 @@ S(("127.0.0.1", port), H).serve_forever()
         }
     }
 
+    /// (contract 6) The system prompt a dispatch records the hash of is the
+    /// one it passes to the runtime as `--system`, named for where the
+    /// sandbox sees the workspace (the runtime sends `--system` byte for
+    /// byte): under Seatbelt the hash recorded is the hash of the host-path
+    /// text the runtime sends, not of the `/workspace` text the role wrote.
+    #[test]
+    fn the_recorded_system_hash_is_of_the_system_prompt_the_runtime_is_passed() {
+        use darkmux_sandbox::{BackendKind, SeatbeltBackend};
+        let root = tempfile::TempDir::new().unwrap();
+        for d in ["ws", "out"] {
+            std::fs::create_dir(root.path().join(d)).unwrap();
+        }
+        let role = "Work in /workspace and read /workspace/a.rs.".to_string();
+        let mut cfg = argv_config_with_base_url(None);
+        cfg.workspace = root.path().join("ws");
+        cfg.host_out = root.path().join("out");
+        cfg.system_prompt = system_prompt_as_sent(role.clone(), Some(BackendKind::Seatbelt), &cfg.workspace);
+        let real = cfg.workspace.canonicalize().unwrap().display().to_string();
+        assert_eq!(cfg.system_prompt, format!("Work in {real} and read {real}/a.rs."));
+        let policy = dispatch_policy_for(&cfg, &SeatbeltBackend);
+        let passed = policy.command.iter().skip_while(|a| *a != "--system").nth(1).unwrap();
+        let mut payload = DispatchStartPayload::default();
+        crate::role_inputs::stamp_prompt_inputs(&mut payload, &cfg.system_prompt, &Default::default());
+        assert_eq!(payload.system_sha256, Some(darkmux_flow::sha256_hex(passed.as_bytes())));
+        // The container run names its prompt so before it is recorded or passed.
+        let src = include_str!("dispatch_internal.rs");
+        assert!(
+            src.contains("let system_prompt = run_system_prompt(system_prompt, &image, &workspace);"),
+            "prepare_container_run must name the prompt before ContainerRun holds it"
+        );
+    }
+
+    /// (contract 6) The system prompt names the workspace for the backend
+    /// that runs the dispatch: the one its runtime image was resolved for,
+    /// never the selection read again later. A setting switched while a
+    /// model loads (Docker to Seatbelt, or back) changes neither the path the
+    /// prompt names nor the backend that launches.
+    #[test]
+    #[serial]
+    fn the_prompt_names_the_workspace_for_the_backend_that_runs() {
+        use darkmux_sandbox::BackendKind;
+        let ws = TempDir::new().unwrap();
+        let real = ws.path().canonicalize().unwrap().display().to_string();
+        let image = |kind| RuntimeImage {
+            inject: false,
+            darkmux_image: crate::runtime_image::ResolvedImage { reference: "r".into(), id: "r".into() },
+            image: "i".into(),
+            run_image: "i".into(),
+            host_runtime: None,
+            kind,
+        };
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        let mut seen = Vec::new();
+        for (selected, resolved) in [("seatbelt", BackendKind::Docker), ("docker", BackendKind::Seatbelt)] {
+            unsafe { std::env::set_var("DARKMUX_SANDBOX", selected) };
+            let img = image(resolved);
+            seen.push((run_system_prompt("in /workspace".into(), &img, ws.path()), run_backend(&img).kind()));
+        }
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        assert_eq!(seen, [("in /workspace".to_string(), BackendKind::Docker), (format!("in {real}"), BackendKind::Seatbelt)]);
+        let src = include_str!("dispatch_internal.rs");
+        assert!(src.contains("let system_prompt = run_system_prompt(system_prompt, &image, &workspace);"));
+        assert!(src.contains("spawn_container(&argv_config, run_backend(&run.image), opts.max_turns_override)?"));
+    }
+
     /// (#3561) A dispatch on the host runs with its managed Node: the
     /// toolchain's PATH, its folder read-only where it is. A container's
     /// config carries none, so its policy names no PATH (the image's own).
@@ -7112,6 +7179,7 @@ S(("127.0.0.1", port), H).serve_forever()
             image: "i".into(),
             run_image: "host".into(),
             host_runtime: Some(host),
+            kind: darkmux_sandbox::BackendKind::Seatbelt,
         };
         assert!(runtime_program(&image).is_ok(), "unchanged, the command is built");
         let staged = root.path().join("bin/.darkmux.new");
@@ -7171,6 +7239,7 @@ S(("127.0.0.1", port), H).serve_forever()
             darkmux_image: crate::runtime_image::ResolvedImage { reference: "r".into(), id: "r".into() },
             image: "i".into(),
             run_image: "i".into(),
+            kind: if host_runtime.is_some() { darkmux_sandbox::BackendKind::Seatbelt } else { darkmux_sandbox::BackendKind::Docker },
             host_runtime,
         };
         let host = HostRuntime { program: PathBuf::from("/real/darkmux"), leading_args: vec!["runtime".to_string()], started_as: None };

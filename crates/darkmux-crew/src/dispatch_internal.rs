@@ -7275,6 +7275,7 @@ fn prepare_container_run(
         image_arg.as_deref(),
         execution,
     )?;
+    let system_prompt = run_system_prompt(system_prompt, &image, &workspace);
 
     Ok(ContainerRun {
         workspace_cleanup,
@@ -7296,6 +7297,29 @@ fn prepare_container_run(
         leased_job,
         toolchain: Default::default(),
     })
+}
+
+/// (contract 6) The system prompt as a `kind` sandbox's runtime sends it:
+/// `/workspace` named where that sandbox sees `workspace` (a container:
+/// unchanged; a sandbox on the host: the workspace's host path), by the
+/// runtime's path-boundary rule. The dispatch records the hash of this text
+/// and passes it as `--system`, which the runtime sends byte for byte, so
+/// `system_sha256` is the hash of the bytes sent on every backend.
+pub(crate) fn system_prompt_as_sent(prompt: String, kind: Option<darkmux_sandbox::BackendKind>, workspace: &Path) -> String {
+    let root = darkmux_sandbox::seen_at(kind, workspace, "/workspace");
+    crate::mission_config::workspace_paths::named_as(&prompt, &root)
+}
+
+/// (contract 6) [`system_prompt_as_sent`] for the backend `image` was
+/// resolved for, the one that runs the dispatch.
+fn run_system_prompt(prompt: String, image: &RuntimeImage, workspace: &Path) -> String {
+    system_prompt_as_sent(prompt, Some(image.kind), workspace)
+}
+
+/// The backend that launches a dispatch on `image`: the one it was resolved
+/// for, never the setting read again (a model load can sit between them).
+fn run_backend(image: &RuntimeImage) -> &'static dyn darkmux_sandbox::SandboxBackend {
+    darkmux_sandbox::backend_of(image.kind)
 }
 
 /// The container brain after [`container_brain_route`]: the brain, the route
@@ -7550,6 +7574,10 @@ struct RuntimeImage {
     /// (#3112 step 2) The runtime a Seatbelt or Landlock sandbox runs;
     /// `None` under Docker.
     host_runtime: Option<HostRuntime>,
+    /// The backend this image was resolved for: the one that launches the
+    /// dispatch ([`run_backend`]) and whose workspace path the system prompt
+    /// names ([`run_system_prompt`]), read once.
+    kind: darkmux_sandbox::BackendKind,
 }
 
 /// (#3112) The runtime an on-host sandbox runs: a host program, the
@@ -7749,6 +7777,7 @@ fn host_runtime_image(kind: darkmux_sandbox::BackendKind, image_arg: Option<&str
         image: format!("host:{shown}"),
         run_image: "host".to_string(),
         host_runtime: Some(runtime),
+        kind,
     })
 }
 
@@ -7812,7 +7841,7 @@ fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool) -> Resul
             format!(" ({})", short_image_id(&darkmux_image.id))
         }
     );
-    Ok(RuntimeImage { inject, darkmux_image, image, run_image, host_runtime: None })
+    Ok(RuntimeImage { inject, darkmux_image, image, run_image, host_runtime: None, kind })
 }
 
 /// Step 1, load the role manifest + .md prompt: the role, its assembled
@@ -8833,7 +8862,7 @@ fn launch_container(
     )?;
     // (#2640) Wrapped at once: every path below that drops it un-waited
     // (an early `?`, a panic) still reaps the docker CLI.
-    let (spawned, sandbox) = spawn_container(&argv_config, opts.max_turns_override)?;
+    let (spawned, sandbox) = spawn_container(&argv_config, run_backend(&run.image), opts.max_turns_override)?;
     let mut child = ReapedChild(Some(spawned));
 
     // (#2131 review round 2, MUST-FIX 2 / NEW-2) Registered the moment
@@ -9185,6 +9214,7 @@ fn container_command(
 /// it with its output piped (and its stdin, when a secret rides it).
 fn spawn_container(
     argv_config: &DockerRunConfig,
+    backend: &dyn darkmux_sandbox::SandboxBackend,
     max_turns_override: Option<u32>,
 ) -> Result<(std::process::Child, darkmux_sandbox::SandboxHandle)> {
     // (#907) Validate the image ref before it reaches docker as a positional
@@ -9192,7 +9222,6 @@ fn spawn_container(
     // interpretation; this rejects malformed refs (leading `-`, whitespace,
     // control chars) so the contract is explicit, not just fence-dependent.
     preflight_docker_config(argv_config)?;
-    let backend = darkmux_sandbox::backend().map_err(|why| anyhow!(why))?;
     let (mut cmd, sandbox) = container_command(argv_config, backend);
 
     // TODO (#839): Network hardening — the runtime must reach host LMStudio

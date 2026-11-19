@@ -11,13 +11,37 @@ const CONTAINER_WORKSPACE: &str = "/workspace";
 /// Whether `text` names `/workspace` as a path: the runtime's rename rule
 /// (`runtime/src/tools/workspace.rs`, `naming`), a boundary on both sides.
 pub fn names_container_workspace(text: &str) -> bool {
+    text.match_indices(CONTAINER_WORKSPACE).any(|(at, _)| is_the_path_at(text, at))
+}
+
+/// (contract 6) `text` with `/workspace` named as `root` wherever it is the
+/// path itself, by the runtime's rule. The host names the system prompt so
+/// before it records its hash and passes it as `--system`, which the runtime
+/// sends byte for byte: the recorded hash is then the hash of what is sent.
+/// Unchanged when `root` is `/workspace`.
+pub fn named_as(text: &str, root: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    for (at, _) in text.match_indices(CONTAINER_WORKSPACE).filter(|(at, _)| is_the_path_at(text, *at)) {
+        out.push_str(&text[from..at]);
+        out.push_str(root);
+        from = at + CONTAINER_WORKSPACE.len();
+    }
+    out.push_str(&text[from..]);
+    out
+}
+
+/// Whether the `/workspace` at byte `at` of `text` is the path itself:
+/// preceded by the start or a character that cannot be part of a path, and
+/// followed by the end, `/`, or a character that cannot continue a name. The
+/// boundary is read from the whole text: in `/workspace/workspace` the
+/// second follows an `e`, so it is a directory inside.
+fn is_the_path_at(text: &str, at: usize) -> bool {
     let name = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
     let path = |c: char| name(c) || c == '/' || c == '.' || c == '~';
-    text.match_indices(CONTAINER_WORKSPACE).any(|(at, _)| {
-        let before_ok = text[..at].chars().next_back().is_none_or(|c| !path(c));
-        let after_ok = text[at + CONTAINER_WORKSPACE.len()..].chars().next().is_none_or(|c| c == '/' || !name(c));
-        before_ok && after_ok
-    })
+    let before_ok = text[..at].chars().next_back().is_none_or(|c| !path(c));
+    let after_ok = text[at + CONTAINER_WORKSPACE.len()..].chars().next().is_none_or(|c| c == '/' || !name(c));
+    before_ok && after_ok
 }
 
 /// Where in `doc` (a mission config) a `message` string names the
@@ -69,5 +93,24 @@ mod tests {
         );
         assert!(names_container_workspace("(/workspace)."));
         assert!(!names_container_workspace("/workspaces"));
+    }
+
+    /// (contract 6) The runtime's rename rule (`runtime/src/tools/workspace.rs`,
+    /// `workspace_is_renamed_only_at_a_path_boundary`, the same cases), so
+    /// the system prompt the host hashes is the one a host sandbox's model
+    /// is sent. Unchanged under `/workspace`.
+    #[test]
+    fn workspace_is_named_as_the_root_only_at_a_path_boundary() {
+        let renamed = |t: &str| named_as(t, "/Users/op/ws");
+        assert_eq!(renamed("/workspace"), "/Users/op/ws");
+        assert_eq!(renamed("at `/workspace/<source>`."), "at `/Users/op/ws/<source>`.");
+        assert_eq!(renamed("cd /workspace && ls /workspace/src"), "cd /Users/op/ws && ls /Users/op/ws/src");
+        assert_eq!(renamed("(/workspace), /workspace."), "(/Users/op/ws), /Users/op/ws.");
+        for kept in ["/workspace2/x", "/workspaces", "/workspace_x", "/workspace-y", "/data/workspace/x", "a/workspace"] {
+            assert_eq!(renamed(kept), kept, "{kept}");
+        }
+        assert_eq!(renamed("/workspace/workspace/x"), "/Users/op/ws/workspace/x");
+        assert_eq!(renamed("/workspace2/workspace"), "/workspace2/workspace");
+        assert_eq!(named_as("cd /workspace", "/workspace"), "cd /workspace");
     }
 }
