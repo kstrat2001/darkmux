@@ -16,6 +16,24 @@ darkmux release.
 
 ### Added
 
+- **Seatbelt sandboxes are held to a process and a memory limit, and the memory limit is a setting
+  (#3112).** New setting `sandbox.memory` (CONFIG 2.11, `DARKMUX_SANDBOX_MEMORY`; Docker's size syntax,
+  from `6m` to `262144g`, default `4g`, written by `init`): the memory every sandbox may hold (a dispatch, a
+  contained command, a client preview), under Docker and Seatbelt alike. `darkmux config set
+  sandbox.memory 16g` changes it; a value that is not such a size (`lots`, `0`, a negative) is refused
+  by `config set`, at every entry point's preflight and by doctor's new `sandbox memory` row, which shows
+  the value in effect and where it came from. Docker holds it in the container's cgroup. Seatbelt, which
+  has no kernel memory ceiling on macOS, adds up the sandbox's resident memory once a second and stops
+  it (exit 137) when it is over, its last stderr line saying what it used, the limit and the setting.
+  Seatbelt also holds a sandbox's processes with `RLIMIT_NPROC`: macOS counts that per user, so the
+  sandbox may start about 512 processes beyond what you ran when it started, room it shares with every
+  other process of yours (another sandbox or a parallel build can use it up, and a fork then fails with
+  a bare "Resource temporarily unavailable"). Landlock holds neither. An older darkmux refuses a config
+  carrying `sandbox.memory`.
+- **The runtime's file tools never read past their cap and never wait on a named pipe.** `read` reads
+  at most its 1 MB cap, `search` at most the first 1 MB of each file (naming the files it cut), `edit`
+  and `create_finding` refuse a file over 16 MB unread, and every file tool (and the detector's code
+  hash) refuses a named pipe, socket or device at its one open instead of blocking the dispatch.
 - **Setup finds the engines darkmux can start, adds one on request, and says when none is usable (#3569).**
   darkmux now looks for installed engines it can run work on: rec's Flint (rec 0.1.0 with a runtime and
   a pulled revision), Tensorfold (a 1.2.x release that lists a model), LM Studio with a downloaded model,

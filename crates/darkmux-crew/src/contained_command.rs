@@ -97,7 +97,7 @@ pub fn policy_with(
     backend: &dyn SandboxBackend,
     toolchain: &darkmux_sandbox::toolchain::Toolchain,
 ) -> SandboxPolicy {
-    use crate::dispatch_internal::{DOCKER_MEMORY, DOCKER_PIDS_LIMIT};
+    use crate::dispatch_internal::DOCKER_PIDS_LIMIT;
     let read_write = |host: &Path, at: &str| Mount { host: host.to_path_buf(), at: at.to_string(), access: Access::ReadWrite };
     let tree = read_write(run.tree, "/workspace");
     let tree_at = backend.place(&tree);
@@ -128,7 +128,7 @@ pub fn policy_with(
         network: Network::None,
         // (#2973 review) The coder container's own limits: model-written
         // code here is no more trusted than the coder's.
-        limits: Limits { memory: Some(DOCKER_MEMORY.to_string()), pids: Some(DOCKER_PIDS_LIMIT) },
+        limits: Limits { memory: Some(darkmux_types::config_access::sandbox_memory()), pids: Some(DOCKER_PIDS_LIMIT) },
         labels: vec![(PID_LABEL.to_string(), std::process::id().to_string())],
         mounts,
         ports: Vec::new(),
@@ -430,6 +430,31 @@ mod tests {
         let docker = policy_for("node:22", "darkmux-test-1", &run, &DockerBackend);
         assert_eq!(docker.workdir.as_deref(), Some("/workspace/pkg"));
         assert!(docker.command[1].starts_with(&format!("test -f {SENTINEL_AT}/{SENTINEL} ||")));
+    }
+
+    /// (#3112) A contained command is held to `sandbox.memory`, the
+    /// default `4g` or what the operator set, under either backend.
+    #[test]
+    #[serial_test::serial]
+    fn a_contained_command_is_held_to_the_sandbox_memory_setting() {
+        let tree = tempfile::TempDir::new().unwrap();
+        let run = Run { command: "npm test", tree: tree.path(), workdir: "", mounts: &[], user: None, name_prefix: "darkmux-test" };
+        let k = darkmux_types::config_access::SANDBOX_MEMORY_ENV;
+        let prev = std::env::var_os(k);
+        unsafe { std::env::remove_var(k) };
+        let default = policy_for("node:22", "darkmux-test-1", &run, &DockerBackend).limits.memory;
+        unsafe { std::env::set_var(k, "12g") };
+        let set = [policy_for("node:22", "darkmux-test-1", &run, &DockerBackend), policy_for("unused", "darkmux-test-1", &run, &darkmux_sandbox::SeatbeltBackend)];
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        assert_eq!(default.as_deref(), Some("4g"));
+        for p in set {
+            assert_eq!(p.limits.memory.as_deref(), Some("12g"));
+        }
     }
 
     fn strings(args: &[&str]) -> Vec<String> {

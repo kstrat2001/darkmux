@@ -17,6 +17,42 @@ pub(crate) fn configured() -> (Result<BackendKind, String>, Source) {
     (darkmux_sandbox::selected(), source)
 }
 
+/// (#3112) The row's name for `sandbox.memory`.
+pub(crate) const SANDBOX_MEMORY_CHECK_NAME: &str = "sandbox memory";
+
+/// (#3112) `sandbox.memory` as every sandbox reads it: the resolved value,
+/// in bytes for a person, and the tier that decided; Fail, naming the form,
+/// when it is not a size every backend takes (every entry point refuses it).
+pub(crate) fn check_sandbox_memory() -> Check {
+    let (value, source) = darkmux_types::config_access::sandbox_memory_with_source();
+    sandbox_memory_row(&value, source)
+}
+
+/// The row for `value` from `source`.
+pub(crate) fn sandbox_memory_row(value: &str, source: Source) -> Check {
+    let name = SANDBOX_MEMORY_CHECK_NAME.to_string();
+    if let Some(problem) = darkmux_types::config_access::sandbox_memory_problem_of(value, source) {
+        return Check { name, status: Status::Fail, message: format!("every entry point refuses it: {problem}"), hint: None };
+    }
+    let bytes = darkmux_types::size::sandbox_memory_bytes(value).unwrap_or_default();
+    let from = match source {
+        Source::Env => format!("`{}`", darkmux_types::config_access::SANDBOX_MEMORY_ENV),
+        Source::Config => "`sandbox.memory` in config.json".to_string(),
+        Source::BuiltIn => "the built-in default".to_string(),
+    };
+    Check {
+        name,
+        status: Status::Pass,
+        message: format!(
+            "`{value}` ({}, from {from}): a sandbox whose processes hold more is stopped. \
+             `darkmux config set sandbox.memory <size>` changes it; a running `darkmux client serve` \
+             keeps the value it started with for its previews until it is restarted",
+            darkmux_types::size::human_bytes(bytes)
+        ),
+        hint: None,
+    }
+}
+
 /// What this host could run besides the configured sandbox, for the row.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Here {
@@ -261,6 +297,24 @@ pub(crate) fn docker_only(selected: &Result<BackendKind, String>, name: &str, pr
 
 #[cfg(test)]
 mod tests {
+
+    /// (#3112) The resolved value, for a person, with the tier that
+    /// decided; a value no sandbox takes fails, naming where it was set.
+    #[test]
+    fn the_sandbox_memory_row_names_the_value_and_where_it_came_from() {
+        let default = sandbox_memory_row("4g", Source::BuiltIn);
+        assert_eq!(default.status, Status::Pass);
+        assert!(default.message.contains("`4g` (4 GiB, from the built-in default)"), "{}", default.message);
+        assert!(default.message.contains("`darkmux client serve` keeps the value it started with"), "{}", default.message);
+        let config = sandbox_memory_row("16g", Source::Config);
+        assert!(config.message.contains("16 GiB, from `sandbox.memory` in config.json"), "{}", config.message);
+        let env = sandbox_memory_row("8g", Source::Env);
+        assert!(env.message.contains("from `DARKMUX_SANDBOX_MEMORY`"), "{}", env.message);
+        let bad = sandbox_memory_row("lots", Source::Config);
+        assert_eq!(bad.status, Status::Fail);
+        assert!(bad.message.contains("config.json key `sandbox.memory`") && bad.message.contains("`lots` is not a size"), "{}", bad.message);
+    }
+
     use super::*;
 
     /// (#3112 review) A user mission config whose step message names the

@@ -885,7 +885,9 @@ pub fn preflight(scope: Scope) -> Result<(), PreflightRefusal> {
         .flat_map(crate::config_access::enum_bad_values)
         .collect();
     let files = crate::user_files::config_json_problems();
-    PreflightRefusal { scope, bad, invalid: Vec::new(), files }.into_result()
+    // (#3112) Every scope can start a sandbox (`runtime.sandbox`'s scopes).
+    let invalid = crate::config_access::sandbox_memory_problem().into_iter().collect();
+    PreflightRefusal { scope, bad, invalid, files }.into_result()
 }
 
 /// Look up a registered setting by its dotted key.

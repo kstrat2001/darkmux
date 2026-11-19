@@ -61,10 +61,15 @@ pub enum Network {
     Default,
 }
 
-/// Resource limits. `None` leaves the backend's own.
+/// Resource limits. `None` leaves the backend's own. Docker holds both in
+/// the container's cgroup; Seatbelt holds `pids` with the user's
+/// `RLIMIT_NPROC` and watches `memory` ([`seatbelt`]'s doc says how far
+/// each reaches); Landlock holds neither ([`landlock`]'s doc).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Limits {
-    /// Memory, in the backend's size syntax (`4g`).
+    /// Memory, in Docker's size syntax (`4g`: a whole number, then `b`,
+    /// `k`, `m` or `g`). A backend that holds memory refuses a value that
+    /// is not one.
     pub memory: Option<String>,
     /// Processes the sandbox may hold at once.
     pub pids: Option<u64>,
@@ -120,6 +125,23 @@ pub struct SandboxPolicy {
     pub entrypoint: Option<String>,
     /// Its arguments.
     pub command: Vec<String>,
+}
+
+/// (#3112) `text` as a sandbox memory limit in bytes, or the refusal
+/// naming it: the grammar `sandbox.memory`'s preflight reads
+/// ([`darkmux_types::size::sandbox_memory_bytes`]), so a value one backend
+/// takes, every backend takes, and none reads `0` as no limit.
+pub fn memory_bytes(text: &str) -> Result<u64, String> {
+    darkmux_types::size::sandbox_memory_bytes(text)
+        .map_err(|why| format!("sandbox: memory limit refused: {why}; the form is {}", darkmux_types::size::SANDBOX_MEMORY_FORM))
+}
+
+/// A command that fails (125, Docker's "could not make it"), saying
+/// `message`: what a backend hands back for a policy it refuses.
+pub(crate) fn failing(message: &str) -> Command {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(r#"echo "$1" >&2; exit 125"#).arg("sh").arg(message);
+    cmd
 }
 
 /// Which backend a handle belongs to.

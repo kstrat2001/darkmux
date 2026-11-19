@@ -48,6 +48,8 @@ fn a_seatbelt_preview_sees_its_paths_where_they_are_and_runs_the_host_shell() {
     let policy = preview_policy(&spec);
     assert_eq!(policy.workdir.as_deref(), Some(root.join("ws/site").to_str().unwrap()));
     assert_eq!(policy.entrypoint.as_deref(), Some("/bin/sh"));
+    // (#3112) The sandbox memory setting, `4g` unless the operator set one.
+    assert_eq!(policy.limits.memory.as_deref(), Some(darkmux_types::config_access::SANDBOX_MEMORY_DEFAULT));
     assert_eq!(policy.user, None, "Seatbelt runs as the caller");
     let ro: Vec<&Path> = policy.mounts.iter().filter(|m| m.access == Access::ReadOnly).map(|m| m.host.as_path()).collect();
     assert_eq!(ro, [spec.heartbeat.as_path(), root.join("node").as_path(), at.log.as_path()]);

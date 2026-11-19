@@ -170,6 +170,9 @@ const KEYS: &[(&str, Ty)] = &[
     // (#3275) A string: a bare uid stays `"1000"`, the field is a string.
     ("runtime.container_user", Ty::Str),
     ("runtime.tests_on_host", Ty::Bool),
+    // (#3112) A string in Docker's size syntax (`4g`), checked before it
+    // is written (`check_sandbox_memory`).
+    ("sandbox.memory", Ty::Str),
     // (#2110/#2109) The thermal governor + breaker's tuning block —
     // see `ThermalConfig`'s own doc. (#2947) The enum-valued keys
     // (`runtime.detection.degeneracy.policy`, `runtime.thermal.pause_at` /
@@ -516,7 +519,20 @@ fn check_value(key: &str, value: &str) -> Result<()> {
     check_answering_seat(key, value)?;
     check_role_binding(key, value)?;
     check_default_engine(key, value)?;
-    check_container_user(key, value)
+    check_container_user(key, value)?;
+    check_sandbox_memory(key, value)
+}
+
+/// (#3112) `sandbox.memory` is a size every sandbox backend takes; anything
+/// else is refused here, before it is written, as every entry point would
+/// refuse it after.
+fn check_sandbox_memory(key: &str, value: &str) -> Result<()> {
+    if key != "sandbox.memory" {
+        return Ok(());
+    }
+    darkmux_types::size::sandbox_memory_bytes(value)
+        .map(|_| ())
+        .map_err(|why| anyhow!("invalid value for `{key}`: {why}; the form is {}", darkmux_types::size::SANDBOX_MEMORY_FORM))
 }
 
 /// `role_profiles.<role> <profile>`: the role must be one darkmux can
@@ -1136,6 +1152,22 @@ mod tests {
         let err = set_at(f.path(), "runtime.container_user", "garbage").unwrap_err().to_string();
         assert!(err.contains("runtime.container_user") && err.contains("`garbage`"), "{err}");
         assert!(!std::fs::read_to_string(f.path()).unwrap_or_default().contains("garbage"), "nothing written");
+    }
+
+    /// (#3112) `config set sandbox.memory 16g` writes it; a value no sandbox
+    /// takes (`lots`, `0`, a negative) is refused naming the form, and
+    /// nothing is written.
+    #[test]
+    fn sandbox_memory_is_settable_and_a_bad_size_is_refused() {
+        let f = tmp();
+        set_at(f.path(), "sandbox.memory", "16g").unwrap();
+        let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(f.path()).unwrap()).unwrap();
+        assert_eq!(cfg.sandbox.unwrap().memory.as_deref(), Some("16g"));
+        for bad in ["lots", "0", "-1g", "262145g"] {
+            let err = set_at(f.path(), "sandbox.memory", bad).unwrap_err().to_string();
+            assert!(err.contains("sandbox.memory") && err.contains(&format!("`{bad}`")) && err.contains("a whole number followed by k, m or g"), "{err}");
+            assert!(std::fs::read_to_string(f.path()).unwrap().contains("\"16g\""), "{bad} was written");
+        }
     }
 
     /// (#3276 review F1) `runtime.container_user` is settable, and kept a

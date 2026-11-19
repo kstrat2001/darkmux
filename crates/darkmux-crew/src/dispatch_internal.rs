@@ -71,9 +71,6 @@ pub const DOCKER_SECURITY_OPT: &str = darkmux_sandbox::docker::SECURITY_OPT;
 /// Per-container PID limit — prevents fork-bomb style resource exhaustion
 /// inside the container. 512 is a sane default for an LLM agent loop.
 pub const DOCKER_PIDS_LIMIT: u64 = 512;
-/// Per-container memory limit — prevents OOM-killing the host. 4g is a
-/// sane default for an LLM agent loop that may compile/test code.
-pub const DOCKER_MEMORY: &str = "4g";
 /// TODO (#839): Run the container as non-root (`--user 1000:1000`).
 /// This requires verifying that the workspace bind-mount and injected
 /// runtime binary are readable/executable by uid 1000:gid 1000 inside
@@ -2727,7 +2724,8 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
         name: config.container_name.clone(),
         image: config.image.clone(),
         network: Network::Default,
-        limits: Limits { memory: Some(DOCKER_MEMORY.to_string()), pids: Some(DOCKER_PIDS_LIMIT) },
+        // (#3112) `sandbox.memory`, default `4g`, under every backend.
+        limits: Limits { memory: Some(darkmux_types::config_access::sandbox_memory()), pids: Some(DOCKER_PIDS_LIMIT) },
         labels: config.host_identity.iter().flat_map(crate::orphan_reaper::host_labels).map(|l| split_kv(&l)).collect(),
         mounts,
         ports: Vec::new(),
