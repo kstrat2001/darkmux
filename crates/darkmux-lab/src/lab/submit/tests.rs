@@ -217,16 +217,16 @@ fn a_rate_over_part_of_the_generation_is_not_quoted() {
     assert_eq!(run["darkmuxVersion"], Value::Null);
     // (Argon review) Decode speed is a rate over the generation too.
     s["decode_tok_per_s"] = json!(80.0);
-    assert_eq!(detail_from(&manifest(), &s, &[])["decodeTokensPerSecond"], Value::Null);
+    assert_eq!(detail_from(&manifest(), &s, &[], darkmux_types::Hardware::SubmittingMachine)["decodeTokensPerSecond"], Value::Null);
     s["checks"]["all_streams_billed"] = json!(true);
-    assert_eq!(detail_from(&manifest(), &s, &[])["decodeTokensPerSecond"], json!(80.0));
+    assert_eq!(detail_from(&manifest(), &s, &[], darkmux_types::Hardware::SubmittingMachine)["decodeTokensPerSecond"], json!(80.0));
 }
 
 #[test]
 fn host_figures_need_busy_samples() {
     let mut s = stats();
     s["samples_busy"] = json!(0);
-    let d = detail_from(&manifest(), &s, &[]);
+    let d = detail_from(&manifest(), &s, &[], darkmux_types::Hardware::SubmittingMachine);
     for k in ["packageWatts", "gpuWatts", "thermalStates", "throttledSamples"] {
         assert_eq!(d[k], Value::Null, "{k}");
     }
@@ -993,7 +993,7 @@ fn profile_model(json: Value) -> darkmux_types::ProfileModel {
 #[test]
 fn hardware_precedence_is_registry_then_flag_then_snapshot() {
     let flint = [snap("flint", HardwareFrom::Endpoint, Some(SubmittingMachine))];
-    let at = |s: Option<&[ModelHardware]>, cur: Option<&darkmux_types::ProfileModel>, flag| served_by("r1", "flint", s, cur, flag);
+    let at = |s: Option<&[ModelHardware]>, cur: Option<&darkmux_types::ProfileModel>, flag| served_by("r1", "flint", s, cur.map(std::slice::from_ref).unwrap_or_default(), flag);
     assert_eq!(at(Some(&flint), None, None).unwrap().hardware, SubmittingMachine, "the snapshot with no flag");
     let corrected = at(Some(&flint), None, Some(Unknown)).unwrap();
     assert_eq!((corrected.hardware, corrected.corrected), (Unknown, Some(SubmittingMachine)), "the flag corrects the snapshot");
@@ -1310,4 +1310,159 @@ fn the_git_user_name_is_the_one_git_reads_there() {
     darkmux_types::host_git::fixture::git(dir.path(), &["config", "user.name", "Repo Owner"]);
     assert_eq!(git_user_name_in(dir.path()), Some("Repo Owner".to_string()));
     assert_eq!(git_user_name_in(&dir.path().join("missing")), None, "git cannot run there");
+}
+
+/// The detail fields that describe the machine a run was served on.
+const HOST_DETAIL: [&str; 9] = [
+    "packageWatts",
+    "cpuWatts",
+    "gpuWatts",
+    "gpuBusyPct",
+    "joulesPer1kTokens",
+    "memoryPressureMaxPct",
+    "thermalStates",
+    "cpuSpeedLimitMinPct",
+    "throttledSamples",
+];
+
+/// A run another machine served publishes none of this machine's host
+/// figures, whatever its telemetry read while it ran (a parallel local run
+/// keeps the GPU busy): the bundle says `unknown`, so its watts, energy per
+/// token and thermal states are null. The run's own work figures stay.
+#[test]
+fn a_run_served_elsewhere_publishes_no_host_figures() {
+    let mut elsewhere = stack();
+    elsewhere.hardware = Unknown;
+    let far = bundle_run("far", &manifest(), &stats(), &RanBy::default(), &elsewhere, &[]);
+    for k in HOST_DETAIL {
+        assert_eq!(far["detail"][k], Value::Null, "{k}");
+    }
+    assert_eq!((&far["detail"]["turns"], &far["detail"]["completionTokens"]), (&json!(12), &json!(9000)));
+    let here = bundle_run("here", &manifest(), &stats(), &RanBy::default(), &stack(), &[]);
+    assert_eq!(here["detail"]["joulesPer1kTokens"], json!(410.3), "this machine's run keeps its figures");
+    let fixture = json!({ "name": "pepper-grinder", "version": "2" });
+    let bundle = assemble("kstrat2001/pepper-grinder", &"a".repeat(40), &fixture, vec![far, here]).unwrap();
+    assert_eq!(site_refusals(&bundle), Vec::<String>::new());
+}
+
+/// `run stats` keeps this machine's readings apart for a run another machine
+/// served (`this_machine`), and the cross-check still reads them there.
+#[test]
+fn the_gpu_cross_check_reads_this_machines_readings_when_the_run_withheld_them() {
+    let withheld = json!({
+        "samples_busy": 30, "gpu_duty_pct": null, "gpu_w_busy": null, "gpu_w_max": null,
+        "this_machine": { "gpu_duty_pct": 60.5, "gpu_w_busy": 31.2, "gpu_w_max": 44.0 },
+    });
+    let e = hardware_check(Unknown, &withheld).expect("this machine's GPU was busy while stated elsewhere");
+    assert!(e.contains("60.5%") && e.contains("31.2 W"), "{e}");
+}
+
+/// (#3644 review) The same model managed here and on a peer's endpoint:
+/// the dispatched wire name picks the entry (`darkmux:` is the managed one),
+/// and a name that several entries match is not decided by order.
+#[test]
+fn the_wire_name_picks_the_snapshot_entry_and_an_ambiguous_one_needs_a_flag() {
+    let both = [snap("qwen3", HardwareFrom::Managed, Some(SubmittingMachine)), snap("qwen3", HardwareFrom::Endpoint, Some(Unknown))];
+    let at = |name: &str, s: &[ModelHardware], flag| served_by("r1", name, Some(s), &[], flag);
+    assert_eq!(at("qwen3", &both, None).unwrap().hardware, Unknown, "a bare name is the endpoint's");
+    let here = at("darkmux:qwen3", &both, None).unwrap();
+    assert_eq!((here.hardware, here.lmstudio), (SubmittingMachine, true), "the namespaced name is the managed one");
+    let two = [snap("qwen3", HardwareFrom::Endpoint, Some(Unknown)), snap("qwen3", HardwareFrom::Endpoint, Some(SubmittingMachine))];
+    let e = at("qwen3", &two, None).unwrap_err();
+    assert!(e.contains("more than one model") && e.contains("--hardware"), "{e}");
+    assert_eq!(at("qwen3", &two, Some(Unknown)).unwrap().hardware, Unknown, "the flag decides what the record cannot");
+}
+
+/// (#3644 re-review) Several snapshot entries that agree decide, with the
+/// same `--hardware` guards as one entry; entries that disagree take the
+/// flag, still refusing one that contradicts every entry, and the refusal
+/// says the flag applies to every run of a submit.
+#[test]
+fn several_entries_agree_or_take_a_flag_under_the_same_guards() {
+    let prov = |m: &str| snap(m, HardwareFrom::Provider, Some(Unknown));
+    let at = |name: &str, s: &[ModelHardware], flag| served_by("r1", name, Some(s), &[], flag);
+    let providers = [snap("qwen3", HardwareFrom::Managed, Some(SubmittingMachine)), prov("claude-opus-4"), prov("claude-opus-4")];
+    let by = at("claude-opus-4", &providers, None).unwrap();
+    assert_eq!((by.hardware, by.provider.as_deref()), (Unknown, Some("Anthropic API")));
+    assert!(at("claude-opus-4", &providers, Some(SubmittingMachine)).unwrap_err().contains("contradicts"));
+    let peers = [snap("q", HardwareFrom::Endpoint, Some(Unknown)), snap("q", HardwareFrom::Endpoint, Some(Unknown))];
+    assert_eq!(at("q", &peers, None).unwrap().hardware, Unknown);
+    assert!(at("q", &peers, Some(SubmittingMachine)).unwrap_err().contains("contradicts"));
+    let managed = [snap("qwen3", HardwareFrom::Managed, Some(SubmittingMachine)), snap("qwen3", HardwareFrom::Managed, Some(SubmittingMachine))];
+    let here = at("darkmux:qwen3", &managed, None).unwrap();
+    assert_eq!((here.hardware, here.lmstudio), (SubmittingMachine, true));
+    assert!(at("darkmux:qwen3", &managed, Some(Unknown)).unwrap_err().contains("contradicts"));
+    let split = [snap("q", HardwareFrom::Endpoint, Some(Unknown)), snap("q", HardwareFrom::Endpoint, Some(SubmittingMachine))];
+    let e = at("q", &split, None).unwrap_err();
+    assert!(e.contains("more than one model") && e.contains("every run of a submit"), "{e}");
+    assert_eq!(at("q", &split, Some(Unknown)).unwrap().hardware, Unknown);
+    assert_eq!(at("q", &split, Some(SubmittingMachine)).unwrap().hardware, SubmittingMachine);
+    let hosted_or_peer = [prov("q"), snap("q", HardwareFrom::Endpoint, None)];
+    assert_eq!(at("q", &hosted_or_peer, Some(Unknown)).unwrap().hardware, Unknown);
+    let e = at("q", &hosted_or_peer, None).unwrap_err();
+    assert!(e.contains("more than one model"), "one model answered and one could not: undecided, {e}");
+    let both_refuse = [prov("q"), prov("q")];
+    assert!(at("q", &both_refuse, Some(SubmittingMachine)).is_err());
+}
+
+/// (#3644 re-review) A run from before the snapshot reads the registry by
+/// the same rule: the wire name's kind first, so a peer's run of a model
+/// also listed as managed is not read as this machine's, and the flag can
+/// say which machine served it.
+#[test]
+fn a_run_before_the_snapshot_reads_the_registry_by_the_wire_name() {
+    let reg: darkmux_types::ProfileRegistry = {
+        let mut r: darkmux_types::ProfileRegistry = serde_json::from_value(json!({
+            "profiles": {"p": {"models": [{"id": "qwen3", "n_ctx": 32768}, {"id": "qwen3", "endpoint": "studio"}]}},
+            "endpoints": {"studio": {"url": "http://studio.local:1234/v1", "hardware": "unknown"}}}))
+        .unwrap();
+        r.materialize_endpoints();
+        r
+    };
+    let models = &reg.profiles["p"].models;
+    let peer = profile_models_named(models, "qwen3");
+    assert_eq!(peer.len(), 1);
+    assert!(!peer[0].is_managed(), "the bare name is the endpoint's");
+    let managed = profile_models_named(models, "darkmux:qwen3");
+    assert!(managed.len() == 1 && managed[0].is_managed(), "the namespaced name is the managed one");
+    assert!(served_by("r1", "qwen3", None, &peer, None).unwrap_err().contains("--hardware"), "the record cannot say; the flag can");
+    assert_eq!(served_by("r1", "qwen3", None, &peer, Some(Unknown)).unwrap().hardware, Unknown);
+    assert_eq!(served_by("r1", "darkmux:qwen3", None, &managed, None).unwrap().hardware, SubmittingMachine);
+    // Several registry models the name could be answer together, never the first alone.
+    let hosted_then_peer = [profile_model(json!({"id": "q", "endpoint": "claude"})), profile_model(json!({"id": "q", "endpoint": "studio"}))];
+    let r = served_by("r1", "q", None, &hosted_then_peer, None);
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(served_by("r1", "q", None, &hosted_then_peer, Some(SubmittingMachine)).unwrap().hardware, SubmittingMachine);
+}
+
+/// (#3644 third review) Before the snapshot, a Flint run's `flint` names
+/// the profile's managed Flint model, not a hosted seat beside it.
+#[test]
+fn a_flint_run_before_the_snapshot_names_its_managed_flint_model() {
+    let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(json!({
+        "profiles": {"p": {"models": [{"id": "claude-opus-4", "endpoint": "anthropic"}, {"id": "flint-int4", "endpoint": "fl"}]}},
+        "endpoints": {"fl": {"managed": "flint", "port": 8092}, "anthropic": {"url": "https://api.anthropic.com/v1"}}}))
+    .unwrap();
+    reg.materialize_endpoints();
+    let named = profile_models_named(&reg.profiles["p"].models, "flint");
+    assert_eq!(named.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["flint-int4"]);
+    assert_eq!(served_by("r1", "flint", None, &named, None).unwrap().hardware, SubmittingMachine);
+}
+
+/// (Operator, 2026-11-17) A run that recorded no hardware has its host
+/// figures withheld by `run stats`, so even a `--hardware
+/// submitting-machine` submit publishes them as null.
+#[test]
+fn a_run_stats_withheld_publishes_null_even_as_this_machines() {
+    let mut s = stats();
+    for k in ["pkg_w_busy", "cpu_w_busy", "gpu_w_busy", "gpu_duty_pct", "pkg_j_per_1k_tokens", "mem_pct_busy_max", "cpu_speed_limit_min"] {
+        s[k] = Value::Null;
+    }
+    s["thermal_states_busy"] = json!({});
+    s["throttled_samples"] = json!(0);
+    s["this_machine"] = json!({"pkg_w_busy": 31.26, "gpu_w_busy": 24.95});
+    let run = bundle_run("r", &manifest(), &s, &RanBy::default(), &stack(), &[]);
+    for k in HOST_DETAIL.into_iter().filter(|k| *k != "throttledSamples") {
+        assert_eq!(run["detail"][k], Value::Null, "{k}");
+    }
 }
