@@ -279,7 +279,7 @@ fn run_on(
         check_relative_home(),
         check_mission_envelope_readability(),
     ]);
-    let checks = [checks, check_enum_settings(), check_user_file_keys(), check_hooks(), eureka_checks()].concat();
+    let checks = [checks, check_enum_settings(), check_numeric_env(), check_user_file_keys(), check_hooks(), eureka_checks()].concat();
     DoctorReport { checks }
 }
 
@@ -2403,6 +2403,27 @@ pub fn check_enum_settings() -> Vec<Check> {
         }
     }
     rows
+}
+
+/// One Fail row per numeric env var set to a value that does not read
+/// (`darkmux_types::numeric_env`), with the line every preflight refuses
+/// with; no row otherwise. The accessor reads such a var as unset, so this
+/// and the preflight are where it surfaces. Names the value's kind, never
+/// the value.
+pub fn check_numeric_env() -> Vec<Check> {
+    numeric_env_rows(&darkmux_types::numeric_env::bad_values())
+}
+
+/// The rows for `bad` ([`check_numeric_env`]).
+fn numeric_env_rows(bad: &[darkmux_types::config_enum::InvalidSetting]) -> Vec<Check> {
+    bad.iter()
+        .map(|b| Check {
+            name: b.set_in.to_string(),
+            status: Status::Fail,
+            message: format!("{}. Every entry point refuses to start over it", b.problem),
+            hint: Some(format!("valid: {}", b.valid)),
+        })
+        .collect()
 }
 
 /// The Pass row for an enum setting with no bad value.
@@ -11278,6 +11299,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A numeric env var set to a value that does not read (the accessor
+    /// reads it as unset: `50k` meant no token cap) is a Fail row in the
+    /// whole doctor, naming the variable, the value's kind and the accepted
+    /// form, never the value.
+    #[test]
+    #[serial_test::serial]
+    fn the_whole_doctor_fails_a_numeric_env_var_that_does_not_read() {
+        use darkmux_sandbox::BackendKind;
+        let _bad = EnvGuard::set("DARKMUX_RUNTIME_MAX_TOKENS", "50k");
+        let r = with_isolated_darkmux_home(|| run_with((Ok(BackendKind::Seatbelt), darkmux_types::config_access::Source::Config)));
+        let row = r.checks.iter().find(|c| c.name == "env var DARKMUX_RUNTIME_MAX_TOKENS").expect("a row for the var");
+        assert_eq!(row.status, Status::Fail, "{}", row.message);
+        assert!(row.message.contains("set to text that is not an integer from 0 to 4294967295"), "{}", row.message);
+        assert!(row.message.contains("Every entry point refuses"), "{}", row.message);
+        assert!(row.hint.as_deref().is_some_and(|h| h.contains("unset DARKMUX_RUNTIME_MAX_TOKENS")), "{:?}", row.hint);
+        assert!(!format!("{} {:?}", row.message, row.hint).contains("50k"), "never the value");
+        drop(_bad);
+        assert!(check_numeric_env().is_empty(), "no row when every var reads");
     }
 
     /// (#2774 round-8 MF1, first half) `max_pause_ms = 0` means an

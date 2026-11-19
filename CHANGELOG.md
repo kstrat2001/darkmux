@@ -193,6 +193,18 @@ darkmux release.
 
 ### Fixed
 
+- **A typo in a hook rule's `match` is refused instead of widening the rule.** A `match` takes its
+  named fields and `payload.<path>` predicates; any other key (`"levle": "error"`) was dropped on load,
+  so a webhook meant for errors fired on every matching action. Every entry point now refuses it at
+  preflight and `darkmux doctor` fails it, naming the key and the closest valid one (`level`, or
+  `payload.ok` for `paylod.ok`).
+- **A numeric `DARKMUX_*` env var that does not read as its number is refused, not ignored.**
+  `DARKMUX_RUNTIME_MAX_TOKENS=50k` was read as unset (no cap), while the same value in `config.json` is
+  refused. Every entry point now refuses it at preflight and `darkmux doctor` fails it, naming the
+  variable, what kind of value it holds and the accepted form; the value itself is never printed.
+- **`DARKMUX_VERBOSE=0` turns off `runtime.verbose: true`** for one shell, as env wins over
+  `config.json` for every other setting.
+
 - **A step command's output is bounded, not only its time.** `procedural.shell`, the `mods.gate`
   `test_command`, lab verify commands and grader suites kept everything a command wrote; a chatty one
   could fill memory within the 600 s default bound. Each stream now keeps its first 768 KiB and last

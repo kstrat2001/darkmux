@@ -812,7 +812,7 @@ pub struct PreflightRefusal {
     pub bad: Vec<BadEnumValue>,
     /// (#2902 step 5) Settings that are not a bad ENUM value but cannot be
     /// used as written (an endpoint's unreadable `limits`, a window period
-    /// that does not parse). Empty for a config.json-only preflight.
+    /// that does not parse, a numeric env var that does not read).
     pub invalid: Vec<InvalidSetting>,
     /// User files the scope consumes that carry a key their schema does not
     /// know, or are not JSON (`crate::user_files`).
@@ -877,7 +877,9 @@ impl std::error::Error for PreflightRefusal {}
 /// Docker probe, and bad config is not a probe result that can be stale.
 ///
 /// Every scope consumes `config.json`, so every scope also refuses one that
-/// carries a key its schema does not know (`crate::user_files`).
+/// carries a key its schema does not know (`crate::user_files`), and a
+/// numeric env var set to a value that does not read
+/// (`crate::numeric_env`).
 pub fn preflight(scope: Scope) -> Result<(), PreflightRefusal> {
     let bad: Vec<BadEnumValue> = ENUM_SETTINGS
         .iter()
@@ -885,7 +887,10 @@ pub fn preflight(scope: Scope) -> Result<(), PreflightRefusal> {
         .flat_map(crate::config_access::enum_bad_values)
         .collect();
     let files = crate::user_files::config_json_problems();
-    PreflightRefusal { scope, bad, invalid: Vec::new(), files }.into_result()
+    // A numeric env var that does not read is refused by every scope, as a
+    // wrong-typed `config.json` value is.
+    let invalid = crate::numeric_env::bad_values();
+    PreflightRefusal { scope, bad, invalid, files }.into_result()
 }
 
 /// Look up a registered setting by its dotted key.
@@ -1112,6 +1117,58 @@ mod tests {
             assert!(busy.scopes.contains(&scope), "{scope:?}");
         }
     }
+    /// Runs `body` with `var` set to `value`, restoring what it was.
+    fn with_env_var(var: &str, value: &str, body: impl FnOnce()) {
+        let prev = std::env::var(var).ok();
+        unsafe { std::env::set_var(var, value) };
+        body();
+        match prev {
+            Some(p) => unsafe { std::env::set_var(var, p) },
+            None => unsafe { std::env::remove_var(var) },
+        }
+    }
+
+    /// A numeric env var that is set but does not parse was read as unset:
+    /// `DARKMUX_RUNTIME_MAX_TOKENS=50k` meant no cap at all, while the same
+    /// value in `config.json` is refused as a wrong type. Every entry point
+    /// refuses it, naming the variable, what its value is (never the value:
+    /// an env var can hold a secret) and the accepted form.
+    #[test]
+    #[serial_test::serial]
+    fn a_set_but_unreadable_numeric_env_var_is_refused_by_every_preflight() {
+        with_env_var("DARKMUX_RUNTIME_MAX_TOKENS", "50k", || {
+            for scope in Scope::ALL {
+                let refusal = preflight(scope).expect_err("an unreadable number is refused").to_string();
+                assert!(refusal.contains("env var DARKMUX_RUNTIME_MAX_TOKENS"), "{scope:?}: {refusal}");
+                assert!(refusal.contains("set to text"), "names what the value is: {refusal}");
+                assert!(refusal.contains("an integer from 0 to 4294967295"), "names the accepted form: {refusal}");
+                assert!(!refusal.contains("50k"), "never echoes the value: {refusal}");
+            }
+        });
+        with_env_var("DARKMUX_SERVE_PORT", "70000", || {
+            let refusal = preflight(Scope::Serve).expect_err("a port out of range is refused").to_string();
+            assert!(refusal.contains("env var DARKMUX_SERVE_PORT: set to a number that is not an integer from 0 to 65535"), "{refusal}");
+            assert!(!refusal.contains("70000"), "{refusal}");
+        });
+        with_env_var("DARKMUX_RUNTIME_MAX_TOKENS", " 50000 ", || {
+            assert_eq!(preflight(Scope::Dispatch), Ok(()), "a readable value, padded, passes");
+        });
+        assert_eq!(preflight(Scope::Dispatch), Ok(()), "unset passes");
+    }
+
+    /// `runtime.memory.pressure_gate` is registered, so a bad value never
+    /// reaches the gate through an entry point that loads a model.
+    #[test]
+    #[serial_test::serial]
+    fn a_bad_pressure_gate_is_refused_by_every_dispatching_preflight() {
+        with_env_var("DARKMUX_MEMORY_PRESSURE_GATE", "sometimes", || {
+            for scope in DISPATCHING {
+                let refusal = preflight(*scope).expect_err("refused").to_string();
+                assert!(refusal.contains("runtime.memory.pressure_gate"), "{scope:?}: {refusal}");
+            }
+        });
+    }
+
     /// The port a URL is dialed on: the one it names, else its scheme's.
     #[test]
     fn a_urls_port_is_the_one_it_names_else_its_schemes() {
@@ -1466,6 +1523,7 @@ mod tests {
             ("Source", "provenance of a resolved value, not a setting"),
             ("Read", "how the registry reads a value, not a setting"),
             ("SetIn", "where a bad value was set, not a setting"),
+            ("Number", "the number type a numeric env var parses as (`numeric_env`), never a setting"),
             ("UserFileKind", "which kind of user file the unknown-key gate checked, not a setting"),
             ("Issue", "what the user-file key gate found at one key, not a setting"),
             ("Problem", "what the unknown-key gate found wrong with a file, not a setting"),

@@ -183,7 +183,9 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    against the schema's type, integer range, enum tokens and variant tags. The `extras` overflow is
    `#[schemars(skip)]` (it catches keys, it does not validate them); a flattened map that IS
    the schema (a hook rule's `match`) stays open, and each kind's `open_objects` test pins
-   that set. `_comment` is valid in any struct-shaped object, as a note for the reader; inside
+   that set; what such a schema cannot say is checked beside it (an extra `match` key must be a
+   `payload.<path>` predicate, `user_files::hook_match_issues`, so a typo there is refused rather
+   than dropped, which would widen the rule). `_comment` is valid in any struct-shaped object, as a note for the reader; inside
    a map it is an entry and is checked as one. A missing required key is refused too. The
    structural guard is `whatever_the_gate_passes_the_typed_load_accepts`: for every shipped
    template and example, and variants inserting `_comment`, an unknown key, or a value of
@@ -402,6 +404,14 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    refusal: today `fleet.mode` (a bad value only makes viewer links use the direct address, with
    a warning) and a hook rule's `match.level` / `match.category` (a bad value turns the hooks sink
    off, loudly, while the run continues without it).
+
+   A numeric setting's env tier follows the same rule (`darkmux-types/src/numeric_env.rs`): a
+   `DARKMUX_*` var a numeric accessor reads, set to a value that does not read as its number
+   (`DARKMUX_RUNTIME_MAX_TOKENS=50k`), is refused by every preflight and failed by doctor, as the
+   same value in `config.json` is refused by the user-file gate. The refusal names the variable,
+   the value's kind (text, a number out of range) and the accepted form, never the value: an env
+   var can hold a secret. `NUMERIC_ENV_VARS` is the list; a test fails on a var a numeric accessor
+   reads that it lacks.
 
    Retired spellings are refused too, naming the replacement ("`enforce` was renamed to `conclude`
    in 5.0"): a rename never reads the old word as the new one. Policy values name the action

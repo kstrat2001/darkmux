@@ -248,13 +248,49 @@ fn config_dirs_ack_is_named_as_retired() {
     assert!(msg.contains("`dirs.ack`: removed in 5.0"), "{msg}");
 }
 
+/// A hook rule's `match` takes any `payload.<path>` predicate (and a
+/// `_comment` note); `role_profiles` takes any role id.
 #[test]
 fn config_hook_match_payload_keys_and_role_profiles_are_free() {
     let doc = json!({
-        "hooks": {"rules": [{"file": "/tmp/x", "match": {"action": "a", "tool": "create_finding", "ok": true}}]},
+        "hooks": {"rules": [{"file": "/tmp/x", "match": {
+            "action": "a", "payload.tool_name": "create_finding", "payload.ok": true,
+            "payload.detections.count": 2, "_comment": "findings only",
+        }}]},
         "role_profiles": {"any-role": "p"},
     });
     assert_eq!(config_problem(&doc.to_string()), None);
+}
+
+/// A hook rule's `match` is open only to payload predicates. Any other key
+/// the typed load drops, so the rule matched more than it says: a misspelled
+/// `level` sent every `dispatch.*` record to a webhook meant for errors. It
+/// is refused at the gate, naming the closest valid key, and by every
+/// preflight.
+#[test]
+#[serial_test::serial]
+fn a_hook_match_key_that_is_no_field_and_no_payload_predicate_is_refused() {
+    let text = r#"{"hooks":{"rules":[{"match":{"action":"dispatch.*","levle":"error","paylod.ok":true,"tool":"x","payload.":1},"http":"http://127.0.0.1:9/x"}]}}"#;
+    let found = config_check_text(Path::new("config.json"), text).refusal.expect("refused");
+    let Problem::Keys(keys) = &found.problem else { panic!("expected key issues, got {found}") };
+    let refused = ["hooks.rules[0].match.levle", "hooks.rules[0].match.\"paylod.ok\"", "hooks.rules[0].match.\"payload.\"", "hooks.rules[0].match.tool"];
+    let mut found_paths = paths(keys);
+    found_paths.sort();
+    let mut want = refused.to_vec();
+    want.sort();
+    assert_eq!(found_paths, want, "a payload predicate names a path");
+    let issue = |p: &str| keys.iter().find(|k| k.path == p).unwrap();
+    assert_eq!(closest_of(issue("hooks.rules[0].match.levle")), Some("hooks.rules[0].match.level"));
+    assert_eq!(closest_of(issue("hooks.rules[0].match.\"paylod.ok\"")), Some("hooks.rules[0].match.\"payload.ok\""));
+    let msg = issue("hooks.rules[0].match.levle").to_string();
+    assert!(msg.contains("payload.<field>"), "names the predicate form among the valid keys: {msg}");
+
+    let cfg: crate::config::DarkmuxConfig = serde_json::from_str(text).unwrap();
+    let _guard = crate::config_access::set_config_for_test(cfg);
+    for scope in Scope::ALL {
+        let refusal = crate::config_enum::preflight(scope).expect_err("refused").to_string();
+        assert!(refusal.contains("unknown key `hooks.rules[0].match.levle`: did you mean `hooks.rules[0].match.level`?"), "{scope:?}: {refusal}");
+    }
 }
 
 /// What `darkmux init` writes must never be refused.
@@ -277,7 +313,9 @@ fn config_syntax_error_is_reported_not_json() {
 /// instead of silently accepting every typo.
 #[test]
 fn open_objects_are_declared() {
-    // HookMatch: its extra keys are payload fields matched against records.
+    // HookMatch: its extra keys are payload predicates matched against
+    // records. Open in the schema only: the config gate refuses an extra key
+    // that is not `payload.<path>` (a_hook_match_key_that_is_no_field_...).
     assert_eq!(open_objects::<crate::config::DarkmuxConfig>(), ["HookMatch"]);
     assert_eq!(open_objects::<crate::ProfileRegistry>(), Vec::<String>::new());
 }

@@ -4,8 +4,9 @@
 //! not the liveness markers and sink banners that precede it. Those lines are
 //! debugging data for logs, so they print when stderr is NOT an interactive
 //! terminal (CI logs, pipes, files, the daemon log, ACP stdio subprocesses),
-//! when `--verbose` is passed, when `DARKMUX_VERBOSE` is truthy, or when
-//! `config.json`'s `runtime.verbose` is `true`.
+//! when `--verbose` is passed, or when `DARKMUX_VERBOSE` is truthy, or it is
+//! not set to a falsy value and `config.json`'s `runtime.verbose` is `true`
+//! (env over config, as for every setting).
 //!
 //! What goes through [`verbose`]: purely informational lines (liveness echo,
 //! sink-enabled banners, dispatch progress headers). What never does: warnings,
@@ -30,16 +31,15 @@ pub fn verbose_flag() -> bool {
     VERBOSE_FLAG.load(Ordering::Relaxed)
 }
 
-/// `1`, `true`, `yes` or `on` (any case) is truthy; anything else is not.
-fn truthy(raw: &str) -> bool {
-    matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-}
-
-/// The pure decision. Verbose when stderr is not a terminal, or any explicit
-/// tier (flag, env, config) asks for it. An explicit "off" never suppresses a
-/// non-terminal stderr: log files keep their diagnostics.
+/// The pure decision. Verbose when stderr is not a terminal or the flag is
+/// passed; otherwise `env > config.json > off`, so `DARKMUX_VERBOSE=0` turns
+/// off a `runtime.verbose: true` for one shell. An explicit "off" never
+/// suppresses a non-terminal stderr: log files keep their diagnostics.
 pub fn decide(stderr_is_terminal: bool, flag: bool, env: Option<&str>, config: Option<bool>) -> bool {
-    !stderr_is_terminal || flag || env.is_some_and(truthy) || config == Some(true)
+    // One boolean vocabulary (`1`/`true`/`yes`/`on`, `0`/`false`/`no`/`off`,
+    // any case); anything else says nothing. A pure parse: it reads no config.
+    let env = env.and_then(crate::config_access::parse_bool_token);
+    !stderr_is_terminal || flag || env.or(config).unwrap_or(false)
 }
 
 /// Raw peek at `<darkmux-home>/config.json`'s `runtime.verbose`; `None` on any
@@ -91,6 +91,20 @@ mod tests {
         assert!(!decide(true, false, Some("0"), Some(false)));
         assert!(!decide(true, false, Some(""), None));
         assert!(!decide(true, false, Some("nonsense"), None));
+    }
+
+    /// `env > config.json`: a falsy `DARKMUX_VERBOSE` turns off a
+    /// `runtime.verbose: true` for one shell; a value that is neither
+    /// truthy nor falsy says nothing, so config decides.
+    #[test]
+    fn a_falsy_env_turns_off_config_verbose_on_a_terminal() {
+        for v in ["0", "false", "NO", " off "] {
+            assert!(!decide(true, false, Some(v), Some(true)), "env {v:?} beats config");
+        }
+        assert!(decide(true, false, Some("nonsense"), Some(true)), "an unrecognized env value defers to config");
+        assert!(decide(true, false, Some(""), Some(true)), "an empty env value defers to config");
+        assert!(decide(true, true, Some("0"), Some(true)), "the --verbose flag still wins");
+        assert!(decide(false, false, Some("0"), Some(true)), "a non-terminal stays verbose");
     }
 
     #[test]

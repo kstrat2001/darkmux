@@ -2193,7 +2193,8 @@ pub struct HookMatch {
     /// permits exactly one flattened field per struct, so a genuinely
     /// nested second field would collide with this one). See
     /// [`HookMatch::payload_predicates`] for the accessor that reads
-    /// them back out.
+    /// them back out. Any other key here is a typo the config gate refuses
+    /// (`user_files::hook_match_issues`): dropped, it would widen the rule.
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -2216,8 +2217,8 @@ impl HookMatch {
     /// field, e.g. `{"action": "dispatch.tool", "payload.tool_name":
     /// "create_finding", "payload.ok": true}` yields `("tool_name",
     /// "create_finding")` and `("ok", true)`. A remaining `extras` key that
-    /// does NOT start with `payload.` is unrelated forward-compat overflow
-    /// and is not a predicate — see the struct doc.
+    /// does NOT start with `payload.` is not a predicate; the config gate
+    /// refuses it (see the field doc).
     pub fn payload_predicates(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
         self.extras
             .iter()
