@@ -307,3 +307,18 @@ fn the_gates_review_rerun_command_names_only_declared_inputs() {
     }
     assert!(line.contains("/wt/x"), "{line}");
 }
+
+/// Every JSON type a refusal can name, so a refusal never says the wrong one.
+#[test]
+fn json_type_phrase_names_every_json_type() {
+    for (value, phrase) in [
+        (serde_json::json!(null), "JSON null"),
+        (serde_json::json!(true), "a JSON boolean"),
+        (serde_json::json!(1), "a JSON number"),
+        (serde_json::json!("s"), "a JSON string"),
+        (serde_json::json!([1]), "a JSON array"),
+        (serde_json::json!({ "k": 1 }), "a JSON object"),
+    ] {
+        assert_eq!(json_type_phrase(&value), phrase, "{value}");
+    }
+}
