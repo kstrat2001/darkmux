@@ -4128,6 +4128,19 @@
         "127.0.0.1:8765".parse().expect("addr parses")
     }
 
+    /// The wordmark opens the banner only on a terminal: six rows of art,
+    /// the tagline and a blank line, each ended. Piped or redirected
+    /// output gets nothing.
+    #[test]
+    fn the_wordmark_is_printed_only_to_a_terminal() {
+        assert_eq!(wordmark(false), "");
+        let shown = wordmark(true);
+        assert!(shown.contains("██████╗  █████╗ ██████╗ ██╗  ██╗███╗   ███╗██╗   ██╗██╗  ██╗"), "{shown}");
+        assert!(shown.contains("╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝"), "{shown}");
+        assert!(shown.ends_with("\n  🤖 Mission control for your AI fleet.\n\n"), "{shown}");
+        assert_eq!(shown.lines().count(), 8, "{shown}");
+    }
+
     #[test]
     fn startup_banner_contains_core_info() {
         let flows = PathBuf::from("/tmp/darkmux-flows-banner-test");

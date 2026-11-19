@@ -1573,6 +1573,22 @@ fn sandbox_configured_now() -> Option<darkmux_sandbox::BackendKind> {
     darkmux_sandbox::selected_in(&darkmux_types::config::DarkmuxConfig::load_from(&path)).ok()
 }
 
+/// The ASCII-art wordmark and tagline the startup banner opens with, each
+/// line ended, then a blank line: only for a terminal (`terminal`), so piped
+/// or redirected logs stay clean; empty otherwise.
+fn wordmark(terminal: bool) -> String {
+    if !terminal {
+        return String::new();
+    }
+    let art = r#"██████╗  █████╗ ██████╗ ██╗  ██╗███╗   ███╗██╗   ██╗██╗  ██╗
+██╔══██╗██╔══██╗██╔══██╗██║ ██╔╝████╗ ████║██║   ██║╚██╗██╔╝
+██║  ██║███████║██████╔╝█████╔╝ ██╔████╔██║██║   ██║ ╚███╔╝ 
+██║  ██║██╔══██║██╔══██╗██╔═██╗ ██║╚██╔╝██║██║   ██║ ██╔██╗ 
+██████╔╝██║  ██║██║  ██║██║  ██╗██║ ╚═╝ ██║╚██████╔╝██╔╝ ██╗
+╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝"#;
+    format!("{}\n  🤖 Mission control for your AI fleet.\n\n", darkmux_types::style::accent(art))
+}
+
 pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Result<()> {
     // (#2988 review) The config gate every entry point runs: a wrong-typed
     // value (`serve.read_auth: "true"`) or a retired key would otherwise be
@@ -1639,19 +1655,9 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         let flows_dir_exists = flows_dir.exists();
         let missions_dir = darkmux_crew::loader::missions_dir();
         let missions_dir_exists = missions_dir.exists();
-        // Print the ASCII-art wordmark + tagline only when stdout is a real
+        // The ASCII-art wordmark + tagline, only when stdout is a real
         // terminal (so piped / redirected logs stay clean).
-        if std::io::stdout().is_terminal() {
-            let art = r#"██████╗  █████╗ ██████╗ ██╗  ██╗███╗   ███╗██╗   ██╗██╗  ██╗
-██╔══██╗██╔══██╗██╔══██╗██║ ██╔╝████╗ ████║██║   ██║╚██╗██╔╝
-██║  ██║███████║██████╔╝█████╔╝ ██╔████╔██║██║   ██║ ╚███╔╝ 
-██║  ██║██╔══██║██╔══██╗██╔═██╗ ██║╚██╔╝██║██║   ██║ ██╔██╗ 
-██████╔╝██║  ██║██║  ██║██║  ██╗██║ ╚═╝ ██║╚██████╔╝██╔╝ ██╗
-╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝"#;
-            println!("{}", darkmux_types::style::accent(art));
-            println!("  🤖 Mission control for your AI fleet.");
-            println!();
-        }
+        print!("{}", wordmark(std::io::stdout().is_terminal()));
 
         // Print the startup panel (viewer URL, counts, warnings).
         let phases_dir = darkmux_crew::loader::phases_dir();
