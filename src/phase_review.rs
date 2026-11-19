@@ -541,7 +541,7 @@ pub(crate) fn phase_review_output_at(
                     phase_id,
                 ),
             );
-            eprintln!("warning: dispatch failed ({e}); emitting empty review");
+            eprintln!("{}", dispatch_failed_warning(&e));
             return Err(anyhow::anyhow!("dispatch failed: {e}"));
         }
     };
@@ -584,9 +584,30 @@ pub(crate) fn phase_review_output_at(
     Ok(output)
 }
 
+/// The warning a failed review dispatch prints. The error can quote an
+/// endpoint's reply, so it is escaped (`escape_text_keeping_lines`): shown,
+/// never acted on by the terminal.
+fn dispatch_failed_warning(e: &anyhow::Error) -> String {
+    let shown = darkmux_types::user_files::escape_text_keeping_lines(&e.to_string());
+    format!("warning: dispatch failed ({shown}); emitting empty review")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An endpoint error holding an OSC 0 title, a screen clear and an OSC 52
+    /// clipboard write prints as text in the dispatch-failed warning.
+    #[test]
+    fn the_dispatch_failed_warning_prints_a_hostile_error_inert() {
+        let inert = |t: &str| !t.chars().any(|c| (c.is_control() && c != '\n' && c != '\t') || c == '\u{202e}');
+        let line = dispatch_failed_warning(&anyhow::anyhow!("endpoint said {}", "\x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}"));
+        assert!(inert(&line), "{line:?}");
+        assert_eq!(
+            dispatch_failed_warning(&anyhow::anyhow!("café 日本語")),
+            "warning: dispatch failed (café 日本語); emitting empty review"
+        );
+    }
 
     // ── phase review tests ─────────────────────────────────────────────
 

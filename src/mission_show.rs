@@ -226,7 +226,11 @@ pub fn render_text(show: &MissionShow) -> String {
         lines.push(format!("Tokens: {}", crate::run_list::grouped(tokens)));
     }
     lines.push(format!("Viewer: {}", show.link));
-    lines.join("\n")
+    // A step's error, its model and a peer's run row are text another system
+    // wrote (an endpoint's error body, a model id, a peer's record), so the
+    // whole text goes through ONE escape step: an escape sequence in any of
+    // it is shown, never acted on, and every line still reads as a line.
+    darkmux_types::user_files::escape_text_keeping_lines(&lines.join("\n"))
 }
 
 #[cfg(test)]
@@ -441,5 +445,28 @@ mod tests {
         assert_eq!(v["graph"]["mission_id"], "show-m3");
         assert_eq!(v["config"]["id"], "machine-status");
         assert!(v["config"]["inputs"].is_array());
+    }
+
+    /// An OSC 0 title, a screen clear and an OSC 52 clipboard write in a
+    /// mission's text print as text, and plain text prints unchanged.
+    #[test]
+    fn render_text_prints_hostile_text_inert_and_plain_text_unchanged() {
+        let hostile = "\x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}";
+        let show = |id: &str, description: &str| MissionShow {
+            id: id.to_string(),
+            status: None,
+            description: Some(description.to_string()),
+            config: None,
+            graph: None,
+            runs: Vec::new(),
+            tokens: None,
+            link: "http://localhost/#mission=m".to_string(),
+        };
+        let text = render_text(&show(&format!("m{hostile}"), &format!("Fix it{hostile}")));
+        assert!(!text.chars().any(|c| (c.is_control() && c != '\n') || c == '\u{202e}'), "{text:?}");
+        assert_eq!(
+            render_text(&show("m-café", "日本語 🇺🇸")),
+            "Mission m-café\n日本語 🇺🇸\nRuns:\nViewer: http://localhost/#mission=m"
+        );
     }
 }

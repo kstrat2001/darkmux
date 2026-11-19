@@ -605,23 +605,18 @@ fn peer_mission_lines(peer: &[Run], now: u64, width: Option<usize>) -> Vec<Strin
     for line in wrap_indented(&header, 0, width) {
         out.push(style::dim(&line));
     }
-    let id_w = peer.iter().map(|r| r.id.chars().count()).max().unwrap_or(0).clamp(1, 40);
-    let machine_w = peer
-        .iter()
-        .map(|r| r.machine.as_deref().unwrap_or("unknown machine").chars().count())
-        .max()
-        .unwrap_or(0)
-        .clamp(1, 24);
+    // A peer row's id and machine are the peer's own text: each is a
+    // `run_list::cell`, escaped and held to its column's display width.
+    let machine_of = |r: &Run| r.machine.as_deref().unwrap_or("unknown machine").to_string();
+    let id_w = peer.iter().map(|r| crate::run_list::cell_width(&r.id)).max().unwrap_or(0).clamp(1, 40);
+    let machine_w = peer.iter().map(|r| crate::run_list::cell_width(&machine_of(r))).max().unwrap_or(0).clamp(1, 24);
     for r in peer {
-        let id = ellipsize(&r.id, id_w);
-        let machine = ellipsize(r.machine.as_deref().unwrap_or("unknown machine"), machine_w);
+        let id = crate::run_list::cell(&r.id, id_w);
+        let machine = crate::run_list::cell(&machine_of(r), machine_w);
         // No timestamp at all is an unknown age, never "now".
         let age = peer_last_seen(r).map_or_else(|| "—".to_string(), |ts| relative_age(now, ts));
         let status = peer_status_word(r.status, r.abandoned_reason);
-        out.push(format!(
-            "  ◇ {id:<id_w$}  {machine:<machine_w$}  {age:>age_w$}  {status}",
-            age_w = AGE_COLS,
-        ));
+        out.push(format!("  ◇ {id}  {machine}  {age:>age_w$}  {status}", age_w = AGE_COLS));
     }
     out
 }
@@ -5636,6 +5631,24 @@ mod tests {
         let rows = peer_mission_lines(&[peer("review-peer-2", RunStatus::Running, None)], BOARD_NOW, Some(100));
         let row = strip_ansi(rows.last().unwrap());
         assert_eq!(row, "  ◇ review-peer-2  peer-a    —  running");
+    }
+
+    /// A peer's mission id and machine name holding an OSC 0 title, a screen
+    /// clear and an OSC 52 clipboard write print as text, cut to the column.
+    /// Colors are forced off (a process-global override, hence serial) so
+    /// the only control bytes the row could hold are the peer's.
+    #[test]
+    #[serial_test::serial]
+    fn a_hostile_peer_row_prints_inert_within_its_columns() {
+        let hostile = "\x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}";
+        let mut r = peer(&format!("m{hostile}"), RunStatus::Running, None);
+        r.machine = Some(format!("p{hostile}"));
+        style::set_colorize_override(Some(false));
+        let rows = peer_mission_lines(&[r], BOARD_NOW, Some(100));
+        style::set_colorize_override(None);
+        let row = rows.last().unwrap();
+        assert!(!row.chars().any(|c| c.is_control() || c == '\u{202e}'), "{row:?}");
+        assert!(darkmux_flow::hooks::display_columns(row) <= 4 + 40 + 2 + 24 + 2 + AGE_COLS + 2 + "running".len(), "{row:?}");
     }
 
     #[test]
