@@ -260,7 +260,10 @@ pub fn load(id: &str) -> Result<LoadedMissionConfig> {
     } else {
         avail.join(", ")
     };
-    bail!("mission config \"{id}\" not found. Available: {listed}")
+    let hint = darkmux_types::user_files::closest(id, avail.iter().map(String::as_str))
+        .map(|c| format!("; the closest is `{c}`"))
+        .unwrap_or_default();
+    bail!("mission config \"{id}\" not found{hint}. Available: {listed}")
 }
 
 /// Every discoverable mission-config id, unioned across all three tiers,
@@ -465,6 +468,16 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("not found"));
         assert!(msg.contains("review"), "embedded ids should be listed: {msg}");
+    }
+
+    /// (#3634) A misspelled id names the closest launchable one.
+    #[test]
+    #[serial_test::serial]
+    fn a_misspelled_mission_config_id_names_the_closest() {
+        let tmp = TempDir::new().unwrap();
+        let _guard = CrewDirGuard::new(tmp);
+        let msg = load("coder-phse").unwrap_err().to_string();
+        assert!(msg.contains("not found; the closest is `coder-phase`"), "{msg}");
     }
 
     #[test]
