@@ -218,6 +218,22 @@ darkmux release.
   hashes it, and the runtime sends the prompt exactly as passed. A container run is unchanged. The
   model still sees the workspace's true host path under a sandbox on the host, so request bodies
   there still carry the path (under your home folder), including those sent to a hosted endpoint.
+- **Flow records: lab runs stay off hooks, a failed write is said, and the audit trail's gaps stay
+  visible.** Found by the 2026-11-17 layer review. A hook rule that matched everything delivered a lab
+  run's records off the machine; hooks now drop them by the same rule that keeps them off the fleet hub
+  (contract 3). A flow record that could not be written (a full disk, a read-only volume, a flows dir
+  under a regular file) vanished without a trace when no audit, Redis or hooks sink was set; the local
+  sink now says it on stderr once per day file per process, naming the file and the OS error, and the
+  work still runs. A tee says a failing child once per process instead of once per record. `darkmux
+  doctor` gains `flow records writable`, which fails when the flows dir cannot be written. A dropped
+  audit write is no longer visible only until UTC midnight: doctor's `audit write integrity` and `flow
+  integrity-check` read the `audit.write_failed` breadcrumbs over every day the audit trail covers, and
+  `flow integrity-check --json` gains `dropped_writes` (additive). An audit day file emptied or cut to
+  whitespace now restarts its chain with a restart sidecar and is flagged `chain_restarted` (before the
+  next write too), and doctor warns on a restart even with nothing set aside. **Exit code change:** `flow
+  integrity-check` exits **3** when every chain verifies but the trail is incomplete (a restarted chain
+  or a recorded dropped write); it used to exit 0. A break still exits 2.
+
 - **A loopback caller is this machine only when its process is not sandboxed work (#3645).** The viewer
   daemon and `darkmux client serve` took any loopback request with a local `Host` and no proxy header for
   the operator. A process in a sandbox on the host (a Seatbelt or Landlock dispatch's bash, a host-run
@@ -232,6 +248,7 @@ darkmux release.
   double-forks into a session of its own, or an app the sandbox has the system open, still reads as the
   operator. **Behavior change:** another OS user's process on the same machine now reads as remote,
   because the lookup cannot see it.
+
 - **Run stats 2.5.0: a run another machine served no longer reports this machine's power as its own.**
   A hosted-seat or remote-peer lab run, while this machine's GPU was busy (a parallel local lab run),
   reported this machine's watts, energy per 1k tokens and thermal states as the run's, and `lab
@@ -269,6 +286,7 @@ darkmux release.
   could fill memory within the 600 s default bound. Each stream now keeps its first 768 KiB and last
   256 KiB, with a note where the middle was naming the bytes cut, and a shell step whose output was cut
   is recorded as degraded.
+
 - **Text a model, a peer or an endpoint wrote can no longer drive your terminal.** `mod list` and
   `mod show` (a kit a local seat wrote through `create_mod`), `finding list` and `finding show`,
   `run list` (its rows, the `--usage` breakdown and an endpoint's `reported model`), `run show`,
@@ -288,6 +306,7 @@ darkmux release.
   step's output shows as typed), a mission's sign-off prompt, and `init --add-engine`'s question.
   Invisible tag characters and blank fillers are shown. `--json` output is unchanged. Found by the
   2026-11-17 layer review.
+
 - **A mission step waiting its turn reads waiting, not running (#3195).** Steps admitted together
   behind one slot (an endpoint with no `limits.concurrent_calls` runs its calls one at a time), or a
   local step waiting for its wave's model (a later wave, or its own wave's load), all read running from

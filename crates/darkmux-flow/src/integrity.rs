@@ -230,6 +230,9 @@ fn read_small_tail(path: &Path, file: &mut std::fs::File, file_len: u64) -> Resu
     file.read_to_end(&mut raw)
         .with_context(|| format!("reading audit log {}", path.display()))?;
     recover_torn_tail(path, file, 0, &mut raw)?;
+    if holds_only_whitespace(&raw) {
+        mark_restart(path, &raw)?;
+    }
     resolve_prev_hash_from_contents(&raw, path)
 }
 
@@ -304,6 +307,20 @@ fn determine_tail_hash(path: &Path, file: &mut std::fs::File, file_len: u64) -> 
     }
 }
 
+/// The length of the locked day file, after marking a restart when it was
+/// found emptied ([`emptied_after_creation`]): the write about to reseed it
+/// must not read as a fresh day.
+#[cfg(unix)]
+fn settled_len(path: &Path, file: &std::fs::File) -> Result<u64> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading metadata of {}", path.display()))?;
+    if metadata.len() == 0 && emptied_after_creation(&metadata) {
+        mark_restart(path, b"")?;
+    }
+    Ok(metadata.len())
+}
+
 /// The locked transaction body of [`audit_record_at`] — reads the chain's
 /// current tail hash from `file` (the SAME file `flock`'s held on, opened
 /// by the shared `darkmux_types::flock::with_locked_file` helper) and
@@ -312,12 +329,7 @@ fn determine_tail_hash(path: &Path, file: &mut std::fs::File, file_len: u64) -> 
 /// stays separate from this crate's own read/parse/append logic.
 #[cfg(unix)]
 fn audit_record_at_locked(record: &FlowRecord, path: &Path, file: &mut std::fs::File) -> Result<()> {
-    use std::io::{Seek, SeekFrom, Write as _};
-
-    let file_len = file
-        .metadata()
-        .with_context(|| format!("reading metadata of {}", path.display()))?
-        .len();
+    let file_len = settled_len(path, file)?;
 
     let (prev_hash, write_header) = determine_tail_hash(path, file, file_len)?;
 
@@ -335,12 +347,6 @@ fn audit_record_at_locked(record: &FlowRecord, path: &Path, file: &mut std::fs::
     let hash_hex = audit_hash_of(&to_write).context("computing audit hash")?;
     let line = format!("{hash_hex} {record_json}");
 
-    // Append (after seeking to end). flock holds. The header (fresh file)
-    // and the record line each carry their own `\n` and go out in ONE
-    // `write_all`, so a crash can tear the tail but can never leave a
-    // complete line without its terminator for the next append to glue onto.
-    file.seek(SeekFrom::End(0))
-        .with_context(|| format!("seek to end of {}", path.display()))?;
     let mut out = String::new();
     if let Some(header) = write_header {
         out.push_str(&header);
@@ -348,11 +354,23 @@ fn audit_record_at_locked(record: &FlowRecord, path: &Path, file: &mut std::fs::
     }
     out.push_str(&line);
     out.push('\n');
+    append_synced(path, file, &out)
+}
+
+/// Append `out` at the end of the locked audit file and sync it. flock
+/// holds. The header (fresh file) and the record line each carry their own
+/// `\n` and go out in ONE `write_all`, so a crash can tear the tail but can
+/// never leave a complete line without its terminator for the next append to
+/// glue onto.
+#[cfg(unix)]
+fn append_synced(path: &Path, file: &mut std::fs::File, out: &str) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write as _};
+    file.seek(SeekFrom::End(0))
+        .with_context(|| format!("seek to end of {}", path.display()))?;
     file.write_all(out.as_bytes())
         .with_context(|| format!("appending record to audit log {}", path.display()))?;
     file.sync_all()
-        .with_context(|| format!("syncing audit log {}", path.display()))?;
-    Ok(())
+        .with_context(|| format!("syncing audit log {}", path.display()))
 }
 
 /// `true` when `tail` (the bytes after the file's last `\n`) is a whole
@@ -388,6 +406,56 @@ fn header_shaped(tail: &[u8]) -> bool {
 /// Sidecar-name marker for bytes set aside from offset 0: the whole file went,
 /// so the chain restarts (#3074).
 const RESTART_SIDECAR_MARK: &str = ".torn-restart-";
+
+/// Whether an empty day file was emptied after it was created: last modified
+/// later than it was born. Every day file this sink writes starts with its
+/// header, sent in one write with its first record, so an emptied one is a
+/// chain that was cut. A file only just created (born and last modified at
+/// once: its creator has yet to take the lock) is not one, and neither is any
+/// empty file on a filesystem that records no creation time.
+fn emptied_after_creation(metadata: &fs::Metadata) -> bool {
+    matches!((metadata.created(), metadata.modified()), (Ok(born), Ok(modified)) if modified > born)
+}
+
+/// Whether a day file's bytes are whitespace and nothing else: no writer
+/// leaves that, so its chain was cut.
+fn holds_only_whitespace(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.iter().all(u8::is_ascii_whitespace)
+}
+
+/// Whether a day file the walk read no line from was cut, judged again under
+/// a shared lock on it, so no darkmux writer is partway through a write: on
+/// Linux a write moves the modification time before the size grows, and a
+/// stat taken in between reads exactly like an emptied file. The lock waits
+/// on a writer stopped mid-first-write (SIGSTOP), as writers already wait on
+/// each other.
+fn lineless_file_is_cut(path: &Path) -> bool {
+    #[cfg(unix)]
+    let Ok(Some(_shared)) = darkmux_types::flock::lock_shared_existing(path) else { return false };
+    let stat = fs::metadata(path).ok();
+    fs::read(path).is_ok_and(|contents| lineless_file_was_cut(stat.as_ref(), &contents))
+}
+
+/// Whether a day file holding no line (its `contents`) was cut rather than
+/// just created: whitespace only, or emptied after its creation. `stat` is
+/// the file's metadata taken BEFORE `contents` was read, and its size must
+/// agree with what was read: a new day file whose first write lands while it
+/// is checked grows under the reader, and a stat taken after the read would
+/// show it written to (modified after it was born) while the bytes read are
+/// still none, which is not a cut.
+pub(crate) fn lineless_file_was_cut(stat: Option<&fs::Metadata>, contents: &[u8]) -> bool {
+    let Some(stat) = stat.filter(|md| md.len() == contents.len() as u64) else { return false };
+    holds_only_whitespace(contents) || (contents.is_empty() && emptied_after_creation(stat))
+}
+
+/// Record that the chain of the day file at `path` starts over: a restart
+/// sidecar holding `bytes` (what the file held, nothing when it was emptied),
+/// which `integrity_check_file` reports as `chain_restarted`.
+#[cfg(unix)]
+fn mark_restart(path: &Path, bytes: &[u8]) -> Result<()> {
+    let sidecar = torn_sidecar_path(path, true);
+    write_synced(&sidecar, bytes).with_context(|| format!("writing restart sidecar {}", sidecar.display()))
+}
 
 /// Path of the sidecar a torn tail of `path` is moved into:
 /// `<day file>.torn-<unix millis>` (`.torn-restart-<millis>` when the file's
@@ -575,7 +643,7 @@ fn header_schema_version(header_line: &str) -> Option<String> {
 pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
     let mut report = walk_chain(path)?;
     report.torn_tails = torn_sidecars_of(path);
-    report.chain_restarted = report.torn_tails.iter().any(|t| t.contains(RESTART_SIDECAR_MARK));
+    report.chain_restarted |= report.torn_tails.iter().any(|t| t.contains(RESTART_SIDECAR_MARK));
     Ok(report)
 }
 
@@ -593,7 +661,7 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
             break_reason: None,
             writer_schema_version: None,
             torn_tails: Vec::new(),
-            chain_restarted: false,
+            chain_restarted: lineless_file_is_cut(path),
         });
     }
 
@@ -749,8 +817,9 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
 ///
 /// | code | meaning |
 /// |---|---|
-/// | `0` | every chain walked clean |
+/// | `0` | every chain walked clean, and no dropped audit write is recorded |
 /// | `2` | a chain BREAK was found, including a file whose header is not in the byte-hash format (nothing in it was verified) |
+/// | `3` | every chain verifies but the trail is incomplete: a chain restarted (`chain_restarted`), or `dropped` holds a day the tee recorded dropped audit writes on |
 ///
 /// This does NOT change the chain's inherent ceiling: an attacker with
 /// write access can still reach exit `0` by rewriting a whole file —
@@ -758,11 +827,61 @@ fn walk_chain(path: &Path) -> Result<IntegrityReport> {
 /// of any anchorless local hash chain and is documented in SECURITY.md.
 /// What it removes is the strictly *simpler* second route, where merely
 /// deleting the format marker skipped verification silently.
-pub fn integrity_exit_code(reports: &[IntegrityReport]) -> i32 {
+pub fn integrity_exit_code(reports: &[IntegrityReport], dropped: &[DroppedAuditWrites]) -> i32 {
     if reports.iter().any(|r| !r.chain_valid) {
-        return 2;
+        2
+    } else if reports.iter().any(|r| r.chain_restarted) || !dropped.is_empty() {
+        3
+    } else {
+        0
     }
-    0
+}
+
+/// Audit writes one UTC day lost: the `audit.write_failed` breadcrumbs the
+/// tee left in that day's local flow file (#877). The hash chain cannot show
+/// such a gap (the next record links to the file's tail), so the breadcrumb
+/// is the only record of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DroppedAuditWrites {
+    /// The UTC day, `YYYY-MM-DD`.
+    pub day: String,
+    /// The local flow file holding the breadcrumbs.
+    pub path: String,
+    /// How many audit writes failed that day.
+    pub count: u64,
+}
+
+/// The dropped audit writes in `flows_dir`'s day files over the days the
+/// audit trail in `audit_dir` covers: from its oldest day file's day on (from
+/// `today` when it has none), a day with no audit file of its own included,
+/// since a day whose every audit write failed leaves none. A dropped write
+/// therefore stays reported after its day ends, for as long as the trail
+/// covers that day; archiving the audit files through that day retires it.
+pub fn dropped_audit_writes_in(flows_dir: &Path, audit_dir: &Path, today: &str) -> Vec<DroppedAuditWrites> {
+    let oldest_audit_day = crate::reader::day_files(audit_dir).into_iter().next().map(|(day, _)| day);
+    let since = oldest_audit_day.map_or_else(|| today.to_string(), |day| day.min(today.to_string()));
+    crate::reader::day_files(flows_dir)
+        .into_iter()
+        .filter(|(day, _)| *day >= since)
+        .filter_map(|(day, path)| {
+            let count = audit_write_failures_in(&path);
+            (count > 0).then(|| DroppedAuditWrites { day, path: path.display().to_string(), count })
+        })
+        .collect()
+}
+
+/// [`dropped_audit_writes_in`] over this process's flows and audit dirs.
+pub fn dropped_audit_writes() -> Vec<DroppedAuditWrites> {
+    dropped_audit_writes_in(&crate::flows_dir(), &crate::audit_dir(), &crate::day_utc_now())
+}
+
+/// The `audit.write_failed` records in one day file. Only a line naming the
+/// action is read, and only its own `action` field.
+fn audit_write_failures_in(path: &Path) -> u64 {
+    let Ok(text) = fs::read_to_string(path) else { return 0 };
+    let wire = crate::FlowAction::AuditWriteFailed.as_str();
+    let breadcrumbs = text.lines().filter(|line| line.contains(wire));
+    breadcrumbs.filter(|line| crate::reader::action_field(line).as_deref() == Some(wire)).count() as u64
 }
 
 /// Walk every audit file under `audit_dir()`. Sorted by filename for
@@ -822,11 +941,13 @@ pub struct IntegrityReport {
     /// can inspect it. Empty (and omitted) when nothing was set aside.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub torn_tails: Vec<String>,
-    /// (#3074) A non-empty day file was set aside whole and reseeded, so its
-    /// chain starts over: `chain_valid` covers only what was written after the
-    /// restart. The chain has no external anchor, so a day file cut to a
-    /// header-shaped prefix is indistinguishable from a crash during the first
-    /// write; this makes the restart visible instead of reading as plain valid.
+    /// (#3074) A day file's chain starts over: its bytes were set aside whole
+    /// and it was reseeded, or it was found emptied or cut to whitespace (now,
+    /// or before a write that reseeded it), so `chain_valid` covers only what
+    /// was written after the restart. The chain has no external anchor, so a
+    /// day file cut to a header-shaped prefix is indistinguishable from a crash
+    /// during the first write; this makes the restart visible instead of
+    /// reading as plain valid, and `integrity_exit_code` exits 3 for it.
     /// A file cut to exactly its whole header line leaves no bytes to set
     /// aside and is not flagged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
