@@ -418,6 +418,24 @@ impl SeatbeltBackend {
             .collect()
     }
 
+    /// The environment the program `cmd` plans is given ([`CARRY`]): each
+    /// variable [`Self::launcher_environment`] carried, under its own name,
+    /// in the order carried. What a caller that checks a planned sandbox's
+    /// environment reads, since the launcher's own holds only `PATH` and
+    /// the carried variables.
+    pub fn program_environment(cmd: &Command) -> Vec<(String, String)> {
+        let mut carried: Vec<(usize, String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                let n = k.to_str()?.strip_prefix(CARRIED)?.parse().ok()?;
+                let (key, value) = v?.to_str()?.split_once('=')?;
+                Some((n, key.to_string(), value.to_string()))
+            })
+            .collect();
+        carried.sort_by_key(|(n, ..)| *n);
+        carried.into_iter().map(|(_, k, v)| (k, v)).collect()
+    }
+
     /// The program and its arguments: the entrypoint, then the command.
     fn program(policy: &SandboxPolicy) -> Vec<String> {
         policy.entrypoint.iter().cloned().chain(policy.command.iter().cloned()).collect()
@@ -894,6 +912,24 @@ mod tests {
         assert!(listing.contains("N\tdarkmux-older-record\trunning"), "{listing}");
         assert_eq!(launchers, Some(vec![pid]));
         assert!(ended.success() && gone && !d.exists(), "a record that compares is still ended by remove");
+    }
+
+    /// A planned sandbox's launcher runs with only `PATH` and the carried
+    /// variables, and [`SeatbeltBackend::program_environment`] reads back
+    /// exactly the policy's environment the program is given, in order.
+    #[test]
+    fn the_program_environment_is_the_policys_carried_through_the_launcher() {
+        let mut p = policy(Vec::new(), Network::None);
+        p.env = vec![("A".into(), "1=2".into()), ("PATH".into(), "/p".into()), ("BASH_FUNC_x%%".into(), "() { :; }".into()), ("".into(), "dropped".into())];
+        let (cmd, _) = SeatbeltBackend.run(&p);
+        let launcher: Vec<String> = cmd.get_envs().map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+        assert!(launcher.iter().all(|k| k == "PATH" || k.starts_with(CARRIED)), "{launcher:?}");
+        let tmp = canonical(&state_root().join("darkmux-dispatch-1/tmp")).to_string_lossy().into_owned();
+        assert_eq!(
+            SeatbeltBackend::program_environment(&cmd),
+            [("A", "1=2"), ("PATH", "/p"), ("BASH_FUNC_x%%", "() { :; }"), ("HOME", tmp.as_str()), ("TMPDIR", tmp.as_str())]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
     }
 
     /// A policy's environment reaches the program and nothing the launcher

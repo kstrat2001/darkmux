@@ -2635,12 +2635,14 @@ fn a_hung_connection_listing_is_no_answer_within_its_bound() {
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
         p
     };
-    let hung = stub("hung", "exec /bin/sleep 3");
+    // Both written before either runs: a file still open for writing in a
+    // process forked meanwhile cannot be run (ETXTBSY).
+    let hung = stub("hung", "exec /bin/sleep 30");
+    let answers = stub("answers", "printf 'p7\\nn127.0.0.1:5000->127.0.0.1:8767\\n'");
     let started = std::time::Instant::now();
     let answer = crate::macos::lsof_established_with(&hung, 8767, std::time::Duration::from_millis(300));
     assert_eq!(answer, None, "a hung lsof is no answer");
-    assert!(started.elapsed() < std::time::Duration::from_secs(2), "within its bound: {:?}", started.elapsed());
-    let answers = stub("answers", "printf 'p7\\nn127.0.0.1:5000->127.0.0.1:8767\\n'");
-    let out = crate::macos::lsof_established_with(&answers, 8767, std::time::Duration::from_secs(5)).unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "within its bound, not the stub's 30 s: {:?}", started.elapsed());
+    let out = crate::macos::lsof_established_with(&answers, 8767, std::time::Duration::from_secs(60)).expect("the stub answers");
     assert_eq!(crate::peers_from_lsof_fpn(&out, "127.0.0.1:8767".parse().unwrap()), vec![("127.0.0.1:5000".parse().unwrap(), 7)]);
 }

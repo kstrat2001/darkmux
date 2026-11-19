@@ -7035,12 +7035,9 @@ S(("127.0.0.1", port), H).serve_forever()
         cfg.workspace = root.path().join("ws");
         cfg.host_out = root.path().join("out");
         let (cmd, _) = container_command(&cfg, &darkmux_sandbox::SeatbeltBackend);
-        let envs: Vec<(String, Option<String>)> = cmd
-            .get_envs()
-            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned())))
-            .collect();
+        let envs = darkmux_sandbox::SeatbeltBackend::program_environment(&cmd);
         let ws = root.path().join("ws").canonicalize().unwrap().display().to_string();
-        assert!(envs.contains(&("DARKMUX_RUNTIME_WORKSPACE".to_string(), Some(ws))), "{envs:?}");
+        assert!(envs.contains(&("DARKMUX_RUNTIME_WORKSPACE".to_string(), ws)), "{envs:?}");
         assert!(!envs.iter().any(|(k, _)| k == "CARGO_PKG_NAME"), "the host's environment rode along: {envs:?}");
     }
 

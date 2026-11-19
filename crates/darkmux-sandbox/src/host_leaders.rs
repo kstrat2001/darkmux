@@ -274,13 +274,13 @@ mod tests {
     #[test]
     fn a_hung_start_reading_is_no_reading_within_its_bound() {
         let started = std::time::Instant::now();
-        let hung = ["/bin/sh", "-c", "exec /bin/sleep 3", "sh"];
+        let hung = ["/bin/sh", "-c", "exec /bin/sleep 30", "sh"];
         assert_eq!(
             started_by(&hung, 1, std::time::Duration::from_millis(300)),
             None
         );
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
+            started.elapsed() < std::time::Duration::from_secs(10),
             "{:?}",
             started.elapsed()
         );

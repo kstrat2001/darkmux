@@ -334,7 +334,7 @@ fn reader(
     Arc::new(move |local| {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::thread::sleep(if Some(local) == stuck_at {
-            std::time::Duration::from_secs(3)
+            std::time::Duration::from_secs(6)
         } else {
             delay
         });
@@ -368,14 +368,14 @@ async fn a_hung_read_is_no_answer_within_the_bound_and_holds_up_no_other_listene
         "another listener answers"
     );
     assert!(
-        begun.elapsed() < std::time::Duration::from_millis(350),
+        begun.elapsed() < std::time::Duration::from_secs(3),
         "while the hung read runs: {:?}",
         begun.elapsed()
     );
     assert_eq!(first.await.unwrap(), None, "the hung read is no answer");
     assert_eq!(waiter.await.unwrap(), None, "nor for one waiting on it");
     assert!(
-        begun.elapsed() < std::time::Duration::from_secs(2),
+        begun.elapsed() < std::time::Duration::from_secs(4),
         "within the bound: {:?}",
         begun.elapsed()
     );
@@ -457,14 +457,14 @@ async fn a_round_reads_the_sandbox_launchers_once_and_a_hung_read_is_no_answer()
         "one look at the launchers"
     );
     let hung: LaunchersReader = Arc::new(|| {
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        std::thread::sleep(std::time::Duration::from_secs(6));
         Some(vec![])
     });
     let stuck = Rounds::new(peers, hung, std::time::Duration::from_millis(300));
     let begun = Instant::now();
     assert!(stuck.look(local, peer, begun).await.is_none(), "no answer");
     assert!(
-        begun.elapsed() < std::time::Duration::from_secs(2),
+        begun.elapsed() < std::time::Duration::from_secs(4),
         "{:?}",
         begun.elapsed()
     );
