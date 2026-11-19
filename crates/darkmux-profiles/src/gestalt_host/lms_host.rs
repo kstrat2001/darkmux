@@ -486,8 +486,8 @@ fn spawn_capped(mut cmd: Command, phase: &'static str) -> Result<std::process::C
             // not an LM Studio problem.
             format!(
                 "`{program}` was not found ({phase}). Install LM Studio and enable its \
-                 command-line tool (`~/.lmstudio/bin/lms bootstrap`), or set `lms_bin` in \
-                 ~/.darkmux/config.json to where `lms` lives."
+                 command-line tool (`~/.lmstudio/bin/lms bootstrap`), or point darkmux at it: \
+                 `darkmux config set lms_bin <path>`."
             )
         } else if e.kind() == std::io::ErrorKind::NotFound {
             format!("`{program}` was not found ({phase})")
@@ -1400,7 +1400,8 @@ esac"#,
         let HostError::CommandFailed { detail } = err else { panic!("expected CommandFailed, got {err:?}") };
         assert!(detail.contains("was not found"), "{detail}");
         assert!(detail.contains("lms bootstrap"), "{detail}");
-        assert!(detail.contains("lms_bin"), "{detail}");
+        assert!(detail.contains("`darkmux config set lms_bin <path>`"), "names the command: {detail}");
+        assert!(!detail.contains("config.json"), "never a hand edit: {detail}");
 
         // The same runner spawns host-telemetry probes; a missing one of
         // those must not be diagnosed as an LM Studio problem.
