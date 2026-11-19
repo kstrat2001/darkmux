@@ -186,6 +186,7 @@ pub fn add_engine(
     dry_run: bool,
     confirm: &mut dyn Confirm,
 ) -> AddOutcome {
+    let port_free = darkmux_platform::tcp_port_free;
     let planned = match add::plan(text, path, &found.detected, req, &port_free) {
         Ok(p) => p,
         Err(r) => return AddOutcome::Refused(r.to_string()),
@@ -211,13 +212,6 @@ pub fn add_engine(
             Err(r) => AddOutcome::Refused(r.to_string()),
         },
     }
-}
-
-/// Nothing listens on `port` (a host that cannot say counts as busy).
-fn port_free(port: u16) -> bool {
-    darkmux_platform::current()
-        .tcp_listeners(port)
-        .is_some_and(|pids| pids.is_empty())
 }
 
 #[cfg(test)]

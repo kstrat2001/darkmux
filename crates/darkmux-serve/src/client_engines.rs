@@ -213,7 +213,7 @@ pub fn add_here(req: &AddRequest) -> Result<Planned, Refusal> {
         path.as_deref(),
         req,
         &darkmux_profiles::engine::detect::detect_servers,
-        &port_free,
+        &darkmux_platform::tcp_port_free,
     )
 }
 
@@ -240,11 +240,4 @@ pub fn add_in(
     // one is configured is read from the registry under the lock (`apply`).
     let found = detect(None);
     darkmux_profiles::engine::add::apply(path, &found, req, port_free)
-}
-
-/// Nothing listens on `port` (a host that cannot say counts as busy).
-fn port_free(port: u16) -> bool {
-    darkmux_platform::current()
-        .tcp_listeners(port)
-        .is_some_and(|pids| pids.is_empty())
 }

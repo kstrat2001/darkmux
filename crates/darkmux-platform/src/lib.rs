@@ -25,6 +25,9 @@ mod dates;
 
 pub mod confine;
 
+mod port_free;
+pub use port_free::{bind_outcome, bind_probe, port_free_from, tcp_port_free, BindOutcome, PROBED};
+
 /// The questions darkmux asks about the host. One method per question; the
 /// answer is data, never an OS name, so a caller can't branch on the OS.
 pub trait Platform: Send + Sync {
