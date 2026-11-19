@@ -1422,9 +1422,9 @@ fn a_run_before_the_snapshot_reads_the_registry_by_the_wire_name() {
     let models = &reg.profiles["p"].models;
     let peer = profile_models_named(models, "qwen3");
     assert_eq!(peer.len(), 1);
-    assert!(peer[0].endpoint.is_some(), "the bare name is the endpoint's");
+    assert!(!peer[0].is_managed(), "the bare name is the endpoint's");
     let managed = profile_models_named(models, "darkmux:qwen3");
-    assert!(managed.len() == 1 && managed[0].endpoint.is_none());
+    assert!(managed.len() == 1 && managed[0].is_managed(), "the namespaced name is the managed one");
     assert!(served_by("r1", "qwen3", None, &peer, None).unwrap_err().contains("--hardware"), "the record cannot say; the flag can");
     assert_eq!(served_by("r1", "qwen3", None, &peer, Some(Unknown)).unwrap().hardware, Unknown);
     assert_eq!(served_by("r1", "darkmux:qwen3", None, &managed, None).unwrap().hardware, SubmittingMachine);

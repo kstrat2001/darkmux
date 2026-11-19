@@ -728,12 +728,27 @@ fn cmd_doctor(verbose: bool, probe: bool) -> Result<i32> {
     if darkmux_types::panel_audience::remote() {
         doctor::shape_for_remote(&mut shown, &darkmux_serve::panel_withheld());
     }
+    escape_doctor_text(&mut shown);
     doctor::print_report(&shown, verbose)?;
 
     Ok(match report.worst_status() {
         doctor::Status::Fail => 1,
         _ => 0,
     })
+}
+
+/// Every check's text as `doctor` prints it, escaped: a row can quote what
+/// another system said (an endpoint probe's reply, a peer's card through the
+/// hub, a model id), so an escape sequence in it is shown as text and never
+/// acted on. Lines are kept in a message or hint; a name is one line.
+/// Already-escaped text is unchanged (`escape_text` leaves `\` alone).
+fn escape_doctor_text(report: &mut doctor::DoctorReport) {
+    use darkmux_types::user_files::{escape_text, escape_text_keeping_lines};
+    for c in &mut report.checks {
+        c.name = escape_text(&c.name);
+        c.message = escape_text_keeping_lines(&c.message);
+        c.hint = c.hint.as_deref().map(escape_text_keeping_lines);
+    }
 }
 
 /// Surface LMStudio models not yet covered by any profile, with task-class
@@ -1375,11 +1390,31 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
             eprintln!("{line}");
         }
     }
-    print!("{}", result.stdout);
+    print!("{}", dispatch_stdout_shown(json, &result.stdout));
     if !quiet && !result.stderr.is_empty() {
-        eprint!("{}", result.stderr);
+        eprint!("{}", dispatch_stderr_shown(&result.stderr));
     }
     Ok(result.exit_code)
+}
+
+/// What `dispatch` prints of the run's stderr, in either mode: the runtime's
+/// and the engine's diagnostics, which can quote what the model or an
+/// endpoint said, escaped with their lines kept.
+fn dispatch_stderr_shown(stderr: &str) -> String {
+    darkmux_types::user_files::escape_text_keeping_lines(stderr)
+}
+
+/// What `dispatch` prints of the run's stdout. Without `--json` that is the
+/// runtime's summary around the model's reply, which the model wrote, so
+/// every escape sequence in it is shown as text (lines and tabs kept); a
+/// `--json` envelope is printed byte for byte, since JSON already escapes
+/// every control character and a parser reads it.
+fn dispatch_stdout_shown(json: bool, stdout: &str) -> String {
+    if json {
+        stdout.to_string()
+    } else {
+        darkmux_types::user_files::escape_text_keeping_lines(stdout)
+    }
 }
 
 /// (#3505) A refused dispatch's `--json` caller reads its code on stdout;
@@ -2667,5 +2702,55 @@ mod tests {
     fn derive_profile_name_strips_garbage_chars() {
         let n = derive_profile_name("publisher/some@weird*name!", heuristics::TaskClass::Mid);
         assert_eq!(n, "someweirdname-mid");
+    }
+
+    /// A dispatch's human output carries the model's reply: an OSC 0 title,
+    /// a screen clear and an OSC 52 clipboard write in it print as text,
+    /// lines kept; a `--json` envelope prints byte for byte.
+    #[test]
+    fn dispatch_human_output_prints_a_hostile_reply_inert_and_json_unchanged() {
+        let stdout = "--- final assistant message ---\nok\x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}\n\tdone\n";
+        let shown = dispatch_stdout_shown(false, stdout);
+        assert!(!shown.chars().any(|c| (c.is_control() && c != '\n' && c != '\t') || c == '\u{202e}'), "{shown:?}");
+        assert!(shown.starts_with("--- final assistant message ---\nok\\u{1b}]0;owned") && shown.ends_with("\n\tdone\n"), "{shown:?}");
+        let plain = "--- final assistant message ---\ncafé 日本語 🇺🇸\n\tindented\n";
+        assert_eq!(dispatch_stdout_shown(false, plain), plain);
+        let envelope = r#"{"final_assistant":"\u001b]0;x"}"#;
+        assert_eq!(dispatch_stdout_shown(true, envelope), envelope);
+    }
+
+    /// The dispatch's stderr, which can quote an endpoint's error, prints
+    /// an OSC 0 title, a screen clear and an OSC 52 clipboard write as text.
+    #[test]
+    fn dispatch_stderr_prints_hostile_text_inert_and_plain_text_unchanged() {
+        let inert = |t: &str| !t.chars().any(|c| (c.is_control() && c != '\n' && c != '\t') || c == '\u{202e}');
+        let shown = dispatch_stderr_shown(&format!("engine: {}\nnext\n", "\x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}"));
+        assert!(inert(&shown), "{shown:?}");
+        assert!(shown.ends_with("\nnext\n"), "{shown:?}");
+        assert_eq!(dispatch_stderr_shown("warn: café\n\tdetail\n"), "warn: café\n\tdetail\n");
+    }
+
+    /// A doctor row quoting an endpoint's reply that holds an OSC 0 title, a
+    /// screen clear and an OSC 52 clipboard write prints as text; a plain
+    /// row, lines and all, prints unchanged.
+    #[test]
+    fn doctor_rows_print_hostile_text_inert_and_plain_text_unchanged() {
+        let hostile = "\x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}";
+        let check = |text: &str| doctor::Check {
+            name: format!("endpoint {text}"),
+            status: doctor::Status::Warn,
+            message: format!("replied {text}\nsecond line"),
+            hint: Some(format!("try {text}")),
+        };
+        let mut report = doctor::DoctorReport { checks: vec![check(hostile)] };
+        escape_doctor_text(&mut report);
+        let c = &report.checks[0];
+        for text in [&c.name, &c.message, c.hint.as_ref().unwrap()] {
+            assert!(!text.chars().any(|ch| (ch.is_control() && ch != '\n') || ch == '\u{202e}'), "{text:?}");
+        }
+        let mut plain = doctor::DoctorReport { checks: vec![check("café 日本語 \\u{1b} already shown")] };
+        escape_doctor_text(&mut plain);
+        let c = &plain.checks[0];
+        assert_eq!(c.message, "replied café 日本語 \\u{1b} already shown\nsecond line");
     }
 }

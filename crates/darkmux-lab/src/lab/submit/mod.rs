@@ -1042,10 +1042,7 @@ fn agreed_n_ctx(models: &[darkmux_types::ProfileModel]) -> Option<u64> {
 /// as the run's snapshot: the wire name's kind first, and `flint` names a
 /// managed Flint model.
 pub fn profile_models_named(models: &[darkmux_types::ProfileModel], dispatched: &str) -> Vec<darkmux_types::ProfileModel> {
-    use darkmux_types::HardwareBasis;
-    let managed = |m: &darkmux_types::ProfileModel| {
-        matches!(m.endpoint.as_ref().map_or(HardwareBasis::Managed, |e| e.hardware_basis()), HardwareBasis::Managed)
-    };
+    let managed = |m: &darkmux_types::ProfileModel| m.is_managed();
     // A managed Flint server answers to `flint` whatever its model's id.
     let flint = |m: &darkmux_types::ProfileModel| {
         m.endpoint.as_ref().is_some_and(|e| {
