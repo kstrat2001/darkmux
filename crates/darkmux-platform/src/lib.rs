@@ -143,6 +143,12 @@ pub trait Platform: Send + Sync {
     /// `None` where the platform has no such choice.
     fn c_library(&self) -> Option<CLibrary>;
 
+    /// How many bytes a spawned process may be handed in its arguments and
+    /// environment: all together, and one string on its own where the
+    /// kernel also limits that. A caller sizing what it puts in a child's
+    /// environment reads this rather than guessing an OS's limit.
+    fn exec_env_limits(&self) -> ExecEnvLimits;
+
     /// What this machine was bought with beyond its chip and RAM: the CPU
     /// and GPU core counts and the model, the choices a buyer makes. What
     /// the OS does not say is left empty, never guessed.
@@ -637,6 +643,54 @@ pub enum ContainerHostAccess {
     /// The name has to be mapped to the engine's host gateway when the
     /// container starts (Docker Engine on Linux).
     HostGateway,
+}
+
+/// What a spawned process may be handed ([`Platform::exec_env_limits`]).
+/// `None` where the platform cannot say, which a caller reads as no limit
+/// it knows of.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecEnvLimits {
+    /// The most bytes one argument or `NAME=value` string may take, where
+    /// the kernel limits a string on its own.
+    pub per_string: Option<usize>,
+    /// The most bytes all arguments and environment strings may take
+    /// together (`ARG_MAX`).
+    pub total: Option<usize>,
+}
+
+/// `sysconf(_SC_ARG_MAX)`: the bytes a new process's arguments and
+/// environment may take together; `None` where the system cannot say.
+pub(crate) fn arg_max() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `sysconf` only reads a system constant.
+        let n = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
+        usize::try_from(n).ok().filter(|n| *n > 0)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Linux's `MAX_ARG_STRLEN`: 32 pages for one argument or environment
+/// string, whatever `ARG_MAX` allows in all (128 KiB with 4 KiB pages).
+pub(crate) fn linux_max_arg_strlen(page_size: usize) -> usize {
+    32 * page_size
+}
+
+/// `sysconf(_SC_PAGESIZE)`; `None` where the system cannot say.
+pub(crate) fn page_size() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `sysconf` only reads a system constant.
+        let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(n).ok().filter(|n| *n > 0)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 /// (#3561 re-review) A Linux machine's C library.

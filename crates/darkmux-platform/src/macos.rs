@@ -158,6 +158,12 @@ impl Platform for MacPlatform {
         None
     }
 
+    /// `ARG_MAX` (1 MiB) bounds everything together; macOS has no limit on
+    /// one string of its own.
+    fn exec_env_limits(&self) -> crate::ExecEnvLimits {
+        crate::ExecEnvLimits { per_string: None, total: crate::arg_max() }
+    }
+
     fn node_release_platform(&self) -> Option<&'static str> {
         crate::node_release_platform_for(crate::NodeOs::Darwin, std::env::consts::ARCH)
     }

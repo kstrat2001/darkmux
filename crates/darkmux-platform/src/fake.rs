@@ -55,6 +55,7 @@ pub struct FakePlatform {
     pub node_release_platform: Option<&'static str>,
     /// What [`Platform::c_library`] answers.
     pub c_library: Option<crate::CLibrary>,
+    pub exec_env_limits: crate::ExecEnvLimits,
     /// What [`Platform::overlay_tool_locations`] answers.
     pub overlay_tool_locations: Vec<String>,
 }
@@ -93,6 +94,7 @@ impl Default for FakePlatform {
             allow_answer: crate::AllowAnswer::NoDialog("a fake platform shows no dialog".to_string()),
             node_release_platform: None,
             c_library: None,
+            exec_env_limits: crate::ExecEnvLimits::default(),
             overlay_tool_locations: Vec::new(),
         }
     }
@@ -186,6 +188,10 @@ impl Platform for FakePlatform {
 
     fn c_library(&self) -> Option<crate::CLibrary> {
         self.c_library
+    }
+
+    fn exec_env_limits(&self) -> crate::ExecEnvLimits {
+        self.exec_env_limits
     }
 
     fn node_release_platform(&self) -> Option<&'static str> {

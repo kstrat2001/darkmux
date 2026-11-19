@@ -3013,9 +3013,9 @@ impl StepKind for DispatchMapStepKind {
 /// output without darkmux having to parse the command's own
 /// substitution syntax. Every output is also written whole to
 /// `$DARKMUX_STEP_INPUTS_DIR/<SANITIZED-DEP-ID>`, and one the environment
-/// cannot carry (over 64 KiB, or past 256 KiB for all of a step's inputs
-/// together) has its variable UNSET, so a command reads it from that file;
-/// see [`export_step_inputs`].
+/// cannot carry ([`input_env_budget`]) has its variable UNSET, so a command
+/// reads it from that file, and a command that names it makes the step
+/// degraded; see [`export_step_inputs`].
 /// `DARKMUX_BIN` is exported too — the absolute path
 /// of the darkmux running the mission, for a command that has to call
 /// darkmux back. A non-zero exit is a loud `Err` carrying stdout
@@ -3210,7 +3210,9 @@ impl StepKind for ProceduralShellStepKind {
         let mut cmd = shell_command(&cfg, cwd.as_deref());
         // Held until the command has finished: it owns the files the inputs
         // were written to.
-        let _inputs_dir = export_step_inputs(step, &mut cmd, input)?;
+        let budget = input_env_budget(darkmux_platform::current().exec_env_limits());
+        let inputs = export_step_inputs(step, &mut cmd, input, budget)?;
+        let unset = unset_inputs_reason(step, &cfg.command, &inputs.unset);
         export_darkmux_bin(&mut cmd);
         // (#2361, swarm S4-4) BOUNDED, in its own process group, and
         // registered with the child registry — see
@@ -3219,7 +3221,7 @@ impl StepKind for ProceduralShellStepKind {
         // SIGTERM/SIGINT to reach the child.
         let timeout = crate::bounded_command::configured_timeout();
         let (ran, cut) = crate::bounded_command::run_bounded_with_cuts(cmd, timeout);
-        shell_outcome(step, cwd.as_deref(), ran, cut)
+        shell_outcome(step, cwd.as_deref(), ran, cut, unset)
     }
 }
 
@@ -3282,12 +3284,14 @@ fn export_darkmux_bin(cmd: &mut std::process::Command) {
 /// What a `procedural.shell` step's bounded run means for the step. A
 /// non-zero exit, a timeout, an interrupt and a failed spawn are step
 /// errors; a finished command's stdout is the step's output, marked
-/// degraded when the output cap cut it.
+/// degraded when the output cap cut it or `unset` says the command read a
+/// variable darkmux left unset.
 fn shell_outcome(
     step: &Step,
     cwd: Option<&std::path::Path>,
     ran: crate::bounded_command::Bounded,
     cut: crate::bounded_command::OutputCut,
+    unset: Option<String>,
 ) -> Result<StepOutcome> {
     use crate::bounded_command::Bounded;
     match ran {
@@ -3301,7 +3305,7 @@ fn shell_outcome(
         Bounded::Finished { stdout, .. } => Ok(StepOutcome {
             output: String::from_utf8_lossy(&stdout).to_string(),
             flow_records: Vec::new(),
-            degraded: cut_output_reason(step, cut.stdout),
+            degraded: either_reason(cut_output_reason(step, cut.stdout), unset),
         }),
         // A killed command produced no output this step could hand on,
         // so — unlike `mods.gate`, where a hung `test_command` is
@@ -3342,25 +3346,40 @@ fn cut_output_reason(step: &Step, cut: u64) -> Option<String> {
     })
 }
 
-/// The most bytes of one dependency's output a `procedural.shell` command
-/// gets in its `DARKMUX_STEP_INPUT_*` variable, under Linux's 128 KiB limit
-/// on any one variable.
-const STEP_INPUT_ENV_MAX_BYTES: usize = 64 * 1024;
+/// Room kept under a per-string limit for a variable's name, its `=` and
+/// its terminating NUL, so the value itself never reaches the limit.
+const STEP_INPUT_NAME_ROOM: usize = 8 * 1024;
 
-/// The most bytes all of one command's `DARKMUX_STEP_INPUT_*` values take
-/// together, well under macOS's 1 MiB limit on a new process's arguments
-/// and environment combined, which the inherited environment and the
-/// command's own text also spend.
-const STEP_INPUT_ENV_TOTAL_BYTES: usize = 256 * 1024;
+/// How much of a step command's environment its inputs may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputEnvBudget {
+    /// The most bytes one input's value may be.
+    per: usize,
+    /// The most bytes all inputs' values may be together.
+    total: usize,
+}
+
+/// The budget under what this platform lets a spawned process be handed:
+/// each input under the per-string limit (Linux's `MAX_ARG_STRLEN`, about
+/// 120 KiB with 4 KiB pages) less [`STEP_INPUT_NAME_ROOM`], and all of them
+/// within three quarters of `ARG_MAX` (768 KiB on macOS), the last quarter
+/// left for the inherited environment and the command's own text. A limit
+/// the platform cannot name is no limit, as before.
+fn input_env_budget(limits: darkmux_platform::ExecEnvLimits) -> InputEnvBudget {
+    InputEnvBudget {
+        per: limits.per_string.map_or(usize::MAX, |n| n.saturating_sub(STEP_INPUT_NAME_ROOM)),
+        total: limits.total.map_or(usize::MAX, |n| n / 4 * 3),
+    }
+}
 
 /// The dependencies whose output is too large for the environment: any over
-/// `per` bytes, and, in dependency order, any that would take the values
-/// kept in the environment past `total` bytes.
-fn inputs_too_large_for_env(input: &BTreeMap<String, String>, per: usize, total: usize) -> std::collections::BTreeSet<&str> {
+/// the budget's per-input bytes, and, in dependency order, any that would
+/// take the values kept in the environment past its total.
+fn inputs_too_large_for_env(input: &BTreeMap<String, String>, budget: InputEnvBudget) -> std::collections::BTreeSet<&str> {
     let mut used = 0;
     let mut too_large = std::collections::BTreeSet::new();
     for (dep_id, output) in input {
-        if output.len() > per || used + output.len() > total {
+        if output.len() > budget.per || used + output.len() > budget.total {
             too_large.insert(dep_id.as_str());
         } else {
             used += output.len();
@@ -3379,27 +3398,39 @@ impl Drop for StepInputsDir {
     }
 }
 
+/// What [`export_step_inputs`] handed a command: the directory holding every
+/// input (which must outlive the command), and the `(variable, key)` of each
+/// input whose variable it left unset.
+#[derive(Default)]
+struct StepInputs {
+    /// Held for its `Drop`: the files are removed once the command is done.
+    _dir: Option<StepInputsDir>,
+    unset: Vec<(String, String)>,
+}
+
 /// Hand each dependency's output to `cmd`. Every one, whatever its size, is
 /// written to `$DARKMUX_STEP_INPUTS_DIR/<KEY>` (a fresh 0700 directory,
-/// each file 0600). Each that fits the environment
-/// ([`inputs_too_large_for_env`]) is also `DARKMUX_STEP_INPUT_<KEY>`; one
-/// that does not has that variable UNSET, never filled with something else,
-/// so `${VAR:?}` fails loudly and a spawn never fails on an input's size.
-/// The returned directory must outlive the command.
+/// each file 0600). Each that fits `budget` ([`inputs_too_large_for_env`])
+/// is also `DARKMUX_STEP_INPUT_<KEY>`; one that does not has that variable
+/// UNSET, never filled with something else, so a spawn never fails on an
+/// input's size and `${VAR:?}` fails loudly. A command that names an unset
+/// variable makes the step degraded ([`unset_inputs_reason`]).
 fn export_step_inputs(
     step: &Step,
     cmd: &mut std::process::Command,
     input: &BTreeMap<String, String>,
-) -> Result<Option<StepInputsDir>> {
+    budget: InputEnvBudget,
+) -> Result<StepInputs> {
     if input.is_empty() {
-        return Ok(None);
+        return Ok(StepInputs::default());
     }
     let base = std::env::temp_dir().join(format!("darkmux-step-inputs-{}-{}", std::process::id(), unix_nanos()));
     let dir = StepInputsDir(
         crate::exclusive_fs::create_dir_exclusive_unique_0700(&base)
             .with_context(|| format!("step `{}`: creating a directory for its inputs", step.id))?,
     );
-    let too_large = inputs_too_large_for_env(input, STEP_INPUT_ENV_MAX_BYTES, STEP_INPUT_ENV_TOTAL_BYTES);
+    let too_large = inputs_too_large_for_env(input, budget);
+    let mut unset = Vec::new();
     for (dep_id, output) in input {
         let key = sanitize_env_key(dep_id);
         crate::exclusive_fs::write_file_refusing_symlinks_0600(&dir.0.join(&key), output.as_bytes())
@@ -3408,12 +3439,13 @@ fn export_step_inputs(
         if too_large.contains(dep_id.as_str()) {
             cmd.env_remove(&name);
             eprintln!("{}", unset_input_warning(step, dep_id, output.len(), &name, &key));
+            unset.push((name, key));
         } else {
             cmd.env(&name, output);
         }
     }
     cmd.env("DARKMUX_STEP_INPUTS_DIR", &dir.0);
-    Ok(Some(dir))
+    Ok(StepInputs { _dir: Some(dir), unset })
 }
 
 /// Nanoseconds since the epoch, for a directory name; `0` on a clock set
@@ -3425,11 +3457,47 @@ fn unix_nanos() -> u128 {
 /// What darkmux says on stderr when an input's variable is left unset.
 fn unset_input_warning(step: &Step, dep_id: &str, len: usize, name: &str, key: &str) -> String {
     format!(
-        "darkmux: step `{}`: the output of `{dep_id}` is {len} bytes, more than a step command's environment \
-         carries ({STEP_INPUT_ENV_MAX_BYTES} bytes for one input, {STEP_INPUT_ENV_TOTAL_BYTES} for all of them), \
-         so `{name}` is unset; the command reads it from \"$DARKMUX_STEP_INPUTS_DIR/{key}\"",
+        "darkmux: step `{}`: the output of `{dep_id}` is {len} bytes, more than this step command's \
+         environment carries, so `{name}` is unset; the command reads it from \"$DARKMUX_STEP_INPUTS_DIR/{key}\"",
         step.id
     )
+}
+
+/// Whether `command` names the variable `name`: the name with no further
+/// identifier byte after it, so `X_2` is not `X`. No shell parsing: a
+/// mention in a comment counts too, which errs toward saying so.
+fn names_variable(command: &str, name: &str) -> bool {
+    command
+        .match_indices(name)
+        .any(|(at, _)| !command[at + name.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// The degraded reason for a command that names a variable darkmux left
+/// unset: it read an empty value where an input was, which can pass for a
+/// clean result (a `grep` for a failure finding nothing), so the run must
+/// not read Clean over it.
+fn unset_inputs_reason(step: &Step, command: &str, unset: &[(String, String)]) -> Option<String> {
+    let named: Vec<String> = unset
+        .iter()
+        .filter(|(name, _)| names_variable(command, name))
+        .map(|(name, key)| format!("`{name}` (read \"$DARKMUX_STEP_INPUTS_DIR/{key}\" instead)"))
+        .collect();
+    (!named.is_empty()).then(|| {
+        format!(
+            "step `{}`: the command reads {}, unset because the input is too large for the environment, \
+             so it saw no value there",
+            step.id,
+            named.join(", ")
+        )
+    })
+}
+
+/// Both degraded reasons, when a step has both.
+fn either_reason(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    }
 }
 
 fn sanitize_env_key(id: &str) -> String {
@@ -4737,14 +4805,15 @@ mod tests {
         assert!(out.output.ends_with("var=unset"), "the variable is unset, not a stand-in: {}", out.output);
     }
 
-    /// The reviewer's case: a 100 KiB failing log reaches the next step. Its
-    /// variable is unset, so `${VAR:?}` fails the step loudly instead of a
-    /// stand-in value passing a `grep` for the failure; the file has it.
+    /// A failing log too large for the environment (2 MiB) reaches the next
+    /// step. Its variable is unset, so `${VAR:?}` fails the step loudly
+    /// instead of a stand-in value passing a `grep` for the failure; the
+    /// file has it.
     #[test]
     // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
     #[serial_test::serial]
     fn procedural_shell_an_unset_large_input_fails_a_required_reference_and_its_file_has_it() {
-        let log = format!("{}\ntest result: FAILED\n", "ok line\n".repeat(100 * 1024 / 8));
+        let log = format!("{}\ntest result: FAILED\n", "ok line\n".repeat(2 * 1024 * 1024 / 8));
         let input = BTreeMap::from([("tests".to_string(), log)]);
         let ctx = crate::step_kinds::StepRunCtx::for_test();
         let required = step("s1", "procedural.shell", json!({"command": r#"printf %s "${DARKMUX_STEP_INPUT_TESTS:?}" | grep -c FAILED"#}));
@@ -4776,14 +4845,15 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let input = BTreeMap::from([("dep".to_string(), "secret".to_string())]);
         let mut cmd = std::process::Command::new("true");
-        let dir = export_step_inputs(&step("s1", "procedural.shell", json!({})), &mut cmd, &input).unwrap().expect("a directory");
+        let budget = InputEnvBudget { per: usize::MAX, total: usize::MAX };
+        let dir = export_step_inputs(&step("s1", "procedural.shell", json!({})), &mut cmd, &input, budget).unwrap()._dir.expect("a directory");
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&dir.0), 0o700, "the directory");
         assert_eq!(mode(&dir.0.join("DEP")), 0o600, "the file");
         let path = dir.0.clone();
         drop(dir);
         assert!(!path.exists(), "removed after the command");
-        assert!(export_step_inputs(&step("s1", "procedural.shell", json!({})), &mut cmd, &BTreeMap::new()).unwrap().is_none(), "no inputs, no directory");
+        assert!(export_step_inputs(&step("s1", "procedural.shell", json!({})), &mut cmd, &BTreeMap::new(), budget).unwrap()._dir.is_none(), "no inputs, no directory");
     }
 
     /// A shell step whose command writes past the output cap (2 MB against
@@ -4815,27 +4885,98 @@ mod tests {
             ("d".to_string(), "x".repeat(2)),
             ("e".to_string(), "x".to_string()),
         ]);
-        let too_large: Vec<_> = inputs_too_large_for_env(&input, 4, 7).into_iter().collect();
+        let budget = |per, total| InputEnvBudget { per, total };
+        let too_large: Vec<_> = inputs_too_large_for_env(&input, budget(4, 7)).into_iter().collect();
         assert_eq!(too_large, ["b", "c"], "b is over 4; c would make 8 of 7; d makes 6, e makes 7 exactly");
-        assert!(inputs_too_large_for_env(&input, 5, 16).is_empty(), "everything fits: 16 of 16");
-        let per_only: Vec<_> = inputs_too_large_for_env(&input, 4, 100).into_iter().collect();
+        assert!(inputs_too_large_for_env(&input, budget(5, 16)).is_empty(), "everything fits: 16 of 16");
+        let per_only: Vec<_> = inputs_too_large_for_env(&input, budget(4, 100)).into_iter().collect();
         assert_eq!(per_only, ["b"], "the per-input limit applies with room left in the total");
     }
 
-    /// Many inputs that each fit, but not all together (twenty of 60 KiB,
-    /// past macOS's 1 MiB limit), do not fail the step's spawn either: all
-    /// twenty are files, the first four are variables, the rest are unset.
+    /// Many inputs that each fit, but not all together (forty of 100 KiB,
+    /// 4 MB, past `ARG_MAX` on macOS and Linux alike), do not fail the step's
+    /// spawn: all forty are files, the first is a variable, the last unset.
     #[test]
     // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
     #[serial_test::serial]
     fn procedural_shell_unsets_inputs_past_the_environments_total() {
-        let input: BTreeMap<String, String> = (0..20).map(|i| (format!("dep-{i:02}"), "y".repeat(60 * 1024))).collect();
-        let command = r#"printf '%s %s ' "${#DARKMUX_STEP_INPUT_DEP_03}" "${DARKMUX_STEP_INPUT_DEP_04-unset}"; ls "$DARKMUX_STEP_INPUTS_DIR" | wc -l | tr -d ' '"#;
+        let input: BTreeMap<String, String> = (0..40).map(|i| (format!("dep-{i:02}"), "y".repeat(100 * 1024))).collect();
+        let command = r#"printf '%s %s ' "${#DARKMUX_STEP_INPUT_DEP_00}" "${DARKMUX_STEP_INPUT_DEP_39-unset}"; ls "$DARKMUX_STEP_INPUTS_DIR" | wc -l | tr -d ' '"#;
         let s = step("s1", "procedural.shell", json!({"command": command}));
         let out = ProceduralShellStepKind
             .run(&s, &empty_task(), &input, &crate::step_kinds::StepRunCtx::for_test())
             .expect("many inputs must not fail the step's spawn");
-        assert_eq!(out.output.trim(), format!("{} unset 20", 60 * 1024));
+        assert_eq!(out.output.trim(), format!("{} unset 40", 100 * 1024));
+    }
+
+    /// The budget sits under what the platform allows: each input 8 KiB
+    /// under the per-string limit (120 KiB of Linux's 128 KiB), all of them
+    /// within three quarters of `ARG_MAX` (768 KiB of macOS's 1 MiB), and no
+    /// limit where the platform names none.
+    #[test]
+    fn the_input_budget_sits_under_the_platforms_limits() {
+        use darkmux_platform::ExecEnvLimits;
+        let linux = input_env_budget(ExecEnvLimits { per_string: Some(128 * 1024), total: Some(2 * 1024 * 1024) });
+        assert_eq!(linux, InputEnvBudget { per: 120 * 1024, total: 1536 * 1024 });
+        let mac = input_env_budget(ExecEnvLimits { per_string: None, total: Some(1024 * 1024) });
+        assert_eq!(mac, InputEnvBudget { per: usize::MAX, total: 768 * 1024 });
+        assert_eq!(input_env_budget(ExecEnvLimits::default()), InputEnvBudget { per: usize::MAX, total: usize::MAX });
+    }
+
+    /// A 100 KiB input, which fit the environment before inputs had files,
+    /// still does: the reviewer's probe, reading the variable bare, sees the
+    /// failure in it and fails the step, as it did then.
+    #[test]
+    // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
+    #[serial_test::serial]
+    fn procedural_shell_a_100_kib_input_still_reaches_a_bare_variable() {
+        let log = format!("{}\ntest result: FAILED\n", "ok line\n".repeat(100 * 1024 / 8));
+        let input = BTreeMap::from([("tests".to_string(), log)]);
+        let s = step("s1", "procedural.shell", json!({"command": REVIEWER_PROBE}));
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &input, &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
+        assert!(err.to_string().contains("exited with Some(1)"), "{err}");
+    }
+
+    /// The reviewer's probe, which reads the variable bare and reports green
+    /// unless it finds `FAILED`.
+    const REVIEWER_PROBE: &str = r#"if printf %s "$DARKMUX_STEP_INPUT_TESTS" | grep -q FAILED; then exit 1; fi; echo tests-green"#;
+
+    /// The reviewer's probe against an input too large for the environment
+    /// (2 MiB): the variable is unset, so the probe reports green, but the
+    /// step is DEGRADED, naming the variable and the file to read instead,
+    /// so the run's verdict does not read Clean. A command that reads only
+    /// the file sees the failure and is not degraded.
+    #[test]
+    // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
+    #[serial_test::serial]
+    fn procedural_shell_naming_an_unset_input_is_degraded_and_reading_the_file_is_not() {
+        let log = format!("{}\ntest result: FAILED\n", "ok line\n".repeat(2 * 1024 * 1024 / 8));
+        let input = BTreeMap::from([("tests".to_string(), log)]);
+        let ctx = crate::step_kinds::StepRunCtx::for_test();
+        let probe = ProceduralShellStepKind.run(&step("s1", "procedural.shell", json!({"command": REVIEWER_PROBE})), &empty_task(), &input, &ctx).unwrap();
+        assert_eq!(probe.output.trim(), "tests-green");
+        let reason = probe.degraded.expect("naming an unset input degrades the step");
+        assert!(reason.contains("DARKMUX_STEP_INPUT_TESTS") && reason.contains("$DARKMUX_STEP_INPUTS_DIR/TESTS"), "{reason}");
+        let file_only = r#"if grep -q FAILED "$DARKMUX_STEP_INPUTS_DIR/TESTS"; then echo saw-failure; fi"#;
+        let read = ProceduralShellStepKind.run(&step("s2", "procedural.shell", json!({"command": file_only})), &empty_task(), &input, &ctx).unwrap();
+        assert_eq!((read.output.trim(), read.degraded), ("saw-failure", None));
+    }
+
+    /// A variable is named when nothing identifier-like follows it, so a
+    /// longer name sharing the prefix is not a mention; the reason lists
+    /// only the unset variables the command names; both reasons combine.
+    #[test]
+    fn an_unset_input_counts_only_when_the_command_names_it() {
+        assert!(names_variable("echo ${X_A:?}", "X_A") && names_variable("echo $X_A", "X_A"));
+        assert!(!names_variable("echo $X_AB $X_A_2", "X_A"));
+        let s = step("s1", "procedural.shell", json!({}));
+        let unset = [("X_A".to_string(), "A".to_string()), ("X_B".to_string(), "B".to_string())];
+        let reason = unset_inputs_reason(&s, "cat \"$X_B\"", &unset).unwrap();
+        assert!(reason.contains("`X_B`") && reason.contains("/B") && !reason.contains("X_A"), "{reason}");
+        assert_eq!(unset_inputs_reason(&s, "cat \"$DARKMUX_STEP_INPUTS_DIR/A\"", &unset), None);
+        assert_eq!(either_reason(Some("a".into()), Some("b".into())).as_deref(), Some("a; b"));
+        assert_eq!(either_reason(None, Some("b".into())).as_deref(), Some("b"));
+        assert_eq!(either_reason(None, None), None);
     }
 
     /// Each way a bounded run ends, as the step sees it: the output, marked
@@ -4846,23 +4987,25 @@ mod tests {
         use crate::bounded_command::{Bounded, OutputCut};
         let s = step("s1", "procedural.shell", json!({}));
         let finished = |success| Bounded::Finished { success, code: Some(if success { 0 } else { 3 }), stdout: b"out".to_vec(), stderr: b"err".to_vec() };
-        let ok = shell_outcome(&s, None, finished(true), OutputCut::default()).unwrap();
+        let ok = shell_outcome(&s, None, finished(true), OutputCut::default(), None).unwrap();
         assert_eq!((ok.output.as_str(), ok.degraded), ("out", None));
-        let only_stderr_cut = shell_outcome(&s, None, finished(true), OutputCut { stdout: 0, stderr: 9 }).unwrap();
+        let named = shell_outcome(&s, None, finished(true), OutputCut::default(), Some("reads `X`".into())).unwrap();
+        assert_eq!(named.degraded.as_deref(), Some("reads `X`"), "an unset input the command names degrades it");
+        let only_stderr_cut = shell_outcome(&s, None, finished(true), OutputCut { stdout: 0, stderr: 9 }, None).unwrap();
         assert_eq!(only_stderr_cut.degraded, None, "stderr is not the step's output");
-        let cut = shell_outcome(&s, None, finished(true), OutputCut { stdout: 42, stderr: 0 }).unwrap();
+        let cut = shell_outcome(&s, None, finished(true), OutputCut { stdout: 42, stderr: 0 }, None).unwrap();
         let reason = cut.degraded.expect("a cut output is degraded");
         assert!(reason.contains("42 bytes") && reason.contains(&crate::bounded_command::OUTPUT_CAP_BYTES.to_string()), "{reason}");
-        let failed = shell_outcome(&s, None, finished(false), OutputCut::default()).unwrap_err().to_string();
+        let failed = shell_outcome(&s, None, finished(false), OutputCut::default(), None).unwrap_err().to_string();
         assert!(failed.contains("exited with Some(3)") && failed.contains("stdout: out") && failed.contains("stderr: err"), "{failed}");
-        let timed_out = shell_outcome(&s, None, Bounded::TimedOut { seconds: 7 }, OutputCut::default()).unwrap_err().to_string();
+        let timed_out = shell_outcome(&s, None, Bounded::TimedOut { seconds: 7 }, OutputCut::default(), None).unwrap_err().to_string();
         assert!(timed_out.contains("exceeded 7s") && timed_out.contains("step_command_timeout_seconds"), "{timed_out}");
-        let interrupted = shell_outcome(&s, None, Bounded::Interrupted, OutputCut::default()).unwrap_err().to_string();
+        let interrupted = shell_outcome(&s, None, Bounded::Interrupted, OutputCut::default(), None).unwrap_err().to_string();
         assert!(interrupted.contains("interrupted"), "{interrupted}");
         let gone = || Bounded::SpawnFailed(std::io::Error::from(std::io::ErrorKind::NotFound));
-        let inherited = format!("{:#}", shell_outcome(&s, None, gone(), OutputCut::default()).unwrap_err());
+        let inherited = format!("{:#}", shell_outcome(&s, None, gone(), OutputCut::default(), None).unwrap_err());
         assert!(inherited.contains("<inherited from the process>"), "{inherited}");
-        let named = format!("{:#}", shell_outcome(&s, Some(std::path::Path::new("/gone/dir")), gone(), OutputCut::default()).unwrap_err());
+        let named = format!("{:#}", shell_outcome(&s, Some(std::path::Path::new("/gone/dir")), gone(), OutputCut::default(), None).unwrap_err());
         assert!(named.contains("/gone/dir"), "{named}");
     }
 
