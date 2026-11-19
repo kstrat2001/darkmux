@@ -372,6 +372,29 @@ fn enum_variants_free_values_and_null_options_are_accepted_or_named() {
     assert_eq!(found, [("shape.kind", Some(("`circle` or `square`", "a string that does not fit"))), ("list", Some(("a list", "an object")))]);
 }
 
+/// Each JSON-schema type name holds exactly its JSON values; an unknown
+/// name holds nothing.
+#[test]
+fn type_holds_matches_each_schema_type_name() {
+    let values = [json!(null), json!(true), json!(3), json!(1.5), json!("s"), json!([1]), json!({"k": 1})];
+    let holds = |t: &str| values.iter().filter(|v| type_holds(t, v)).cloned().collect::<Vec<Value>>();
+    assert_eq!(holds("null"), [json!(null)]);
+    assert_eq!(holds("boolean"), [json!(true)]);
+    assert_eq!(holds("integer"), [json!(3)]);
+    assert_eq!(holds("number"), [json!(3), json!(1.5)]);
+    assert_eq!(holds("string"), [json!("s")]);
+    assert_eq!(holds("array"), [json!([1])]);
+    assert_eq!(holds("object"), [json!({"k": 1})]);
+    assert_eq!(holds("tuple"), Vec::<Value>::new());
+}
+
+/// Each JSON type has its operator words.
+#[test]
+fn json_type_names_each_json_type() {
+    let named: Vec<&str> = [json!(null), json!(false), json!(-3), json!(u64::MAX), json!(1.5), json!("s"), json!([]), json!({})].iter().map(json_type).collect();
+    assert_eq!(named, ["null", "a boolean", "an integer", "an integer", "a number", "a string", "a list", "an object"]);
+}
+
 /// Every JSON type is named, never shown: no part of any wrong value
 /// reaches the message, whatever its type or length.
 #[test]

@@ -830,14 +830,28 @@ fn array_words(node: &Value) -> String {
 
 /// A value's JSON type in operator words, the words [`type_words`] uses.
 pub fn json_type(value: &Value) -> &'static str {
+    match schema_types(value)[0] {
+        "null" => "null",
+        "boolean" => "a boolean",
+        "integer" => "an integer",
+        "number" => "a number",
+        "string" => "a string",
+        "array" => "a list",
+        _ => "an object",
+    }
+}
+
+/// The JSON-schema type names `value` is, most specific first: an integer
+/// is also a number.
+fn schema_types(value: &Value) -> &'static [&'static str] {
     match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(n) if n.is_i64() || n.is_u64() => "an integer",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "a list",
-        Value::Object(_) => "an object",
+        Value::Null => &["null"],
+        Value::Bool(_) => &["boolean"],
+        Value::Number(n) if n.is_f64() => &["number"],
+        Value::Number(_) => &["integer", "number"],
+        Value::String(_) => &["string"],
+        Value::Array(_) => &["array"],
+        Value::Object(_) => &["object"],
     }
 }
 
@@ -898,16 +912,7 @@ fn escaped_string_len(body: &str) -> usize {
 /// Whether a JSON-schema `type` name holds `value`, its other constraints
 /// aside.
 fn type_holds(t: &str, value: &Value) -> bool {
-    match t {
-        "integer" => value.is_i64() || value.is_u64(),
-        "number" => value.is_number(),
-        "string" => value.is_string(),
-        "boolean" => value.is_boolean(),
-        "array" => value.is_array(),
-        "object" => value.is_object(),
-        "null" => value.is_null(),
-        _ => false,
-    }
+    schema_types(value).contains(&t)
 }
 
 fn shorten_to(text: &str, cap: usize) -> String {

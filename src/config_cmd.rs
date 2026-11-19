@@ -295,15 +295,13 @@ pub fn run(cmd: ConfigCmd) -> Result<i32> {
             return Ok(2);
         }
         ConfigCmd::Get { key } => {
-            warn_about_duplicates(&path);
-            println!("{}", get_at(&path, &key)?);
+            println!("{}", get_warned(&path, &key)?);
         }
         ConfigCmd::List => {
-            warn_about_duplicates(&path);
             // (5.0) The console's config-list panel, for a viewer that is not
             // this machine: values that name an address, a path, a URL, a
             // credential pointer or the execution surface are withheld.
-            let listed = list_for(&path, darkmux_types::panel_audience::remote())?;
+            let listed = list_warned(&path, darkmux_types::panel_audience::remote())?;
             println!("{listed}");
             // (#2947) stderr, so `darkmux config list | jq` still parses,
             // and only for a person at a terminal: the serve daemon's
@@ -324,6 +322,18 @@ fn warn_about_duplicates(path: &Path) {
     if let Some(warning) = duplicate_warning_at(path) {
         eprintln!("warning: {warning}");
     }
+}
+
+/// `config get`: [`get_at`], after the duplicate-key warning.
+fn get_warned(path: &Path, key: &str) -> Result<String> {
+    warn_about_duplicates(path);
+    get_at(path, key)
+}
+
+/// `config list`: [`list_for`], after the duplicate-key warning.
+fn list_warned(path: &Path, remote: bool) -> Result<String> {
+    warn_about_duplicates(path);
+    list_for(path, remote)
 }
 
 /// Look up a key's type, or `None` if it isn't a known settable key. Static
@@ -893,6 +903,9 @@ mod tests {
         let warning = duplicate_warning_at(f.path()).expect("a warning");
         assert!(warning.contains("duplicate key `machine_id`") && warning.contains("so the file fails to load"), "{warning}");
         assert!(warning.contains("last copy"), "says what get and list show: {warning}");
+        // What `get` and `list` print after the warning is the last copy.
+        assert_eq!(get_warned(f.path(), "machine_id").unwrap(), "\"b\"");
+        assert!(list_warned(f.path(), false).unwrap().contains("\"machine_id\": \"b\""));
         std::fs::write(f.path(), r#"{"machine_id": "a"}"#).unwrap();
         assert_eq!(duplicate_warning_at(f.path()), None);
         std::fs::write(f.path(), r#"{"machine_idd": "a"}"#).unwrap();
