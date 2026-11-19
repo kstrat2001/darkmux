@@ -6806,9 +6806,44 @@ S(("127.0.0.1", port), H).serve_forever()
         // The container run names its prompt so before it is recorded or passed.
         let src = include_str!("dispatch_internal.rs");
         assert!(
-            src.contains("let system_prompt = system_prompt_as_sent(system_prompt, darkmux_sandbox::selected().ok(), &workspace);"),
+            src.contains("let system_prompt = run_system_prompt(system_prompt, &image, &workspace);"),
             "prepare_container_run must name the prompt before ContainerRun holds it"
         );
+    }
+
+    /// (contract 6) The system prompt names the workspace for the backend
+    /// that runs the dispatch: the one its runtime image was resolved for,
+    /// never the selection read again later. A setting switched while a
+    /// model loads (Docker to Seatbelt, or back) changes neither the path the
+    /// prompt names nor the backend that launches.
+    #[test]
+    #[serial]
+    fn the_prompt_names_the_workspace_for_the_backend_that_runs() {
+        use darkmux_sandbox::BackendKind;
+        let ws = TempDir::new().unwrap();
+        let real = ws.path().canonicalize().unwrap().display().to_string();
+        let image = |kind| RuntimeImage {
+            inject: false,
+            darkmux_image: crate::runtime_image::ResolvedImage { reference: "r".into(), id: "r".into() },
+            image: "i".into(),
+            run_image: "i".into(),
+            host_runtime: None,
+            kind,
+        };
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        let mut seen = Vec::new();
+        for (selected, resolved) in [("seatbelt", BackendKind::Docker), ("docker", BackendKind::Seatbelt)] {
+            unsafe { std::env::set_var("DARKMUX_SANDBOX", selected) };
+            let img = image(resolved);
+            seen.push((run_system_prompt("in /workspace".into(), &img, ws.path()), run_backend(&img).kind()));
+        }
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        assert_eq!(seen, [("in /workspace".to_string(), BackendKind::Docker), (format!("in {real}"), BackendKind::Seatbelt)]);
+        let src = include_str!("dispatch_internal.rs");
+        assert!(src.contains("let system_prompt = run_system_prompt(system_prompt, &image, &workspace);"));
+        assert!(src.contains("spawn_container(&argv_config, run_backend(&run.image), opts.max_turns_override)?"));
     }
 
     /// (#3561) A dispatch on the host runs with its managed Node: the
@@ -7114,6 +7149,7 @@ S(("127.0.0.1", port), H).serve_forever()
             image: "i".into(),
             run_image: "host".into(),
             host_runtime: Some(host),
+            kind: darkmux_sandbox::BackendKind::Seatbelt,
         };
         assert!(runtime_program(&image).is_ok(), "unchanged, the command is built");
         let staged = root.path().join("bin/.darkmux.new");
@@ -7173,6 +7209,7 @@ S(("127.0.0.1", port), H).serve_forever()
             darkmux_image: crate::runtime_image::ResolvedImage { reference: "r".into(), id: "r".into() },
             image: "i".into(),
             run_image: "i".into(),
+            kind: if host_runtime.is_some() { darkmux_sandbox::BackendKind::Seatbelt } else { darkmux_sandbox::BackendKind::Docker },
             host_runtime,
         };
         let host = HostRuntime { program: PathBuf::from("/real/darkmux"), leading_args: vec!["runtime".to_string()], started_as: None };
