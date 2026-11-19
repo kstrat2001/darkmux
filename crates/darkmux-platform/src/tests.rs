@@ -2775,3 +2775,44 @@ fn a_port_held_on_the_ipv6_loopback_is_not_free() {
     assert_eq!(bind_probe(port)[loopback], BindOutcome::InUse);
     assert!(!tcp_port_free(port));
 }
+
+/// The probe binds and never listens: while it holds each address, a
+/// connection to that address (the loopback of its family, for a wildcard)
+/// is not accepted (macOS lets it time out rather than refusing it; a
+/// listener on the loopback accepts within microseconds). A listening probe
+/// would accept one, and on a Mac whose
+/// application firewall is on, listening on the wildcard can prompt.
+#[test]
+fn the_port_probe_binds_without_listening() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (held, accepted) = (std::sync::Mutex::new(Vec::new()), std::sync::Mutex::new(Vec::new()));
+    let outcomes = crate::port_free::bind_probe_holding(port, &|at| {
+        held.lock().unwrap().push(at);
+        let ip = match at.ip() {
+            std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        };
+        let to = std::net::SocketAddr::new(ip, port);
+        if std::net::TcpStream::connect_timeout(&to, std::time::Duration::from_millis(250)).is_ok() {
+            accepted.lock().unwrap().push(at);
+        }
+    });
+    let bound = outcomes.iter().filter(|o| **o == BindOutcome::Bound).count();
+    assert_eq!((outcomes[0], held.into_inner().unwrap().len()), (BindOutcome::Bound, bound), "the probe held each address it bound");
+    assert_eq!(accepted.into_inner().unwrap(), Vec::<std::net::SocketAddr>::new(), "a connection reached the probe");
+}
+
+/// A port whose last connection closed on this side first is left in
+/// `TIME_WAIT`, holding no listener: the probe sets `SO_REUSEADDR` as a
+/// server does, so the port reads free, as it would bind for one.
+#[test]
+fn a_port_left_in_time_wait_is_free() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let (served, _) = listener.accept().unwrap();
+    drop(served);
+    drop(listener);
+    drop(client);
+    assert!(tcp_port_free(port));
+}

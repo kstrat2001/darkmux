@@ -19,11 +19,11 @@ pub enum BindOutcome {
     Failed,
 }
 
-/// The addresses [`bind_probe`] binds, each one exactly. std sets
-/// `SO_REUSEADDR` on a Unix listener, and under it macOS refuses a bind only
-/// at the same address a socket of this user holds: a listener on the
-/// wildcard leaves `127.0.0.1` bindable, and the reverse. Linux refuses
-/// either way. Another user's listener is refused at any address that
+/// The addresses [`bind_probe`] binds, each one exactly. The probe sets
+/// `SO_REUSEADDR` (as std does on a Unix listener), and under it macOS
+/// refuses a bind only at the same address a socket of this user holds:
+/// a listener on the wildcard leaves `127.0.0.1` bindable, and the reverse.
+/// Linux refuses either way. Another user's listener is refused at any address that
 /// overlaps it, but only in its own family: an IPv6-only listener leaves
 /// every IPv4 address bindable, so both families are probed.
 pub const PROBED: [IpAddr; 4] = [
@@ -48,10 +48,76 @@ pub fn bind_outcome(addr: IpAddr, result: &std::io::Result<()>) -> BindOutcome {
 /// Binds each of [`PROBED`] on `port` in turn, releasing each before the
 /// next.
 pub fn bind_probe(port: u16) -> Vec<BindOutcome> {
-    PROBED
-        .iter()
-        .map(|&ip| bind_outcome(ip, &std::net::TcpListener::bind(SocketAddr::new(ip, port)).map(drop)))
-        .collect()
+    bind_probe_holding(port, &|_| {})
+}
+
+/// [`bind_probe`], calling `held` with each address while its bind holds it.
+pub(crate) fn bind_probe_holding(port: u16, held: &dyn Fn(SocketAddr)) -> Vec<BindOutcome> {
+    PROBED.iter().map(|&ip| bind_outcome(ip, &bind_only(SocketAddr::new(ip, port), held))).collect()
+}
+
+/// A TCP socket bound to `at` and closed, never listening: a listener on
+/// the wildcard can raise the application firewall's prompt on a Mac.
+/// `SO_REUSEADDR` is set as std sets it on a listener, so a connection of
+/// this port's left in `TIME_WAIT` does not read as a holder. The socket
+/// closes on every path, when its `OwnedFd` drops.
+#[cfg(unix)]
+fn bind_only(at: SocketAddr, held: &dyn Fn(SocketAddr)) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let family = if at.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
+    let socket = unsafe { OwnedFd::from_raw_fd(checked(fd)?) };
+    let on: libc::c_int = 1;
+    let on_len = std::mem::size_of_val(&on) as libc::socklen_t;
+    let raw = socket.as_raw_fd();
+    checked(unsafe { libc::setsockopt(raw, libc::SOL_SOCKET, libc::SO_REUSEADDR, (&on as *const libc::c_int).cast(), on_len) })?;
+    checked(bind_raw(raw, at))?;
+    held(at);
+    Ok(())
+}
+
+/// No socket call of this kind where there is no libc: no answer, so busy.
+#[cfg(not(unix))]
+fn bind_only(_at: SocketAddr, _held: &dyn Fn(SocketAddr)) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// A socket call's return as a result: negative is the call's error.
+#[cfg(unix)]
+fn checked(rc: libc::c_int) -> std::io::Result<libc::c_int> {
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(rc)
+    }
+}
+
+/// `bind(2)` of `fd` to `at`. The address is built from zero with its
+/// family, port and address set; BSD's `sin_len` is left zero, since the
+/// kernel sets it from the length passed.
+#[cfg(unix)]
+fn bind_raw(fd: libc::c_int, at: SocketAddr) -> libc::c_int {
+    match at {
+        SocketAddr::V4(v4) => {
+            let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            sa.sin_family = libc::AF_INET as libc::sa_family_t;
+            sa.sin_port = v4.port().to_be();
+            sa.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+            bind_sockaddr(fd, &sa)
+        }
+        SocketAddr::V6(v6) => {
+            let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sa.sin6_port = v6.port().to_be();
+            sa.sin6_addr.s6_addr = v6.ip().octets();
+            bind_sockaddr(fd, &sa)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn bind_sockaddr<T>(fd: libc::c_int, sa: &T) -> libc::c_int {
+    unsafe { libc::bind(fd, (sa as *const T).cast(), std::mem::size_of::<T>() as libc::socklen_t) }
 }
 
 /// The decision: free only when darkmux bound the port at some address,
