@@ -4,6 +4,7 @@
 //! profile registry declares a Tensorfold endpoint.
 
 use crate::{Check, Status};
+use darkmux_profiles::engine::availability;
 use darkmux_profiles::engine::flint::{OwnServer, OwnServerUse, Rec, Remedy, VERIFIED_RELEASE};
 use darkmux_profiles::engine::tensorfold::{TensorfoldProbe, ServeFlags, Tensorfold, Version, VERIFIED_RELEASES};
 use darkmux_types::config_access::Source;
@@ -146,6 +147,11 @@ pub(crate) struct FlintFacts {
     pub models: Vec<Result<(), String>>,
     /// What `rec status` says of rec's own server, when it is up.
     pub own_server: Result<Option<OwnServer>, String>,
+    /// Whether `rec auth token` gave a key, asked only while rec's own
+    /// server is up, as a listing asks it
+    /// ([`darkmux_profiles::engine::availability::own_server_key`]). `None`:
+    /// not asked.
+    pub key: Option<Result<(), String>>,
     /// For each Flint profile model, darkmux's own live server on its
     /// endpoint (which `rec status` may be naming).
     pub darkmuxs: Vec<Option<darkmux_types::engine_record::EngineRecord>>,
@@ -154,18 +160,29 @@ pub(crate) struct FlintFacts {
 impl FlintFacts {
     fn probe(models: &[&darkmux_types::ProfileModel]) -> Self {
         let (bin, source) = darkmux_types::config_access::flint_bin_with_source();
-        let rec = Rec::installed();
-        let msg = |e: anyhow::Error| format!("{e:#}");
         let dirs = darkmux_profiles::engine::server::Dirs::under_home();
+        Self::probe_with((bin, source), &Rec::installed(), &dirs, models)
+    }
+
+    /// [`Self::probe`] against the `rec` and server records it is given.
+    fn probe_with(
+        (bin, source): (String, Source),
+        rec: &Rec,
+        dirs: &darkmux_profiles::engine::server::Dirs,
+        models: &[&darkmux_types::ProfileModel],
+    ) -> Self {
+        let msg = |e: anyhow::Error| format!("{e:#}");
         let endpoint = |m: &darkmux_types::ProfileModel| m.endpoint.as_ref().and_then(|e| e.named_id()).unwrap_or_default().to_string();
+        let own_server = rec.own_server().map_err(msg);
         FlintFacts {
             bin,
             source,
             version: rec.version().map_err(msg),
             runtime: rec.runtime().map(|_| ()).map_err(msg),
             models: models.iter().map(|m| rec.model_dir(&m.id).map(|_| ()).map_err(msg)).collect(),
-            own_server: rec.own_server().map_err(msg),
-            darkmuxs: models.iter().map(|m| darkmux_profiles::engine::server::running_now(&dirs, &endpoint(m))).collect(),
+            key: availability::own_server_key(rec, &own_server),
+            own_server,
+            darkmuxs: models.iter().map(|m| darkmux_profiles::engine::server::running_now(dirs, &endpoint(m))).collect(),
         }
     }
 }
@@ -260,8 +277,9 @@ fn flint_install_problems(models: &[FlintModel<'_>], facts: &FlintFacts) -> Vec<
 }
 
 /// The row once rec's install is good: a warning while rec's own server
-/// runs and does not serve every Flint model (#3574: each judged as a
-/// dispatch judges it, `flint::own_server_use`).
+/// runs and a dispatch could not use it for every Flint model (#3574: each
+/// judged as a dispatch and a listing judge it,
+/// `availability::keyed_own_server_use`).
 fn flint_server_row(lead: &str, facts: &FlintFacts, models: &[FlintModel<'_>]) -> Check {
     match &facts.own_server {
         Err(e) => flint_row(Status::Warn, format!("{lead}: `rec status` did not answer: {e}"), None),
@@ -269,34 +287,50 @@ fn flint_server_row(lead: &str, facts: &FlintFacts, models: &[FlintModel<'_>]) -
     }
 }
 
-/// [`flint_server_row`] once `rec status` answered: each model's
-/// [`OwnServerUse`], read into one row.
+/// One Flint model a dispatch could not send to rec's own server: where it
+/// is declared and why, and the remedy (`None`: `rec auth token` gave no
+/// key, refused `engine_unavailable`).
+type Refused = (String, Option<Remedy>);
+
+/// [`flint_server_row`] once `rec status` answered: each model's decision
+/// ([`availability::keyed_own_server_use`]), read into one row.
 fn own_server_row(lead: &str, own: Option<&OwnServer>, facts: &FlintFacts, models: &[FlintModel<'_>]) -> Check {
-    let uses: Vec<(String, OwnServerUse)> = models
+    let uses: Vec<(String, Result<OwnServerUse, String>)> = models
         .iter()
         .zip(facts.darkmuxs.iter().chain(std::iter::repeat(&None)))
         .map(|((p, i, m), darkmuxs)| {
-            (format!("profiles.{p}.models[{i}]"), darkmux_profiles::engine::flint::own_server_use(own, m, darkmuxs.as_ref()))
+            let decided = availability::keyed_own_server_use(own, m, darkmuxs.as_ref(), facts.key.as_ref());
+            (format!("profiles.{p}.models[{i}]"), decided)
         })
         .collect();
     let address = own.map_or("", |o| o.address.as_str());
-    let refused: Vec<(String, Remedy)> = uses
-        .iter()
-        .filter_map(|(at, u)| match u {
-            OwnServerUse::Refuse { why, remedy, .. } => Some((format!("{at}: {why}"), *remedy)),
-            _ => None,
-        })
-        .collect();
-    let reused = uses.iter().filter(|(_, u)| matches!(u, OwnServerUse::Reuse { .. })).count();
+    let refused: Vec<Refused> = uses.iter().filter_map(|(at, u)| refusal(at, u)).collect();
+    let reused = uses.iter().filter(|(_, u)| matches!(u, Ok(OwnServerUse::Reuse { .. }))).count();
     flint_own_server_check(lead, address, &refused, reused, models.len())
+}
+
+/// The model at `at` as [`Refused`], when a dispatch could not use rec's own
+/// server for it.
+fn refusal(at: &str, decided: &Result<OwnServerUse, String>) -> Option<Refused> {
+    match decided {
+        Ok(OwnServerUse::Refuse { why, remedy, .. }) => Some((format!("{at}: {why}"), Some(*remedy))),
+        Err(e) => Some((format!("{at}: rec's own server serves it, but {e}"), None)),
+        Ok(_) => None,
+    }
 }
 
 /// The hint for the models rec's own server does not serve, following
 /// their why (#3574): wait when every one only waits on rec's server being
-/// ready, else `rec stop`.
-fn own_server_hint(refused: &[(String, Remedy)]) -> String {
-    if refused.iter().all(|(_, r)| *r == Remedy::WaitReady) {
+/// ready; fix rec's key when every other one only lacks it; else `rec stop`.
+fn own_server_hint(refused: &[Refused]) -> String {
+    if refused.iter().all(|(_, r)| *r == Some(Remedy::WaitReady)) {
         return "rec's own server is still starting and will serve them: wait until `rec status` says it is ready"
+            .into();
+    }
+    if refused.iter().all(|(_, r)| matches!(r, None | Some(Remedy::WaitReady))) {
+        return "those dispatches are refused (`engine_unavailable`): darkmux sends rec's local key, read with `rec \
+                auth token`, with every request to rec's own server. Fix rec's install until `rec auth token` prints \
+                a key, or run `rec stop` to let darkmux start its own server"
             .into();
     }
     "those dispatches are refused (`engine_in_use`): darkmux never stops or takes over rec's server. Run `rec stop` \
@@ -304,10 +338,10 @@ fn own_server_hint(refused: &[(String, Remedy)]) -> String {
         .into()
 }
 
-/// The row from what rec's own server means for the Flint models: any it
-/// does not serve warn, naming why; otherwise it passes, saying which go to
-/// rec's own server.
-fn flint_own_server_check(lead: &str, address: &str, refused: &[(String, Remedy)], reused: usize, models: usize) -> Check {
+/// The row from what rec's own server means for the Flint models: any a
+/// dispatch could not use it for warn, naming why; otherwise it passes,
+/// saying which go to rec's own server.
+fn flint_own_server_check(lead: &str, address: &str, refused: &[Refused], reused: usize, models: usize) -> Check {
     if !refused.is_empty() {
         let whys: Vec<&str> = refused.iter().map(|(why, _)| why.as_str()).collect();
         return flint_row(
@@ -354,6 +388,7 @@ mod flint_tests {
             runtime: Ok(()),
             models: vec![Ok(())],
             own_server: Ok(None),
+            key: None,
             darkmuxs: vec![None],
         }
     }
@@ -376,6 +411,7 @@ mod flint_tests {
     fn recs_own_server_serving_the_model_passes_and_serving_another_warns() {
         let mut reused = facts("0.1.0");
         reused.own_server = Ok(Some(serving("flint-int4", 8192)));
+        reused.key = Some(Ok(()));
         let c = flint_engine_status(&registry(REG), |_| reused);
         assert_eq!(c.status, Status::Pass, "{}", c.message);
         assert!(c.message.contains("serves 1 of 1") && c.message.contains("does not manage it"), "{}", c.message);
@@ -392,6 +428,53 @@ mod flint_tests {
         assert_eq!(c.status, Status::Warn, "{}", c.message);
         let hint = c.hint.unwrap();
         assert!(hint.contains("wait until `rec status` says it is ready") && !hint.contains("rec stop"), "{hint}");
+    }
+
+    /// (#3574) rec's own server serving the model is used only with rec's
+    /// key: when `rec auth token` gives none, a dispatch and a listing
+    /// refuse it (`engine_unavailable`), so the row warns, naming the
+    /// command, rather than passing.
+    #[test]
+    fn recs_own_server_without_its_key_warns_as_a_dispatch_refuses_it() {
+        let mut keyless = facts("0.1.0");
+        keyless.own_server = Ok(Some(serving("flint-int4", 8192)));
+        keyless.key = Some(Err("`rec auth token` printed no key (exit 1)".into()));
+        let c = flint_engine_status(&registry(REG), |_| keyless);
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert!(c.message.contains("profiles.f.models[0]") && c.message.contains("rec auth token"), "{}", c.message);
+        let hint = c.hint.unwrap_or_default();
+        assert!(hint.contains("engine_unavailable") && hint.contains("rec stop"), "{hint}");
+        let mut keyed = facts("0.1.0");
+        keyed.own_server = Ok(Some(serving("flint-int4", 8192)));
+        keyed.key = Some(Ok(()));
+        let c = flint_engine_status(&registry(REG), |_| keyed);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+    }
+
+    /// (#3574) The probe asks rec's key as a listing asks it: from `rec auth
+    /// token`, only while rec's own server is up, keeping whether it gave
+    /// one. A stub `rec` stands in for rec's install.
+    #[test]
+    fn the_probe_asks_recs_key_only_while_its_own_server_is_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let rec = |status: &str| {
+            let bin = dir.path().join(format!("rec-{}", status.len()));
+            let script = format!("#!/bin/sh\ncase \"$1\" in\n  --version) echo 'rec 0.1.0';;\n  status) {status};;\n  *) exit 1;;\nesac\n");
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Rec::at(bin.to_string_lossy().into_owned(), Some(dir.path().join("rec")))
+        };
+        let dirs = darkmux_profiles::engine::server::Dirs { records: dir.path().join("run"), logs: dir.path().join("logs") };
+        let r = registry(REG);
+        let models: Vec<&darkmux_types::ProfileModel> = r.profiles.values().flat_map(|p| &p.models).collect();
+        let up = r#"echo '{"ready":true,"endpoint":"http://127.0.0.1:11500/v1","revision":"flint-int4","context":8192}'"#;
+        let at = ("rec".to_string(), Source::BuiltIn);
+        let facts = FlintFacts::probe_with(at.clone(), &rec(up), &dirs, &models);
+        assert!(matches!(facts.own_server, Ok(Some(_))), "{:?}", facts.own_server);
+        assert!(matches!(&facts.key, Some(Err(e)) if e.contains("auth token")), "{:?}", facts.key);
+        let facts = FlintFacts::probe_with(at, &rec("exit 1"), &dirs, &models);
+        assert_eq!(facts.key, None, "not asked while rec's own server is down");
     }
 
     /// (#3453) No Flint endpoint: rec is never asked.

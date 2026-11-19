@@ -698,7 +698,7 @@ pub fn machine_port_owners() -> Vec<PortOwner> {
     let mut owners = Vec::new();
     let lms = crate::config_access::lmstudio_url();
     if crate::endpoint::url_names_this_machine(&lms) {
-        if let Some(port) = url_port(&lms) {
+        if let Some(port) = crate::endpoint::url_port(&lms) {
             owners.push(PortOwner { port, owner: "LM Studio's (`lmstudio_url`)".to_string() });
         }
     }
@@ -710,28 +710,21 @@ pub fn machine_port_owners() -> Vec<PortOwner> {
     owners
 }
 
-/// The port `url` is dialed on: the one it names, else its scheme's.
-fn url_port(url: &str) -> Option<u16> {
-    let (scheme, _) = url.split_once("://")?;
-    // A host `url_host` accepts closes any `[` it opens.
-    let hostport = crate::endpoint::url_host(url)?;
-    let after_host = match hostport.strip_prefix('[') {
-        Some(v6) => v6.split_once(']').map_or("", |(_, tail)| tail),
-        None => hostport.find(':').map_or("", |i| &hostport[i..]),
-    };
-    match after_host.strip_prefix(':').filter(|p| !p.is_empty()) {
-        Some(port) => port.parse().ok(),
-        None => scheme_port(scheme),
-    }
-}
-
-/// The port a URL scheme dials when the URL names none.
-fn scheme_port(scheme: &str) -> Option<u16> {
-    match scheme.to_ascii_lowercase().as_str() {
-        "http" => Some(80),
-        "https" => Some(443),
-        _ => None,
-    }
+/// The ports darkmux's own services and LM Studio listen on here, as
+/// resolved now, whether or not they run: [`machine_port_owners`]' (LM
+/// Studio's when `lmstudio_url` names this machine, the daemon's
+/// `serve.port`, a running daemon's own), the fleet listener's
+/// (`fleet.listener.port`, bound to the overlay address) and `darkmux client
+/// serve`'s default ([`crate::config_access::CLIENT_SERVE_PORT`], on the
+/// loopback and published on the overlay). Sorted, once each. What a
+/// sandbox on the host is refused even before they listen.
+pub fn darkmux_service_ports() -> Vec<u16> {
+    let owned = machine_port_owners().into_iter().map(|o| o.port);
+    let started = [crate::config_access::fleet_listener_port(), crate::config_access::CLIENT_SERVE_PORT];
+    let mut ports: Vec<u16> = owned.chain(started).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 /// Every engine endpoint (a server darkmux starts) whose `port` something
@@ -1089,6 +1082,25 @@ pub fn config_path_of(setting: &EnumSetting) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// darkmux's own service ports are refused before they listen: the
+    /// daemon's resolved `serve.port`, the fleet listener's, `client serve`'s
+    /// default, and LM Studio's when it is on this machine; once each, sorted.
+    #[test]
+    fn darkmux_service_ports_name_every_listener_darkmux_starts() {
+        let ports = super::darkmux_service_ports();
+        for want in [crate::config_access::serve_port(), crate::config_access::fleet_listener_port(), crate::config_access::CLIENT_SERVE_PORT] {
+            assert!(ports.contains(&want), "{want} missing from {ports:?}");
+        }
+        let lms = crate::config_access::lmstudio_url();
+        if crate::endpoint::url_names_this_machine(&lms) {
+            assert!(ports.contains(&crate::endpoint::url_port(&lms).unwrap()), "{ports:?}");
+        }
+        let mut sorted = ports.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(ports, sorted);
+    }
+
 
     /// (#3504) A busy dispatch reads `fleet.busy_policy`, so every entry
     /// point that dispatches refuses a value it does not know, as the fleet
@@ -1114,7 +1126,7 @@ mod tests {
             ("http://bad host:1234", None),
             ("http://localhost:99999", None),
         ] {
-            assert_eq!(super::url_port(url), port, "{url}");
+            assert_eq!(crate::endpoint::url_port(url), port, "{url}");
         }
     }
 

@@ -224,6 +224,14 @@ impl Platform for FakePlatform {
         Some(self.tcp_peers.clone())
     }
 
+    /// The ports [`Self::port_listeners`] names.
+    fn tcp_listening_ports(&self) -> Option<Vec<u16>> {
+        let mut ports: Vec<u16> = self.port_listeners.iter().map(|(p, _)| *p).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        Some(ports)
+    }
+
     fn tcp_port_listeners(&self, port: u16) -> Option<Vec<crate::PortListener>> {
         use std::sync::atomic::Ordering;
         if self.port_listeners_unreadable_reads.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {

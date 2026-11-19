@@ -203,6 +203,11 @@ impl Platform for MacPlatform {
         netstat_tcp().and_then(|out| crate::port_listeners_from_netstat(&out, port))
     }
 
+    /// One `netstat -anv -p tcp`, as [`Self::tcp_port_listeners`] reads.
+    fn tcp_listening_ports(&self) -> Option<Vec<u16>> {
+        netstat_tcp().and_then(|out| crate::listening_ports_from_netstat(&out))
+    }
+
     /// (#3559) In-process, no command spawned: the process table from
     /// libproc (`proc_listallpids`, then each process's `PROC_PIDTBSDINFO`,
     /// which answers for this user's processes), then each member's own open

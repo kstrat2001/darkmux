@@ -191,6 +191,13 @@ pub trait Platform: Send + Sync {
     /// not to the loopback, #3559) listening beyond this machine.
     fn tcp_port_listeners(&self, port: u16) -> Option<Vec<PortListener>>;
 
+    /// Every port a TCP socket on this host listens on, at any address and
+    /// whatever the process (another user's included), from the kernel's
+    /// socket table, sorted: `None` when this platform cannot say or its
+    /// answer does not read (never "none"). What keeps a sandbox on the host
+    /// off this host's services it was not given.
+    fn tcp_listening_ports(&self) -> Option<Vec<u16>>;
+
     /// (#3559) Every TCP socket listening that a sandbox on the host holds,
     /// each with its port: the sandbox being `leader` (its launcher, which
     /// leads its process group, and under Seatbelt its session), every
@@ -1025,6 +1032,23 @@ pub(crate) fn port_listeners_from_netstat(out: &str, port: u16) -> Option<Vec<Po
         }
     }
     Some(found)
+}
+
+/// Every port a LISTEN row holds in `netstat -anv -p tcp`'s answer, sorted
+/// and once each. `None` when the header is not netstat's, or a LISTEN row's
+/// local address has no port that reads.
+pub(crate) fn listening_ports_from_netstat(out: &str) -> Option<Vec<u16>> {
+    let mut lines = out.lines();
+    lines.find(|l| l.starts_with("Proto") && l.contains("Local Address") && l.contains("process:pid"))?;
+    let mut ports = Vec::new();
+    for f in lines.map(|l| l.split_whitespace().collect::<Vec<_>>()) {
+        if f.first().is_some_and(|p| p.starts_with("tcp")) && f.get(5) == Some(&"LISTEN") {
+            ports.push(f.get(3)?.rsplit_once('.')?.1.parse::<u16>().ok()?);
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    Some(ports)
 }
 
 /// One netstat row: a listener on `port` (`Some(Some(_))`), another row
