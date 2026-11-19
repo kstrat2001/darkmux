@@ -1472,6 +1472,7 @@ mod tests {
             ("Others", "how a schema treats keys it does not name, internal to the gate"),
             ("Depth", "how strictly the user-file gate judges a value, internal to the gate"),
             ("Reach", "which files a user-file check reaches (doctor vs preflight), not a setting"),
+            ("Repeat", "what a key written twice in a user file costs its load, not a setting"),
             ("LeftoverPolicy", "whether a retired env var still set is refused or only warned about, fixed per retired setting, not a setting"),
             ("LeftoverValue", "how a retired config key's leftover value is judged, fixed per retired setting, not a setting"),
             ("OldDefault", "a value a retired config key held by default, matched by the leftover check, not a setting"),

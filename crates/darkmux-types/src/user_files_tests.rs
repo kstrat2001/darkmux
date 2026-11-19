@@ -51,7 +51,7 @@ fn paths(keys: &[KeyIssue]) -> Vec<&str> {
 fn closest_of(k: &KeyIssue) -> Option<&str> {
     match &k.issue {
         Issue::Unknown { closest, .. } => closest.as_deref(),
-        Issue::Retired(_) | Issue::Removed(_) | Issue::WrongType { .. } | Issue::Missing { .. } | Issue::Rule(_) => None,
+        Issue::Retired(_) | Issue::Removed(_) | Issue::WrongType { .. } | Issue::Missing { .. } | Issue::Rule(_) | Issue::Duplicate(_) => None,
     }
 }
 
@@ -338,8 +338,8 @@ fn a_mistyped_config_value_is_named_with_its_expected_type() {
     assert!(serde_json::from_str::<crate::config::DarkmuxConfig>(text).is_err(), "precondition: the typed load fails");
     let keys = config_keys(serde_json::from_str(text).unwrap());
     assert_eq!(paths(&keys), ["redis.port"]);
-    assert_eq!(wrong_type(&keys[0]), Some(("an integer from 0 to 65535", "\"x\"")));
-    assert_eq!(keys[0].to_string(), "`redis.port` must be an integer from 0 to 65535, got \"x\"");
+    assert_eq!(wrong_type(&keys[0]), Some(("an integer from 0 to 65535", "a string")));
+    assert_eq!(keys[0].to_string(), "`redis.port` must be an integer from 0 to 65535, got a string");
 }
 
 #[test]
@@ -355,10 +355,10 @@ fn wrong_types_are_found_at_every_level_and_in_every_json_type() {
     assert_eq!(
         found,
         [
-            ("redis.port", Some(("an integer from 0 to 65535", "70000"))),
-            ("redis.enabled", Some(("true or false", "\"yes\""))),
-            ("hooks.rules[0].file", Some(("a string", "5"))),
-            ("role_profiles.coder", Some(("a string", "[\"not\",\"a\",\"string\"]"))),
+            ("redis.port", Some(("an integer from 0 to 65535", "an integer that does not fit"))),
+            ("redis.enabled", Some(("true or false", "a string"))),
+            ("hooks.rules[0].file", Some(("a string", "an integer"))),
+            ("role_profiles.coder", Some(("a string", "a list"))),
         ]
     );
 }
@@ -369,16 +369,55 @@ fn enum_variants_free_values_and_null_options_are_accepted_or_named() {
     assert_eq!(key_issues::<Probe>(&ok, &no_retired), vec![]);
     let bad = key_issues::<Probe>(&json!({"shape": {"kind": "hexagon"}, "list": {"port": 1}}), &no_retired);
     let found: Vec<(&str, Option<(&str, &str)>)> = bad.iter().map(|k| (k.path.as_str(), wrong_type(k))).collect();
-    assert_eq!(found, [("shape.kind", Some(("`circle` or `square`", "\"hexagon\""))), ("list", Some(("a list", "{\"port\":1}")))]);
+    assert_eq!(found, [("shape.kind", Some(("`circle` or `square`", "a string that does not fit"))), ("list", Some(("a list", "an object")))]);
 }
 
-/// A long value is shortened in the message, never printed whole.
+/// Each JSON-schema type name holds exactly its JSON values; an unknown
+/// name holds nothing.
 #[test]
-fn a_long_wrong_value_is_shortened() {
-    let long = "y".repeat(200);
-    let keys = key_issues::<Probe>(&json!({"type": [long]}), &no_retired);
-    let (_, got) = wrong_type(&keys[0]).unwrap();
-    assert!(got.chars().count() <= 61 && got.ends_with('…'), "{got}");
+fn type_holds_matches_each_schema_type_name() {
+    let values = [json!(null), json!(true), json!(3), json!(1.5), json!("s"), json!([1]), json!({"k": 1})];
+    let holds = |t: &str| values.iter().filter(|v| type_holds(t, v)).cloned().collect::<Vec<Value>>();
+    assert_eq!(holds("null"), [json!(null)]);
+    assert_eq!(holds("boolean"), [json!(true)]);
+    assert_eq!(holds("integer"), [json!(3)]);
+    assert_eq!(holds("number"), [json!(3), json!(1.5)]);
+    assert_eq!(holds("string"), [json!("s")]);
+    assert_eq!(holds("array"), [json!([1])]);
+    assert_eq!(holds("object"), [json!({"k": 1})]);
+    assert_eq!(holds("tuple"), Vec::<Value>::new());
+}
+
+/// Each JSON type has its operator words.
+#[test]
+fn json_type_names_each_json_type() {
+    let named: Vec<&str> = [json!(null), json!(false), json!(-3), json!(u64::MAX), json!(1.5), json!("s"), json!([]), json!({})].iter().map(json_type).collect();
+    assert_eq!(named, ["null", "a boolean", "an integer", "an integer", "a number", "a string", "a list", "an object"]);
+}
+
+/// Every JSON type is named, never shown: no part of any wrong value
+/// reaches the message, whatever its type or length.
+#[test]
+fn every_wrong_value_is_named_by_its_json_type_alone() {
+    let secret = "s3cret-".repeat(30);
+    let cases = [
+        (json!({"type": [secret.clone()]}), "a list"),
+        (json!({"type": {"k": secret.clone()}}), "an object"),
+        (json!({"type": 4.5}), "a number"),
+        (json!({"type": 12345}), "an integer"),
+        (json!({"type": true}), "a boolean"),
+        (json!({"redis": {"port": secret.clone()}}), "a string"),
+        (json!({"redis": {"port": -1}}), "an integer that does not fit"),
+        (json!({"redis": {"port": 1.5}}), "a number"),
+        (json!({"shape": {"kind": secret.clone()}}), "a string that does not fit"),
+    ];
+    for (doc, want) in cases {
+        let keys = key_issues::<Probe>(&doc, &no_retired);
+        assert_eq!(keys.len(), 1, "{doc}: {keys:?}");
+        assert_eq!(wrong_type(&keys[0]).map(|(_, got)| got), Some(want), "{doc}");
+        let shown = keys[0].to_string();
+        assert!(!shown.contains("s3cret") && !shown.contains("12345") && !shown.contains("4.5"), "{shown}");
+    }
 }
 
 /// What `darkmux init` writes and a clean config have no wrong types either.
@@ -404,6 +443,199 @@ fn a_comment_key_inside_a_map_is_an_entry_not_a_note() {
     assert_eq!(paths(&keys), ["role_profiles._comment"]);
 }
 
+// ── a key written twice in one object ──
+
+fn refused_paths(fp: &FileProblem) -> Vec<String> {
+    match &fp.problem {
+        Problem::Keys(keys) => keys.iter().filter(|k| matches!(k.issue, Issue::Duplicate(_))).map(|k| k.path.clone()).collect(),
+        other => panic!("expected key issues, got {other:?}"),
+    }
+}
+
+/// A key written twice fails the typed `config.json` load ("duplicate
+/// field"), and the lenient loader then drops EVERY setting to its default.
+/// `serde_json::Value` keeps only the last copy, so a gate that walks a
+/// `Value` never saw it: preflight and doctor passed while Redis and audit
+/// went silently off. The gate refuses it, naming the key's path.
+#[test]
+fn a_duplicate_config_key_is_refused_naming_its_path() {
+    let text = r#"{"machine_id":"a","redis":{"enabled":true},"machine_id":"b"}"#;
+    let err = serde_json::from_str::<crate::config::DarkmuxConfig>(text).unwrap_err();
+    assert!(err.to_string().contains("duplicate field `machine_id`"), "precondition: the typed load fails: {err}");
+    let found = config_check_text(Path::new("config.json"), text).refusal.expect("a duplicate key is refused");
+    assert_eq!(refused_paths(&found), ["machine_id"]);
+    let msg = found.to_string();
+    assert!(msg.starts_with("config config.json: "), "names the file: {msg}");
+    assert!(msg.contains("duplicate key `machine_id`"), "{msg}");
+    assert!(config_problem(text).is_some(), "the file on disk is refused too (doctor's path)");
+}
+
+/// At any depth: a nested block, a list item, a map entry, and the same key
+/// three times is one finding.
+#[test]
+fn a_duplicate_key_is_refused_at_every_depth() {
+    let text = r#"{"redis":{"port":1,"enabled":true,"port":2},
+        "hooks":{"rules":[{"file":"a","file":"b"}]},
+        "role_profiles":{"coder":"x","coder":"y","coder":"z"}}"#;
+    let found = config_check_text(Path::new("config.json"), text).refusal.expect("refused");
+    assert_eq!(refused_paths(&found), ["redis.port", "hooks.rules[0].file", "role_profiles.coder"]);
+}
+
+fn repeats(fp: &FileProblem) -> Vec<(&str, Repeat)> {
+    match &fp.problem {
+        Problem::Keys(keys) => keys
+            .iter()
+            .filter_map(|k| match k.issue {
+                Issue::Duplicate(r) => Some((k.path.as_str(), r)),
+                _ => None,
+            })
+            .collect(),
+        other => panic!("expected key issues, got {other:?}"),
+    }
+}
+
+/// A repeated `_comment` is a note written twice, a common idiom, and the
+/// typed load accepts it (it lands in the overflow): it is not refused, at
+/// the top level or nested.
+#[test]
+fn a_repeated_comment_note_is_not_refused() {
+    for text in [r#"{"_comment":"a","machine_id":"x","_comment":"b"}"#, r#"{"redis":{"_comment":"a","enabled":true,"_comment":"b"}}"#] {
+        assert!(serde_json::from_str::<crate::config::DarkmuxConfig>(text).is_ok(), "precondition: it loads: {text}");
+        assert_eq!(config_check_text(Path::new("config.json"), text).refusal, None, "{text}");
+    }
+}
+
+/// Each repeat is named for what it costs. A repeated struct field fails
+/// the typed load; a repeated map entry or unknown key loads with only the
+/// last copy used, which is still a silent mistake, so it is refused, and
+/// said truthfully.
+#[test]
+fn each_repeat_is_named_for_what_it_costs() {
+    let entry = r#"{"role_profiles":{"coder":"p","coder":"q"}}"#;
+    let loaded: crate::config::DarkmuxConfig = serde_json::from_str(entry).expect("precondition: a repeated map entry loads");
+    assert_eq!(loaded.role_profiles.as_ref().and_then(|m| m.get("coder")).map(String::as_str), Some("q"), "the last copy is used");
+    let text = r#"{"machine_id":"a","role_profiles":{"coder":"p","coder":"q"},"zz":1,"zz":2,"machine_id":"b"}"#;
+    let found = config_check_text(Path::new("config.json"), text).refusal.expect("refused");
+    assert_eq!(repeats(&found), [("machine_id", Repeat::Field), ("role_profiles.coder", Repeat::Entry), ("zz", Repeat::Entry)]);
+    let msg = found.to_string();
+    assert!(msg.contains("duplicate key `machine_id`: it is written more than once in the same object, so the file fails to load"), "{msg}");
+    assert!(msg.contains("duplicate key `role_profiles.coder`: it is written more than once in the same object, and only the last copy is used"), "{msg}");
+}
+
+/// A kind whose loader reads a `serde_json::Value` first (the registry, a
+/// rule) keeps the last copy of every key, a named field included.
+#[test]
+fn a_kind_read_through_a_value_names_every_repeat_as_last_copy() {
+    let text = r#"{"redis": {"host": "a", "host": "b"}}"#;
+    for (kind, want) in [(UserFileKind::Profiles, Repeat::Entry), (UserFileKind::Rule, Repeat::Entry), (UserFileKind::Role, Repeat::Field)] {
+        let fp = check_text::<Probe>(kind, Path::new("/x/f.json"), text, &no_retired).expect("refused");
+        assert_eq!(repeats(&fp), [("redis.host", want)], "{kind:?}");
+    }
+}
+
+/// A repeat inside a free-form value (no schema below it) keeps its last
+/// copy, and so does one beside a refused unknown key.
+#[test]
+fn a_repeat_inside_a_free_value_is_a_last_copy_entry() {
+    let fp = check_text::<Probe>(UserFileKind::Role, Path::new("/x/f.json"), r#"{"anything": {"k": 1, "k": 2}}"#, &no_retired).expect("refused");
+    assert_eq!(repeats(&fp), [("anything.k", Repeat::Entry)]);
+}
+
+/// A type that counts how often it is deserialized: the trial loads that
+/// classify repeats are the gate's only typed loads.
+struct Counted;
+
+static LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl<'de> Deserialize<'de> for Counted {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Value::deserialize(d).map(|_| Counted)
+    }
+}
+
+impl JsonSchema for Counted {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Counted".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type": "object"})
+    }
+}
+
+/// A clean file costs no typed load, and a file with many repeats costs a
+/// bounded number: past the cap, a repeat is refused without saying what
+/// it costs, so a hostile file cannot stall a preflight.
+#[test]
+fn classifying_repeats_costs_a_bounded_number_of_loads() {
+    let loads = || LOADS.load(std::sync::atomic::Ordering::SeqCst);
+    let before = loads();
+    assert_eq!(check_text::<Counted>(UserFileKind::Role, Path::new("f"), r#"{"a": 1, "b": {"c": 2}}"#, &no_retired), None);
+    assert_eq!(loads(), before, "no repeat, no typed load");
+    let keys: Vec<String> = (0..50).map(|i| format!("\"k{i}\": 1, \"k{i}\": 2")).collect();
+    let text = format!("{{{}}}", keys.join(", "));
+    let fp = check_text::<Counted>(UserFileKind::Role, Path::new("f"), &text, &no_retired).expect("refused");
+    let found = repeats(&fp);
+    assert_eq!(found.len(), 50, "every repeat is still refused");
+    let judged = found.iter().filter(|(_, r)| *r != Repeat::Unjudged).count();
+    assert_eq!(judged, MAX_REPEAT_TRIALS, "{found:?}");
+    assert!(loads() - before <= MAX_REPEAT_TRIALS + 1, "{} loads", loads() - before);
+    let msg = fp.to_string();
+    assert!(msg.contains("duplicate key `k49`: it is written more than once in the same object; keep one"), "{msg}");
+}
+
+/// Every user file kind goes through the one check, so every kind refuses it.
+#[test]
+fn every_user_file_kind_refuses_a_duplicate_key() {
+    for kind in UserFileKind::ALL {
+        let text = r#"{"redis": {"host": "a", "host": "a"}}"#;
+        let fp = check_text::<Probe>(kind, Path::new("/x/f.json"), text, &no_retired)
+            .unwrap_or_else(|| panic!("{kind:?} accepted a duplicate key"));
+        assert_eq!(refused_paths(&fp), ["redis.host"], "{kind:?}");
+    }
+}
+
+/// The duplicate-key fixture writes the key it names twice.
+#[test]
+fn with_duplicate_key_repeats_the_first_key_of_the_object_it_names() {
+    let doc = json!({"list": [{"port": 1, "host": "h"}], "type": "t"});
+    let (text, path) = with_duplicate_key(&doc, "/list/0");
+    assert_eq!(path, "list[0].port");
+    assert_eq!(text.matches("\"port\"").count(), 2, "{text}");
+    let (text, path) = with_duplicate_key(&doc, "");
+    assert_eq!(path, "list");
+    assert_eq!(text.matches("\"list\"").count(), 2, "{text}");
+}
+
+// ── a refusal never quotes the value it refuses ──
+
+/// A wrong-typed value is named by its type, never quoted: the value is
+/// whatever the operator pasted, and a Redis URL carries its password into
+/// preflight stderr, doctor and the daemon's log.
+#[test]
+fn a_wrong_typed_value_is_named_by_its_type_never_quoted() {
+    let text = r#"{"redis": "redis://:hunter2@10.0.0.5:6379/0"}"#;
+    let found = config_check_text(Path::new("config.json"), text).refusal.expect("refused");
+    let msg = found.to_string();
+    assert!(msg.contains("`redis` must be an object or null, got a string"), "{msg}");
+    assert!(!msg.contains("hunter2") && !msg.contains("10.0.0.5"), "the value leaked: {msg}");
+}
+
+/// A serde error keeps its keys, types and position, and loses every value
+/// it quotes, whatever the value holds.
+#[test]
+fn a_load_error_keeps_its_shape_and_loses_every_quoted_value() {
+    let wrong = serde_json::from_str::<crate::config::DarkmuxConfig>(r#"{"redis": "redis://:hunter2@h:1/0"}"#).unwrap_err();
+    assert_eq!(load_error(&wrong), "invalid type: a string, expected struct RedisConfig at line 1 column 34");
+    let tricky = r#"invalid value: string "a\"b, expected x", expected y; unknown variant `p@ss`, expected `a` or `b`; tail"#;
+    assert_eq!(without_values(tricky), "invalid value: a string, expected y; an unknown variant, expected `a` or `b`; tail");
+    assert_eq!(without_values("unknown variant `x`, there are no variants"), "an unknown variant, there are no variants");
+    assert_eq!(without_values("missing field `id` and string \"unterminated"), "missing field `id` and a string");
+    assert_eq!(without_values("unknown field `zz`, expected `a`"), "unknown field `zz`, expected `a`");
+    // A value holding the delimiter itself: the closing one is the last.
+    let inside = "unknown variant `a`, expected b hunter2`, expected `x` or `y` at line 1 column 9";
+    assert_eq!(without_values(inside), "an unknown variant, expected `x` or `y` at line 1 column 9");
+}
 
 /// (review C1) A capability vector's keys are the `Capability` tokens: a
 /// misspelled one fails the load, so the gate names it.
@@ -432,8 +664,9 @@ fn a_key_cannot_forge_an_output_line() {
     assert!(keys.iter().any(|k| k.path.starts_with("redis.\"")), "{keys:?}");
 }
 
-/// Bidi and other invisible format characters in a value or a key are shown
-/// as escapes, never passed to the terminal to reorder the line.
+/// Bidi and other invisible format characters in a key are shown as
+/// escapes, never passed to the terminal to reorder the line (a value is
+/// never shown at all).
 #[test]
 fn bidi_and_format_characters_are_escaped() {
     let keys = key_issues::<Probe>(&json!({"type": ["a\u{202e}b\u{200b}"], "ab\u{2066}c": 1}), &no_retired);
@@ -441,7 +674,7 @@ fn bidi_and_format_characters_are_escaped() {
     for c in ['\u{202e}', '\u{200b}', '\u{2066}'] {
         assert!(!text.contains(c), "{c:?} reached the message: {text:?}");
     }
-    assert!(text.contains("\\u{202e}") && text.contains("\\u{2066}"), "{text}");
+    assert!(text.contains("\\u{2066}"), "{text}");
 }
 
 /// A file path is escaped the same way before it is printed.

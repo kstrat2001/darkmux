@@ -2681,8 +2681,14 @@ impl DarkmuxConfig {
         Self::load_from(&path)
     }
 
-    /// Load from an explicit path (used by tests + `load_resolved`). Silent
-    /// default on missing/unreadable/unparseable file.
+    /// Load from an explicit path (used by tests + `load_resolved`). Default
+    /// on a missing, unreadable or unparseable file, so a bad config never
+    /// bricks the CLI (contract 7). The default is never the only word: the
+    /// user-file gate refuses every document this load fails on (a wrong
+    /// type, a key written twice; `whatever_the_gate_passes_the_typed_load_accepts`
+    /// pins that), so every command that starts work refuses at preflight,
+    /// a command with no preflight prints it as a warning, and doctor fails
+    /// it.
     pub fn load_from(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
