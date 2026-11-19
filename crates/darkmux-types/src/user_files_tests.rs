@@ -748,3 +748,129 @@ fn each_retired_key_is_judged_by_its_value() {
         assert!(!crate::config::leftover_is_harmless(key, &value), "{key} = {value} must refuse");
     }
 }
+
+/// Text a model, a peer or an endpoint wrote, printed whole: every escape
+/// sequence is shown as text, never acted on, and the lines and tabs it
+/// holds still read as lines and tabs.
+#[test]
+fn escape_text_keeping_lines_shows_escapes_and_keeps_lines_and_tabs() {
+    let hostile = "a\x1b]0;owned\x07b\n\x1b[2J\tc\x1b]52;c;aGk=\x07\u{9b}31m\u{202e}d\r\ne";
+    let shown = escape_text_keeping_lines(hostile);
+    assert!(!shown.chars().any(|c| c.is_control() && c != '\n' && c != '\t'), "{shown:?}");
+    assert!(!shown.contains('\u{202e}'), "{shown:?}");
+    assert_eq!(shown, "a\\u{1b}]0;owned\\u{7}b\n\\u{1b}[2J\tc\\u{1b}]52;c;aGk=\\u{7}\\u{9b}31m\\u{202e}d\ne");
+}
+
+#[test]
+fn escape_text_keeping_lines_leaves_plain_text_and_unicode_unchanged() {
+    for text in ["", "plain", "two\nlines\n", "a\tb", "café 日本語 🇺🇸 👍🏽", "trailing\n\n"] {
+        assert_eq!(escape_text_keeping_lines(text), text);
+    }
+}
+
+/// Real text that needs a joiner or a direction mark reads as written: a
+/// ZWJ family, a ZWNJ in Persian, a flag, and Hebrew with a right-to-left
+/// mark. Prose needs them; exact-text surfaces use `escape_text_strict`.
+#[test]
+fn escape_text_keeps_joiners_direction_marks_and_flags() {
+    for text in ["👩\u{200d}💻 👨\u{200d}👩\u{200d}👧", "می\u{200c}خواهم", "🇺🇸🇯🇵", "שלום\u{200f} world\u{200e}"] {
+        assert_eq!(escape_text(text), text);
+        assert_eq!(escape_text_keeping_lines(text), text);
+    }
+}
+
+/// The bidi overrides and isolates, zero-width characters and invisible
+/// tag characters are escaped: each can override the text's direction or
+/// hide content.
+#[test]
+fn escape_text_escapes_overrides_isolates_zero_width_and_tags() {
+    assert_eq!(escape_text("a\u{202e}b\u{2066}c\u{2069}d\u{200b}e\u{2060}f"), "a\\u{202e}b\\u{2066}c\\u{2069}d\\u{200b}e\\u{2060}f");
+    assert_eq!(escape_text("x\u{e0041}\u{e007f}y"), "x\\u{e0041}\\u{e007f}y");
+}
+
+/// A lone carriage return would let one line overwrite another, so it is
+/// escaped; a `\r\n` line end is a line end.
+#[test]
+fn escape_text_keeping_lines_escapes_a_lone_carriage_return() {
+    assert_eq!(escape_text_keeping_lines("safe\rFORGED\r\nnext"), "safe\\u{d}FORGED\nnext");
+}
+
+/// Text the operator must verify exactly (an approval prompt, a command
+/// about to run) keeps no mark: the RLM and ALM probes that would show
+/// `budget=500 / 5` and `ids=42 ,17` show every mark as text, and so do the
+/// joiners, which are invisible.
+#[test]
+fn escape_text_strict_shows_every_mark_and_joiner() {
+    assert_eq!(escape_text_strict("budget=\u{200f}5 / 500\u{200f}"), "budget=\\u{200f}5 / 500\\u{200f}");
+    assert_eq!(escape_text_strict("ids=\u{61c}17, 42\u{61c}"), "ids=\\u{61c}17, 42\\u{61c}");
+    assert_eq!(escape_text_strict("a\u{200d}b\u{200c}c\u{200e}d"), "a\\u{200d}b\\u{200c}c\\u{200e}d");
+    assert_eq!(escape_text_strict("x\x1b[2J\u{202e}y\n"), "x\\u{1b}[2J\\u{202e}y\\n");
+    assert_eq!(escape_text_strict("darkmux mission launch review --param pr=42 café"), "darkmux mission launch review --param pr=42 café");
+}
+
+/// Invisible format characters and blank-looking fillers are escaped in
+/// both variants: shorthand format controls, musical symbol format
+/// controls, and the Hangul fillers.
+#[test]
+fn escape_text_escapes_shorthand_musical_and_hangul_fillers() {
+    for c in ['\u{1bca0}', '\u{1bca3}', '\u{1d173}', '\u{1d17a}', '\u{115f}', '\u{1160}', '\u{3164}', '\u{ffa0}'] {
+        let text = format!("a{c}b");
+        let want = format!("a\\u{{{:x}}}b", c as u32);
+        assert_eq!(escape_text(&text), want);
+        assert_eq!(escape_text_keeping_lines(&text), want);
+        assert_eq!(escape_text_strict(&text), want);
+    }
+}
+
+/// Every Default_Ignorable_Code_Point (Unicode 16.0.0: 4174 of them) is
+/// escaped by the strict variant: `src/ma<U+034F>in.rs` cannot show as
+/// `src/main.rs`. Walks every code point.
+#[test]
+fn escape_text_strict_escapes_every_default_ignorable_code_point() {
+    let mut ignorable = 0u32;
+    for cp in 0..=0x10FFFFu32 {
+        let Some(c) = char::from_u32(cp) else { continue };
+        if !in_ranges(c, DEFAULT_IGNORABLE) {
+            continue;
+        }
+        ignorable += 1;
+        let text = c.to_string();
+        assert_eq!(escape_text_strict(&text), format!("\\u{{{cp:x}}}"), "U+{cp:04X}");
+    }
+    assert_eq!(ignorable, 4174, "Unicode 16.0.0 has 4174 Default_Ignorable_Code_Points");
+    for cp in [0x34F, 0x17B4, 0x17B5, 0x180B, 0x180D, 0x180F, 0xFE00, 0xFE0F, 0xE0080, 0xE0FFF, 0x200D, 0x61C] {
+        assert!(in_ranges(char::from_u32(cp).unwrap(), DEFAULT_IGNORABLE), "U+{cp:04X}");
+    }
+    assert_eq!(escape_text_strict("src/ma\u{34f}in.rs"), "src/ma\\u{34f}in.rs");
+}
+
+/// A visible right-to-left character on both sides of `5 / 500` would lay
+/// it out as `500 / 5`, so approval text escapes every character of bidi
+/// class R, AL and AN: a Hebrew letter, an Arabic letter, an Arabic-Indic
+/// digit.
+#[test]
+fn escape_text_strict_escapes_right_to_left_characters() {
+    assert_eq!(escape_text_strict("\u{5d0}5 / 500\u{5d0}"), "\\u{5d0}5 / 500\\u{5d0}");
+    assert_eq!(escape_text_strict("\u{661}5 / 500\u{661}"), "\\u{661}5 / 500\\u{661}");
+    assert_eq!(escape_text_strict("\u{627}x"), "\\u{627}x");
+    for (cp, _) in STRICT_RIGHT_TO_LEFT {
+        assert!(escape_text_strict(&char::from_u32(*cp).unwrap().to_string()).starts_with("\\u{"), "U+{cp:04X}");
+    }
+}
+
+/// Only control, invisible and right-to-left characters are escaped: every
+/// other code point, Latin, CJK, emoji and all, prints as itself. Walks
+/// every code point.
+#[test]
+fn escape_text_strict_leaves_every_other_character_unchanged() {
+    for cp in 0..=0x10FFFFu32 {
+        let Some(c) = char::from_u32(cp) else { continue };
+        let special = c.is_control() || is_invisible_format(c) || in_ranges(c, DEFAULT_IGNORABLE) || in_ranges(c, STRICT_RIGHT_TO_LEFT);
+        let text = c.to_string();
+        let shown = escape_text_strict(&text);
+        assert_eq!(shown != text, special, "U+{cp:04X}");
+    }
+    for table in [DEFAULT_IGNORABLE, STRICT_RIGHT_TO_LEFT] {
+        assert!(table.windows(2).all(|w| w[0].1 < w[1].0) && table.iter().all(|(a, b)| a <= b), "sorted, disjoint");
+    }
+}

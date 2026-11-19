@@ -63,8 +63,10 @@ pub(crate) fn render_report(r: &CharacterizeReport) -> String {
             DispatchEnd::Failed => "✗",
         };
         p!(out, "  {} {}: {}", status, o.run_id, format_seconds(o.duration_ms));
+        // A note can quote what a verify command printed, which the model's
+        // code wrote: shown as text, never acted on by the terminal.
         for note in &o.notes {
-            p!(out, "      {note}");
+            p!(out, "      {}", darkmux_types::user_files::escape_text(note));
         }
     }
     p!(out);
@@ -261,6 +263,17 @@ mod tests {
         let text = render_report(&report(vec![errored]));
         assert!(text.contains("  ✗ r2: 0s\n      provider=stub\n      error: boom\n"), "{text}");
         assert!(text.contains("verdict: at least one dispatch failed"), "{text}");
+    }
+
+    /// A verify note quoting command output that holds an OSC 0 title, a
+    /// screen clear and an OSC 52 clipboard write prints as text.
+    #[test]
+    fn a_hostile_note_prints_inert() {
+        let mut o = outcome("r1", true, Some(false), 3);
+        o.notes = vec!["verify=fail (\x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e})".into()];
+        let text = render_report(&report(vec![o]));
+        assert!(!text.chars().any(|c| (c.is_control() && c != '\n') || c == '\u{202e}'), "{text:?}");
+        assert!(text.contains("      verify=fail (\\u{1b}]0;owned"), "{text}");
     }
 
     #[test]
