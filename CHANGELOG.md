@@ -227,6 +227,37 @@ darkmux release.
   that one row.
 - **`DARKMUX_VERBOSE=0` turns off `runtime.verbose: true`** for one shell, as env wins over
   `config.json` for every other setting.
+- **Run stats 2.5.0: a run another machine served no longer reports this machine's power as its own.**
+  A hosted-seat or remote-peer lab run, while this machine's GPU was busy (a parallel local lab run),
+  reported this machine's watts, energy per 1k tokens and thermal states as the run's, and `lab
+  submit` published them in a bundle marked `stack.hardware: "unknown"`. On a host with no GPU
+  utilization reading (Omarchy), a sample taken while the run's model stream was open counts as busy,
+  so it happened on every such run with telemetry. `run stats` now
+  reads which machine served the run's model from the run manifest's `model_hardware` snapshot and
+  adds `hardware` (`submitting-machine`, `unknown`, or `null` when the run did not record it). For
+  `unknown` and for `null`, every host power, energy and thermal figure is `null` (or empty, or 0 for
+  `throttled_samples`), each listed in `host_unmeasured` with the reason, and the new `this_machine`
+  object keeps this machine's own readings over the window (no energy per token: this machine's watts
+  against another machine's tokens measure nothing). **This withholds the host figures of every run
+  that recorded no hardware**: runs from before run manifest 1.3, and runs on an endpoint that declared
+  no `hardware` (set `"hardware"` on the endpoint for later runs). The text view prints "not measured
+  for this run" with the reason, and the set table flags `ELSEWHERE` or `NO-HW`. `lab submit` publishes
+  null for every host detail field of a run whose bundle says `unknown`, including a run `--hardware
+  unknown` corrects, and of a run `run stats` withheld them from. Additive
+  to the `run stats --json` shape; the meaning of the host fields narrows to "the machine that served
+  the run". The submit bundle's shape and format version are unchanged (those fields were already
+  nullable). Both `run stats` and `lab submit` pick the run's snapshot entry by the name the run sent:
+  `darkmux:<id>` is the managed model and a bare name the endpoint's, so a profile listing the same
+  model managed here and on a peer is no longer decided by its order. Several entries a name matches
+  decide when they agree on the machine (one hosted id on two providers, the same managed model listed
+  twice), and decide nothing when they disagree (`run stats` reads `hardware: null`; `lab submit`
+  takes `--hardware` under the same contradiction checks as one entry, and otherwise asks for it). A run
+  from before the snapshot reads the registry by the same rule, and `flint` (the name a managed Flint
+  server always answers to) names the managed Flint model. `run stats` adds `compactor_calls_here` for a
+  run whose figures are withheld: its compactions on a model this machine served, each `compaction.start`
+  counting whether or not a reply followed (`null` when one's model is not placed by the snapshot). In
+  a set, a run whose figures are withheld (`ELSEWHERE` or `NO-HW`) with no compaction here no longer
+  counts as overlapping a local run, and an energy cost withheld because of one says why.
 
 - **A step command's output is bounded, not only its time.** `procedural.shell`, the `mods.gate`
   `test_command`, lab verify commands and grader suites kept everything a command wrote; a chatty one
