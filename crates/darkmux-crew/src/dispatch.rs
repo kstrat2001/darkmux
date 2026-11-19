@@ -136,6 +136,12 @@ pub struct DispatchOpts {
     /// and coreutils `timeout` (debian/ubuntu-family ship them; bare-alpine
     /// images need them added — Slice 2).
     pub image: Option<String>,
+    /// The sandbox backend a caller already resolved, when it rendered
+    /// sandbox-specific text into `message` (where the sandbox sees the
+    /// workspace, a mod's attachment mount). The dispatch then runs in that
+    /// backend and reads `runtime.sandbox` no more. `None`: the dispatch
+    /// reads the setting once itself.
+    pub sandbox: Option<darkmux_sandbox::BackendKind>,
     /// Mock-model harness: override the container's `--base-url` — the
     /// LMStudio-compatible chat-completions host the runtime dials for a
     /// LOCAL-brain dispatch. `None` (the default) uses the configured

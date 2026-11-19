@@ -574,7 +574,11 @@ pub(crate) fn dispatch_opts_for(
     let image = task.image.clone().or(cfg.image);
     let config_path = cfg.config_path;
     let workdir = task.workdir.clone().or_else(|| cfg.workdir.map(std::path::PathBuf::from));
-    let base = expand_workspace_root(cfg.message.as_deref().unwrap_or_default(), darkmux_sandbox::selected().ok(), workdir.as_deref());
+    // The one read of `runtime.sandbox` for this step: the message names
+    // paths as this backend sees them, and the dispatch runs in it
+    // (`DispatchOpts::sandbox`), whatever the setting says by then.
+    let sandbox = darkmux_sandbox::selected().ok();
+    let base = expand_workspace_root(cfg.message.as_deref().unwrap_or_default(), sandbox, workdir.as_deref());
     let message = compose_message(&base, input);
     // The owning Task names the phase for every step minted from a mission
     // config; the step config's own `phase_id` (the crew-of-one's way of
@@ -622,6 +626,7 @@ pub(crate) fn dispatch_opts_for(
         &message,
         &brief_refs,
         &crate::brief_refs::StoreDirs::resolved(),
+        sandbox,
     )
     .with_context(|| format!("step `{}`: resolving the brief's records", step.id))?;
 
@@ -656,6 +661,7 @@ pub(crate) fn dispatch_opts_for(
         force_container: false,
         max_completion_tokens,
         image,
+        sandbox,
         model_base_url_override: None,
         // (#1483) Stamp the step id so the tailer's live turn/tool/token
         // records attribute to this seat even when the session is not the
@@ -4569,9 +4575,11 @@ mod tests {
     }
 
     /// (#3112 review) The production wiring: `dispatch.internal` expands the
-    /// placeholder through `selected()`, never leaving it for the model.
-    /// Under Docker (a test build's default) it is `/workspace`; under
-    /// `DARKMUX_SANDBOX=seatbelt` (on a Mac) the workdir's own path.
+    /// placeholder through `selected()`, never leaving it for the model, and
+    /// hands that same backend to the dispatch (`DispatchOpts::sandbox`), so
+    /// it runs where its message says. Under Docker (a test build's default)
+    /// it is `/workspace`; under `DARKMUX_SANDBOX=seatbelt` (on a Mac) the
+    /// workdir's own path.
     #[test]
     #[serial_test::serial]
     fn dispatch_internal_expands_the_workspace_placeholder_through_the_selection() {
@@ -4579,18 +4587,22 @@ mod tests {
         let cfg = json!({"role_id": "coder", "workdir": dir.path().display().to_string(),
             "message": "read `${WORKSPACE_ROOT}/<source>/x`"});
         let opts_now = || dispatch_opts_for(&step("s1", "dispatch.internal", cfg.clone()), &empty_task(), &BTreeMap::new(), &StepRunCtx::for_test()).unwrap();
-        assert_eq!(opts_now().message, "read `/workspace/<source>/x`");
+        let docker = opts_now();
+        assert_eq!(docker.message, "read `/workspace/<source>/x`");
+        assert_eq!(docker.sandbox, Some(darkmux_sandbox::BackendKind::Docker));
         if !darkmux_sandbox::SeatbeltBackend::available() {
             return;
         }
         let prev = std::env::var_os("DARKMUX_SANDBOX");
         unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
-        let seatbelt = opts_now().message;
+        let seatbelt_opts = opts_now();
+        let seatbelt = seatbelt_opts.message;
         unsafe {
             match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
         }
         let real = dir.path().canonicalize().unwrap().display().to_string();
         assert_eq!(seatbelt, format!("read `{real}/<source>/x`"));
+        assert_eq!(seatbelt_opts.sandbox, Some(darkmux_sandbox::BackendKind::Seatbelt));
     }
 
     /// (#3112 review) The shipped mod-writer messages name the repository

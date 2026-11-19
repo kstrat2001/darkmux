@@ -63,11 +63,12 @@ pub fn append_to_brief(
     message: &str,
     refs: &[BriefRef],
     dirs: &StoreDirs,
+    sandbox: Option<darkmux_sandbox::BackendKind>,
 ) -> Result<(String, Vec<BriefRef>)> {
     let mut brief = message.to_string();
     let mut appended = Vec::new();
     for r in refs {
-        let (block, canonical) = resolve(r, dirs)?;
+        let (block, canonical) = resolve(r, dirs, sandbox)?;
         brief.push_str("\n\n");
         brief.push_str(&block);
         appended.push(canonical);
@@ -83,7 +84,7 @@ pub fn append_to_brief(
 /// took a different path from the render is a check that can pass for a ref
 /// the render then refuses.
 pub fn check_all(refs: &[BriefRef], dirs: &StoreDirs) -> Result<Vec<BriefRef>> {
-    refs.iter().map(|r| resolve(r, dirs).map(|(_, canonical)| canonical)).collect()
+    refs.iter().map(|r| resolve(r, dirs, None).map(|(_, canonical)| canonical)).collect()
 }
 
 /// Render one ref, or refuse naming the kind and the key.
@@ -93,7 +94,9 @@ pub fn check_all(refs: &[BriefRef], dirs: &StoreDirs) -> Result<Vec<BriefRef>> {
 /// `findings::parse_key` (which validates the dispatch segment), a mod key
 /// through `mods::is_safe_key` — and a bad key is a REFUSAL, never a silent
 /// filter (#2295 review, CRITICAL 2).
-fn resolve(r: &BriefRef, dirs: &StoreDirs) -> Result<(String, BriefRef)> {
+/// `sandbox` is the backend the brief is rendered for: a mod's attachment
+/// mount is named where that sandbox sees it.
+fn resolve(r: &BriefRef, dirs: &StoreDirs, sandbox: Option<darkmux_sandbox::BackendKind>) -> Result<(String, BriefRef)> {
     match r.kind {
         BriefRefKind::Finding => {
             let key = &r.key;
@@ -128,7 +131,7 @@ fn resolve(r: &BriefRef, dirs: &StoreDirs) -> Result<(String, BriefRef)> {
                     dirs.mods.display()
                 )
             })?;
-            let mount = attachments_seen(darkmux_sandbox::selected().ok(), &dirs.mods, &record.key);
+            let mount = attachments_seen(sandbox, &dirs.mods, &record.key);
             let canonical = BriefRef::mod_(record.key.clone());
             Ok((crate::mods::brief_block(&record, &mount), canonical))
         }
@@ -227,6 +230,37 @@ mod tests {
         let real = crate::mods::attachments_dir_at(m.path(), "mod-9-zzz").canonicalize().unwrap();
         assert_eq!(attachments_seen(Some(BackendKind::Seatbelt), m.path(), "mod-9-zzz"), real.display().to_string());
     }
+    /// The brief names a mod's attachments for the backend it is rendered
+    /// for (the one its dispatch runs in), never for `runtime.sandbox` read
+    /// on its own: here the setting says `docker` and the brief is for a
+    /// sandbox on the host.
+    #[test]
+    #[serial_test::serial]
+    fn the_brief_names_a_mods_attachments_for_the_given_sandbox_not_the_setting() {
+        let f = TempDir::new().unwrap();
+        let m = TempDir::new().unwrap();
+        write_mod(m.path(), "mod-9-zzz", Some("kit"), &["one.patch"]);
+        let prev = std::env::var_os(darkmux_sandbox::SANDBOX_ENV);
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var(darkmux_sandbox::SANDBOX_ENV, "docker") };
+        let rendered = append_to_brief(
+            "go",
+            &[BriefRef::mod_("mod-9-zzz")],
+            &dirs(&f, &m),
+            Some(darkmux_sandbox::BackendKind::Seatbelt),
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(darkmux_sandbox::SANDBOX_ENV, v),
+                None => std::env::remove_var(darkmux_sandbox::SANDBOX_ENV),
+            }
+        }
+        let (brief, _) = rendered.unwrap();
+        assert!(!brief.contains("/darkmux-mods/"), "named for a container: {brief}");
+        let on_host = attachments_seen(Some(darkmux_sandbox::BackendKind::Seatbelt), m.path(), "mod-9-zzz");
+        assert!(brief.contains(&on_host), "{brief}");
+    }
+
     use std::fs;
     use tempfile::TempDir;
 
@@ -286,7 +320,7 @@ mod tests {
         write_mod(m.path(), "mod-1-aaa", Some("KIT-BODY"), &["patch.diff"]);
 
         let refs = vec![BriefRef::finding("sess-a/1"), BriefRef::mod_("mod-1-aaa")];
-        let (brief, appended) = append_to_brief("do it", &refs, &dirs(&f, &m)).unwrap();
+        let (brief, appended) = append_to_brief("do it", &refs, &dirs(&f, &m), None).unwrap();
 
         assert!(brief.starts_with("do it\n\n"), "the user's message comes first: {brief}");
         let finding_at = brief.find("MARKER-observed").expect("the finding block");
@@ -350,7 +384,7 @@ mod tests {
     fn a_missing_mod_refuses_and_names_the_kind_and_the_key() {
         let f = TempDir::new().unwrap();
         let m = TempDir::new().unwrap();
-        let err = append_to_brief("hi", &[BriefRef::mod_("mod-nope-1")], &dirs(&f, &m))
+        let err = append_to_brief("hi", &[BriefRef::mod_("mod-nope-1")], &dirs(&f, &m), None)
             .expect_err("a key that addresses no stored mod must refuse");
         let text = format!("{err:#}");
         assert!(text.contains("no mod mod-nope-1"), "{text}");
@@ -360,7 +394,7 @@ mod tests {
     fn a_missing_finding_refuses() {
         let f = TempDir::new().unwrap();
         let m = TempDir::new().unwrap();
-        let err = append_to_brief("hi", &[BriefRef::finding("sess-a/9")], &dirs(&f, &m))
+        let err = append_to_brief("hi", &[BriefRef::finding("sess-a/9")], &dirs(&f, &m), None)
             .expect_err("a key that addresses no stored finding must refuse");
         assert!(format!("{err:#}").contains("no finding sess-a/9"));
     }
@@ -369,7 +403,7 @@ mod tests {
     fn a_traversing_mod_key_is_refused_before_any_read() {
         let f = TempDir::new().unwrap();
         let m = TempDir::new().unwrap();
-        let err = append_to_brief("hi", &[BriefRef::mod_("../etc")], &dirs(&f, &m))
+        let err = append_to_brief("hi", &[BriefRef::mod_("../etc")], &dirs(&f, &m), None)
             .expect_err("a key that escapes the store must refuse");
         assert!(format!("{err:#}").contains("is not a mod key"));
     }
@@ -431,13 +465,13 @@ mod tests {
                 .expect_err("a key that could escape the store must refuse: {key}");
             assert!(format!("{err:#}").contains("is not a key"), "{key}: {err:#}");
             // And the resolver refuses it first, so it never gets that far.
-            let err = append_to_brief("hi", &refs, &dirs(&f, &m)).expect_err("resolve refuses");
+            let err = append_to_brief("hi", &refs, &dirs(&f, &m), None).expect_err("resolve refuses");
             assert!(format!("{err:#}").contains("is not a mod key"), "{key}: {err:#}");
         }
 
         // `a b` is a legal single path segment — it cannot escape, so it is
         // refused for the ordinary reason instead: no mod is stored under it.
-        let err = append_to_brief("hi", &[BriefRef::mod_("a b")], &dirs(&f, &m))
+        let err = append_to_brief("hi", &[BriefRef::mod_("a b")], &dirs(&f, &m), None)
             .expect_err("a key naming no stored mod must refuse");
         assert!(format!("{err:#}").contains("no mod a b"), "{err:#}");
         assert!(
@@ -512,6 +546,7 @@ mod tests {
             "go",
             &[BriefRef::finding("sess-a/1"), BriefRef::mod_("mod-1-aaa")],
             &dirs(&f, &m),
+            None,
         )
         .unwrap();
         let term = format!("<darkmux-term name=\"mod\">{}</darkmux-term>", crate::mods::MOD_TERM);

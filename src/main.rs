@@ -1289,6 +1289,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         // (#703) operator-selected dispatch image; darkmux injects its runtime
         // binary into it when it's not the default.
         image,
+        sandbox: None,
         // Mock-model harness (v1): no CLI surface yet (deliberately — see
         // darkmux's CLAUDE.md doctrine on shipping the underlying mechanism
         // before the CLI verb). `None` on every operator-facing dispatch.

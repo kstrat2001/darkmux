@@ -1449,6 +1449,7 @@ impl StepKind for DispatchUnitStepKind {
                 force_container: false,
                 max_completion_tokens: None,
                 image: None,
+                sandbox: None,
                 model_base_url_override: None,
                 step_id: Some(step.id.clone()),
                 system_prompt_override: None,

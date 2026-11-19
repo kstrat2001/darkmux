@@ -291,6 +291,7 @@ fn run_mock_dispatch(
         force_container: false,
         max_completion_tokens: None,
         image: None,
+        sandbox: None,
         model_base_url_override: Some(format!("http://host.docker.internal:{port}/v1")),
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
@@ -548,6 +549,7 @@ fn real_container_dispatch_ends_alone_on_a_phase_stop_and_refuses_a_live_resume(
         force_container: false,
         max_completion_tokens: None,
         image: None,
+        sandbox: None,
         model_base_url_override: Some(format!("http://host.docker.internal:{port}/v1")),
         step_id: None,
         system_prompt_override: None,
@@ -995,6 +997,7 @@ fn run_mock_dispatch_with_timeout_override(
         force_container: false,
         max_completion_tokens: None,
         image: None,
+        sandbox: None,
         model_base_url_override: Some(format!("http://host.docker.internal:{port}/v1")),
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,

@@ -686,6 +686,7 @@ fn dispatch_opts(
         // path's own default.
         max_completion_tokens: None,
         image: image.map(str::to_string),
+        sandbox: None,
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
