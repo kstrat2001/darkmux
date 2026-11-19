@@ -230,8 +230,41 @@ pub const SANDBOX_KEY: &str = "runtime.sandbox";
 /// `seatbelt` where `sandbox-exec` is missing, or `landlock` where the
 /// kernel lacks what it needs (saying what).
 pub fn selected() -> Result<BackendKind, String> {
+    selection().map(|s| s.kind)
+}
+
+/// One read of `runtime.sandbox`: the backend it names and the tier that set
+/// it. A caller that reads the setting once and carries this value gives
+/// every later message (why Docker, the way back) from that same read, so a
+/// setting changed in between never splits one run across two answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub kind: BackendKind,
+    pub source: darkmux_types::config_access::Source,
+}
+
+/// [`selected`], with the tier that set it.
+pub fn selection() -> Result<Selection, String> {
     let resolved = darkmux_types::config_access::sandbox_with_source().map_err(|bad| bad.to_string());
-    selected_from(resolved, SeatbeltBackend::available(), LandlockBackend::available())
+    let source = resolved.as_ref().map_or(darkmux_types::config_access::Source::BuiltIn, |(_, s)| *s);
+    selected_from(resolved, SeatbeltBackend::available(), LandlockBackend::available()).map(|kind| Selection { kind, source })
+}
+
+impl Selection {
+    /// [`docker_remedy`] for this selection.
+    pub fn docker_remedy(&self) -> Option<String> {
+        docker_remedy_given(self.kind, self.source, host_alternative())
+    }
+
+    /// [`docker_needs`] for this selection.
+    pub fn docker_needs(&self) -> Option<String> {
+        docker_needs_given(self.kind, self.source, host_alternative())
+    }
+
+    /// [`way_back_to_docker`] for this selection.
+    pub fn way_back_to_docker(&self) -> String {
+        way_back_to_docker_given(setting_value(self.kind), self.source)
+    }
 }
 
 /// [`selected`] against `cfg`, a `config.json` read fresh (the env tier
@@ -340,15 +373,13 @@ pub fn way_back_to_docker_given(current: &str, source: darkmux_types::config_acc
 /// can run (Seatbelt, Landlock), how to need no Docker. `None` unless the configured sandbox is Docker (a
 /// refused setting included): a Docker remedy never appears under another.
 pub fn docker_remedy() -> Option<String> {
-    let (kind, source) = configured_kind()?;
-    docker_remedy_given(kind, source, host_alternative())
+    selection().ok()?.docker_remedy()
 }
 
 /// [`docker_remedy`] without naming the setting, for a message whose
 /// [`placed_in`] already does.
 pub fn docker_needs() -> Option<String> {
-    let (kind, source) = configured_kind()?;
-    docker_needs_given(kind, source, host_alternative())
+    selection().ok()?.docker_needs()
 }
 
 /// The sandbox on the host this host can run, if any: Seatbelt on a Mac,
@@ -359,12 +390,6 @@ fn host_alternative() -> Option<BackendKind> {
     } else {
         LandlockBackend::available().ok().map(|()| BackendKind::Landlock)
     }
-}
-
-fn configured_kind() -> Option<(BackendKind, darkmux_types::config_access::Source)> {
-    let kind = selected().ok()?;
-    let source = darkmux_types::config_access::sandbox_with_source().map_or(darkmux_types::config_access::Source::BuiltIn, |(_, s)| s);
-    Some((kind, source))
 }
 
 fn docker_remedy_given(kind: BackendKind, source: darkmux_types::config_access::Source, on_host: Option<BackendKind>) -> Option<String> {
@@ -527,6 +552,9 @@ pub trait SandboxBackend: Send + Sync {
     /// [`list`]: SandboxBackend::list
     fn parse_list(&self, query: &Query, listing: &str) -> Vec<Listed>;
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod setting_reads;
 
 #[cfg(test)]
 mod tests {

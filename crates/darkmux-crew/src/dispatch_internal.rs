@@ -7233,34 +7233,35 @@ struct ContainerRun {
     toolchain: darkmux_sandbox::toolchain::Toolchain,
 }
 
-/// The container path up to its `dispatch.start`: the resume preflight and
-/// the budget gate, the workdir's git check, the image, the role and its
-/// prompt, the workdir and any resume checkpoint, (#3574) where the hosted
-/// brain sends and its credential, the model, the workspace and the
-/// out-dir. The first refusal wins, and none of them emits a bookend.
-/// The one read of `runtime.sandbox` for a container dispatch: the backend
-/// the caller already resolved and rendered the message for
-/// (`DispatchOpts::sandbox`), else the setting now. Everything after it (the
-/// resume check, the origin stamp, the prompt, the runtime image, the model
-/// URLs, the launch) takes this value; none reads the setting again, since
-/// an admission wait or a model load can sit between them. A setting that
-/// names no backend this host can run refuses the dispatch here (contract 9).
-fn dispatch_sandbox(opts: &DispatchOpts) -> Result<darkmux_sandbox::BackendKind> {
-    match opts.sandbox {
-        Some(kind) => Ok(kind),
-        None => darkmux_sandbox::selected().map_err(|why| anyhow!(why)),
+/// The one read of `runtime.sandbox` for a container dispatch: the read
+/// the caller already made and rendered the message for
+/// (`DispatchOpts::sandbox`, a refusal included), else the setting now.
+/// Everything after it (the resume check, the origin stamp, the prompt, the
+/// runtime image and its Docker remedies, the model URLs, the launch) takes
+/// this value; none reads the setting again, since an admission wait or a
+/// model load can sit between them. A setting that names no backend this
+/// host can run refuses the dispatch here (contract 9).
+fn dispatch_sandbox(opts: &DispatchOpts) -> Result<darkmux_sandbox::Selection> {
+    match &opts.sandbox {
+        Some(read) => read.clone().map_err(|why| anyhow!(why)),
+        None => darkmux_sandbox::selection().map_err(|why| anyhow!(why)),
     }
 }
 
 /// The dispatch's sandbox ([`dispatch_sandbox`]), then, for a resume, the
 /// image it runs on and its origin's lock, checked against that sandbox
 /// ([`resume_preflight`]).
-fn sandbox_and_resume(opts: &DispatchOpts) -> Result<(darkmux_sandbox::BackendKind, Option<String>, ExecutionLock)> {
-    let kind = dispatch_sandbox(opts)?;
-    let (image_arg, lock) = resume_preflight(opts.resume_from.as_deref(), opts.image.as_deref(), kind)?;
-    Ok((kind, image_arg, lock))
+fn sandbox_and_resume(opts: &DispatchOpts) -> Result<(darkmux_sandbox::Selection, Option<String>, ExecutionLock)> {
+    let sandbox = dispatch_sandbox(opts)?;
+    let (image_arg, lock) = resume_preflight(opts.resume_from.as_deref(), opts.image.as_deref(), sandbox.kind)?;
+    Ok((sandbox, image_arg, lock))
 }
 
+/// The container path up to its `dispatch.start`: the resume preflight and
+/// the budget gate, the workdir's git check, the image, the role and its
+/// prompt, the workdir and any resume checkpoint, (#3574) where the hosted
+/// brain sends and its credential, the model, the workspace and the
+/// out-dir. The first refusal wins, and none of them emits a bookend.
 fn prepare_container_run(
     opts: &DispatchOpts,
     execution: &ExecutionId,
@@ -7272,11 +7273,12 @@ fn prepare_container_run(
     // budget gate: a resume that is going to be refused must not first sit in
     // a `wait` on the endpoint's window, behind the very run it collides with.
     // The lock is held, with this dispatch's own, until the run returns.
-    let (kind, image_arg, mut execution_lock) = sandbox_and_resume(opts)?;
+    let (sandbox, image_arg, mut execution_lock) = sandbox_and_resume(opts)?;
+    let kind = sandbox.kind;
     admit_container_start(opts, execution, brain.limits_pm())?;
     let workdir_split_gitdirs = warn_split_gitdirs(opts, kind);
     warn_writable_git_dir(opts);
-    let image = resolve_runtime_image(image_arg.as_deref(), opts.skip_preflight, kind)?;
+    let image = resolve_runtime_image(image_arg.as_deref(), opts.skip_preflight, sandbox)?;
     let (role, system_prompt, allowed_tools, provenance) = container_role(
         opts,
         brain.agentic_pm.as_ref().is_some_and(brain_leaves_this_machine),
@@ -7764,13 +7766,17 @@ pub(crate) fn dispatch_toolchain(
 /// the setting that chose it and the way back: `--image` (such a sandbox
 /// runs this host's own programs and has no image), and any runtime this
 /// process cannot run.
+///
+/// `way_back` is the selection's own way back to Docker
+/// ([`darkmux_sandbox::Selection::way_back_to_docker`]), from the read the
+/// caller made.
 fn host_runtime_for(
     kind: darkmux_sandbox::BackendKind,
     image_arg: Option<&str>,
     override_program: Option<std::ffi::OsString>,
     at_start: &ExecutableAtStart,
+    way_back: String,
 ) -> Result<HostRuntime> {
-    let way_back = darkmux_sandbox::way_back_to_docker(kind);
     if let Some(image) = image_arg {
         bail!("--image {image}: the `{}` sandbox runs this machine's own programs, not an image. {way_back}", darkmux_sandbox::setting_value(kind));
     }
@@ -7783,7 +7789,7 @@ fn host_runtime_for(
 /// refusal.
 pub fn host_runtime_status(kind: darkmux_sandbox::BackendKind) -> std::result::Result<String, String> {
     let at_start = EXECUTABLE_AT_START.get_or_init(|| executable_at_start(std::env::current_exe()));
-    host_runtime_for(kind, None, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start)
+    host_runtime_for(kind, None, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start, darkmux_sandbox::way_back_to_docker(kind))
         .map(|r| std::iter::once(r.program.display().to_string()).chain(r.leading_args).collect::<Vec<_>>().join(" "))
         .map_err(|e| format!("{e:#}"))
 }
@@ -7791,9 +7797,10 @@ pub fn host_runtime_status(kind: darkmux_sandbox::BackendKind) -> std::result::R
 /// (#3112 step 2) What a dispatch on `kind`, a sandbox on the host, runs in
 /// place of an image: the [`host_runtime`]. No image is checked or pulled,
 /// and `--image` is refused: there is no image to name.
-fn host_runtime_image(kind: darkmux_sandbox::BackendKind, image_arg: Option<&str>) -> Result<RuntimeImage> {
+fn host_runtime_image(sandbox: darkmux_sandbox::Selection, image_arg: Option<&str>) -> Result<RuntimeImage> {
+    let kind = sandbox.kind;
     let at_start = EXECUTABLE_AT_START.get_or_init(|| executable_at_start(std::env::current_exe()));
-    let runtime = host_runtime_for(kind, image_arg, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start)?;
+    let runtime = host_runtime_for(kind, image_arg, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start, sandbox.way_back_to_docker())?;
     let sandbox = darkmux_sandbox::setting_value(kind);
     let shown = std::iter::once(runtime.program.display().to_string()).chain(runtime.leading_args.iter().cloned()).collect::<Vec<_>>().join(" ");
     darkmux_types::diag_eprintln!("darkmux dispatch: runtime=internal, sandbox={sandbox}, runtime: {shown}");
@@ -7808,9 +7815,10 @@ fn host_runtime_image(kind: darkmux_sandbox::BackendKind, image_arg: Option<&str
 }
 
 /// Resolve and check the runtime image, then say which one runs.
-fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool, kind: darkmux_sandbox::BackendKind) -> Result<RuntimeImage> {
+fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool, sandbox: darkmux_sandbox::Selection) -> Result<RuntimeImage> {
+    let kind = sandbox.kind;
     if kind.on_host() {
-        return host_runtime_image(kind, image_arg);
+        return host_runtime_image(sandbox, image_arg);
     }
     // (#703) `inject` is true only when the operator named a NON-darkmux image
     // (e.g. `rust:slim`) — then darkmux's static runtime binary is injected
@@ -7841,7 +7849,7 @@ fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool, kind: da
     let darkmux_image = if skip_preflight {
         ensure_darkmux_image_present(explicit_darkmux_image)?
     } else {
-        check_docker_preflight(explicit_darkmux_image)?
+        check_docker_preflight(explicit_darkmux_image, sandbox.docker_remedy())?
     };
 
     // The image we actually run: the operator's `--image` if given (injected),
@@ -14716,7 +14724,10 @@ fn status_for_plan(plan: Result<crate::runtime_image::DefaultImagePlan>) -> Dock
 /// role-load / model-probe / workspace setup so a new user without Docker gets
 /// a clean, operator-actionable bail, and a `brew install` user without a
 /// local image gets a one-time pull instead of a "build from source" dead-end.
-fn check_docker_preflight(explicit: Option<&str>) -> Result<crate::runtime_image::ResolvedImage> {
+///
+/// `remedy` is why Docker was needed and the way to need none, from the
+/// caller's one read of the setting ([`darkmux_sandbox::Selection::docker_remedy`]).
+fn check_docker_preflight(explicit: Option<&str>, remedy: Option<String>) -> Result<crate::runtime_image::ResolvedImage> {
     match docker_runtime_status() {
         // Daemon up (image present OR absent) — resolve the darkmux image,
         // pulling the version-pinned GHCR image on demand if none is local.
@@ -14729,25 +14740,28 @@ fn check_docker_preflight(explicit: Option<&str>) -> Result<crate::runtime_image
         // (reuse the pure mapper, which returns Err for all of these). The
         // `.and_then` only adapts the Ok type so the signature lines up —
         // these variants never produce Ok.
-        other => preflight_result_for(other)
+        other => preflight_result_for(other, remedy.as_deref())
             .and_then(|()| Err(anyhow!("docker preflight produced no runtime image"))),
     }
-}
-
-/// (#906) The darkmux runtime image, resolved for running a lab run's tests
-/// in it: the same preflight and version check a dispatch gets. (#3355
-/// review) By the content id that was checked, like the dispatch (#2923
-/// review C6), so a tag re-pointed after the check cannot swap the image.
-pub(crate) fn test_runtime_image() -> Result<String> {
-    resolved_runtime_image()
 }
 
 /// The darkmux runtime image as a dispatch resolves it (Docker reachable,
 /// the version-checked local or pinned image, pulled when absent), by the
 /// content id that was checked. For containers darkmux runs beside
-/// dispatch: lab test runs, and client previews (#3456).
+/// dispatch: client previews (#3456). It reads `runtime.sandbox` for its
+/// Docker remedy; a run that already read it uses
+/// [`resolved_runtime_image_with`].
 pub fn resolved_runtime_image() -> Result<String> {
-    check_docker_preflight(None).map(|image| image.id)
+    resolved_runtime_image_with(darkmux_sandbox::docker_remedy())
+}
+
+/// (#906, #3355 review) [`resolved_runtime_image`] with the Docker remedy of
+/// the caller's own read of the setting (`None`: no remedy is named), for a
+/// lab run's tests: the same preflight and version check a dispatch gets,
+/// by the content id that was checked, so a tag re-pointed after the check
+/// cannot swap the image.
+pub fn resolved_runtime_image_with(remedy: Option<String>) -> Result<String> {
+    check_docker_preflight(None, remedy).map(|image| image.id)
 }
 
 /// The `--user` a darkmux container runs as, as the dispatch container
@@ -14763,14 +14777,15 @@ pub fn runtime_container_user() -> Result<Option<String>> {
 }
 
 /// (#3112) `\n<why Docker, and the way to need none>`, or nothing when the
-/// configured sandbox is not Docker.
-fn docker_remedy_line() -> String {
-    darkmux_sandbox::docker_remedy().map(|r| format!("\n{r}.")).unwrap_or_default()
+/// sandbox read is not Docker (`remedy` is `None`).
+fn docker_remedy_line(remedy: Option<&str>) -> String {
+    remedy.map(|r| format!("\n{r}.")).unwrap_or_default()
 }
 
 /// Map a probe result to the dispatch-time bail (pure — unit-testable
-/// without Docker on the host).
-fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
+/// without Docker on the host). `remedy` is the caller's
+/// [`darkmux_sandbox::Selection::docker_remedy`].
+fn preflight_result_for(status: DockerRuntimeStatus, remedy: Option<&str>) -> Result<()> {
     match status {
         DockerRuntimeStatus::Ready => Ok(()),
         // (#3112) Each names why Docker was asked for (the sandbox setting)
@@ -14779,12 +14794,12 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
             "darkmux's runtime requires Docker, but `docker version` failed:\n  {}\n\
              Start Docker Desktop and retry.{}",
             stderr,
-            docker_remedy_line()
+            docker_remedy_line(remedy)
         ),
         DockerRuntimeStatus::BinaryMissing => bail!(
             "darkmux's runtime requires Docker, but the `docker` binary isn't on PATH.\n\
              Install Docker Desktop (https://www.docker.com/products/docker-desktop) and retry.{}",
-            docker_remedy_line()
+            docker_remedy_line(remedy)
         ),
         DockerRuntimeStatus::ImageMissing => bail!(
             "no darkmux runtime image for darkmux {version} found locally. darkmux pulls the \

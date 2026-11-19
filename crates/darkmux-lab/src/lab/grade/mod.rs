@@ -582,7 +582,7 @@ fn run_suite_in(runner: &Runner, spec: &SuiteGrade, root: &Path, dir: &Path) -> 
         name_prefix: "darkmux-grade",
     };
     let ran = contained_command::run(&runner.placement, &run, Duration::from_secs(seconds))
-        .map_err(|why| anyhow!("the suite did not run in {}: {why}", darkmux_sandbox::placed_in_configured()))?;
+        .map_err(|why| anyhow!("the suite did not run in {}: {why}", suite_place(runner)))?;
     let outcome = match ran {
         Bounded::Finished { code, .. } => SuiteOutcome::Exited { code },
         Bounded::TimedOut { seconds } => SuiteOutcome::TimedOut { seconds },
@@ -595,6 +595,12 @@ fn run_suite_in(runner: &Runner, spec: &SuiteGrade, root: &Path, dir: &Path) -> 
             .and_then(|xml| junit::parse(&xml)),
     };
     Ok(SuiteRun { outcome, counts })
+}
+
+/// Where `runner` runs a suite, for a message: its sandbox, or this machine
+/// under `runtime.tests_on_host`.
+fn suite_place(runner: &Runner) -> String {
+    runner.sandbox.map_or_else(|| "this machine (`runtime.tests_on_host`)".to_string(), darkmux_sandbox::placed_in)
 }
 
 fn shell_quote(s: &str) -> String {
@@ -1088,7 +1094,8 @@ pub(crate) fn apply(
         .as_ref()
         .and_then(|v| v.coverage_min_pct);
     let (ungraded, tests_added) = ungraded_verdict(spec, coverage, raw, gate);
-    let graded = match (crate::providers::coding_task::graded_prompt(loaded), Runner::for_workload(loaded, darkmux_sandbox::selected())) {
+    let placement = placement_of(RunManifest::read(run_dir).ok().as_ref());
+    let graded = match (crate::providers::coding_task::graded_prompt(loaded), Runner::for_workload(loaded, &placement)) {
         (Ok(prompt), Ok(runner)) => grade_run(run_dir, spec, &prompt, fixture, result, dispatch, &runner)?,
         (Err(e), _) => cannot_grade(&anyhow!("resolving the prompt: {e:#}")),
         (_, Err(e)) => cannot_grade(&e),
@@ -1200,7 +1207,7 @@ fn grade_kept(run_dir: &Path, manifest: &RunManifest, fixture: Option<&Path>) ->
     let spec = declared_grade(&loaded)?;
     let fixture_dir = run_fixture(run_dir, manifest, fixture)?;
     let result = kept_result(run_dir, manifest)?;
-    let (prompt, runner) = prompt_and_runner(&loaded)?;
+    let (prompt, runner) = prompt_and_runner(&loaded, &placement_of(Some(manifest)))?;
     try_grade_run(run_dir, spec, &prompt, &fixture_dir, &result, &kept_dispatch(manifest), &runner)
 }
 
@@ -1226,8 +1233,34 @@ pub fn grade_runs(runs: &[String], fixture: Option<&Path>, write: bool) -> i32 {
 }
 
 /// The prompt the model was given, and where the suite runs.
-fn prompt_and_runner(loaded: &crate::workloads::types::LoadedWorkload) -> Result<(String, Runner)> {
-    Ok((crate::providers::coding_task::graded_prompt(loaded)?, Runner::for_workload(loaded, darkmux_sandbox::selected())?))
+fn prompt_and_runner(
+    loaded: &crate::workloads::types::LoadedWorkload,
+    placement: &crate::providers::coding_task::RunPlacement,
+) -> Result<(String, Runner)> {
+    Ok((crate::providers::coding_task::graded_prompt(loaded)?, Runner::for_workload(loaded, placement)?))
+}
+
+/// Where a run's suite runs: where the run placed its own tests, as its
+/// manifest recorded them (`isolation`), so a setting changed since (during
+/// the run's dispatch, or before a regrade) never moves them. A run that
+/// recorded no placement (written before the record existed) is placed by
+/// the settings now, the one fresh read here.
+fn placement_of(manifest: Option<&RunManifest>) -> crate::providers::coding_task::RunPlacement {
+    placement_of_isolation(manifest.and_then(|m| m.isolation.as_ref()))
+}
+
+fn placement_of_isolation(
+    isolation: Option<&crate::lab::manifest::RunIsolation>,
+) -> crate::providers::coding_task::RunPlacement {
+    use crate::providers::coding_task::RunPlacement;
+    isolation.map_or_else(RunPlacement::read, RunPlacement::recorded)
+}
+
+#[cfg(test)]
+pub(crate) fn placement_of_for_test(
+    isolation: Option<&crate::lab::manifest::RunIsolation>,
+) -> crate::providers::coding_task::RunPlacement {
+    placement_of_isolation(isolation)
 }
 
 /// The workload's `verify.grade`, which a regrade needs.

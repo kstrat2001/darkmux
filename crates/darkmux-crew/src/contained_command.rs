@@ -318,8 +318,14 @@ pub fn remove_container(handle: &SandboxHandle) {
 /// else the darkmux runtime image the dispatch itself runs (resolved and
 /// version-checked the same way, pulled if absent). Refuses when Docker is
 /// not reachable, naming the opt-out. `sandbox` is the backend the run
-/// resolved: on the host there is no image.
-pub fn lab_test_image_in(sandbox: darkmux_sandbox::BackendKind, workload_image: Option<&str>) -> anyhow::Result<String> {
+/// resolved: on the host there is no image. `read` is the run's own read of
+/// the setting, for why Docker was needed (`None`, a run recorded earlier:
+/// no setting is named).
+pub fn lab_test_image_in(
+    sandbox: darkmux_sandbox::BackendKind,
+    workload_image: Option<&str>,
+    read: Option<darkmux_sandbox::Selection>,
+) -> anyhow::Result<String> {
     use anyhow::Context;
     // (#3112 step 2) A Seatbelt sandbox runs this host's own toolchain: there
     // is no image to name, resolve or pull.
@@ -337,14 +343,15 @@ pub fn lab_test_image_in(sandbox: darkmux_sandbox::BackendKind, workload_image: 
         crate::dispatch_internal::validate_image_ref(image)?;
         return Ok(image.to_string());
     }
-    crate::dispatch_internal::test_runtime_image().with_context(tests_need_docker)
+    crate::dispatch_internal::resolved_runtime_image_with(read.and_then(|s| s.docker_remedy()))
+        .with_context(|| tests_need_docker(read.and_then(|s| s.docker_needs())))
 }
 
 /// (#3112) Why a lab run's tests could not get the runtime image: Docker is
 /// asked for only under `runtime.sandbox docker`, so the message says so,
 /// and how to need no Docker where that can run.
-fn tests_need_docker() -> String {
-    let remedy = darkmux_sandbox::docker_needs().unwrap_or_else(|| "Docker must be installed and running".to_string());
+fn tests_need_docker(needs: Option<String>) -> String {
+    let remedy = needs.unwrap_or_else(|| "Docker must be installed and running".to_string());
     format!(
         "model-written tests run in {}: {remedy}; \
          to run them on this machine as your user instead, `darkmux config set runtime.tests_on_host true`",
@@ -862,25 +869,25 @@ mod tests {
     fn a_lab_runs_its_tests_in_the_image_its_sandbox_uses() {
         use darkmux_sandbox::BackendKind::{Docker, Landlock, Seatbelt};
         for on_host in [Seatbelt, Landlock] {
-            assert_eq!(lab_test_image_in(on_host, None).unwrap(), "host", "{on_host:?}");
-            assert_eq!(lab_test_image_in(on_host, Some("node:22")).unwrap(), "host", "{on_host:?}: a pinned image is not used on the host");
+            assert_eq!(lab_test_image_in(on_host, None, None).unwrap(), "host", "{on_host:?}");
+            assert_eq!(lab_test_image_in(on_host, Some("node:22"), None).unwrap(), "host", "{on_host:?}: a pinned image is not used on the host");
         }
-        assert_eq!(lab_test_image_in(Docker, Some("node:22")).unwrap(), "node:22");
-        let why = lab_test_image_in(Docker, Some("--privileged")).unwrap_err().to_string();
+        assert_eq!(lab_test_image_in(Docker, Some("node:22"), None).unwrap(), "node:22");
+        let why = lab_test_image_in(Docker, Some("--privileged"), None).unwrap_err().to_string();
         assert!(why.contains("starts with `-`"), "{why}");
-        let runtime = crate::dispatch_internal::test_runtime_image().unwrap();
+        let runtime = crate::dispatch_internal::resolved_runtime_image_with(None).unwrap();
         assert_ne!(runtime, "host");
-        assert_eq!(lab_test_image_in(Docker, None).unwrap(), runtime, "no pin: the dispatch's own runtime image");
+        assert_eq!(lab_test_image_in(Docker, None, None).unwrap(), runtime, "no pin: the dispatch's own runtime image");
     }
 
     /// (#3112) Tests that cannot get the runtime image say why Docker was
     /// needed and the way to run them on this machine instead, whether or not
-    /// the configured sandbox can be read.
+    /// the run's read of the sandbox names a remedy.
     #[test]
     #[serial_test::serial] // sets DARKMUX_SANDBOX
     fn tests_without_docker_say_why_docker_and_the_way_to_run_them_here() {
         for sandbox in ["docker", "podman"] {
-            let why = under_sandbox(sandbox, tests_need_docker);
+            let why = under_sandbox(sandbox, || tests_need_docker(darkmux_sandbox::selection().ok().and_then(|s| s.docker_needs())));
             assert!(
                 why.starts_with("model-written tests run in a Docker container (`runtime.sandbox` is `docker`): Docker must be installed and running"),
                 "{sandbox}: {why}"

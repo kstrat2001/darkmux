@@ -65,6 +65,9 @@ httpmock = "0.7"
 # operator's real runtime.inactivity_timeout_seconds. Dev-dep only; off in the
 # release binary.
 darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
+# The derived list of functions that read `runtime.sandbox`, for the guard
+# that a run reads it once.
+darkmux-sandbox = { path = "../darkmux-sandbox", features = ["test-support"] }
 # (#2632 CONSIDER 3) Same shape as the `darkmux-types` dev-dep above, one
 # hop further out: darkmux-profiles' own `test-support` feature forwards to
 # `darkmux-types/test-support`, so crew's TEST build compiles the

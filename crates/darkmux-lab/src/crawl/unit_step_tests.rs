@@ -3514,6 +3514,7 @@ fn a_units_readback_maps_a_host_seen_finding_like_a_workspace_one() {
             session_id: SessionId::adhoc(run, "crawler", "u-1"),
             tree_root: tmp.path().join("tree"),
             tree_seen: tree_seen.to_string(),
+            sandbox: Err("not read in this test".into()),
         };
         let into = tmp.path().join("findings.jsonl");
         let session = ctx.session_id.clone();

@@ -1276,14 +1276,26 @@
 
     // ─── #680: Docker-runtime preflight status → bail mapping ─────────
 
+    /// The Docker bail names the remedy of the dispatch's own read of the
+    /// sandbox setting, passed in, and nothing when that read is not Docker.
+    #[test]
+    fn the_docker_bail_names_the_remedy_it_is_given() {
+        let with = preflight_result_for(DockerRuntimeStatus::BinaryMissing, Some("`runtime.sandbox` is `docker`, so Docker must run"))
+            .unwrap_err()
+            .to_string();
+        assert!(with.ends_with("\n`runtime.sandbox` is `docker`, so Docker must run."), "{with}");
+        let without = preflight_result_for(DockerRuntimeStatus::BinaryMissing, None).unwrap_err().to_string();
+        assert!(without.ends_with("and retry."), "{without}");
+    }
+
     #[test]
     fn preflight_ready_is_ok() {
-        assert!(preflight_result_for(DockerRuntimeStatus::Ready).is_ok());
+        assert!(preflight_result_for(DockerRuntimeStatus::Ready, None).is_ok());
     }
 
     #[test]
     fn preflight_binary_missing_bails_with_install_hint() {
-        let msg = preflight_result_for(DockerRuntimeStatus::BinaryMissing)
+        let msg = preflight_result_for(DockerRuntimeStatus::BinaryMissing, darkmux_sandbox::Selection { kind: darkmux_sandbox::BackendKind::Docker, source: darkmux_types::config_access::Source::Config }.docker_remedy().as_deref())
             .unwrap_err()
             .to_string();
         assert!(msg.contains("isn't on PATH"), "{msg}");
@@ -1296,7 +1308,7 @@
     fn preflight_daemon_unreachable_surfaces_stderr_and_start_hint() {
         let msg = preflight_result_for(DockerRuntimeStatus::DaemonUnreachable(
             "Cannot connect to the Docker daemon".to_string(),
-        ))
+        ), darkmux_sandbox::Selection { kind: darkmux_sandbox::BackendKind::Docker, source: darkmux_types::config_access::Source::Config }.docker_remedy().as_deref())
         .unwrap_err()
         .to_string();
         assert!(msg.contains("`docker version` failed"), "{msg}");
@@ -1311,7 +1323,7 @@
         // path pulls the GHCR image on demand (#759) rather than bailing. The
         // message should name the GHCR pull as primary and build-from-source
         // as the fallback.
-        let msg = preflight_result_for(DockerRuntimeStatus::ImageMissing)
+        let msg = preflight_result_for(DockerRuntimeStatus::ImageMissing, None)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("GHCR"), "{msg}");
@@ -1357,7 +1369,7 @@
             status_for_plan(plan_default_image(&Empty, "9.9.9", None)),
             DockerRuntimeStatus::ImageMissing
         );
-        assert!(preflight_result_for(DockerRuntimeStatus::ImageRefused("refusing: x".into()))
+        assert!(preflight_result_for(DockerRuntimeStatus::ImageRefused("refusing: x".into()), None)
             .unwrap_err()
             .to_string()
             .contains("refusing: x"));
@@ -1398,7 +1410,7 @@
     #[test]
     fn preflight_probe_error_bails_with_underlying_error() {
         // The one arm whose behavior changed (old `.context(...)?` → `anyhow!`).
-        let msg = preflight_result_for(DockerRuntimeStatus::ProbeError("boom".to_string()))
+        let msg = preflight_result_for(DockerRuntimeStatus::ProbeError("boom".to_string()), None)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("running `docker images`"), "{msg}");
@@ -7056,9 +7068,9 @@ S(("127.0.0.1", port), H).serve_forever()
         let way_back = "darkmux config set runtime.sandbox docker";
         for kind in [darkmux_sandbox::BackendKind::Seatbelt, darkmux_sandbox::BackendKind::Landlock] {
             let refusals = [
-                host_runtime_for(kind, Some("rust:latest"), None, &at_start).unwrap_err(),
-                host_runtime_for(kind, None, None, &executable_at_start(Err(std::io::Error::other("gone")))).unwrap_err(),
-                host_runtime_for(kind, None, Some(root.path().join("nope").into_os_string()), &at_start).unwrap_err(),
+                host_runtime_for(kind, Some("rust:latest"), None, &at_start, darkmux_sandbox::way_back_to_docker(kind)).unwrap_err(),
+                host_runtime_for(kind, None, None, &executable_at_start(Err(std::io::Error::other("gone"))), darkmux_sandbox::way_back_to_docker(kind)).unwrap_err(),
+                host_runtime_for(kind, None, Some(root.path().join("nope").into_os_string()), &at_start, darkmux_sandbox::way_back_to_docker(kind)).unwrap_err(),
             ];
             let named = format!("`runtime.sandbox` is `{}`", darkmux_sandbox::setting_value(kind));
             for err in refusals.iter().map(|e| format!("{e:#}")) {
@@ -7066,7 +7078,7 @@ S(("127.0.0.1", port), H).serve_forever()
                 assert!(!err.contains("DARKMUX_SANDBOX=") && !err.contains("cargo build"), "{err}");
             }
             assert!(format!("{:#}", refusals[0]).contains("--image rust:latest"));
-            assert_eq!(host_runtime_for(kind, None, None, &at_start).unwrap().program, exe.canonicalize().unwrap());
+            assert_eq!(host_runtime_for(kind, None, None, &at_start, darkmux_sandbox::way_back_to_docker(kind)).unwrap().program, exe.canonicalize().unwrap());
         }
     }
 
@@ -7352,45 +7364,77 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(compaction.compactor_chat_url.as_deref(), Some("http://127.0.0.1:8081/v1/chat/completions"));
     }
 
+    /// A caller's read of the setting reaches the dispatch as it was, a
+    /// refusal included: the dispatch is refused with that refusal and never
+    /// reads the setting again (here it says `docker`, which would run).
+    #[test]
+    #[serial]
+    fn a_callers_refused_read_is_the_dispatchs_refusal_not_a_second_read() {
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.sandbox = Some(Err("the caller's read: `runtime.sandbox` is `podman`".into()));
+        let prev = std::env::var_os(darkmux_sandbox::SANDBOX_ENV);
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var(darkmux_sandbox::SANDBOX_ENV, "docker") };
+        let refused = dispatch_sandbox(&opts).map(|s| s.kind);
+        opts.sandbox = Some(Ok(darkmux_sandbox::Selection { kind: darkmux_sandbox::BackendKind::Seatbelt, source: darkmux_types::config_access::Source::Config }));
+        let carried = dispatch_sandbox(&opts).map(|s| s.kind);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(darkmux_sandbox::SANDBOX_ENV, v),
+                None => std::env::remove_var(darkmux_sandbox::SANDBOX_ENV),
+            }
+        }
+        assert!(refused.unwrap_err().to_string().contains("the caller's read"));
+        assert_eq!(carried.unwrap(), darkmux_sandbox::BackendKind::Seatbelt);
+    }
+
     /// A container dispatch reads `runtime.sandbox` once, in
     /// `dispatch_sandbox`, and everything after takes that value: the resume
-    /// check, the origin stamp, the prompt, the runtime image, the model
-    /// URLs and the launch. Counted over the whole file, so a helper that
-    /// reads the setting (as `sandbox_of` did) is a second read wherever it
-    /// is called from. The step that renders a dispatch's message reads it
-    /// once and hands it on (`DispatchOpts::sandbox`, asserted by
-    /// `dispatch_internal_expands_the_workspace_placeholder_through_the_selection`);
-    /// the brief renderer reads it never.
+    /// check, the origin stamp, the prompt, the runtime image and its Docker
+    /// remedies, the model URLs and the launch.
+    ///
+    /// What counts as a read is derived, not listed: every function of
+    /// darkmux-sandbox that reaches the setting, directly or through another
+    /// of its functions (`darkmux_sandbox::setting_reads`), however it is
+    /// spelled here (`darkmux_sandbox::f(`, imported bare, renamed on
+    /// import), and the types crate's accessors. The scan covers these
+    /// files' own text: a helper elsewhere in this crate that reads the
+    /// setting is caught only by its own file's scan below, so a new file on
+    /// the dispatch path joins the list.
+    ///
+    /// In dispatch_internal.rs the reads are confined to `dispatch_sandbox`
+    /// and two entries outside the dispatch path, each its own caller's one
+    /// read (`resolved_runtime_image`, for containers beside a dispatch;
+    /// `host_runtime_status`, for doctor), and nothing in the file calls
+    /// those two.
     #[test]
     fn a_container_dispatch_reads_the_sandbox_setting_once() {
-        const READERS: [&str; 5] = [
-            "darkmux_sandbox::selected(",
-            "darkmux_sandbox::selected_in(",
-            "darkmux_sandbox::backend(",
-            "config_access::sandbox(",
-            "config_access::sandbox_with_source",
-        ];
-        let reads = |src: &str| -> Vec<usize> {
-            let mut at: Vec<usize> = READERS.iter().flat_map(|r| src.match_indices(r).map(|(i, _)| i)).collect();
-            at.sort_unstable();
-            at
-        };
+        use darkmux_sandbox::setting_reads::reads_in;
+        const ENTRIES: [&str; 2] = ["resolved_runtime_image", "host_runtime_status"];
         let production = |full: &'static str, end: &str| &full[..full.find(end).unwrap_or(full.len())];
+        let body_of = |src: &'static str, name: &str| {
+            let at = src.find(&format!("\nfn {name}(")).or_else(|| src.find(&format!("\npub fn {name}("))).unwrap_or_else(|| panic!("fn {name}"));
+            at..at + src[at..].find("\n}\n").unwrap()
+        };
         let dispatch = production(include_str!("dispatch_internal.rs"), "\nmod tests;");
-        let at = reads(dispatch);
-        let resolver = dispatch.find("\nfn dispatch_sandbox(").expect("the one resolution");
-        let resolver_end = resolver + dispatch[resolver..].find("\n}\n").unwrap();
-        assert!(
-            at.len() == 1 && (resolver..resolver_end).contains(&at[0]),
-            "dispatch_internal.rs reads the sandbox setting outside dispatch_sandbox, at byte offsets {at:?}"
-        );
+        let allowed: Vec<_> = std::iter::once("dispatch_sandbox").chain(ENTRIES).map(|f| body_of(dispatch, f)).collect();
+        let stray: Vec<_> = reads_in(dispatch, &[]).into_iter().filter(|(at, _)| !allowed.iter().any(|r| r.contains(at))).collect();
+        assert!(stray.is_empty(), "dispatch_internal.rs reads the sandbox setting outside dispatch_sandbox: {stray:?}");
+        let in_resolver = reads_in(&dispatch[allowed[0].clone()], &[]);
+        assert_eq!(in_resolver.len(), 1, "dispatch_sandbox reads it once: {in_resolver:?}");
+        let entry_calls: Vec<_> = reads_in(dispatch, &ENTRIES).into_iter().filter(|(_, n)| ENTRIES.contains(&n.as_str())).collect();
+        assert!(entry_calls.is_empty(), "the dispatch reaches a reading entry: {entry_calls:?}");
+
         let step = production(include_str!("step_kinds/builtins.rs"), "\n#[cfg(test)]");
-        assert_eq!(reads(step).len(), 1, "a dispatch.internal step reads the setting once, for its message and its DispatchOpts");
-        for (name, src) in [
-            ("brief_refs.rs", production(include_str!("brief_refs.rs"), "\n#[cfg(test)]")),
-            ("role_inputs.rs", production(include_str!("role_inputs.rs"), "\n#[cfg(test)]")),
+        assert_eq!(reads_in(step, &ENTRIES).len(), 1, "a dispatch.internal step reads the setting once, for its message and its DispatchOpts");
+        let crew_helpers = include_str!("contained_command.rs");
+        for (name, text) in [
+            ("brief_refs.rs", production(include_str!("brief_refs.rs"), "\n#[cfg(test)]").to_string()),
+            ("role_inputs.rs", include_str!("role_inputs.rs").to_string()),
+            ("lab_test_image_in", crew_helpers[body_of(crew_helpers, "lab_test_image_in")].to_string()),
+            ("lab_test_user_in", crew_helpers[body_of(crew_helpers, "lab_test_user_in")].to_string()),
         ] {
-            assert_eq!(reads(src), Vec::<usize>::new(), "{name} reads the sandbox setting");
+            assert_eq!(reads_in(&text, &ENTRIES), Vec::new(), "{name} reads the sandbox setting");
         }
         assert!(dispatch.contains("spawn_container(&argv_config, run_backend(&run.image), opts.max_turns_override)?"));
     }

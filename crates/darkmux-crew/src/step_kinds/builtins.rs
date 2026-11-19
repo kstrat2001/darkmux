@@ -577,8 +577,9 @@ pub(crate) fn dispatch_opts_for(
     // The one read of `runtime.sandbox` for this step: the message names
     // paths as this backend sees them, and the dispatch runs in it
     // (`DispatchOpts::sandbox`), whatever the setting says by then.
-    let sandbox = darkmux_sandbox::selected().ok();
-    let base = expand_workspace_root(cfg.message.as_deref().unwrap_or_default(), sandbox, workdir.as_deref());
+    let sandbox = darkmux_sandbox::selection();
+    let kind = sandbox.as_ref().ok().map(|s| s.kind);
+    let base = expand_workspace_root(cfg.message.as_deref().unwrap_or_default(), kind, workdir.as_deref());
     let message = compose_message(&base, input);
     // The owning Task names the phase for every step minted from a mission
     // config; the step config's own `phase_id` (the crew-of-one's way of
@@ -626,7 +627,7 @@ pub(crate) fn dispatch_opts_for(
         &message,
         &brief_refs,
         &crate::brief_refs::StoreDirs::resolved(),
-        sandbox,
+        kind,
     )
     .with_context(|| format!("step `{}`: resolving the brief's records", step.id))?;
 
@@ -661,7 +662,7 @@ pub(crate) fn dispatch_opts_for(
         force_container: false,
         max_completion_tokens,
         image,
-        sandbox,
+        sandbox: Some(sandbox),
         model_base_url_override: None,
         // (#1483) Stamp the step id so the tailer's live turn/tool/token
         // records attribute to this seat even when the session is not the
@@ -4589,7 +4590,16 @@ mod tests {
         let opts_now = || dispatch_opts_for(&step("s1", "dispatch.internal", cfg.clone()), &empty_task(), &BTreeMap::new(), &StepRunCtx::for_test()).unwrap();
         let docker = opts_now();
         assert_eq!(docker.message, "read `/workspace/<source>/x`");
-        assert_eq!(docker.sandbox, Some(darkmux_sandbox::BackendKind::Docker));
+        assert_eq!(docker.sandbox.and_then(Result::ok).map(|s| s.kind), Some(darkmux_sandbox::BackendKind::Docker));
+        // A refused read is handed on as the refusal, never dropped to
+        // `None` (which the dispatch would answer with a second read).
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        unsafe { std::env::set_var("DARKMUX_SANDBOX", "podman") };
+        let refused = opts_now().sandbox;
+        unsafe {
+            match &prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        assert!(matches!(&refused, Some(Err(why)) if why.contains("podman")), "{refused:?}");
         if !darkmux_sandbox::SeatbeltBackend::available() {
             return;
         }
@@ -4602,7 +4612,7 @@ mod tests {
         }
         let real = dir.path().canonicalize().unwrap().display().to_string();
         assert_eq!(seatbelt, format!("read `{real}/<source>/x`"));
-        assert_eq!(seatbelt_opts.sandbox, Some(darkmux_sandbox::BackendKind::Seatbelt));
+        assert_eq!(seatbelt_opts.sandbox.and_then(Result::ok).map(|s| s.kind), Some(darkmux_sandbox::BackendKind::Seatbelt));
     }
 
     /// (#3112 review) The shipped mod-writer messages name the repository
