@@ -2795,11 +2795,9 @@ fn detector_code_hash(canonical_args: &str) -> Option<String> {
         .get("path")?
         .as_str()?
         .to_owned();
-    let meta = std::fs::metadata(&path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_HASH_BYTES {
-        return None;
-    }
-    let bytes = std::fs::read(&path).ok()?;
+    // One open, never a named pipe or device (a swap after a separate check
+    // could block the loop for ever), refused unread over the cap.
+    let bytes = crate::tools::workspace::read_whole_regular_bytes(std::path::Path::new(&path), MAX_HASH_BYTES).ok()?;
     Some(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -15111,6 +15109,37 @@ mod tests {
         assert!(detector_code_hash("not json").is_none());
         // A `path` that doesn't exist → None (best-effort, never a fake hash).
         assert!(detector_code_hash(r#"{"path":"/no/such/file.rs"}"#).is_none());
+    }
+
+    /// A named pipe is refused at its open, never waited on: the hash runs
+    /// on the loop's own thread, with no deadline.
+    #[test]
+    fn detector_code_hash_never_waits_on_a_named_pipe() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pipe = dir.path().join("p");
+        let c = std::ffi::CString::new(pipe.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let args = serde_json::json!({ "path": pipe.to_str().unwrap() }).to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(detector_code_hash(&args)).unwrap());
+        let hashed = rx.recv_timeout(std::time::Duration::from_secs(5));
+        if hashed.is_err() {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new().read(true).write(true).custom_flags(libc::O_NONBLOCK).open(&pipe);
+        }
+        assert_eq!(hashed.expect("still blocked on a named pipe after 5 s"), None);
+    }
+
+    /// Over the cap is no hash; at the cap is one.
+    #[test]
+    fn detector_code_hash_skips_a_file_over_its_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let big = dir.path().join("big.rs");
+        std::fs::File::create(&big).unwrap().set_len(10 * 1024 * 1024 + 1).unwrap();
+        let args = |p: &std::path::Path| serde_json::json!({ "path": p.to_str().unwrap() }).to_string();
+        assert!(detector_code_hash(&args(&big)).is_none());
+        std::fs::OpenOptions::new().write(true).open(&big).unwrap().set_len(10 * 1024 * 1024).unwrap();
+        assert!(detector_code_hash(&args(&big)).is_some());
     }
 
     // ─── (#465/#472) cadence_drift_step state machine ────────────────

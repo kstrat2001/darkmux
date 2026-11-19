@@ -41,13 +41,19 @@ use std::time::{Duration, Instant};
 
 use crate::lmstudio::{FunctionDef, ToolDef};
 use workspace::{
-    read_file_nofollow, resolve_read, resolve_write, write_file_nofollow,
+    read_regular, read_whole_regular, resolve_read, resolve_write, write_file_nofollow,
 };
 
 /// Hard cap on how much content a Read tool returns. Anything bigger
 /// gets truncated with a marker so the model knows. Keeps a single
 /// tool result from blowing the context window on its own.
 const READ_MAX_BYTES: usize = 1024 * 1024; // 1 MB
+
+/// The most of one file `search` reads: as much as `read` can show of it.
+const SEARCH_FILE_MAX_BYTES: u64 = READ_MAX_BYTES as u64;
+
+/// The largest file `edit` and `create_finding` take whole.
+const WHOLE_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// (#3073) Cap on how much of ONE stream (stdout or stderr) of a Bash command
 /// reaches the model. The rest is read and dropped, never buffered, so a
@@ -1100,23 +1106,23 @@ fn execute_read(raw_args: &str, workspace_root: &Path) -> Result<String> {
 
     let path = resolve_read(&args.path, workspace_root)?;
 
-    // Read as bytes first so the 1MB safety cap still applies even
-    // when limit=0. The cap is the last line of defense against a model
-    // accidentally asking for an enormous binary; the offset/limit pair
-    // is the first.
-    let bytes = std::fs::read(&path)
+    // Never more than the 1MB safety cap is read, even when limit=0, and
+    // never a named pipe or device (`read_regular`). The cap is the last line
+    // of defense against a model accidentally asking for an enormous binary;
+    // the offset/limit pair is the first.
+    let start = read_regular(&path, READ_MAX_BYTES as u64)
         .with_context(|| format!("reading file: {path:?}"))?;
 
-    if bytes.len() > READ_MAX_BYTES {
-        let truncated = String::from_utf8_lossy(&bytes[..READ_MAX_BYTES]);
+    if !start.whole {
+        let truncated = String::from_utf8_lossy(&start.bytes);
         return Ok(format!(
             "{}\n\n--- [byte safety cap fired; original file size {} bytes, truncated to {READ_MAX_BYTES}; offset/limit applied to truncated content] ---",
             slice_lines(&truncated, args.offset, args.limit),
-            bytes.len()
+            start.size
         ));
     }
 
-    let content = String::from_utf8_lossy(&bytes);
+    let content = String::from_utf8_lossy(&start.bytes);
     let total_lines = content.lines().count() as u64;
     let (sliced, returned_lines, end_offset) =
         slice_lines_with_info(&content, args.offset, args.limit);
@@ -1299,7 +1305,7 @@ fn execute_edit_hooked(
 /// Apply edits to an already-resolved path; the `O_NOFOLLOW` seam for edit.
 fn edit_resolved(path: &Path, edits: &[EditOp]) -> Result<String> {
     let path = path.to_path_buf();
-    let original = read_file_nofollow(&path)
+    let original = read_whole_regular(&path, WHOLE_FILE_MAX_BYTES)
         .with_context(|| format!("reading file for edit: {path:?}"))?;
 
     let (content, total_replacements) = apply_edits(original, edits, &path)?;
@@ -1409,20 +1415,22 @@ fn execute_search(raw_args: &str, workspace_root: &Path) -> Result<String> {
     let meta = std::fs::symlink_metadata(&resolved)
         .with_context(|| format!("stat: {resolved:?}"))?;
 
-    let mut hits: Vec<String> = Vec::new();
+    let mut found = Found::default();
     if meta.is_file() {
-        search_file(&resolved, &canonical_root, &args.pattern, &mut hits, max_results);
+        search_file(&resolved, &canonical_root, &args.pattern, &mut found, max_results);
     } else if meta.is_dir() {
-        search_dir(&resolved, &canonical_root, &args.pattern, &mut hits, max_results);
+        search_dir(&resolved, &canonical_root, &args.pattern, &mut found, max_results);
     } else {
         return Err(anyhow!(
             "search: path is neither a file nor a directory: {resolved:?}"
         ));
     }
 
+    let hits = &found.hits;
+    let cut_note = found.cut_note();
     if hits.is_empty() {
         Ok(format!(
-            "No matches for pattern {:?} in {}.",
+            "No matches for pattern {:?} in {}.{cut_note}",
             args.pattern, args.path
         ))
     } else {
@@ -1431,7 +1439,44 @@ fn execute_search(raw_args: &str, workspace_root: &Path) -> Result<String> {
         } else {
             String::new()
         };
-        Ok(format!("{}{}", hits.join("\n"), capped_marker))
+        Ok(format!("{}{}{cut_note}", hits.join("\n"), capped_marker))
+    }
+}
+
+/// What a search found: its matches, and the files it searched only the
+/// first [`SEARCH_FILE_MAX_BYTES`] of.
+#[derive(Default)]
+struct Found {
+    hits: Vec<String>,
+    cut: Vec<String>,
+}
+
+/// How many cut files [`Found::cut_note`] names before it only counts.
+const SEARCH_CUT_NAMED: usize = 10;
+
+impl Found {
+    /// A line telling the model which files were searched only in part, or
+    /// nothing when none was.
+    fn cut_note(&self) -> String {
+        if self.cut.is_empty() {
+            return String::new();
+        }
+        let named = self.cut.iter().take(SEARCH_CUT_NAMED).cloned().collect::<Vec<_>>().join(", ");
+        let more = self.cut.len().saturating_sub(SEARCH_CUT_NAMED);
+        let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+        format!(
+            "\n[larger than {SEARCH_FILE_MAX_BYTES} bytes, so only their first {SEARCH_FILE_MAX_BYTES} bytes were searched: {named}{more}]"
+        )
+    }
+}
+
+/// The text of what a search read of a file: `None` for a file that is not
+/// UTF-8 text. A cut that splits a character keeps what comes before it.
+fn searchable_text(start: &workspace::FileStart) -> Option<&str> {
+    match std::str::from_utf8(&start.bytes) {
+        Ok(text) => Some(text),
+        Err(e) if !start.whole && e.error_len().is_none() => std::str::from_utf8(&start.bytes[..e.valid_up_to()]).ok(),
+        Err(_) => None,
     }
 }
 
@@ -1439,25 +1484,27 @@ fn search_file(
     path: &Path,
     ws_root: &Path,
     pattern: &str,
-    hits: &mut Vec<String>,
+    found: &mut Found,
     max: usize,
 ) {
-    if hits.len() >= max {
+    if found.hits.len() >= max {
         return;
     }
 
-    // Try to read as UTF-8. Binary / non-UTF8 files are silently skipped
-    // (the model wanted text matches; returning mojibake helps nobody).
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    // At most the first SEARCH_FILE_MAX_BYTES, from a regular file only.
+    // Binary / non-UTF8 files are silently skipped (the model wanted text
+    // matches; returning mojibake helps nobody).
+    let Ok(start) = read_regular(path, SEARCH_FILE_MAX_BYTES) else { return };
+    let Some(content) = searchable_text(&start) else { return };
 
     let rel = path.strip_prefix(ws_root).unwrap_or(path);
     let rel_display = rel.display();
+    if !start.whole {
+        found.cut.push(rel_display.to_string());
+    }
 
     for (idx, line) in content.lines().enumerate() {
-        if hits.len() >= max {
+        if found.hits.len() >= max {
             break;
         }
         if line.contains(pattern) {
@@ -1468,13 +1515,13 @@ fn search_file(
             } else {
                 line.to_string()
             };
-            hits.push(format!("{rel_display}:{}:{line_str}", idx + 1));
+            found.hits.push(format!("{rel_display}:{}:{line_str}", idx + 1));
         }
     }
 }
 
-fn search_dir(dir: &Path, ws_root: &Path, pattern: &str, hits: &mut Vec<String>, max: usize) {
-    if hits.len() >= max {
+fn search_dir(dir: &Path, ws_root: &Path, pattern: &str, found: &mut Found, max: usize) {
+    if found.hits.len() >= max {
         return;
     }
 
@@ -1489,7 +1536,7 @@ fn search_dir(dir: &Path, ws_root: &Path, pattern: &str, hits: &mut Vec<String>,
     sorted.sort_by_key(|e| e.file_name());
 
     for entry in sorted {
-        if hits.len() >= max {
+        if found.hits.len() >= max {
             break;
         }
 
@@ -1519,12 +1566,15 @@ fn search_dir(dir: &Path, ws_root: &Path, pattern: &str, hits: &mut Vec<String>,
 
         let path = entry.path();
         if sym_meta.is_dir() {
-            search_dir(&path, ws_root, pattern, hits, max);
+            search_dir(&path, ws_root, pattern, found, max);
         } else if sym_meta.is_file() {
-            search_file(&path, ws_root, pattern, hits, max);
+            search_file(&path, ws_root, pattern, found, max);
         }
     }
 }
+
+#[cfg(test)]
+mod bounds_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3763,8 +3813,8 @@ fn capture_finding_context(
 ) -> std::result::Result<FindingContext, String> {
     let path = resolve_read(file, workspace_root)
         .map_err(|e| format!("`file` did not resolve to a readable path in the workspace ({e})"))?;
-    let body = std::fs::read_to_string(&path)
-        .map_err(|e| format!("`file` could not be read ({e})"))?;
+    let body = read_whole_regular(&path, WHOLE_FILE_MAX_BYTES)
+        .map_err(|e| format!("`file` could not be read ({e:#})"))?;
     let lines: Vec<&str> = body.lines().collect();
     let n = line as usize;
     if n > lines.len() {
@@ -4168,6 +4218,18 @@ fn execute_create_mod(raw_args: &str, out_dir: &Path, workspace_root: &Path) -> 
     execute_create_mod_with(raw_args, out_dir, workspace_root, execution_id(), dispatch_brief())
 }
 
+/// Why an `attach` path could not be carried: not a file, or unreadable.
+fn attachment_unreadable(rel: &str, e: &anyhow::Error) -> String {
+    if e.downcast_ref::<workspace::NotRegular>().is_some() {
+        format!(
+            "NOT RECORDED — `attach` names {rel:?}, which is not a file. \
+             Attach individual files, not directories."
+        )
+    } else {
+        format!("NOT RECORDED — `attach` names {rel:?}, which could not be read ({e:#}).")
+    }
+}
+
 /// (#2386) The same tool with its dispatch context passed IN — the form the
 /// tests drive, so a test that needs an identity does not have to set a
 /// process-wide `OnceLock` that every later test in the binary would then
@@ -4247,24 +4309,16 @@ fn execute_create_mod_with(
                 )));
             }
         };
-        let meta = match std::fs::metadata(&path) {
-            Ok(m) if m.is_file() => m,
-            Ok(_) => {
-                return Ok(ToolRun::text(format!(
-                    "NOT RECORDED — `attach` names {rel:?}, which is not a file. \
-                     Attach individual files, not directories."
-                )));
-            }
-            Err(e) => {
-                return Ok(ToolRun::text(format!(
-                    "NOT RECORDED — `attach` names {rel:?}, which could not be read ({e})."
-                )));
-            }
+        // One open, never a named pipe or device, and never more read than
+        // the whole budget (and a byte to tell the file is larger).
+        let start = match read_regular(&path, MAX_ATTACHMENT_TOTAL_BYTES) {
+            Ok(start) => start,
+            Err(e) => return Ok(ToolRun::text(attachment_unreadable(rel, &e))),
         };
         // A cap is a REFUSAL, not a truncation: half a file is not the data the
         // kit needs, and the emission rides a flow record the host bounds.
-        total_bytes += meta.len();
-        if total_bytes > MAX_ATTACHMENT_TOTAL_BYTES {
+        total_bytes += start.size;
+        if total_bytes > MAX_ATTACHMENT_TOTAL_BYTES || !start.whole {
             return Ok(ToolRun::text(format!(
                 "NOT RECORDED — the attachments total {total_bytes} bytes, over this \
                  tool's budget of {MAX_ATTACHMENT_TOTAL_BYTES} bytes across ALL \
@@ -4274,14 +4328,7 @@ fn execute_create_mod_with(
                  its kit."
             )));
         }
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                return Ok(ToolRun::text(format!(
-                    "NOT RECORDED — `attach` names {rel:?}, which could not be read ({e})."
-                )));
-            }
-        };
+        let bytes = start.bytes;
         attached.push(serde_json::json!({ "path": rel, "bytes": b64_encode(&bytes) }));
     }
 

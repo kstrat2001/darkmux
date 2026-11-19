@@ -887,9 +887,11 @@ pub fn preflight(scope: Scope) -> Result<(), PreflightRefusal> {
         .flat_map(crate::config_access::enum_bad_values)
         .collect();
     let files = crate::user_files::config_json_problems();
+    // (#3112) Every scope can start a sandbox (`runtime.sandbox`'s scopes).
+    let mut invalid: Vec<InvalidSetting> = crate::config_access::sandbox_memory_problem().into_iter().collect();
     // A numeric env var that does not read is refused by every scope, as a
     // wrong-typed `config.json` value is.
-    let invalid = crate::numeric_env::bad_values();
+    invalid.extend(crate::numeric_env::bad_values());
     PreflightRefusal { scope, bad, invalid, files }.into_result()
 }
 
