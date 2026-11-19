@@ -266,6 +266,7 @@ fn run_on(
         check_default_engine(),
         check_env_masks_config(),
         check_binary_split_brain(),
+        check_flows_dir_writable(),
         check_audit_integrity(),
         check_audit_write_drops(),
         check_unknown_flow_actions(),
@@ -590,23 +591,9 @@ fn summarize_audit_reports(reports: &[darkmux_flow::IntegrityReport]) -> Check {
         .iter()
         .flat_map(|r| r.torn_tails.iter().map(String::as_str))
         .collect();
-    if !torn.is_empty() {
-        let restarted = reports.iter().filter(|r| r.chain_restarted).count();
-        let restart_note = if restarted == 0 {
-            String::new()
-        } else {
-            format!(" ({restarted} restarted its chain: the verified chain covers only what was written after)")
-        };
-        return Check {
-            name: "audit integrity".into(),
-            status: Status::Warn,
-            message: format!(
-                "{} torn audit tail(s) set aside after an interrupted write{restart_note}: {}",
-                torn.len(),
-                torn.join(", ")
-            ),
-            hint: Some("A write was interrupted mid-line; the incomplete bytes were moved to the named sidecar file and the chain continues from the last complete line. Inspect or delete the sidecar once reviewed. The chain check does not detect records removed from the end of a day file.".into()),
-        };
+    let restarted: Vec<&str> = reports.iter().filter(|r| r.chain_restarted).map(|r| r.path.as_str()).collect();
+    if !torn.is_empty() || !restarted.is_empty() {
+        return torn_or_restarted_check(&torn, &restarted);
     }
 
     let total_records: u64 = reports.iter().map(|r| r.records_checked).sum();
@@ -623,6 +610,34 @@ fn summarize_audit_reports(reports: &[darkmux_flow::IntegrityReport]) -> Check {
             reports.len()
         ),
         hint: None,
+    }
+}
+
+/// The `audit integrity` warning for a walk whose chains all verify but where
+/// bytes were set aside (`torn`, the sidecars) or a day file's chain started
+/// over (`restarted`, the day files): an emptied or whitespace-only file, or
+/// one whose first line was set aside. `flow integrity-check` exits 3 for a
+/// restart.
+fn torn_or_restarted_check(torn: &[&str], restarted: &[&str]) -> Check {
+    let restart_note = if restarted.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{} day file(s) restarted their chain, so the verified chain covers only what was written after: {}",
+            restarted.len(),
+            restarted.join(", ")
+        )
+    };
+    let message = match (torn.is_empty(), restart_note.is_empty()) {
+        (true, _) => restart_note,
+        (false, true) => format!("{} torn audit tail(s) set aside after an interrupted write: {}", torn.len(), torn.join(", ")),
+        (false, false) => format!("{} torn audit tail(s) set aside after an interrupted write ({restart_note}): {}", torn.len(), torn.join(", ")),
+    };
+    Check {
+        name: "audit integrity".into(),
+        status: Status::Warn,
+        message,
+        hint: Some("A write was interrupted mid-line, or a day file was found cut (emptied, whitespace only, or its first line set aside), and the chain continued or started over. Set-aside bytes are in the named sidecar files (an empty restart sidecar means the file was found empty); inspect or delete them once reviewed. The chain check does not detect records removed from the end of a day file.".into()),
     }
 }
 
@@ -670,32 +685,83 @@ fn unknown_flow_actions_check(tally: &darkmux_flow::reader::UnknownActions) -> C
 /// (#877) Surface DROPPED audit writes. An `AuditFileSink` write failure leaves
 /// a durable `audit.write_failed` breadcrumb in the local flow sink — the hash
 /// chain itself still validates clean (the next record re-seeds `prev_hash`
-/// from the file tail), so `integrity-check` cannot see the gap. Counting
-/// today's breadcrumbs makes the dropped write DETECTABLE: the audit log is
-/// INCOMPLETE for those records even though the surviving chain passes.
+/// from the file tail), so the chain walk cannot see the gap. Every breadcrumb
+/// over the days the audit trail covers is counted, not only today's, so a
+/// dropped write stays visible after UTC midnight.
 fn check_audit_write_drops() -> Check {
-    let n = darkmux_flow::count_audit_write_failures_today();
-    if n == 0 {
-        Check {
-            name: "audit write integrity".into(),
+    audit_write_drops_check(&darkmux_flow::dropped_audit_writes())
+}
+
+fn audit_write_drops_check(dropped: &[darkmux_flow::DroppedAuditWrites]) -> Check {
+    let name = "audit write integrity".to_string();
+    if dropped.is_empty() {
+        return Check {
+            name,
             status: Status::Pass,
-            message: "no dropped audit writes recorded today".into(),
+            message: "no dropped audit writes recorded over the days the audit trail covers".into(),
             hint: None,
-        }
-    } else {
-        Check {
-            name: "audit write integrity".into(),
-            status: Status::Warn,
-            message: format!(
-                "{n} audit write(s) FAILED today — the hash chain is INCOMPLETE for those records (the records that were written still link)"
-            ),
-            hint: Some(
-                "An AuditFileSink write failed (audit dir unwritable / ENOSPC / flock contention). \
-                 Confirm DARKMUX_AUDIT_DIR (or ~/.darkmux/audit) is writable; the dropped records are \
-                 in today's flow file as `action=audit.write_failed`."
-                    .into(),
-            ),
-        }
+        };
+    }
+    let total: u64 = dropped.iter().map(|d| d.count).sum();
+    let days: Vec<String> = dropped.iter().map(|d| format!("{} ({})", d.day, d.count)).collect();
+    Check {
+        name,
+        status: Status::Warn,
+        message: format!(
+            "{total} audit write(s) FAILED on {}: the hash chain is INCOMPLETE for those records (the records that were written still link)",
+            days.join(", ")
+        ),
+        hint: Some(
+            "An AuditFileSink write failed (audit dir unwritable / ENOSPC / flock contention). \
+             Confirm DARKMUX_AUDIT_DIR (or ~/.darkmux/audit) is writable; each dropped record is \
+             in that day's flow file as `action=audit.write_failed`. It stays reported, and \
+             `darkmux flow integrity-check` exits 3, while the audit trail covers that day; \
+             once reviewed, archive the audit files through that day to retire it."
+                .into(),
+        ),
+    }
+}
+
+/// Whether the local sink can write today's day file under the flows dir,
+/// and, when audit is on, the audit sink its own. In the default setup the
+/// local sink is the only sink, and every caller discards a failed write, so
+/// an unwritable flows dir drops every record (the dispatch bookends included)
+/// with one stderr line per process as its only trace. A full disk is not
+/// probed (`day_file_write_problem`).
+fn check_flows_dir_writable() -> Check {
+    use darkmux_flow::DayFileAccess;
+    let today = darkmux_flow::day_utc_now();
+    let flows = darkmux_types::config_access::flows_dir();
+    let flows_problem = darkmux_flow::day_file_write_problem(&flows, &today, DayFileAccess::Append);
+    let audit = darkmux_types::config_access::audit_enabled().then(darkmux_flow::audit_dir);
+    let audit_problem = audit.and_then(|dir| darkmux_flow::day_file_write_problem(&dir, &today, DayFileAccess::ReadWrite));
+    flows_dir_writable_check(&flows, flows_problem, audit_problem)
+}
+
+fn flows_dir_writable_check(dir: &std::path::Path, flows: Option<String>, audit: Option<String>) -> Check {
+    let name = "flow records writable".to_string();
+    if flows.is_none() && audit.is_none() {
+        return Check {
+            name,
+            status: Status::Pass,
+            message: format!("day files can be written under {}", dir.display()),
+            hint: None,
+        };
+    }
+    let flows = flows.map(|p| format!("flow records cannot be written under {}: {p}", dir.display()));
+    let audit = audit.map(|p| format!("audit records cannot be written: {p}"));
+    Check {
+        name,
+        status: Status::Fail,
+        message: [flows, audit].into_iter().flatten().collect::<Vec<_>>().join("; "),
+        hint: Some(
+            "While this holds, every record to that sink is dropped (for the flows dir, the \
+             dispatch bookends included); the work itself still runs. Fix the path or its \
+             permissions (a day file left read-only or owned by root by a `sudo darkmux` run \
+             counts), or point the dir at a writable one: `darkmux config set dirs.flows <dir>` \
+             or `audit.dir` (an exported DARKMUX_FLOWS_DIR or DARKMUX_AUDIT_DIR wins over it)."
+                .into(),
+        ),
     }
 }
 
@@ -10889,6 +10955,50 @@ mod tests {
         assert!(check.message.contains("BROKEN"));
     }
 
+    /// A day file that restarted its chain with nothing set aside (it was
+    /// emptied) still warns, naming the day file: it is not a clean walk.
+    #[test]
+    fn summarize_audit_reports_restart_without_a_sidecar_warns_naming_the_file() {
+        let emptied = darkmux_flow::IntegrityReport { chain_restarted: true, ..mk_clean_report(0) };
+        let check = summarize_audit_reports(&[mk_clean_report(2), emptied]);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("restarted") && check.message.contains("2026-08-11.jsonl"), "{}", check.message);
+    }
+
+    /// Dropped audit writes warn with their days and counts, whatever day
+    /// they fell on; none passes.
+    #[test]
+    fn audit_write_drops_name_each_day_and_none_pass() {
+        assert_eq!(audit_write_drops_check(&[]).status, Status::Pass);
+        let day = |day: &str, count| darkmux_flow::DroppedAuditWrites { day: day.into(), path: format!("/flows/{day}.jsonl"), count };
+        let check = audit_write_drops_check(&[day("2026-11-12", 2), day("2026-11-17", 1)]);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.starts_with("3 audit write(s) FAILED on 2026-11-12 (2), 2026-11-17 (1)"), "{}", check.message);
+        assert!(check.hint.unwrap().contains("exits 3"));
+    }
+
+    /// An unwritable flows dir fails doctor, naming the dir and why, and so
+    /// does an audit day file the audit sink cannot open; a writable setup
+    /// passes.
+    #[test]
+    fn an_unwritable_flows_dir_fails_naming_it() {
+        use darkmux_flow::DayFileAccess;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("a-regular-file");
+        std::fs::write(&blocker, "").unwrap();
+        let dir = blocker.join("flows");
+        let problem = darkmux_flow::day_file_write_problem(&dir, "2026-11-17", DayFileAccess::Append);
+        let check = flows_dir_writable_check(&dir, problem, None);
+        assert_eq!(check.status, Status::Fail, "{}", check.message);
+        assert!(check.message.contains(&dir.display().to_string()) && check.message.contains("not a directory"), "{}", check.message);
+        assert!(check.hint.unwrap().contains("dirs.flows"));
+        let audit = flows_dir_writable_check(tmp.path(), None, Some("cannot open /audit/2026-11-17.jsonl for writing".into()));
+        assert_eq!(audit.status, Status::Fail);
+        assert!(audit.message.starts_with("audit records cannot be written: cannot open /audit/"), "{}", audit.message);
+        let ok = flows_dir_writable_check(tmp.path(), darkmux_flow::day_file_write_problem(tmp.path(), "2026-11-17", DayFileAccess::Append), None);
+        assert_eq!(ok.status, Status::Pass, "{}", ok.message);
+    }
+
     #[test]
     fn summarize_audit_reports_clean_chain_is_pass() {
         let check = summarize_audit_reports(&[mk_clean_report(3), mk_clean_report(7)]);
@@ -13296,10 +13406,13 @@ mod tests {
         //
         // (#3569) 84: `checks_installed::check_installed_engines` joined
         // beside the Flint row.
+        //
         // (#3112) 85: `checks_sandbox::check_sandbox_memory` joined after
         // the sandbox's own rows.
+        //
+        // 86: `check_flows_dir_writable`, before the audit rows.
         let expected =
-            85 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            86 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
