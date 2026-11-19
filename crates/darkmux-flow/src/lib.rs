@@ -342,10 +342,13 @@ fn dir_write_problem(dir: &Path) -> Option<String> {
 }
 
 /// Whether an existing day file opens as its sink opens it. Opening writes
-/// nothing; a file not there yet is the dir probe's.
+/// nothing; a file not there yet is the dir probe's. A symlink to a missing
+/// target is there, though `exists()` (which follows it) says not: the
+/// sink's `create_new` meets EEXIST on it and its append open ENOENT.
 fn existing_day_file_problem(file: &Path, access: DayFileAccess) -> Option<String> {
+    file.symlink_metadata().ok()?;
     if !file.exists() {
-        return None;
+        return Some(format!("{} is a symlink to a missing target", file.display()));
     }
     let mut options = fs::OpenOptions::new();
     match access {
@@ -2765,6 +2768,21 @@ mod tests {
         assert!(audit.contains(&file.display().to_string()), "{audit}");
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "kept\n", "the probe never writes to the day file");
+    }
+
+    /// Today's day file as a symlink to a missing target fails the probe,
+    /// naming the link: the sink's `create_new` meets EEXIST on it and its
+    /// append open meets ENOENT, so every record is dropped.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_fails_a_dangling_day_file_link() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("2026-11-17.jsonl");
+        std::os::unix::fs::symlink(tmp.path().join("gone.jsonl"), &link).unwrap();
+        for access in [DayFileAccess::Append, DayFileAccess::ReadWrite] {
+            let problem = day_file_write_problem(tmp.path(), "2026-11-17", access).expect("a dangling day-file link is not writable");
+            assert!(problem.contains(&link.display().to_string()) && problem.contains("missing target"), "{problem}");
+        }
     }
 
     /// A flows dir that is a symlink to a missing target fails the probe,

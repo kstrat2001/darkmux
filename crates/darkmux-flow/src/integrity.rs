@@ -426,7 +426,9 @@ fn holds_only_whitespace(bytes: &[u8]) -> bool {
 /// Whether a day file the walk read no line from was cut, judged again under
 /// a shared lock on it, so no darkmux writer is partway through a write: on
 /// Linux a write moves the modification time before the size grows, and a
-/// stat taken in between reads exactly like an emptied file.
+/// stat taken in between reads exactly like an emptied file. The lock waits
+/// on a writer stopped mid-first-write (SIGSTOP), as writers already wait on
+/// each other.
 fn lineless_file_is_cut(path: &Path) -> bool {
     #[cfg(unix)]
     let Ok(Some(_shared)) = darkmux_types::flock::lock_shared_existing(path) else { return false };
