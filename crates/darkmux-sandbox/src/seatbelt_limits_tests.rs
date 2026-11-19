@@ -189,6 +189,28 @@ fn a_plan_refuses_a_bad_name_or_memory_and_otherwise_carries_the_limits() {
     assert_eq!(stderr(bad_name), "../escape");
 }
 
+/// (#3112) `create`'s command, on every OS: built, never run. A refused
+/// policy gets the refusal naming why; any other gets the script that
+/// writes the sandbox's directory, its profile, labels and start script.
+#[test]
+#[serial_test::serial]
+fn a_create_command_is_the_refusal_or_the_script_that_writes_the_sandbox() {
+    let _state = StateDir::new();
+    let args = |cmd: &Command| cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
+    let refused = perl("darkmux-create-1", Limits { memory: Some("0".into()), pids: None }, "1;");
+    let (cmd, handle) = SeatbeltBackend::create_command(&refused);
+    assert_eq!((handle.backend, handle.id.as_str()), (BackendKind::Seatbelt, "darkmux-create-1"));
+    assert!(args(&cmd).last().is_some_and(|m| m.contains("`0` is below the 6m")), "{:?}", args(&cmd));
+    let good = perl("darkmux-create-2", Limits { memory: Some("64m".into()), pids: Some(8) }, "print 1;");
+    let (cmd, handle) = SeatbeltBackend::create_command(&good);
+    assert_eq!(handle.id, "darkmux-create-2");
+    let a = args(&cmd);
+    assert!(a[1].contains("\"$d/start.sh\""), "writes the start script: {}", a[1]);
+    assert!(a[3].ends_with("darkmux-create-2"), "the sandbox's directory: {a:?}");
+    assert!(a[4].starts_with("(version 1)"), "the profile: {}", a[4]);
+    assert!(a[6].contains("'8' '67108864' '64 MiB' '/usr/bin/perl'"), "the start script carries the limits: {}", a[6]);
+}
+
 /// (#3112) A created sandbox's start script runs the launcher with only
 /// the sandbox's environment, then its directory, working directory, the
 /// three limit arguments in order and the program, each one quoted.

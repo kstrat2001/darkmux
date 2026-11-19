@@ -571,6 +571,21 @@ impl SeatbeltBackend {
         Ok((dir, limits))
     }
 
+    /// `create`'s command, built and never run: the one that writes the
+    /// sandbox's directory and its start script, or the refusal
+    /// ([`Self::planned`]).
+    fn create_command(policy: &SandboxPolicy) -> (Command, SandboxHandle) {
+        let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: policy.name.clone() };
+        let (dir, limits) = match Self::planned(policy) {
+            Ok(planned) => planned,
+            Err(refusal) => return (*refusal, handle),
+        };
+        let start = Self::start_script(policy, &dir, limits);
+        let args = vec![dir.to_string_lossy().into_owned(), Self::profile(policy, &dir), Self::labels(policy), start];
+        let cmd = Self::script(&format!("{PREPARE}printf '%s' \"$4\" > \"$d/start.sh\" || exit 125\n"), &args, &[("PATH".into(), DEFAULT_PATH.into())]);
+        (cmd, handle)
+    }
+
     /// The start script a created sandbox runs: the launcher, with nothing
     /// of the starting process's environment but the sandbox's own, its
     /// directory, working directory, limits and program, each quoted.
@@ -634,16 +649,8 @@ impl SandboxBackend for SeatbeltBackend {
     }
 
     fn create(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle) {
-        let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: policy.name.clone() };
-        let (dir, limits) = match Self::planned(policy) {
-            Ok(planned) => planned,
-            Err(refusal) => return (*refusal, handle),
-        };
         let _ = std::fs::create_dir_all(state_root());
-        let start = Self::start_script(policy, &dir, limits);
-        let args = vec![dir.to_string_lossy().into_owned(), Self::profile(policy, &dir), Self::labels(policy), start];
-        let cmd = Self::script(&format!("{PREPARE}printf '%s' \"$4\" > \"$d/start.sh\" || exit 125\n"), &args, &[("PATH".into(), DEFAULT_PATH.into())]);
-        (cmd, handle)
+        Self::create_command(policy)
     }
 
     fn start(&self, handle: &SandboxHandle) -> Command {
