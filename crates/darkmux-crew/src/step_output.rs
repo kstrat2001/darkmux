@@ -318,6 +318,21 @@ impl<T: DeserializeOwned> Output<T> {
 /// This is the untyped half, for the one consumer that legitimately does
 /// not know the body type: the graph's `grow` seam, which only needs an
 /// items ARRAY out of whatever a producer wrote.
+/// What a failed parse of a producing step's inline output says: that the
+/// text was cut, when a bounded command's output cap took its middle (the
+/// likely reason it no longer parses), not only that it is malformed.
+fn inline_parse_context(raw: &str) -> String {
+    let base = "step output: parsing a producing step's output as JSON";
+    match crate::bounded_command::carries_cut_note(raw) {
+        true => format!(
+            "{base}: the producing command wrote more than the {}-byte output cap and its middle was cut, \
+             so the text is no longer whole JSON; have it write the document to a file and print the path",
+            crate::bounded_command::OUTPUT_CAP_BYTES
+        ),
+        false => base.to_string(),
+    }
+}
+
 pub fn resolve_output_doc(raw: &str) -> Result<(serde_json::Value, String)> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -335,8 +350,7 @@ pub fn resolve_output_doc(raw: &str) -> Result<(serde_json::Value, String)> {
         Ok((doc, p.to_string()))
     };
     if raw.starts_with('{') {
-        let doc: serde_json::Value =
-            serde_json::from_str(raw).context("step output: parsing a producing step's output as JSON")?;
+        let doc: serde_json::Value = serde_json::from_str(raw).with_context(|| inline_parse_context(raw))?;
         return match ref_path(&doc) {
             Some(p) => read_file(&p),
             None => Ok((doc, "the step's own output".to_string())),
@@ -366,6 +380,17 @@ pub fn missing_output(what: &str, expected_kind: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A producing step's JSON that the output cap cut fails to parse with
+    /// a message naming the cut; an ordinary malformed one does not claim it.
+    #[test]
+    fn a_cut_json_output_says_it_was_cut() {
+        let cut = format!("{{\"items\": [1,\n{}2]}}", "\n[darkmux cut 99 bytes from the middle of stdout: ...]\n");
+        let err = format!("{:#}", resolve_output_doc(&cut).unwrap_err());
+        assert!(err.contains("middle was cut") && err.contains("output cap"), "{err}");
+        let malformed = format!("{:#}", resolve_output_doc("{\"items\": [1,").unwrap_err());
+        assert!(malformed.contains("as JSON") && !malformed.contains("was cut"), "{malformed}");
+    }
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

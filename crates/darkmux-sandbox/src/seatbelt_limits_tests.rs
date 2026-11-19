@@ -43,6 +43,8 @@ fn perl(name: &str, limits: Limits, script: &str) -> SandboxPolicy {
         labels: Vec::new(),
         mounts: Vec::new(),
         ports: Vec::new(),
+        host_services: Vec::new(),
+        refused_ports: Vec::new(),
         stdin: false,
         host_alias: None,
         user: None,

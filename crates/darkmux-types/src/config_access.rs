@@ -458,6 +458,10 @@ pub fn fleet_listener_enabled_with_source() -> (bool, Source) {
     }
 }
 
+/// The port `darkmux client serve` listens on (loopback) and publishes on
+/// the overlay network when `--port` names none.
+pub const CLIENT_SERVE_PORT: u16 = 8767;
+
 /// The work-submission port, `env(DARKMUX_FLEET_LISTENER_PORT) >
 /// config.fleet.listener.port > 8766`. A SENDER dials the target's roster
 /// host on this same resolved port: the fleet uses one port.

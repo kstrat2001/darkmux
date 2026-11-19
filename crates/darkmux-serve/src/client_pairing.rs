@@ -153,7 +153,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
 
 /// The listener's default port (the viewer is 8765, the fleet listener 8766).
-pub const DEFAULT_PORT: u16 = 8767;
+pub const DEFAULT_PORT: u16 = darkmux_types::config_access::CLIENT_SERVE_PORT;
 /// A pairing request lives this long from when it was made, approved or not.
 pub const PENDING_TTL_SECS: u64 = 600;
 /// Expired and denied requests are kept this long past their TTL, so the app
@@ -497,6 +497,10 @@ fn parse_clients(path: &Path, text: &str) -> Result<(ClientsFile, bool)> {
     }
     let mut doc: Value = serde_json::from_str(text)
         .with_context(|| format!("{} is not valid JSON", path.display()))?;
+    // `doc` holds only the last copy of a key written twice.
+    if let Some(lines) = darkmux_types::user_files::duplicate_refusal(text) {
+        bail!("client store {}: {lines}", path.display());
+    }
     if let Some(v) = darkmux_types::data_version::newer(&doc, CLIENTS_SCHEMA_VERSION) {
         bail!("{} was written by a newer darkmux (schema_version {v}; this one reads {CLIENTS_SCHEMA_VERSION}). Upgrade darkmux.", path.display());
     }
@@ -1468,8 +1472,9 @@ fn read_config_at(path: &Path) -> Result<darkmux_types::config::DarkmuxConfig, S
             }
             serde_json::from_str::<darkmux_types::config::DarkmuxConfig>(&text).map_err(|e| {
                 format!(
-                    "{} does not parse ({e}); refusing client work",
-                    path.display()
+                    "{} does not parse ({}); refusing client work",
+                    path.display(),
+                    darkmux_types::user_files::load_error(&e)
                 )
             })?
         }

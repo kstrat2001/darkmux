@@ -1771,6 +1771,50 @@ fn netstat_listen_rows_on_a_port_parse_to_addresses_and_owners() {
     assert_eq!(crate::port_listeners_from_netstat(&unparsed, 47996), None);
 }
 
+/// Every port a netstat LISTEN row holds, at any address and in either
+/// family, sorted and once each; an ESTABLISHED row is not one. A header
+/// that is not netstat's, or a LISTEN row whose port does not read, is no
+/// answer at all, never "nothing listens".
+#[test]
+fn netstat_listen_rows_parse_to_every_listening_port() {
+    let head = "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat          process:pid    state  options           gencnt    flags   flags1 usecnt rtncnt fltrs\n";
+    let row = |proto: &str, local: &str, state: &str| {
+        format!("{proto}       0      0  {local}                *.*                    {state}                 0            0  131072  131072           Python:2900   00000 00000002 0000000000ff626a 00000000 00000800      1      0 000000\n")
+    };
+    let table = [
+        head.to_string(),
+        row("tcp4", "127.0.0.1.8799", "LISTEN"),
+        row("tcp6", "::1.1234", "LISTEN"),
+        row("tcp46", "*.8799", "LISTEN"),
+        row("tcp6", "fe80::1823:f45e:.6379", "LISTEN"),
+        "tcp4       0      0  127.0.0.1.4000         127.0.0.1.50000        ESTABLISHED         1 2 3 4 x:9 00 0 0 0 0 0 0 0\n".to_string(),
+    ]
+    .concat();
+    assert_eq!(crate::listening_ports_from_netstat(&table), Some(vec![1234, 6379, 8799]));
+    assert_eq!(crate::listening_ports_from_netstat(head), Some(vec![]), "nothing listens");
+    assert_eq!(crate::listening_ports_from_netstat("not netstat\n"), None, "a header that is not netstat's");
+    let broken = format!("{head}{}", row("tcp4", "127.0.0.1.80x", "LISTEN"));
+    assert_eq!(crate::listening_ports_from_netstat(&broken), None, "a LISTEN row whose port does not read");
+}
+
+/// This host's listening ports, asked of its strategy, hold a port this
+/// process listens on, on the loopback in either family. An OS with no
+/// strategy cannot say.
+#[test]
+fn the_host_lists_every_port_something_listens_on() {
+    if current().id() == "other" {
+        assert_eq!(current().tcp_listening_ports(), None, "no strategy reads sockets here");
+        return;
+    }
+    let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let v6 = std::net::TcpListener::bind("[::1]:0").ok();
+    let ports = current().tcp_listening_ports().unwrap();
+    assert!(ports.contains(&v4.local_addr().unwrap().port()), "{ports:?}");
+    if let Some(v6) = v6 {
+        assert!(ports.contains(&v6.local_addr().unwrap().port()), "{ports:?}");
+    }
+}
+
 /// (#3112 review) Only a netstat that exited 0 answers; any other exit,
 /// or none (killed at the bound), is no answer.
 #[test]
@@ -2540,4 +2584,28 @@ fn the_overlay_tool_is_looked_for_where_each_platform_installs_it() {
     let fake = crate::fake::FakePlatform { overlay_tool_locations: vec!["/x/t".into()], ..Default::default() };
     assert_eq!(fake.overlay_tool_locations(), ["/x/t"]);
     assert!(crate::fake::FakePlatform::default().overlay_tool_locations().is_empty());
+}
+
+/// What each strategy says a spawned process may be handed: macOS bounds
+/// only the total (`ARG_MAX`), Linux also each string (`MAX_ARG_STRLEN`,
+/// 32 pages: 128 KiB with 4 KiB pages, 512 KiB with Asahi's 16 KiB), an
+/// unknown OS nothing, and a fake what the test set.
+#[test]
+fn each_strategy_answers_what_a_spawned_process_may_be_handed() {
+    assert_eq!(linux_max_arg_strlen(4096), 128 * 1024);
+    assert_eq!(linux_max_arg_strlen(16384), 512 * 1024);
+    let mac = MacPlatform.exec_env_limits();
+    assert_eq!(mac.per_string, None);
+    let linux = LinuxPlatform.exec_env_limits();
+    assert_eq!(linux.per_string, page_size().map(linux_max_arg_strlen));
+    #[cfg(unix)]
+    {
+        let total = arg_max().expect("a unix system answers ARG_MAX");
+        assert!(total >= 64 * 1024, "{total}");
+        assert_eq!((mac.total, linux.total), (Some(total), Some(total)));
+        assert!(linux.per_string.unwrap() >= 128 * 1024);
+    }
+    assert_eq!(OtherPlatform.exec_env_limits(), ExecEnvLimits::default());
+    let set = ExecEnvLimits { per_string: Some(1), total: Some(2) };
+    assert_eq!(FakePlatform { exec_env_limits: set, ..Default::default() }.exec_env_limits(), set);
 }
