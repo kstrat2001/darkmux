@@ -632,6 +632,19 @@ MachineLoad
   battery_health: BatteryHealthNow | null
   now: HostSampleNow
   window: LoadWindow
+MachineReadings
+  gpu_w_busy: double | null
+  gpu_w_max: double | null
+  cpu_w_busy: double | null
+  pkg_w_busy: double | null
+  gpu_duty_pct: double | null
+  busy_ms: uint64 | null
+  thermal_states_busy: { [key: string]: uint }
+  cpu_speed_limit_min: uint64 | null
+  throttled_samples: uint
+  mem_pct_busy_max: uint64 | null
+  board_temp_c_max_busy: double | null
+  fan_rpm_max_busy: uint32 | null
 MachineResourcesResponse
   schema_version: string
   generated_at_ms: uint64
@@ -1096,6 +1109,9 @@ RunStats
   throttled_samples: uint
   mem_pct_busy_max: uint64 | null
   telemetry_max_gap_ms: uint64 | null
+  hardware: Hardware | null
+  this_machine: MachineReadings | null
+  compactor_calls_here: uint64 | null
   flow_records_in_window: uint
   flow_scan: FlowScan
   checks: RunChecks

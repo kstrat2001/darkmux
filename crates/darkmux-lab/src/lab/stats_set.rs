@@ -136,11 +136,7 @@ pub fn flags(s: &RunStats) -> Vec<&'static str> {
     if !c.rest_within_wall {
         f.push("REST");
     }
-    if !c.have_telemetry_samples {
-        f.push("NO-TELEM");
-    } else if !c.telemetry_covers_run {
-        f.push("TELEM-GAP");
-    }
+    telemetry_flags(s, &mut f);
     if !c.have_flow_records {
         f.push("NO-FLOW");
     }
@@ -163,7 +159,60 @@ pub fn flags(s: &RunStats) -> Vec<&'static str> {
     if s.verify_ungated {
         f.push("UNGATED");
     }
+    f.extend(hardware_flag(s));
     f
+}
+
+/// A run whose host columns are empty because this machine's telemetry is
+/// not its own (another machine served it, or it recorded no hardware),
+/// not because none was read.
+fn hardware_flag(s: &RunStats) -> Option<&'static str> {
+    match s.hardware {
+        Some(darkmux_types::Hardware::Unknown) => Some("ELSEWHERE"),
+        None => Some("NO-HW"),
+        Some(darkmux_types::Hardware::SubmittingMachine) => None,
+    }
+}
+
+/// Another machine served the run's model.
+fn served_elsewhere(s: &RunStats) -> bool {
+    s.hardware == Some(darkmux_types::Hardware::Unknown)
+}
+
+/// This machine is not known to have served the run's model (another did,
+/// or the run recorded no hardware), so its host figures are withheld.
+fn not_attributed(s: &RunStats) -> bool {
+    s.hardware != Some(darkmux_types::Hardware::SubmittingMachine)
+}
+
+/// Why the set's energy cost is withheld when a run's own figure is: an
+/// overlap that cannot be apportioned, a run another machine served, a run
+/// that recorded no hardware, or several; `None` leaves the generic reason.
+fn energy_withheld_reason(overlapping: usize, elsewhere: usize, unrecorded: usize) -> Option<String> {
+    let reasons: Vec<String> = [
+        (overlapping > 0).then(|| {
+            format!("{overlapping} run(s) have overlapping host-telemetry windows (OVERLAP) and cannot be apportioned")
+        }),
+        (elsewhere > 0).then(|| {
+            format!("{elsewhere} run(s) were served by another machine (ELSEWHERE), so this machine's meter does not hold their energy")
+        }),
+        (unrecorded > 0).then(|| {
+            format!("{unrecorded} run(s) recorded no hardware (NO-HW), so this machine's readings can't be attributed to them")
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!reasons.is_empty()).then(|| reasons.join("; "))
+}
+
+/// Whether host telemetry landed in the run's window, and covered it.
+fn telemetry_flags(s: &RunStats, f: &mut Vec<&'static str>) {
+    if !s.checks.have_telemetry_samples {
+        f.push("NO-TELEM");
+    } else if !s.checks.telemetry_covers_run {
+        f.push("TELEM-GAP");
+    }
 }
 
 /// Run ids in `runs` whose `[started_at_unix_ms, +wall_ms]` window overlaps
@@ -178,9 +227,18 @@ pub fn flags(s: &RunStats) -> Vec<&'static str> {
 /// copy of another run's file put a clean run in the dock: all 17 OVERLAP
 /// hits measured then were stale copies or the clean owner they were copied
 /// from.
+///
+/// A run this machine is not known to have served (`hardware` `unknown`,
+/// or unrecorded: its figures are withheld) whose records show no model
+/// work on this machine (`compactor_calls_here == Some(0)`) is no consumer
+/// here: overlapping it does not make a local run's energy the host's draw
+/// claimed twice. One that compacted on a model this machine served, or
+/// whose records cannot say, still is. An unrecorded run whose model was
+/// in fact local is not seen: the record that would say so is missing.
 pub fn overlapping(runs: &[RunStats]) -> std::collections::BTreeSet<String> {
     let mut windows: Vec<(&str, u64, u64)> = runs
         .iter()
+        .filter(|s| !(not_attributed(s) && s.compactor_calls_here == Some(0)))
         .filter_map(|s| s.started_at_unix_ms.map(|from| (s.run.as_str(), from, from.saturating_add(s.wall_ms))))
         .collect();
     windows.sort_by_key(|(_, from, _)| *from);
@@ -267,9 +325,8 @@ pub fn summarize(runs: &[RunStats]) -> SetSummary {
     if passed == 0 && n > 0 {
         withheld.push("no run in the set passed verify, so there is no success to cost".into());
     }
-    let energy_reason = (!overlap.is_empty()).then(|| {
-        format!("{} run(s) have overlapping host-telemetry windows (OVERLAP) and cannot be apportioned", overlap.len())
-    });
+    let count = |f: fn(&RunStats) -> bool| runs.iter().filter(|s| f(s)).count();
+    let energy_reason = energy_withheld_reason(overlap.len(), count(served_elsewhere), count(|s| s.hardware.is_none()));
     let cost_per_success = CostPerSuccess {
         active_ms: per_success(
             sum_all_excluding(&std::collections::BTreeSet::new(), |s| Some(s.active_ms as f64)),

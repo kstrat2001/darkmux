@@ -646,7 +646,8 @@ fn a_run_that_crossed_midnight_reads_both_days_files() {
             // The shape the manifest actually writes — `{passed, details}`,
             // not a bare string.
             "verify": {"passed": true, "details": "verify command exited 0"},
-            "ok": true, "session_id": "sid-1"
+            "ok": true, "session_id": "sid-1",
+            "model_hardware": [{"model": "m", "from": "managed", "hardware": "submitting-machine"}]
         })
         .to_string(),
     )
@@ -1565,4 +1566,320 @@ fn with_no_first_output_mark_decode_and_first_token_are_null_not_guessed() {
     assert_eq!(m.decode_tok_per_s, None, "one stream unmarked: its split is unknown, so the run's is");
     assert_eq!(m.prefill_ms_billed, None);
     assert_eq!(m.first_token_ms_median, Some(2_000), "the marked stream's wait is still a measurement");
+}
+
+// ---------------------------------------------------------------------------
+// Whose machine the host figures describe
+// ---------------------------------------------------------------------------
+
+/// A finished run of `model` that billed 800 tokens over 8 s, while this
+/// machine's GPU read busy throughout (its own work, or another run's), with
+/// `snapshot` as the manifest's `model_hardware` (no manifest when `None`).
+fn busy_run(model: &str, snapshot: Option<serde_json::Value>) -> RunStats {
+    let start = 1_000 * MIN;
+    let run = tempfile::TempDir::new().unwrap();
+    let traj = format!(
+        "{}{}{}{}",
+        line(serde_json::json!({"type": "dispatch.start", "ts": start, "model": model})),
+        stream(1, start + 1_000, Some(start + 9_000)),
+        completed(1, Some(800), 0),
+        line(serde_json::json!({"type": "dispatch.complete", "ts": start + 10_000, "result": "stop", "wall_ms": 10_000})),
+    );
+    std::fs::write(run.path().join("trajectory.jsonl"), traj).unwrap();
+    if let Some(snap) = snapshot {
+        let manifest = serde_json::json!({"schema_version": 7, "ok": true, "model_hardware": snap});
+        std::fs::write(run.path().join("manifest.json"), manifest.to_string()).unwrap();
+    }
+    let flows = tempfile::TempDir::new().unwrap();
+    let body = format!("{}{}", telem(start + 2_000, 96, 40.0), telem(start + 6_000, 97, 44.0));
+    flow_file(flows.path(), "d.jsonl", &body, start + MIN);
+    compute_from_dir(run.path(), flows.path()).unwrap()
+}
+
+/// The host figures a run would publish as its own.
+fn attributed(s: &RunStats) -> Vec<(&'static str, bool)> {
+    vec![
+        ("gpu_w_busy", s.gpu_w_busy.is_some()),
+        ("gpu_w_max", s.gpu_w_max.is_some()),
+        ("cpu_w_busy", s.cpu_w_busy.is_some()),
+        ("pkg_w_busy", s.pkg_w_busy.is_some()),
+        ("gpu_duty_pct", s.gpu_duty_pct.is_some()),
+        ("pkg_j_per_1k_tokens", s.pkg_j_per_1k_tokens.is_some()),
+        ("thermal_states_busy", !s.thermal_states_busy.is_empty()),
+        ("cpu_speed_limit_min", s.cpu_speed_limit_min.is_some()),
+        ("mem_pct_busy_max", s.mem_pct_busy_max.is_some()),
+    ]
+}
+
+fn served(from: &str, hardware: Option<&str>) -> serde_json::Value {
+    let mut entry = serde_json::json!({"model": "m", "from": from, "endpoint": "e"});
+    if let Some(h) = hardware {
+        entry["hardware"] = h.into();
+    }
+    if from == "provider" {
+        entry["provider"] = "Anthropic API".into();
+    }
+    serde_json::json!([entry])
+}
+
+/// A hosted seat's run while this machine's GPU was busy with something
+/// else (a parallel local lab run): the watts, energy per token and thermal
+/// states are this machine's, never the run's. They are kept apart, and
+/// each withheld figure says why.
+#[test]
+fn a_hosted_run_reports_no_host_figures_as_its_own() {
+    let s = busy_run("m", Some(served("provider", Some("unknown"))));
+    assert_eq!(s.hardware, Some(darkmux_types::Hardware::Unknown));
+    for (field, present) in attributed(&s) {
+        assert!(!present, "{field} is this machine's, not the hosted run's");
+        let why = s.host_unmeasured.get(field).unwrap_or_else(|| panic!("{field} says why it is absent"));
+        assert!(why.contains("another machine served"), "{field}: {why}");
+    }
+    assert_eq!((s.busy_ms, s.pkg_j_busy, s.throttled_samples), (None, None, 0));
+    let mine = s.this_machine.as_ref().expect("this machine's own readings are kept");
+    assert_eq!((mine.gpu_w_busy, mine.gpu_w_max, mine.gpu_duty_pct), (Some(42.0), Some(44.0), Some(100.0)));
+    assert_eq!(mine.pkg_w_busy, Some(47.0));
+    assert_eq!(mine.thermal_states_busy.get("nominal"), Some(&2));
+    assert_eq!(s.tok_per_s, Some(100.0), "the run's own work is still measured");
+}
+
+/// A remote peer (another Mac's endpoint, declared `unknown`) is the same.
+#[test]
+fn a_remote_peer_run_reports_no_host_figures_as_its_own() {
+    let s = busy_run("m", Some(served("endpoint", Some("unknown"))));
+    assert_eq!(s.hardware, Some(darkmux_types::Hardware::Unknown));
+    assert!(attributed(&s).iter().all(|(_, present)| !present), "{:?}", attributed(&s));
+    assert!(s.this_machine.is_some());
+}
+
+/// A run this machine served keeps every figure, and nothing is set apart.
+#[test]
+fn a_local_run_keeps_its_host_figures() {
+    for snap in [served("managed", Some("submitting-machine")), served("endpoint", Some("submitting-machine"))] {
+        let s = busy_run("darkmux:m", Some(snap));
+        assert_eq!(s.hardware, Some(darkmux_types::Hardware::SubmittingMachine));
+        assert!(attributed(&s).iter().all(|(_, present)| *present), "{:?}", attributed(&s));
+        assert_eq!(s.pkg_j_per_1k_tokens, Some(470.0), "47 W over 8 s for 800 tokens");
+        assert!(s.this_machine.is_none());
+        assert!(!s.unreconciled().iter().any(|c| c.contains("which machine")), "{:?}", s.unreconciled());
+    }
+}
+
+/// (Operator, 2026-11-17: "withhold those runs that don't have hardware")
+/// A run that did not record which machine served it (from before darkmux
+/// recorded it, or an endpoint that declared none) gets none of this
+/// machine's figures as its own: they are withheld, each with the reason,
+/// and kept apart under `this_machine`.
+#[test]
+fn a_run_with_unrecorded_hardware_withholds_its_host_figures() {
+    for s in [busy_run("m", None), busy_run("m", Some(served("endpoint", None)))] {
+        assert_eq!(s.hardware, None);
+        for (field, present) in attributed(&s) {
+            assert!(!present, "{field} cannot be attributed to a run with no hardware");
+            let why = s.host_unmeasured.get(field).unwrap_or_else(|| panic!("{field} says why it is absent"));
+            assert_eq!(why, "this run recorded no hardware, so this machine's readings can't be attributed to it");
+        }
+        assert_eq!(s.this_machine.as_ref().and_then(|m| m.pkg_w_busy), Some(47.0), "this machine's readings are kept apart");
+        assert_eq!(s.compactor_calls_here, Some(0), "no compaction: no model work on this machine");
+        assert!(!s.unreconciled().iter().any(|c| c.contains("which machine")), "{:?}", s.unreconciled());
+    }
+}
+
+/// The run's model is found by id or identifier, with or without darkmux's
+/// namespace; a snapshot that names another model still decides when every
+/// entry agrees, and decides nothing when they disagree.
+#[test]
+fn the_runs_model_is_found_in_the_snapshot() {
+    use darkmux_types::Hardware::{SubmittingMachine, Unknown};
+    let entry = |model: &str, identifier: Option<&str>, hardware: &str| {
+        let mut e = serde_json::json!({"model": model, "from": "endpoint", "hardware": hardware});
+        if let Some(i) = identifier {
+            e["identifier"] = i.into();
+        }
+        serde_json::from_value::<crate::lab::manifest::ModelHardware>(e).unwrap()
+    };
+    let mixed = [entry("a", None, "unknown"), entry("b", Some("b-id"), "submitting-machine")];
+    assert_eq!(served_hardware(Some(&mixed), Some("darkmux:a")), Some(Unknown));
+    assert_eq!(served_hardware(Some(&mixed), Some("b-id")), Some(SubmittingMachine));
+    assert_eq!(served_hardware(Some(&mixed), Some("c")), None, "the entries disagree, so nothing is decided");
+    let agree = [entry("a", None, "unknown"), entry("b", None, "unknown")];
+    assert_eq!(served_hardware(Some(&agree), Some("flint")), Some(Unknown), "every entry says the same");
+    assert_eq!(served_hardware(Some(&[]), Some("a")), None);
+    assert_eq!(served_hardware(None, Some("a")), None);
+}
+
+/// With no telemetry in the window there is nothing of this machine's to
+/// keep apart, and nothing to list as withheld.
+#[test]
+fn a_hosted_run_without_telemetry_keeps_nothing_apart() {
+    let mut s = stats("", 10_000);
+    attribute_host(&mut s, Some(darkmux_types::Hardware::Unknown));
+    assert_eq!(s.hardware, Some(darkmux_types::Hardware::Unknown));
+    assert_eq!(s.this_machine, None);
+    assert!(s.host_unmeasured.is_empty(), "{:?}", s.host_unmeasured);
+}
+
+/// With no telemetry, a run with no hardware has nothing to withhold.
+#[test]
+fn unrecorded_hardware_without_telemetry_withholds_nothing() {
+    let mut s = stats("", 10_000);
+    attribute_host(&mut s, None);
+    assert_eq!((s.hardware, s.this_machine.as_ref()), (None, None));
+    assert!(s.host_unmeasured.is_empty(), "{:?}", s.host_unmeasured);
+}
+
+/// (#3644 review) A profile can list the same model twice: managed on this
+/// machine, and on a peer's endpoint. The wire name tells them apart
+/// (`darkmux:<id>` is the managed one, a bare name the endpoint's), so it is
+/// matched before the namespace is stripped; a run the peer served keeps
+/// none of this machine's watts.
+#[test]
+fn the_wire_name_tells_a_managed_model_from_a_peers_of_the_same_name() {
+    use darkmux_types::Hardware::{SubmittingMachine, Unknown};
+    let both = serde_json::json!([
+        {"model": "qwen3", "from": "managed", "hardware": "submitting-machine"},
+        {"model": "qwen3", "from": "endpoint", "hardware": "unknown", "endpoint": "peer"},
+    ]);
+    let peer = busy_run("qwen3", Some(both.clone()));
+    assert_eq!(peer.hardware, Some(Unknown));
+    assert_eq!((peer.pkg_w_busy, peer.pkg_j_per_1k_tokens), (None, None), "the peer's run keeps none of this machine's draw");
+    let here = busy_run("darkmux:qwen3", Some(both));
+    assert_eq!(here.hardware, Some(SubmittingMachine));
+    assert_eq!((here.pkg_w_busy, here.pkg_j_per_1k_tokens), (Some(47.0), Some(470.0)));
+}
+
+/// Several entries a name matches, with nothing to choose between them,
+/// decide nothing: the run's hardware is not recorded, and says so.
+#[test]
+fn a_name_several_entries_match_decides_nothing() {
+    let entry = |hardware: &str, endpoint: &str| {
+        serde_json::from_value::<crate::lab::manifest::ModelHardware>(
+            serde_json::json!({"model": "qwen3", "from": "endpoint", "hardware": hardware, "endpoint": endpoint}),
+        )
+        .unwrap()
+    };
+    let two = [entry("unknown", "peer"), entry("submitting-machine", "splash")];
+    assert_eq!(served_hardware(Some(&two), Some("qwen3")), None);
+    assert_eq!(served_hardware(Some(&two), Some("darkmux:qwen3")), None, "no managed entry, and the fallback is ambiguous");
+    let one = [entry("unknown", "peer")];
+    assert_eq!(
+        served_hardware(Some(&one), Some("darkmux:qwen3")),
+        Some(darkmux_types::Hardware::Unknown),
+        "the stripped name, when exactly one entry matches it"
+    );
+}
+
+/// The `model_hardware` snapshot a run on profile `p` of `registry` records.
+fn snapshot_of(registry: serde_json::Value) -> serde_json::Value {
+    let mut reg: darkmux_types::ProfileRegistry = serde_json::from_value(registry).unwrap();
+    reg.materialize_endpoints();
+    serde_json::to_value(crate::lab::manifest::model_hardware_of(&reg.profiles["p"])).unwrap()
+}
+
+/// (#3644 re-review) A profile may list one id twice. When every entry the
+/// name matches says the same machine, that is the answer: one hosted id
+/// on two providers, or one id on two peers, is still served elsewhere, and
+/// the same managed model listed twice is still this machine's.
+#[test]
+fn entries_that_agree_decide_even_when_several_match() {
+    use darkmux_types::Hardware::{SubmittingMachine, Unknown};
+    let providers = snapshot_of(serde_json::json!({
+        "profiles": {"p": {"models": [{"id": "qwen3", "n_ctx": 32768},
+            {"id": "claude-opus-4", "endpoint": "anthropic"}, {"id": "claude-opus-4", "endpoint": "router"}]}},
+        "endpoints": {"anthropic": {"url": "https://api.anthropic.com/v1"}, "router": {"url": "https://openrouter.ai/api/v1"}}}));
+    let hosted = busy_run("claude-opus-4", Some(providers));
+    assert_eq!(hosted.hardware, Some(Unknown));
+    assert_eq!((hosted.pkg_w_busy, hosted.pkg_j_per_1k_tokens), (None, None));
+    let peers = snapshot_of(serde_json::json!({
+        "profiles": {"p": {"models": [{"id": "qwen3", "n_ctx": 32768},
+            {"id": "qwen3.8", "endpoint": "lms"}, {"id": "qwen3.8", "endpoint": "splash"}]}},
+        "endpoints": {"lms": {"url": "http://studio.local:1234/v1", "hardware": "unknown"},
+            "splash": {"url": "http://studio.local:8080/v1", "hardware": "unknown"}}}));
+    let peer = busy_run("qwen3.8", Some(peers));
+    assert_eq!(peer.hardware, Some(Unknown));
+    assert_eq!(peer.pkg_w_busy, None);
+    let twice = serde_json::json!([
+        {"model": "qwen3", "from": "managed", "hardware": "submitting-machine"},
+        {"model": "qwen3", "from": "managed", "hardware": "submitting-machine"},
+    ]);
+    let here = busy_run("darkmux:qwen3", Some(twice));
+    assert_eq!(here.hardware, Some(SubmittingMachine));
+    assert_eq!(here.pkg_w_busy, Some(47.0));
+}
+
+/// A run another machine served whose compactor ran on a model this
+/// machine served drew on this machine; its records say how many calls.
+/// A compactor model the snapshot does not name cannot be placed.
+#[test]
+fn a_hosted_runs_compactor_calls_on_this_machine_are_counted() {
+    let call = |model: &str| line(serde_json::json!({"type": "compaction.call", "generation": 1, "ts": 5, "requested_model": model}));
+    let snap: Vec<crate::lab::manifest::ModelHardware> = serde_json::from_value(serde_json::json!([
+        {"model": "claude-opus-4", "from": "provider", "hardware": "unknown", "provider": "Anthropic API"},
+        {"model": "qwen3-4b", "from": "managed", "hardware": "submitting-machine"},
+    ]))
+    .unwrap();
+    let traj = |calls: &[&str]| calls.iter().map(|m| call(m)).collect::<String>();
+    assert_eq!(compactor_calls_here(&traj(&[]), Some(&snap)), Some(0));
+    assert_eq!(compactor_calls_here(&traj(&["darkmux:qwen3-4b", "darkmux:qwen3-4b"]), Some(&snap)), Some(2));
+    assert_eq!(compactor_calls_here(&traj(&["claude-opus-4"]), Some(&snap)), Some(0), "a compactor also served elsewhere");
+    assert_eq!(compactor_calls_here(&traj(&["default-compactor"]), Some(&snap)), None, "a model the record does not place");
+    assert_eq!(compactor_calls_here(&traj(&["darkmux:qwen3-4b"]), None), None);
+    assert_eq!(compactor_calls_here(&traj(&[]), None), Some(0), "no compaction, no local model work");
+}
+
+/// `compactor_calls_here` is read for a run this machine is not known to
+/// have served, and only there: a local run's model work is this
+/// machine's anyway.
+#[test]
+fn compactor_calls_here_is_read_only_for_a_run_served_elsewhere() {
+    let hosted = busy_run("m", Some(served("provider", Some("unknown"))));
+    assert_eq!(hosted.compactor_calls_here, Some(0));
+    let local = busy_run("darkmux:m", Some(served("managed", Some("submitting-machine"))));
+    assert_eq!(local.compactor_calls_here, None);
+    assert_eq!(busy_run("m", None).compactor_calls_here, Some(0), "read for a run with no hardware too");
+}
+
+/// (#3644 third review) The runtime writes `compaction.call` only for a
+/// compactor call that got a reply. A local compaction that timed out,
+/// errored or was killed leaves only its `compaction.start`, and still drew
+/// on this machine: each start counts, placed by its `requested_model`.
+#[test]
+fn a_compaction_that_got_no_reply_still_counts_as_work_here() {
+    let start = |model: Option<&str>| {
+        let mut e = serde_json::json!({"type": "compaction.start", "generation": 1, "ts": 5});
+        if let Some(m) = model {
+            e["requested_model"] = m.into();
+        }
+        line(e)
+    };
+    let call = line(serde_json::json!({"type": "compaction.call", "generation": 1, "ts": 6, "requested_model": "darkmux:qwen3-4b"}));
+    let snap: Vec<crate::lab::manifest::ModelHardware> = serde_json::from_value(serde_json::json!([
+        {"model": "claude-opus-4", "from": "provider", "hardware": "unknown", "provider": "Anthropic API"},
+        {"model": "qwen3-4b", "from": "managed", "hardware": "submitting-machine"},
+    ]))
+    .unwrap();
+    let timed_out = start(Some("darkmux:qwen3-4b"));
+    assert_eq!(compactor_calls_here(&timed_out, Some(&snap)), Some(1), "a start with no reply drew here");
+    let answered = format!("{}{call}", start(Some("darkmux:qwen3-4b")));
+    assert_eq!(compactor_calls_here(&answered, Some(&snap)), Some(1), "a start and its reply are one compaction");
+    assert_eq!(compactor_calls_here(&start(None), Some(&snap)), None, "a start naming no model cannot be placed");
+    assert_eq!(compactor_calls_here(&call, Some(&snap)), Some(1), "a trajectory with replies and no starts");
+}
+
+/// (#3644 third review) A managed Flint server always answers to `flint`
+/// (rec has no `--name`), so a Flint run sends `flint`, never its snapshot
+/// entry's id. In a profile beside a hosted seat, that name is the managed
+/// entry's, and the run is this machine's, as `lab submit` reads it.
+#[test]
+fn a_flint_run_is_its_managed_entry_beside_a_hosted_seat() {
+    let snap = snapshot_of(serde_json::json!({
+        "profiles": {"p": {"models": [{"id": "flint-int4", "n_ctx": 262144, "endpoint": "fl"},
+            {"id": "claude-opus-4", "endpoint": "anthropic"}]}},
+        "endpoints": {"fl": {"managed": "flint", "port": 8092}, "anthropic": {"url": "https://api.anthropic.com/v1"}}}));
+    let snapshot: Vec<crate::lab::manifest::ModelHardware> = serde_json::from_value(snap.clone()).unwrap();
+    assert_eq!(served_hardware(Some(&snapshot), Some("flint")), Some(darkmux_types::Hardware::SubmittingMachine));
+    let by = crate::lab::submit::served_by("r1", "flint", Some(&snapshot), &[], None).unwrap();
+    assert_eq!(by.hardware, darkmux_types::Hardware::SubmittingMachine, "run stats and lab submit agree");
+    let s = busy_run("flint", Some(snap));
+    assert_eq!((s.hardware, s.pkg_w_busy), (Some(darkmux_types::Hardware::SubmittingMachine), Some(47.0)));
 }
