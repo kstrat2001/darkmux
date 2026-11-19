@@ -96,6 +96,11 @@ impl Platform for OtherPlatform {
         None
     }
 
+    /// No limit darkmux knows of, which is how it treated every OS before.
+    fn exec_env_limits(&self) -> crate::ExecEnvLimits {
+        crate::ExecEnvLimits::default()
+    }
+
     fn node_release_platform(&self) -> Option<&'static str> {
         None
     }
@@ -117,6 +122,10 @@ impl Platform for OtherPlatform {
     }
 
     fn tcp_port_listeners(&self, _port: u16) -> Option<Vec<crate::PortListener>> {
+        None
+    }
+
+    fn tcp_listening_ports(&self) -> Option<Vec<u16>> {
         None
     }
 

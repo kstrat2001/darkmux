@@ -143,6 +143,12 @@ pub trait Platform: Send + Sync {
     /// `None` where the platform has no such choice.
     fn c_library(&self) -> Option<CLibrary>;
 
+    /// How many bytes a spawned process may be handed in its arguments and
+    /// environment: all together, and one string on its own where the
+    /// kernel also limits that. A caller sizing what it puts in a child's
+    /// environment reads this rather than guessing an OS's limit.
+    fn exec_env_limits(&self) -> ExecEnvLimits;
+
     /// What this machine was bought with beyond its chip and RAM: the CPU
     /// and GPU core counts and the model, the choices a buyer makes. What
     /// the OS does not say is left empty, never guessed.
@@ -190,6 +196,13 @@ pub trait Platform: Send + Sync {
     /// What tells a sandbox on the host (which can hold a bind to a port but
     /// not to the loopback, #3559) listening beyond this machine.
     fn tcp_port_listeners(&self, port: u16) -> Option<Vec<PortListener>>;
+
+    /// Every port a TCP socket on this host listens on, at any address and
+    /// whatever the process (another user's included), from the kernel's
+    /// socket table, sorted: `None` when this platform cannot say or its
+    /// answer does not read (never "none"). What keeps a sandbox on the host
+    /// off this host's services it was not given.
+    fn tcp_listening_ports(&self) -> Option<Vec<u16>>;
 
     /// (#3559) Every TCP socket listening that a sandbox on the host holds,
     /// each with its port: the sandbox being `leader` (its launcher, which
@@ -639,6 +652,54 @@ pub enum ContainerHostAccess {
     HostGateway,
 }
 
+/// What a spawned process may be handed ([`Platform::exec_env_limits`]).
+/// `None` where the platform cannot say, which a caller reads as no limit
+/// it knows of.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecEnvLimits {
+    /// The most bytes one argument or `NAME=value` string may take, where
+    /// the kernel limits a string on its own.
+    pub per_string: Option<usize>,
+    /// The most bytes all arguments and environment strings may take
+    /// together (`ARG_MAX`).
+    pub total: Option<usize>,
+}
+
+/// `sysconf(_SC_ARG_MAX)`: the bytes a new process's arguments and
+/// environment may take together; `None` where the system cannot say.
+pub(crate) fn arg_max() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `sysconf` only reads a system constant.
+        let n = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
+        usize::try_from(n).ok().filter(|n| *n > 0)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Linux's `MAX_ARG_STRLEN`: 32 pages for one argument or environment
+/// string, whatever `ARG_MAX` allows in all (128 KiB with 4 KiB pages).
+pub(crate) fn linux_max_arg_strlen(page_size: usize) -> usize {
+    32 * page_size
+}
+
+/// `sysconf(_SC_PAGESIZE)`; `None` where the system cannot say.
+pub(crate) fn page_size() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `sysconf` only reads a system constant.
+        let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(n).ok().filter(|n| *n > 0)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// (#3561 re-review) A Linux machine's C library.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CLibrary {
@@ -985,6 +1046,23 @@ pub(crate) fn port_listeners_from_netstat(out: &str, port: u16) -> Option<Vec<Po
         }
     }
     Some(found)
+}
+
+/// Every port a LISTEN row holds in `netstat -anv -p tcp`'s answer, sorted
+/// and once each. `None` when the header is not netstat's, or a LISTEN row's
+/// local address has no port that reads.
+pub(crate) fn listening_ports_from_netstat(out: &str) -> Option<Vec<u16>> {
+    let mut lines = out.lines();
+    lines.find(|l| l.starts_with("Proto") && l.contains("Local Address") && l.contains("process:pid"))?;
+    let mut ports = Vec::new();
+    for f in lines.map(|l| l.split_whitespace().collect::<Vec<_>>()) {
+        if f.first().is_some_and(|p| p.starts_with("tcp")) && f.get(5) == Some(&"LISTEN") {
+            ports.push(f.get(3)?.rsplit_once('.')?.1.parse::<u16>().ok()?);
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    Some(ports)
 }
 
 /// One netstat row: a listener on `port` (`Some(Some(_))`), another row

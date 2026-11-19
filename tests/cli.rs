@@ -14617,7 +14617,7 @@ fn a_mistyped_value_in_a_user_file_is_refused_by_every_consuming_entry_point() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{args:?} succeeded: {stderr}");
         assert!(stderr.contains("refusing to start: bad config") && stderr.contains(&path.display().to_string()), "{args:?}: {stderr}");
-        assert!(stderr.contains("`skills` must be a list, got \"code-reviewing\""), "{args:?}: {stderr}");
+        assert!(stderr.contains("`skills` must be a list, got a string"), "{args:?}: {stderr}");
         let mut written = Vec::new();
         collect_files(&home, &mut written);
         written.retain(|p| p != &path && !p.components().any(|c| c.as_os_str() == "liveness"));
@@ -15442,12 +15442,15 @@ fn doctor_keeps_its_rows_and_withholds_the_execution_surface_from_a_remote_viewe
     assert!(remote.contains("lms binary"), "{remote}");
     assert!(remote.contains("→"), "remedies stay: {remote}");
     let local = console_run(&["doctor", "-v"], false, &listener);
-    // The fixture's wrong-typed `runtime.max_turns` makes config.json fail
-    // the typed load, so this machine's `fleet trust` row names the value in
-    // its parse error; the remote form above names it nowhere.
-    for s in ["8766", "/opt/fake-wrongtype-path", "/opt/fake"] {
+    for s in ["8766", "/opt/fake"] {
         assert!(local.contains(s), "this machine reads `{s}` in doctor:\n{local}");
     }
+    // The fixture's wrong-typed `runtime.max_turns` makes config.json fail
+    // the typed load, and the `fleet trust` row names that parse error by
+    // type and position, never the value, on this machine too: a
+    // wrong-typed value may be a pasted credential.
+    assert!(local.contains("does not parse"), "{local}");
+    assert!(!local.contains("/opt/fake-wrongtype-path"), "the wrong-typed value is quoted nowhere:\n{local}");
     assert!(names_tmpdir(&local), "this machine reads its temp directory:\n{local}");
 }
 

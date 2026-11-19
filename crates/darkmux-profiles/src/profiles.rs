@@ -201,7 +201,7 @@ pub fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
                 quarantined.push(QuarantinedEntry {
                     kind,
                     name: name.clone(),
-                    error: e.to_string(),
+                    error: darkmux_types::user_files::load_error(&e),
                 });
             }
         }
@@ -229,7 +229,8 @@ pub fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
                 name: "endpoints".to_string(),
                 error: format!(
                     "`endpoints` must be an object mapping each endpoint id to its definition \
-                     (got {raw}); no endpoint from it is defined"
+                     (got {}); no endpoint from it is defined",
+                    darkmux_types::user_files::json_type(&raw)
                 ),
             });
         }
@@ -241,7 +242,7 @@ pub fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
                 serde_json::from_value::<darkmux_types::ModelEndpoint>(entry.clone()).err().map(|e| QuarantinedEntry {
                     kind: QuarantinedEntryKind::Endpoint,
                     name: name.clone(),
-                    error: e.to_string(),
+                    error: darkmux_types::user_files::load_error(&e),
                 })
             })
             .collect();
@@ -913,6 +914,30 @@ mod tests {
             issues.iter().any(|m| m.contains("\"bad\"") && m.contains("quarantined")),
             "the reference names the quarantine: {issues:?}"
         );
+    }
+
+    /// A quarantine reason reaches load warnings, `validate` and doctor, so
+    /// it never quotes the entry: an endpoint written as its URL carries the
+    /// URL's credentials, and serde's own message quotes a wrong value.
+    #[test]
+    fn a_quarantine_reason_never_quotes_the_entry() {
+        let secret = "https://user:hunter2@h.example/v1";
+        for doc in [
+            format!(r#"{{"profiles":{{"l":{{"models":[{{"id":"m","n_ctx":1}}]}}}},"endpoints":{{"azure":"{secret}"}}}}"#),
+            format!(r#"{{"profiles":{{"l":{{"models":[{{"id":"m","n_ctx":1}}]}}}},"endpoints":"{secret}"}}"#),
+            format!(r#"{{"profiles":{{"l":{{"models":[{{"id":"m","n_ctx":"{secret}"}}]}}}}}}"#),
+            format!(r#"{{"profiles":{{"l":{{"models":[{{"id":"m","n_ctx":1}}]}}}},"endpoints":{{"e":{{"managed":"{secret}"}}}}}}"#),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let p = tmp.path().join("profiles.json");
+            write(&p, &doc);
+            let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
+            let reasons: Vec<&str> = loaded.registry.quarantined.iter().map(|q| q.error.as_str()).collect();
+            assert!(!reasons.is_empty() || doc.contains("managed"), "{doc}: quarantined");
+            for r in reasons {
+                assert!(!r.contains("hunter2") && !r.contains("h.example"), "the value leaked: {r}");
+            }
+        }
     }
 
     #[test]

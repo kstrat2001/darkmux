@@ -295,13 +295,13 @@ pub fn run(cmd: ConfigCmd) -> Result<i32> {
             return Ok(2);
         }
         ConfigCmd::Get { key } => {
-            println!("{}", get_at(&path, &key)?);
+            println!("{}", get_warned(&path, &key)?);
         }
         ConfigCmd::List => {
             // (5.0) The console's config-list panel, for a viewer that is not
             // this machine: values that name an address, a path, a URL, a
             // credential pointer or the execution surface are withheld.
-            let listed = list_for(&path, darkmux_types::panel_audience::remote())?;
+            let listed = list_warned(&path, darkmux_types::panel_audience::remote())?;
             println!("{listed}");
             // (#2947) stderr, so `darkmux config list | jq` still parses,
             // and only for a person at a terminal: the serve daemon's
@@ -316,6 +316,24 @@ pub fn run(cmd: ConfigCmd) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+fn warn_about_duplicates(path: &Path) {
+    if let Some(warning) = duplicate_warning_at(path) {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// `config get`: [`get_at`], after the duplicate-key warning.
+fn get_warned(path: &Path, key: &str) -> Result<String> {
+    warn_about_duplicates(path);
+    get_at(path, key)
+}
+
+/// `config list`: [`list_for`], after the duplicate-key warning.
+fn list_warned(path: &Path, remote: bool) -> Result<String> {
+    warn_about_duplicates(path);
+    list_for(path, remote)
 }
 
 /// Look up a key's type, or `None` if it isn't a known settable key. Static
@@ -681,6 +699,29 @@ pub(crate) fn load_object(path: &Path) -> Result<Value> {
     }
 }
 
+/// Every key the config.json at `path` writes twice, as the gate words
+/// each, `None` when there is none (or the file is clean otherwise judged:
+/// other problems are doctor's and the preflights').
+fn duplicate_lines_at(path: &Path) -> Option<String> {
+    use darkmux_types::user_files::{Issue, Problem};
+    let refusal = darkmux_types::user_files::config_check_at(path).refusal?;
+    let Problem::Keys(keys) = &refusal.problem else { return None };
+    let lines: Vec<String> = keys.iter().filter(|k| matches!(k.issue, Issue::Duplicate(_))).map(ToString::to_string).collect();
+    (!lines.is_empty()).then(|| lines.join("; "))
+}
+
+/// What `config get` and `config list` print on stderr before they show a
+/// config.json with a key written twice: they read a `Value`, which holds
+/// only the last copy, while the runtime may be on defaults.
+fn duplicate_warning_at(path: &Path) -> Option<String> {
+    duplicate_lines_at(path).map(|lines| {
+        format!(
+            "{}: {lines}\n  `config get` and `config list` show the last copy of each; fix the file by hand (`darkmux doctor` names the fix)",
+            path.display()
+        )
+    })
+}
+
 /// [`load_object`] for a writer: a file written by a newer darkmux is refused
 /// ("upgrade darkmux") instead of being rewritten by a binary that cannot place
 /// its keys (the same refusal every reader gives it, `data_version::newer_refusal`).
@@ -689,6 +730,20 @@ pub(crate) fn load_object_for_write(path: &Path) -> Result<Value> {
     let known = darkmux_types::config::CONFIG_SCHEMA_VERSION;
     if let Some(found) = darkmux_types::data_version::newer(&root, known) {
         bail!("{}: {}", path.display(), darkmux_types::data_version::newer_refusal("config", &found, known));
+    }
+    // A rewrite from `root` would keep only the last copy of a key written
+    // twice and delete the rest, silently: the operator chooses which stays.
+    // Every repeat counts here, a `_comment` note included, which the gate
+    // lets a load through with but a rewrite would still lose.
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let repeated: Vec<String> = darkmux_types::user_files::duplicate_paths(&raw).iter().map(|p| format!("`{p}`")).collect();
+    if !repeated.is_empty() {
+        bail!(
+            "{}: {} written more than once in the same object. Refusing to rewrite it: a rewrite would keep only the \
+             last copy of each and delete the rest. Fix it by hand first",
+            path.display(),
+            repeated.join(", ")
+        );
     }
     Ok(root)
 }
@@ -809,6 +864,52 @@ mod tests {
         let err = set_at(f.path(), "serve.port", "8799").unwrap_err().to_string();
         assert!(err.contains("written by a newer darkmux") && err.contains("Upgrade darkmux"), "{err}");
         assert_eq!(std::fs::read_to_string(f.path()).unwrap(), original);
+    }
+
+    /// A key written twice: `config set` would rewrite the file from a
+    /// `Value` holding only the last copy, silently deleting the others, so
+    /// it refuses, naming each, and leaves the file byte-for-byte as it was.
+    #[test]
+    fn config_set_refuses_a_config_with_a_key_written_twice() {
+        let f = tmp();
+        let original = r#"{"machine_id": "a", "role_profiles": {"coder": "p", "coder": "q"}, "machine_id": "b"}"#;
+        std::fs::write(f.path(), original).unwrap();
+        let err = set_at(f.path(), "serve.port", "8799").unwrap_err().to_string();
+        assert!(err.contains("`machine_id`") && err.contains("`role_profiles.coder`") && err.contains("written more than once"), "{err}");
+        assert!(err.contains("by hand"), "{err}");
+        assert_eq!(std::fs::read_to_string(f.path()).unwrap(), original);
+    }
+
+    /// A repeated `_comment` note loads (the gate lets it through), but a
+    /// rewrite would keep only its last copy: the writer refuses it too,
+    /// naming it, and leaves the file as it was.
+    #[test]
+    fn config_set_refuses_a_config_with_a_repeated_comment_note() {
+        let f = tmp();
+        let original = r#"{"runtime": {"_comment": "note one", "max_turns": 5, "_comment": "note two"}}"#;
+        std::fs::write(f.path(), original).unwrap();
+        let err = set_at(f.path(), "serve.port", "8799").unwrap_err().to_string();
+        assert!(err.contains("`runtime._comment`") && err.contains("by hand"), "{err}");
+        assert_eq!(std::fs::read_to_string(f.path()).unwrap(), original);
+    }
+
+    /// `config get` and `config list` read a `Value`, so they show the last
+    /// copy of a key written twice while the runtime may be on defaults:
+    /// they warn, naming each duplicate. A clean file gets no warning.
+    #[test]
+    fn config_get_and_list_warn_about_a_key_written_twice() {
+        let f = tmp();
+        std::fs::write(f.path(), r#"{"machine_id": "a", "machine_id": "b"}"#).unwrap();
+        let warning = duplicate_warning_at(f.path()).expect("a warning");
+        assert!(warning.contains("duplicate key `machine_id`") && warning.contains("so the file fails to load"), "{warning}");
+        assert!(warning.contains("last copy"), "says what get and list show: {warning}");
+        // What `get` and `list` print after the warning is the last copy.
+        assert_eq!(get_warned(f.path(), "machine_id").unwrap(), "\"b\"");
+        assert!(list_warned(f.path(), false).unwrap().contains("\"machine_id\": \"b\""));
+        std::fs::write(f.path(), r#"{"machine_id": "a"}"#).unwrap();
+        assert_eq!(duplicate_warning_at(f.path()), None);
+        std::fs::write(f.path(), r#"{"machine_idd": "a"}"#).unwrap();
+        assert_eq!(duplicate_warning_at(f.path()), None, "only duplicates: other problems are doctor's and preflight's");
     }
 
     /// (#2765) The knob the operator could not reach. `darkmux config list`

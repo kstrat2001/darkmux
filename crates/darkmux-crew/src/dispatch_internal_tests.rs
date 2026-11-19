@@ -6622,6 +6622,163 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(prompt(&docker).as_deref(), Some("/darkmux-out/.prompt.txt"));
     }
 
+    /// A dispatch is given the port of each endpoint its runtime dials on
+    /// this machine: its model server (`--base-url`, or the runtime's own
+    /// default when none is passed), a brain's `--chat-url` and an unmanaged
+    /// compactor's, each at the port it names or its scheme's. An endpoint
+    /// on another host opens no port of this one (an `https` brain is not
+    /// this machine's :443).
+    #[test]
+    fn a_dispatch_is_given_the_ports_of_the_endpoints_its_runtime_dials_here() {
+        use darkmux_sandbox::SeatbeltBackend;
+        let mut cfg = argv_config_with_base_url(Some("http://localhost:1234/v1".to_string()));
+        assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [1234]);
+        cfg.base_url_override = Some("http://127.0.0.1:41999/v1".to_string());
+        cfg.remote_chat_url = Some("https://api.example.com/v1/chat/completions".to_string());
+        cfg.compaction.compactor_chat_url = Some("http://[::1]:8088/v1/chat/completions".to_string());
+        assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [8088, 41999], "a hosted brain opens no port here");
+        cfg.remote_chat_url = Some("http://192.0.2.7/v1/chat/completions".to_string());
+        cfg.compaction.compactor_chat_url = Some("http://[::ffff:127.0.0.1]:8090/v1".to_string());
+        assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [8090, 41999], "another host's address opens no :80");
+        cfg.base_url_override = None;
+        cfg.remote_chat_url = None;
+        cfg.compaction.compactor_chat_url = None;
+        assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [1234], "the runtime's own default");
+        assert!(dispatch_policy_for(&cfg, &SeatbeltBackend).ports.is_empty(), "a dispatch binds any port");
+        let refused = dispatch_policy_for(&cfg, &SeatbeltBackend).refused_ports;
+        assert_eq!(refused, darkmux_types::config_enum::darkmux_service_ports(), "darkmux's own services, refused before they listen");
+        assert!(refused.contains(&darkmux_types::config_access::serve_port()), "{refused:?}");
+    }
+
+    /// What names this machine in an endpoint's URL, read as the runtime's
+    /// WHATWG URL parser reads the host: `localhost` (any case, a trailing
+    /// dot), an IPv4 literal in any spelling it accepts (one
+    /// to four parts, hex, octal, a single 32-bit number, a trailing dot)
+    /// that is a loopback or unspecified address, an IPv6 loopback,
+    /// unspecified or IPv4-mapped one, an address of this host's own, and its
+    /// own name, with or without `.local`. Never a multicast or the limited
+    /// broadcast address, whatever `own` says (a subnet's broadcast is
+    /// `is_own_address`'s to refuse); nothing the parser refuses, and no name
+    /// is looked up.
+    #[test]
+    fn an_endpoint_is_on_this_machine_only_when_its_host_names_it() {
+        let own = |ip: std::net::IpAddr| {
+            // What a bind test says: multicast and the limited broadcast bind too.
+            ["192.168.1.5", "2001:db8::5", "224.0.0.1", "239.1.2.3", "ff02::1", "ff0e::1", "255.255.255.255"]
+                .iter()
+                .any(|a| ip == a.parse::<std::net::IpAddr>().unwrap())
+        };
+        let here = |url: &str| host_is_this_machine(url, Some("Mac-Studio.local"), own);
+        for yes in [
+            "http://localhost:1234/v1",
+            "http://LOCALHOST:1",
+            "http://localhost.:1234/v1",
+            "http://127.0.0.1:1234",
+            "http://127.0.0.1.:1",
+            "http://127.9.9.9:1",
+            "http://127.1:1",
+            "http://127.0.1:1",
+            "http://0x7f000001:1",
+            "http://0X7F.1:1",
+            "http://2130706433:1",
+            "http://0177.0.0.1:1",
+            "http://0x7f.0.0.0x1:1",
+            "http://0:1",
+            "http://0.0.0.0:1",
+            "http://[::1]:1",
+            "http://[::]:1",
+            "http://[::ffff:127.0.0.1]:1",
+            "http://[::ffff:7f00:1]:1",
+            "http://192.168.1.5:1234",
+            "http://3232235781:1",
+            "http://[::ffff:192.168.1.5]:1",
+            "http://[2001:db8::5]:1",
+            "http://mac-studio.local:1234",
+            "http://Mac-Studio.:1234",
+            "http://Mac-Studio:1234",
+        ] {
+            assert!(here(yes), "{yes}");
+        }
+        for no in [
+            "https://api.example.com/v1",
+            "http://192.0.2.7/v1",
+            "http://[2001:db8::9]:1",
+            "http://mac-studio.example.com:1",
+            "http://studio:1",
+            "not a url",
+            "http://224.0.0.1:6379",
+            "http://239.1.2.3:1",
+            "http://[ff02::1]:1",
+            "http://[ff0e::1]:1",
+            "http://[::ffff:224.0.0.1]:1",
+            "http://255.255.255.255:1",
+            "http://0xffffffff:1",
+            "http://4294967296:1",
+            "http://256.0.0.1:1",
+            "http://126.256.0.1:1",
+            "http://127.0.0.256:1",
+            "http://127.0.0.1.1.1:1",
+            "http://127..0.1:1",
+            "http://0x7g.0.0.1:1",
+            "http://08.0.0.1:1",
+            "http://evil.example\\@127.0.0.1:1",
+            "http://localhost..:1",
+            // Percent-encoded: the runtime decodes it, this check does not (fails closed).
+            "http://%6Cocalhost:1",
+        ] {
+            assert!(!here(no), "{no}");
+        }
+        assert!(!host_is_this_machine("http://mac-studio:1", None, own), "no name of its own, no name matches");
+    }
+
+    /// Each way a URL's host reads, as the runtime reads it: an IPv6 literal
+    /// (none without its `]`, none with a zone), a name lowercased without
+    /// one trailing dot, an IPv4 address in a spelling WHATWG accepts (none
+    /// in one it refuses), nothing for an empty host, a backslash, a
+    /// character that is not printable ASCII, or no `scheme://`.
+    #[test]
+    fn a_urls_host_reads_as_the_runtime_reads_it() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let ip = |a: IpAddr| Some(RuntimeHost::Ip(a));
+        assert_eq!(runtime_host("http://[::1]:1/v1"), ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert_eq!(bracketed_host("::1"), None, "no closing bracket");
+        assert_eq!(bracketed_host("fe80::1%25lo0]:1"), None, "a zone");
+        assert_eq!(bracketed_host("not-an-address]"), None);
+        assert_eq!(runtime_host("http://Studio.Local.:1"), Some(RuntimeHost::Name("studio.local".into())));
+        assert_eq!(runtime_host("http://0x7f.1:1"), ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert_eq!(runtime_host("http://256.0.0.1:1"), None, "an IPv4 address WHATWG refuses");
+        assert_eq!(plain_host(":1"), None, "an empty host");
+        assert_eq!(plain_host("Host"), Some(RuntimeHost::Name("host".into())), "no port");
+        for refused in ["http://a\\b@127.0.0.1:1", "http://local host:1", "http://h\tx:1", "127.0.0.1:1"] {
+            assert_eq!(runtime_host(refused), None, "{refused}");
+        }
+    }
+
+    /// This host's own addresses are its interfaces' unicast ones: the
+    /// loopback, and never a multicast address, the limited broadcast, or
+    /// the broadcast address of a subnet this host is on (which a socket can
+    /// bind, so a bind test would take it for this host).
+    #[test]
+    fn this_hosts_own_addresses_are_its_interfaces_unicast_ones() {
+        use std::net::{IpAddr, Ipv4Addr};
+        assert!(is_own_address(IpAddr::from(Ipv4Addr::LOCALHOST)));
+        for not in ["224.0.0.1", "239.1.2.3", "255.255.255.255", "ff02::1", "ff0e::1", "192.0.2.7"] {
+            assert!(!is_own_address(not.parse().unwrap()), "{not}");
+        }
+        let v4: Vec<Ipv4Addr> = own_addresses().into_iter().filter_map(|a| match a {
+            IpAddr::V4(a) if !a.is_loopback() => Some(a),
+            _ => None,
+        }).collect();
+        for a in &v4 {
+            assert!(is_own_address(IpAddr::V4(*a)), "{a}");
+            let [x, y, z, _] = a.octets();
+            let edge = Ipv4Addr::new(x, y, z, 255);
+            if !v4.contains(&edge) {
+                assert!(!is_own_address(IpAddr::V4(edge)), "{edge}, the broadcast of a /24 this host is on");
+            }
+        }
+    }
+
     /// (#3561) A dispatch on the host runs with its managed Node: the
     /// toolchain's PATH, its folder read-only where it is. A container's
     /// config carries none, so its policy names no PATH (the image's own).

@@ -158,6 +158,12 @@ impl Platform for MacPlatform {
         None
     }
 
+    /// `ARG_MAX` (1 MiB) bounds everything together; macOS has no limit on
+    /// one string of its own.
+    fn exec_env_limits(&self) -> crate::ExecEnvLimits {
+        crate::ExecEnvLimits { per_string: None, total: crate::arg_max() }
+    }
+
     fn node_release_platform(&self) -> Option<&'static str> {
         crate::node_release_platform_for(crate::NodeOs::Darwin, std::env::consts::ARCH)
     }
@@ -201,6 +207,11 @@ impl Platform for MacPlatform {
     /// over processes), bounded to 5 s: about 5 ms measured on an M5 Max.
     fn tcp_port_listeners(&self, port: u16) -> Option<Vec<crate::PortListener>> {
         netstat_tcp().and_then(|out| crate::port_listeners_from_netstat(&out, port))
+    }
+
+    /// One `netstat -anv -p tcp`, as [`Self::tcp_port_listeners`] reads.
+    fn tcp_listening_ports(&self) -> Option<Vec<u16>> {
+        netstat_tcp().and_then(|out| crate::listening_ports_from_netstat(&out))
     }
 
     /// (#3559) In-process, no command spawned: the process table from
