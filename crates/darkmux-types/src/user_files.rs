@@ -1495,38 +1495,29 @@ fn value_at<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
     path.split('.').try_fold(doc, |v, key| v.get(key))
 }
 
-/// The key form a hook rule's `match` takes beside the fields it names: a
-/// predicate on the record's payload
-/// ([`crate::config::HookMatch::payload_predicates`]).
-const PAYLOAD_PREDICATE_PREFIX: &str = "payload.";
-
-/// Every key of a hook rule's `match` that is neither a field it names, nor
-/// a `payload.<path>` predicate, nor a [`COMMENT_KEY`] note. The schema keeps
+/// Every key of a hook rule's `match` that
+/// [`crate::config::HookMatch::is_match_key`] refuses. The schema keeps
 /// `match` open for the predicates, so it cannot say this; the typed load
 /// drops such a key, and the rule then matches more than it says (a
 /// misspelled `level` matches every level).
 fn hook_match_issues(doc: &Value) -> Vec<KeyIssue> {
-    let named = top_level_keys::<crate::config::HookMatch>();
+    use crate::config::HookMatch;
+    let named = HookMatch::field_names();
     let rules = doc.pointer("/hooks/rules").and_then(Value::as_array).into_iter().flatten();
     let matches = rules.enumerate().filter_map(|(i, rule)| Some((format!("hooks.rules[{i}].match"), rule.get("match")?.as_object()?)));
     let mut out = Vec::new();
     for (parent, m) in matches {
-        let unknown = m.keys().filter(|k| !is_hook_match_key(k, &named));
+        let unknown = m.keys().filter(|k| !HookMatch::is_match_key(k, &named));
         out.extend(unknown.map(|k| unknown_hook_match_key(&parent, k, &named)));
     }
     out
-}
-
-/// Whether `key` is valid in a hook rule's `match` ([`hook_match_issues`]).
-fn is_hook_match_key(key: &str, named: &[String]) -> bool {
-    let predicate = key.strip_prefix(PAYLOAD_PREDICATE_PREFIX).is_some_and(|path| !path.is_empty());
-    predicate || key == COMMENT_KEY || named.iter().any(|n| n == key)
 }
 
 /// The refusal of `key` in the `match` at `parent`: the closest named field,
 /// or for a dotted key the payload predicate it may have meant
 /// (`paylod.ok` is `payload.ok`).
 fn unknown_hook_match_key(parent: &str, key: &str, named: &[String]) -> KeyIssue {
+    use crate::config::PAYLOAD_PREDICATE_PREFIX;
     let path = key.split_once('.').map(|(_, path)| path).filter(|path| !path.is_empty());
     let predicate = path.map(|path| format!("{PAYLOAD_PREDICATE_PREFIX}{path}"));
     let candidates = named.iter().map(String::as_str).chain(predicate.as_deref());

@@ -197,11 +197,15 @@ darkmux release.
   named fields and `payload.<path>` predicates; any other key (`"levle": "error"`) was dropped on load,
   so a webhook meant for errors fired on every matching action. Every entry point now refuses it at
   preflight and `darkmux doctor` fails it, naming the key and the closest valid one (`level`, or
-  `payload.ok` for `paylod.ok`).
+  `payload.ok` for `paylod.ok`). A command that runs no preflight disables that rule in its hooks sink,
+  with one stderr line naming the rule and the key.
 - **A numeric `DARKMUX_*` env var that does not read as its number is refused, not ignored.**
   `DARKMUX_RUNTIME_MAX_TOKENS=50k` was read as unset (no cap), while the same value in `config.json` is
   refused. Every entry point now refuses it at preflight and `darkmux doctor` fails it, naming the
-  variable, what kind of value it holds and the accepted form; the value itself is never printed.
+  variable, what kind of value it holds and the accepted form; the value itself is never printed. The
+  older doctor warnings for `DARKMUX_TURN_DELAY_MS`, `DARKMUX_HOST_SAMPLER_INTERVAL_MS` and
+  `DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL`, which quoted the value, are gone: each bad var gets
+  that one row.
 - **`DARKMUX_VERBOSE=0` turns off `runtime.verbose: true`** for one shell, as env wins over
   `config.json` for every other setting.
 

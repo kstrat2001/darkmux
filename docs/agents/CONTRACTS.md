@@ -184,8 +184,9 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    `#[schemars(skip)]` (it catches keys, it does not validate them); a flattened map that IS
    the schema (a hook rule's `match`) stays open, and each kind's `open_objects` test pins
    that set; what such a schema cannot say is checked beside it (an extra `match` key must be a
-   `payload.<path>` predicate, `user_files::hook_match_issues`, so a typo there is refused rather
-   than dropped, which would widen the rule). `_comment` is valid in any struct-shaped object, as a note for the reader; inside
+   `payload.<path>` predicate, `HookMatch::is_match_key`, so a typo there is refused rather
+   than dropped, which would widen the rule; a hooks sink built where no preflight ran disables
+   that rule through the same predicate). `_comment` is valid in any struct-shaped object, as a note for the reader; inside
    a map it is an entry and is checked as one. A missing required key is refused too. The
    structural guard is `whatever_the_gate_passes_the_typed_load_accepts`: for every shipped
    template and example, and variants inserting `_comment`, an unknown key, or a value of

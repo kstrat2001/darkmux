@@ -986,6 +986,9 @@ pub fn resolve_rules(rules: &[HookRule], outbox_dir: &Path) -> Result<Vec<Resolv
 /// caller (`HookSink::new`) can isolate one bad rule's refusal from the
 /// rest of the sink (#2183's "load-time refusal for that RULE only").
 pub fn resolve_one_rule(index: usize, r: &HookRule, outbox_dir: &Path) -> Result<ResolvedRule> {
+    if let Some(refused) = RefusedMatchKeys::of(index, r) {
+        return Err(refused.into());
+    }
     let (url, target_kind, file_dir) = match destination(r) {
         Err(problem) => bail!("hook rule #{index} {}", problem.describe()),
         Ok(Destination::Http(u)) => {
@@ -1047,6 +1050,72 @@ pub fn resolve_one_rule(index: usize, r: &HookRule, outbox_dir: &Path) -> Result
         headers,
         attribution_headers,
     })
+}
+
+/// A rule whose `match` carries a key
+/// [`darkmux_types::config::HookMatch::is_match_key`] refuses: loaded into
+/// `extras` and read by nothing, it would make the rule match more than it
+/// says. Every preflight refuses the config over it; a process that runs
+/// none disables just this rule ([`HookSink::new`]).
+#[derive(Debug)]
+pub struct RefusedMatchKeys {
+    pub index: usize,
+    pub keys: Vec<String>,
+}
+
+impl RefusedMatchKeys {
+    fn of(index: usize, r: &HookRule) -> Option<Self> {
+        let keys: Vec<String> = r.r#match.as_ref()?.refused_keys().into_iter().map(str::to_string).collect();
+        (!keys.is_empty()).then_some(RefusedMatchKeys { index, keys })
+    }
+}
+
+impl std::fmt::Display for RefusedMatchKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<String> = self.keys.iter().map(|k| format!("`{}`", darkmux_types::user_files::escape_text(k))).collect();
+        write!(
+            f,
+            "hook rule #{}'s `match` has a key that is no field and no `payload.<field>` predicate ({}), so \
+             the rule would match more than it says (`darkmux doctor` names the closest key)",
+            self.index,
+            keys.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for RefusedMatchKeys {}
+
+/// [`HookSink::new`]'s rules, each resolved alone: a rule refused for its
+/// `match` keys, or (with a sound destination) for a `transform` that fails
+/// to load, is disabled with one stderr line and the rest still work; any
+/// other refusal refuses the whole sink.
+fn resolve_isolating_rules(rules: &[HookRule], outbox_dir: &Path) -> Result<Vec<ResolvedRule>> {
+    let mut resolved = Vec::with_capacity(rules.len());
+    for (index, r) in rules.iter().enumerate() {
+        match resolve_one_rule(index, r, outbox_dir) {
+            Ok(rr) => resolved.push(rr),
+            Err(e) => match disabled_alone(r, &e) {
+                Some(why) => eprintln!("flow::HookSink: rule #{index} disabled{why}; the rest of the sink still works: {e:#}"),
+                None => return Err(e),
+            },
+        }
+    }
+    Ok(resolved)
+}
+
+/// Whether refusal `e` disables only rule `r`, and the words that say why
+/// (empty when `e` says it).
+fn disabled_alone(r: &HookRule, e: &anyhow::Error) -> Option<&'static str> {
+    if e.downcast_ref::<RefusedMatchKeys>().is_some() {
+        return Some("");
+    }
+    let destination_ok = match destination(r) {
+        Ok(Destination::Http(u)) => validate_hook_target_url(u).is_ok(),
+        Ok(Destination::File(_)) => true,
+        Err(_) => false,
+    };
+    let transform = r.transform.as_ref().is_some_and(|t| !t.trim().is_empty());
+    (destination_ok && transform).then_some(" — its `transform` failed to load")
 }
 
 /// (fix-round finding 8) Non-blocking probe: which of `rules`' drain
@@ -1197,6 +1266,46 @@ mod destination_tests {
         }
         let err = HookSink::new(&[r], tmp.path().to_path_buf(), Arc::new(Discard)).err();
         assert!(err.is_some_and(|e| format!("{e:#}").contains("names BOTH")));
+    }
+
+    /// A `match` key that is no field, no `payload.<path>` predicate and no
+    /// `_comment` note loads into `extras` and is not a predicate, so the
+    /// rule would match more than it says (a misspelled `level` matches every
+    /// level). A process that runs no preflight still builds this sink:
+    /// `resolve_one_rule` refuses the rule, naming it and the key, and
+    /// `HookSink::new` disables that rule only.
+    #[test]
+    fn a_match_key_the_config_gate_refuses_disables_that_rule_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = tmp.path().join("out");
+        let mut typo = rule(None, Some(out.to_str().unwrap()));
+        let m = typo.r#match.as_mut().unwrap();
+        m.extras.insert("levle".into(), serde_json::json!("error"));
+        m.extras.insert("payload.ok".into(), serde_json::json!(true));
+        m.extras.insert("_comment".into(), serde_json::json!("errors only"));
+        let Err(err) = resolve_one_rule(0, &typo, tmp.path()).map(|_| ()) else { panic!("refused") };
+        let err = err.to_string();
+        assert!(err.contains("hook rule #0") && err.contains("`levle`"), "{err}");
+        assert!(!err.contains("payload.ok") && !err.contains("_comment"), "only the bad key: {err}");
+
+        let mut fine = rule(None, Some(out.to_str().unwrap()));
+        let m = fine.r#match.as_mut().unwrap();
+        m.extras.insert("payload.tool_name".into(), serde_json::json!("create_finding"));
+        m.extras.insert("_comment".into(), serde_json::json!("a note"));
+        assert!(resolve_one_rule(1, &fine, tmp.path()).is_ok(), "predicates and notes resolve");
+
+        struct Discard;
+        impl FlowSink for Discard {
+            fn persist(&self, _record: crate::CheckedRecord<'_>) -> Result<()> {
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Discard".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let sink = HookSink::new(&[typo, fine], tmp.path().to_path_buf(), Arc::new(Discard)).expect("the rest of the sink works");
+        let indices: Vec<usize> = sink.rules.iter().map(|r| r.rule.index).collect();
+        assert_eq!(indices, [1], "only the refused rule is disabled");
     }
 }
 
@@ -4226,27 +4335,7 @@ impl HookSink {
         // pre-#2183 behavior (see `resolve_rules_refuses_on_first_non_
         // loopback`).
         warn_unmatchable_rules(rules);
-        let mut resolved = Vec::with_capacity(rules.len());
-        for (index, r) in rules.iter().enumerate() {
-            match resolve_one_rule(index, r, &outbox_dir) {
-                Ok(rr) => resolved.push(rr),
-                Err(e) => {
-                    let destination_ok = match destination(r) {
-                        Ok(Destination::Http(u)) => validate_hook_target_url(u).is_ok(),
-                        Ok(Destination::File(_)) => true,
-                        Err(_) => false,
-                    };
-                    if destination_ok && r.transform.as_ref().is_some_and(|t| !t.trim().is_empty()) {
-                        eprintln!(
-                            "flow::HookSink: rule #{index} disabled — its `transform` failed to load; the rest of \
-                             the sink still works: {e:#}"
-                        );
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
-        }
+        let resolved = resolve_isolating_rules(rules, &outbox_dir)?;
         // (#2093 merge-gate finding 4) Fix up a torn trailing line BEFORE
         // this process's drainer (or any appender) touches the file — see
         // `ensure_trailing_newline`'s doc. Best-effort: a failure here
@@ -8590,6 +8679,7 @@ mod tests {
         "flow::HookSink: file-transport write to ",
         "flow::HookSink: failed to check/fix trailing newline on ",
         "flow::HookSink: rule #0 disabled — its `transform` failed to load; the rest of the sink still works: ",
+        "flow::HookSink: rule #0 disabled; the rest of the sink still works: ",
         "flow::HookSink: rule #0 outbox append failed: ",
     ];
 
