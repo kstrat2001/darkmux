@@ -43,6 +43,7 @@ fn run(name: &str) -> RunStats {
         busy_ms: Some(280_000),
         pkg_j_busy: Some(10_640.0),
         pkg_j_per_1k_tokens: Some(190.0),
+        hardware: Some(darkmux_types::Hardware::SubmittingMachine),
         checks: clean_checks(),
         ..Default::default()
     }
@@ -154,6 +155,37 @@ fn a_package_only_host_prints_its_package_and_board_temperature() {
     assert!(t.contains("board        hottest sensor 54.4 °C   fan max 2214 rpm"), "{t}");
     s.pkg_w_busy = None;
     assert!(run_text(&s).contains("board        hottest sensor 54.4 °C"), "board sensors print without power");
+}
+
+/// A run another machine served prints no power, energy or thermal line of
+/// its own: it says they were not measured for this run, and why.
+#[test]
+fn a_run_served_elsewhere_says_its_host_figures_were_not_measured() {
+    let mut s = run("r");
+    s.hardware = Some(darkmux_types::Hardware::Unknown);
+    (s.gpu_w_busy, s.cpu_w_busy, s.pkg_w_busy, s.gpu_duty_pct, s.busy_ms, s.pkg_j_busy, s.pkg_j_per_1k_tokens) =
+        (None, None, None, None, None, None, None);
+    s.this_machine = Some(crate::lab::stats::MachineReadings { pkg_w_busy: Some(38.0), ..Default::default() });
+    let t = run_text(&s);
+    assert!(
+        t.contains("power        not measured for this run: another machine served its model (hardware: unknown)"),
+        "{t}"
+    );
+    assert!(!t.contains("38 W") && !t.contains("energy  "), "this machine's draw is never printed as the run's: {t}");
+}
+
+/// A run that recorded no hardware prints no power line of its own: it
+/// says why its readings are not attributed.
+#[test]
+fn a_run_with_unrecorded_hardware_says_its_host_figures_were_not_measured() {
+    let mut s = run("r");
+    s.hardware = None;
+    let t = run_text(&s);
+    assert!(
+        t.contains("power        not measured for this run: it recorded no hardware, so this machine's readings can't be attributed to it"),
+        "{t}"
+    );
+    assert!(!t.contains("package 38 W"), "{t}");
 }
 
 /// The caveats print beneath the figures, and only when a check failed.
