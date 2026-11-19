@@ -19,7 +19,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Placement {
     /// In a sandbox of this backend (the caller's one read of
-    /// `runtime.sandbox`, or the backend a run recorded), on this image
+    /// `runtime.sandbox`), on this image
     /// (`host` for a sandbox on the host, which has none), with no network
     /// and only the named mounts.
     Container(String, darkmux_sandbox::BackendKind),
@@ -197,8 +197,11 @@ pub fn container_args(image: &str, name: &str, run: &Run) -> Vec<String> {
 }
 
 /// The command to spawn, and the sandbox's handle when it runs in one: in
-/// the backend the placement names, never the setting read again (a test
-/// suite runs long after the run read it, and a regrade long after that).
+/// the backend the placement names. The caller read the setting once for
+/// the whole unit of work (a run, a regrade, a gate) and placed this
+/// command with it, so everything that unit does agrees by construction
+/// rather than by every read in one process happening to return the same
+/// value.
 pub fn command(placement: &Placement, run: &Run) -> Result<(Command, Option<SandboxHandle>), NotRun> {
     match placement {
         Placement::Host => {
@@ -616,10 +619,10 @@ mod tests {
     }
 
     /// A contained run runs in the backend its placement names, whatever
-    /// `runtime.sandbox` says when it starts: the setting can change between
-    /// the run's read and the suite (a dispatch in between), or before a
-    /// regrade. Here the placement says Seatbelt (image `host`) while the
-    /// setting says Docker, then the reverse.
+    /// `runtime.sandbox` says when it is built: the placement is the
+    /// caller's one read, and this code never reads the setting itself.
+    /// Here the placement says Seatbelt (image `host`) while the setting
+    /// says Docker, then the reverse.
     #[test]
     #[serial_test::serial]
     fn a_contained_run_runs_where_its_placement_says_not_where_the_setting_says_now() {

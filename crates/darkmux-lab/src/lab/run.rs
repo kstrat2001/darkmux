@@ -509,7 +509,7 @@ impl OneRun<'_> {
             result.verify.as_ref(),
             self.workload,
             gate,
-            result.sandbox_read,
+            result.placement.clone(),
         );
         // A graded run has a verdict even with no verify command of its own.
         if result.verify.is_none() && self.workload.manifest.workload.verify.as_ref().is_some_and(|v| v.grade.is_some()) {
@@ -2715,7 +2715,7 @@ mod tests {
                     duration_ms: 1,
                     verify: Some(VerifyOutcome { passed: true, details: "stub".into() }),
                     error: None,
-                    sandbox_read: None,
+                    placement: None,
                 })
             }
             fn inspect(&self, _: &LoadedWorkload, _: &Path) -> Result<InspectionReport> {
@@ -2841,7 +2841,7 @@ mod tests {
                     duration_ms: 1,
                     verify: Some(VerifyOutcome { passed: true, details: "stub".into() }),
                     error: None,
-                    sandbox_read: None,
+                    placement: None,
                 })
             }
             fn inspect(&self, _: &LoadedWorkload, _: &Path) -> Result<InspectionReport> {

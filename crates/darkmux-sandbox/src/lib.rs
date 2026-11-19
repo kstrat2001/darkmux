@@ -226,10 +226,10 @@ pub const SANDBOX_ENV: &str = "DARKMUX_SANDBOX";
 pub const SANDBOX_KEY: &str = "runtime.sandbox";
 
 /// One read of `runtime.sandbox`: the backend it names and the tier that set
-/// it. A caller that reads the setting once and carries this value gives
-/// every later message (why Docker, the way back) from that same read, so a
-/// setting changed in between never splits one run across two answers. No
-/// method of it reads the setting.
+/// it. A caller that reads the setting once per unit of work and carries
+/// this value gives every later message (why Docker, the way back) from that
+/// same read, so the unit's parts agree by construction. No method of it
+/// reads the setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     pub kind: BackendKind,

@@ -1070,8 +1070,10 @@ pub(crate) fn record(
 /// Every graded run is recorded, a gate or prompt that failed included: the
 /// verdict is then a fail that says why.
 ///
-/// `read` is the run's own read of `runtime.sandbox` (its Docker remedies);
-/// where the suite runs is the run's recorded placement either way.
+/// `placement` is the run's own (`RunResult::placement`): the suite runs
+/// where the run placed its own tests, from the run's one read. A run that
+/// made none (no provider of a graded workload does today) reads the
+/// settings here, in the same process.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply(
     run_dir: &Path,
@@ -1081,7 +1083,7 @@ pub(crate) fn apply(
     raw: Option<&crate::workloads::types::VerifyOutcome>,
     loaded: &crate::workloads::types::LoadedWorkload,
     gate: Result<Option<WorkGateResult>>,
-    read: Option<darkmux_sandbox::Selection>,
+    placement: Option<crate::providers::coding_task::RunPlacement>,
 ) -> Result<Option<WorkGateResult>> {
     let Some(spec) = loaded
         .manifest
@@ -1099,7 +1101,7 @@ pub(crate) fn apply(
         .as_ref()
         .and_then(|v| v.coverage_min_pct);
     let (ungraded, tests_added) = ungraded_verdict(spec, coverage, raw, gate);
-    let placement = placement_of(RunManifest::read(run_dir).ok().as_ref(), read);
+    let placement = placement.unwrap_or_else(crate::providers::coding_task::RunPlacement::read);
     let graded = match (crate::providers::coding_task::graded_prompt(loaded), Runner::for_workload(loaded, &placement)) {
         (Ok(prompt), Ok(runner)) => grade_run(run_dir, spec, &prompt, fixture, result, dispatch, &runner)?,
         (Err(e), _) => cannot_grade(&anyhow!("resolving the prompt: {e:#}")),
@@ -1212,7 +1214,11 @@ fn grade_kept(run_dir: &Path, manifest: &RunManifest, fixture: Option<&Path>) ->
     let spec = declared_grade(&loaded)?;
     let fixture_dir = run_fixture(run_dir, manifest, fixture)?;
     let result = kept_result(run_dir, manifest)?;
-    let (prompt, runner) = prompt_and_runner(&loaded, &placement_of(Some(manifest), None))?;
+    let (placement, moved) = regrade_placement(manifest, loaded.manifest.workload.image.as_deref());
+    if let Some(note) = moved {
+        eprintln!("{note}");
+    }
+    let (prompt, runner) = prompt_and_runner(&loaded, &placement)?;
     try_grade_run(run_dir, spec, &prompt, &fixture_dir, &result, &kept_dispatch(manifest), &runner)
 }
 
@@ -1245,32 +1251,29 @@ fn prompt_and_runner(
     Ok((crate::providers::coding_task::graded_prompt(loaded)?, Runner::for_workload(loaded, placement)?))
 }
 
-/// Where a run's suite runs: where the run placed its own tests, as its
-/// manifest recorded them (`isolation`), so a setting changed since (during
-/// the run's dispatch, or before a regrade) never moves them. A run that
-/// recorded no placement (written before the record existed) is placed by
-/// the settings now, the one fresh read here.
-fn placement_of(
-    manifest: Option<&RunManifest>,
-    read: Option<darkmux_sandbox::Selection>,
-) -> crate::providers::coding_task::RunPlacement {
-    placement_of_isolation(manifest.and_then(|m| m.isolation.as_ref()), read)
-}
-
-fn placement_of_isolation(
-    isolation: Option<&crate::lab::manifest::RunIsolation>,
-    read: Option<darkmux_sandbox::Selection>,
-) -> crate::providers::coding_task::RunPlacement {
-    use crate::providers::coding_task::RunPlacement;
-    isolation.map_or_else(RunPlacement::read, |i| RunPlacement::recorded(i, read))
-}
-
-#[cfg(test)]
-pub(crate) fn placement_of_for_test(
-    isolation: Option<&crate::lab::manifest::RunIsolation>,
-    read: Option<darkmux_sandbox::Selection>,
-) -> crate::providers::coding_task::RunPlacement {
-    placement_of_isolation(isolation, read)
+/// Where a regrade runs its suite: where the settings say now, read once
+/// (`RunPlacement::read`), as main always did, so this host's check of the
+/// backend and every remedy (`config set runtime.sandbox …`,
+/// `runtime.tests_on_host`) are the current settings' own. A regrade is its
+/// own process, run whenever the operator asks; when that is not where the
+/// run's own tests ran (its manifest's `isolation.tests`), the note names
+/// both, so the move is said, never made silently. `declared` is the
+/// workload's pinned image.
+pub(crate) fn regrade_placement(
+    manifest: &RunManifest,
+    declared: Option<&str>,
+) -> (crate::providers::coding_task::RunPlacement, Option<String>) {
+    let placement = crate::providers::coding_task::RunPlacement::read();
+    let now = crate::providers::coding_task::run_isolation(declared, placement.tests_on_host, placement.sandbox.clone()).tests;
+    let ran = manifest.isolation.as_ref().and_then(|i| i.tests.clone());
+    let note = match (ran, now) {
+        (Some(ran), Some(now)) if ran != now => Some(format!(
+            "darkmux lab grade: this run's tests ran in `{ran}`; regrading in `{now}` \
+             (the current `runtime.sandbox` and `runtime.tests_on_host`)"
+        )),
+        _ => None,
+    };
+    (placement, note)
 }
 
 /// The workload's `verify.grade`, which a regrade needs.

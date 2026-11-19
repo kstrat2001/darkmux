@@ -8498,8 +8498,8 @@ S(("127.0.0.1", port), H).serve_forever()
 
     /// A resume is checked against the backend the dispatch resolved and
     /// runs in, and a dispatch stamps that backend on its own origin and
-    /// names its workspace for it in the prompt file, never `runtime.sandbox`
-    /// read again (an admission wait or a model load sits between). Here the
+    /// names its workspace for it in the prompt file: all from the one
+    /// value it was handed, never `runtime.sandbox` read again. Here the
     /// setting says `docker` while the dispatch runs on the host.
     #[test]
     #[serial]

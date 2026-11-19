@@ -92,7 +92,7 @@ mod tests {
                     details: "stub".into(),
                 }),
                 error: None,
-                sandbox_read: None,
+                placement: None,
             })
         }
         fn inspect(&self, _: &LoadedWorkload, _: &Path) -> Result<InspectionReport> {

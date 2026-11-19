@@ -207,7 +207,8 @@ impl WorkloadProvider for CodingTaskProvider {
         // The run's placement settings, read once (`RunPlacement::read`):
         // the prompt names the workspace for its sandbox, the verify command
         // runs there, the dispatch runs there (`DispatchOpts::sandbox`), the
-        // manifest records it and the grader reads it back from there.
+        // manifest records it, and the in-run grader takes it
+        // (`RunResult::placement`).
         let placement = RunPlacement::read();
         let (prompt, verify) = prompt_and_verify_plan(loaded, sandbox_dir, &placement)?;
         let role = pick_role(loaded);
@@ -1096,23 +1097,23 @@ pub(crate) struct TestRunner {
     /// (#3112) The sandbox a contained run uses; `None` on the host.
     pub sandbox: Option<darkmux_sandbox::BackendKind>,
     /// The run's own read of `runtime.sandbox`, for why Docker was needed
-    /// when a contained run could not start; `None` on the host, or for a
-    /// run placed from its manifest.
+    /// when a contained run could not start; `None` on the host.
     pub read: Option<darkmux_sandbox::Selection>,
 }
 
 /// The settings a coding-task run is placed by, read once per run: its
 /// sandbox (`runtime.sandbox`, or why it was refused) and whether its
 /// model-written tests run on the host (`runtime.tests_on_host`). The prompt,
-/// the verify runner, the dispatch and the manifest all take this value, and
-/// the grader takes it back from the manifest, so a setting changed during
-/// the run never places one part of it somewhere else.
+/// the verify runner, the dispatch, the manifest and the in-run grader all
+/// take this value, so they agree by construction rather than by every read
+/// in one process returning the same cached value. A regrade is its own
+/// process and reads the settings afresh (`grade::regrade_placement`).
 #[derive(Debug, Clone)]
 pub(crate) struct RunPlacement {
     pub sandbox: std::result::Result<darkmux_sandbox::BackendKind, String>,
     pub tests_on_host: bool,
-    /// The read itself when this process made it (its Docker remedies, and
-    /// what the dispatch is handed); `None` when placed from a manifest.
+    /// The read itself (its Docker remedies, and what the dispatch is
+    /// handed); `None` only for a placement a test builds by hand.
     pub read: Option<std::result::Result<darkmux_sandbox::Selection, String>>,
 }
 
@@ -1125,27 +1126,6 @@ impl RunPlacement {
             tests_on_host: darkmux_types::config_access::tests_on_host_with_source().0,
             read: Some(read),
         }
-    }
-
-    /// The placement a run recorded in its manifest (`isolation`): where a
-    /// grade of that run runs its suite, in the run itself and in a later
-    /// regrade. `read` is the run's own read when the grade runs in the same
-    /// process (its Docker remedies); `None` for a regrade.
-    ///
-    /// A manifest from before this record was taken from the run's own read
-    /// (5.11) wrote `isolation` from a read at the END of the run, so a
-    /// missing `sandbox` says only that the setting was refused when the
-    /// manifest was written, which is what the refusal says.
-    pub(crate) fn recorded(isolation: &crate::lab::manifest::RunIsolation, read: Option<darkmux_sandbox::Selection>) -> Self {
-        let sandbox = match &isolation.sandbox {
-            Some(value) => serde_json::from_value::<darkmux_sandbox::BackendKind>(serde_json::Value::String(value.clone()))
-                .map_err(|_| format!("the run recorded `runtime.sandbox` `{value}`, which this darkmux does not know")),
-            None => Err("the run's manifest records no `runtime.sandbox` (the setting was refused when the manifest was \
-                         written), so its tests have no recorded sandbox to run in"
-                .to_string()),
-        };
-        let read = read.filter(|r| sandbox.as_ref().is_ok_and(|k| *k == r.kind)).map(Ok);
-        Self { sandbox, tests_on_host: isolation.tests.as_deref() == Some("host"), read }
     }
 
     /// The read's selection, when there is one and it was not refused.
@@ -1468,7 +1448,7 @@ pub(crate) fn finish_run(f: FinishInputs<'_>, d: &Dispatched) -> Result<RunResul
         duration_ms: f.duration_ms,
         verify: f.verify,
         error: d.error(),
-        sandbox_read: f.placement.read_selection(),
+        placement: Some(f.placement),
     })
 }
 
@@ -3112,64 +3092,92 @@ mod tests {
         assert!(unit.contains("sandbox: Some(ctx.sandbox.clone()),"), "the unit's dispatch is handed the unit's read");
     }
 
-    /// The grader places a run's suite where the run recorded its own tests
-    /// (`isolation`), whatever the settings say now: here the setting says
-    /// `docker` and the run recorded Seatbelt, then the host. A run that
-    /// recorded nothing is placed by the settings now.
-    #[test]
-    #[serial_test::serial]
-    fn a_graded_run_is_placed_where_its_manifest_recorded_it() {
-        use crate::lab::manifest::RunIsolation;
-        use darkmux_sandbox::BackendKind;
-        let keys = ["DARKMUX_SANDBOX", "DARKMUX_TESTS_ON_HOST"];
-        let saved: Vec<_> = keys.iter().map(|k| (*k, env::var_os(k))).collect();
-        unsafe {
-            env::set_var("DARKMUX_SANDBOX", "docker");
-            env::set_var("DARKMUX_TESTS_ON_HOST", "false");
+    /// The env vars a regrade test sets, restored when it drops.
+    struct SettingsGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl SettingsGuard {
+        fn set(pairs: &[(&'static str, &str)]) -> Self {
+            let saved = pairs.iter().map(|(k, _)| (*k, env::var_os(k))).collect();
+            // SAFETY: every caller is #[serial]; restored on drop.
+            unsafe {
+                for (k, v) in pairs {
+                    env::set_var(k, v);
+                }
+            }
+            Self(saved)
         }
-        let recorded = |sandbox: Option<&str>, tests: Option<&str>| {
-            crate::lab::grade::placement_of_for_test(Some(&RunIsolation { sandbox: sandbox.map(str::to_string), tests: tests.map(str::to_string), image_not_used: None }), None)
-        };
-        let seatbelt = recorded(Some("seatbelt"), Some("seatbelt"));
-        let host = recorded(Some("seatbelt"), Some("host"));
-        let refused = recorded(None, None);
-        let unrecorded = crate::lab::grade::placement_of_for_test(None, None);
-        // And the suite runs there: the runner built from the record spawns
-        // in Seatbelt, not `docker run ... host`, under the Docker setting.
-        let tmp = TempDir::new().unwrap();
-        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
-        let runner = TestRunner::for_workload(&loaded, &seatbelt).unwrap();
-        let tree = tmp.path().join("tree");
-        fs::create_dir_all(&tree).unwrap();
-        let run = contained_command::Run { command: "true", tree: &tree, workdir: "", mounts: &[], user: None, name_prefix: "darkmux-test" };
-        let program = contained_command::command(&runner.placement, &run).map(|(cmd, _)| cmd.get_program().to_string_lossy().into_owned());
-        unsafe {
-            for (k, v) in &saved {
-                match v {
-                    Some(v) => env::set_var(k, v),
-                    None => env::remove_var(k),
+    }
+
+    impl Drop for SettingsGuard {
+        fn drop(&mut self) {
+            unsafe {
+                for (k, v) in &self.0 {
+                    match v {
+                        Some(v) => env::set_var(k, v),
+                        None => env::remove_var(k),
+                    }
                 }
             }
         }
-        assert_eq!((seatbelt.sandbox, seatbelt.tests_on_host), (Ok(BackendKind::Seatbelt), false));
-        assert_eq!(runner.placement, Placement::Container("host".into(), BackendKind::Seatbelt));
-        // Grading in the run's own process keeps the run's read, for its
-        // Docker remedies, when it is the read the record came from.
-        let docker = darkmux_sandbox::Selection { kind: BackendKind::Docker, source: darkmux_types::config_access::Source::Env };
-        let in_run = |sandbox: &str| {
-            crate::lab::grade::placement_of_for_test(
-                Some(&RunIsolation { sandbox: Some(sandbox.into()), tests: None, image_not_used: None }),
-                Some(docker),
-            )
-            .read_selection()
-        };
-        assert_eq!(in_run("docker"), Some(docker));
-        assert_eq!(in_run("seatbelt"), None, "a read of another backend is not this run's");
-        assert_ne!(program.unwrap(), "docker", "a regrade ran its suite in Docker");
-        assert_eq!((host.sandbox, host.tests_on_host), (Ok(BackendKind::Seatbelt), true));
-        assert!(refused.sandbox.unwrap_err().contains("refused when the manifest was written"));
-        assert_eq!((unrecorded.sandbox, unrecorded.tests_on_host), (Ok(BackendKind::Docker), false), "no record: the settings now");
     }
+
+    fn manifest_recording(sandbox: &str, tests: &str) -> crate::lab::manifest::RunManifest {
+        crate::lab::manifest::RunManifest {
+            isolation: Some(crate::lab::manifest::RunIsolation {
+                sandbox: Some(sandbox.into()),
+                tests: Some(tests.into()),
+                image_not_used: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A regrade is its own process, run whenever the operator asks: it runs
+    /// the suite where the settings say now (so the host check and every
+    /// remedy are the settings' own), and says so when that is not where
+    /// the run's own tests ran. It never substitutes silently.
+    #[test]
+    #[serial_test::serial]
+    fn a_regrade_is_placed_by_the_current_settings_and_says_when_that_moved() {
+        let _settings = SettingsGuard::set(&[("DARKMUX_SANDBOX", "docker"), ("DARKMUX_TESTS_ON_HOST", "false")]);
+        let (moved, note) = crate::lab::grade::regrade_placement(&manifest_recording("seatbelt", "seatbelt"), None);
+        let same_tests = format!("docker:{}", crate::lab::manifest::RUNTIME_IMAGE_TESTS);
+        let (_, unmoved) = crate::lab::grade::regrade_placement(&manifest_recording("docker", &same_tests), None);
+        assert_eq!((moved.sandbox, moved.tests_on_host), (Ok(darkmux_sandbox::BackendKind::Docker), false));
+        let note = note.expect("a note when the regrade runs elsewhere");
+        for part in ["seatbelt", "docker", "runtime.sandbox"] {
+            assert!(note.contains(part), "{part} not in {note}");
+        }
+        assert_eq!(unmoved, None, "no note when it runs where the run did");
+    }
+
+    /// A regrade's Docker remedy is the current setting's own, as a fresh
+    /// read gives it: nothing is dropped.
+    #[test]
+    #[serial_test::serial]
+    fn a_regrades_docker_remedy_is_the_current_settings() {
+        let _settings = SettingsGuard::set(&[("DARKMUX_SANDBOX", "docker"), ("DARKMUX_TESTS_ON_HOST", "false")]);
+        let (placement, _) = crate::lab::grade::regrade_placement(&manifest_recording("docker", "docker:node:22"), Some("node:22"));
+        let ours = placement.read_selection().and_then(|s| s.docker_remedy());
+        let now = darkmux_sandbox::selection().ok().and_then(|s| s.docker_remedy());
+        assert!(ours.is_some(), "the regrade dropped its Docker remedy");
+        assert_eq!(ours, now);
+    }
+
+    /// A regrade under a setting this host cannot run gets the setting's own
+    /// refusal, never a launcher spawned for a backend that cannot work.
+    #[test]
+    #[serial_test::serial]
+    fn a_regrade_under_a_backend_this_host_cannot_run_is_refused() {
+        let unrunnable = if darkmux_sandbox::SeatbeltBackend::available() { "landlock" } else { "seatbelt" };
+        let _settings = SettingsGuard::set(&[("DARKMUX_SANDBOX", unrunnable), ("DARKMUX_TESTS_ON_HOST", "false")]);
+        let tmp = TempDir::new().unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let (placement, _) = crate::lab::grade::regrade_placement(&manifest_recording(unrunnable, unrunnable), None);
+        let why = TestRunner::for_workload(&loaded, &placement).unwrap_err().to_string();
+        assert!(why.contains(&format!("is `{unrunnable}`, but")) && why.contains("runtime.sandbox"), "{why}");
+    }
+
 
     /// What a run resolves before it dispatches: the prompt, and no plan for
     /// a workload with no verify command. A workload with no prompt is

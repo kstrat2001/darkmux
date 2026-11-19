@@ -1311,7 +1311,7 @@ impl WorkloadProvider for ToolBenchProvider {
                 ),
             }),
             error: None,
-            sandbox_read: None,
+            placement: None,
         })
     }
 

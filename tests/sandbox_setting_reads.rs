@@ -1,10 +1,16 @@
 //! Where the workspace reads `runtime.sandbox` and `runtime.tests_on_host`.
 //!
-//! A run reads its placement settings once and carries the value: the
+//! Each unit of work (a dispatch, a lab run, a regrade, a gate step, a
+//! crawl unit) reads its placement settings once and carries the value: the
 //! prompt, the runtime image, the model URLs, the launch, a test run's
-//! sandbox, the manifest and the grader all take it, so a setting changed
-//! while a dispatch waits for admission or a model load never places one
-//! part of the run somewhere else.
+//! sandbox, the manifest and the in-run grader all take it, so they agree
+//! by construction. Within one process the settings cannot change today
+//! (`config.json` is cached once per process, and nothing in darkmux sets
+//! `DARKMUX_SANDBOX`), so this does not fix a race; it keeps the agreement
+//! from resting on that cache. The reads that see different values are
+//! across processes: the daemon reads `config.json` per request, and a
+//! regrade is its own process (it reads the settings now, and says when
+//! that moves the suite from where the run's tests ran).
 //!
 //! darkmux-sandbox offers exactly two readers, `selection` and
 //! `selection_in` (its own test derives that from its source), and the
@@ -14,9 +20,30 @@
 //! A token match still sees an alias (`sb::selection`), a function value
 //! (`let f = darkmux_sandbox::selection;`) and a `{self as sb}` import,
 //! since each spells the name; renaming one on import (`selection as f`) is
-//! refused everywhere. Comments and string literals are not code; test
-//! code (a `cfg(test)` item, a `_tests.rs` or `tests.rs` file, a `tests/`
-//! directory) is not scanned.
+//! refused everywhere, as is a raw field path (`runtime.sandbox`,
+//! `runtime.tests_on_host` as code). Comments and string literals are not
+//! code; test code (a `#[cfg(test)]` item, a `_tests.rs` or `tests.rs`
+//! file, a `tests/` directory) is not scanned. Every other `cfg` attribute,
+//! `cfg(not(test))` and `cfg(any(test, ...))` included, is scanned.
+//!
+//! What it does NOT catch, stated so nobody reads more into a green run:
+//! - calling an entry point (or any function that calls one, such as
+//!   `RunPlacement::read` or `resolved_runtime_image`) from somewhere else:
+//!   the read is inside the entry, so a second unit of work can reuse an
+//!   entry to read again;
+//! - an entry is matched by file and function name, so a second function of
+//!   the same name in that file is allowed too, and a token after an entry
+//!   function's body but before the next `fn` (a `static`, a macro) counts
+//!   as inside it;
+//! - the generic enum resolver `config_enum::resolve_in(setting, ..)`, which
+//!   can read any enum setting given its handle;
+//! - a new accessor of either setting added inside darkmux-types (its
+//!   source is not scanned), until something outside calls it by a name
+//!   not on the list;
+//! - a raw config read through a closure or a chain
+//!   (`cfg.runtime.as_ref().and_then(|r| r.sandbox)`), and the bare names
+//!   `sandbox` / `tests_on_host`, which every variable and field so named
+//!   would match.
 
 use std::path::{Path, PathBuf};
 
@@ -63,10 +90,14 @@ fn stray_reads(root: &Path, files: &[PathBuf]) -> Vec<String> {
         let code = production(&blank_comments_and_strings(&src));
         let tokens = identifiers(&code);
         for (i, (at, word)) in tokens.iter().enumerate() {
+            let line = code[..*at].matches('\n').count() + 1;
+            if let Some(field) = raw_field_read(&code, &tokens, i) {
+                out.push(format!("{rel}:{line}: `runtime.{field}` read as a raw config field"));
+                continue;
+            }
             if !READERS.contains(&word.as_str()) {
                 continue;
             }
-            let line = code[..*at].matches('\n').count() + 1;
             if tokens.get(i + 1).is_some_and(|(_, w)| w == "as") {
                 out.push(format!("{rel}:{line}: `{word} as` renames a reader"));
                 continue;
@@ -79,6 +110,14 @@ fn stray_reads(root: &Path, files: &[PathBuf]) -> Vec<String> {
         }
     }
     out
+}
+
+/// The field when the token at `i` starts `runtime.sandbox` or
+/// `runtime.tests_on_host` as code (a raw read of the config struct).
+fn raw_field_read<'a>(code: &str, tokens: &'a [(usize, String)], i: usize) -> Option<&'a str> {
+    let ((at, word), (next_at, next)) = (&tokens[i], tokens.get(i + 1)?);
+    let between = &code[at + word.len()..*next_at];
+    (word == "runtime" && between.trim() == "." && matches!(next.as_str(), "sandbox" | "tests_on_host")).then_some(next.as_str())
 }
 
 /// The workspace's Rust sources outside the two crates that own the
@@ -200,22 +239,17 @@ fn ident_byte(b: &[u8], i: usize) -> bool {
     i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')
 }
 
-/// `code` with every item under a `cfg(test)` attribute (or one naming
-/// `test` among others, as `cfg(any(test, ...))`) blanked: a test module,
-/// a test-only function or import.
+/// `code` with every item under exactly `#[cfg(test)]` blanked: a test
+/// module, a test-only function or import. Any other `cfg` attribute
+/// (`not(test)`, `any(test, ...)`) may build into a shipped binary, so its
+/// item is scanned.
 fn production(code: &str) -> String {
     let b = code.as_bytes();
     let mut out = b.to_vec();
     let mut from = 0;
-    while let Some(p) = code[from..].find("#[cfg(") {
+    while let Some(p) = code[from..].find("#[cfg(test)]") {
         let at = from + p;
-        let attr_end = code[at..].find(']').map_or(code.len(), |e| at + e + 1);
-        let attr = &code[at..attr_end];
-        from = attr_end;
-        let names_test = attr.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == "test");
-        if !names_test || attr.contains("not(test") {
-            continue;
-        }
+        let attr_end = at + "#[cfg(test)]".len();
         let rest = &code[attr_end..];
         let semi = rest.find(';');
         let brace = rest.find('{');
@@ -321,6 +355,9 @@ fn the_scan_finds_a_read_however_it_is_spelled() {
         ("types.rs", "use darkmux_types::config_access as ca;\nfn f() { ca::sandbox_with_source(); }\n"),
         ("on_host.rs", "fn f() -> bool { darkmux_types::config_access::tests_on_host_with_source().0 }\n"),
         ("enum.rs", "fn f() { let _ = darkmux_types::config_access::resolve_enum::<K>(\"runtime.sandbox\"); }\n"),
+        ("raw_field.rs", "fn f(c: &Config) -> bool { c.runtime.tests_on_host.unwrap_or(false) }\n"),
+        ("not_test.rs", "#[cfg(not(test))]\nfn f() { darkmux_sandbox::selection(); }\n"),
+        ("any_test.rs", "#[cfg(any(test, feature = \"x\"))]\nfn f() { darkmux_sandbox::selection(); }\n"),
     ] {
         assert!(!case(name, body).is_empty(), "{name} was not seen");
     }

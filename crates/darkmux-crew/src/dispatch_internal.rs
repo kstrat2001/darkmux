@@ -7243,9 +7243,11 @@ struct ContainerRun {
 /// (`DispatchOpts::sandbox`, a refusal included), else the setting now.
 /// Everything after it (the resume check, the origin stamp, the prompt, the
 /// runtime image and its Docker remedies, the model URLs, the launch) takes
-/// this value; none reads the setting again, since an admission wait or a
-/// model load can sit between them. A setting that names no backend this
-/// host can run refuses the dispatch here (contract 9).
+/// this value, so they agree by construction. Within one process every read
+/// returns the same value today (`config.json` is cached once per process,
+/// and nothing in darkmux sets `DARKMUX_SANDBOX`), so this is not a race
+/// fix: it keeps the agreement from resting on that cache. A setting that
+/// names no backend this host can run refuses the dispatch here (contract 9).
 fn dispatch_sandbox(opts: &DispatchOpts) -> Result<darkmux_sandbox::Selection> {
     match &opts.sandbox {
         Some(read) => read.clone().map_err(|why| anyhow!(why)),
