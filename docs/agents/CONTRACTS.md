@@ -43,7 +43,9 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
 3. **Lab/fleet sink boundary** — lab runs write per-run-local artifacts; the fleet flow
    stream carries engagement work only. No crossings in either direction. Conformance:
    `RedisSink::persist` and the outage backfill drop any record whose `session_id` is a
-   lab run, through the one `is_lab_session` predicate (#3074).
+   lab run, through the one `is_lab_session` predicate (#3074), and so does every hook
+   rule (`hooks::hook_match`, which `HookSink::persist` decides by), since a hook delivers
+   off the machine too (`a_lab_runs_records_never_reach_a_hook`).
 4. **Namespace convention** — darkmux-owned state in shared systems carries the darkmux
    namespace; operations manage only the namespaced subset (see the namespace section).
    Formalized as ABSOLUTE for model lifecycle (operator, 2026-07-10, #1274): every darkmux

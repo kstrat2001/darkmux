@@ -6810,6 +6810,73 @@ S(("127.0.0.1", port), H).serve_forever()
         }
     }
 
+    /// (contract 6) The system prompt a dispatch records the hash of is the
+    /// one it passes to the runtime as `--system`, named for where the
+    /// sandbox sees the workspace (the runtime sends `--system` byte for
+    /// byte): under Seatbelt the hash recorded is the hash of the host-path
+    /// text the runtime sends, not of the `/workspace` text the role wrote.
+    #[test]
+    fn the_recorded_system_hash_is_of_the_system_prompt_the_runtime_is_passed() {
+        use darkmux_sandbox::{BackendKind, SeatbeltBackend};
+        let root = tempfile::TempDir::new().unwrap();
+        for d in ["ws", "out"] {
+            std::fs::create_dir(root.path().join(d)).unwrap();
+        }
+        let role = "Work in /workspace and read /workspace/a.rs.".to_string();
+        let mut cfg = argv_config_with_base_url(None);
+        cfg.workspace = root.path().join("ws");
+        cfg.host_out = root.path().join("out");
+        cfg.system_prompt = system_prompt_as_sent(role.clone(), Some(BackendKind::Seatbelt), &cfg.workspace);
+        let real = cfg.workspace.canonicalize().unwrap().display().to_string();
+        assert_eq!(cfg.system_prompt, format!("Work in {real} and read {real}/a.rs."));
+        let policy = dispatch_policy_for(&cfg, &SeatbeltBackend);
+        let passed = policy.command.iter().skip_while(|a| *a != "--system").nth(1).unwrap();
+        let mut payload = DispatchStartPayload::default();
+        crate::role_inputs::stamp_prompt_inputs(&mut payload, &cfg.system_prompt, &Default::default());
+        assert_eq!(payload.system_sha256, Some(darkmux_flow::sha256_hex(passed.as_bytes())));
+        // The container run names its prompt so before it is recorded or passed.
+        let src = include_str!("dispatch_internal.rs");
+        assert!(
+            src.contains("let system_prompt = run_system_prompt(system_prompt, &image, &workspace);"),
+            "prepare_container_run must name the prompt before ContainerRun holds it"
+        );
+    }
+
+    /// (contract 6) The system prompt names the workspace for the backend
+    /// that runs the dispatch: the one its runtime image was resolved for,
+    /// never the selection read again later. A setting switched while a
+    /// model loads (Docker to Seatbelt, or back) changes neither the path the
+    /// prompt names nor the backend that launches.
+    #[test]
+    #[serial]
+    fn the_prompt_names_the_workspace_for_the_backend_that_runs() {
+        use darkmux_sandbox::BackendKind;
+        let ws = TempDir::new().unwrap();
+        let real = ws.path().canonicalize().unwrap().display().to_string();
+        let image = |kind| RuntimeImage {
+            inject: false,
+            darkmux_image: crate::runtime_image::ResolvedImage { reference: "r".into(), id: "r".into() },
+            image: "i".into(),
+            run_image: "i".into(),
+            host_runtime: None,
+            kind,
+        };
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        let mut seen = Vec::new();
+        for (selected, resolved) in [("seatbelt", BackendKind::Docker), ("docker", BackendKind::Seatbelt)] {
+            unsafe { std::env::set_var("DARKMUX_SANDBOX", selected) };
+            let img = image(resolved);
+            seen.push((run_system_prompt("in /workspace".into(), &img, ws.path()), run_backend(&img).kind()));
+        }
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        assert_eq!(seen, [("in /workspace".to_string(), BackendKind::Docker), (format!("in {real}"), BackendKind::Seatbelt)]);
+        let src = include_str!("dispatch_internal.rs");
+        assert!(src.contains("let system_prompt = run_system_prompt(system_prompt, &image, &workspace);"));
+        assert!(src.contains("spawn_container(&argv_config, run_backend(&run.image), opts.max_turns_override)?"));
+    }
+
     /// (#3561) A dispatch on the host runs with its managed Node: the
     /// toolchain's PATH, its folder read-only where it is. A container's
     /// config carries none, so its policy names no PATH (the image's own).
@@ -7225,12 +7292,9 @@ S(("127.0.0.1", port), H).serve_forever()
         cfg.workspace = root.path().join("ws");
         cfg.host_out = root.path().join("out");
         let (cmd, _) = container_command(&cfg, &darkmux_sandbox::SeatbeltBackend);
-        let envs: Vec<(String, Option<String>)> = cmd
-            .get_envs()
-            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned())))
-            .collect();
+        let envs = darkmux_sandbox::SeatbeltBackend::program_environment(&cmd);
         let ws = root.path().join("ws").canonicalize().unwrap().display().to_string();
-        assert!(envs.contains(&("DARKMUX_RUNTIME_WORKSPACE".to_string(), Some(ws))), "{envs:?}");
+        assert!(envs.contains(&("DARKMUX_RUNTIME_WORKSPACE".to_string(), ws)), "{envs:?}");
         assert!(!envs.iter().any(|(k, _)| k == "CARGO_PKG_NAME"), "the host's environment rode along: {envs:?}");
     }
 
@@ -21992,6 +22056,80 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
     assert!(err.contains("262144"), "message must name the declared n_ctx, got: {err}");
 }
 
+fn refuse_taken(identifier: &str) -> anyhow::Result<()> {
+    anyhow::bail!("`lms load` exited with exit status: 1: Error: A model with identifier {identifier} already exists.")
+}
+
+#[test]
+#[serial_test::serial]
+fn a_variant_id_second_dispatch_reuses_its_own_load() {
+    // The second dispatch of a variant id: darkmux's own load is resident,
+    // listed under the base key. Reuse it; never issue a load the host
+    // refuses as identifier-taken.
+    let pm = darkmux_types::ProfileModel {
+        id: "qwen/qwen3.8-27b@4bit".to_string(),
+        n_ctx: Some(262144),
+        ..Default::default()
+    };
+    let row = resident("darkmux:qwen/qwen3.8-27b@4bit", "qwen/qwen3.8-27b", 262144);
+    let loads = std::sync::atomic::AtomicUsize::new(0);
+    let out = crate::dispatch_internal::ensure_model_resident(&pm, &|| vec![row.clone()], &|_| Ok(()), &|_, id, _| {
+        loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        refuse_taken(id)
+    });
+    assert!(out.is_ok(), "expected reuse, got {:?}", out.err().map(|e| format!("{e:#}")));
+    assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 0, "no load for a resident darkmux instance");
+}
+
+/// The identifier-taken message for a profile whose opt-out identifier
+/// `my-qwen` is held by `held`, as the re-probe after the refused load sees it.
+fn taken_opt_out_error(held: darkmux_types::LoadedModel) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let pm = darkmux_types::ProfileModel {
+        id: "qwen".to_string(),
+        n_ctx: Some(32768),
+        identifier: Some("my-qwen".to_string()),
+        ..Default::default()
+    };
+    let reads = AtomicUsize::new(0);
+    let out = crate::dispatch_internal::ensure_model_resident(
+        &pm,
+        &|| if reads.fetch_add(1, Ordering::SeqCst) == 0 { Vec::new() } else { vec![held.clone()] },
+        &|_| Ok(()),
+        &|_, id, _| refuse_taken(id),
+    );
+    format!("{:#}", out.expect_err("a refused load with no usable resident must error"))
+}
+
+#[test]
+#[serial_test::serial]
+fn an_identifier_taken_remedy_never_points_eject_at_a_bare_identifier() {
+    // `darkmux machine eject` unloads only the `darkmux:` namespace, so for
+    // an opt-out identifier it would do nothing: the remedy names the
+    // instance and `lms unload`, in both the undersized and the
+    // other-model arms.
+    for held in [resident("my-qwen", "qwen", 4096), resident("my-qwen", "phi-4", 262144)] {
+        let err = taken_opt_out_error(held);
+        assert!(!err.contains("machine eject"), "eject cannot reach `my-qwen`: {err}");
+        assert!(err.contains("lms unload my-qwen"), "names the command that frees it: {err}");
+        assert!(err.contains("darkmux:"), "offers a namespaced identifier: {err}");
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn an_identifier_taken_remedy_names_the_other_model_holding_it() {
+    let err = taken_opt_out_error(resident("my-qwen", "phi-4", 262144));
+    assert!(err.contains("phi-4"), "names the model holding the identifier: {err}");
+    assert!(!err.contains("listed no resident"), "the probe did list it: {err}");
+}
+
+#[test]
+fn an_identifier_taken_remedy_keeps_eject_for_a_darkmux_identifier() {
+    let hint = crate::dispatch_internal::free_identifier_hint("darkmux:qwen");
+    assert!(hint.contains("darkmux machine eject"), "{hint}");
+}
+
     /// (#2794) A compaction record must name the model that did the
     /// compaction, not the specialist the dispatch is for.
     ///
@@ -24217,6 +24355,75 @@ fn decide_preflight_a_different_darkmux_instance_cannot_answer() {
         decide_preflight("qwen", None, 32768, &l),
         PreflightDecision::LoadFresh { foreign_identifier: Some(_) }
     ));
+}
+
+/// A variant (`@4bit`) or path id loads under `darkmux:<id>`, while LM Studio
+/// may report the instance's `modelKey` as the base key (inferred: no recorded
+/// `lms ps` row for such a load). The namespaced identifier alone names it.
+#[test]
+fn decide_preflight_a_variant_id_reuses_its_own_load() {
+    let l = [resident("darkmux:qwen/qwen3.8-27b@4bit", "qwen/qwen3.8-27b", 262144)];
+    assert_eq!(
+        decide_preflight("qwen/qwen3.8-27b@4bit", None, 262144, &l),
+        PreflightDecision::Reuse { identifier: "darkmux:qwen/qwen3.8-27b@4bit".into(), resident_ctx: 262144 }
+    );
+}
+
+#[test]
+fn decide_preflight_a_path_id_reloads_its_own_undersized_load() {
+    let id = "lmstudio-community/Qwen3-Coder-30B-MLX-4bit";
+    let l = [resident(&format!("darkmux:{id}"), "qwen3-coder-30b", 4096)];
+    assert_eq!(
+        decide_preflight(id, None, 32768, &l),
+        PreflightDecision::Reload { stale_identifier: format!("darkmux:{id}"), stale_ctx: 4096 }
+    );
+}
+
+#[test]
+fn decide_preflight_an_opt_out_identifier_on_another_model_is_not_ours() {
+    let l = [resident("my-qwen", "phi-4", 262144)];
+    assert_eq!(
+        decide_preflight("qwen", Some("my-qwen"), 32768, &l),
+        PreflightDecision::LoadFresh { foreign_identifier: None }
+    );
+}
+
+/// LM Studio names a load made without an identifier (its app, a bare `lms
+/// load`) by the model key, so an opt-out identifier equal to the key cannot
+/// tell darkmux's instance from the operator's: never reused or unloaded.
+#[test]
+fn decide_preflight_a_load_named_by_its_own_key_is_never_ours() {
+    let l = [resident("qwen", "qwen", 1000)];
+    assert_eq!(
+        decide_preflight("qwen", Some("qwen"), 32768, &l),
+        PreflightDecision::LoadFresh { foreign_identifier: Some("qwen".into()) }
+    );
+}
+
+/// The operator changed the model's `id` and kept `identifier:
+/// "darkmux:coder"` while the old model's load is resident: an explicit
+/// identifier also needs the resident's key, so the dispatch loads (and the
+/// taken identifier is refused loudly) rather than being answered by the old
+/// model.
+#[test]
+fn decide_preflight_an_explicit_darkmux_identifier_on_another_model_is_not_reused() {
+    let l = [resident("darkmux:coder", "qwen3.6-27b", 262144)];
+    assert_eq!(
+        decide_preflight("qwen/qwen3.8-27b", Some("darkmux:coder"), 32768, &l),
+        PreflightDecision::LoadFresh { foreign_identifier: None }
+    );
+}
+
+/// An explicit identifier on `q@4bit` never reuses another quantization's
+/// load listed under the base key `q` (the 8bit one the profile ran before
+/// its id changed).
+#[test]
+fn decide_preflight_an_explicit_identifier_never_reuses_another_quantization() {
+    let l = [resident("darkmux:coder", "q", 262144)];
+    assert_eq!(
+        decide_preflight("q@4bit", Some("darkmux:coder"), 32768, &l),
+        PreflightDecision::LoadFresh { foreign_identifier: None }
+    );
 }
 
 #[test]

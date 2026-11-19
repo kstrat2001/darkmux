@@ -214,8 +214,9 @@ fn a_create_command_is_the_refusal_or_the_script_that_writes_the_sandbox() {
 }
 
 /// (#3112) A created sandbox's start script runs the launcher with only
-/// the sandbox's environment, then its directory, working directory, the
-/// three limit arguments in order and the program, each one quoted.
+/// the launcher's environment (`PATH` and the sandbox's, carried for its
+/// program), then its directory, working directory, the three limit
+/// arguments in order and the program, each one quoted.
 #[test]
 fn a_start_script_carries_the_limits_between_the_workdir_and_the_program() {
     let mut p = perl("darkmux-start-1", Limits::default(), "print 1;");
@@ -223,7 +224,8 @@ fn a_start_script_carries_the_limits_between_the_workdir_and_the_program() {
     let script = SeatbeltBackend::start_script(&p, Path::new("/s/darkmux-start-1"), ["8".into(), "67108864".into(), "64 MiB".into()]);
     assert!(script.starts_with("exec /usr/bin/env -i "), "{script}");
     assert!(script.ends_with(" sh '/s/darkmux-start-1' '/w d' '8' '67108864' '64 MiB' '/usr/bin/perl' '-e' 'print 1;'\n"), "{script}");
-    assert!(script.contains("'TMPDIR=/s/darkmux-start-1/tmp'"), "the sandbox's own tmp: {script}");
+    assert!(script.contains(&format!("'{CARRIED}2=TMPDIR=/s/darkmux-start-1/tmp'")), "the sandbox's own tmp, carried: {script}");
+    assert!(!script.contains("'TMPDIR="), "never the launcher's own: {script}");
 }
 
 /// A memory limit Docker would read as no limit (`0`) is refused by both

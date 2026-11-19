@@ -226,6 +226,16 @@ impl Platform for MacPlatform {
         crate::unix_process_group(pid)
     }
 
+    /// The process table from libproc ([`Platform::tcp_listeners_held_by`]'s).
+    fn in_sandbox_of(&self, pid: u32, leaders: &[u32]) -> Option<bool> {
+        process_table().map(|table| crate::in_sandbox_of_table(pid, leaders, &table))
+    }
+
+    /// `proc_pidpath`, which answers for another user's process too.
+    fn process_name(&self, pid: u32) -> Option<String> {
+        process_path(pid).ok()?.file_name().map(|n| n.to_string_lossy().into_owned())
+    }
+
     /// (#3453) The XDG layout, read from this process's environment.
     fn xdg_data_home(&self) -> Option<std::path::PathBuf> {
         crate::xdg_data_home_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
@@ -944,16 +954,28 @@ pub(crate) fn netstat_answer(code: Option<i32>, stdout: &str) -> Option<String> 
 /// (exit 1 with no output is "none").
 #[cfg(target_os = "macos")]
 fn lsof_established(port: u16) -> Option<String> {
-    let out = std::process::Command::new("/usr/sbin/lsof")
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:ESTABLISHED", "-Fpn"])
-        .current_dir("/")
-        .output()
-        .ok()?;
+    lsof_established_with(std::path::Path::new("/usr/sbin/lsof"), port, LSOF_BOUND)
+}
+
+/// [`lsof_established`] run as `program` (a stub in a test), within
+/// `bound` ([`LSOF_BOUND`]). (Compiled on every OS for its test; only macOS
+/// runs lsof.)
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn lsof_established_with(program: &std::path::Path, port: u16, bound: std::time::Duration) -> Option<String> {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(["-nP", &format!("-iTCP:{port}"), "-sTCP:ESTABLISHED", "-Fpn"]).current_dir("/");
+    let out = crate::output_within(cmd, bound)?;
     match out.status.code() {
         Some(0 | 1) => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
         _ => None,
     }
 }
+
+/// How long one look at a port's connections may take, as
+/// [`NETSTAT_BOUND`] bounds netstat's: one that hangs (a stuck mount it
+/// waits on) is no answer, never a wait without end.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const LSOF_BOUND: std::time::Duration = NETSTAT_BOUND;
 
 #[cfg(not(target_os = "macos"))]
 fn lsof_established(_port: u16) -> Option<String> {

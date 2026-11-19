@@ -190,14 +190,23 @@ fn is_hook_own_action(action: &crate::FlowAction) -> bool {
     !matches!(action.scope(), Some(scope) if scope != crate::FlowScope::Hook)
 }
 
+/// True for a record no rule may deliver: the sink's own vocabulary (the loop
+/// guard) and a lab run's record (contract 3).
+fn never_delivered(record: &FlowRecord) -> bool {
+    is_hook_own_action(&record.action) || crate::is_lab_session(record.session_id.as_deref())
+}
+
 /// True when `record` satisfies `m`. Records whose `action` is the
 /// sink's own vocabulary (see `is_hook_own_action`) NEVER match,
 /// regardless of `m` — the loop guard, checked first and
-/// unconditionally. An all-`None` match matches nothing (`m.is_empty()`
+/// unconditionally. A lab run's records never match either (contract 3,
+/// [`crate::is_lab_session`], the same predicate that keeps them off the
+/// fleet hub): a hook delivers off the machine, and a lab run writes only
+/// per-run-local artifacts. An all-`None` match matches nothing (`m.is_empty()`
 /// short-circuits false) — an empty match is a rule an operator forgot to
 /// fill in, not an accidental catch-all.
 pub fn hook_match(m: &HookMatch, record: &FlowRecord) -> bool {
-    if is_hook_own_action(&record.action) {
+    if never_delivered(record) {
         return false;
     }
     if m.is_empty() {
@@ -4343,7 +4352,8 @@ impl FlowSink for HookSink {
     fn persist(&self, record: crate::CheckedRecord<'_>) -> Result<()> {
         let record = record.get();
         // Loop guard — never even considered against any rule. See
-        // `is_hook_own_action`'s doc (#2093 merge-gate finding 11).
+        // `is_hook_own_action`'s doc (#2093 merge-gate finding 11). A lab
+        // run's record matches no rule (`hook_match`, contract 3).
         if is_hook_own_action(&record.action) {
             return Ok(());
         }
@@ -5367,6 +5377,44 @@ mod tests {
         std::thread::sleep(POLL_INTERVAL * 10);
         assert_eq!(receiver.request_count(), 1, "cursor must advance so the delivered line is never resent");
         assert_eq!(read_cursor(&sink.rules[0].rule.cursor_path), std::fs::read_to_string(&sink.rules[0].rule.outbox_path).unwrap().len() as u64);
+    }
+
+    /// (contract 3) A lab run's records stay on this machine: a match-all
+    /// rule queues and delivers an engagement record, and never a lab
+    /// run's, whatever its action. A rule naming the lab session exactly
+    /// matches nothing either. The same predicate keeps them off the hub.
+    #[test]
+    fn a_lab_runs_records_never_reach_a_hook() {
+        use darkmux_types::session_id::{RunId, SessionId};
+        let lab = SessionId::adhoc(RunId::lab("l-hook").unwrap(), "coder", "n").wire();
+        assert!(crate::is_lab_session(Some(&lab)), "the fixture is a lab session");
+        let exact = HookMatch { session_id: Some(lab.clone()), ..Default::default() };
+        let mut lab_record = record(crate::FlowAction::DispatchStart);
+        lab_record.session_id = Some(lab.clone());
+        assert!(!hook_match(&exact, &lab_record), "a rule naming the lab session matches nothing");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            ..Default::default()
+        }];
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), Arc::new(NullSink)).unwrap();
+
+        sink.write(&lab_record).unwrap();
+        let mut lab_note = marked("lab-note");
+        lab_note.session_id = Some(lab);
+        sink.write(&lab_note).unwrap();
+        sink.write(&marked("engagement")).unwrap();
+
+        assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)), "the engagement record is delivered");
+        std::thread::sleep(POLL_INTERVAL * 5);
+        let bodies = receiver.bodies();
+        assert_eq!(bodies.len(), 1, "only the engagement record left the machine: {bodies:?}");
+        assert!(bodies[0].contains("\"engagement\""), "{bodies:?}");
+        let outbox = std::fs::read_to_string(&sink.rules[0].rule.outbox_path).unwrap();
+        assert_eq!(outbox.lines().count(), 1, "no lab record was queued: {outbox}");
     }
 
     // ─── (#2135 option 2) delivery contract headers + signing ──────────

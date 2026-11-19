@@ -66,7 +66,7 @@ pub use estimator::{
 };
 pub use facts::{Budget, CallerIntent, CatalogFact, Facts, PoolFact, PoolId, Pools, ResidentFact};
 pub use ownership::{
-    bare_model_key, ctx_sufficient, is_darkmux_owned, namespaced_identifier, DARKMUX_NAMESPACE,
+    bare_model_key, ctx_sufficient, is_darkmux_owned, is_own_instance, namespaced_identifier, DARKMUX_NAMESPACE,
 };
 pub use plan::{
     Action, EvictionOrder, ForeignTargetError, OwnedTarget, Plan, PlannedAction,

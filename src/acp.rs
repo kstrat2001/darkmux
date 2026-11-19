@@ -2668,19 +2668,13 @@ async fn host_shutdown_reap_loop_ready(
 /// launched mission's own model dispatches take (the retired review
 /// launcher streamed a `Plan` immediately for the same reason).
 ///
-/// **`args` honesty note (#1684 QA finding — MUST-FIX 5).** The raw text
-/// forwards as `--param args=<raw>` (omitted when empty) — the standard
-/// `mission launch` CLI mechanism (`collect_inputs`). This is a
-/// forward-compatible HOOK, not (yet) a wired delivery: today NO shipped
-/// config declares `args` as a `MissionInput` or consumes it via
-/// `task_overrides` (`build_launch_params` only produces overrides for the
-/// coder-phase-shaped kinds), so a Launch-routed panel command that takes
-/// arguments will see `mission launch` warn on stderr about an undeclared
-/// input and the value will not reach any step's config. #1685's verb
-/// configs are expected to declare `args` for real; wiring the actual
-/// delivery mechanism (however #1685 chooses to shape it — task_overrides,
-/// a generic step-config substitution, or something else) is that packet's
-/// job, not this one's.
+/// **`args` (#1684 QA finding MUST-FIX 5, #1685).** The raw text forwards
+/// as `--param args=<raw>` (omitted when empty), the standard `mission
+/// launch` mechanism (`collect_inputs`). `mission launch` delivers it into a
+/// graph that reads `__panel_args__` (`inject_panel_args_task_if_referenced`)
+/// and into a `cmd` config's audit record; any other config refuses `args`
+/// as an undeclared input, so the panel sends it only to a config that takes
+/// panel text (`acp_panel::map_launch_args`).
 ///
 /// **A gated step in this route can never be approved (#1684 QA
 /// CONSIDER, a deliberate boundary, not a bug).** The subprocess below

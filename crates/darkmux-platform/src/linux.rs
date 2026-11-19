@@ -288,6 +288,19 @@ impl Platform for LinuxPlatform {
         crate::unix_process_group(pid)
     }
 
+    /// The process table from every `/proc/<pid>/stat`.
+    fn in_sandbox_of(&self, pid: u32, leaders: &[u32]) -> Option<bool> {
+        proc_table().map(|table| crate::in_sandbox_of_table(pid, leaders, &table))
+    }
+
+    /// `/proc/<pid>/exe`'s file name, else `/proc/<pid>/comm` (which another
+    /// user's process, a root `docker-proxy` say, still shows).
+    fn process_name(&self, pid: u32) -> Option<String> {
+        let exe = read_link(&format!("/proc/{pid}/exe"));
+        let comm = || read_to_string(&format!("/proc/{pid}/comm"));
+        name_from_exe_or_comm(exe, comm)
+    }
+
     /// (#3453) The XDG layout, read from this process's environment.
     fn xdg_data_home(&self) -> Option<std::path::PathBuf> {
         crate::xdg_data_home_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
@@ -605,6 +618,19 @@ fn list_dir(path: &str) -> Vec<String> {
 #[cfg(not(target_os = "linux"))]
 fn list_dir(_path: &str) -> Vec<String> {
     Vec::new()
+}
+
+/// A process's name from its `/proc/<pid>/exe` link (`exe`), else from
+/// `comm`: the link's file name, a deleted binary's ` (deleted)` mark
+/// dropped; the command name, trimmed, when there is no link to read.
+/// Compiled on every OS for its test.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn name_from_exe_or_comm(exe: Option<String>, comm: impl FnOnce() -> Option<String>) -> Option<String> {
+    let from_exe = exe.as_deref().map(|l| l.trim_end_matches(" (deleted)")).and_then(|l| l.rsplit('/').next()).filter(|n| !n.is_empty());
+    match from_exe {
+        Some(name) => Some(name.to_string()),
+        None => comm().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()),
+    }
 }
 
 #[cfg(target_os = "linux")]

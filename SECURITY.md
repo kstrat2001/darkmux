@@ -120,7 +120,7 @@ frame:
   What remains is structural rather than a bug.
 
   **Truncating the tail of a file is undetectable, and it is the least
-  conspicuous of the three** — it leaves a present, plausible-looking file
+  conspicuous of the ceilings below** — it leaves a present, plausible-looking file
   rather than a missing day. Delete the last record line (or the last k of them)
   and the walk sees a shorter but fully consistent chain: every `prev_hash`
   links, every byte-hash matches, the file reports valid. Nothing records how many records a file should contain or
@@ -136,6 +136,20 @@ frame:
   `darkmux doctor` name the sidecar. Anyone with write access can produce the
   same file shape, so a sidecar is a signal to look, not a finding.
 
+  A day file whose chain **starts over** is flagged, not passed: one cut to a
+  header-shaped prefix (its bytes go to a `<day>.jsonl.torn-restart-<ts>`
+  sidecar), one cut to whitespace, and one emptied to 0 bytes (an empty restart
+  sidecar; the file is flagged before the next write too). An emptied file is
+  told apart from one just created by its timestamps (modified after it was
+  born), so on a filesystem that records no creation time, or after someone
+  resets the modification time, an emptied file reads as new. `flow
+  integrity-check` exits **3** for a restart: every chain verifies, but it does
+  not cover the whole day. It exits 3 as well when the local flow files record
+  a **dropped audit write** (`audit.write_failed`, left when the audit sink
+  could not write a record) on any day the audit trail covers, since the chain
+  itself cannot show a record that never reached it; `darkmux doctor` names
+  those days. A break (exit 2) wins over both.
+
   **Whole-file deletion is undetectable**, because each per-day file seeds its
   own chain and nothing records which files should exist.
 
@@ -143,7 +157,19 @@ frame:
   attacker with write access who rewrites a file wholesale (fresh header,
   recomputed hashes, relinked `prev_hash`) produces one that validates.
 
-  All three ceilings are inherent to an anchorless local chain. What the walk
+  **A restart can be hidden.** Empty a day file (or cut it to a header-shaped
+  prefix), let the next write reseed it, then delete the restart sidecar that
+  write left: the day file holds a short chain that verifies, nothing else
+  records that it started over, and `flow integrity-check` exits 0. The
+  sidecar is the only record of the restart, and anyone with write access to
+  the audit dir can remove it.
+
+  **A dropped audit write can be hidden.** Its only record is the
+  `audit.write_failed` breadcrumb in the local flow file, and the local flow
+  files are not hash-chained: delete those lines and neither `darkmux doctor`
+  nor `flow integrity-check` reports the gap.
+
+  All five ceilings are inherent to an anchorless local chain. What the walk
   does catch: in-place edits, reordering, insertion, and **any deletion that is
   not a pure suffix** — removing the first record, or a run from the middle,
   breaks the following record's `prev_hash` linkage. Only records removed from

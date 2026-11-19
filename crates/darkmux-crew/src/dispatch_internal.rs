@@ -7300,6 +7300,7 @@ fn prepare_container_run(
         (image_arg.as_deref(), kind),
         execution,
     )?;
+    let system_prompt = run_system_prompt(system_prompt, &image, &workspace);
 
     Ok(ContainerRun {
         workspace_cleanup,
@@ -7321,6 +7322,29 @@ fn prepare_container_run(
         leased_job,
         toolchain: Default::default(),
     })
+}
+
+/// (contract 6) The system prompt as a `kind` sandbox's runtime sends it:
+/// `/workspace` named where that sandbox sees `workspace` (a container:
+/// unchanged; a sandbox on the host: the workspace's host path), by the
+/// runtime's path-boundary rule. The dispatch records the hash of this text
+/// and passes it as `--system`, which the runtime sends byte for byte, so
+/// `system_sha256` is the hash of the bytes sent on every backend.
+pub(crate) fn system_prompt_as_sent(prompt: String, kind: Option<darkmux_sandbox::BackendKind>, workspace: &Path) -> String {
+    let root = darkmux_sandbox::seen_at(kind, workspace, "/workspace");
+    crate::mission_config::workspace_paths::named_as(&prompt, &root)
+}
+
+/// (contract 6) [`system_prompt_as_sent`] for the backend `image` was
+/// resolved for, the one that runs the dispatch.
+fn run_system_prompt(prompt: String, image: &RuntimeImage, workspace: &Path) -> String {
+    system_prompt_as_sent(prompt, Some(image.kind), workspace)
+}
+
+/// The backend that launches a dispatch on `image`: the one it was resolved
+/// for, never the setting read again (a model load can sit between them).
+fn run_backend(image: &RuntimeImage) -> &'static dyn darkmux_sandbox::SandboxBackend {
+    darkmux_sandbox::backend_of(image.kind)
 }
 
 /// The container brain after [`container_brain_route`]: the brain, the route
@@ -7576,7 +7600,8 @@ struct RuntimeImage {
     /// `None` under Docker.
     host_runtime: Option<HostRuntime>,
     /// The backend this image was resolved for: the one that launches the
-    /// dispatch ([`run_backend`]) and whose network the model URLs it is
+    /// dispatch ([`run_backend`]), whose workspace path the system prompt
+    /// names ([`run_system_prompt`]) and whose network the model URLs it is
     /// handed are written for, read once.
     kind: darkmux_sandbox::BackendKind,
 }
@@ -7841,12 +7866,6 @@ fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool, kind: da
         }
     );
     Ok(RuntimeImage { inject, darkmux_image, image, run_image, host_runtime: None, kind })
-}
-
-/// The backend that launches a dispatch on `image`: the one it was resolved
-/// for, never the setting read again (a model load can sit between them).
-fn run_backend(image: &RuntimeImage) -> &'static dyn darkmux_sandbox::SandboxBackend {
-    darkmux_sandbox::backend_of(image.kind)
 }
 
 /// Step 1, load the role manifest + .md prompt: the role, its assembled
@@ -15807,15 +15826,20 @@ fn strict_selection_enabled() -> bool {
 ///
 /// Comparing against the minted identifier recognizes both forms and still
 /// excludes a hand-loaded bare copy, because a resident darkmux did not load
-/// cannot carry the identifier this profile would have minted.
+/// cannot carry the identifier this profile would have minted. The rule is
+/// [`darkmux_gestalt::is_own_instance`], the planner's own: the default
+/// `darkmux:<id>` identifier names the instance by itself (a variant or path
+/// id is listed under a key other than its id), and an explicit identifier
+/// also needs the listed key, so one left in place after the `id` changed
+/// never reuses the old model's load.
 pub(crate) fn is_reloadable_target(
     resident_model: &str,
     resident_identifier: &str,
     want: &str,
     want_identifier: Option<&str>,
 ) -> bool {
-    resident_model == want
-        && resident_identifier == darkmux_gestalt::namespaced_identifier(want, want_identifier)
+    let identifier = darkmux_gestalt::namespaced_identifier(want, want_identifier);
+    darkmux_gestalt::is_own_instance(resident_identifier, resident_model, want, &identifier)
 }
 
 /// What the dispatch residency preflight does about the resident set for one
@@ -16124,7 +16148,8 @@ fn ensure_model_resident_from(
         // satisfies the declared context — the namespace contract says a
         // resident `darkmux:<id>` at the right context IS the thing to reuse.
         Err(e) if identifier_already_resident(&format!("{e:#}")) => {
-            match decide_preflight(&pm.id, want_identifier, n_ctx, &list()) {
+            let listed = list();
+            match decide_preflight(&pm.id, want_identifier, n_ctx, &listed) {
                 PreflightDecision::Reuse { resident_ctx, .. } => {
                     eprintln!(
                         "darkmux dispatch: `{identifier}` was already resident at context {resident_ctx} \
@@ -16136,29 +16161,58 @@ fn ensure_model_resident_from(
                 PreflightDecision::Reload { stale_ctx, .. } => bail!(
                     "darkmux: `{identifier}` is already resident at context {stale_ctx} but this \
                      dispatch declares n_ctx={n_ctx}, and the load that would have fixed \
-                     that was refused because the identifier is taken. Evict it with \
-                     `darkmux machine eject`, then retry. (#2318)"
+                     that was refused because the identifier is taken: {}. (#2318)",
+                    free_identifier_hint(&identifier)
                 ),
-                // Say only what is known. LMStudio refused the load as
-                // already-resident, and the follow-up `lms ps` probe did not
-                // list it — which is equally consistent with the probe itself
-                // failing (`list_loaded().unwrap_or_default()` yields an empty
-                // list on error) as with a residency the match missed. Asserting
-                // the latter would name a cause this path cannot distinguish;
-                // #2318 is cited as where this was first seen, not as a
-                // diagnosis.
-                PreflightDecision::LoadFresh { .. } => bail!(
-                    "darkmux: loading `{model_key}` at n_ctx={n_ctx} was refused because \
-                     `{identifier}` is already taken, but the follow-up `lms ps` probe \
-                     listed no resident under that identifier — so either the probe failed \
-                     or something holds the identifier that darkmux cannot see. Check \
-                     `lms ps`; evict with `darkmux machine eject` if a stale darkmux \
-                     instance is holding it. (seen in #2318) Original error: {e:#}"
-                ),
+                PreflightDecision::LoadFresh { .. } => {
+                    Err(identifier_taken_error(model_key, n_ctx, &identifier, &listed, &e))
+                }
             }
         }
         Err(e) => Err(e),
     }
+}
+
+/// (#2318) How the operator frees `identifier` after a load was refused
+/// because it is taken. `darkmux machine eject` unloads only the `darkmux:`
+/// namespace, so it is named only for such an identifier; an opt-out
+/// identifier is freed with `lms unload`, or the profile model is given a
+/// namespaced one.
+pub(crate) fn free_identifier_hint(identifier: &str) -> String {
+    if darkmux_gestalt::is_darkmux_owned(identifier) {
+        return "evict it with `darkmux machine eject`, then retry".to_string();
+    }
+    format!(
+        "`{identifier}` is outside the `darkmux:` namespace, so free it with `lms unload {identifier}` if \
+         nothing else needs it, or give this profile model a `darkmux:`-prefixed `identifier`, then retry"
+    )
+}
+
+/// (#2318) The refusal when a load was refused as identifier-taken and the
+/// re-probe of `listed` found nothing darkmux may reuse or reload.
+fn identifier_taken_error(model_key: &str, n_ctx: u32, identifier: &str, listed: &[darkmux_types::LoadedModel], e: &anyhow::Error) -> anyhow::Error {
+    let hint = free_identifier_hint(identifier);
+    // A holder the probe listed is a load of another model under this
+    // identifier (an opt-out identifier is matched with its key).
+    if let Some(holder) = listed.iter().find(|m| m.identifier == identifier) {
+        return anyhow::anyhow!(
+            "darkmux: loading `{model_key}` at n_ctx={n_ctx} was refused because `{identifier}` is \
+             already taken by a load of `{}`, which is not this profile model's instance: {hint}. (#2318)",
+            holder.model
+        );
+    }
+    // Say only what is known. LMStudio refused the load as already-resident,
+    // and the follow-up `lms ps` probe did not list it, which is equally
+    // consistent with the probe itself failing (`list_loaded()
+    // .unwrap_or_default()` yields an empty list on error) as with a
+    // residency the match missed. #2318 is cited as where this was first
+    // seen, not as a diagnosis.
+    anyhow::anyhow!(
+        "darkmux: loading `{model_key}` at n_ctx={n_ctx} was refused because `{identifier}` is already \
+         taken, but the follow-up `lms ps` probe listed no resident under that identifier, so either the \
+         probe failed or something holds the identifier that darkmux cannot see. Check `lms ps`; if a stale \
+         instance is holding it, {hint}. (seen in #2318) Original error: {e:#}"
+    )
 }
 
 /// What the residency preflight does before it loads, given its decision.
