@@ -167,6 +167,12 @@ impl Platform for LinuxPlatform {
     /// From `/bin/sh`'s ELF interpreter: musl where it is `ld-musl-*`
     /// (Alpine's busybox, `gcompat` installed or not), glibc otherwise and
     /// when it cannot be read ([`crate::c_library_of_program`]).
+    /// `ARG_MAX` (a quarter of the stack limit) bounds everything together,
+    /// and `MAX_ARG_STRLEN` (32 pages) bounds each string on its own.
+    fn exec_env_limits(&self) -> crate::ExecEnvLimits {
+        crate::ExecEnvLimits { per_string: crate::page_size().map(crate::linux_max_arg_strlen), total: crate::arg_max() }
+    }
+
     fn c_library(&self) -> Option<crate::CLibrary> {
         Some(crate::c_library_of_program(&shell()))
     }
@@ -228,6 +234,16 @@ impl Platform for LinuxPlatform {
                 .map(|(at, inode)| crate::PortListener { addr: Some(at.ip()), text: at.ip().to_string(), scope: None, pid: owner(inode) })
                 .collect(),
         )
+    }
+
+    /// The LISTEN sockets in `/proc/net/tcp` and `tcp6`, every owner's.
+    fn tcp_listening_ports(&self) -> Option<Vec<u16>> {
+        let mut listening = listening_sockets(&read_to_string("/proc/net/tcp")?);
+        listening.extend(listening_sockets(&read_to_string("/proc/net/tcp6").unwrap_or_default()));
+        let mut ports: Vec<u16> = listening.iter().map(|(at, _)| at.port()).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        Some(ports)
     }
 
     /// The ESTABLISHED sockets in `/proc/net/tcp` and `tcp6` (where a

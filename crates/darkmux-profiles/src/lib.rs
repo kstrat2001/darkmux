@@ -299,6 +299,30 @@ mod wrong_type_tests {
 }
 
 #[cfg(test)]
+mod duplicate_key_tests {
+    /// A key written twice in the registry, top level or inside a profile's
+    /// model, is refused naming its path. The registry loader reads a
+    /// `serde_json::Value`, which silently keeps the last copy: the
+    /// operator's first value is dropped with no word, so the gate says it.
+    #[test]
+    fn a_duplicate_registry_key_is_refused_naming_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let doc = serde_json::json!({"profiles": {"p": {"models": [{"n_ctx": 32000, "id": "m"}]}}});
+        for (pointer, want) in [("", "profiles"), ("/profiles/p/models/0", "profiles.p.models[0].n_ctx")] {
+            let (text, key) = darkmux_types::user_files::with_duplicate_key(&doc, pointer);
+            assert_eq!(key, want);
+            std::fs::write(&path, &text).unwrap();
+            assert!(crate::profiles::load_registry_quiet(path.to_str()).is_ok(), "precondition: the lenient load keeps the last copy");
+            let msg = crate::profiles::user_file_problem(&path).expect("refused").to_string();
+            assert!(msg.contains(&format!("duplicate key `{want}`")), "{msg}");
+            let refusal = crate::preflight_with(darkmux_types::config_enum::Scope::Dispatch, Some(path.to_str().unwrap())).unwrap_err();
+            assert!(refusal.to_string().contains(&format!("duplicate key `{want}`")), "{refusal}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod unloadable_registry_tests {
     use darkmux_types::user_files::Problem;
 

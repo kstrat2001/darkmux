@@ -179,6 +179,18 @@ darkmux release.
   `gpu_w_max`, the highest GPU-rail watts any telemetry sample in the run window read, busy or
   not. `None`, and listed in `host_unmeasured`, where no sample reads a GPU rail. Additive.
 
+### Changed
+
+- **A `procedural.shell` step gets every dependency's output as a file, and a variable too large for the
+  environment is unset.** Each input is written whole to `$DARKMUX_STEP_INPUTS_DIR/<DEP-ID>`, an
+  owner-only directory removed when the command finishes, whatever its size. An input that fits the
+  environment is still `$DARKMUX_STEP_INPUT_<DEP-ID>`, as before: up to about 120 KiB each on Linux
+  (its per-variable limit) and 768 KiB for all of them on macOS (three quarters of `ARG_MAX`). One past
+  that leaves its variable **unset**, where it used to fail the step's spawn with `Argument list too
+  long`. darkmux says so on stderr, and a step whose command names an unset variable is recorded as
+  degraded, naming the file to read instead, so the run's verdict does not read Clean. Read the file
+  when an input can be large; see the missions guide.
+
 ### Fixed
 
 - **Flow records: lab runs stay off hooks, a failed write is said, and the audit trail's gaps stay
@@ -196,6 +208,12 @@ darkmux release.
   next write too), and doctor warns on a restart even with nothing set aside. **Exit code change:** `flow
   integrity-check` exits **3** when every chain verifies but the trail is incomplete (a restarted chain
   or a recorded dropped write); it used to exit 0. A break still exits 2.
+
+- **A step command's output is bounded, not only its time.** `procedural.shell`, the `mods.gate`
+  `test_command`, lab verify commands and grader suites kept everything a command wrote; a chatty one
+  could fill memory within the 600 s default bound. Each stream now keeps its first 768 KiB and last
+  256 KiB, with a note where the middle was naming the bytes cut, and a shell step whose output was cut
+  is recorded as degraded.
 
 - **Text a model, a peer or an endpoint wrote can no longer drive your terminal.** `mod list` and
   `mod show` (a kit a local seat wrote through `create_mod`), `finding list` and `finding show`,

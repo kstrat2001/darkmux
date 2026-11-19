@@ -5,7 +5,7 @@
 
 use super::*;
 use darkmux_types::test_isolation::IsolatedState;
-use darkmux_types::user_files::{key_issues, no_retired, open_objects, Problem, Reach};
+use darkmux_types::user_files::{key_issues, no_retired, open_objects, with_duplicate_key, Problem, Reach};
 use serde_json::{json, Value};
 
 fn embedded(table: &[(&str, &str)], id: &str) -> Value {
@@ -128,6 +128,72 @@ fn each_kind_refuses_an_unknown_key_at_every_consuming_preflight_naming_the_clos
             }
         }
     }
+}
+
+fn write_text(state: &IsolatedState, subdir: &str, text: &str) -> std::path::PathBuf {
+    let dir = state.join(subdir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("probe.json");
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+/// A key written twice, at the top level or nested, is refused for every
+/// kind at every preflight that consumes it and at no other. A
+/// `serde_json::Value` keeps only the last copy, so the gate never saw it,
+/// while the typed load of a role, skill or crew refuses the whole file
+/// over it and the builtin of the same id silently stands in.
+#[test]
+#[serial_test::serial]
+fn each_kind_refuses_a_duplicate_key_at_every_consuming_preflight() {
+    let nested = [
+        (UserFileKind::Role, "/tool_palette"),
+        (UserFileKind::Skill, "/keywords/0"),
+        (UserFileKind::Crew, "/members/0"),
+        (UserFileKind::MissionConfig, "/phases/0/tasks/0"),
+        (UserFileKind::Rule, "/search"),
+    ];
+    for case in cases() {
+        let inner = nested.iter().find(|(k, _)| *k == case.kind).map(|(_, p)| *p).expect("a nested object per kind");
+        for pointer in ["", inner] {
+            let (text, key) = with_duplicate_key(&case.clean, pointer);
+            let state = IsolatedState::new();
+            let path = write_text(&state, case.subdir, &text);
+            let found = problems(case.kind, Reach::Every);
+            assert_eq!(found.len(), 1, "{:?} {key}: {found:?}", case.kind);
+            let msg = found[0].to_string();
+            assert!(msg.contains(&path.display().to_string()), "names the file: {msg}");
+            assert!(msg.contains(&format!("duplicate key `{key}`")), "names the key: {msg}");
+            for scope in Scope::ALL {
+                let refused = preflight(scope).err().map(|r| r.to_string());
+                if case.kind.scopes().contains(&scope) {
+                    let r = refused.unwrap_or_else(|| panic!("{:?} {key} must be refused at {scope:?}", case.kind));
+                    assert!(r.contains(&format!("duplicate key `{key}`")), "{r}");
+                } else {
+                    assert_eq!(refused, None, "{:?} is not consumed at {scope:?}", case.kind);
+                }
+            }
+        }
+    }
+}
+
+/// The danger the refusal guards: a user role with a key written twice
+/// fails its typed load, and the builtin of the same id runs in its place.
+#[test]
+#[serial_test::serial]
+fn a_role_with_a_duplicate_key_would_be_replaced_by_the_builtin() {
+    let state = IsolatedState::new();
+    let mut role = embedded(crate::loader::BUILTIN_ROLES, "code-reviewer");
+    role.as_object_mut().unwrap().shift_insert(0, "id".into(), json!("code-reviewer"));
+    role["skills"] = json!([]);
+    let (text, key) = with_duplicate_key(&role, "");
+    assert_eq!(key, "id");
+    write_text(&state, "roles", &text);
+    let loaded = crate::loader::load_roles().unwrap();
+    let reviewer = loaded.iter().find(|r| r.id == "code-reviewer").unwrap();
+    assert!(!reviewer.skills.is_empty(), "precondition: the builtin stood in for the user copy");
+    let refusal = preflight(Scope::Dispatch).expect_err("refused").to_string();
+    assert!(refusal.contains("duplicate key `id`"), "{refusal}");
 }
 
 #[test]
@@ -260,7 +326,7 @@ fn a_mistyped_value_is_refused_where_the_loader_would_fall_back_to_the_builtin()
     assert!(!reviewer.skills.is_empty() && reviewer.prompt_path.is_none(), "precondition: the builtin stood in");
     for scope in [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun] {
         let refusal = preflight(scope).expect_err("refused").to_string();
-        assert!(refusal.contains("`skills` must be a list, got \"code-reviewing\""), "{scope:?}: {refusal}");
+        assert!(refusal.contains("`skills` must be a list, got a string"), "{scope:?}: {refusal}");
     }
 }
 
