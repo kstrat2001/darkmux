@@ -279,13 +279,13 @@ pub struct Totals {
     pub edges: Vec<EdgeLedgerEntry>,
 }
 
-/// `Deserialize` added in #1959 packet 2 (this struct and every type it
-/// contains — `PlanSource`/`SkippedEntry`/`EdgeLedgerEntry`/`RuleTotal`/
-/// `Totals`) for `darkmux mission launch crawl --param plan=<plan.json>`:
-/// the launcher loads a plan a prior `darkmux crawl plan` run already
-/// wrote, rather than re-planning, and verifies each source's `sha` still
-/// matches the resolved tree before dispatching anything. No wire-format
-/// change — every field this crate already writes reads back unchanged.
+/// `Deserialize` (#1959 packet 2) covers this struct and every type it
+/// contains (`PlanSource`/`SkippedEntry`/`EdgeLedgerEntry`/`RuleTotal`/
+/// `Totals`), so a plan a `crawl.plan` step wrote reads back: each
+/// `dispatch.unit` step reads the plan its config names
+/// (`Output::<Plan>::read`, which checks the content id before the body),
+/// and the run's summary reads every `plan/<rule>.json` the run wrote. No
+/// wire-format change: every field this crate writes reads back unchanged.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]

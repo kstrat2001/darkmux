@@ -2,8 +2,8 @@
 //! review resourcing resolver — the single planning step that staffs a
 //! review's roles via the role→profile flip: each review role resolves
 //! INDEPENDENTLY through the machine-local `role_profiles` map (with a
-//! per-run launch override on top, and `default_profile` as the fresh-user
-//! floor). It hands the review driver a [`ResolvedReviewRoles`] whose
+//! profile the task or step names on top, and `default_profile` as the
+//! fresh-user floor). It hands the review driver a [`ResolvedReviewRoles`] whose
 //! `staffing` snapshot records what resolved and WHY (role → profile →
 //! model → binding-source), so the run's envelope shows truth (operator
 //! sovereignty #44).
@@ -51,7 +51,7 @@ pub struct StaffingProvenance {
 
 impl StaffingProvenance {
     /// (#1475) A seat staffed by the role→profile flip: the role was resolved by
-    /// a per-run launch override (`source = "launch override"`), through the
+    /// a profile the task or step names (`source = "named by the task or step"`), through the
     /// machine-local `role_profiles` map (`source = "role_profiles map"`), or
     /// fell through to `default_profile` (`source = "default_profile fallback"`,
     /// the fresh-user floor). Names the whole role→profile→model chain so the

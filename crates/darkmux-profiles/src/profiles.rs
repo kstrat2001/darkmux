@@ -345,9 +345,11 @@ pub fn get_profile<'a>(reg: &'a ProfileRegistry, name: &str) -> Result<&'a Profi
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RoleProfileSource {
-    /// (#1475 packet 3) The role was bound by a per-run launch override
-    /// (`mission launch review --param <role>=<profile>`) — highest precedence,
-    /// above the `role_profiles` map and `default_profile`.
+    /// (#1475 packet 3) The role was bound by a profile the run itself names:
+    /// a task's or step's `profile_name` (`review`'s `mod_seat_profile` input
+    /// reaches its seat this way). Highest precedence, above the
+    /// `role_profiles` map and `default_profile`. `mission launch` takes no
+    /// `--param <role>=<profile>` override (an undeclared input is refused).
     Overridden,
     /// The role was bound to this profile by the `role_profiles` map.
     Mapped,
@@ -359,7 +361,7 @@ impl RoleProfileSource {
     /// The words `mission config show` prints for the tier.
     pub fn label(self) -> &'static str {
         match self {
-            RoleProfileSource::Overridden => "launch override (--param)",
+            RoleProfileSource::Overridden => "named by the task or step",
             RoleProfileSource::Mapped => "role_profiles map",
             RoleProfileSource::DefaultFallback => "default_profile fallback",
         }
@@ -368,14 +370,15 @@ impl RoleProfileSource {
 
 /// (#1475 packet 3) The origin of a role→profile binding, supplied to
 /// [`resolve_role_profile_with`] so it can stamp the right [`RoleProfileSource`]
-/// without collapsing a per-run launch override into a plain map binding.
+/// without collapsing a profile the run names into a plain map binding.
 /// Precedence (override > map > unmapped) is decided by the CALLER building this
 /// value; the resolver only reads which tier won. Owns its profile name so a
 /// caller can build it from `config_access`'s owned `Option<String>` return
 /// without lifetime gymnastics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoleBinding {
-    /// A per-run launch override (`--param <role>=<profile>`). Highest precedence.
+    /// A profile the run itself names (a task's or step's `profile_name`).
+    /// Highest precedence.
     Overridden(String),
     /// The machine-local `role_profiles` map binding in `config.json`.
     Mapped(String),
@@ -410,10 +413,11 @@ pub fn resolve_role_profile<'a>(
     role_id: &str,
     registry: &'a ProfileRegistry,
 ) -> Result<ResolvedRoleProfile<'a>> {
-    // The config-only production entry knows nothing of launch overrides — it
-    // reads the `role_profiles` map (→ `Mapped`) or resolves unmapped
-    // (→ `Unmapped`). Override bindings enter only via `resolve_role_profile_with`
-    // from a launcher that has the `--param <role>=<profile>` values (#1475 packet 3).
+    // The config-only production entry knows nothing of a profile the run
+    // names: it reads the `role_profiles` map (→ `Mapped`) or resolves
+    // unmapped (→ `Unmapped`). `Overridden` enters only via
+    // `resolve_role_profile_with`, from a caller holding a task's or step's
+    // `profile_name` (the mission launch staffing gate).
     let binding = match darkmux_types::config_access::role_profile(role_id) {
         Some(p) => RoleBinding::Mapped(p),
         None => RoleBinding::Unmapped,
@@ -474,12 +478,14 @@ pub fn resolve_role_profile_with<'a>(
             }
             let available: Vec<&str> = registry.profiles.keys().map(String::as_str).collect();
             let listed = if available.is_empty() { "(none)".to_string() } else { available.join(", ") };
-            // The fix suggestion tracks the binding tier: an override is fixed
-            // on the launch line, a map binding via `config set`.
+            // The fix suggestion tracks the binding tier: a profile the run
+            // names is fixed where it is named, a map binding via `config set`.
             let (how, fix) = match source {
                 RoleProfileSource::Overridden => (
-                    "is overridden to",
-                    format!("check the `--param {role_id}=<profile>` launch value"),
+                    "is staffed by the run with",
+                    "check the profile the task or step names (its `profile_name`; `review`'s \
+                     `mod_seat_profile` input sets one)"
+                        .to_string(),
                 ),
                 _ => (
                     "is mapped to",
@@ -1066,7 +1072,7 @@ mod tests {
 
     #[test]
     fn resolve_overridden_role_binds_and_records_overridden_source() {
-        // (#1475 packet 3) A per-run launch override binds identically to a map
+        // (#1475 packet 3) A profile the run names binds identically to a map
         // binding, but the recorded source is `Overridden` (highest precedence)
         // so the envelope names the winning tier.
         let reg = two_profile_reg();
@@ -1076,16 +1082,23 @@ mod tests {
     }
 
     #[test]
-    fn resolve_overridden_to_nonexistent_profile_names_the_launch_value() {
-        // (#1475 packet 3) A bad override profile is a loud error whose fix
-        // suggestion points at the launch line, not `config set`.
+    fn resolve_overridden_to_nonexistent_profile_names_where_the_profile_was_named() {
+        // A bad profile named by the run (a task's or step's `profile_name`)
+        // is a loud error whose fix points at that name, not `config set`
+        // and not a `--param <role>=<profile>` no launch accepts.
         let reg = two_profile_reg();
         let err = resolve_role_profile_with("judge", &RoleBinding::Overridden("ghost35b".into()), &reg)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("overridden to"), "names the tier: {err}");
-        assert!(err.contains("ghost35b"), "names the bad profile: {err}");
-        assert!(err.contains("--param judge=<profile>"), "points at the launch value: {err}");
+        assert!(err.contains("is staffed by the run with profile \"ghost35b\""), "names the tier: {err}");
+        assert!(err.contains("`profile_name`"), "points at where it was named: {err}");
+        assert!(!err.contains("--param"), "no launch takes a role override: {err}");
+    }
+
+    #[test]
+    fn the_overridden_label_says_where_the_profile_was_named() {
+        assert_eq!(RoleProfileSource::Overridden.label(), "named by the task or step");
+        assert!(!RoleProfileSource::Overridden.label().contains("--param"));
     }
 
     #[test]
