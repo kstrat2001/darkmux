@@ -114,7 +114,8 @@ pub const LAST_PORT: u16 = 8190;
 
 /// Plan adding the engine `req` names to the registry `text` (the file at
 /// `path`), from what detection found. Writes nothing. `port_free` says
-/// whether nothing listens on a port.
+/// whether a server could listen on a port: nobody's socket holds it
+/// (`darkmux_platform::tcp_port_free`).
 pub fn plan(
     text: &str,
     path: &Path,

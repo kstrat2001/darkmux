@@ -50,13 +50,6 @@ pub fn naming_root(text: &str) -> String {
     naming(text, &root())
 }
 
-/// (#3112 review) The role's `--system` text and the user's message as the
-/// model reads them: both with `/workspace` named as `root` (this run's
-/// [`root`] in production), the same path-boundary rule for each.
-pub fn named_prompts(system: &str, prompt: &str, root: &Path) -> (String, String) {
-    (naming(system, root), naming(prompt, root))
-}
-
 /// `text` with [`DEFAULT_WORKSPACE`] named as `root`, wherever it is the
 /// path itself (#3112 review): preceded by the start or a character that
 /// cannot be part of a path, and followed by the end, `/`, or a character
@@ -392,25 +385,21 @@ mod tests {
         );
     }
 
-    /// (#3112 review) A user's message is renamed like `--system`: a mission
-    /// config copied before `${WORKSPACE_ROOT}` says "mounted at
-    /// `/workspace/<source>`". The runtime's entry renames both, through
-    /// this one function.
+    /// (#3112 review) A user's message is renamed at a path boundary: a
+    /// mission config copied before `${WORKSPACE_ROOT}` says "mounted at
+    /// `/workspace/<source>`". (contract 6) `--system` is not: the host
+    /// hashed it, so it already names where the sandbox sees the workspace
+    /// (`darkmux-crew`'s `system_prompt_as_sent`) and is sent as passed.
     #[test]
-    fn the_users_message_is_renamed_like_the_system_prompt() {
-        let (system, prompt) = named_prompts(
-            "work in /workspace",
-            "the repository is mounted at `/workspace/<source>`, not /workspace2",
-            Path::new("/Users/op/ws"),
-        );
-        assert_eq!(system, "work in /Users/op/ws");
+    fn the_users_message_is_renamed_and_the_system_prompt_is_sent_as_passed() {
+        let prompt = naming("the repository is mounted at `/workspace/<source>`, not /workspace2", Path::new("/Users/op/ws"));
         assert_eq!(prompt, "the repository is mounted at `/Users/op/ws/<source>`, not /workspace2");
-        let same = named_prompts("a /workspace", "b /workspace/x", Path::new(DEFAULT_WORKSPACE));
-        assert_eq!(same, ("a /workspace".to_string(), "b /workspace/x".to_string()));
+        assert_eq!(naming("b /workspace/x", Path::new(DEFAULT_WORKSPACE)), "b /workspace/x");
         let entry = include_str!("../lib.rs");
+        assert!(entry.contains("let prompt = tools::workspace::naming_root(&prompt);"), "the entry renames the user's message");
         assert!(
-            entry.contains("tools::workspace::named_prompts(&system, &prompt, &tools::workspace::root())"),
-            "the runtime's entry must rename both prompts"
+            entry.contains("let system_prompt = args.system.take().unwrap_or_else(|| tools::workspace::naming_root(&default_system_prompt()));"),
+            "the entry sends `--system` as passed and renames only its own default"
         );
     }
 
@@ -432,34 +421,6 @@ mod tests {
         // is renamed, the next match's boundary read from the whole text.
         assert_eq!(renamed("/workspace/workspace/x"), "/Users/op/ws/workspace/x");
         assert_eq!(renamed("/workspace2/workspace"), "/workspace2/workspace");
-    }
-
-    /// (#3112 review) Line 3 of `templates/builtin/roles/tool-bench.md`.
-    pub(crate) const TOOL_BENCH_WORKSPACE_SENTENCE: &str = "You are an assistant operating inside a container. A working directory is mounted at `/workspace` and you have tools to read files, search file contents, run shell commands, and write or edit files.";
-
-    /// (#3112 review) A shipped role whose frozen prompt says the working
-    /// directory is mounted at `/workspace` (`tool-bench`) reaches the model
-    /// naming the host-seen root under a sandbox on the host: the runtime
-    /// renames its `--system` text (`naming_root`), so the frozen text itself
-    /// never changes. Byte-identical under the default root.
-    #[test]
-    fn a_shipped_role_prompt_naming_workspace_is_renamed_to_the_root() {
-        // The shipped sentence, verbatim. It is held here rather than read
-        // from `templates/`, which is outside this crate: the PR-diff mutation
-        // job copies only `runtime/`. `darkmux-crew`'s
-        // `the_tool_bench_role_still_names_the_workspace_the_runtime_renames`
-        // keeps the two in step.
-        let role = TOOL_BENCH_WORKSPACE_SENTENCE;
-        assert_eq!(naming(role, Path::new(DEFAULT_WORKSPACE)), role);
-        let renamed = naming(role, Path::new("/Users/op/ws"));
-        assert!(!renamed.contains("/workspace") && renamed.contains("`/Users/op/ws`"), "{renamed}");
-        // The role reaches the runtime as `--system`, which the runtime's
-        // entry (`lib.rs` since #3558) renames before anything reads it.
-        let entry = include_str!("../lib.rs");
-        assert!(
-            entry.contains("tools::workspace::named_prompts(&system, &prompt, &tools::workspace::root())"),
-            "the runtime's entry must rename the `--system` text"
-        );
     }
 
     /// (#3112 step 2) The root is the env override when set and non-empty,

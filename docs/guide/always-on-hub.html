@@ -312,7 +312,7 @@ brew services restart darkmux                       <span class="comment"># pick
 <section id="phase-4">
   <div class="wrap">
     <h2>Phase 4: Survive at scale</h2>
-    <p>Two habits the hub needs that the daemon doesn't ship: <strong>log rotation</strong> so <code>serve.err</code> doesn't grow forever, and (if you enabled the audit substrate) <strong>a daily integrity check</strong> that fires a notification if the chain ever breaks.</p>
+    <p>Two habits the hub needs that the daemon doesn't ship: <strong>log rotation</strong> so <code>serve.err</code> doesn't grow forever, and (if you enabled the audit substrate) <strong>a daily integrity check</strong> that fires a notification if the chain ever breaks or the trail is incomplete.</p>
 
     <h3>Log rotation via newsyslog</h3>
     <p>macOS's native rotation system is <code>newsyslog</code>. Drop-in configs live under <code>/etc/newsyslog.d/</code>. File: <code>/etc/newsyslog.d/darkmux.conf</code></p>
@@ -338,7 +338,7 @@ sudo newsyslog -nv | grep -i darkmux               <span class="comment"># "will
   &lt;array&gt;
     &lt;string&gt;/bin/zsh&lt;/string&gt;
     &lt;string&gt;-lc&lt;/string&gt;
-    &lt;string&gt;export DARKMUX_AUDIT_DIR="$HOME/.darkmux/audit"; /opt/homebrew/bin/darkmux flow integrity-check; ec=$?; if [ $ec -eq 2 ]; then /usr/bin/osascript -e 'display notification "darkmux audit chain BROKEN: see ~/Library/Logs/darkmux/integrity.log" with title "darkmux integrity-check"'; fi; exit $ec&lt;/string&gt;
+    &lt;string&gt;export DARKMUX_AUDIT_DIR="$HOME/.darkmux/audit"; /opt/homebrew/bin/darkmux flow integrity-check; ec=$?; if [ $ec -eq 2 ]; then /usr/bin/osascript -e 'display notification "darkmux audit chain BROKEN: see ~/Library/Logs/darkmux/integrity.log" with title "darkmux integrity-check"'; elif [ $ec -ne 0 ]; then /usr/bin/osascript -e 'display notification "darkmux audit trail INCOMPLETE (exit '"$ec"'): see ~/Library/Logs/darkmux/integrity.log" with title "darkmux integrity-check"'; fi; exit $ec&lt;/string&gt;
   &lt;/array&gt;
   &lt;key&gt;EnvironmentVariables&lt;/key&gt;
   &lt;dict&gt;
@@ -352,7 +352,7 @@ sudo newsyslog -nv | grep -i darkmux               <span class="comment"># "will
   &lt;key&gt;RunAtLoad&lt;/key&gt;&lt;false/&gt;
 &lt;/dict&gt;
 &lt;/plist&gt;</code></pre>
-    <p><code>darkmux flow integrity-check</code> exits 2 only on chain break; that case fires a desktop notification you can't miss. Exit 0 (the happy path) appends a <code>✓ valid</code> line silently. Load + smoke-test:</p>
+    <p><code>darkmux flow integrity-check</code> exits 2 on a chain break and 3 when every chain verifies but the trail is incomplete (a day file's chain restarted, or the local flow files record a dropped audit write); any other non-zero exit is a check that could not run. Every non-zero exit fires a desktop notification you can't miss, a break with its own wording. Exit 0 (the happy path) appends a <code>✓ valid</code> line silently. Load + smoke-test:</p>
     <pre><code>plutil -lint ~/Library/LaunchAgents/com.darkmux.flow-integrity-check.plist
 launchctl load -w ~/Library/LaunchAgents/com.darkmux.flow-integrity-check.plist
 launchctl start com.darkmux.flow-integrity-check

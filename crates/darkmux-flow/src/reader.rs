@@ -108,6 +108,12 @@ impl UnknownActions {
 /// The day files (`YYYY-MM-DD.jsonl`) in `dir`, newest first, at most
 /// `limit` of them. Empty when `dir` does not exist.
 pub fn recent_day_files(dir: &Path, limit: usize) -> Vec<PathBuf> {
+    day_files(dir).into_iter().rev().take(limit).map(|(_, p)| p).collect()
+}
+
+/// The day files (`YYYY-MM-DD.jsonl`) in `dir` with their days, oldest first.
+/// Empty when `dir` does not exist.
+pub fn day_files(dir: &Path) -> Vec<(String, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut days: Vec<(String, PathBuf)> = entries
         .filter_map(|e| e.ok())
@@ -117,8 +123,8 @@ pub fn recent_day_files(dir: &Path, limit: usize) -> Vec<PathBuf> {
             is_day_stem(stem).then(|| (stem.to_string(), e.path()))
         })
         .collect();
-    days.sort_by(|a, b| b.0.cmp(&a.0));
-    days.into_iter().take(limit).map(|(_, p)| p).collect()
+    days.sort_by(|a, b| a.0.cmp(&b.0));
+    days
 }
 
 fn is_day_stem(stem: &str) -> bool {
