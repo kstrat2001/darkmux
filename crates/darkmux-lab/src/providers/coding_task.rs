@@ -203,7 +203,12 @@ impl WorkloadProvider for CodingTaskProvider {
         // (#3355 review) Where the verify command runs is resolved here too,
         // before the dispatch: a verify that cannot run is refused now, not
         // after the model has spent minutes on the run.
-        let (prompt, verify) = prompt_and_verify_plan(loaded, sandbox_dir)?;
+        //
+        // The one read of `runtime.sandbox` for this run: the prompt names
+        // the workspace for it, the verify command runs in it, the dispatch
+        // runs in it (`DispatchOpts::sandbox`) and the manifest records it.
+        let sandbox = darkmux_sandbox::selected();
+        let (prompt, verify) = prompt_and_verify_plan(loaded, sandbox_dir, &sandbox)?;
         let role = pick_role(loaded);
         let session_id = SessionId::adhoc(run.clone(), &role, &loaded.manifest.workload.id);
         // (#2511) Report the id back to the lab harness BEFORE dispatching —
@@ -260,6 +265,7 @@ impl WorkloadProvider for CodingTaskProvider {
             config_path,
             out_dir,
             loaded,
+            sandbox.clone().ok(),
         )
         .and_then(dispatch_via_internal)?;
         let duration_ms = started.elapsed().as_millis();
@@ -385,6 +391,7 @@ impl WorkloadProvider for CodingTaskProvider {
                 final_hash,
                 refused_artifacts: &refused_artifacts,
                 verify: verify_outcome,
+                sandbox,
             },
             &dispatched,
         )
@@ -630,13 +637,7 @@ fn reject_escaping_relpath(raw: &str, label: &str) -> Result<()> {
 const WORKSPACE_AT: &str = "/workspace";
 
 /// The prompt as the dispatch gives it to the model, whose workspace is
-/// `sandbox_dir`: the sandbox placeholders expanded to where the configured
-/// sandbox sees it.
-pub(crate) fn dispatched_prompt(loaded: &LoadedWorkload, sandbox_dir: &Path) -> Result<String> {
-    dispatched_prompt_for(loaded, sandbox_dir, darkmux_sandbox::selected().ok())
-}
-
-/// [`dispatched_prompt`] under `kind`: `/workspace` in a container (byte for
+/// `sandbox_dir`, under `kind`: `/workspace` in a container (byte for
 /// byte what every Docker run was told), the workspace's own host path in a
 /// sandbox on the host (#3112 review: a Seatbelt brief that said
 /// `/workspace` sent the model looking for files that are not there). The
@@ -702,6 +703,7 @@ fn dispatch_opts(
     config_path: Option<&str>,
     host_out: PathBuf,
     loaded: &LoadedWorkload,
+    sandbox: Option<darkmux_sandbox::BackendKind>,
 ) -> Result<darkmux_crew::dispatch::DispatchOpts> {
     let lab_inputs = crate::providers::lab_inputs(loaded)?;
     let image = loaded.manifest.workload.image.as_deref();
@@ -745,7 +747,7 @@ fn dispatch_opts(
         force_container: false,
         max_completion_tokens: None,
         image: image.map(str::to_string),
-        sandbox: None,
+        sandbox,
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
@@ -1095,15 +1097,19 @@ pub(crate) struct TestRunner {
 }
 
 impl TestRunner {
-    /// In a container on the workload's image (else the runtime image),
-    /// unless the operator opted in to the host with `runtime.tests_on_host`.
-    pub(crate) fn for_workload(loaded: &LoadedWorkload) -> Result<Self> {
+    /// In a container on the workload's image (else the runtime image) in
+    /// the run's `sandbox`, unless the operator opted in to the host with
+    /// `runtime.tests_on_host`.
+    pub(crate) fn for_workload(
+        loaded: &LoadedWorkload,
+        sandbox: std::result::Result<darkmux_sandbox::BackendKind, String>,
+    ) -> Result<Self> {
         if darkmux_types::config_access::tests_on_host() {
             return Ok(Self::host());
         }
-        let sandbox = darkmux_sandbox::selected().map_err(|why| anyhow::anyhow!(why))?;
-        let image = contained_command::lab_test_image(loaded.manifest.workload.image.as_deref())?;
-        Ok(Self { placement: Placement::Container(image), user: contained_command::lab_test_user()?, sandbox: Some(sandbox) })
+        let sandbox = sandbox.map_err(|why| anyhow::anyhow!(why))?;
+        let image = contained_command::lab_test_image_in(sandbox, loaded.manifest.workload.image.as_deref())?;
+        Ok(Self { placement: Placement::Container(image), user: contained_command::lab_test_user_in(sandbox)?, sandbox: Some(sandbox) })
     }
 
     pub(crate) fn host() -> Self {
@@ -1136,10 +1142,14 @@ pub(crate) struct VerifyPlan {
 }
 
 /// The prompt as dispatched, and the verify plan: everything a run resolves
-/// before it dispatches.
-fn prompt_and_verify_plan(loaded: &LoadedWorkload, sandbox_dir: &Path) -> Result<(String, Option<VerifyPlan>)> {
-    let prompt = dispatched_prompt(loaded, sandbox_dir)?;
-    Ok((prompt, verify_plan(loaded, sandbox_dir, TestRunner::for_workload)?))
+/// before it dispatches, both for the run's `sandbox`.
+fn prompt_and_verify_plan(
+    loaded: &LoadedWorkload,
+    sandbox_dir: &Path,
+    sandbox: &std::result::Result<darkmux_sandbox::BackendKind, String>,
+) -> Result<(String, Option<VerifyPlan>)> {
+    let prompt = dispatched_prompt_for(loaded, sandbox_dir, sandbox.clone().ok())?;
+    Ok((prompt, verify_plan(loaded, sandbox_dir, |l| TestRunner::for_workload(l, sandbox.clone()))?))
 }
 
 /// The workload's verify plan; `None` when it declares no verify command,
@@ -1191,7 +1201,7 @@ fn run_verify_command(
         name_prefix: "darkmux-verify",
     };
     let ran = contained_command::run(&plan.runner.placement, &run, darkmux_crew::bounded_command::configured_timeout());
-    let (passed, details, output) = verify_result(ran, &plan.command)?;
+    let (passed, details, output) = verify_result(ran, &plan.command, plan.runner.sandbox)?;
     fs::write(run_dir.join("verify-output.txt"), &output)?;
     Ok(Some(crate::workloads::types::VerifyOutcome { passed, details }))
 }
@@ -1225,7 +1235,7 @@ fn verify_workdir(cwd: Option<&str>, view: &str) -> Result<String> {
 }
 
 /// (#3112) Why a verify command never ran, naming the sandbox it was to run
-/// in (`kind`, the configured one) and, under Docker alone, why Docker.
+/// in (`kind`, the run's) and, under Docker alone, why Docker.
 fn not_run_details(why: &str, kind: Option<darkmux_sandbox::BackendKind>) -> String {
     let (place, docker) = match kind {
         Some(darkmux_sandbox::BackendKind::Docker) => (
@@ -1244,12 +1254,16 @@ fn not_run_details(why: &str, kind: Option<darkmux_sandbox::BackendKind>) -> Str
 /// A verify run's (passed, details, captured output). A container that never
 /// ran the command, or a command that could not start, is a failed verify
 /// that says so, so the run is still recorded (#3355 review); an interrupt
-/// is the one error.
-fn verify_result(ran: Result<Bounded, contained_command::NotRun>, cmd: &str) -> Result<(bool, String, String)> {
+/// is the one error. `sandbox` is where the plan ran it (`None` on the host).
+fn verify_result(
+    ran: Result<Bounded, contained_command::NotRun>,
+    cmd: &str,
+    sandbox: Option<darkmux_sandbox::BackendKind>,
+) -> Result<(bool, String, String)> {
     let ran = match ran {
         Ok(ran) => ran,
         Err(why) => {
-            let details = not_run_details(&why.to_string(), darkmux_sandbox::selected().ok());
+            let details = not_run_details(&why.to_string(), sandbox);
             return Ok((false, details.clone(), format!("{details}\n")));
         }
     };
@@ -1354,6 +1368,8 @@ pub(crate) struct FinishInputs<'a> {
     pub final_hash: Option<String>,
     pub refused_artifacts: &'a [RefusedArtifact],
     pub verify: Option<crate::workloads::types::VerifyOutcome>,
+    /// The backend the run resolved once, for its manifest.
+    pub sandbox: std::result::Result<darkmux_sandbox::BackendKind, String>,
 }
 
 /// The tail of a run: write the manifest and build the result. How the
@@ -1380,7 +1396,7 @@ pub(crate) fn finish_run(f: FinishInputs<'_>, d: &Dispatched) -> Result<RunResul
             isolation: Some(run_isolation(
                 f.loaded.manifest.workload.image.as_deref(),
                 darkmux_types::config_access::tests_on_host(),
-                darkmux_sandbox::selected(),
+                f.sandbox.clone(),
             )),
         },
     )?;
@@ -1681,7 +1697,7 @@ mod tests {
             let run_dir = tmp.path().join(format!("run{i}"));
             fs::create_dir_all(&run_dir).unwrap();
             let d = Dispatched { exit_code, stdout: stdout.into(), stderr: "boom".into() };
-            let r = finish_run(FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, sandbox_dir: tmp.path(), final_hash: None, refused_artifacts: &[], verify: None }, &d).unwrap();
+            let r = finish_run(FinishInputs { loaded: &loaded, run_dir: &run_dir, profile: &profile, profile_name: "p", session_id: &session, duration_ms: 1, sandbox_dir: tmp.path(), final_hash: None, refused_artifacts: &[], verify: None, sandbox: Ok(darkmux_sandbox::BackendKind::Docker) }, &d).unwrap();
             assert_eq!(r.ok, ok, "case {i}");
             assert_eq!(r.escalation.as_deref(), escalation, "case {i}");
             assert_eq!(r.error.is_some(), errored, "case {i}: an escalation is not an error");
@@ -2002,7 +2018,7 @@ mod tests {
         loaded.lab_inputs = Some(inputs.clone());
         let session = darkmux_types::session_id::SessionId::adhoc(darkmux_types::session_id::RunId::lab("r3363").unwrap(), "probe-3363", "coding");
         let build = |loaded: &LoadedWorkload| {
-            dispatch_opts("probe-3363", "p", &session, Some(state.join("sandbox")), Default::default(), "p", None, state.join("out"), loaded)
+            dispatch_opts("probe-3363", "p", &session, Some(state.join("sandbox")), Default::default(), "p", None, state.join("out"), loaded, None)
         };
         let opts = build(&loaded).unwrap();
         assert_eq!(opts.lab_inputs.as_ref(), Some(&inputs), "the eval's exact role bytes");
@@ -2967,30 +2983,72 @@ mod tests {
         assert_eq!(graded_prompt(&loaded).unwrap(), "Fix /workspace/bug.py so the tests in /workspace pass.");
     }
 
-    /// (#3112 review) The production wiring, through `selected()`: under
-    /// `DARKMUX_SANDBOX=seatbelt` (on a Mac) the dispatched prompt names the
-    /// sandbox dir's own path; under Docker (a test build's default)
-    /// `/workspace`.
+    /// The prompt names the workspace where the run's resolved sandbox sees
+    /// it, and the verify plan runs in that same sandbox, whatever
+    /// `runtime.sandbox` says by then: `/workspace` under Docker, the sandbox
+    /// dir's own path on the host. Here the setting says `docker` while the
+    /// run resolved Seatbelt.
     #[test]
     #[serial_test::serial]
-    fn the_dispatched_prompt_follows_the_selected_sandbox() {
+    fn the_prompt_and_the_verify_runner_follow_the_runs_sandbox_not_the_setting() {
+        use darkmux_sandbox::BackendKind;
         let tmp = TempDir::new().unwrap();
         let sandbox = tmp.path().join("sb");
         fs::create_dir_all(&sandbox).unwrap();
         let mut spec = basic_spec();
         spec.prompt = Some("Fix ${SANDBOX}/bug.py".into());
+        spec.verify = Some(serde_json::from_value(serde_json::json!({"command": "true"})).unwrap());
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        assert_eq!(dispatched_prompt(&loaded, &sandbox).unwrap(), "Fix /workspace/bug.py");
-        if !darkmux_sandbox::SeatbeltBackend::available() {
-            return;
-        }
-        let prev = std::env::var_os("DARKMUX_SANDBOX");
-        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
-        let seatbelt = dispatched_prompt(&loaded, &sandbox).unwrap();
+        let keys = ["DARKMUX_SANDBOX", "DARKMUX_TESTS_ON_HOST"];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, env::var_os(k))).collect();
         unsafe {
-            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+            env::set_var("DARKMUX_SANDBOX", "docker");
+            env::set_var("DARKMUX_TESTS_ON_HOST", "false");
         }
-        assert_eq!(seatbelt, format!("Fix {}/bug.py", sandbox.canonicalize().unwrap().display()));
+        // Docker's verify runner would resolve a runtime image; its prompt alone is enough here.
+        let docker = dispatched_prompt_for(&loaded, &sandbox, Some(BackendKind::Docker));
+        let host = prompt_and_verify_plan(&loaded, &sandbox, &Ok(BackendKind::Seatbelt));
+        unsafe {
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => env::set_var(k, v),
+                    None => env::remove_var(k),
+                }
+            }
+        }
+        assert_eq!(docker.unwrap(), "Fix /workspace/bug.py");
+        let (prompt, plan) = host.unwrap();
+        assert_eq!(prompt, format!("Fix {}/bug.py", sandbox.canonicalize().unwrap().display()));
+        let runner = plan.expect("a verify plan").runner;
+        assert_eq!((runner.placement, runner.sandbox), (Placement::Container("host".into()), Some(BackendKind::Seatbelt)));
+    }
+
+    /// The run's dispatch runs in the backend its prompt was written for.
+    #[test]
+    fn the_runs_dispatch_carries_its_sandbox() {
+        let tmp = TempDir::new().unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let session = SessionId::adhoc(RunId::lab("run1").unwrap(), "coder", "w");
+        let opts = dispatch_opts("coder", "p", &session, None, Default::default(), "p", None, tmp.path().join("out"), &loaded, Some(darkmux_sandbox::BackendKind::Seatbelt));
+        assert_eq!(opts.map(|o| o.sandbox).ok().flatten(), Some(darkmux_sandbox::BackendKind::Seatbelt));
+    }
+
+    /// A coding-task run reads `runtime.sandbox` once, in `run`, and carries
+    /// the value to the prompt, the verify plan, the dispatch and the
+    /// manifest; the lab's test-image helpers read it never.
+    #[test]
+    fn a_coding_task_run_reads_the_sandbox_setting_once() {
+        let full = include_str!("coding_task.rs");
+        let src = &full[..full.find("\nmod tests {").expect("the test module")];
+        let reads = src.matches("darkmux_sandbox::selected(").count();
+        assert_eq!(reads, 1, "coding_task.rs reads the setting {reads} times");
+        let crew = include_str!("../../../darkmux-crew/src/contained_command.rs");
+        let crew = &crew[..crew.find("\n#[cfg(test)]").unwrap_or(crew.len())];
+        for f in ["pub fn lab_test_image_in", "pub fn lab_test_user_in"] {
+            let at = crew.find(f).unwrap_or_else(|| panic!("{f}"));
+            let body = &crew[at..at + crew[at..].find("\n}\n").unwrap()];
+            assert!(!body.contains("darkmux_sandbox::selected("), "{f} reads the setting");
+        }
     }
 
     /// What a run resolves before it dispatches: the prompt, and no plan for
@@ -3000,12 +3058,12 @@ mod tests {
     fn the_prompt_and_verify_plan_resolve_before_the_dispatch() {
         let tmp = TempDir::new().unwrap();
         let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
-        let (prompt, plan) = prompt_and_verify_plan(&loaded, tmp.path()).unwrap();
+        let (prompt, plan) = prompt_and_verify_plan(&loaded, tmp.path(), &Ok(darkmux_sandbox::BackendKind::Docker)).unwrap();
         assert_eq!((prompt.as_str(), plan), ("write tests", None));
         let mut spec = basic_spec();
         spec.prompt = None;
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        let err = prompt_and_verify_plan(&loaded, tmp.path()).unwrap_err();
+        let err = prompt_and_verify_plan(&loaded, tmp.path(), &Ok(darkmux_sandbox::BackendKind::Docker)).unwrap_err();
         assert!(err.to_string().contains("must define prompt or promptFile"), "{err}");
     }
 
@@ -3061,7 +3119,7 @@ mod tests {
     #[test]
     fn a_verify_that_never_ran_fails_and_says_why() {
         let never = contained_command::NotRun("Unable to find image".into());
-        let (passed, details, output) = verify_result(Err(never), "npm test").unwrap();
+        let (passed, details, output) = verify_result(Err(never), "npm test", Some(darkmux_sandbox::BackendKind::Docker)).unwrap();
         assert!(!passed && details.contains("Unable to find image") && details.contains("runtime.tests_on_host"), "{details}");
         // (#3112) It names the configured sandbox, and Docker only under it.
         let docker = not_run_details("x", Some(darkmux_sandbox::BackendKind::Docker));
@@ -3072,13 +3130,13 @@ mod tests {
         assert!(seatbelt.contains("runtime.tests_on_host"), "{seatbelt}");
         assert!(output.contains("Unable to find image"));
         let own_125 = Bounded::Finished { success: false, code: Some(125), stdout: vec![], stderr: vec![] };
-        let (passed, details, _) = verify_result(Ok(own_125), "x").unwrap();
+        let (passed, details, _) = verify_result(Ok(own_125), "x", Some(darkmux_sandbox::BackendKind::Docker)).unwrap();
         assert!(!passed && details == "exit 125", "a command's own exit 125 is its own");
-        let (passed, details, output) = verify_result(Ok(Bounded::TimedOut { seconds: 7 }), "x").unwrap();
+        let (passed, details, output) = verify_result(Ok(Bounded::TimedOut { seconds: 7 }), "x", Some(darkmux_sandbox::BackendKind::Docker)).unwrap();
         assert!(!passed && details.contains("7s") && output.contains("7s"));
         let spawn = Bounded::SpawnFailed(std::io::Error::other("no sh"));
-        assert!(!verify_result(Ok(spawn), "x").unwrap().0);
-        assert!(verify_result(Ok(Bounded::Interrupted), "x").is_err());
+        assert!(!verify_result(Ok(spawn), "x", Some(darkmux_sandbox::BackendKind::Docker)).unwrap().0);
+        assert!(verify_result(Ok(Bounded::Interrupted), "x", Some(darkmux_sandbox::BackendKind::Docker)).is_err());
     }
 
     /// (#906) Without the opt-in, a workload's tests run in a container on
@@ -3093,11 +3151,15 @@ mod tests {
         let prev = env::var("DARKMUX_TESTS_ON_HOST").ok();
         unsafe { env::set_var("DARKMUX_TESTS_ON_HOST", "false") };
         assert_eq!(
-            TestRunner::for_workload(&loaded).unwrap().placement,
+            TestRunner::for_workload(&loaded, Ok(darkmux_sandbox::BackendKind::Docker)).unwrap().placement,
             Placement::Container("node:22-bookworm-slim".into())
         );
+        // (#3112) A refused `runtime.sandbox` refuses the run's tests by
+        // name, never falling back to Docker.
+        let why = TestRunner::for_workload(&loaded, Err("runtime.sandbox is `podman`".into())).unwrap_err().to_string();
+        assert!(why.contains("podman") && why.contains("runtime.sandbox"), "{why}");
         unsafe { env::set_var("DARKMUX_TESTS_ON_HOST", "true") };
-        assert_eq!(TestRunner::for_workload(&loaded).unwrap(), TestRunner::host());
+        assert_eq!(TestRunner::for_workload(&loaded, Ok(darkmux_sandbox::BackendKind::Docker)).unwrap(), TestRunner::host());
         unsafe {
             match prev {
                 Some(v) => env::set_var("DARKMUX_TESTS_ON_HOST", v),

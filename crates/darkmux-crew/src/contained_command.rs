@@ -317,14 +317,9 @@ pub fn remove_container(handle: &SandboxHandle) {
 /// (#906) The image a lab run's tests run in: the workload's declared image,
 /// else the darkmux runtime image the dispatch itself runs (resolved and
 /// version-checked the same way, pulled if absent). Refuses when Docker is
-/// not reachable, naming the opt-out.
-pub fn lab_test_image(workload_image: Option<&str>) -> anyhow::Result<String> {
-    let sandbox = darkmux_sandbox::selected().map_err(|why| anyhow::anyhow!(why))?;
-    lab_test_image_in(sandbox, workload_image)
-}
-
-/// [`lab_test_image`] under the selected `sandbox`.
-fn lab_test_image_in(sandbox: darkmux_sandbox::BackendKind, workload_image: Option<&str>) -> anyhow::Result<String> {
+/// not reachable, naming the opt-out. `sandbox` is the backend the run
+/// resolved: on the host there is no image.
+pub fn lab_test_image_in(sandbox: darkmux_sandbox::BackendKind, workload_image: Option<&str>) -> anyhow::Result<String> {
     use anyhow::Context;
     // (#3112 step 2) A Seatbelt sandbox runs this host's own toolchain: there
     // is no image to name, resolve or pull.
@@ -370,10 +365,10 @@ pub fn image_not_used_note(image: &str) -> String {
 /// (#906) The user a lab run's test container runs as: the same answer the
 /// dispatch container gets (the operator's `runtime.container_user`, else
 /// the platform's), so files the tests write into a bind-mounted tree belong
-/// to whoever owns the tree.
-pub fn lab_test_user() -> anyhow::Result<Option<String>> {
+/// to whoever owns the tree. `sandbox` is the backend the run resolved.
+pub fn lab_test_user_in(sandbox: darkmux_sandbox::BackendKind) -> anyhow::Result<Option<String>> {
     // (#3112 step 2) A Seatbelt sandbox runs as the caller.
-    if darkmux_sandbox::selected().map_err(|why| anyhow::anyhow!(why))?.on_host() {
+    if sandbox.on_host() {
         return Ok(None);
     }
     crate::dispatch_internal::runtime_container_user()
@@ -876,16 +871,6 @@ mod tests {
         let runtime = crate::dispatch_internal::test_runtime_image().unwrap();
         assert_ne!(runtime, "host");
         assert_eq!(lab_test_image_in(Docker, None).unwrap(), runtime, "no pin: the dispatch's own runtime image");
-    }
-
-    /// (#3112) The configured sandbox decides: a refused `runtime.sandbox`
-    /// refuses the lab's tests by name, never falling back to Docker.
-    #[test]
-    #[serial_test::serial] // sets DARKMUX_SANDBOX
-    fn a_lab_test_image_follows_the_configured_sandbox() {
-        assert_eq!(under_sandbox("docker", || lab_test_image(Some("node:22"))).unwrap(), "node:22");
-        let why = under_sandbox("podman", || lab_test_image(Some("node:22"))).unwrap_err().to_string();
-        assert!(why.contains("podman") && why.contains("runtime.sandbox"), "{why}");
     }
 
     /// (#3112) Tests that cannot get the runtime image say why Docker was
