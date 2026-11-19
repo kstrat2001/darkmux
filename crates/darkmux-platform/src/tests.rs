@@ -2585,3 +2585,27 @@ fn the_overlay_tool_is_looked_for_where_each_platform_installs_it() {
     assert_eq!(fake.overlay_tool_locations(), ["/x/t"]);
     assert!(crate::fake::FakePlatform::default().overlay_tool_locations().is_empty());
 }
+
+/// What each strategy says a spawned process may be handed: macOS bounds
+/// only the total (`ARG_MAX`), Linux also each string (`MAX_ARG_STRLEN`,
+/// 32 pages: 128 KiB with 4 KiB pages, 512 KiB with Asahi's 16 KiB), an
+/// unknown OS nothing, and a fake what the test set.
+#[test]
+fn each_strategy_answers_what_a_spawned_process_may_be_handed() {
+    assert_eq!(linux_max_arg_strlen(4096), 128 * 1024);
+    assert_eq!(linux_max_arg_strlen(16384), 512 * 1024);
+    let mac = MacPlatform.exec_env_limits();
+    assert_eq!(mac.per_string, None);
+    let linux = LinuxPlatform.exec_env_limits();
+    assert_eq!(linux.per_string, page_size().map(linux_max_arg_strlen));
+    #[cfg(unix)]
+    {
+        let total = arg_max().expect("a unix system answers ARG_MAX");
+        assert!(total >= 64 * 1024, "{total}");
+        assert_eq!((mac.total, linux.total), (Some(total), Some(total)));
+        assert!(linux.per_string.unwrap() >= 128 * 1024);
+    }
+    assert_eq!(OtherPlatform.exec_env_limits(), ExecEnvLimits::default());
+    let set = ExecEnvLimits { per_string: Some(1), total: Some(2) };
+    assert_eq!(FakePlatform { exec_env_limits: set, ..Default::default() }.exec_env_limits(), set);
+}
