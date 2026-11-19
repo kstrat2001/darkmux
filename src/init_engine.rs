@@ -251,7 +251,9 @@ pub fn prompt_choice(
     }
     let _ = writeln!(out, "darkmux init: more than one engine answers on this machine:");
     for (i, f) in options.iter().enumerate() {
-        let _ = writeln!(out, "  {}) {}", i + 1, f.describe());
+        // The operator picks by what is shown: strict, so an id or url read
+        // from an engine shows every mark and escape as text.
+        let _ = writeln!(out, "  {}) {}", i + 1, darkmux_types::user_files::escape_text_strict(&f.describe()));
     }
     let _ = write!(out, "Which is this machine's engine? [1]: ");
     let _ = out.flush();
