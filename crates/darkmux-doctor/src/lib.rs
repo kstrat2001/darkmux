@@ -7021,15 +7021,23 @@ fn models_load_hint(registry: Option<&darkmux_types::ProfileRegistry>) -> String
     )
 }
 
-/// The default profile's default model, when it runs on LM Studio.
+/// The default profile's default model, when it runs on LM Studio: the
+/// remedy names an `lms load`, which only LM Studio runs.
 fn default_lmstudio_model(
     registry: Option<&darkmux_types::ProfileRegistry>,
 ) -> Option<(&str, &darkmux_types::ProfileModel)> {
     let (name, profile) = registry?.resolve_active(None)?;
-    let id = profile.default_model_id()?;
-    let pm = profile.models.iter().find(|m| m.id == id)?;
+    let pm = profile_default_model(profile)?;
     let lmstudio = darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Lmstudio);
     (pm.endpoint_kind().ok() == Some(lmstudio)).then_some((name, pm))
+}
+
+/// (#590) A profile's default model (`default_model`, or its first model):
+/// the one doctor's residency rows read for that profile. Not a model
+/// choice for a dispatch, which selects through `target::resolve_in`.
+fn profile_default_model(profile: &darkmux_types::Profile) -> Option<&darkmux_types::ProfileModel> {
+    let id = profile.default_model_id()?;
+    profile.models.iter().find(|m| m.id == id)
 }
 
 fn check_profile_loaded_match() -> Check {
@@ -7082,10 +7090,8 @@ fn profile_match_status(registry: &darkmux_types::ProfileRegistry, loaded: &[dar
     let mut matching: Vec<&str> = Vec::new();
     let mut near: Vec<(String, String)> = Vec::new();
     for (name, profile) in &registry.profiles {
-        // (#590) The profile's default model (default_model, or first model)
-        // is the load-bearing match.
-        let default_id = profile.default_model_id();
-        let Some(pm) = profile.models.iter().find(|m| Some(m.id.as_str()) == default_id) else { continue };
+        // (#590) The profile's default model is the load-bearing match.
+        let Some(pm) = profile_default_model(profile) else { continue };
         match standing(name, pm, loaded) {
             Standing::Usable => matching.push(name),
             Standing::Unusable { why, fix } => near.push((why, fix)),
@@ -7676,13 +7682,7 @@ fn pick_active_profile<'a>(
         .registry
         .profiles
         .iter()
-        .filter(|(_, p)| {
-            let default_id = p.default_model_id();
-            p.models
-                .iter()
-                .filter(|m| Some(m.id.as_str()) == default_id)
-                .any(|pm| darkmux_reuses(pm, loaded))
-        })
+        .filter(|(_, p)| profile_default_model(p).is_some_and(|pm| darkmux_reuses(pm, loaded)))
         .map(|(name, p)| (name.as_str(), p))
         .collect();
     if matches.is_empty() {
