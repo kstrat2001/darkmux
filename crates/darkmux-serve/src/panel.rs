@@ -3079,7 +3079,7 @@ mod tests {
             Path("role-list".to_string()),
             axum::extract::RawQuery(None),
             Query(HashMap::new()),
-            Some(axum::extract::ConnectInfo(peer.parse().unwrap())),
+            Some(axum::extract::ConnectInfo(crate::local_peer::operator(peer.parse().unwrap()))),
             headers,
             State(state),
         )
@@ -3178,7 +3178,7 @@ mod tests {
                 Path("role-list".to_string()),
                 axum::extract::RawQuery(None),
                 Query(HashMap::new()),
-                Some(axum::extract::ConnectInfo(peer.parse().unwrap())),
+                Some(axum::extract::ConnectInfo(crate::local_peer::operator(peer.parse().unwrap()))),
                 headers,
                 State(state.clone()),
             )
@@ -3221,7 +3221,7 @@ mod tests {
                 Path("role-list".to_string()),
                 axum::extract::RawQuery(Some(format!("cols={cols}"))),
                 Query(params),
-                Some(axum::extract::ConnectInfo("127.0.0.1:50000".parse().unwrap())),
+                Some(axum::extract::ConnectInfo(crate::local_peer::operator("127.0.0.1:50000".parse().unwrap()))),
                 headers,
                 State(state.clone()),
             )
@@ -3244,7 +3244,7 @@ mod tests {
             Path(id.to_string()),
             axum::extract::RawQuery(Some(format!("cols={cols}"))),
             Query(params),
-            Some(axum::extract::ConnectInfo(peer.parse().unwrap())),
+            Some(axum::extract::ConnectInfo(crate::local_peer::operator(peer.parse().unwrap()))),
             headers,
             State(state.clone()),
         )
@@ -3360,7 +3360,7 @@ mod tests {
                 Path("doctor".to_string()),
                 axum::extract::RawQuery(None),
                 Query(HashMap::new()),
-                Some(axum::extract::ConnectInfo(peer.parse().unwrap())),
+                Some(axum::extract::ConnectInfo(crate::local_peer::operator(peer.parse().unwrap()))),
                 headers,
                 State(state.clone()),
             )
@@ -3425,7 +3425,7 @@ mod tests {
                 Path(id.to_string()),
                 axum::extract::RawQuery(None),
                 Query(HashMap::new()),
-                Some(axum::extract::ConnectInfo(peer.parse().unwrap())),
+                Some(axum::extract::ConnectInfo(crate::local_peer::operator(peer.parse().unwrap()))),
                 headers,
                 State(state),
             )
