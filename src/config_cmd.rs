@@ -24,9 +24,10 @@ pub enum ConfigCmd {
     /// `darkmux config set redis.host 100.64.0.2`,
     /// `darkmux config set fleet.mode hub`, or
     /// `darkmux config set role_profiles.code-reviewer qwen35b` (bind a role to
-    /// a profile). The role id must be a real one (`darkmux role
-    /// list`): a typo'd or invented role id is settable but resolves nothing
-    /// (`darkmux doctor` flags it).
+    /// a profile). The role must be one `darkmux role list` shows and the
+    /// profile one the registry defines: either refused names the closest,
+    /// and nothing is written. An empty value clears a binding, whatever its
+    /// role.
     ///
     /// With no VALUE, prints what the key accepts: for an enum-valued key,
     /// every valid value with its meaning.
@@ -525,17 +526,21 @@ fn check_value(key: &str, value: &str) -> Result<()> {
 /// in the first place. radio's answering seat may name a profile on a fleet
 /// peer (`<profile>@<machine>`), whose registry defines it, so that form
 /// skips the registry check, as doctor's does. A blank value binds nothing
-/// (the map drops it, `config_access::role_profiles`), so it names no
-/// profile to check.
+/// (the map drops it, `config_access::role_profiles`), so it is always
+/// accepted, whatever the role: it is how a binding is cleared (no `config`
+/// verb removes one), including a binding whose role no longer exists.
 fn check_role_binding(key: &str, value: &str) -> Result<()> {
     let Some(role) = key.strip_prefix("role_profiles.") else { return Ok(()) };
+    if value.trim().is_empty() {
+        return Ok(());
+    }
     let roles: Vec<String> = crate::crew::loader::load_roles()
         .map_err(|e| anyhow!("cannot check `{key}`: the role library did not load ({e:#}); `darkmux doctor` names the file"))?
         .into_iter()
         .map(|r| r.id)
         .collect();
     refuse_unknown_binding_role(key, role, &roles)?;
-    if value.trim().is_empty() || is_peer_seat(role, value) {
+    if is_peer_seat(role, value) {
         return Ok(());
     }
     let loaded = darkmux_profiles::profiles::load_registry_quiet(None).map_err(|e| {
@@ -546,12 +551,19 @@ fn check_role_binding(key: &str, value: &str) -> Result<()> {
 }
 
 /// The refusal for a `role_profiles.<role>` key whose role does not exist.
+/// A role of the operator's own exists once its manifest is in the user
+/// roles directory, so the refusal names that path for one not added yet.
 fn refuse_unknown_binding_role(key: &str, role: &str, roles: &[String]) -> Result<()> {
     if roles.iter().any(|r| r == role) {
         return Ok(());
     }
     let hint = closest_hint(role, roles.iter().map(String::as_str));
-    bail!("`{key}`: `{role}` names no role{hint}. `darkmux role list` shows the roles; nothing was written")
+    let manifest = crate::crew::loader::user_roles_dir().join(format!("{role}.json"));
+    bail!(
+        "`{key}`: `{role}` names no role{hint}. `darkmux role list` shows the roles; a role of your own exists once \
+         its manifest is at {}, so add that first. Nothing was written",
+        manifest.display()
+    )
 }
 
 /// The refusal for a binding whose profile the registry does not define.
@@ -1381,6 +1393,25 @@ mod tests {
         let err = set_at(p, "role_profiles.radio-host", "elsewhere").unwrap_err().to_string();
         assert!(err.contains("names no profile"), "a bare name is this machine's: {err}");
         set_at(p, "role_profiles.code-reviewer", "").expect("a blank value binds nothing, so there is no profile to check");
+    }
+
+    /// A binding whose role is gone (its manifest removed) can still be
+    /// cleared: a blank value binds nothing, and no `config unset` exists. A
+    /// non-blank value for that role is still refused, naming where a role of
+    /// the operator's own is defined.
+    #[test]
+    #[serial_test::serial]
+    fn a_binding_on_a_role_that_is_gone_can_still_be_cleared() {
+        let _home = BindingHome::new();
+        let f = tmp();
+        let p = f.path();
+        std::fs::write(p, "{\"role_profiles\": {\"oldrole\": \"deep\"}}\n").unwrap();
+        set_at(p, "role_profiles.oldrole", "").expect("clearing a binding is always accepted");
+        set_at(p, "role_profiles.oldrole", "  ").expect("whitespace is blank too");
+        let err = set_at(p, "role_profiles.oldrole", "deep").unwrap_err().to_string();
+        assert!(err.contains("`oldrole` names no role"), "{err}");
+        let manifest = crate::crew::loader::user_roles_dir().join("oldrole.json");
+        assert!(err.contains(&manifest.display().to_string()), "names where its manifest goes: {err}");
     }
 
     /// `fleet.accept_work.<name>` has no `config set` form: the remedy is the

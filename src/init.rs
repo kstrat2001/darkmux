@@ -1057,9 +1057,11 @@ fn user_profile_registry_path() -> Result<PathBuf> {
 /// operator's values outrank a re-run. It is **completed** instead
 /// ([`complete_config`]): a `config set` before the first `init` leaves a
 /// one-key file, and `init` used to stop at "already present" there, so the
-/// full default and `machine_id` were never written. Completing adds only the
-/// keys the file lacks, so it is the same visible config whichever command
-/// ran first.
+/// full default was never written. Completing adds only the keys the file
+/// lacks, except the ones whose absence darkmux reads differently from the
+/// default ([`NEVER_COMPLETED`], `machine_id` among them: an existing file
+/// keeps the machine's name), so the visible defaults are the same whichever
+/// command ran first.
 ///
 /// The write target routes through `paths::resolve(ForceUser).config`, so it
 /// honors the `DARKMUX_HOME` bootstrap pointer and lands where the runtime
@@ -1113,13 +1115,12 @@ fn write_config(path: &Path, value: &Value) -> Result<()> {
 }
 
 /// The `config:` line for a config `init` completed: how many defaults it
-/// added (or would add, on a dry run), whether `machine_id` was among them,
-/// and that the operator's own values were kept.
+/// added (or would add, on a dry run), and that the operator's own values
+/// were kept.
 pub fn config_completed_line(path: &Path, added: &[String], dry_run: bool) -> String {
     let verb = if dry_run { "would add" } else { "added" };
-    let seeded = if added.iter().any(|k| k == "machine_id") { ", machine_id seeded" } else { "" };
     format!(
-        "config: completed at {}: {verb} {} default setting(s) it was missing{seeded}; your own values were kept",
+        "config: completed at {}: {verb} {} default setting(s) it was missing; your own values were kept",
         path.display(),
         added.len()
     )
@@ -1135,11 +1136,40 @@ fn complete_config(path: &Path, dry_run: bool) -> Result<Vec<String>> {
     let Ok(mut existing) = crate::config_cmd::load_object_for_write(path) else {
         return Ok(Vec::new());
     };
-    let added = add_missing_keys(&mut existing, &default_config()?, "");
+    let mut defaults = default_config()?;
+    for key in NEVER_COMPLETED {
+        remove_dotted(&mut defaults, key);
+    }
+    let added = add_missing_keys(&mut existing, &defaults, "");
     if !added.is_empty() && !dry_run {
         write_config(path, &existing)?;
     }
     Ok(added)
+}
+
+/// The keys completion never adds, because darkmux reads their absence
+/// differently from the value `init` writes on a fresh machine. Every other
+/// key `with_defaults` writes resolves the same absent or present (each
+/// accessor compared under an empty config and under `with_defaults`).
+/// - `machine_id`: absent, the machine is named by `hostname(1)`
+///   (`resolve_machine_id`); the seeded computer name differs from it, so
+///   adding one would rename an established machine on the fleet (roster
+///   entries, `<profile>@<machine>` addresses, flow records).
+/// - `redis.host`: absent, nothing assembles a Redis URL, even with
+///   `redis.enabled` true; adding `127.0.0.1` would point it at localhost.
+/// - `audit.dir`, `hooks.outbox_dir`: absent, each is derived from the
+///   darkmux root at run time; a literal freezes today's root.
+const NEVER_COMPLETED: &[&str] = &["machine_id", "redis.host", "audit.dir", "hooks.outbox_dir"];
+
+/// Remove the dotted `key` from a JSON object, when present.
+fn remove_dotted(root: &mut Value, key: &str) {
+    let (parent, leaf) = match key.rsplit_once('.') {
+        Some((parent, leaf)) => (parent.split('.').try_fold(&mut *root, |v, seg| v.get_mut(seg)), leaf),
+        None => (Some(root), key),
+    };
+    if let Some(obj) = parent.and_then(Value::as_object_mut) {
+        obj.remove(leaf);
+    }
 }
 
 /// Copy each key of `defaults` that `target` lacks into it, descending into
@@ -1552,11 +1582,10 @@ mod tests {
         let added = add_missing_keys(&mut own, &defaults, "");
         assert_eq!(added, ["b.y", "d"]);
         assert_eq!(own, serde_json::json!({ "a": 1, "b": { "x": "mine", "y": 2 }, "c": "not-an-object", "d": false }));
-        let line = config_completed_line(Path::new("/c.json"), &["machine_id".to_string(), "d".to_string()], true);
+        let line = config_completed_line(Path::new("/c.json"), &["redis".to_string(), "d".to_string()], true);
         assert_eq!(
             line,
-            "config: completed at /c.json: would add 2 default setting(s) it was missing, machine_id seeded; your own \
-             values were kept"
+            "config: completed at /c.json: would add 2 default setting(s) it was missing; your own values were kept"
         );
     }
 

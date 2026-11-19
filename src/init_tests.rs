@@ -389,8 +389,13 @@ fn an_existing_configs_values_are_never_overwritten_even_with_force() {
 }
 
 /// `config set` before `init` leaves a one-key file. `init` completes it with
-/// every default it lacks and the seeded `machine_id`, keeping the key the
-/// operator set, and says what it added.
+/// every default it lacks, keeping the key the operator set, and says what it
+/// added. It never adds a key whose absence reads differently from its
+/// default: `machine_id` (absent, the machine is named by its hostname, and
+/// seeding another name would rename it on the fleet), `redis.host` (absent,
+/// nothing assembles a Redis URL), and the two directories derived from the
+/// darkmux root (`audit.dir`, `hooks.outbox_dir`), which a literal would
+/// freeze.
 #[test]
 #[serial_test::serial]
 fn a_partial_config_is_completed_with_the_defaults_it_lacks() {
@@ -402,14 +407,19 @@ fn a_partial_config_is_completed_with_the_defaults_it_lacks() {
     let r = init(&opts()).unwrap();
 
     assert!(r.config_already_present && !r.config_created);
-    assert!(r.config_completed.contains(&"machine_id".to_string()), "{:?}", r.config_completed);
     assert!(r.config_completed.iter().any(|k| k.starts_with("redis")), "{:?}", r.config_completed);
     assert!(!r.config_completed.contains(&"lms_bin".to_string()), "the operator's own key is not added");
     let cfg: darkmux_types::config::DarkmuxConfig =
         serde_json::from_str(&fs::read_to_string(env.config()).unwrap()).unwrap();
     assert_eq!(cfg.lms_bin.as_deref(), Some("/opt/lms"));
-    assert!(cfg.machine_id.as_deref().is_some_and(|m| !m.is_empty() && m != "my-machine"), "{:?}", cfg.machine_id);
+    assert_eq!(cfg.machine_id, None, "the machine keeps its hostname name: {:?}", r.config_completed);
     assert_eq!(cfg.redis.as_ref().and_then(|x| x.enabled), Some(false));
+    assert_eq!(cfg.redis.as_ref().and_then(|x| x.host.clone()), None, "absent host assembles no Redis URL");
+    assert_eq!(cfg.audit.as_ref().and_then(|x| x.dir.clone()), None, "the audit dir stays derived from the root");
+    assert_eq!(cfg.hooks.as_ref().and_then(|x| x.outbox_dir.clone()), None, "the outbox stays derived from the root");
+    for kept_absent in ["machine_id", "redis.host", "audit.dir", "hooks.outbox_dir"] {
+        assert!(!r.config_completed.iter().any(|k| k == kept_absent), "{kept_absent}: {:?}", r.config_completed);
+    }
     assert!(cfg.schema_version.is_some());
 
     // A second run has nothing left to add and writes nothing.
@@ -429,7 +439,7 @@ fn a_dry_run_or_an_unreadable_config_is_not_completed() {
     env.lms(&[model("tiny-llm", TINY, "llm")], &[]);
     fs::write(env.config(), "{\"lms_bin\": \"/opt/lms\"}\n").unwrap();
     let r = init(&InitOptions { dry_run: true, ..opts() }).unwrap();
-    assert!(r.config_completed.contains(&"machine_id".to_string()), "{:?}", r.config_completed);
+    assert!(r.config_completed.contains(&"default_engine".to_string()), "{:?}", r.config_completed);
     assert_eq!(fs::read_to_string(env.config()).unwrap(), "{\"lms_bin\": \"/opt/lms\"}\n");
 
     fs::write(env.config(), "not json\n").unwrap();
