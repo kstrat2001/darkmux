@@ -62,9 +62,10 @@ pub enum ResidencyDecision {
 ///
 /// A seat dispatches to its placement's own identifier, so only the resident
 /// [`is_own_instance`] names as that identifier's instance is judged for
-/// Reuse (#3074 B10). A `darkmux:` identifier matches by itself, so a
-/// variant or path id finds its own load whatever key LM Studio lists it
-/// under; an opt-out identifier also needs the modelKey. Judging a
+/// Reuse (#3074 B10). The default `darkmux:<id>` identifier matches by
+/// itself, so a variant or path id finds its own load whatever key LM Studio
+/// lists it under; an explicit identifier also needs the listed key (the
+/// wanted key or a variant's base key). Judging a
 /// different `darkmux:` copy of the same modelKey would report Reuse for an
 /// instance the dispatch never reaches. With no exact copy, another
 /// darkmux-owned copy of the key is never reusable and is never left beside
@@ -354,5 +355,29 @@ mod tests {
             decide_residency(&residents, &p),
             ResidencyDecision::ForeignDuplicate { foreign_identifier: "devstral".into() }
         );
+    }
+
+    #[test]
+    fn an_explicit_darkmux_identifier_left_on_another_model_is_not_reused() {
+        // The operator changed the model's `id` and kept `identifier:
+        // "darkmux:coder"` while the old model's load is still resident.
+        // Reusing it would answer with the wrong model (the #1135 ghost): an
+        // explicit identifier also needs the resident's key.
+        let residents = vec![resident("darkmux:coder", "qwen3.6-27b", 262_144)];
+        let p = placement("qwen/qwen3.8-27b", 32_768, Some("darkmux:coder"));
+        assert_eq!(decide_residency(&residents, &p), ResidencyDecision::LoadFresh);
+    }
+
+    #[test]
+    fn an_explicit_identifier_on_a_variant_reuses_its_load_under_the_base_key() {
+        for alias in ["darkmux:coder", "my-coder"] {
+            let residents = vec![resident(alias, "qwen/qwen3.8-27b", 262_144)];
+            let p = placement("qwen/qwen3.8-27b@4bit", 32_768, Some(alias));
+            assert_eq!(
+                decide_residency(&residents, &p),
+                ResidencyDecision::Reuse { identifier: alias.into(), resident_ctx: 262_144 },
+                "{alias}"
+            );
+        }
     }
 }

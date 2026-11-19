@@ -441,10 +441,10 @@ impl ProfileModel {
     /// so only these two spellings are refused.
     pub fn identifier_problem(&self) -> Option<String> {
         let identifier = self.identifier.as_deref()?;
-        if !matches!(self.endpoint_kind(), Ok(EndpointKind::Managed(ManagedBackend::Lmstudio))) {
+        if !self.on_lmstudio() {
             return None;
         }
-        let key = self.id.strip_prefix("darkmux:").unwrap_or(&self.id);
+        let key = self.bare_key();
         let base = key.split_once('@').map_or(key, |(base, _)| base);
         (identifier == key || identifier == base).then(|| {
             format!(
@@ -454,6 +454,32 @@ impl ProfileModel {
                  distinct from the model key, or no `identifier` (darkmux then loads under `darkmux:{key}`)"
             )
         })
+    }
+
+    /// Whether darkmux loads this model into LM Studio, whose identifiers
+    /// [`Self::identifier_problem`] and [`Self::darkmux_load_name`] read.
+    fn on_lmstudio(&self) -> bool {
+        matches!(self.endpoint_kind(), Ok(EndpointKind::Managed(ManagedBackend::Lmstudio)))
+    }
+
+    /// The model's loadable key: its `id` without a `darkmux:` prefix.
+    fn bare_key(&self) -> &str {
+        self.id.strip_prefix("darkmux:").unwrap_or(&self.id)
+    }
+
+    /// The `darkmux:` identifier this LM Studio model loads under (its
+    /// explicit `identifier`, or the default `darkmux:<id>`) with its bare
+    /// key, or `None` when it loads under an identifier outside the namespace
+    /// or is not on LM Studio. Two models with different keys under one such
+    /// identifier would reuse each other's load
+    /// (`config_enum::shared_darkmux_identifiers`).
+    pub fn darkmux_load_name(&self) -> Option<(String, &str)> {
+        if !self.on_lmstudio() {
+            return None;
+        }
+        let key = self.bare_key();
+        let identifier = self.identifier.clone().unwrap_or_else(|| format!("darkmux:{key}"));
+        identifier.starts_with("darkmux:").then_some((identifier, key))
     }
 
     /// (#2902 step 4) THE n_ctx rule: a managed model must declare the window

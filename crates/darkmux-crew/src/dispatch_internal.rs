@@ -15543,10 +15543,11 @@ fn strict_selection_enabled() -> bool {
 /// Comparing against the minted identifier recognizes both forms and still
 /// excludes a hand-loaded bare copy, because a resident darkmux did not load
 /// cannot carry the identifier this profile would have minted. The rule is
-/// [`darkmux_gestalt::is_own_instance`], the planner's own: a `darkmux:`
-/// identifier names the instance by itself (a variant or path id is listed
-/// under a key other than its id), and an opt-out identifier also needs the
-/// key.
+/// [`darkmux_gestalt::is_own_instance`], the planner's own: the default
+/// `darkmux:<id>` identifier names the instance by itself (a variant or path
+/// id is listed under a key other than its id), and an explicit identifier
+/// also needs the listed key, so one left in place after the `id` changed
+/// never reuses the old model's load.
 pub(crate) fn is_reloadable_target(
     resident_model: &str,
     resident_identifier: &str,

@@ -24030,6 +24030,29 @@ fn decide_preflight_a_load_named_by_its_own_key_is_never_ours() {
     );
 }
 
+/// The operator changed the model's `id` and kept `identifier:
+/// "darkmux:coder"` while the old model's load is resident: an explicit
+/// identifier also needs the resident's key, so the dispatch loads (and the
+/// taken identifier is refused loudly) rather than being answered by the old
+/// model.
+#[test]
+fn decide_preflight_an_explicit_darkmux_identifier_on_another_model_is_not_reused() {
+    let l = [resident("darkmux:coder", "qwen3.6-27b", 262144)];
+    assert_eq!(
+        decide_preflight("qwen/qwen3.8-27b", Some("darkmux:coder"), 32768, &l),
+        PreflightDecision::LoadFresh { foreign_identifier: None }
+    );
+}
+
+#[test]
+fn decide_preflight_an_explicit_identifier_on_a_variant_reuses_its_load() {
+    let l = [resident("darkmux:coder", "qwen/qwen3.8-27b", 262144)];
+    assert_eq!(
+        decide_preflight("qwen/qwen3.8-27b@4bit", Some("darkmux:coder"), 32768, &l),
+        PreflightDecision::Reuse { identifier: "darkmux:coder".into(), resident_ctx: 262144 }
+    );
+}
+
 #[test]
 fn decide_preflight_normalizes_a_namespaced_profile_id() {
     let l = [resident("darkmux:qwen", "qwen", 32768)];

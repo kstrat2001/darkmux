@@ -4369,6 +4369,8 @@ fn endpoints_status(
     invalid.extend(darkmux_types::config_enum::invalid_engine_args(registry));
     // An `identifier` that is LM Studio's name for a load made without one.
     invalid.extend(darkmux_types::config_enum::colliding_identifiers(registry));
+    // Two models with different ids under one `darkmux:` identifier.
+    invalid.extend(darkmux_types::config_enum::shared_darkmux_identifiers(registry));
     // (#3453) rec runs one Flint server per machine.
     invalid.extend(darkmux_types::config_enum::extra_flint_endpoints(registry));
     // Two servers cannot listen on one port.
@@ -12696,6 +12698,18 @@ mod tests {
         assert!(c.message.contains("profiles.p.models[0].identifier") && c.message.contains("`phi-4`"), "{}", c.message);
         let ok = materialized(r#"{"profiles":{"p":{"models":[{"id":"phi-4","n_ctx":8,"identifier":"darkmux:phi-4"}]}}}"#);
         assert_eq!(endpoints_status(&ok, &[], &mut no_spend, REGISTRY).status, Status::Pass);
+    }
+
+    /// Two models with different ids under one `darkmux:` identifier, which
+    /// every preflight refuses, are Fail here too, naming the path.
+    #[test]
+    fn a_darkmux_identifier_shared_by_two_models_fails() {
+        let bad = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"old","n_ctx":8,"identifier":"darkmux:coder"},{"id":"new","n_ctx":8,"identifier":"darkmux:coder"}]}}}"#,
+        );
+        let c = endpoints_status(&bad, &[], &mut no_spend, REGISTRY);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("profiles.p.models[1].identifier") && c.message.contains("`darkmux:coder`"), "{}", c.message);
     }
 
     /// (#3453) A Flint endpoint is labeled as a server darkmux starts, and a

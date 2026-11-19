@@ -2355,4 +2355,34 @@ mod tests {
         assert_eq!(paths, (0..4).map(|i| format!("profiles.json key `profiles.p.models[{i}].identifier`")).collect::<Vec<_>>());
         assert!(invalid.iter().all(|v| v.valid.contains("darkmux:")), "the fix names a namespaced identifier");
     }
+
+    /// Two models with different ids under one `darkmux:` identifier (an
+    /// explicit one, or one equal to another model's default) would let one
+    /// model's dispatch reuse the other's load. Refused at preflight naming
+    /// both; the same id in two profiles shares its identifier by design.
+    #[test]
+    fn two_models_sharing_one_darkmux_identifier_are_refused() {
+        let r = registry(
+            r#"{"profiles":{
+                "a":{"models":[{"id":"qwen3.6-27b","n_ctx":8192,"identifier":"darkmux:coder"},{"id":"y","n_ctx":8192}]},
+                "b":{"models":[{"id":"qwen/qwen3.8-27b","n_ctx":8192,"identifier":"darkmux:coder"},
+                               {"id":"x","n_ctx":8192,"identifier":"darkmux:y"},
+                               {"id":"qwen3.6-27b","n_ctx":4096,"identifier":"darkmux:coder"},
+                               {"id":"darkmux:y","n_ctx":4096}]},
+                "c":{"models":[{"id":"p","n_ctx":8192,"identifier":"my-coder"},{"id":"q","n_ctx":8192,"identifier":"my-coder"},
+                               {"id":"h1","endpoint":"hosted","identifier":"darkmux:h"},
+                               {"id":"h2","endpoint":"hosted","identifier":"darkmux:h"}]}},
+                "endpoints":{"hosted":{"url":"https://h.example/v1"}}}"#,
+        );
+        // An opt-out identifier outside the namespace is matched with its key
+        // (never reused across ids), and a hosted model loads nothing, so
+        // neither pair is refused.
+        let invalid = crate::config_enum::shared_darkmux_identifiers(&r);
+        let found: Vec<(String, &str)> = invalid.iter().map(|v| (v.set_in.to_string(), v.problem.as_str())).collect();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].0.contains("profiles.b.models[0].identifier"), "{found:?}");
+        assert!(found[0].1.contains("`darkmux:coder`") && found[0].1.contains("profiles.a.models[0]"), "{found:?}");
+        assert!(found[1].0.contains("profiles.b.models[1].identifier"), "{found:?}");
+        assert!(found[1].1.contains("`darkmux:y`") && found[1].1.contains("profiles.a.models[1]"), "{found:?}");
+    }
 }
