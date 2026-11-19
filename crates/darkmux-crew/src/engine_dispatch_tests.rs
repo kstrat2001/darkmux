@@ -659,6 +659,28 @@ fn flint_target(id: &str, port: u16) -> crate::target::Target {
     crate::target::target_for("p".into(), profile, m).unwrap()
 }
 
+/// (#1135 class) A profile asking more context than the revision's manifest
+/// states (`max_context`) is refused `model_start_failed` before any server
+/// starts, naming both and the profile's `n_ctx`; at or under it, it plans.
+#[test]
+fn a_flint_model_asking_more_context_than_its_manifest_states_is_refused_before_a_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = fake_rec(dir.path(), "0.1.0");
+    let manifest = dir.path().join("share/rec/models/fdc852/flint-int4.json");
+    let target = flint_target("flint-int4", 11_590);
+    let plan = |limit: u64| {
+        std::fs::write(&manifest, format!(r#"{{"model_id":"flint-int4","max_context":{limit}}}"#)).unwrap();
+        ServerEngine::plan(&rec, "fl", 11_590, &target.model)
+    };
+    let refusal = plan(4_096).expect_err("8192 is beyond the manifest's 4096");
+    assert_eq!(refusal.code, ClientCode::ModelStartFailed.as_str());
+    for part in ["`flint-int4` takes at most 4096", "n_ctx=8192", "`n_ctx` to 4096 or less"] {
+        assert!(refusal.message.contains(part), "{part}: {}", refusal.message);
+    }
+    let spec = plan(8_192).expect("a revision that takes 8192 plans at 8192");
+    assert_eq!(spec.n_ctx, 8_192);
+}
+
 /// A Flint dispatch starts rec's own `rec-mlx serve flint` (never `rec
 /// _supervise`) for the profile's revision, waits until it lists `flint`,
 /// and holds a lease on `flint`; the next dispatch reuses it.

@@ -481,8 +481,14 @@ impl ServerEngine for Tensorfold {
 
 /// (#3453) rec's Flint: paths from rec's own install, verified release only.
 impl ServerEngine for Rec {
+    /// (#1135 class) A profile asking more context than the revision's
+    /// manifest states is refused before a server starts: rec would serve
+    /// less than the profile declares.
     fn plan(&self, endpoint: &str, port: u16, model: &darkmux_types::ProfileModel) -> Result<ServerSpec, EngineRefusal> {
         let version = self.verified_version().map_err(unavailable)?;
+        let n_ctx = model.require_n_ctx().map_err(unavailable)?;
+        darkmux_gestalt::refuse_beyond_limit(&model.id, n_ctx, self.context_limit(&model.id))
+            .map_err(|e| refuse(ClientCode::ModelStartFailed, e.to_string()))?;
         self.serve_spec(endpoint, port, model, &version).map_err(unavailable)
     }
     /// The weights on disk, priced with a margin and the cache the model's

@@ -115,8 +115,11 @@ fn send(args: &SubmitArgs, credential: &upload::Credential, text: &str) -> Resul
     Ok(answer)
 }
 
-/// What the site took, as printed.
+/// What the site took, as printed. Its urls and states are the site's own
+/// text, and a JSON `\u001b` decodes to a real ESC, so each is escaped
+/// (`escape_text`): shown, never acted on by the terminal.
 fn shared_text(site: &str, fixture: &str, data: &serde_json::Value) -> String {
+    use darkmux_types::user_files::escape_text as shown;
     let mut text = format!(
         "Shared {fixture} of {site}: {} added, {} already there, {} replaced.\n",
         data["added"].as_u64().unwrap_or(0),
@@ -124,10 +127,11 @@ fn shared_text(site: &str, fixture: &str, data: &serde_json::Value) -> String {
         data["replaced"].as_u64().unwrap_or(0)
     );
     if let Some(url) = data["eval"]["url"].as_str() {
-        text.push_str(&format!("  eval: {url}\n"));
+        text.push_str(&format!("  eval: {}\n", shown(url)));
     }
     for run in data["runs"].as_array().into_iter().flatten() {
-        text.push_str(&format!("  run: {} ({})\n", run["url"].as_str().unwrap_or("?"), run["state"].as_str().unwrap_or("?")));
+        let (url, state) = (run["url"].as_str().unwrap_or("?"), run["state"].as_str().unwrap_or("?"));
+        text.push_str(&format!("  run: {} ({})\n", shown(url), shown(state)));
     }
     text
 }
@@ -390,5 +394,22 @@ mod tests {
         let (site, _server) = serve_once(401, r#"{"error":"Unknown token"}"#);
         let err = login_with(&site, &token(), |_| unreachable!("a refused token is never stored")).unwrap_err().to_string();
         assert_eq!(err, format!("{site} did not accept the token: Unknown token (HTTP 401)"));
+    }
+
+    /// The site's answer is JSON, where `\u001b` decodes to a real ESC: an
+    /// eval or run url, or a run state, holding an OSC 0 title, a screen
+    /// clear or an OSC 52 clipboard write prints as text.
+    #[test]
+    fn a_hostile_site_answer_prints_inert() {
+        let data: serde_json::Value = serde_json::from_str(
+            r#"{"added":1,"eval":{"url":"https://x/e\u001b]0;owned\u0007"},
+                "runs":[{"url":"https://x/r\u001b[2J","state":"new\u001b]52;c;aGk=\u0007\u009b2J\u202e"}]}"#,
+        )
+        .unwrap();
+        let text = shared_text("https://site", "fixture", &data);
+        assert!(!text.chars().any(|c| (c.is_control() && c != '\n') || c == '\u{202e}'), "{text:?}");
+        assert!(text.contains("  eval: https://x/e\\u{1b}]0;owned\\u{7}\n"), "{text}");
+        let plain = serde_json::json!({"eval": {"url": "https://x/e/1"}, "runs": [{"url": "https://x/r/1", "state": "new"}]});
+        assert!(shared_text("s", "f", &plain).ends_with("  eval: https://x/e/1\n  run: https://x/r/1 (new)\n"));
     }
 }

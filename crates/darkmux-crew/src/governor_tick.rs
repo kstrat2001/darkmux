@@ -15,7 +15,7 @@
 //! toward 0%. That defect was proven once, by a throwaway probe, and then
 //! deleted.
 //!
-//! Three facts live here now, and all three are testable:
+//! Four facts live here now, and all four are testable:
 //!
 //! 1. **Thermal ticks FIRST**, so the battery governor reads a
 //!    post-decision thermal state rather than the previous tick's.
@@ -24,6 +24,15 @@
 //! 3. **Both are fed the SAME `elapsed_ms`** — one clock, so two
 //!    governors' heartbeat accounting can never disagree about how much
 //!    time passed.
+//!
+//! 4. **No release is written over a live pause.** Thermal ticks first,
+//!    told whether the battery governor or the budget pacer holds a pause
+//!    (their state as the tick begins); while one does, its duty cycle and
+//!    its resumes write nothing. The battery governor is told whether the
+//!    pacer holds a pause and what duty cycle is in force, so its own
+//!    release writes nothing over the pacer and restores the duty cycle.
+//!    The rule, and why it must hold for every write rather than for the
+//!    file a tick leaves behind, is `pace_file`'s module doc.
 //!
 //! The EMISSION of the resulting events stays at the sampler: this seam
 //! decides, the sampler reports. That split is what keeps the seam
@@ -66,19 +75,38 @@ impl GovernorPair {
     /// sampler measures it; a scenario driver supplies its simulated
     /// interval). `host_out` is the dispatch's out-dir, `stop_file` the
     /// crawl `STOP` path when this dispatch is a crawl unit.
+    /// `budget_pausing` is whether the dispatch's budget pacer holds a pause
+    /// as this tick begins (`false` when there is no pacer); the pacer
+    /// itself decides after this, from [`Self::other_pacing`].
     pub fn tick(
         &mut self,
         reading: &HostReading,
         elapsed_ms: u64,
         host_out: &Path,
         stop_file: Option<&Path>,
+        budget_pausing: bool,
     ) -> TickEvents {
-        let thermal = self.thermal.on_sample(reading.thermal.as_ref(), elapsed_ms, host_out, stop_file);
+        let others_pausing_for_thermal = self.battery.is_pacing() || budget_pausing;
+        let thermal = self.thermal.on_sample_beside(
+            reading.thermal.as_ref(),
+            elapsed_ms,
+            host_out,
+            stop_file,
+            others_pausing_for_thermal,
+        );
         // (#2774 review F1) `is_pausing`, NOT `is_pacing` — read AFTER the
         // thermal tick above, so this is the post-decision state. See this
         // module's doc for what gating on `is_pacing` cost.
         let thermal_pausing = self.thermal.is_pausing();
-        let battery = self.battery.on_sample(reading.battery.as_ref(), elapsed_ms, host_out, thermal_pausing);
+        let beside_battery =
+            crate::pace_file::OtherPacing { pausing: budget_pausing, duty_cycle: self.thermal.duty_cycle() };
+        let battery = self.battery.on_sample_beside(
+            reading.battery.as_ref(),
+            elapsed_ms,
+            host_out,
+            thermal_pausing,
+            &beside_battery,
+        );
         TickEvents { thermal, battery }
     }
 
@@ -89,8 +117,8 @@ impl GovernorPair {
     /// and the thermal duty cycle's instruction when one is in force. The one
     /// place this is derived, so the live sampler and the scenario tests read
     /// the same answer.
-    pub fn other_pacing(&self) -> crate::budget::OtherPacing {
-        crate::budget::OtherPacing {
+    pub fn other_pacing(&self) -> crate::pace_file::OtherPacing {
+        crate::pace_file::OtherPacing {
             pausing: self.thermal.is_pausing() || self.battery.is_pacing(),
             duty_cycle: self.thermal.duty_cycle(),
         }

@@ -155,12 +155,16 @@ where
     W: std::io::Write + 'a,
 {
     move |step: &Step, facts: &BTreeMap<String, String>| {
-        let _ = writeln!(writer, "── operator sign-off required — step `{}` ──", step.id);
+        // A fact is an upstream step's output, which a model wrote, and the
+        // operator approves it as read: the strict escape shows every escape
+        // sequence, direction mark and joiner as text.
+        let strict = darkmux_types::user_files::escape_text_strict;
+        let _ = writeln!(writer, "── operator sign-off required — step `{}` ──", strict(&step.id));
         if facts.is_empty() {
             let _ = writeln!(writer, "  (no upstream facts)");
         } else {
             for (k, v) in facts {
-                let _ = writeln!(writer, "  {k}: {v}");
+                let _ = writeln!(writer, "  {}: {}", strict(k), strict(v));
             }
         }
         let _ = write!(writer, "Approve? [y/N] ");
@@ -316,6 +320,25 @@ mod tests {
         let mut writer = Vec::new();
         let mut handler = tty_prompt_handler_with(reader, &mut writer);
         assert!(matches!(handler(&step, &BTreeMap::new()), GateDecision::Declined { .. }));
+    }
+
+    /// A fact the operator signs off on shows every mark and joiner as text:
+    /// between two RLMs `5 / 500` would display as `500 / 5`, and an ALM
+    /// pair would turn `17, 42` into `42 ,17`.
+    #[test]
+    fn tty_prompt_handler_shows_direction_marks_in_a_fact_as_text() {
+        let step = gated_step(Some(GATE_KIND_OPERATOR));
+        let mut facts = BTreeMap::new();
+        facts.insert("budget".to_string(), "\u{200f}5 / 500\u{200f}".to_string());
+        facts.insert("ids".to_string(), "\u{61c}17, 42\u{61c}\x1b[2J".to_string());
+        let mut writer = Vec::new();
+        {
+            let mut handler = tty_prompt_handler_with(std::io::Cursor::new(b"n\n".to_vec()), &mut writer);
+            handler(&step, &facts);
+        }
+        let out = String::from_utf8(writer).unwrap();
+        assert!(out.contains("  budget: \\u{200f}5 / 500\\u{200f}\n"), "{out}");
+        assert!(out.contains("  ids: \\u{61c}17, 42\\u{61c}\\u{1b}[2J\n"), "{out}");
     }
 
     #[test]
