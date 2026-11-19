@@ -2714,3 +2714,64 @@ fn each_strategy_answers_what_a_spawned_process_may_be_handed() {
     let set = ExecEnvLimits { per_string: Some(1), total: Some(2) };
     assert_eq!(FakePlatform { exec_env_limits: set, ..Default::default() }.exec_env_limits(), set);
 }
+
+/// The port-free decision over what the binds came to and the listeners
+/// this user can see. A bind the host refuses is a held port even when no
+/// listener is visible: another user's or root's, which `lsof` and
+/// `/proc/<pid>/fd` leave out.
+#[test]
+fn a_port_is_free_only_when_darkmux_could_bind_it_and_sees_no_listener() {
+    use BindOutcome::{Absent, Bound, Failed, InUse};
+    let none: &[u32] = &[];
+    assert!(port_free_from(&[Bound, Bound, Bound, Bound], Some(none)));
+    assert!(!port_free_from(&[Bound, InUse, Bound, Bound], Some(none)), "a listener this user cannot see");
+    assert!(!port_free_from(&[Bound, Bound, Bound, InUse], Some(none)), "an IPv6-only listener this user cannot see");
+    assert!(!port_free_from(&[Bound, Bound, Bound, Bound], Some(&[7])), "a listener this user can see");
+    assert!(port_free_from(&[Bound, Bound, Absent, Absent], None), "no IPv6, and no listing: the binds decide");
+    assert!(!port_free_from(&[Failed, Bound, Bound, Bound], Some(none)), "a bind that says nothing is no answer");
+    assert!(!port_free_from(&[Absent, Absent, Absent, Absent], Some(none)), "nothing bound");
+    assert!(!port_free_from(&[], Some(none)), "nothing tried");
+}
+
+/// A bind's result as an outcome: in use when the host says so; any other
+/// failure is an absent address for IPv6 and no answer for IPv4.
+#[test]
+fn a_binds_result_reads_as_bound_in_use_absent_or_failed() {
+    use std::io::{Error, ErrorKind};
+    let v4 = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let v6 = std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+    let in_use = || Err(Error::from(ErrorKind::AddrInUse));
+    let other = || Err(Error::from(ErrorKind::AddrNotAvailable));
+    assert_eq!(bind_outcome(v4, &Ok(())), BindOutcome::Bound);
+    assert_eq!((bind_outcome(v4, &in_use()), bind_outcome(v6, &in_use())), (BindOutcome::InUse, BindOutcome::InUse));
+    assert_eq!((bind_outcome(v4, &other()), bind_outcome(v6, &other())), (BindOutcome::Failed, BindOutcome::Absent));
+}
+
+/// A real socket held on the wildcard: the probe's bind of the wildcard is
+/// refused (macOS lets the loopback bind beside it under `SO_REUSEADDR`), and
+/// the port is not free. Released, it is free again.
+#[test]
+fn a_port_held_on_the_wildcard_is_not_free() {
+    let held = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    let wildcard = PROBED.iter().position(|ip| *ip == std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)).unwrap();
+    assert_eq!(bind_probe(port)[wildcard], BindOutcome::InUse);
+    assert!(!tcp_port_free(port));
+    drop(held);
+    assert!(tcp_port_free(port), "released, nothing holds it");
+}
+
+/// A real socket held on the IPv6 loopback only: the IPv4 binds go through,
+/// and the probe's IPv6 bind is what refuses it. A host without an IPv6
+/// loopback has nothing to hold.
+#[test]
+fn a_port_held_on_the_ipv6_loopback_is_not_free() {
+    let Ok(held) = std::net::TcpListener::bind("[::1]:0") else {
+        eprintln!("this host has no IPv6 loopback");
+        return;
+    };
+    let port = held.local_addr().unwrap().port();
+    let loopback = PROBED.iter().position(|ip| *ip == std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)).unwrap();
+    assert_eq!(bind_probe(port)[loopback], BindOutcome::InUse);
+    assert!(!tcp_port_free(port));
+}
