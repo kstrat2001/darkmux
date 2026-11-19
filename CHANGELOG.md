@@ -181,6 +181,13 @@ darkmux release.
 
 ### Fixed
 
+- **A dispatch's recorded system-prompt hash is the hash of the bytes sent, under every sandbox.**
+  Under `seatbelt` or `landlock` the runtime renamed `/workspace` in the system prompt to the
+  workspace's host path after darkmux had hashed it, so `dispatch.start`'s `system_sha256` named
+  text the model never received. darkmux now writes that path into the system prompt before it
+  hashes it, and the runtime sends the prompt exactly as passed. A container run is unchanged. The
+  model still sees the workspace's true host path under a sandbox on the host, so request bodies
+  there still carry the path (under your home folder), including those sent to a hosted endpoint.
 - **Text a model, a peer or an endpoint wrote can no longer drive your terminal.** `mod list` and
   `mod show` (a kit a local seat wrote through `create_mod`), `finding list` and `finding show`,
   `run list` (its rows, the `--usage` breakdown and an endpoint's `reported model`), `run show`,

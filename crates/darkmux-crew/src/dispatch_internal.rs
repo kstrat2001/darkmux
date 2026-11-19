@@ -7277,6 +7277,7 @@ fn prepare_container_run(
         image_arg.as_deref(),
         execution,
     )?;
+    let system_prompt = system_prompt_as_sent(system_prompt, darkmux_sandbox::selected().ok(), &workspace);
 
     Ok(ContainerRun {
         workspace_cleanup,
@@ -7298,6 +7299,17 @@ fn prepare_container_run(
         leased_job,
         toolchain: Default::default(),
     })
+}
+
+/// (contract 6) The system prompt as a `kind` sandbox's runtime sends it:
+/// `/workspace` named where that sandbox sees `workspace` (a container:
+/// unchanged; a sandbox on the host: the workspace's host path), by the
+/// runtime's path-boundary rule. The dispatch records the hash of this text
+/// and passes it as `--system`, which the runtime sends byte for byte, so
+/// `system_sha256` is the hash of the bytes sent on every backend.
+pub(crate) fn system_prompt_as_sent(prompt: String, kind: Option<darkmux_sandbox::BackendKind>, workspace: &Path) -> String {
+    let root = darkmux_sandbox::seen_at(kind, workspace, "/workspace");
+    crate::mission_config::workspace_paths::named_as(&prompt, &root)
 }
 
 /// The container brain after [`container_brain_route`]: the brain, the route

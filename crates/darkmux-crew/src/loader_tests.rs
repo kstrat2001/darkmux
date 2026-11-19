@@ -439,21 +439,21 @@
     }
 
 
-/// (#3112 review) The runtime's test holds `tool-bench`'s `/workspace`
-/// sentence verbatim (`runtime/src/tools/workspace.rs`
-/// `TOOL_BENCH_WORKSPACE_SENTENCE`), because the runtime crate cannot read
-/// `templates/`. This keeps the shipped role and that copy in step: if the
-/// role's wording changes, both change together, and the runtime's rename
-/// test keeps checking what actually ships.
+/// (#3112 review, contract 6) A shipped role whose frozen prompt says the
+/// working directory is mounted at `/workspace` (`tool-bench`) reaches a host
+/// sandbox's model naming where that sandbox sees the workspace: the host
+/// names it (`system_prompt_as_sent`) before it hashes and passes the
+/// prompt, so the frozen text never changes and the recorded hash is of the
+/// bytes sent. Byte-identical in a container.
 #[test]
-fn the_tool_bench_role_still_names_the_workspace_the_runtime_renames() {
-    let role = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/tool-bench.md"));
-    let runtime_test = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../runtime/src/tools/workspace.rs"));
-    let held = runtime_test
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("pub(crate) const TOOL_BENCH_WORKSPACE_SENTENCE: &str = \""))
-        .and_then(|rest| rest.strip_suffix("\";"))
-        .expect("the runtime's test holds the sentence");
-    assert!(held.contains("`/workspace`"), "{held}");
-    assert!(role.lines().any(|l| l == held), "tool-bench.md no longer carries the sentence the runtime test renames: {held}");
+fn the_tool_bench_role_names_the_workspace_where_a_host_sandbox_sees_it() {
+    use darkmux_sandbox::BackendKind;
+    let role = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/tool-bench.md")).to_string();
+    assert!(role.contains("mounted at `/workspace`"), "tool-bench.md no longer names `/workspace`");
+    let ws = tempfile::TempDir::new().unwrap();
+    let real = ws.path().canonicalize().unwrap().display().to_string();
+    let docker = crate::dispatch_internal::system_prompt_as_sent(role.clone(), Some(BackendKind::Docker), ws.path());
+    assert_eq!(docker, role);
+    let seatbelt = crate::dispatch_internal::system_prompt_as_sent(role.clone(), Some(BackendKind::Seatbelt), ws.path());
+    assert!(seatbelt.contains(&format!("mounted at `{real}`")) && !seatbelt.contains("`/workspace`"), "{seatbelt}");
 }

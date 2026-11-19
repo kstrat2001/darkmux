@@ -6779,6 +6779,38 @@ S(("127.0.0.1", port), H).serve_forever()
         }
     }
 
+    /// (contract 6) The system prompt a dispatch records the hash of is the
+    /// one it passes to the runtime as `--system`, named for where the
+    /// sandbox sees the workspace (the runtime sends `--system` byte for
+    /// byte): under Seatbelt the hash recorded is the hash of the host-path
+    /// text the runtime sends, not of the `/workspace` text the role wrote.
+    #[test]
+    fn the_recorded_system_hash_is_of_the_system_prompt_the_runtime_is_passed() {
+        use darkmux_sandbox::{BackendKind, SeatbeltBackend};
+        let root = tempfile::TempDir::new().unwrap();
+        for d in ["ws", "out"] {
+            std::fs::create_dir(root.path().join(d)).unwrap();
+        }
+        let role = "Work in /workspace and read /workspace/a.rs.".to_string();
+        let mut cfg = argv_config_with_base_url(None);
+        cfg.workspace = root.path().join("ws");
+        cfg.host_out = root.path().join("out");
+        cfg.system_prompt = system_prompt_as_sent(role.clone(), Some(BackendKind::Seatbelt), &cfg.workspace);
+        let real = cfg.workspace.canonicalize().unwrap().display().to_string();
+        assert_eq!(cfg.system_prompt, format!("Work in {real} and read {real}/a.rs."));
+        let policy = dispatch_policy_for(&cfg, &SeatbeltBackend);
+        let passed = policy.command.iter().skip_while(|a| *a != "--system").nth(1).unwrap();
+        let mut payload = DispatchStartPayload::default();
+        crate::role_inputs::stamp_prompt_inputs(&mut payload, &cfg.system_prompt, &Default::default());
+        assert_eq!(payload.system_sha256, Some(darkmux_flow::sha256_hex(passed.as_bytes())));
+        // The container run names its prompt so before it is recorded or passed.
+        let src = include_str!("dispatch_internal.rs");
+        assert!(
+            src.contains("let system_prompt = system_prompt_as_sent(system_prompt, darkmux_sandbox::selected().ok(), &workspace);"),
+            "prepare_container_run must name the prompt before ContainerRun holds it"
+        );
+    }
+
     /// (#3561) A dispatch on the host runs with its managed Node: the
     /// toolchain's PATH, its folder read-only where it is. A container's
     /// config carries none, so its policy names no PATH (the image's own).
