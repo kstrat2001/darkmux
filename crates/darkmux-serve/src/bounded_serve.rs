@@ -4,7 +4,9 @@
 //!
 //! What they share is [`Admission`]: at most `max_conns` connections at
 //! once, at most `per_ip` from one peer address, and one past either is
-//! closed as it is accepted. Each listener therefore holds a bounded number
+//! closed as it is accepted. A connection keeps its slots for as long as
+//! its socket is open, a socket switched to another protocol (a WebSocket)
+//! included ([`SlotHeld`]). Each listener therefore holds a bounded number
 //! of file descriptors, whatever a peer opens, so a flood of idle
 //! connections cannot take the descriptors the rest of the process needs.
 //! Every connection must also send a complete request head within a
@@ -161,7 +163,8 @@ pub(crate) const CLIENT: KeptAliveLimits = KeptAliveLimits {
 /// (sandboxed work is not this machine) before any of its requests reaches
 /// a route. Once `shutdown` says stop, nothing more is accepted, each
 /// open connection finishes the answer it is giving and closes (an idle one
-/// at once), and this returns when the last has closed.
+/// at once), and this returns when the last has closed: an upgraded one
+/// (a WebSocket) once its handler has let its stream go.
 pub(crate) async fn serve_kept_alive(
     listener: tokio::net::TcpListener,
     app: Router,
@@ -195,14 +198,17 @@ async fn kept_alive(
     let Admitted {
         stream,
         peer,
-        slots: _slots,
+        slots,
     } = conn;
     let this_conn = crate::local_peer::PeerConn::new(peer, stream.local_addr().ok());
     let served = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(header_read_timeout)
         .serve_connection(
-            TokioIo::new(stream),
+            TokioIo::new(SlotHeld {
+                io: stream,
+                _slots: slots,
+            }),
             connection_service(app, ConnectInfo(this_conn)),
         )
         .with_upgrades();
@@ -212,6 +218,63 @@ async fn kept_alive(
         () = stopped(&mut shutdown) => served.as_mut().graceful_shutdown(),
     }
     let _ = served.await;
+}
+
+/// A connection's socket together with its slots, so they are given back
+/// only when the socket is dropped. Hyper hands this same IO to an upgrade
+/// (a WebSocket's handler holds it as `hyper::upgrade::Upgraded`), so an
+/// upgraded connection keeps counting toward the caps, and holds up the
+/// drain, until its handler lets the stream go, not when hyper's own
+/// connection future ends.
+struct SlotHeld {
+    io: tokio::net::TcpStream,
+    _slots: Slots,
+}
+
+impl tokio::io::AsyncRead for SlotHeld {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for SlotHeld {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+    }
 }
 
 /// `app` as it serves one connection: each request carries `conn` (what

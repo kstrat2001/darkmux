@@ -292,3 +292,101 @@ fn the_viewer_and_the_client_listener_cap_their_connections() {
         );
     }
 }
+
+/// An app whose `/up` switches protocols and keeps the upgraded stream
+/// open until the other end hangs up; `/ok` answers plainly.
+fn upgrading_app() -> Router {
+    ok_app().route(
+        "/up",
+        axum::routing::get(|mut req: axum::extract::Request| async move {
+            let on = hyper::upgrade::on(&mut req);
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let Ok(up) = on.await else { return };
+                let mut io = hyper_util::rt::TokioIo::new(up);
+                let mut b = [0u8; 64];
+                while io.read(&mut b).await.is_ok_and(|n| n > 0) {}
+            });
+            axum::http::Response::builder()
+                .status(101)
+                .header("connection", "upgrade")
+                .header("upgrade", "test")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        }),
+    )
+}
+
+/// `n` connections to `addr`, each switched to another protocol (a
+/// WebSocket's shape) and held open.
+fn upgraded(addr: SocketAddr, n: usize) -> Vec<std::net::TcpStream> {
+    (0..n)
+        .map(|_| {
+            let mut s = std::net::TcpStream::connect(addr).unwrap();
+            s.write_all(
+                b"GET /up HTTP/1.1\r\nHost: x\r\nConnection: upgrade\r\nUpgrade: test\r\n\r\n",
+            )
+            .unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut head = Vec::new();
+            let mut b = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                assert_eq!(s.read(&mut b).unwrap(), 1, "the upgrade was not answered");
+                head.push(b[0]);
+            }
+            assert!(
+                head.starts_with(b"HTTP/1.1 101"),
+                "{}",
+                String::from_utf8_lossy(&head)
+            );
+            s
+        })
+        .collect()
+}
+
+/// An upgraded connection (a WebSocket) keeps its slot for as long as its
+/// stream is open: with the cap held by upgraded streams a new connection
+/// is closed on accept, and stopping waits for them; once they close,
+/// connections are admitted again and the server returns.
+/// The header deadline (30 s) is far past the 5 s the refused connection
+/// is given to close, so an admitted one could never pass for refused,
+/// however slowly a loaded machine gets to the accept.
+#[test]
+fn an_upgraded_connection_holds_its_slot_until_its_stream_closes() {
+    let (addr, stop, done) = serving(upgrading_app(), limits(4, 8, Duration::from_secs(30)));
+    let held = upgraded(addr, 4);
+    std::thread::sleep(Duration::from_millis(150));
+    let mut extra = std::net::TcpStream::connect(addr).unwrap();
+    assert!(
+        closed_within(&mut extra, Duration::from_secs(5)),
+        "a connection past a cap held by upgraded streams must be closed on accept"
+    );
+    drop(held);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut again = upgraded(addr, 1);
+    while std::time::Instant::now() < deadline
+        && ureq::get(&format!("http://{addr}/ok")).call().is_err()
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let body = ureq::get(&format!("http://{addr}/ok"))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert_eq!(
+        body, "ok",
+        "slots came back once the upgraded streams closed"
+    );
+    stop.send(true).unwrap();
+    assert!(
+        done.recv_timeout(Duration::from_millis(500)).is_err(),
+        "returned while an upgraded stream was still open"
+    );
+    let _ = again[0].shutdown(std::net::Shutdown::Both);
+    again.clear();
+    assert!(
+        done.recv_timeout(Duration::from_secs(3)).is_ok(),
+        "did not return once the upgraded stream closed"
+    );
+}
