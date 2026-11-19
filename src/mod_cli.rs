@@ -4,7 +4,9 @@
 //! whatever form the proposer chose. **darkmux never types a kit and never
 //! opens it.** `list` previews the raw kit truncated and nothing else — no
 //! parsed fields, no diff rendering, no verdict — the same discipline
-//! `finding list` applies to an emission.
+//! `finding list` applies to an emission. Every human rendering shows an
+//! escape sequence in the kit or a field as text (`\u{1b}`), never passing
+//! it to the terminal; `--json` carries the bytes.
 //!
 //! `--mission` answers from the mod's own create-time SNAPSHOT of its
 //! findings, not from the finding store as it stands now: a mod created
@@ -19,8 +21,9 @@
 use anyhow::{Context, Result};
 use darkmux_crew::mods::{self, ModRecord};
 use darkmux_types::config_access;
+use darkmux_types::user_files::{escape_text as shown, escape_text_keeping_lines};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::cli_json;
 
@@ -130,7 +133,7 @@ fn list_row(m: &ModRecord) -> String {
     let for_bit = if m.r#for.is_empty() {
         "for (none)".to_string()
     } else {
-        format!("for {}", m.r#for.join(", "))
+        format!("for {}", shown(&m.r#for.join(", ")))
     };
     let attach = match m.attachments.len() {
         0 => String::new(),
@@ -144,7 +147,7 @@ fn list_row(m: &ModRecord) -> String {
         (None, Some(_)) => "  [gate: skipped]".to_string(),
         (None, None) => String::new(),
     };
-    format!("{}  {}  {}  [{for_bit}]{attach}{gate}\n    {}", m.key, m.ts, m.by, preview(m.kit.as_deref()))
+    format!("{}  {}  {}  [{for_bit}]{attach}{gate}\n    {}", shown(&m.key), shown(&m.ts), shown(&m.by), preview(m.kit.as_deref()))
 }
 
 /// `mod list` — every mod in the store, ts-ascending.
@@ -206,9 +209,9 @@ pub fn list(for_key: Option<&str>, mission: Option<&str>, json: bool) -> Result<
 /// The `gate` line of `mod show`: passed, failed, skipped (with why), or not yet gated.
 fn gate_summary(rec: &ModRecord) -> String {
     match (&rec.gate, &rec.gate_skipped_reason) {
-        (Some(g), _) if g.passed => format!("passed ({})", g.command),
-        (Some(g), _) => format!("failed ({})", g.command),
-        (None, Some(reason)) => format!("skipped: {reason}"),
+        (Some(g), _) if g.passed => format!("passed ({})", shown(&g.command)),
+        (Some(g), _) => format!("failed ({})", shown(&g.command)),
+        (None, Some(reason)) => format!("skipped: {}", shown(reason)),
         (None, None) => "(not yet gated)".to_string(),
     }
 }
@@ -220,25 +223,106 @@ fn gate_summary(rec: &ModRecord) -> String {
 fn provenance_lines(rec: &ModRecord) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(k) = &rec.change_key {
-        lines.push(format!("change    {k}"));
+        lines.push(format!("change    {}", shown(k)));
     }
     if let Some(p) = &rec.proposer {
-        let profile = p.profile.as_deref().map(|x| format!(", profile {x}")).unwrap_or_default();
-        lines.push(format!("proposer  {} ({}{profile})", p.role, p.model));
+        let profile = p.profile.as_deref().map(|x| format!(", profile {}", shown(x))).unwrap_or_default();
+        lines.push(format!("proposer  {} ({}{profile})", shown(&p.role), shown(&p.model)));
     }
     if let Some(s) = &rec.site {
-        lines.push(format!("site      {}@{} {}:{}-{}", s.source, s.sha, s.file, s.start_line, s.end_line));
+        let (source, sha, file) = (shown(&s.source), shown(&s.sha), shown(&s.file));
+        lines.push(format!("site      {source}@{sha} {file}:{}-{}", s.start_line, s.end_line));
     }
     lines
 }
 
-fn print_provenance(rec: &ModRecord) {
-    for line in provenance_lines(rec) {
-        println!("{line}");
+/// The `for` lines of `mod show`: each finding the mod answers, with its
+/// mission, or `(none)`.
+fn for_lines(rec: &ModRecord) -> Vec<String> {
+    if rec.r#for.is_empty() {
+        return vec!["for       (none)".to_string()];
+    }
+    rec.context
+        .findings
+        .iter()
+        .map(|f| {
+            let detail = match (f.missing, f.mission_id.as_deref()) {
+                (true, _) => " (no stored finding)".to_string(),
+                (false, Some(m)) => format!(" [mission={}]", shown(m)),
+                (false, None) => String::new(),
+            };
+            format!("for       {}{detail}", shown(&f.key))
+        })
+        .collect()
+}
+
+/// The `attachments` section of `mod show`, empty when the mod has none.
+fn attachment_lines(rec: &ModRecord, root: &Path) -> Vec<String> {
+    if rec.attachments.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["\nattachments".to_string()];
+    lines.extend(rec.attachments.iter().map(|name| attachment_line(rec, root, name)));
+    lines
+}
+
+fn attachment_line(rec: &ModRecord, root: &Path, name: &str) -> String {
+    // Checked BEFORE the path is joined or stat'd: a recorded name is data
+    // off disk, and only a plain basename addresses a file inside this mod's
+    // own directory.
+    if !mods::is_safe_basename(name) {
+        return format!("  {}  (not a usable file name — skipped)", shown(name));
+    }
+    let path = mods::attachments_dir_at(root, &rec.key).join(name);
+    match std::fs::metadata(&path).map(|m| m.len()) {
+        Ok(n) => format!("  {}  ({n} bytes)", shown(name)),
+        // A recorded attachment whose file is gone is a fact worth showing,
+        // not a reason to fail the read.
+        Err(_) => format!("  {}  (missing from {})", shown(name), shown(&path.display().to_string())),
     }
 }
 
-/// `mod show <key>` — one record, whole, with the kit printed RAW.
+/// `mod show`'s whole text for `rec`. Every field a model or a peer can
+/// have written goes through ONE escape step (`escape_text`, one line per
+/// field; the kit through `escape_text_keeping_lines`), so an escape
+/// sequence in it is shown as text and never acted on by the terminal.
+///
+/// A mod the host wrote PARTIALLY says so above the kit: the `warnings`
+/// field exists so the record is honest about what was dropped, and a
+/// rendering that hid it would make the record look whole again.
+///
+/// The kit is the proposer's own text, printed unindented, unparsed, and
+/// with NOTHING appended: a trailing newline this did not receive is one it
+/// must not add. This rendering is for reading; the byte-exact channel a
+/// script should use is `mod show --json | jq -j .kit`, named in the verb's
+/// own `--help`.
+fn show_text(rec: &ModRecord, root: &Path) -> String {
+    let mut lines = vec![
+        format!("mod       {}", shown(&rec.key)),
+        format!("recorded  {}", shown(&rec.ts)),
+        format!("by        {}", shown(&rec.by)),
+        format!("kind      {}", shown(rec.kit_kind.as_deref().unwrap_or("(untyped)"))),
+    ];
+    lines.extend(provenance_lines(rec));
+    // (#2310 P4c-2b neighbor check) `mods.gate` is the one write path
+    // besides `mod create`/the runtime `create_mod` tool that mutates a
+    // stored mod, so a gated mod must not look identical to a never-gated one.
+    lines.push(format!("gate      {}", gate_summary(rec)));
+    lines.extend(for_lines(rec));
+    lines.extend(attachment_lines(rec, root));
+    if !rec.warnings.is_empty() {
+        lines.push("\nwarnings".to_string());
+        lines.extend(rec.warnings.iter().map(|w| format!("  {}", shown(w))));
+    }
+    lines.push("\nkit".to_string());
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text.push_str(&escape_text_keeping_lines(rec.kit.as_deref().unwrap_or("")));
+    text
+}
+
+/// `mod show <key>` — one record, whole, the kit as its proposer wrote it
+/// with every escape sequence shown as text ([`show_text`]).
 pub fn show(key: &str, json: bool) -> Result<i32> {
     let root = config_access::mods_dir();
     // An invalid key and a missing one need different remedies, so they must
@@ -260,68 +344,7 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
         return Ok(0);
     }
 
-    println!("mod       {}", rec.key);
-    println!("recorded  {}", rec.ts);
-    println!("by        {}", rec.by);
-    println!("kind      {}", rec.kit_kind.as_deref().unwrap_or("(untyped)"));
-    print_provenance(&rec);
-    // (#2310 P4c-2b neighbor check) `mods.gate` is the one write path
-    // besides `mod create`/the runtime `create_mod` tool that mutates a
-    // stored mod — `mod show --json` already surfaces it for free (the
-    // whole record serializes), but the plain-text rendering did not name
-    // it at all, which would have made a gated mod look identical to a
-    // never-gated one here.
-    println!("gate      {}", gate_summary(&rec));
-    if rec.r#for.is_empty() {
-        println!("for       (none)");
-    } else {
-        for f in &rec.context.findings {
-            let detail = if f.missing {
-                " (no stored finding)".to_string()
-            } else {
-                f.mission_id.as_deref().map(|m| format!(" [mission={m}]")).unwrap_or_default()
-            };
-            println!("for       {}{detail}", f.key);
-        }
-    }
-    if !rec.attachments.is_empty() {
-        println!("\nattachments");
-        for name in &rec.attachments {
-            // Checked BEFORE the path is joined or stat'd: a recorded name is
-            // data off disk, and only a plain basename addresses a file
-            // inside this mod's own directory.
-            if !mods::is_safe_basename(name) {
-                println!("  {name}  (not a usable file name — skipped)");
-                continue;
-            }
-            let path = mods::attachments_dir_at(&root, &rec.key).join(name);
-            let size = std::fs::metadata(&path).map(|m| m.len());
-            match size {
-                Ok(n) => println!("  {name}  ({n} bytes)"),
-                // A recorded attachment whose file is gone is a fact worth
-                // showing, not a reason to fail the read.
-                Err(_) => println!("  {name}  (missing from {})", path.display()),
-            }
-        }
-    }
-    // A mod the host wrote PARTIALLY says so here, above the kit: the
-    // `warnings` field exists so the record is honest about what was dropped,
-    // and a rendering that hid it would make the record look whole again.
-    if !rec.warnings.is_empty() {
-        println!("\nwarnings");
-        for w in &rec.warnings {
-            println!("  {w}");
-        }
-    }
-    // The kit is the proposer's own bytes, printed unindented, unparsed, and
-    // with NOTHING appended — a trailing newline this did not receive is a
-    // byte it must not add. This rendering is for reading; the byte-exact
-    // channel a script should use is `mod show --json | jq -j .kit`, named in
-    // the verb's own `--help` rather than only in a comment here.
-    println!("\nkit");
-    if let Some(kit) = rec.kit.as_deref() {
-        print!("{kit}");
-    }
+    print!("{}", show_text(&rec, &root));
     Ok(0)
 }
 
@@ -329,7 +352,7 @@ pub fn show(key: &str, json: bool) -> Result<i32> {
 /// collapsed so it fits a line, then cut. Plain text, not JSON: the kit is
 /// never parsed, and this is a glance at it, not an interpretation of it.
 fn preview(kit: Option<&str>) -> String {
-    let compact: String = kit.unwrap_or("(attachments only)").split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = shown(&kit.unwrap_or("(attachments only)").split_whitespace().collect::<Vec<_>>().join(" "));
     if compact.chars().count() <= PREVIEW_CHARS {
         return compact;
     }
@@ -367,5 +390,50 @@ mod tests {
                 "site      app@abc src/a.ts:3-9".to_string(),
             ]
         );
+    }
+
+    /// An OSC 0 title, a screen clear and an OSC 52 clipboard write, the
+    /// kind of bytes a local seat can put in a kit through `create_mod`.
+    const HOSTILE: &str = "\x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}";
+
+    fn hostile() -> ModRecord {
+        let mut r = bare();
+        r.kit = Some(format!("--- a/x\n+{HOSTILE}\n\tline\n"));
+        r.by = format!("coder ({HOSTILE})");
+        r.attachments = vec![format!("a{HOSTILE}")];
+        r.warnings = vec![format!("dropped {HOSTILE}")];
+        r.proposer = Some(ModProposer { role: "coder".into(), profile: None, model: HOSTILE.into() });
+        r
+    }
+
+    fn inert(text: &str) -> bool {
+        !text.chars().any(|c| (c.is_control() && c != '\n' && c != '\t') || c == '\u{202e}')
+    }
+
+    #[test]
+    fn mod_show_prints_a_hostile_kit_and_fields_inert_keeping_its_lines() {
+        let root = tempfile::tempdir().unwrap();
+        let text = show_text(&hostile(), root.path());
+        assert!(inert(&text), "{text:?}");
+        assert!(text.ends_with("\nkit\n--- a/x\n+\\u{1b}]0;owned\\u{7}\\u{1b}[2J\\u{1b}]52;c;aGk=\\u{7}\\u{9b}2J\\u{202e}\n\tline\n"), "{text:?}");
+    }
+
+    #[test]
+    fn mod_list_prints_a_hostile_kit_preview_inert() {
+        let row = list_row(&hostile());
+        assert!(inert(&row), "{row:?}");
+    }
+
+    #[test]
+    fn mod_show_leaves_plain_text_newlines_and_unicode_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let mut r = bare();
+        r.kit = Some("café 日本語 🇺🇸 👩\u{200d}💻 שלום\u{200f}\n\tindented\n".into());
+        let text = show_text(&r, root.path());
+        assert_eq!(
+            text,
+            "mod       mod-1\nrecorded  t\nby        kain\nkind      (untyped)\ngate      (not yet gated)\nfor       (none)\n\nkit\ncafé 日本語 🇺🇸 👩\u{200d}💻 שלום\u{200f}\n\tindented\n"
+        );
+        assert_eq!(list_row(&r), "mod-1  t  kain  [for (none)]\n    café 日本語 🇺🇸 👩\u{200d}💻 שלום\u{200f} indented");
     }
 }

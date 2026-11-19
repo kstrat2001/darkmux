@@ -111,6 +111,15 @@ fn shown(text: &str) -> String {
     darkmux_types::user_files::escape_text(text)
 }
 
+/// The question `init --add-engine` asks before it writes: what it adds, as
+/// [`escape_text_strict`](darkmux_types::user_files::escape_text_strict)
+/// shows it. The summary names a model an engine listed, and a direction
+/// mark or joiner in it would make what is approved read differently from
+/// what is written.
+fn add_question(summary: &str, path: &Path) -> String {
+    darkmux_types::user_files::escape_text_strict(&format!("darkmux init: add {summary} to {}?", path.display()))
+}
+
 fn add_line_text(outcome: &AddOutcome, path: &Path) -> String {
     match outcome {
         AddOutcome::Added(p) => format!("add engine: added {} to {}", p.summary(), path.display()),
@@ -187,11 +196,7 @@ pub fn add_engine(
             why: "a dry run",
         };
     }
-    let question = shown(&format!(
-        "darkmux init: add {} to {}?",
-        planned.summary(),
-        path.display()
-    ));
+    let question = add_question(&planned.summary(), path);
     match confirm.confirm(&question) {
         None => AddOutcome::NotWritten {
             planned,
@@ -417,5 +422,14 @@ mod tests {
         assert!(!add_line(&refused, Path::new("/p"))
             .chars()
             .any(char::is_control));
+    }
+
+    /// The add question shows a direction mark or joiner in a model name as
+    /// text, so the model approved is the model written.
+    #[test]
+    fn the_add_question_shows_direction_marks_as_text() {
+        let q = add_question("endpoint `flint` running qwen\u{200f}-7b\u{200f}", Path::new("/p/profiles.json"));
+        assert_eq!(q, "darkmux init: add endpoint `flint` running qwen\\u{200f}-7b\\u{200f} to /p/profiles.json?");
+        assert_eq!(add_question("x", Path::new("/p")), "darkmux init: add x to /p?");
     }
 }

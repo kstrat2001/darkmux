@@ -622,9 +622,7 @@ impl FlintAnswer {
             )
         });
         // Asked after `rec status`, and only while rec's own server is up.
-        let key = matches!(own_server, Ok(Some(_))).then(|| {
-            crate::gestalt_host::lms_host::with_deadline_cap(cap, || rec.auth_token().map(drop).map_err(msg))
-        });
+        let key = crate::gestalt_host::lms_host::with_deadline_cap(cap, || own_server_key(&rec, &own_server));
         FlintAnswer {
             rec,
             version,
@@ -681,14 +679,15 @@ impl FlintAnswer {
             }
             Ok(own) => own.as_ref(),
         };
-        match super::flint::own_server_use(own, model, darkmuxs) {
-            super::flint::OwnServerUse::Free => None,
-            super::flint::OwnServerUse::Reuse { .. } => Some(self.key_verdict()),
-            super::flint::OwnServerUse::Refuse {
+        match keyed_own_server_use(own, model, darkmuxs, self.key.as_ref()) {
+            Err(e) => Some(Availability::refused(ClientCode::EngineUnavailable, e)),
+            Ok(super::flint::OwnServerUse::Free) => None,
+            Ok(super::flint::OwnServerUse::Reuse { .. }) => Some(Availability::external()),
+            Ok(super::flint::OwnServerUse::Refuse {
                 address,
                 why,
                 remedy,
-            } => Some(Availability::refused(
+            }) => Some(Availability::refused(
                 ClientCode::EngineInUse,
                 super::flint::own_server_refusal(&address, &why, remedy),
             )),
@@ -696,14 +695,35 @@ impl FlintAnswer {
     }
 }
 
-impl FlintAnswer {
-    /// A model rec's own server serves: `external`, unless `rec auth token`
-    /// failed, which a dispatch refuses `engine_unavailable`.
-    fn key_verdict(&self) -> Availability {
-        match &self.key {
-            Some(Err(e)) => Availability::refused(ClientCode::EngineUnavailable, e.clone()),
-            _ => Availability::external(),
-        }
+/// (#3574) Whether `rec auth token` gives a key, asked only while rec's own
+/// server is up (`own_server`, what `rec status` said): a dispatch that uses
+/// that server sends the key with every request. The key itself is dropped
+/// at once, never kept. `None`: not asked. A listing and doctor's
+/// `flint engine` row both ask it here.
+pub fn own_server_key(
+    rec: &super::flint::Rec,
+    own_server: &Result<Option<super::flint::OwnServer>, String>,
+) -> Option<Result<(), String>> {
+    matches!(own_server, Ok(Some(_)))
+        .then(|| rec.auth_token().map(drop).map_err(|e| format!("{e:#}")))
+}
+
+/// (#3574) What rec's own server means for `model` as a dispatch decides
+/// it: [`super::flint::own_server_use`], with a reuse refused when `rec auth
+/// token` gave no key (`key`, from [`own_server_key`]), since a dispatch
+/// refuses it `engine_unavailable`. `Err` is that refusal's reason. The one
+/// decision a listing and doctor read; a dispatch makes the same one in
+/// `darkmux_crew::engine_dispatch`, which reads the key itself to send it.
+pub fn keyed_own_server_use(
+    own: Option<&super::flint::OwnServer>,
+    model: &ProfileModel,
+    darkmuxs: Option<&darkmux_types::engine_record::EngineRecord>,
+    key: Option<&Result<(), String>>,
+) -> Result<super::flint::OwnServerUse, String> {
+    let decided = super::flint::own_server_use(own, model, darkmuxs);
+    match (&decided, key) {
+        (super::flint::OwnServerUse::Reuse { .. }, Some(Err(e))) => Err(e.clone()),
+        _ => Ok(decided),
     }
 }
 

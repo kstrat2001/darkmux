@@ -54,6 +54,7 @@ pub mod test_ports;
 pub mod style;
 pub mod url_authority;
 pub mod user_files;
+pub(crate) mod unicode_tables;
 pub mod workdir;
 
 use serde::{Deserialize, Serialize};
