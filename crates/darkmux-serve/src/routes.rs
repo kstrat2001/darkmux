@@ -667,7 +667,7 @@ mod tests {
         let answer = |method: &str, uri: String| {
             let app = client_router(state.clone());
             let mut req = Request::builder().method(method).uri(uri).header("host", "localhost").body(Body::empty()).unwrap();
-            req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5555))));
+            req.extensions_mut().insert(axum::extract::ConnectInfo(crate::local_peer::operator(std::net::SocketAddr::from(([127, 0, 0, 1], 5555)))));
             async move {
                 let res = app.oneshot(req).await.unwrap();
                 let status = res.status();

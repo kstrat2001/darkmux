@@ -246,6 +246,8 @@ fn run_on(
     // (#2947) `None` when a thermal threshold is bad config; that value's
     // own enum-settings row reports it.
     checks.extend(check_thermal_governor());
+    // Seatbelt sandboxes darkmux cannot decide on, each with its remedy.
+    checks.extend(checks_sandbox::check_undecided_sandboxes());
     // What `darkmux client serve` reads on every request (`clients.*`).
     checks.extend(checks_clients::check_clients_settings());
     // (#3560) What `client serve` does on the tailnet (`clients.remote`).

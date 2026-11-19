@@ -1347,7 +1347,7 @@ pub(crate) async fn serve_bounded(
 async fn one_request(conn: crate::bounded_serve::Admitted, app: Router, limits: ConnLimits) {
     use hyper_util::rt::{TokioIo, TokioTimer};
     let crate::bounded_serve::Admitted { stream, peer, slots: _slots } = conn;
-    let svc = crate::bounded_serve::connection_service(app, peer);
+    let svc = crate::bounded_serve::connection_service(app, ConnectInfo(peer));
     let conn = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(limits.header_read_timeout)

@@ -6,7 +6,9 @@
 //! ([`bind_addr`]): never `0.0.0.0`, never the tailnet address. Every route
 //! sits behind one gate ([`admitted`]): the request must be from this
 //! machine as the viewer daemon decides it (`is_local_request`: a loopback
-//! peer, no reverse-proxy header, a `Host` naming this listener), must carry
+//! peer whose process is the operator's, never sandboxed work or a container
+//! engine's forwarder (`local_peer`), no reverse-proxy header, a `Host`
+//! naming this listener), must carry
 //! no `Origin` (a web page sends one; a native app does not), and a POST with
 //! a body must be `Content-Type: application/json`. A browser page on any
 //! site therefore cannot drive it, whatever DNS it rebinds. (#3560) With
@@ -1984,7 +1986,8 @@ pub(crate) async fn method_not_allowed() -> Response {
 
 /// The gate in front of every route. The request must come from this
 /// machine the way the viewer daemon decides it ([`crate::is_local_at`]: a
-/// loopback peer, no reverse-proxy header, a `Host` naming this listener),
+/// loopback peer whose process is the operator's, no reverse-proxy header, a
+/// `Host` naming this listener),
 /// or (#3560) from a paired device through the tailnet entry this process
 /// published ([`remote_admitted`]). Either way it must not come from a web
 /// page (it carries no `Origin`; a native app sends none, and every browser

@@ -154,8 +154,12 @@ pub(crate) const CLIENT: KeptAliveLimits = KeptAliveLimits {
 /// and answers that stream (SSE) for as long as they last. What bounds a
 /// connection is [`Admission`] and the header deadline: one that sends no
 /// complete request head in time, an idle one between requests included,
-/// is closed. The peer address is attached to each request as
-/// `ConnectInfo`. Once `shutdown` says stop, nothing more is accepted, each
+/// is closed. Each connection gets one [`crate::local_peer::PeerConn`], and
+/// the app is served behind [`crate::local_peer::judged`] (applied once
+/// here), so every request carries its peer's address as
+/// `ConnectInfo<SocketAddr>` and a loopback connection's process is judged
+/// (sandboxed work is not this machine) before any of its requests reaches
+/// a route. Once `shutdown` says stop, nothing more is accepted, each
 /// open connection finishes the answer it is giving and closes (an idle one
 /// at once), and this returns when the last has closed.
 pub(crate) async fn serve_kept_alive(
@@ -165,6 +169,7 @@ pub(crate) async fn serve_kept_alive(
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut shutdown = shutdown;
+    let app = crate::local_peer::judged(app);
     let admission = Admission::new(limits.label, limits.max_conns, limits.per_ip);
     while let Some(conn) = admission.next(&listener, &mut shutdown).await {
         tokio::spawn(kept_alive(
@@ -192,10 +197,14 @@ async fn kept_alive(
         peer,
         slots: _slots,
     } = conn;
+    let this_conn = crate::local_peer::PeerConn::new(peer, stream.local_addr().ok());
     let served = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(header_read_timeout)
-        .serve_connection(TokioIo::new(stream), connection_service(app, peer))
+        .serve_connection(
+            TokioIo::new(stream),
+            connection_service(app, ConnectInfo(this_conn)),
+        )
         .with_upgrades();
     tokio::pin!(served);
     tokio::select! {
@@ -205,13 +214,15 @@ async fn kept_alive(
     let _ = served.await;
 }
 
-/// `app` as it serves one connection from `peer`: each request carries the
-/// peer's address as `ConnectInfo<SocketAddr>`, set before the router sees
-/// it. Constant time per connection; layering the router for each one
+/// `app` as it serves one connection: each request carries `conn` (what
+/// the listener knows of the connection: `ConnectInfo<SocketAddr>` for the
+/// fleet listener, `ConnectInfo<PeerConn>` for a listener behind
+/// [`crate::local_peer::judged`]) as an extension, set before the router
+/// sees it. Constant time per connection; layering the router for each one
 /// instead rebuilds every route (about 95 µs on the viewer's).
-pub(crate) fn connection_service(
+pub(crate) fn connection_service<C: Clone + Send + Sync + 'static>(
     app: Router,
-    peer: SocketAddr,
+    conn: C,
 ) -> impl hyper::service::Service<
     axum::http::Request<hyper::body::Incoming>,
     Response = axum::response::Response,
@@ -222,7 +233,7 @@ pub(crate) fn connection_service(
 > + Send {
     let router = hyper_util::service::TowerToHyperService::new(app);
     hyper::service::service_fn(move |mut req: axum::http::Request<hyper::body::Incoming>| {
-        req.extensions_mut().insert(ConnectInfo(peer));
+        req.extensions_mut().insert(conn.clone());
         hyper::service::Service::call(&router, req)
     })
 }

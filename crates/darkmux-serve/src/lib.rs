@@ -86,6 +86,7 @@ mod hub_conn;
 mod flow_window;
 mod day_index;
 mod host_gate;
+mod local_peer;
 pub use fleet_window::{FleetRecord, FleetRecords, RecordIdentity};
 pub(crate) use fleet_window::{read_fleet_cached, FleetCaches, FleetScope};
 mod routes;
@@ -432,7 +433,7 @@ pub(crate) fn build_router_full(
 /// way to carry.
 ///
 /// A real request always arrives on a connection, so `run()`'s
-/// `into_make_service_with_connect_info` always supplies a peer address. A
+/// `serve_viewer` always supplies a peer address. A
 /// `oneshot` call has no connection and therefore no `ConnectInfo`, which used
 /// to be papered over inside `auth_mw` itself (absent ⇒ loopback ⇒ exempt) —
 /// the fail-open default this issue removed.
@@ -456,8 +457,9 @@ pub(crate) fn build_router_full(
 #[cfg(test)]
 async fn assume_loopback_peer(mut req: Request, next: Next) -> Response {
     if req.extensions().get::<ConnectInfo<SocketAddr>>().is_none() {
-        req.extensions_mut()
-            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+        let peer = SocketAddr::from(([127, 0, 0, 1], 5555));
+        local_peer::state_operator(peer);
+        req.extensions_mut().insert(ConnectInfo(peer));
     }
     if !req.headers().contains_key(axum::http::header::HOST) {
         req.headers_mut().insert(axum::http::header::HOST, axum::http::HeaderValue::from_static("localhost"));
@@ -633,9 +635,15 @@ pub(crate) fn record_bound_addr(addr: Option<SocketAddr>) {
 
 /// (#2916 stage 2 review C5, #2988 review) Whether a request comes from THIS
 /// machine, judged by the one predicate every local decision in this daemon
-/// uses. All three must hold:
+/// uses. All four must hold:
 ///
 /// - a loopback peer address (an IPv4-mapped `::ffff:127.0.0.1` included);
+/// - whose connection is the operator's: held by a process of this user
+///   outside every sandbox on the host and not a container engine's
+///   forwarder ([`local_peer`]). Sandboxed work runs on this machine too,
+///   and a container reaches the host's loopback through the engine's
+///   forwarder; neither is the operator. A peer no connection here was
+///   judged for (a lookup that failed included) is not;
 /// - no header a reverse proxy adds ([`PROXY_HEADERS`]);
 /// - a `Host` header naming this daemon: `localhost`, `127.0.0.1`, `[::1]`
 ///   or the bound address, each with or without the bound port. A page an
@@ -664,9 +672,14 @@ pub(crate) fn is_local_at(
     headers: &axum::http::HeaderMap,
     bound: Option<SocketAddr>,
 ) -> bool {
-    peer.is_some_and(|p| p.ip().to_canonical().is_loopback())
-        && !PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
+    peer.is_some_and(|p| p.ip().to_canonical().is_loopback() && local_peer::is_operator(p))
+        && !carries_proxy_header(headers)
         && host_names_this_daemon(headers, bound)
+}
+
+/// Whether `headers` hold any header a reverse proxy adds ([`PROXY_HEADERS`]).
+pub(crate) fn carries_proxy_header(headers: &axum::http::HeaderMap) -> bool {
+    PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
 }
 
 /// The host part of a `Host` header value.
@@ -1562,6 +1575,22 @@ fn sandbox_configured_now() -> Option<darkmux_sandbox::BackendKind> {
     darkmux_sandbox::selected_in(&darkmux_types::config::DarkmuxConfig::load_from(&path)).ok()
 }
 
+/// The ASCII-art wordmark and tagline the startup banner opens with, each
+/// line ended, then a blank line: only for a terminal (`terminal`), so piped
+/// or redirected logs stay clean; empty otherwise.
+fn wordmark(terminal: bool) -> String {
+    if !terminal {
+        return String::new();
+    }
+    let art = r#"██████╗  █████╗ ██████╗ ██╗  ██╗███╗   ███╗██╗   ██╗██╗  ██╗
+██╔══██╗██╔══██╗██╔══██╗██║ ██╔╝████╗ ████║██║   ██║╚██╗██╔╝
+██║  ██║███████║██████╔╝█████╔╝ ██╔████╔██║██║   ██║ ╚███╔╝ 
+██║  ██║██╔══██║██╔══██╗██╔═██╗ ██║╚██╔╝██║██║   ██║ ██╔██╗ 
+██████╔╝██║  ██║██║  ██║██║  ██╗██║ ╚═╝ ██║╚██████╔╝██╔╝ ██╗
+╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝"#;
+    format!("{}\n  🤖 Mission control for your AI fleet.\n\n", darkmux_types::style::accent(art))
+}
+
 pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Result<()> {
     // (#2988 review) The config gate every entry point runs: a wrong-typed
     // value (`serve.read_auth: "true"`) or a retired key would otherwise be
@@ -1628,19 +1657,9 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         let flows_dir_exists = flows_dir.exists();
         let missions_dir = darkmux_crew::loader::missions_dir();
         let missions_dir_exists = missions_dir.exists();
-        // Print the ASCII-art wordmark + tagline only when stdout is a real
+        // The ASCII-art wordmark + tagline, only when stdout is a real
         // terminal (so piped / redirected logs stay clean).
-        if std::io::stdout().is_terminal() {
-            let art = r#"██████╗  █████╗ ██████╗ ██╗  ██╗███╗   ███╗██╗   ██╗██╗  ██╗
-██╔══██╗██╔══██╗██╔══██╗██║ ██╔╝████╗ ████║██║   ██║╚██╗██╔╝
-██║  ██║███████║██████╔╝█████╔╝ ██╔████╔██║██║   ██║ ╚███╔╝ 
-██║  ██║██╔══██║██╔══██╗██╔═██╗ ██║╚██╔╝██║██║   ██║ ██╔██╗ 
-██████╔╝██║  ██║██║  ██║██║  ██╗██║ ╚═╝ ██║╚██████╔╝██╔╝ ██╗
-╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝"#;
-            println!("{}", darkmux_types::style::accent(art));
-            println!("  🤖 Mission control for your AI fleet.");
-            println!();
-        }
+        print!("{}", wordmark(std::io::stdout().is_terminal()));
 
         // Print the startup panel (viewer URL, counts, warnings).
         let phases_dir = darkmux_crew::loader::phases_dir();
@@ -1797,7 +1816,8 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         // (#881) `serve_viewer` populates each request's
         // `ConnectInfo<SocketAddr>` from the real TCP peer — that's how
         // `auth_mw` tells a remote peer (token required) from a loopback one
-        // (exempt).
+        // (exempt). It also judges whose process a loopback peer is, so
+        // sandboxed work on this machine is not taken for the operator.
         //
         // (#1663) This used to be SECURITY-load-bearing: `auth_mw` treated an
         // absent `ConnectInfo` as loopback, so downgrading to a plain
