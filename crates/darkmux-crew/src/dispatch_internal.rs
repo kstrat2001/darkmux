@@ -218,11 +218,16 @@ fn git_checkout(workdir: &Path, found: &darkmux_types::workdir::SplitGitdir) -> 
 /// both the operator warning and the model-facing note name a path the
 /// reader can actually see. `volume_mounts` above mounts the
 /// workdir at `/workspace`, so a checkout AT the workdir is `/workspace`
-/// and one one level under it is `/workspace/<child>`. (#3112) The same
-/// under a sandbox on the host: the model is shown `/workspace` there too,
-/// and the runtime maps it to the host path.
+/// and one one level under it is `/workspace/<child>`.
 pub(crate) fn container_path_for(workdir: &Path, checkout: &Path) -> String {
-    let root = "/workspace".to_string();
+    seen_path_for(darkmux_sandbox::selected().ok(), workdir, checkout)
+}
+
+/// (#3112 review) [`container_path_for`] under `kind`: beneath where the
+/// sandbox sees the workdir (`/workspace` in a container, the workdir's own
+/// host path in a sandbox on the host).
+pub(crate) fn seen_path_for(kind: Option<darkmux_sandbox::BackendKind>, workdir: &Path, checkout: &Path) -> String {
+    let root = darkmux_sandbox::seen_at(kind, workdir, "/workspace");
     match checkout.strip_prefix(workdir) {
         Ok(rel) if rel.as_os_str().is_empty() => root,
         Ok(rel) => format!("{root}/{}", rel.display()),
@@ -2693,15 +2698,12 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
     // (#3112 step 2) Where the sandbox sees the workspace and the out-dir.
     let (ws_at, out_at) = (backend.place(&mounts[0]), backend.place(&mounts[1]));
     mounts.extend(workdir_git_read_only_mount(config.workdir_git_read_only.as_deref()));
-    let attachments = mod_attachment_mounts(&config.mod_attachment_mounts);
-    let cache = config.cache_dir.as_deref().map(|c| cache_mount_placed(c, backend));
-    // (#3112) The other mounts a model is shown, where this sandbox sees them.
-    let elsewhere = placed_elsewhere(attachments.iter().chain(cache.iter().map(|(m, _)| m)), backend);
-    mounts.extend(attachments);
+    mounts.extend(mod_attachment_mounts(&config.mod_attachment_mounts));
     // (#3561) A sandbox on the host's managed Node, read-only where it is.
     mounts.extend(crate::contained_command::toolchain_mounts(&config.toolchain));
     let mut env: Vec<(String, String)> = config.toolchain.path.iter().map(|p| ("PATH".to_string(), p.clone())).collect();
-    if let Some((mount, cache_env)) = cache {
+    if let Some(cache) = &config.cache_dir {
+        let (mount, cache_env) = cache_mount_placed(cache, backend);
         mounts.push(mount);
         env.extend(cache_env);
     }
@@ -2713,7 +2715,6 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
     if out_at != mounts[1].at {
         env.push(("DARKMUX_RUNTIME_OUT_DIR".to_string(), out_at.clone()));
     }
-    env.extend(runtime_paths_env(&elsewhere));
     let injected = config.runtime_binary.as_deref().filter(|_| config.inject).map(runtime_injection_mount);
     let entrypoint = injected.as_ref().map(|m| backend.place(m));
     mounts.extend(injected);
@@ -2731,6 +2732,10 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
         mounts,
         ports: Vec::new(),
         stdin: config.needs_stdin(),
+        host_services: endpoint_ports(config),
+        // Refused even before they listen: a daemon started after the
+        // dispatch is planned (the profile's listing missed it).
+        refused_ports: darkmux_types::config_enum::darkmux_service_ports(),
         host_alias: (config.container_host_access == darkmux_platform::ContainerHostAccess::HostGateway)
             .then(|| "host.docker.internal".to_string()),
         user,
@@ -2743,18 +2748,237 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
     }
 }
 
-/// (#3112) Each of `mounts` that `backend` places away from its container
-/// path, as `(container path, where the sandbox sees it)`.
-fn placed_elsewhere<'a>(mounts: impl Iterator<Item = &'a Mount>, backend: &dyn darkmux_sandbox::SandboxBackend) -> Vec<(String, String)> {
-    mounts.map(|m| (m.at.clone(), backend.place(m))).filter(|(at, seen)| at != seen).collect()
+/// The port the runtime's model client dials when it is passed no
+/// `--base-url` (`runtime/src/lmstudio.rs`'s `DEFAULT_BASE_URL`).
+const RUNTIME_DEFAULT_MODEL_PORT: u16 = 1234;
+
+/// The ports of the endpoints a dispatch's runtime dials on this machine,
+/// sorted: its model server (`--base-url`, else the runtime's default, which
+/// names this host), a brain's `--chat-url` and an unmanaged compactor's,
+/// each at the port its URL names or its scheme's, when its host is this
+/// machine ([`host_is_this_machine`]). A sandbox on the host is given these
+/// of this host's services and no other.
+fn endpoint_ports(config: &DockerRunConfig) -> Vec<u16> {
+    let here = |url: &&str| host_is_this_machine(url, this_hosts_name().as_deref(), is_own_address);
+    let urls = [&config.base_url_override, &config.remote_chat_url, &config.compaction.compactor_chat_url];
+    let named = urls.into_iter().filter_map(|u| u.as_deref()).filter(here).filter_map(darkmux_types::endpoint::url_port);
+    let default = config.base_url_override.is_none().then_some(RUNTIME_DEFAULT_MODEL_PORT);
+    let mut ports: Vec<u16> = named.chain(default).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
-/// (#3112) `DARKMUX_RUNTIME_PATHS`, the runtime's map from the container
-/// paths a model is shown to where this sandbox sees them (a JSON array of
-/// pairs), when any mount is placed elsewhere; nothing in a container.
-fn runtime_paths_env(elsewhere: &[(String, String)]) -> Option<(String, String)> {
-    let json = serde_json::to_string(elsewhere).ok()?;
-    (!elsewhere.is_empty()).then(|| ("DARKMUX_RUNTIME_PATHS".to_string(), json))
+/// Whether `url`'s host is this machine, read as the runtime's WHATWG URL
+/// parser reads it ([`runtime_host`]): `localhost`, a loopback or
+/// unspecified address in any spelling (an IPv4-mapped one included), an
+/// address of this host (`own`), or this host's `name`, with or without
+/// `.local`, in any case. Never a multicast or broadcast address. No name is
+/// looked up.
+pub(crate) fn host_is_this_machine(url: &str, name: Option<&str>, own: impl Fn(std::net::IpAddr) -> bool) -> bool {
+    match runtime_host(url) {
+        Some(RuntimeHost::Ip(ip)) => ip_is_this_machine(ip, own),
+        Some(RuntimeHost::Name(host)) => host == "localhost" || name.is_some_and(|n| same_host_name(&host, n)),
+        None => false,
+    }
+}
+
+/// A URL's host as the runtime reads it.
+#[derive(Debug, PartialEq)]
+enum RuntimeHost {
+    Ip(std::net::IpAddr),
+    /// A domain, lowercased, without one trailing dot.
+    Name(String),
+}
+
+/// `url`'s host as a WHATWG URL parser (the runtime's) reads it for an
+/// `http` URL: an IPv6 literal in brackets (no zone), else the host
+/// lowercased, an IPv4 address when it ends in a number ([`whatwg_ipv4`]),
+/// else a name. `None` for no host, a host the parser refuses, a
+/// percent-encoded one (`url_host` refuses it: the runtime would decode it,
+/// so such a URL is given no port, failing closed), or a URL any client
+/// might read differently (a backslash, which WHATWG reads as `/`, or a
+/// character that is not printable ASCII).
+fn runtime_host(url: &str) -> Option<RuntimeHost> {
+    if url.chars().any(|c| c == '\\' || !c.is_ascii_graphic()) {
+        return None;
+    }
+    let hostport = darkmux_types::endpoint::url_host(url)?;
+    match hostport.strip_prefix('[') {
+        Some(v6) => bracketed_host(v6),
+        None => plain_host(&hostport),
+    }
+}
+
+/// An IPv6 literal's host, `v6` being what follows its `[`: the address up
+/// to `]`, with no zone (WHATWG refuses one). `None` when it does not read.
+fn bracketed_host(v6: &str) -> Option<RuntimeHost> {
+    let (inside, _) = v6.split_once(']')?;
+    inside.parse::<std::net::Ipv6Addr>().ok().map(|a| RuntimeHost::Ip(a.into()))
+}
+
+/// A host that is not an IPv6 literal, `hostport` with any `:port`:
+/// lowercased, an IPv4 address when it ends in a number ([`whatwg_ipv4`],
+/// `None` when that parser refuses it), else a name without one trailing
+/// dot. `None` for an empty host.
+fn plain_host(hostport: &str) -> Option<RuntimeHost> {
+    let host = hostport.split_once(':').map_or(hostport, |(h, _)| h).to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    match whatwg_ipv4(&host) {
+        Some(parsed) => parsed.map(|a| RuntimeHost::Ip(a.into())),
+        None => Some(RuntimeHost::Name(host.strip_suffix('.').unwrap_or(&host).to_string())),
+    }
+}
+
+/// The WHATWG URL standard's IPv4 parser over a host: `None` when the host
+/// does not end in a number (it is a name); else the address, or `None`
+/// inside when the parser refuses it. One to four dot-separated parts (one
+/// trailing dot allowed), each decimal, `0x` hex or `0`-led octal; every
+/// part but the last at most 255, the last filling the bytes left.
+fn whatwg_ipv4(host: &str) -> Option<Option<std::net::Ipv4Addr>> {
+    let mut parts: Vec<&str> = host.split('.').collect();
+    if parts.len() > 1 && parts.last() == Some(&"") {
+        parts.pop();
+    }
+    let last = parts.last()?;
+    if !(!last.is_empty() && last.bytes().all(|b| b.is_ascii_digit())) && ipv4_number(last).is_none() {
+        return None;
+    }
+    Some(ipv4_from_parts(&parts))
+}
+
+/// The address `parts` (each an IPv4 number) spell, or `None` when the
+/// parser refuses them.
+fn ipv4_from_parts(parts: &[&str]) -> Option<std::net::Ipv4Addr> {
+    if parts.len() > 4 {
+        return None;
+    }
+    let numbers = parts.iter().map(|p| ipv4_number(p)).collect::<Option<Vec<u64>>>()?;
+    let (last, leading) = numbers.split_last()?;
+    if leading.iter().any(|n| *n > 255) || *last >= 1u64 << (8 * (5 - numbers.len())) {
+        return None;
+    }
+    let value = leading.iter().enumerate().fold(*last, |acc, (i, n)| acc + (n << (8 * (3 - i))));
+    Some(std::net::Ipv4Addr::from(u32::try_from(value).ok()?))
+}
+
+/// One part of a WHATWG IPv4 address: `0x` (or `0X`) hex, `0`-led octal,
+/// else decimal; `0x` alone is 0. `None` for an empty part or a digit its
+/// radix does not have.
+fn ipv4_number(part: &str) -> Option<u64> {
+    if part.is_empty() {
+        return None;
+    }
+    let (digits, radix) = match part.get(..2) {
+        Some("0x") | Some("0X") => (&part[2..], 16),
+        _ if part.len() >= 2 && part.starts_with('0') => (&part[1..], 8),
+        _ => (part, 10),
+    };
+    if digits.is_empty() {
+        return Some(0);
+    }
+    if !digits.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    u64::from_str_radix(digits, radix).ok()
+}
+
+/// Whether `ip` (an IPv4-mapped one read as its IPv4 address) is a loopback
+/// or unspecified address, or one `own` says is this host's; never a
+/// multicast or broadcast one.
+fn ip_is_this_machine(ip: std::net::IpAddr, own: impl Fn(std::net::IpAddr) -> bool) -> bool {
+    let ip = ip.to_canonical();
+    if ip.is_multicast() || matches!(ip, std::net::IpAddr::V4(v4) if v4.is_broadcast()) {
+        return false;
+    }
+    ip.is_loopback() || ip.is_unspecified() || own(ip)
+}
+
+/// Whether two host names are one, ignoring case and a `.local` suffix.
+fn same_host_name(a: &str, b: &str) -> bool {
+    let bare = |n: &str| {
+        let n = n.trim_end_matches('.').to_ascii_lowercase();
+        n.strip_suffix(".local").map(str::to_string).unwrap_or(n)
+    };
+    bare(a) == bare(b)
+}
+
+/// Whether `ip` is an address one of this host's interfaces holds: never a
+/// multicast or broadcast address (a subnet's broadcast is one a socket can
+/// bind, so a bind test would take it for this host's).
+pub(crate) fn is_own_address(ip: std::net::IpAddr) -> bool {
+    own_addresses().contains(&ip)
+}
+
+/// Every address this host's interfaces hold (`getifaddrs`): unicast only,
+/// the loopback included. Empty where it cannot be read.
+#[cfg(unix)]
+pub(crate) fn own_addresses() -> Vec<std::net::IpAddr> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs writes a list it allocates to `head`, freed below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    let mut at = head;
+    while !at.is_null() {
+        // SAFETY: `at` is a node of the list getifaddrs returned, live until freeifaddrs.
+        let node = unsafe { &*at };
+        found.extend(sockaddr_ip(node.ifa_addr));
+        at = node.ifa_next;
+    }
+    // SAFETY: `head` came from getifaddrs and is freed once.
+    unsafe { libc::freeifaddrs(head) };
+    found
+}
+
+#[cfg(not(unix))]
+pub(crate) fn own_addresses() -> Vec<std::net::IpAddr> {
+    Vec::new()
+}
+
+/// The IP address a `sockaddr` holds, when it is an IPv4 or IPv6 one.
+#[cfg(unix)]
+fn sockaddr_ip(addr: *const libc::sockaddr) -> Option<std::net::IpAddr> {
+    if addr.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null `ifa_addr` points at a sockaddr whose family says
+    // which struct it is; each is read only as that struct.
+    unsafe {
+        match i32::from((*addr).sa_family) {
+            libc::AF_INET => {
+                let v4 = &*(addr as *const libc::sockaddr_in);
+                Some(std::net::IpAddr::from(u32::from_be(v4.sin_addr.s_addr).to_be_bytes()))
+            }
+            libc::AF_INET6 => {
+                let v6 = &*(addr as *const libc::sockaddr_in6);
+                Some(std::net::IpAddr::from(v6.sin6_addr.s6_addr))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// This host's own name, as the kernel has it.
+#[cfg(unix)]
+fn this_hosts_name() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer is valid for `len` bytes; gethostname writes at most
+    // that many and the result is read only up to its first NUL.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    std::str::from_utf8(&buf[..end]).ok().map(str::to_string).filter(|s| !s.is_empty())
+}
+
+#[cfg(not(unix))]
+fn this_hosts_name() -> Option<String> {
+    None
 }
 
 /// `KEY=value` as its two halves (a value may hold `=`).
@@ -7987,12 +8211,13 @@ fn materialize_dirs(
 ///
 /// Then, in order: this dispatch's own origin stamp, any staged resume
 /// checkpoint, and the prompt file.
-/// (#3112) The message as the prompt file carries it: a `${WORKSPACE_ROOT}`
-/// still in it (a CLI `dispatch` message: the placeholder is darkmux's in
-/// any dispatch message) names the workspace as the model sees it,
-/// `/workspace`, under every sandbox. A message without it is unchanged.
-fn prompt_file_text(message: &str, _workspace: &Path) -> String {
-    crate::step_kinds::builtins::expand_workspace_root(message)
+/// (#3112 review) The message as the prompt file carries it: a
+/// `${WORKSPACE_ROOT}` still in it (a step with no workdir, whose workspace
+/// is a fresh tempdir; a CLI `dispatch` message: the placeholder is
+/// darkmux's in any dispatch message) names `workspace` where the
+/// configured sandbox sees it. A message without it is unchanged.
+fn prompt_file_text(message: &str, workspace: &Path) -> String {
+    crate::step_kinds::builtins::expand_workspace_root(message, darkmux_sandbox::selected().ok(), Some(workspace))
 }
 
 fn prepare_host_out(

@@ -629,14 +629,21 @@ fn reject_escaping_relpath(raw: &str, label: &str) -> Result<()> {
 /// Where a dispatch mounts the workspace inside a container.
 const WORKSPACE_AT: &str = "/workspace";
 
-/// The prompt as the dispatch gives it to the model: the sandbox
-/// placeholders expanded to `/workspace` under every sandbox (contract 6:
-/// a measured prompt is the same bytes on every machine and every run). A
-/// sandbox on the host sees the workspace at its host path, and the runtime
-/// maps `/workspace` to it (#3112), so the host path, which names the
-/// user's home folder, never reaches a model.
-pub(crate) fn dispatched_prompt(loaded: &LoadedWorkload, _sandbox_dir: &Path) -> Result<String> {
-    Ok(expand_placeholders_with(&resolve_prompt(loaded)?, WORKSPACE_AT))
+/// The prompt as the dispatch gives it to the model, whose workspace is
+/// `sandbox_dir`: the sandbox placeholders expanded to where the configured
+/// sandbox sees it.
+pub(crate) fn dispatched_prompt(loaded: &LoadedWorkload, sandbox_dir: &Path) -> Result<String> {
+    dispatched_prompt_for(loaded, sandbox_dir, darkmux_sandbox::selected().ok())
+}
+
+/// [`dispatched_prompt`] under `kind`: `/workspace` in a container (byte for
+/// byte what every Docker run was told), the workspace's own host path in a
+/// sandbox on the host (#3112 review: a Seatbelt brief that said
+/// `/workspace` sent the model looking for files that are not there). The
+/// same answer the dispatch's own mount gives (`SandboxBackend::place`).
+pub(crate) fn dispatched_prompt_for(loaded: &LoadedWorkload, sandbox_dir: &Path, kind: Option<darkmux_sandbox::BackendKind>) -> Result<String> {
+    let seen = darkmux_sandbox::seen_at(kind, sandbox_dir, WORKSPACE_AT);
+    Ok(expand_placeholders_with(&resolve_prompt(loaded)?, &seen))
 }
 
 /// The prompt as the eval wrote it for grading: the placeholders expanded
@@ -2933,26 +2940,36 @@ mod tests {
         assert!(run_verify_command(None, tmp.path(), tmp.path()).unwrap().is_none());
     }
 
-    /// (#3112) The dispatched prompt names the workspace `/workspace`, the
-    /// graded prompt's words, whatever the sandbox: the runtime maps the
-    /// path to where a sandbox on the host sees it (a Seatbelt brief that
-    /// said `/workspace` once sent the model looking for a file that was not
-    /// there, before the runtime mapped it).
+    /// (#3112 review, live-proven) The dispatched prompt names the
+    /// workspace where the sandbox sees it: `/workspace` in a container,
+    /// byte for byte as before; its own host path in a sandbox on the host.
+    /// A Seatbelt brief that said `/workspace` sent the model looking for a
+    /// file that is not there. The graded prompt keeps the eval's own words.
     #[test]
-    fn the_prompt_names_the_workspace_the_model_sees() {
+    fn the_prompt_names_the_workspace_where_the_sandbox_sees_it() {
+        use darkmux_sandbox::BackendKind;
         let tmp = TempDir::new().unwrap();
         let sandbox = tmp.path().join("sb");
         fs::create_dir_all(&sandbox).unwrap();
         let mut spec = basic_spec();
         spec.prompt = Some("Fix ${SANDBOX}/bug.py so the tests in ${SANDBOX_DIR} pass.".into());
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        assert_eq!(dispatched_prompt(&loaded, &sandbox).unwrap(), "Fix /workspace/bug.py so the tests in /workspace pass.");
+        let real = sandbox.canonicalize().unwrap().display().to_string();
+        assert_eq!(
+            dispatched_prompt_for(&loaded, &sandbox, Some(BackendKind::Docker)).unwrap(),
+            "Fix /workspace/bug.py so the tests in /workspace pass."
+        );
+        assert_eq!(
+            dispatched_prompt_for(&loaded, &sandbox, Some(BackendKind::Seatbelt)).unwrap(),
+            format!("Fix {real}/bug.py so the tests in {real} pass.")
+        );
         assert_eq!(graded_prompt(&loaded).unwrap(), "Fix /workspace/bug.py so the tests in /workspace pass.");
     }
 
-    /// (#3112) The production wiring, through `selected()`: `/workspace`
-    /// under Docker (a test build's default) and under
-    /// `DARKMUX_SANDBOX=seatbelt` (on a Mac).
+    /// (#3112 review) The production wiring, through `selected()`: under
+    /// `DARKMUX_SANDBOX=seatbelt` (on a Mac) the dispatched prompt names the
+    /// sandbox dir's own path; under Docker (a test build's default)
+    /// `/workspace`.
     #[test]
     #[serial_test::serial]
     fn the_dispatched_prompt_follows_the_selected_sandbox() {
@@ -2972,7 +2989,7 @@ mod tests {
         unsafe {
             match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
         }
-        assert_eq!(seatbelt, "Fix /workspace/bug.py", "the model is shown `/workspace` on every backend");
+        assert_eq!(seatbelt, format!("Fix {}/bug.py", sandbox.canonicalize().unwrap().display()));
     }
 
     /// What a run resolves before it dispatches: the prompt, and no plan for

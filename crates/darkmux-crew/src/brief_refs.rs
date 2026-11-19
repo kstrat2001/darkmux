@@ -128,9 +128,7 @@ fn resolve(r: &BriefRef, dirs: &StoreDirs) -> Result<(String, BriefRef)> {
                     dirs.mods.display()
                 )
             })?;
-            // (#3112) The container mount under every sandbox: a sandbox on
-            // the host is told where it really is (`DARKMUX_RUNTIME_PATHS`).
-            let mount = crate::mods::attachments_container_dir(&record.key);
+            let mount = attachments_seen(darkmux_sandbox::selected().ok(), &dirs.mods, &record.key);
             let canonical = BriefRef::mod_(record.key.clone());
             Ok((crate::mods::brief_block(&record, &mount), canonical))
         }
@@ -207,32 +205,27 @@ pub fn mod_attachment_mounts(
     Ok(out)
 }
 
+/// (#3112 review) Where the model reads a mod's attachments: their mount
+/// as the sandbox sees it (`/darkmux-mods/<key>/attachments` in a
+/// container, unchanged; the store's own path in a sandbox on the host).
+fn attachments_seen(kind: Option<darkmux_sandbox::BackendKind>, mods_root: &Path, key: &str) -> String {
+    darkmux_sandbox::seen_at(kind, &crate::mods::attachments_dir_at(mods_root, key), &crate::mods::attachments_container_dir(key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// (#3112) The brief names a mod's attachments at their container mount
-    /// under every sandbox, a sandbox on the host (`DARKMUX_SANDBOX=seatbelt`,
-    /// on a Mac) included: the model is never shown the store's host path,
-    /// and the runtime maps the mount to it (`DARKMUX_RUNTIME_PATHS`).
+    /// (#3112 review) The brief names a mod's attachments where the sandbox
+    /// mounts them: unchanged in a container, the store's path on the host.
     #[test]
-    #[serial_test::serial]
-    fn a_mods_attachments_are_named_at_their_container_mount() {
-        let (f, m) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    fn a_mods_attachments_are_named_where_the_sandbox_sees_them() {
+        use darkmux_sandbox::BackendKind;
+        let m = TempDir::new().unwrap();
         write_mod(m.path(), "mod-9-zzz", Some("kit"), &["one.patch"]);
-        let brief = || resolve(&BriefRef::mod_("mod-9-zzz".to_string()), &dirs(&f, &m)).unwrap().0;
-        assert!(brief().contains("/darkmux-mods/mod-9-zzz/attachments"), "{}", brief());
-        if !darkmux_sandbox::SeatbeltBackend::available() {
-            return;
-        }
-        let prev = std::env::var_os("DARKMUX_SANDBOX");
-        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
-        let seatbelt = brief();
-        unsafe {
-            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
-        }
-        assert!(seatbelt.contains("/darkmux-mods/mod-9-zzz/attachments"), "{seatbelt}");
-        assert!(!seatbelt.contains(&m.path().canonicalize().unwrap().display().to_string()), "{seatbelt}");
+        assert_eq!(attachments_seen(Some(BackendKind::Docker), m.path(), "mod-9-zzz"), "/darkmux-mods/mod-9-zzz/attachments");
+        let real = crate::mods::attachments_dir_at(m.path(), "mod-9-zzz").canonicalize().unwrap();
+        assert_eq!(attachments_seen(Some(BackendKind::Seatbelt), m.path(), "mod-9-zzz"), real.display().to_string());
     }
     use std::fs;
     use tempfile::TempDir;

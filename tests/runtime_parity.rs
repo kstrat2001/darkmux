@@ -326,18 +326,6 @@ fn tool_turns(n: usize, _: &str) -> Reply {
     }
 }
 
-/// (#3112) Tool calls naming the workspace as the model is shown it, and a
-/// command that prints where it runs, then an answer.
-fn workspace_path_turns(n: usize, _: &str) -> Reply {
-    match n {
-        0 => calls(json!([
-            call("c1", "bash", json!({ "command": "pwd && cat /workspace/x.txt" })),
-            call("c2", "read", json!({ "limit": 0, "path": "/workspace/x.txt", "offset": 1 })),
-        ])),
-        _ => answer("all done"),
-    }
-}
-
 /// The same turns, streamed.
 fn streamed(n: usize, body: &str) -> Reply {
     let whole: Value = serde_json::from_str(&tool_turns(n, body).body).unwrap();
@@ -826,6 +814,8 @@ fn the_runtime_subcommand_runs_inside_a_seatbelt_sandbox() {
             mounts,
             ports: Vec::new(),
             stdin: false,
+            host_services: Vec::new(),
+            refused_ports: Vec::new(),
             host_alias: None,
             user: None,
             env,
@@ -870,41 +860,6 @@ fn the_runtime_subcommand_runs_inside_a_seatbelt_sandbox() {
     assert_eq!(std::fs::read_to_string(ws.path().join("new.txt")).unwrap(), "made\n", "the write landed");
     let trajectory = std::fs::read_to_string(out.path().join(".darkmux-runtime/trajectory.jsonl")).unwrap();
     assert!(trajectory.trim_end().lines().next_back().unwrap().contains("\"dispatch.complete\""), "{trajectory}");
-
-    // (#3112, contract 6) Inside the sandbox the model is shown `/workspace`:
-    // no request carries the workspace's host path or the home folder, the
-    // system prompt is sent as the bytes the host hashed, and a command or a
-    // read naming `/workspace` reaches the files.
-    let paths = Mock::start(workspace_path_turns);
-    let mut command = vec!["runtime".to_string()];
-    command.extend(dispatch(&["--no-stream", "--json"]).into_iter().map(|a| a.replace("{base}", &paths.base_url())));
-    let mounts = vec![
-        Mount { host: ws.path().to_path_buf(), at: "/workspace".to_string(), access: Access::ReadWrite },
-        Mount { host: out.path().to_path_buf(), at: "/darkmux-out".to_string(), access: Access::ReadWrite },
-    ];
-    let env = vec![
-        ("DARKMUX_RUNTIME_WORKSPACE".to_string(), backend.place(&mounts[0])),
-        ("DARKMUX_RUNTIME_OUT_DIR".to_string(), backend.place(&mounts[1])),
-        ("DARKMUX_TURN_DELAY_MS".to_string(), "0".to_string()),
-    ];
-    let output = run_in_sandbox(&exe, command, mounts, env);
-    assert_eq!(output.status.code(), Some(0), "stderr:\n{}", String::from_utf8_lossy(&output.stderr));
-    let sent = paths.requests();
-    assert_eq!(sent.len(), 2);
-    let mut host = vec![ws.path().display().to_string(), ws.path().canonicalize().unwrap().display().to_string()];
-    host.extend(std::env::var("HOME").ok().filter(|h| h.len() > 1));
-    for (n, r) in sent.iter().enumerate() {
-        for path in &host {
-            assert!(!r.body.contains(path.as_str()), "request {n} carries the host path {path}:\n{}", r.body);
-        }
-    }
-    let first: Value = serde_json::from_str(&sent[0].body).unwrap();
-    assert_eq!(first["messages"][0]["content"], "You are a test. Work in /workspace.", "the system prompt as hashed");
-    let second: Value = serde_json::from_str(&sent[1].body).unwrap();
-    let bash = second["messages"][3]["content"].as_str().unwrap();
-    let read = second["messages"][4]["content"].as_str().unwrap();
-    assert!(bash.contains("/workspace\n") && bash.contains("bye\nworld"), "{bash}");
-    assert!(read.contains("bye"), "{read}");
 
     // Entrypoints where installs put darkmux.
     let mut entrypoints: Vec<PathBuf> = Vec::new();

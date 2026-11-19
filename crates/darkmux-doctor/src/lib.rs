@@ -254,6 +254,8 @@ fn run_on(
         // (#3112) Read only by a Docker sandbox: Seatbelt runs as you.
         checks_sandbox::docker_only(&sandbox, checks_container::NAME, checks_container::check_container_user),
         checks_container::check_lab_tests_placement(&sandbox),
+        // (#3112 review) User mission configs naming the container's `/workspace`.
+        checks_sandbox::check_mission_config_workspace_paths(),
         check_unmanaged_endpoint_credentials(),
         check_endpoints(),
         check_default_engine(),
@@ -13234,12 +13236,8 @@ mod tests {
         //
         // (#3569) 84: `checks_installed::check_installed_engines` joined
         // beside the Flint row.
-        //
-        // (#3112) 83: the `mission config workspace paths` row left: a step
-        // message's literal `/workspace` is what the model is shown under
-        // every sandbox now, and the runtime maps it.
         let expected =
-            83 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            84 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

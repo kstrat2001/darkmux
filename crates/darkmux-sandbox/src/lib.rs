@@ -91,6 +91,21 @@ pub struct SandboxPolicy {
     /// Whether the sandbox reads the caller's stdin (a secret piped in);
     /// otherwise it gets none.
     pub stdin: bool,
+    /// The ports of this host's own services the sandbox may connect to (a
+    /// dispatch's model server). Under Seatbelt it reaches no other service
+    /// listening on this machine, at any of its addresses, beyond its own
+    /// `ports` (with no ports named: none listening when it is planned, so
+    /// its own servers on any other port stay reachable). Landlock does not
+    /// hold it. A container reaches the host by the engine's name for it
+    /// (`host.docker.internal`), which Docker Desktop forwards to this
+    /// host's loopback whatever this says.
+    pub host_services: Vec<u16>,
+    /// Ports of this host that a sandbox on the host naming no `ports` is
+    /// refused whether or not anything listens on them when it is planned
+    /// (darkmux's own services, which may start after it), unless given in
+    /// `host_services`. A policy naming ports is refused every port of this
+    /// machine but its own and the given ones already.
+    pub refused_ports: Vec<u16>,
     /// A name inside the sandbox that reaches this host's own services (a
     /// model server on the host), where the backend does not provide one.
     pub host_alias: Option<String>,

@@ -153,7 +153,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
 
 /// The listener's default port (the viewer is 8765, the fleet listener 8766).
-pub const DEFAULT_PORT: u16 = 8767;
+pub const DEFAULT_PORT: u16 = darkmux_types::config_access::CLIENT_SERVE_PORT;
 /// A pairing request lives this long from when it was made, approved or not.
 pub const PENDING_TTL_SECS: u64 = 600;
 /// Expired and denied requests are kept this long past their TTL, so the app

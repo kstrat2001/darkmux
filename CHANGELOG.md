@@ -181,22 +181,6 @@ darkmux release.
 
 ### Fixed
 
-- **A dispatch in a sandbox on the host no longer sends your home folder's path to the model, and
-  its recorded prompt hash is the hash of what was sent.** Under `seatbelt` or `landlock` the
-  runtime used to rewrite `/workspace` to the workspace's host path (for example
-  `/Users/<you>/...`) in the system prompt, the user's message and every tool description. So
-  every request body, including those sent to hosted endpoints, carried the path, and
-  `dispatch.start`'s `system_sha256` did not match the bytes sent. The model is now shown
-  `/workspace` (and a mod's attachments and the cache at their container paths) under every
-  sandbox, so the system prompt, the message and the tool descriptions are the same bytes on every
-  backend. The runtime maps paths instead: a command or file path naming `/workspace` runs against
-  the host path, and a host path in a tool's output is shown as `/workspace`. `${WORKSPACE_ROOT}`
-  and a lab workload's prompt also name `/workspace` everywhere, so a lab prompt is the same bytes
-  on every machine. Some things are still not mapped: output from a command that prints a path
-  outside every mount (`$HOME`, `$TMPDIR`, toolchain paths), and a script the model writes with
-  `/workspace` hard-coded in it, which fails when run under a sandbox on the host. `darkmux doctor`
-  drops its `mission config workspace paths` row, because a literal `/workspace` in a step message
-  now works under every sandbox.
 - **Text a model, a peer or an endpoint wrote can no longer drive your terminal.** `mod list` and
   `mod show` (a kit a local seat wrote through `create_mod`), `finding list` and `finding show`,
   `run list` (its rows, the `--usage` breakdown and an endpoint's `reported model`), `run show`,
