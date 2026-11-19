@@ -362,8 +362,9 @@ fn an_upgraded_connection_holds_its_slot_until_its_stream_closes() {
         "a connection past a cap held by upgraded streams must be closed on accept"
     );
     drop(held);
+    // A slot frees only once the server sees its stream end, so wait for a
+    // plain request to be served before opening another upgrade.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    let mut again = upgraded(addr, 1);
     while std::time::Instant::now() < deadline
         && ureq::get(&format!("http://{addr}/ok")).call().is_err()
     {
@@ -378,6 +379,7 @@ fn an_upgraded_connection_holds_its_slot_until_its_stream_closes() {
         body, "ok",
         "slots came back once the upgraded streams closed"
     );
+    let mut again = upgraded(addr, 1);
     stop.send(true).unwrap();
     assert!(
         done.recv_timeout(Duration::from_millis(500)).is_err(),
