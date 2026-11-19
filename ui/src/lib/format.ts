@@ -89,8 +89,19 @@ function sameDay(a: number, b: number): boolean {
  * prefixes each end with its short date ("Aug 7 16:40:59–Aug 8 16:40:59"). */
 export function clkrange(a: number, b: number): string {
   if (sameDay(a, b)) return `${clk(a)}–${clk(b)}`;
-  const d = (t: number) => new Date(t).toLocaleDateString([], { month: "short", day: "numeric" });
-  return `${d(a)} ${clk(a)}–${d(b)} ${clk(b)}`;
+  return `${shortDate(a)} ${clk(a)}–${shortDate(b)} ${clk(b)}`;
+}
+
+/** A time of day that may not be `ref`'s day: bare `HH:MM:SS` on the same
+ *  local day, otherwise prefixed with its short date ("Nov 18 23:10:05"),
+ *  so a time from yesterday never passes for today's. */
+export function clkOn(t: number, ref: number): string {
+  return sameDay(t, ref) ? clk(t) : `${shortDate(t)} ${clk(t)}`;
+}
+
+/** `clkrange`'s short local date ("Aug 7"). */
+function shortDate(t: number): string {
+  return new Date(t).toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
 /** `relAgoFrom()`. Coarse past-only relative time.

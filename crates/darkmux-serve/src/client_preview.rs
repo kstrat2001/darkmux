@@ -436,6 +436,10 @@ pub fn parse_recipe(text: &str) -> Result<Recipe, RecipeRefusal> {
         )));
     }
     check_version(&doc)?;
+    // `doc` holds only the last copy of a key written twice.
+    if let Some(lines) = darkmux_types::user_files::duplicate_refusal(text) {
+        return Err(RecipeRefusal::Invalid(format!("{RECIPE_PATH}: {lines}")));
+    }
     let issues = darkmux_types::user_files::key_issues::<Recipe>(
         &doc,
         &darkmux_types::user_files::no_retired,
@@ -447,8 +451,12 @@ pub fn parse_recipe(text: &str) -> Result<Recipe, RecipeRefusal> {
             lines.join("; ")
         )));
     }
-    let recipe: Recipe = serde_json::from_value(doc)
-        .map_err(|e| RecipeRefusal::Invalid(format!("{RECIPE_PATH}: {e}")))?;
+    let recipe: Recipe = serde_json::from_value(doc).map_err(|e| {
+        RecipeRefusal::Invalid(format!(
+            "{RECIPE_PATH}: {}",
+            darkmux_types::user_files::load_error(&e)
+        ))
+    })?;
     check_recipe_paths(&recipe)?;
     check_env_names(&recipe)?;
     Ok(recipe)
@@ -1078,7 +1086,7 @@ pub struct ContainerSpec {
 /// it (the host's own), its program is the host's `/bin/sh`, and
 /// `spec.read_only` adds its toolchain and log, read-only.
 pub fn preview_policy(spec: &ContainerSpec) -> SandboxPolicy {
-    use darkmux_crew::dispatch_internal::{DOCKER_MEMORY, DOCKER_PIDS_LIMIT};
+    use darkmux_crew::dispatch_internal::DOCKER_PIDS_LIMIT;
     let mount = |host: &Path, at: &str, access| Mount {
         host: host.to_path_buf(),
         at: at.to_string(),
@@ -1093,7 +1101,8 @@ pub fn preview_policy(spec: &ContainerSpec) -> SandboxPolicy {
         image: spec.image.clone(),
         network: Network::Default,
         limits: Limits {
-            memory: Some(DOCKER_MEMORY.to_string()),
+            // (#3112) `sandbox.memory`, read when `client serve` starts.
+            memory: Some(darkmux_types::config_access::sandbox_memory()),
             pids: Some(DOCKER_PIDS_LIMIT),
         },
         labels: spec
@@ -5176,6 +5185,16 @@ mod tests {
                 "{good}"
             );
         }
+    }
+
+    /// A key written twice in a recipe (an `env` variable set twice, say)
+    /// would read as its last copy alone: it refuses instead, naming it.
+    #[test]
+    fn a_recipe_with_a_key_written_twice_is_refused_naming_it() {
+        let text = r#"{"schema_version": "1.0", "command": "x", "env": {"TOKEN": "a", "TOKEN": "b"}}"#;
+        let e = parse_recipe(text).unwrap_err();
+        assert!(e.message().contains("duplicate key `env.TOKEN`"), "{e:?}");
+        assert!(!e.message().contains("\"a\"") && !e.message().contains("\"b\""), "{e:?}");
     }
 
     #[test]

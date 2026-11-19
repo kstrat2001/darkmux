@@ -885,7 +885,9 @@ pub fn preflight(scope: Scope) -> Result<(), PreflightRefusal> {
         .flat_map(crate::config_access::enum_bad_values)
         .collect();
     let files = crate::user_files::config_json_problems();
-    PreflightRefusal { scope, bad, invalid: Vec::new(), files }.into_result()
+    // (#3112) Every scope can start a sandbox (`runtime.sandbox`'s scopes).
+    let invalid = crate::config_access::sandbox_memory_problem().into_iter().collect();
+    PreflightRefusal { scope, bad, invalid, files }.into_result()
 }
 
 /// Look up a registered setting by its dotted key.
@@ -1472,6 +1474,7 @@ mod tests {
             ("Others", "how a schema treats keys it does not name, internal to the gate"),
             ("Depth", "how strictly the user-file gate judges a value, internal to the gate"),
             ("Reach", "which files a user-file check reaches (doctor vs preflight), not a setting"),
+            ("Repeat", "what a key written twice in a user file costs its load, not a setting"),
             ("LeftoverPolicy", "whether a retired env var still set is refused or only warned about, fixed per retired setting, not a setting"),
             ("LeftoverValue", "how a retired config key's leftover value is judged, fixed per retired setting, not a setting"),
             ("OldDefault", "a value a retired config key held by default, matched by the leftover check, not a setting"),

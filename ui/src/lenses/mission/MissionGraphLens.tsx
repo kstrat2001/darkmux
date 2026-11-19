@@ -61,7 +61,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient, skipToken } from "@tanstack/react-query";
 import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { missionRowOf } from "../../lib/lifecycle";
-import { runChip } from "../runs/format";
+import { lastKnownChip, runChip } from "../runs/format";
 import type { Run } from "../../types/generated/Run";
 import type { RunsResponse } from "../../types/generated/RunsResponse";
 import { queryKeys, PRESENCE_POLL_MS, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
@@ -323,13 +323,6 @@ function useKeptMissionRow(data: FetchResult<RunsResponse> | undefined, missionI
   return { row, stale: !rows && row !== null };
 }
 
-/** A kept row's chip while `/runs` is failing: its word and color stand, but
- *  a running row loses the live treatment (no pulse, no clock, no process
- *  readout), since nothing says it is still running. */
-function lastKnownChip(chip: MissionHeaderChip): MissionHeaderChip {
-  return { ...chip, live: "stale", title: LAST_KNOWN_TITLE };
-}
-
 /** Whether the header's chip is a run in flight right now: running, and not a
  *  kept row read while `/runs` is failing. It gates the clock and the host
  *  readout. */
@@ -337,7 +330,6 @@ function chipIsLive(chip: MissionHeaderChip): boolean {
   return workStatusKind(chip.status, chip.abandonReason) === "running" && chip.live !== "stale";
 }
 
-const LAST_KNOWN_TITLE = "last known status; the daemon's run list isn't answering";
 
 /** The chip the header renders: a row's (`runChip`), a kept row's
  *  (`lastKnownChip`), the lifecycle word, or the neutral one while `/runs`
