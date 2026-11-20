@@ -277,6 +277,10 @@ def specs_for(machine, world, ledger, now_ms, version, schema):
         # `machineNames()`, which reads records' `machine_id`) still finds
         # this machine under the SAME value it publishes here.
         "machine_id": disp(machine), "os": "macos aarch64",
+        # (#3662) The same uid the machine's records and beats carry: the
+        # viewer joins "is this machine" on it, and never credits a machine
+        # whose records carry a uid by its name alone.
+        "machine_uid": machine["uid"],
         "ram_total_bytes": machine["ram_gb"] * GIB,
         "ram_free_for_ai_bytes": ledger["pool"]["available_bytes"],
         "cpu_brand": machine["cpu_brand"], "loaded_models": loaded,

@@ -56,6 +56,15 @@ export const NOT_REPORTED = "not reported";
 export const NOT_REPORTING_STATUS = "not_reporting";
 export const NOT_REPORTING_TITLE = "The machine this ran on is not reporting, so whether it is still running is unknown.";
 
+/** (#3662) A machine's availability once this page's presence read is stale
+ *  or unreadable. A peer this viewer saw, and one it never saw (the hub can
+ *  have been down longer than the window), are both `hub_unread`: what is
+ *  missing is this viewer's read of the hub, not the peer's stream. This
+ *  machine, and a peer known to be down, keep what they had. */
+export function underUnreadPresence(a: MachineAvailability, self: boolean): MachineAvailability {
+  return !self && (a === "known" || a === "not_streamed") ? "hub_unread" : a;
+}
+
 /** Whether a surface must hold back its idle / zero / quiet claims. */
 export const isUnseen = (a: MachineAvailability | undefined): boolean => a !== undefined && a !== "known";
 
@@ -63,8 +72,8 @@ export const isUnseen = (a: MachineAvailability | undefined): boolean => a !== u
  *  answered and the page knows whose machine it is (until then `known`: the
  *  pending forms already say "checking…"). `self`: the page is about the
  *  machine serving it. `presenceDegraded` (#3662): this page's presence read
- *  is stale or unreadable, so another machine the window holds is
- *  `hub_unread`: its records are history, its live state unknown. */
+ *  is stale or unreadable, so another machine is `hub_unread`
+ *  (`underUnreadPresence`). */
 export function windowAvailability(
   data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
@@ -74,7 +83,7 @@ export function windowAvailability(
   if (!opts.answered || uid === null) return "known";
   const seen = windowHoldsMachine(data, liveMachines, uid);
   const a = machineAvailability({ self: opts.self, seen, standing: "unknown" });
-  return opts.presenceDegraded && a === "known" && !opts.self ? "hub_unread" : a;
+  return opts.presenceDegraded ? underUnreadPresence(a, opts.self) : a;
 }
 
 /** A remote machine's live-load line when it has no samples: the page says

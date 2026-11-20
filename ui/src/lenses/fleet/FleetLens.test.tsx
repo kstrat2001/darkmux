@@ -969,8 +969,8 @@ describe("FleetLens", () => {
         { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
         { ts: `${today}T10:00:01.000Z`, machine_uid: "u2", machine_id: "studio", session_id: "s2", action: "dispatch.start", handle: "coder" },
       ],
-      // specs names THIS daemon as MacBook-Pro, so u2 is positively remote.
-      specs: { machine_id: "MacBook-Pro" },
+      // specs names THIS daemon as MacBook-Pro (u1), so u2 is positively remote.
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u1" },
     });
     renderFleetLens();
     await waitFor(() => expect(document.querySelectorAll(".mach").length).toBe(2));
@@ -2000,6 +2000,55 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
       expect(document.querySelector(".fleetcov")).toBeNull();
     });
   }
+
+  // (#3662 review 2) The real case: the hub has been down longer than the
+  // window, so a reachable peer has NO records here at all. It is not that its
+  // stream is off; this viewer cannot read the hub. Neither the card nor the
+  // hero blames its stream.
+  it("with presence unreadable, a reachable peer with no records in the window blames the hub, not its stream", async () => {
+    mockFleetFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max" },
+      view: [
+        viewRow(
+          { machine_id: "studio", machine_uid: "u-studio", cpu_brand: "Apple M1 Max" },
+          { entry: { id: "studio", address: "100.64.1.2:8765", added_unix_ms: 1000 }, liveness: "unknown" },
+        ),
+      ],
+      runs: [],
+      presence: { state: "unavailable", detail: "could not read presence beats from Redis" },
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
+    await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
+    const studio = [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".mach-name")!.textContent === "studio")!;
+    await waitFor(() => expect(studio.querySelector(".stat")!.getAttribute("title")).toBe(HUB_UNREAD_ONLINE));
+    expect(studio.querySelector(".runs")!.textContent).toBe("not streaming");
+    const lbl = document.querySelector(".savlbl")!;
+    expect(lbl.getAttribute("title") ?? "").not.toContain("Not streaming here");
+  });
+
+  // (#3662 review 2) Records written after the hub went down cannot be in the
+  // window, so the hero does not say "all tokens"; it says what it counts.
+  // The inverted case, healthy presence, keeps "all tokens".
+  it("with presence unreadable, the hero says it counts the tokens seen, not all of them", async () => {
+    mockFleetFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max" },
+      runs: [],
+      presence: { state: "unavailable", detail: "could not read presence beats from Redis" },
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
+    const lbl = document.querySelector(".savlbl")!;
+    await waitFor(() => expect(lbl.textContent).toBe("tokens seen · last 24h"));
+    expect(lbl.getAttribute("title")).toBe("Counts only records that reached this viewer: this viewer can't read the fleet hub right now.");
+  });
+
+  it("with presence healthy, the hero still says all tokens", async () => {
+    mockFleetFetch({ specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max" }, runs: [], presence: { state: "ok" } });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
+    await waitFor(() => expect(document.querySelector(".savlbl")!.textContent).toBe("all tokens · last 24h"));
+  });
 
   // (#3662 review) A peer nobody rostered, known only from records in the
   // window: with presence unreadable nothing read says it is up, so it reads

@@ -17,6 +17,7 @@ import {
   sameMachine,
   sameUid,
   UNNAMED_MACHINE,
+  NO_UID_KEY,
 } from "./machineIdentity";
 import { FLEET_UID as U, lower, machineFleet } from "../testing/machineFleet";
 import { norm } from "../testing/records";
@@ -312,11 +313,23 @@ describe("self identity is a uid comparison", () => {
     expect(isSelfMachine(f.data, f.liveMachines, specs, U.macB)).toBe(false);
   });
 
-  it("without a specs uid, a name only one machine carries still finds self, .local or not", () => {
+  // (#3662 review) Without a specs uid this machine's probe has no uid, so
+  // its own records carry none either (`darkmux_hardware::machine_uid`
+  // stamps both): a machine whose records DO carry a uid is another machine,
+  // whatever it is named. The name fallback applies only to the uid-less
+  // bucket.
+  it("without a specs uid, a uid-bearing machine of the same name is never self", () => {
     const f = machineFleet();
     const specs = { machine_id: "macbook-pro.local", machine_uid: null };
-    expect(isSelfMachine(f.data, f.liveMachines, specs, U.mbp)).toBe(true);
+    expect(isSelfMachine(f.data, f.liveMachines, specs, U.mbp)).toBe(false);
     expect(isSelfMachine(f.data, f.liveMachines, specs, U.studio)).toBe(false);
+  });
+
+  it("without a specs uid, the uid-less records named as this machine are self, .local or not", () => {
+    const data = [norm({ ts: "2026-06-15T10:00:00.000Z", action: "dispatch.start", session_id: "s", machine_id: "MacBook-Pro" })];
+    const specs = { machine_id: "macbook-pro.local", machine_uid: null };
+    expect(isSelfMachine(data, new Map(), specs, NO_UID_KEY)).toBe(true);
+    expect(isSelfMachine(data, new Map(), { machine_id: "studio", machine_uid: null }, NO_UID_KEY)).toBe(false);
   });
 
   it("localMachineUid returns the flow's spelling of the reported uid", () => {

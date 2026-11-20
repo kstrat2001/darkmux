@@ -9,7 +9,7 @@ import { buildFleetCard, faceOf } from "../../testing/fleetCard";
 import { LampForm } from "../../lib/lamp";
 import { utilityReading, UtilityResidency } from "../../lib/utilityJobs";
 import { outcomeLine, rowStanding, type RowFacts } from "./viewRows";
-import { machineAvailability } from "../../lib/machineAvailability";
+import { machineAvailability, underUnreadPresence } from "../../lib/machineAvailability";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import type { PresenceBeat } from "../../types/generated/PresenceBeat";
@@ -176,9 +176,13 @@ describe("specOf", () => {
     generated_at_ms: 0,
   };
 
+  // (#3662 review) Specs without a uid stamp no uid on this machine's
+  // records either: these cases carry the uid both sides share.
+  const specsU1 = { ...specs, machine_uid: "u1" };
+
   it("prefers the live /machine/specs probe for THIS machine", () => {
     const data: NormRecord[] = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro" })];
-    expect(specOf(data, new Map(), specs, "u1")).toBe("Apple M5 Max · 128 GB");
+    expect(specOf(data, new Map(), specsU1, "u1")).toBe("Apple M5 Max · 128 GB");
   });
 
   it("still recognizes THIS machine when its records use a different alias than specs reports", () => {
@@ -191,7 +195,7 @@ describe("specOf", () => {
       rec({ machine_uid: "u1", machine_id: "MacBook-Pro.local" }),
       rec({ machine_uid: "u1", machine_id: "MacBook-Pro" }),
     ];
-    expect(specOf(data, new Map(), specs, "u1")).toBe("Apple M5 Max · 128 GB");
+    expect(specOf(data, new Map(), specsU1, "u1")).toBe("Apple M5 Max · 128 GB");
   });
 
   it("does NOT claim this daemon's hardware for a machine that merely shares no alias", () => {
@@ -258,12 +262,9 @@ describe("specOf", () => {
     expect(specOf(data, live, specsWithUid, "u2")).toBe("M1 Max · 32 GB");
   });
 
-  it("(#2814) keeps the alias join when specs reports no uid at all", () => {
-    // Non-macOS, a failed `ioreg`, or a peer/static fixture built before the
-    // field existed. Absence degrades to the pre-#2814 behavior; it never
-    // means "not this machine".
-    const data: NormRecord[] = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro" })];
-    expect(specOf(data, new Map(), specs, "u1")).toBe("Apple M5 Max · 128 GB");
+  it("(#3662 review) with no specs uid, a uid-bearing machine of this name is another machine", () => {
+    const data: NormRecord[] = [rec({ machine_uid: "u2", machine_id: "MacBook-Pro" })];
+    expect(specOf(data, new Map(), specs, "u2")).not.toBe("Apple M5 Max · 128 GB");
   });
 });
 
@@ -863,7 +864,7 @@ describe("(#1855) the spec line says WHICH kind of unknown", () => {
     // probe, not from a beat, and must not be pushed into either unknown
     // bucket just because presence is switched off.
     const data = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro", action: "dispatch.start" })];
-    const specs = machineSpecs({ machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 });
+    const specs = machineSpecs({ machine_id: "MacBook-Pro", machine_uid: "u1", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 });
     const card = buildFleetCard(data, new Map(), specs, new Set(), false, "u1", T);
     expect(card.spec).toBe("Apple M5 Max · 128 GB");
     expect(card.specUnknown).toBeNull();
@@ -1561,6 +1562,8 @@ describe("the card's status, for the rows the Rust twin also answers", () => {
   interface SharedCase {
     name: string;
     row: FleetMachine;
+    /** (#3662) The view's presence read was stale or unreadable. */
+    presence_unread?: boolean;
     expect: { status: string; word: string; second_line: string | null; reason: string | null };
   }
   const cases = JSON.parse(
@@ -1574,18 +1577,19 @@ describe("the card's status, for the rows the Rust twin also answers", () => {
     const standing = rowStanding(c.row);
     // The view-only stand-in for "records reach this viewer": a live beat, or this machine.
     const seen = c.row.is_this_machine || c.row.liveness === "live";
+    const read = machineAvailability({ self: c.row.is_this_machine, seen, standing });
     const card = {
       active: aModelIsWorking(c.row),
       runsCount: 0,
       standing,
-      availability: machineAvailability({ self: c.row.is_this_machine, seen, standing }),
+      availability: c.presence_unread ? underUnreadPresence(read, c.row.is_this_machine) : read,
       note: outcomeLine(c.row.card),
     };
     const face = cardFace(card, false, answered);
     expect(face.status).toBe(c.expect.status);
     expect(STATUS_WORD[face.status]).toBe(c.expect.word);
     expect(secondLineOf(face.status)).toBe(c.expect.second_line);
-    expect(statusReason(card.note, face.status) ?? null).toBe(c.expect.reason);
+    expect(statusReason(card.note, face.status, card.availability) ?? null).toBe(c.expect.reason);
   });
 
   it("the shared rows cover every status the console shows", () => {
@@ -1789,6 +1793,9 @@ describe("withPresenceUnread", () => {
   });
   it("this machine's own card is unchanged: its records are its own", () => {
     expect(withPresenceUnread(base("known", true)).availability).toBe("known");
+  });
+  it("a peer whose records never reached the window reads hub_unread too: the hub is what is unread", () => {
+    expect(withPresenceUnread(base("not_streamed", false)).availability).toBe("hub_unread");
   });
   it("a peer already not reporting (down) stays not reporting, never 'check its stream'", () => {
     expect(withPresenceUnread(base("not_reporting", false)).availability).toBe("not_reporting");

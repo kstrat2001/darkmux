@@ -37,6 +37,7 @@ import { rowFacts, rowSpecs } from "./viewRows";
 import { runsForMachine } from "../runs/format";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { workStatusKind } from "../../components/WorkStatus";
+import { HUB_UNREAD } from "../../lib/machineAvailability";
 
 /** (#3213) A flow-only card's absence as `buildFleetCardBase` reads it. The
  *  bucket of records with no hardware uid (`uidOf`'s "unknown") can never
@@ -95,12 +96,21 @@ type OffRow = { calls: number; tokens: number };
 /** (#3067) The hover text under the total: what it leaves out (machines not
  *  streaming here) and what it includes that no run's row shows (calls with no
  *  session, radio routing). A tooltip, so the hero keeps its height. */
-export function totalHint(noRun: OffRow, unlisted: OffRow, notStreaming: readonly string[]): string | undefined {
+export function totalHint(noRun: OffRow, unlisted: OffRow, notStreaming: readonly string[], hubUnread = false): string | undefined {
   const parts: string[] = [];
+  // (#3662) Records written since the hub went unread cannot be here.
+  if (hubUnread) parts.push(`Counts only records that reached this viewer: ${HUB_UNREAD}.`);
   if (notStreaming.length > 0) parts.push(`Counts only machines whose records reach this viewer. Not streaming here: ${notStreaming.join(", ")}.`);
   if (noRun.calls > 0) parts.push(`Includes ${fmtC(noRun.tokens)} tokens with no run (radio routing and probes).`);
   if (unlisted.calls > 0) parts.push(`Includes ${fmtC(unlisted.tokens)} tokens on runs not listed here.`);
   return parts.length > 0 ? parts.join(" ") : undefined;
+}
+
+/** The total's word: "all tokens" only when every machine's records can be
+ *  here; "tokens seen" when some machine does not stream here or (#3662) this
+ *  viewer cannot read the fleet hub. */
+function totalWord(notStreaming: readonly string[], hubUnread: boolean): string {
+  return notStreaming.length > 0 || hubUnread ? "tokens seen" : "all tokens";
 }
 
 /**
@@ -124,9 +134,14 @@ const SavingsHero = memo(function SavingsHero({
   liveMode,
   settled,
   notStreaming,
+  hubUnread,
 }: {
   tokens: ReturnType<typeof tokensOffMeter>;
   liveMode: boolean;
+  /** (#3662) This page's presence read is stale or unreadable: this viewer
+   *  cannot read the fleet hub, so whatever was written since cannot be in
+   *  the total, and it says it counts what is seen rather than "all". */
+  hubUnread: boolean;
   /** (5.0 R3) The names of machines whose records never reach this viewer.
    *  The total cannot include their tokens, so it says it counts what is
    *  seen rather than "all". */
@@ -218,9 +233,9 @@ const SavingsHero = memo(function SavingsHero({
           <div className="savlblwrap">
             <div
               className="savlbl"
-              title={totalHint(t.noRun, t.unlisted, notStreaming)}
+              title={totalHint(t.noRun, t.unlisted, notStreaming, hubUnread)}
             >
-              {notStreaming.length > 0 ? "tokens seen" : "all tokens"}
+              {totalWord(notStreaming, hubUnread)}
               {liveMode ? ` · last ${hours}h` : ""}
             </div>
             {t.utility && settled ? <div className="savpart"><span className="savpartv">{fmtC(t.utility)}</span> utility</div> : null}
@@ -931,6 +946,7 @@ export function FleetLens({
         // one keeps the loading silhouette rather than counting up to "0".
         settled={flowWindow.settled && flowWindow.failure === null}
         notStreaming={notStreaming}
+        hubUnread={presenceDegraded}
       />
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
       <RosterUnreadableNotice error={rosterError} />

@@ -44,7 +44,7 @@ import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { DEFAULT_POLICY, isRunning, lifecycleAt, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
 import { currentRun, runIndex, type RunGroup } from "../../lib/runRef";
-import { HUB_UNREAD, machineAvailability, type MachineAvailability } from "../../lib/machineAvailability";
+import { HUB_UNREAD, machineAvailability, underUnreadPresence, type MachineAvailability } from "../../lib/machineAvailability";
 import { CardStatus } from "./cardStatus";
 import { RUNNING_WORD } from "../../components/WorkStatus";
 import type { CardResidents } from "../../lib/machineEngine";
@@ -596,9 +596,11 @@ export function buildFleetCardBase(
  *  records in the window still count (the hero does not list it as missing).
  *  This machine's own card is unchanged, whether the view or only the flow
  *  window drew it (`cardIdentity`'s `self`): its records are its own. A peer
- *  already unseen or down keeps what it had. */
+ *  is `hub_unread` whether the window holds its records or not (the hub can
+ *  have been down longer than the window); one known to be down keeps
+ *  `not_reporting` (`underUnreadPresence`). */
 export function withPresenceUnread(base: FleetCardBase): FleetCardBase {
-  return base.liveInputs.self || base.availability !== "known" ? base : { ...base, availability: "hub_unread" };
+  return { ...base, availability: underUnreadPresence(base.availability, base.liveInputs.self) };
 }
 
 /** (#2958) Which of a fleet card's sources have answered at least once on
