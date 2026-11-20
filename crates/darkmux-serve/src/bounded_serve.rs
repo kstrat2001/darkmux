@@ -91,6 +91,9 @@ pub(crate) struct Admission {
 pub(crate) struct Slots {
     _conn: tokio::sync::OwnedSemaphorePermit,
     _ip: KeySlot<IpAddr>,
+    /// On a listener that judges, the connection's record with its rounds
+    /// ([`crate::local_peer::Rounds::holding`]), dropped with it.
+    held: Option<crate::local_peer::HeldEnd>,
 }
 
 /// One admitted connection. Hold `slots` for as long as it is served.
@@ -160,19 +163,24 @@ impl Admission {
         }
     }
 
-    /// `stream` with its slots, or `None` (and the stream dropped, which
-    /// closes it) when its address or the listener is at its cap.
+    /// `stream` with its slots, or `None` (and the stream reset,
+    /// [`refused`]) when its address or the listener is at its cap.
     fn admit(&self, stream: tokio::net::TcpStream, peer: SocketAddr) -> Option<Admitted> {
         let local = self.judging.then(|| stream.local_addr().ok()).flatten();
         let here = self.judging && from_this_machine(peer, local);
-        let (ip, held) = self.per_ip.try_take_counted(counted_as(peer, here))?;
-        let conn = self.permits.clone().try_acquire_owned().ok()?;
+        let Some((ip, held)) = self.per_ip.try_take_counted(counted_as(peer, here)) else {
+            return refused(stream);
+        };
+        let Ok(conn) = self.permits.clone().try_acquire_owned() else {
+            return refused(stream);
+        };
         Some(Admitted {
             stream,
             peer,
             slots: Slots {
                 _conn: conn,
                 _ip: ip,
+                held: None,
             },
             local,
             judge_first: here && held >= self.open_share,
@@ -210,6 +218,18 @@ pub(crate) fn counted_as(peer: SocketAddr, here: bool) -> IpAddr {
     } else {
         peer.ip().to_canonical()
     }
+}
+
+/// Closes a connection this listener refuses with a reset (`SO_LINGER` 0),
+/// never an ordinary close: the side that closes first keeps the
+/// connection in TIME_WAIT for a minute or so, and on a Mac one held on
+/// 127.0.0.1 keeps its port from every other loopback connection on this
+/// machine. A peer that opens connections as fast as they are refused
+/// could otherwise use up those ports, and with them the operator's
+/// browser's way in. The reset is immediate; nothing blocks.
+pub(crate) fn refused<T>(stream: tokio::net::TcpStream) -> Option<T> {
+    let _ = stream.set_zero_linger();
+    None
 }
 
 /// The bounds of a listener served by [`serve_kept_alive`].
@@ -310,8 +330,11 @@ pub(crate) async fn serve_kept_alive_reading(
         .with_judged_share(limits.judged_share);
     while let Some(conn) = admission.next(&listener, &mut shutdown).await {
         if refused_on_accept(&rounds, darkmux_platform::current(), &conn).await {
+            refused::<()>(conn.stream);
             continue;
         }
+        let mut conn = conn;
+        conn.slots.held = conn.local.map(|local| rounds.holding(conn.peer, local));
         tokio::spawn(kept_alive(
             conn,
             app.clone(),
@@ -328,8 +351,9 @@ pub(crate) async fn serve_kept_alive_reading(
 /// already been reset (it is gone; nothing to read for it), or one a known
 /// container forwarder holds
 /// ([`crate::local_peer::Rounds::held_by_a_known_forwarder`], read through
-/// `platform`). Every other connection takes its own end out of the
-/// forwarders' cache, since a port it reuses later is another connection.
+/// `platform`). Every connection takes its own end out of the forwarders'
+/// cache, the reset ones and the refused ones included, since a port it
+/// reuses later is another connection.
 ///
 /// Asked as the connection is accepted, so a container's is closed before
 /// it holds a slot while a round runs. The accept loop waits for the
@@ -344,14 +368,14 @@ async fn refused_on_accept(
     let Some(local) = conn.local else {
         return false;
     };
-    if !conn.judge_first {
+    let reset = matches!(conn.stream.take_error(), Ok(Some(_)));
+    if !conn.judge_first || reset {
         rounds.take_end(conn.peer, local);
-        return false;
+        return conn.judge_first;
     }
-    matches!(conn.stream.take_error(), Ok(Some(_)))
-        || rounds
-            .held_by_a_known_forwarder(platform, conn.peer, local)
-            .await
+    rounds
+        .held_by_a_known_forwarder(platform, conn.peer, local)
+        .await
 }
 
 /// Serves one admitted connection until it closes, or, once `shutdown`
@@ -375,6 +399,7 @@ async fn kept_alive(
     let local = local.or_else(|| stream.local_addr().ok());
     let this_conn = crate::local_peer::PeerConn::new(peer, local, rounds);
     if judge_first && !judged_in_time(&this_conn, &stream, &mut shutdown).await {
+        refused::<()>(stream);
         return;
     }
     let served = hyper::server::conn::http1::Builder::new()

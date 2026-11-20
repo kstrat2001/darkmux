@@ -466,6 +466,11 @@ fn this_machine_is_every_peer_of_a_loopback_listener_and_counts_as_one() {
 ///   (past the open share: a round names this forwarder and closes it),
 ///   then one from source port `port` (closed as a known forwarder's),
 ///   prints whether each was closed, and exits.
+/// - `drop-one <addr> <open> <port>`: holds the open share, one of its
+///   connections from source port `port`; opens one more (a round names
+///   this forwarder and closes it) and another (a read of this process's
+///   connections, which sees the one from `port`, refuses it); then resets
+///   the connection from `port`, prints `ready` and holds the rest.
 /// - `churn <addr> <hold> <threads> <secs>`: holds `hold` connections, prints
 ///   `churning`, and for `secs` has each of `threads` threads connect, wait
 ///   for the other end to close, and connect again (a container reopening
@@ -482,9 +487,11 @@ fn container_forwarder_stand_in() {
     let _held = match parts[0] {
         "hold" => {
             let source = parts[4].parse().ok();
-            let held: Vec<_> = (0..num(2)).map(|_| connect_from(addr, source)).collect();
-            let closed = closed_count(&held, num(3), Duration::from_secs(8));
-            println!("closed {closed}");
+            let held: Vec<_> = (0..num(2))
+                .map(|_| abortive(connect_from(addr, source)))
+                .collect();
+            let (closed, reset) = closed_count(&held, num(3), Duration::from_secs(8));
+            println!("closed {closed} reset {reset}");
             held
         }
         "flick" => flick(addr, num(2), num(3), Duration::from_secs(num(4) as u64)),
@@ -492,6 +499,7 @@ fn container_forwarder_stand_in() {
             tag(addr, num(2), num(3) as u16);
             return;
         }
+        "drop-one" => drop_one(addr, num(2), num(3) as u16),
         _ => churn(addr, num(2), num(3), Duration::from_secs(num(4) as u64)),
     };
     let _ = std::io::stdin().read_to_end(&mut Vec::new());
@@ -524,9 +532,7 @@ fn flick(
     threads: usize,
     for_: Duration,
 ) -> Vec<std::net::TcpStream> {
-    let held: Vec<_> = (0..hold)
-        .map(|_| std::net::TcpStream::connect(addr).unwrap())
-        .collect();
+    let held: Vec<_> = (0..hold).map(|_| resetting(addr)).collect();
     let until = std::time::Instant::now() + for_;
     for _ in 0..threads {
         std::thread::spawn(move || {
@@ -560,12 +566,61 @@ fn flick(
 }
 
 /// [`container_forwarder_stand_in`]'s `tag` mode.
-fn tag(addr: SocketAddr, hold: usize, port: u16) {
-    let _held: Vec<_> = (0..hold)
-        .map(|_| std::net::TcpStream::connect(addr).unwrap())
-        .collect();
+/// Resets `s` (SO_LINGER 0) as it is dropped: no closed connection is left
+/// waiting on this machine's ports.
+fn reset(s: std::net::TcpStream) {
+    drop(abortive(s));
+}
+
+/// A connection to `addr` that resets when it is closed ([`abortive`]).
+fn resetting(addr: SocketAddr) -> std::net::TcpStream {
+    abortive(std::net::TcpStream::connect(addr).unwrap())
+}
+
+/// `s`, set to reset rather than close gracefully when it is dropped or its
+/// process ends, so tests that open thousands of connections leave none in
+/// TIME_WAIT on this machine (the side that closes first keeps one unless
+/// it is reset).
+fn abortive(s: std::net::TcpStream) -> std::net::TcpStream {
+    use std::os::fd::AsRawFd;
+    let off = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: a socket this function owns, and a `linger` of the size given.
+    unsafe {
+        libc::setsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            (&off as *const libc::linger).cast(),
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    s
+}
+
+/// [`container_forwarder_stand_in`]'s `drop-one` mode: the held connections.
+fn drop_one(addr: SocketAddr, open: usize, port: u16) -> Vec<std::net::TcpStream> {
+    let held: Vec<_> = (1..open).map(|_| resetting(addr)).collect();
+    let tagged = connect_from_port(addr, port);
     std::thread::sleep(Duration::from_millis(200));
-    let mut extra = std::net::TcpStream::connect(addr).unwrap();
+    let mut named = resetting(addr);
+    println!(
+        "named {}",
+        closed_within(&mut named, Duration::from_secs(6))
+    );
+    let mut read = resetting(addr);
+    println!("read {}", closed_within(&mut read, Duration::from_secs(6)));
+    reset(tagged);
+    println!("ready");
+    held
+}
+
+fn tag(addr: SocketAddr, hold: usize, port: u16) {
+    let _held: Vec<_> = (0..hold).map(|_| resetting(addr)).collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let mut extra = resetting(addr);
     println!(
         "named {}",
         closed_within(&mut extra, Duration::from_secs(6))
@@ -594,7 +649,7 @@ fn connect_from_port(addr: SocketAddr, port: u16) -> std::net::TcpStream {
     });
     let s = s.into_std().unwrap();
     s.set_nonblocking(false).unwrap();
-    s
+    abortive(s)
 }
 
 /// A container engine's forwarder holding `hold` connections to `addr` and,
@@ -614,9 +669,7 @@ fn churn(
     threads: usize,
     for_: Duration,
 ) -> Vec<std::net::TcpStream> {
-    let held: Vec<_> = (0..hold)
-        .map(|_| std::net::TcpStream::connect(addr).unwrap())
-        .collect();
+    let held: Vec<_> = (0..hold).map(|_| resetting(addr)).collect();
     let until = std::time::Instant::now() + for_;
     for _ in 0..threads {
         std::thread::spawn(move || {
@@ -624,6 +677,7 @@ fn churn(
                 if let Ok(mut s) = std::net::TcpStream::connect(addr) {
                     let _ = s.set_read_timeout(Some(Duration::from_secs(9)));
                     let _ = s.read(&mut [0u8; 1]);
+                    reset(s);
                 }
             }
         });
@@ -633,26 +687,37 @@ fn churn(
 }
 
 /// How many of `conns` the other end has closed, once `want` have been or
-/// `within` has passed.
-fn closed_count(conns: &[std::net::TcpStream], want: usize, within: Duration) -> usize {
+/// `within` has passed, and how many of those it reset rather than closed.
+fn closed_count(conns: &[std::net::TcpStream], want: usize, within: Duration) -> (usize, usize) {
     for c in conns {
         c.set_nonblocking(true).unwrap();
     }
+    let mut seen: Vec<Option<bool>> = vec![None; conns.len()];
     let until = std::time::Instant::now() + within;
     loop {
-        let closed = conns.iter().filter(|c| is_closed(c)).count();
+        for (c, how) in conns.iter().zip(seen.iter_mut()) {
+            *how = how.or_else(|| close_seen(c));
+        }
+        let closed = seen.iter().flatten().count();
         if closed >= want || std::time::Instant::now() >= until {
-            return closed;
+            return (
+                closed,
+                seen.iter().flatten().filter(|reset| **reset).count(),
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-/// Whether the other end of nonblocking `c` has closed it.
-fn is_closed(mut c: &std::net::TcpStream) -> bool {
+/// How the other end of nonblocking `c` ended it: `Some(true)` reset,
+/// `Some(false)` closed, `None` still open. A reset is told by the first
+/// read after it, so each connection is read until its end is seen once.
+fn close_seen(mut c: &std::net::TcpStream) -> Option<bool> {
     match c.read(&mut [0u8; 1]) {
-        Ok(n) => n == 0,
-        Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+        Ok(0) => Some(false),
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+        Err(e) => Some(e.kind() == std::io::ErrorKind::ConnectionReset),
     }
 }
 
@@ -672,8 +737,9 @@ impl Drop for Forwarder {
 /// A container engine's forwarder opening `n` connections to `addr`: this
 /// test binary copied as `com.docker.backend` (the name is what tells a
 /// forwarder) and running [`container_forwarder_stand_in`]. Returns once
-/// `closing` of them have been closed (or 8 s passed), with how many were.
-fn forwarder(addr: SocketAddr, n: usize, closing: usize) -> (Forwarder, usize) {
+/// `closing` of them have been closed (or 8 s passed), with how many were
+/// and how many of those were reset.
+fn forwarder(addr: SocketAddr, n: usize, closing: usize) -> (Forwarder, usize, usize) {
     forwarder_from(addr, n, closing, None)
 }
 
@@ -683,17 +749,19 @@ fn forwarder_from(
     n: usize,
     closing: usize,
     source: Option<std::net::IpAddr>,
-) -> (Forwarder, usize) {
+) -> (Forwarder, usize, usize) {
     let source = source.map_or("-".to_string(), |s| s.to_string());
     let (held, mut lines) = stand_in(&format!("hold {addr} {n} {closing} {source}"));
     // libtest prints the test's name on the same line first.
-    let closed = lines
-        .find_map(|l| {
-            l.rsplit_once("closed ")
-                .map(|(_, k)| k.trim().parse().unwrap())
-        })
+    let report = lines
+        .find_map(|l| l.rsplit_once("closed ").map(|(_, r)| r.to_string()))
         .expect("the stand-in reports what it holds");
-    (held, closed)
+    let (closed, reset) = report.split_once(" reset ").expect("closed k reset r");
+    (
+        held,
+        closed.trim().parse().unwrap(),
+        reset.trim().parse().unwrap(),
+    )
 }
 
 /// A container engine's forwarder holding `hold` connections to `addr` and
@@ -818,15 +886,17 @@ fn a_container_holds_only_the_open_share_and_the_operator_and_tailscale_are_serv
     };
     let open = lim.per_ip - lim.judged_share;
     let (addr, _stop, _done) = serving_judged(ok_app(), lim, not_seeing("curl"));
-    let (_container, closed) = forwarder(addr, 2 * lim.per_ip, 2 * lim.per_ip - open);
+    let (_container, closed, reset) = forwarder(addr, 2 * lim.per_ip, 2 * lim.per_ip - open);
     assert_eq!(
         closed,
         2 * lim.per_ip - open,
         "the container holds only the open share ({open})"
     );
-    let mut mine: Vec<_> = (1..lim.judged_share)
-        .map(|_| std::net::TcpStream::connect(addr).unwrap())
-        .collect();
+    assert_eq!(
+        reset, closed,
+        "each one refused, judged or past the cap, is reset: no TIME_WAIT left on this machine"
+    );
+    let mut mine: Vec<_> = (1..lim.judged_share).map(|_| resetting(addr)).collect();
     for (i, s) in mine.iter_mut().enumerate() {
         let got = get_on(s, "/ok");
         assert!(
@@ -864,9 +934,7 @@ fn the_operators_own_connections_fill_the_judged_share_and_the_cap_still_holds()
             header_read_timeout: Duration::from_secs(30),
         };
         let (addr, _stop, _done) = serving_judged(ok_app(), lim, rounds);
-        let mut mine: Vec<_> = (0..lim.per_ip)
-            .map(|_| std::net::TcpStream::connect(addr).unwrap())
-            .collect();
+        let mut mine: Vec<_> = (0..lim.per_ip).map(|_| resetting(addr)).collect();
         for (i, s) in mine.iter_mut().enumerate() {
             let got = get_on(s, "/ok");
             assert!(got.starts_with("HTTP/1.1 200"), "{what}: #{i}: {got:?}");
@@ -906,11 +974,12 @@ fn the_viewer_and_the_client_listener_keep_a_share_no_container_can_take() {
     ];
     for (name, lim, start) in starts {
         let (addr, _stop, _done) = serving_with(start, ok_app());
-        let (_container, closed) = forwarder(addr, lim.per_ip, lim.judged_share);
+        let (_container, closed, reset) = forwarder(addr, lim.per_ip, lim.judged_share);
         assert_eq!(
             closed, lim.judged_share,
             "{name}: the container's judged connections are closed"
         );
+        assert_eq!(reset, closed, "{name}: each one reset");
         let body = ureq::get(&format!("http://{addr}/ok"))
             .call()
             .map(|r| r.into_string().unwrap());
@@ -934,6 +1003,7 @@ fn served_of(addr: SocketAddr, n: usize, gap: Duration) -> usize {
             {
                 served += 1;
             }
+            reset(s);
         }
         std::thread::sleep(gap);
     }
@@ -1003,12 +1073,12 @@ fn a_container_connecting_from_another_address_of_this_machine_shares_the_open_s
     };
     let open = lim.per_ip - lim.judged_share;
     let (addr, _stop, _done) = serving_judged(ok_app(), lim, crate::local_peer::this_machine());
-    let (_from_lan, closed) = forwarder_from(addr, lim.per_ip, lim.judged_share, Some(lan));
+    let (_from_lan, closed, _) = forwarder_from(addr, lim.per_ip, lim.judged_share, Some(lan));
     assert_eq!(
         closed, lim.judged_share,
         "from {lan}: the open share ({open}) is held"
     );
-    let (_from_loopback, closed) = forwarder(addr, open, open);
+    let (_from_loopback, closed, _) = forwarder(addr, open, open);
     assert_eq!(
         closed, open,
         "from 127.0.0.1 too: the open share is already held"
@@ -1129,9 +1199,7 @@ fn a_known_forwarders_old_connection_never_refuses_a_later_one_from_its_port() {
         "the forwarder was named and its connection from {port} closed: {said:?}"
     );
     std::thread::sleep(Duration::from_millis(300));
-    let _mine: Vec<_> = (0..open)
-        .map(|_| std::net::TcpStream::connect(addr).unwrap())
-        .collect();
+    let _mine: Vec<_> = (0..open).map(|_| resetting(addr)).collect();
     std::thread::sleep(Duration::from_millis(200));
     let mut again = connect_from_port(addr, port);
     again
@@ -1335,5 +1403,70 @@ async fn hung_up_notices_a_close_behind_unread_data() {
     assert!(
         tokio::time::timeout(soon, hung_up(&server)).await.is_ok(),
         "reset"
+    );
+}
+
+/// A read of a known forwarder's connections never caches the end of one
+/// this listener already holds: the forwarder holds the open share, one
+/// connection from a fixture port among them; a later read sees them all;
+/// then that one is reset while the forwarder keeps running. The operator
+/// takes the freed slot, then connects from the same port, and is served.
+#[test]
+fn a_held_connections_end_is_never_cached_to_refuse_a_later_one() {
+    let _ = crate::raise_open_file_limit(4096);
+    let (addr, _stop, _done) = serving_with(
+        Box::new(|l, app, rx| Box::pin(crate::serve_viewer(l, app, rx))),
+        ok_app(),
+    );
+    let open = VIEWER.per_ip - VIEWER.judged_share;
+    let port = darkmux_types::test_ports::fixture_port();
+    let (_container, lines) = stand_in(&format!("drop-one {addr} {open} {port}"));
+    let said: Vec<String> = lines.take_while(|l| !l.contains("ready")).collect();
+    assert!(
+        said.iter().any(|l| l.contains("named true"))
+            && said.iter().any(|l| l.contains("read true")),
+        "the forwarder was named and read: {said:?}"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let served = |s: &mut std::net::TcpStream| {
+        s.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+        let _ = s.write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n");
+        get_answer(s)
+    };
+    let mut first = std::net::TcpStream::connect(addr).unwrap();
+    assert!(
+        served(&mut first).starts_with("HTTP/1.1 200"),
+        "the freed slot"
+    );
+    let mut again = connect_from_port(addr, port);
+    let got = served(&mut again);
+    assert!(
+        got.starts_with("HTTP/1.1 200"),
+        "the operator's connection from {port}, past the open share: {got:?}"
+    );
+    reset(first);
+    reset(again);
+}
+
+/// A connection judged first that its peer has already reset still takes
+/// its end out of the forwarders' cache as it is closed.
+#[tokio::test]
+async fn a_reset_connection_takes_its_end_out_of_the_cache() {
+    let (conn, client) = admitted(true).await;
+    let local = conn.local.unwrap();
+    let m = forwarder_machine(vec![conn.peer]);
+    let rounds = knowing_the_forwarder();
+    let unrelated: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    assert!(!rounds.held_by_a_known_forwarder(m, unrelated, local).await);
+    reset(client.into_std().unwrap());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        refused_on_accept(&rounds, m, &conn).await,
+        "gone, so closed"
+    );
+    assert_eq!(
+        rounds.take_end(conn.peer, local),
+        None,
+        "its end went with it"
     );
 }

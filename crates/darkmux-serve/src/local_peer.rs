@@ -387,13 +387,40 @@ const KNOWN_FORWARDERS: usize = 8;
 
 /// The container forwarders the rounds named, each with its name then,
 /// newest last; per listener address, the ends of their connections there
-/// as last read, each with its forwarder, and when that read ended and how
-/// long it took.
+/// as last read, each with its forwarder (never one the listener already
+/// holds), when that read ended and how long it took, and the ends of the
+/// connections the listener holds now ([`HeldEnd`]).
 #[derive(Default)]
 struct KnownForwarders {
     pids: Vec<(u32, String)>,
     ends: HashMap<SocketAddr, HashMap<SocketAddr, (u32, String)>>,
     reads: HashMap<SocketAddr, (Instant, std::time::Duration)>,
+    held: HashMap<SocketAddr, std::collections::HashSet<SocketAddr>>,
+}
+
+/// A connection a listener holds, recorded with its rounds for as long as
+/// this lives ([`Rounds::holding`]), so no read caches its end: the cache
+/// only ever holds ends of connections not accepted yet, each used once.
+pub(crate) struct HeldEnd {
+    rounds: Arc<Rounds>,
+    peer: SocketAddr,
+    local: SocketAddr,
+}
+
+impl Drop for HeldEnd {
+    fn drop(&mut self) {
+        let mut known = self
+            .rounds
+            .forwarders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(held) = known.held.get_mut(&self.local) {
+            held.remove(&self.peer);
+            if held.is_empty() {
+                known.held.remove(&self.local);
+            }
+        }
+    }
 }
 
 /// The least time between two reads of the forwarders for one listener.
@@ -600,9 +627,24 @@ impl Rounds {
         }
     }
 
+    /// Records that the listener at `local` holds the connection from
+    /// `peer` until the returned [`HeldEnd`] is dropped (with the
+    /// connection): a read keeps no cached end for it.
+    pub(crate) fn holding(self: &Arc<Self>, peer: SocketAddr, local: SocketAddr) -> HeldEnd {
+        let (peer, local) = (canonical(peer), canonical(local));
+        let mut known = self.forwarders.lock().unwrap_or_else(|p| p.into_inner());
+        known.held.entry(local).or_default().insert(peer);
+        HeldEnd {
+            rounds: self.clone(),
+            peer,
+            local,
+        }
+    }
+
     /// Keeps a refresh's answer: forgets the `gone` forwarders
-    /// ([`Self::forget`]), replaces `local`'s ends, and records when the
-    /// read that `began` then ended.
+    /// ([`Self::forget`]), replaces `local`'s ends with those of connections
+    /// it does not hold yet, and records when the read that `began` then
+    /// ended.
     fn store(
         &self,
         gone: &[u32],
@@ -612,6 +654,10 @@ impl Rounds {
     ) {
         self.forget(gone);
         let mut known = self.forwarders.lock().unwrap_or_else(|p| p.into_inner());
+        let mut ends = ends;
+        if let Some(held) = known.held.get(&canonical(local)) {
+            ends.retain(|end, _| !held.contains(end));
+        }
         known.ends.insert(canonical(local), ends);
         known
             .reads

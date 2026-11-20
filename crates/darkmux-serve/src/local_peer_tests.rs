@@ -657,3 +657,29 @@ fn a_round_looks_at_each_process_once() {
     ];
     assert_eq!(pids_in(&peers), vec![3, 9]);
 }
+
+/// While the listener holds a connection, no read caches its end; once the
+/// connection is closed, a forwarder's later connection from that end is
+/// read again.
+#[tokio::test]
+async fn a_held_end_is_left_out_of_reads_until_its_connection_closes() {
+    let at = |s: &str| -> SocketAddr { s.parse().unwrap() };
+    let (theirs, local) = (at("127.0.0.1:50001"), at("127.0.0.1:8799"));
+    let m: &'static darkmux_platform::FakePlatform =
+        Box::leak(Box::new(darkmux_platform::FakePlatform {
+            tcp_peers: vec![(theirs, 68948)],
+            ..machine()
+        }));
+    let rounds = Rounds::new_for_test(Arc::new(|_| None), std::time::Duration::from_secs(1));
+    rounds.remember(forwarders_among(m, &[68948]));
+    let held = rounds.holding(theirs, local);
+    assert!(
+        !rounds.held_by_a_known_forwarder(m, theirs, local).await,
+        "held, so never cached"
+    );
+    drop(held);
+    assert!(
+        rounds.held_by_a_known_forwarder(m, theirs, local).await,
+        "closed, so a later connection from it is read"
+    );
+}
