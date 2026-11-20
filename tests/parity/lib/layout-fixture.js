@@ -532,6 +532,10 @@ async function installLayoutRoutes(page, { blockStream = false, machineSpecs = f
     // machine the view cannot read and never hears, which renders as an
     // offline card beside this machine's own.
     if (holdPresence && p === "/fleet/machines/live") return new Promise(() => {});
+    // (#3662) Otherwise presence answers as a standalone daemon's does
+    // (switched off). A 404 here reads as presence UNREADABLE, which the
+    // fleet cards now say rather than "idle": the page has no other notice.
+    if (p === "/fleet/machines/live") return json({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } });
     // `holdView`: a promise the fleet view's answer waits on, so a test can
     // look at the page while the cards' order is not final and again after.
     if (holdView && p === "/fleet/view") await holdView;

@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { presenceUnreadBases, withPresenceUnread, type FleetCardBase } from "./cards";
+import { withPresenceUnread, type FleetCardBase } from "./cards";
 import { machActive, specOf, busiestExecution, isStrictlyBusier, specUnknownLabel, cardFace, notStreamedNames, servesLine, servesParts, executionCountText, countLine, shownExecution } from "./cards";
 import { CardStatus, STATUS_WORD, lampOf, secondLineOf, statusReason } from "./cardStatus";
 import { buildFleetCard, faceOf } from "../../testing/fleetCard";
@@ -1798,18 +1798,5 @@ describe("withPresenceUnread", () => {
   });
   it("a peer already not reporting (down) stays not reporting, never 'check its stream'", () => {
     expect(withPresenceUnread(base("not_reporting", false)).availability).toBe("not_reporting");
-  });
-});
-
-// (#3662 review 3) A flow-only card is converted only once the page knows
-// which machine is its own; a view row always is (it says if it is self).
-describe("presenceUnreadBases", () => {
-  const base = (uid: string) => ({ uid, availability: "known", liveInputs: { self: false } }) as unknown as FleetCardBase;
-  it("with this machine unknown, a flow-only card keeps its availability and a view row's is converted", () => {
-    const out = presenceUnreadBases([base("flow"), base("row")], new Set(["row"]), false);
-    expect(out.map((b) => b.availability)).toEqual(["known", "hub_unread"]);
-  });
-  it("with this machine known, every non-self card is converted", () => {
-    expect(presenceUnreadBases([base("flow")], new Set(), true)[0].availability).toBe("hub_unread");
   });
 });

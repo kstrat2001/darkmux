@@ -2079,58 +2079,86 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     });
   }
 
-  // (#3662 review 3) Where the view row names this machine's uid, the self
-  // join uses it even though the card's specs carry none: a peer logging
-  // under the same hostname is a separate card and never gets this
-  // machine's hardware.
-  it("with uid-less specs, this machine's view row uid keeps a same-named peer from being taken for it", async () => {
+  // (#3662 review 3) This machine's row can carry a uid the roster or the flow
+  // history gave it (`uid_source`), not this machine's own report: the oldest
+  // uid under its name, say. Its specs carry none. The self join must not
+  // take that uid for this machine's: its current records (on another uid)
+  // are still this machine, with its hardware line, never a stranger.
+  it("with uid-less specs and a row uid from flow history, this machine's current records are still this machine", async () => {
     const day = todayUTC();
     mockFleetFetch({
-      view: [viewRow({ machine_id: "MacBook-Pro", machine_uid: null, cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 }, { is_this_machine: true, machine_uid: "u1", accepts: { state: "this_machine" } })],
-      // This machine has no records in the window; the peer's are the only
-      // ones named MacBook-Pro, so a name join alone would take it for self.
-      flowToday: [
-        { ts: `${day}T09:40:00.000Z`, action: "dispatch.start", session_id: "p1", machine_uid: "u2", machine_id: "MacBook-Pro", handle: "coder" },
-        { ts: `${day}T09:41:00.000Z`, action: "dispatch.complete", session_id: "p1", machine_uid: "u2", machine_id: "MacBook-Pro", handle: "coder" },
+      view: [
+        viewRow(
+          { machine_id: "MacBook-Pro", machine_uid: null, cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
+          { is_this_machine: true, machine_uid: "u-old", uid_source: "flow_history", accepts: { state: "this_machine" } },
+        ),
       ],
+      flowToday: [
+        { ts: `${day}T09:30:00.000Z`, action: "dispatch.start", session_id: "s1", machine_uid: "u-self", machine_id: "MacBook-Pro", handle: "coder" },
+        { ts: `${day}T09:31:00.000Z`, action: "dispatch.complete", session_id: "s1", machine_uid: "u-self", machine_id: "MacBook-Pro", handle: "coder" },
+      ],
+      runs: [],
+      presence: { state: "unavailable", detail: "could not read presence beats from Redis" },
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
+    await waitFor(() => expect(document.querySelectorAll(".mach").length).toBeGreaterThan(0));
+    await new Promise((r) => setTimeout(r, 50));
+    const specs = [...document.querySelectorAll(".mach .spec")].map((e) => e.textContent);
+    expect(specs.every((t) => t === "Apple M5 Max · 128 GB"), specs.join(" | ")).toBe(true);
+    expect(document.body.textContent).not.toContain("nothing says whether it is up");
+  });
+
+  // (#3662 review 4) The fleet view and `/machine/specs` both fail while
+  // presence is unreadable: nothing names this machine. A flow-only card may
+  // be this machine or a peer, so it claims neither "idle" (a peer's live
+  // state is unknown) nor "nothing says whether it is up" (this machine is up
+  // by definition): it reads "not streaming" with only the hub reason. Every
+  // source has answered, so this is the settled state, not "checking…".
+  it("with presence unreadable and nothing naming this machine, no flow-only card reads idle or stranger", async () => {
+    const day = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${day}T09:30:00.000Z`, action: "dispatch.start", session_id: "s1", machine_uid: "u-self", machine_id: "MacBook-Pro", handle: "coder" },
+        { ts: `${day}T09:31:00.000Z`, action: "dispatch.complete", session_id: "s1", machine_uid: "u-self", machine_id: "MacBook-Pro", handle: "coder" },
+        { ts: `${day}T09:40:00.000Z`, action: "dispatch.start", session_id: "g1", machine_uid: "u-ghost", machine_id: "ghost", handle: "coder" },
+        { ts: `${day}T09:41:00.000Z`, action: "dispatch.complete", session_id: "g1", machine_uid: "u-ghost", machine_id: "ghost", handle: "coder" },
+      ],
+      fail: { "/fleet/view": 500, "/machine/specs": 500 },
       runs: [],
       presence: { state: "unavailable", detail: "could not read presence beats from Redis" },
     });
     renderFleetLens();
     await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
     await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
-    const withHardware = [...document.querySelectorAll(".mach .spec")].filter((e) => e.textContent === "Apple M5 Max · 128 GB");
-    expect(withHardware).toHaveLength(1);
-    // The peer is a peer: under unread presence it reads not streaming,
-    // never this machine's "idle".
-    const peer = [...document.querySelectorAll(".mach")].find((c) => !c.contains(withHardware[0]))!;
-    await waitFor(() => expect(peer.querySelector(".stat")!.textContent).toBe("not streaming"));
+    await waitFor(() => expect([...document.querySelectorAll(".mach .stat")].map((e) => e.textContent)).toEqual(["not streaming", "not streaming"]));
+    for (const stat of document.querySelectorAll(".mach .stat")) {
+      expect(stat.getAttribute("title")).toBe("not streaming: this viewer can't read the fleet hub right now");
+    }
+    expect(document.body.textContent).not.toMatch(/idle|0 running|nothing says whether it is up/);
   });
 
-  // (#3662 review 3) With nothing naming this machine (no view, no specs),
-  // a flow-only card may be this machine itself, which is up by definition:
-  // the page cannot say "nothing says whether it is up" about it. It waits
-  // ("checking…") like any card whose sources have not all answered. Only a
-  // card positively not this machine reads standing unknown.
-  it("with presence unreadable and nothing naming this machine, a flow-only card is not called a stranger", async () => {
+  // (#3662 review 4) A failed `/machine/specs` read is retried at the presence
+  // cadence, so this machine is named once the daemon answers, and its card
+  // then reads its own records.
+  it("a failed /machine/specs read is retried, and this machine is recognized once it answers", async () => {
     const day = todayUTC();
     mockFleetFetch({
       flowToday: [
-        { ts: `${day}T09:30:00.000Z`, action: "dispatch.start", session_id: "s1", machine_uid: "u1", machine_id: "MacBook-Pro", handle: "coder" },
-        { ts: `${day}T09:31:00.000Z`, action: "dispatch.complete", session_id: "s1", machine_uid: "u1", machine_id: "MacBook-Pro", handle: "coder" },
+        { ts: `${day}T09:30:00.000Z`, action: "dispatch.start", session_id: "s1", machine_uid: "u-self", machine_id: "MacBook-Pro", handle: "coder" },
+        { ts: `${day}T09:31:00.000Z`, action: "dispatch.complete", session_id: "s1", machine_uid: "u-self", machine_id: "MacBook-Pro", handle: "coder" },
       ],
-      hold: { "/runs": new Promise<void>(() => {}) },
+      fail: { "/fleet/view": 500 },
+      failOnce: ["/machine/specs"],
+      machineSpecs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
       runs: [],
       presence: { state: "unavailable", detail: "could not read presence beats from Redis" },
     });
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    renderFleetLens({}, qc);
-    await waitFor(() => expect(qc.getQueryState(queryKeys.fleetMachinesLive())?.status).toBe("success"));
-    await waitFor(() => expect(document.querySelector(".mach .stat")).not.toBeNull());
-    await new Promise((r) => setTimeout(r, 50));
-    expect(document.querySelector(".mach .stat")!.textContent).toBe("checking…");
-    expect(document.body.textContent).not.toContain("nothing says whether it is up");
-  });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach .stat")?.textContent).toBe("not streaming"));
+    await waitFor(() => expect(document.querySelector(".mach .stat")?.textContent).toBe("idle"), { timeout: 8000 });
+    expect(document.querySelector(".mach .spec")!.textContent).toBe("Apple M5 Max · 128 GB");
+  }, 12000);
 
   // (#3662 review) A peer nobody rostered, known only from records in the
   // window: with presence unreadable nothing read says it is up, so it reads

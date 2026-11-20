@@ -399,9 +399,18 @@ export interface FleetCard {
  *  never have any), so it reads unknown, never online, and carries a reason:
  *  a `null` note would say the card was read and the status line would claim
  *  "online". */
-function flowOnlyStanding(machAbsent: boolean | null, m: string): { standing: Standing; note: string | null } {
-  if (machAbsent === null) return { standing: "unknown", note: m === NO_UID_KEY ? "it carries no machine id, so nothing can say whether it is up" : `${HUB_UNREAD}, so nothing says whether it is up` };
+function flowOnlyStanding(machAbsent: boolean | null, m: string, selfKnown: boolean): { standing: Standing; note: string | null } {
+  if (machAbsent === null) return { standing: "unknown", note: unknownStandingNote(m, selfKnown) };
   return { standing: machAbsent ? "offline" : "online", note: null };
+}
+
+/** Why a flow-only card's standing is unknown. (#3662) Under an unread hub,
+ *  "nothing says whether it is up" only once this machine is known
+ *  (`selfKnown`): until then the card may be this machine, which is up by
+ *  definition, so it says only that the hub cannot be read. */
+function unknownStandingNote(m: string, selfKnown: boolean): string {
+  if (m === NO_UID_KEY) return "it carries no machine id, so nothing can say whether it is up";
+  return selfKnown ? `${HUB_UNREAD}, so nothing says whether it is up` : HUB_UNREAD;
 }
 
 /** What a card says about WHO the machine is and whether it is up. A machine
@@ -428,7 +437,7 @@ function cardIdentity(
       spec,
       // (#1855) `specUnknown` says whether a beat existed to carry hardware.
       specUnknown: spec ? null : liveMachines.has(m) ? ("not-reported" as const) : ("not-seen" as const),
-      ...(self ? { standing: "online" as const, note: null } : flowOnlyStanding(machAbsent, m)),
+      ...(self ? { standing: "online" as const, note: null } : flowOnlyStanding(machAbsent, m, specs !== null)),
       hub: false,
       servesRadio: false,
       servesProfiles: 0,
@@ -601,15 +610,6 @@ export function buildFleetCardBase(
  *  `not_reporting` (`underUnreadPresence`). */
 export function withPresenceUnread(base: FleetCardBase): FleetCardBase {
   return { ...base, availability: underUnreadPresence(base.availability, base.liveInputs.self) };
-}
-
-/** (#3662 review 3) `withPresenceUnread` over a page's card bases: every view
- *  row (each says whether it is this machine), and a flow-only card only once
- *  the page knows which machine is its own (`selfKnown`). Until then a
- *  flow-only card may be this machine, which is up by definition and whose
- *  records are its own. */
-export function presenceUnreadBases(bases: readonly FleetCardBase[], viewUids: ReadonlySet<string>, selfKnown: boolean): FleetCardBase[] {
-  return bases.map((b) => (selfKnown || viewUids.has(b.uid) ? withPresenceUnread(b) : b));
 }
 
 /** (#2958) Which of a fleet card's sources have answered at least once on

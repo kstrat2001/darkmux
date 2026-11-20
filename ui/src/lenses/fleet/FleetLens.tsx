@@ -29,7 +29,7 @@ import { fmtN, fmtC } from "../../lib/format";
 import { Shimmer } from "../../components/Placeholder";
 import { usePlaybackClock } from "../../lib/pageClockRate";
 import { tokensOffMeter } from "./savings";
-import { buildFleetCardBase, withLiveReadings, presenceUnreadBases, shownExecution, cardFace, notStreamedNames, type CardSourcesAnswered } from "./cards";
+import { buildFleetCardBase, withLiveReadings, withPresenceUnread, shownExecution, cardFace, notStreamedNames, type CardSourcesAnswered } from "./cards";
 import { MachineCard } from "./MachineCard";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
@@ -45,34 +45,33 @@ import { HUB_UNREAD } from "../../lib/machineAvailability";
  *  uid), so with none it reads `null`: standing unknown, never online. Every
  *  other machine keeps reading absent only on positive evidence.
  *  `presenceUnread` (#3662): this page's presence read is stale or
- *  unreadable, so no evidence is not "up" either: every machine reads `null`.
- *  The caller passes it only once it knows which machine is this one (a
- *  flow-only card that may be this machine is up by definition). */
+ *  unreadable, so no evidence is not "up" either: every machine reads `null`
+ *  (this machine is exempt by `cardIdentity`'s self rule once it is known). */
 export const absentOrUnknown = (present: boolean | null, m: string, presenceUnread = false): boolean | null =>
   (m === NO_UID_KEY || presenceUnread) && present === null ? null : present === false;
 
-/** (#3662 review) This machine's own row names its uid even when its card's
- *  specs do not (a degraded specs gather): the self join then compares uids
- *  rather than falling back to a name a peer could share. */
-function withRowUid(specs: MachineSpecsResponse | null, row: FleetMachine): MachineSpecsResponse | null {
-  return specs && !specs.machine_uid && row.machine_uid ? { ...specs, machine_uid: row.machine_uid } : specs;
-}
-
 /** This machine's specs: its own row of the fleet view, else (#3662 review),
  *  when the view holds no row for it (its read failed), `/machine/specs`.
- *  That is the query `App` runs on every live route, so this shares its cache
- *  slot rather than adding a request. Without it this machine's card was
- *  drawn as a stranger's whenever the view failed. `live`: a daemon to ask. */
+ *  `App` reads the same query key once per live page; this observer adds one
+ *  request at most when the cache is empty, and while the last read FAILED
+ *  re-asks at the presence cadence (`fetchJson` settles a failure as a
+ *  successful query, so nothing else would ever ask again), stopping once it
+ *  answers. Without it this machine's card was drawn as a stranger's
+ *  whenever the view failed. `live`: a daemon to ask. A row's own uid is not
+ *  used for self here: unless its card stated it (then the specs carry it
+ *  already), it came from the roster or the flow history, which can name an
+ *  older uid than the one this machine stamps now. */
 function useSelfSpecs(viewRows: readonly FleetMachine[] | null, live: boolean): MachineSpecsResponse | null {
   const query = useQuery({
     enabled: live,
     queryKey: queryKeys.machineSpecs(),
     queryFn: () => fetchJson<MachineSpecsResponse>("/machine/specs"),
+    refetchInterval: (q) => (q.state.data?.ok === false ? PRESENCE_POLL_MS : false),
   });
   const probed = live && query.data?.ok ? query.data.data : null;
   return useMemo(() => {
     const self = viewRows?.find((r) => r.is_this_machine);
-    return self ? withRowUid(rowSpecs(self), self) : probed;
+    return self ? rowSpecs(self) : probed;
   }, [viewRows, probed]);
 }
 
@@ -864,7 +863,7 @@ export function FleetLens({
         liveMachines,
         specs,
         presence,
-        absentOrUnknown(machPresent(flowWindow.data, liveMachines, playheadT, m), m, presenceDegraded && specs !== null),
+        absentOrUnknown(machPresent(flowWindow.data, liveMachines, playheadT, m), m, presenceDegraded),
         m,
         playheadT,
         null,
@@ -877,7 +876,7 @@ export function FleetLens({
     // view's order nor the flow window's, so which source answered first
     // never moves a card.
     const bases = orderCards([...viewBases, ...flowBases], (b) => b.order).map((b) => b.base);
-    return presenceDegraded ? presenceUnreadBases(bases, new Set(viewBases.map((b) => b.base.uid)), specs !== null) : bases;
+    return presenceDegraded ? bases.map(withPresenceUnread) : bases;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
   }, [viewCards, flowOnlyUids, flowWindow.data, liveEdgeClock, liveMachines, specs, presence, runs, roster, policy, presenceDegraded]);
   const cards = useMemo(
