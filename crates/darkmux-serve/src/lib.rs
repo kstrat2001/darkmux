@@ -1570,7 +1570,7 @@ pub fn listen_socket_addr(bind: &str, port: u16) -> Result<std::net::SocketAddr>
 /// both, and doctor says when they differ).
 fn sandbox_configured_now() -> Option<darkmux_sandbox::BackendKind> {
     let path = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config;
-    darkmux_sandbox::selected_in(&darkmux_types::config::DarkmuxConfig::load_from(&path)).ok()
+    darkmux_sandbox::selection_in(&darkmux_types::config::DarkmuxConfig::load_from(&path)).ok().map(|s| s.kind)
 }
 
 /// The ASCII-art wordmark and tagline the startup banner opens with, each
@@ -1889,7 +1889,7 @@ async fn health(
     let loopback_caller = is_local_request(peer.map(|c| c.0), &headers);
     // (#3112) The sandbox this daemon runs isolated work in; `None` when the
     // setting is refused (every launch through the daemon refuses it too).
-    let daemon_sandbox = darkmux_sandbox::selected().ok();
+    let daemon_sandbox = darkmux_sandbox::selection().ok().map(|s| s.kind);
     let configured = if loopback_caller { sandbox_configured_now() } else { None };
     axum::Json(wire::HealthResponse {
         darkmux_version: env!("CARGO_PKG_VERSION").to_string(),

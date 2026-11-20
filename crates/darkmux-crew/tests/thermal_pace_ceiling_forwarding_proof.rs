@@ -279,6 +279,7 @@ fn captured_docker_argv_with(
         force_container: false,
         max_completion_tokens: None,
         image: None,
+        sandbox: None,
         // Routes past the host-side compactor-residency block entirely, so
         // the only `lms` call possible is the sampler's own `ps --json`.
         // The URL is never dialed: the fake `docker` never runs the real

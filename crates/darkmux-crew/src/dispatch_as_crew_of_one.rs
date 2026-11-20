@@ -462,6 +462,9 @@ fn step_config(opts: &DispatchOpts) -> serde_json::Value {
         system_prompt_override: _,
         // (#3363) Only a lab run sets it; `darkmux dispatch` never does.
         lab_inputs: _,
+        // The step resolves the backend itself, once, when it renders the
+        // message (`step_kinds::builtins::dispatch_opts_for`).
+        sandbox: _,
         host_out: _,
         max_turns_override: _,
     } = opts;
@@ -647,6 +650,7 @@ mod tests {
             force_container: false,
             max_completion_tokens: None,
             image: None,
+            sandbox: None,
             model_base_url_override: None,
             step_id: None,
             system_prompt_override: None,
@@ -1884,7 +1888,7 @@ mod tests {
             valid_checkpoint_json("coder"),
         )
         .unwrap();
-        crate::dispatch_internal::write_resume_origin_meta(resume_from.path(), &workdir_path, false, None, &darkmux_types::execution_id::ExecutionId::mint());
+        crate::dispatch_internal::write_resume_origin_meta(resume_from.path(), &workdir_path, false, None, &darkmux_types::execution_id::ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
 
         let mut opts = test_opts("coder", "resume please");
         opts.resume_from = Some(resume_from.path().to_path_buf());

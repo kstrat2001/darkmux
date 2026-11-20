@@ -10,7 +10,7 @@
 //! should ever select.
 
 use crate::bounded_command::{run_bounded, Bounded};
-use darkmux_sandbox::{backend, Access, DockerBackend, Limits, Mount, Network, Query, SandboxBackend, SandboxHandle, SandboxPolicy};
+use darkmux_sandbox::{Access, DockerBackend, Limits, Mount, Network, Query, SandboxBackend, SandboxHandle, SandboxPolicy};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -18,9 +18,11 @@ use std::time::Duration;
 /// Where model-written code runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Placement {
-    /// `docker run` on this image, with no network and only the named
-    /// mounts.
-    Container(String),
+    /// In a sandbox of this backend (the caller's one read of
+    /// `runtime.sandbox`), on this image
+    /// (`host` for a sandbox on the host, which has none), with no network
+    /// and only the named mounts.
+    Container(String, darkmux_sandbox::BackendKind),
     /// `sh -c` on this machine, as the darkmux user.
     Host,
 }
@@ -195,8 +197,11 @@ pub fn container_args(image: &str, name: &str, run: &Run) -> Vec<String> {
 }
 
 /// The command to spawn, and the sandbox's handle when it runs in one: in
-/// the configured sandbox (`runtime.sandbox`), or `NotRun` when that is
-/// refused (#3112 review: never Docker by default).
+/// the backend the placement names. The caller read the setting once for
+/// the whole unit of work (a run, a regrade, a gate) and placed this
+/// command with it, so everything that unit does agrees by construction
+/// rather than by every read in one process happening to return the same
+/// value.
 pub fn command(placement: &Placement, run: &Run) -> Result<(Command, Option<SandboxHandle>), NotRun> {
     match placement {
         Placement::Host => {
@@ -204,8 +209,8 @@ pub fn command(placement: &Placement, run: &Run) -> Result<(Command, Option<Sand
             cmd.arg("-c").arg(run.command).current_dir(run.tree.join(run.workdir));
             Ok((cmd, None))
         }
-        Placement::Container(image) => {
-            let backend = backend().map_err(NotRun)?;
+        Placement::Container(image, kind) => {
+            let backend = darkmux_sandbox::backend_of(*kind);
             static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let name = format!("{}-{}-{n}", run.name_prefix, std::process::id());
@@ -317,14 +322,15 @@ pub fn remove_container(handle: &SandboxHandle) {
 /// (#906) The image a lab run's tests run in: the workload's declared image,
 /// else the darkmux runtime image the dispatch itself runs (resolved and
 /// version-checked the same way, pulled if absent). Refuses when Docker is
-/// not reachable, naming the opt-out.
-pub fn lab_test_image(workload_image: Option<&str>) -> anyhow::Result<String> {
-    let sandbox = darkmux_sandbox::selected().map_err(|why| anyhow::anyhow!(why))?;
-    lab_test_image_in(sandbox, workload_image)
-}
-
-/// [`lab_test_image`] under the selected `sandbox`.
-fn lab_test_image_in(sandbox: darkmux_sandbox::BackendKind, workload_image: Option<&str>) -> anyhow::Result<String> {
+/// not reachable, naming the opt-out. `sandbox` is the backend the run
+/// resolved: on the host there is no image. `read` is the run's own read of
+/// the setting, for why Docker was needed (`None`, a placement built without
+/// a read: no setting is named).
+pub fn lab_test_image_in(
+    sandbox: darkmux_sandbox::BackendKind,
+    workload_image: Option<&str>,
+    read: Option<darkmux_sandbox::Selection>,
+) -> anyhow::Result<String> {
     use anyhow::Context;
     // (#3112 step 2) A Seatbelt sandbox runs this host's own toolchain: there
     // is no image to name, resolve or pull.
@@ -342,14 +348,15 @@ fn lab_test_image_in(sandbox: darkmux_sandbox::BackendKind, workload_image: Opti
         crate::dispatch_internal::validate_image_ref(image)?;
         return Ok(image.to_string());
     }
-    crate::dispatch_internal::test_runtime_image().with_context(tests_need_docker)
+    crate::dispatch_internal::resolved_runtime_image_with(read.and_then(|s| s.docker_remedy()))
+        .with_context(|| tests_need_docker(read.and_then(|s| s.docker_needs())))
 }
 
 /// (#3112) Why a lab run's tests could not get the runtime image: Docker is
 /// asked for only under `runtime.sandbox docker`, so the message says so,
 /// and how to need no Docker where that can run.
-fn tests_need_docker() -> String {
-    let remedy = darkmux_sandbox::docker_needs().unwrap_or_else(|| "Docker must be installed and running".to_string());
+fn tests_need_docker(needs: Option<String>) -> String {
+    let remedy = needs.unwrap_or_else(|| "Docker must be installed and running".to_string());
     format!(
         "model-written tests run in {}: {remedy}; \
          to run them on this machine as your user instead, `darkmux config set runtime.tests_on_host true`",
@@ -370,10 +377,10 @@ pub fn image_not_used_note(image: &str) -> String {
 /// (#906) The user a lab run's test container runs as: the same answer the
 /// dispatch container gets (the operator's `runtime.container_user`, else
 /// the platform's), so files the tests write into a bind-mounted tree belong
-/// to whoever owns the tree.
-pub fn lab_test_user() -> anyhow::Result<Option<String>> {
+/// to whoever owns the tree. `sandbox` is the backend the run resolved.
+pub fn lab_test_user_in(sandbox: darkmux_sandbox::BackendKind) -> anyhow::Result<Option<String>> {
     // (#3112 step 2) A Seatbelt sandbox runs as the caller.
-    if darkmux_sandbox::selected().map_err(|why| anyhow::anyhow!(why))?.on_host() {
+    if sandbox.on_host() {
         return Ok(None);
     }
     crate::dispatch_internal::runtime_container_user()
@@ -501,7 +508,7 @@ mod tests {
     /// argv, and the container is named `<prefix>-<pid>-<seq>`.
     #[test]
     fn a_contained_command_spawns_docker_with_the_pinned_argv() {
-        let (cmd, handle) = command(&Placement::Container("node:22".into()), &a_run(&[], None)).unwrap();
+        let (cmd, handle) = command(&Placement::Container("node:22".into(), darkmux_sandbox::BackendKind::Docker), &a_run(&[], None)).unwrap();
         let name = handle.expect("a container run is named").id;
         let prefix = format!("darkmux-test-{}-", std::process::id());
         assert!(name.strip_prefix(&prefix).is_some_and(|n| n.parse::<u64>().is_ok()), "{name}");
@@ -575,7 +582,7 @@ mod tests {
         let tree = dir.path().join("tree");
         std::fs::create_dir(&tree).unwrap();
         let run_ = Run { command: "true", tree: &tree, workdir: "", mounts: &[], user: None, name_prefix: "darkmux-test" };
-        let ran = run(&Placement::Container("img:1".into()), &run_, Duration::from_secs(20));
+        let ran = run(&Placement::Container("img:1".into(), darkmux_sandbox::BackendKind::Docker), &run_, Duration::from_secs(20));
         restore_path(prev);
         let Ok(Bounded::Finished { stdout, .. }) = ran else { panic!("{ran:?}") };
         assert_eq!(String::from_utf8_lossy(&stdout), "ran\n");
@@ -600,7 +607,7 @@ mod tests {
         let tree = dir.path().join("tree");
         std::fs::create_dir(&tree).unwrap();
         let run_ = Run { command: "sleep 300", tree: &tree, workdir: "", mounts: &[], user: None, name_prefix: "darkmux-test" };
-        let ran = run(&Placement::Container("img:1".into()), &run_, Duration::from_secs(2));
+        let ran = run(&Placement::Container("img:1".into(), darkmux_sandbox::BackendKind::Docker), &run_, Duration::from_secs(2));
         restore_path(prev);
         assert!(matches!(ran, Ok(Bounded::TimedOut { .. })), "{ran:?}");
         let calls = invocations(&record);
@@ -611,30 +618,26 @@ mod tests {
         assert_eq!(calls[2], strings(&["rm", "-f", &name]));
     }
 
-    /// (#3112 review) A refused `runtime.sandbox` refuses the run: it never
-    /// falls back to Docker (an empty `PATH` would make any Docker attempt
-    /// a spawn failure instead of this refusal).
+    /// A contained run runs in the backend its placement names, whatever
+    /// `runtime.sandbox` says when it is built: the placement is the
+    /// caller's one read, and this code never reads the setting itself.
+    /// Here the placement says Seatbelt (image `host`) while the setting
+    /// says Docker, then the reverse.
     #[test]
     #[serial_test::serial]
-    fn a_refused_sandbox_refuses_a_contained_run_instead_of_using_docker() {
+    fn a_contained_run_runs_where_its_placement_says_not_where_the_setting_says_now() {
         darkmux_types::run_in_own_process!();
         let root = tempfile::TempDir::new().unwrap();
         let tree = root.path().join("tree");
         std::fs::create_dir_all(&tree).unwrap();
-        let empty = tempfile::TempDir::new().unwrap();
-        let (prev_path, prev_sb) = (std::env::var_os("PATH"), std::env::var_os("DARKMUX_SANDBOX"));
-        unsafe {
-            std::env::set_var("PATH", empty.path());
-            std::env::set_var("DARKMUX_SANDBOX", "podman");
-        }
         let r = Run { command: "true", tree: &tree, workdir: "", mounts: &[], user: None, name_prefix: "darkmux-test" };
-        let ran = run(&Placement::Container("node:22".into()), &r, Duration::from_secs(5));
-        unsafe {
-            match prev_path { Some(v) => std::env::set_var("PATH", v), None => std::env::remove_var("PATH") }
-            match prev_sb { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
-        }
-        let why = ran.expect_err("a refused sandbox never runs").0;
-        assert!(why.contains("podman") && why.contains("runtime.sandbox"), "{why}");
+        let program = |placement: &Placement, setting: &str| {
+            under_sandbox(setting, || command(placement, &r).map(|(cmd, _)| cmd.get_program().to_string_lossy().into_owned()))
+        };
+        let on_host = program(&Placement::Container("host".into(), darkmux_sandbox::BackendKind::Seatbelt), "docker").unwrap();
+        assert_ne!(on_host, "docker", "a Seatbelt placement ran `docker run ... host`");
+        let in_docker = program(&Placement::Container("node:22".into(), darkmux_sandbox::BackendKind::Docker), "seatbelt").unwrap();
+        assert_eq!(in_docker, "docker");
     }
 
     /// (#3112 review) A contained run under Seatbelt reaps only Seatbelt
@@ -666,7 +669,7 @@ mod tests {
             std::env::set_var(darkmux_sandbox::seatbelt::STATE_DIR_ENV, state.path());
         }
         let r = Run { command: "true", tree: &tree, workdir: "", mounts: &[], user: None, name_prefix: "darkmux-test" };
-        let ran = run(&Placement::Container("host".into()), &r, Duration::from_secs(30));
+        let ran = run(&Placement::Container("host".into(), darkmux_sandbox::BackendKind::Seatbelt), &r, Duration::from_secs(30));
         unsafe {
             match prev_path { Some(v) => std::env::set_var("PATH", v), None => std::env::remove_var("PATH") }
             match prev_sb { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
@@ -720,7 +723,7 @@ mod tests {
             preload.display()
         );
         let r = Run { command: &command, tree: &tree, workdir: "pkg", mounts: &[], user: None, name_prefix: "darkmux-test" };
-        let ran = run(&Placement::Container("host".into()), &r, Duration::from_secs(60));
+        let ran = run(&Placement::Container("host".into(), darkmux_sandbox::BackendKind::Seatbelt), &r, Duration::from_secs(60));
         unsafe {
             for (k, v) in saved {
                 match v { Some(v) => std::env::set_var(k, v), None => std::env::remove_var(k) }
@@ -795,7 +798,7 @@ mod tests {
     /// a tree with no parent, or a parent that is not a directory.
     #[test]
     fn a_container_run_without_room_for_the_mount_check_never_starts() {
-        let contained = Placement::Container("darkmux-no-such-image:0".into());
+        let contained = Placement::Container("darkmux-no-such-image:0".into(), darkmux_sandbox::BackendKind::Docker);
         let at_root = Run { tree: Path::new("/"), ..a_run(&[], None) };
         let err = run(&contained, &at_root, Duration::from_secs(5)).unwrap_err().0;
         assert!(err.contains("no parent directory"), "{err}");
@@ -823,7 +826,7 @@ mod tests {
             user: None,
             name_prefix: "darkmux-test",
         };
-        let contained = Placement::Container("node:22-bookworm-slim".into());
+        let contained = Placement::Container("node:22-bookworm-slim".into(), darkmux_sandbox::BackendKind::Docker);
         let ran = run(&contained, &run_, Duration::from_secs(60));
         let Ok(Bounded::Finished { success, stdout, stderr, .. }) = ran else { panic!("{ran:?}") };
         assert!(success, "{} {}", String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr));
@@ -838,7 +841,7 @@ mod tests {
         let Ok(Bounded::Finished { code, stdout, .. }) = run(&contained, &own, Duration::from_secs(60)) else { panic!() };
         assert_eq!((code, String::from_utf8_lossy(&stdout).trim().to_string()), (Some(125), "a.txt".to_string()));
         // A missing image never ran the command.
-        let missing = run(&Placement::Container("darkmux-no-such-image:0".into()), &run_, Duration::from_secs(60));
+        let missing = run(&Placement::Container("darkmux-no-such-image:0".into(), darkmux_sandbox::BackendKind::Docker), &run_, Duration::from_secs(60));
         assert!(missing.is_err(), "{missing:?}");
     }
 
@@ -867,35 +870,25 @@ mod tests {
     fn a_lab_runs_its_tests_in_the_image_its_sandbox_uses() {
         use darkmux_sandbox::BackendKind::{Docker, Landlock, Seatbelt};
         for on_host in [Seatbelt, Landlock] {
-            assert_eq!(lab_test_image_in(on_host, None).unwrap(), "host", "{on_host:?}");
-            assert_eq!(lab_test_image_in(on_host, Some("node:22")).unwrap(), "host", "{on_host:?}: a pinned image is not used on the host");
+            assert_eq!(lab_test_image_in(on_host, None, None).unwrap(), "host", "{on_host:?}");
+            assert_eq!(lab_test_image_in(on_host, Some("node:22"), None).unwrap(), "host", "{on_host:?}: a pinned image is not used on the host");
         }
-        assert_eq!(lab_test_image_in(Docker, Some("node:22")).unwrap(), "node:22");
-        let why = lab_test_image_in(Docker, Some("--privileged")).unwrap_err().to_string();
+        assert_eq!(lab_test_image_in(Docker, Some("node:22"), None).unwrap(), "node:22");
+        let why = lab_test_image_in(Docker, Some("--privileged"), None).unwrap_err().to_string();
         assert!(why.contains("starts with `-`"), "{why}");
-        let runtime = crate::dispatch_internal::test_runtime_image().unwrap();
+        let runtime = crate::dispatch_internal::resolved_runtime_image_with(None).unwrap();
         assert_ne!(runtime, "host");
-        assert_eq!(lab_test_image_in(Docker, None).unwrap(), runtime, "no pin: the dispatch's own runtime image");
-    }
-
-    /// (#3112) The configured sandbox decides: a refused `runtime.sandbox`
-    /// refuses the lab's tests by name, never falling back to Docker.
-    #[test]
-    #[serial_test::serial] // sets DARKMUX_SANDBOX
-    fn a_lab_test_image_follows_the_configured_sandbox() {
-        assert_eq!(under_sandbox("docker", || lab_test_image(Some("node:22"))).unwrap(), "node:22");
-        let why = under_sandbox("podman", || lab_test_image(Some("node:22"))).unwrap_err().to_string();
-        assert!(why.contains("podman") && why.contains("runtime.sandbox"), "{why}");
+        assert_eq!(lab_test_image_in(Docker, None, None).unwrap(), runtime, "no pin: the dispatch's own runtime image");
     }
 
     /// (#3112) Tests that cannot get the runtime image say why Docker was
     /// needed and the way to run them on this machine instead, whether or not
-    /// the configured sandbox can be read.
+    /// the run's read of the sandbox names a remedy.
     #[test]
     #[serial_test::serial] // sets DARKMUX_SANDBOX
     fn tests_without_docker_say_why_docker_and_the_way_to_run_them_here() {
         for sandbox in ["docker", "podman"] {
-            let why = under_sandbox(sandbox, tests_need_docker);
+            let why = under_sandbox(sandbox, || tests_need_docker(darkmux_sandbox::selection().ok().and_then(|s| s.docker_needs())));
             assert!(
                 why.starts_with("model-written tests run in a Docker container (`runtime.sandbox` is `docker`): Docker must be installed and running"),
                 "{sandbox}: {why}"

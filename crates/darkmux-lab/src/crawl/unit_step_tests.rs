@@ -3399,7 +3399,7 @@ fn a_unit_naming_a_rule_no_longer_declared_is_refused() {
     }
 }
 
-/// (#3112 review) The production wiring, through `selected()`: under
+/// (#3112 review) The production wiring, through the unit's one read: under
 /// `DARKMUX_SANDBOX=seatbelt` (on a Mac) a unit's dispatch is briefed with
 /// the tree's own path and stamps it as `context.root`; under Docker (a test
 /// build's default) it says `/workspace` and stamps nothing.
@@ -3514,6 +3514,7 @@ fn a_units_readback_maps_a_host_seen_finding_like_a_workspace_one() {
             session_id: SessionId::adhoc(run, "crawler", "u-1"),
             tree_root: tmp.path().join("tree"),
             tree_seen: tree_seen.to_string(),
+            sandbox: Err("not read in this test".into()),
         };
         let into = tmp.path().join("findings.jsonl");
         let session = ctx.session_id.clone();

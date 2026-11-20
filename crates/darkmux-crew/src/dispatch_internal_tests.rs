@@ -983,7 +983,7 @@
         std::fs::create_dir(&out_dir).unwrap();
         let lock_path = darkmux_types::paths::execution_lock_path(&out_dir).unwrap();
         let mut held = ExecutionLock { _guards: Vec::new() };
-        stamp_own_execution(&mut held, &out_dir, (ws.path(), false, None), &ExecutionId::mint()).unwrap();
+        stamp_own_execution(&mut held, &out_dir, (ws.path(), false, None), &ExecutionId::mint(), darkmux_sandbox::BackendKind::Docker).unwrap();
         assert!(
             darkmux_types::flock::try_lock_exclusive_owned(&lock_path).unwrap().is_none(),
             "another try_lock on the running dispatch's lock fails"
@@ -1276,14 +1276,26 @@
 
     // ─── #680: Docker-runtime preflight status → bail mapping ─────────
 
+    /// The Docker bail names the remedy of the dispatch's own read of the
+    /// sandbox setting, passed in, and nothing when that read is not Docker.
+    #[test]
+    fn the_docker_bail_names_the_remedy_it_is_given() {
+        let with = preflight_result_for(DockerRuntimeStatus::BinaryMissing, Some("`runtime.sandbox` is `docker`, so Docker must run"))
+            .unwrap_err()
+            .to_string();
+        assert!(with.ends_with("\n`runtime.sandbox` is `docker`, so Docker must run."), "{with}");
+        let without = preflight_result_for(DockerRuntimeStatus::BinaryMissing, None).unwrap_err().to_string();
+        assert!(without.ends_with("and retry."), "{without}");
+    }
+
     #[test]
     fn preflight_ready_is_ok() {
-        assert!(preflight_result_for(DockerRuntimeStatus::Ready).is_ok());
+        assert!(preflight_result_for(DockerRuntimeStatus::Ready, None).is_ok());
     }
 
     #[test]
     fn preflight_binary_missing_bails_with_install_hint() {
-        let msg = preflight_result_for(DockerRuntimeStatus::BinaryMissing)
+        let msg = preflight_result_for(DockerRuntimeStatus::BinaryMissing, darkmux_sandbox::Selection { kind: darkmux_sandbox::BackendKind::Docker, source: darkmux_types::config_access::Source::Config }.docker_remedy().as_deref())
             .unwrap_err()
             .to_string();
         assert!(msg.contains("isn't on PATH"), "{msg}");
@@ -1296,7 +1308,7 @@
     fn preflight_daemon_unreachable_surfaces_stderr_and_start_hint() {
         let msg = preflight_result_for(DockerRuntimeStatus::DaemonUnreachable(
             "Cannot connect to the Docker daemon".to_string(),
-        ))
+        ), darkmux_sandbox::Selection { kind: darkmux_sandbox::BackendKind::Docker, source: darkmux_types::config_access::Source::Config }.docker_remedy().as_deref())
         .unwrap_err()
         .to_string();
         assert!(msg.contains("`docker version` failed"), "{msg}");
@@ -1311,7 +1323,7 @@
         // path pulls the GHCR image on demand (#759) rather than bailing. The
         // message should name the GHCR pull as primary and build-from-source
         // as the fallback.
-        let msg = preflight_result_for(DockerRuntimeStatus::ImageMissing)
+        let msg = preflight_result_for(DockerRuntimeStatus::ImageMissing, None)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("GHCR"), "{msg}");
@@ -1357,7 +1369,7 @@
             status_for_plan(plan_default_image(&Empty, "9.9.9", None)),
             DockerRuntimeStatus::ImageMissing
         );
-        assert!(preflight_result_for(DockerRuntimeStatus::ImageRefused("refusing: x".into()))
+        assert!(preflight_result_for(DockerRuntimeStatus::ImageRefused("refusing: x".into()), None)
             .unwrap_err()
             .to_string()
             .contains("refusing: x"));
@@ -1398,7 +1410,7 @@
     #[test]
     fn preflight_probe_error_bails_with_underlying_error() {
         // The one arm whose behavior changed (old `.context(...)?` → `anyhow!`).
-        let msg = preflight_result_for(DockerRuntimeStatus::ProbeError("boom".to_string()))
+        let msg = preflight_result_for(DockerRuntimeStatus::ProbeError("boom".to_string()), None)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("running `docker images`"), "{msg}");
@@ -2354,11 +2366,11 @@
         let prev = std::env::var("DARKMUX_TEST_3207_UTIL_KEY").ok();
         unsafe { std::env::set_var("DARKMUX_TEST_3207_UTIL_KEY", "util-secret") };
         let mut on = crate::dispatch::CompactionDispatchArgs { compactor_model: Some("mlx-util".into()), ..Default::default() };
-        let header = prepare_unmanaged_compactor(&mut on, &utility);
+        let header = prepare_unmanaged_compactor(&mut on, &utility, darkmux_sandbox::BackendKind::Docker);
         let mut no_window = utility.clone();
         no_window.n_ctx = None;
         let mut off = crate::dispatch::CompactionDispatchArgs { compactor_model: Some("mlx-util".into()), ..Default::default() };
-        let refused = prepare_unmanaged_compactor(&mut off, &no_window);
+        let refused = prepare_unmanaged_compactor(&mut off, &no_window, darkmux_sandbox::BackendKind::Docker);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_TEST_3207_UTIL_KEY", v),
@@ -3012,7 +3024,7 @@
         let ws = TempDir::new().unwrap();
         let prior = TempDir::new().unwrap();
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
-        write_resume_origin_meta(prior.path(), ws.path(), false, None, &ExecutionId::mint());
+        write_resume_origin_meta(prior.path(), ws.path(), false, None, &ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
         record_origin_git_mount(prior.path(), false).unwrap();
         let hint = resume_hint_from_origin(prior.path(), "coder");
         assert!(!parse_hint_args(&hint).iter().any(|a| a == "--workdir-git-writable"), "{hint}");
@@ -3028,7 +3040,7 @@
     fn a_resume_never_escalates_the_git_mount() {
         let ws = TempDir::new().unwrap();
         let prior = TempDir::new().unwrap();
-        write_resume_origin_meta(prior.path(), ws.path(), false, None, &ExecutionId::mint());
+        write_resume_origin_meta(prior.path(), ws.path(), false, None, &ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
         check_resume_git_mount(prior.path(), false).expect("no record, read-only asked: fine");
         let err = check_resume_git_mount(prior.path(), true).unwrap_err().to_string();
         assert!(err.contains("RESUME GIT MOUNT ESCALATION"), "no record reads as read-only: {err}");
@@ -3424,6 +3436,7 @@
             force_container: false,
             max_completion_tokens: None,
             image: None,
+            sandbox: None,
             model_base_url_override: None,
             step_id: None,
             system_prompt_override: None,
@@ -4196,12 +4209,12 @@ S(("127.0.0.1", port), H).serve_forever()
         }
         assert!(matches!(own, crate::engine_dispatch::OwnRoute::Reuse(_)), "{own:?}");
         let brain = theirs.agentic_pm.as_ref().unwrap();
-        let (chat_url, _) = agentic_brain_flags(Some(brain));
+        let (chat_url, _) = agentic_brain_flags(Some(brain), darkmux_sandbox::BackendKind::Docker);
         assert!(chat_url.as_deref().is_some_and(|u| u.contains(":11500/v1/chat/completions")), "{chat_url:?}");
         assert!(brain.route_label().unwrap().contains("127.0.0.1:11500"), "{:?}", brain.route_label());
         assert_eq!(auth, Some(("Authorization".to_string(), "Bearer placeholder-key-for-tests".to_string())), "rec's key is handed on");
         assert!(matches!(mine_own, crate::engine_dispatch::OwnRoute::Free), "{mine_own:?}");
-        let (chat_url, _) = agentic_brain_flags(mine.agentic_pm.as_ref());
+        let (chat_url, _) = agentic_brain_flags(mine.agentic_pm.as_ref(), darkmux_sandbox::BackendKind::Docker);
         assert!(chat_url.as_deref().is_some_and(|u| u.contains(":8092/v1/chat/completions")), "{chat_url:?}");
         assert_eq!(mine_auth, None, "darkmux's own server takes no key");
     }
@@ -5879,7 +5892,7 @@ S(("127.0.0.1", port), H).serve_forever()
     fn split_gitdir_warning_names_the_worktree_remedy() {
         let (_tmp, worktree) = real_worktree_for_test();
         let found = darkmux_types::workdir::find_split_gitdirs(&worktree);
-        let msg = split_gitdir_warning(&worktree, &found);
+        let msg = split_gitdir_warning(&worktree, &found, darkmux_sandbox::BackendKind::Docker);
         assert!(msg.contains("git WORKTREE"), "{msg}");
         assert!(msg.contains("plain clone or the main checkout"), "{msg}");
         assert!(
@@ -5900,7 +5913,7 @@ S(("127.0.0.1", port), H).serve_forever()
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join(".git"), "gitdir: ../../.git/modules/vendor/sub\n").unwrap();
         let found = darkmux_types::workdir::find_split_gitdirs(&sub);
-        let msg = split_gitdir_warning(&sub, &found);
+        let msg = split_gitdir_warning(&sub, &found, darkmux_sandbox::BackendKind::Docker);
         assert!(msg.contains("git SUBMODULE"), "{msg}");
         assert!(
             msg.contains(&tmp.path().join("super-repo").display().to_string()),
@@ -5922,7 +5935,7 @@ S(("127.0.0.1", port), H).serve_forever()
         std::fs::create_dir(&repo).unwrap();
         std::fs::write(repo.join(".git"), "gitdir: /elsewhere/the-repo.git\n").unwrap();
         let found = darkmux_types::workdir::find_split_gitdirs(&repo);
-        let msg = split_gitdir_warning(&repo, &found);
+        let msg = split_gitdir_warning(&repo, &found, darkmux_sandbox::BackendKind::Docker);
         assert!(msg.contains("--separate-git-dir"), "{msg}");
         assert!(
             msg.contains("no main checkout or superproject to fall back to"),
@@ -5952,7 +5965,7 @@ S(("127.0.0.1", port), H).serve_forever()
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join(".git"), "gitdir: /elsewhere/.git/worktrees/the-source\n").unwrap();
         let found = darkmux_types::workdir::find_split_gitdirs(&tree_root);
-        let msg = split_gitdir_warning(&tree_root, &found);
+        let msg = split_gitdir_warning(&tree_root, &found, darkmux_sandbox::BackendKind::Docker);
         assert!(msg.contains("contains, at"), "{msg}");
         assert!(msg.contains(&source.display().to_string()), "{msg}");
         assert!(
@@ -5980,7 +5993,7 @@ S(("127.0.0.1", port), H).serve_forever()
         }
         let found = darkmux_types::workdir::find_split_gitdirs(&tree_root);
         assert_eq!(found.len(), 2, "{found:?}");
-        let msg = split_gitdir_warning(&tree_root, &found);
+        let msg = split_gitdir_warning(&tree_root, &found, darkmux_sandbox::BackendKind::Docker);
         assert!(msg.contains("contains 2 checkouts"), "{msg}");
         for source in ["alpha", "zeta"] {
             assert!(
@@ -5998,12 +6011,12 @@ S(("127.0.0.1", port), H).serve_forever()
         let (_tmp, worktree) = real_worktree_for_test();
         let found = darkmux_types::workdir::find_split_gitdirs(&worktree);
 
-        let plain = with_workspace_notes("ROLE PROMPT".to_string(), None, &[]);
+        let plain = with_workspace_notes("ROLE PROMPT".to_string(), None, &[], darkmux_sandbox::BackendKind::Docker);
         assert_eq!(plain, "ROLE PROMPT", "no workdir ⇒ the prompt is untouched");
-        let none_found = with_workspace_notes("ROLE PROMPT".to_string(), Some(&worktree), &[]);
+        let none_found = with_workspace_notes("ROLE PROMPT".to_string(), Some(&worktree), &[], darkmux_sandbox::BackendKind::Docker);
         assert_eq!(none_found, "ROLE PROMPT", "no hit ⇒ the prompt is untouched");
 
-        let noted = with_workspace_notes("ROLE PROMPT".to_string(), Some(&worktree), &found);
+        let noted = with_workspace_notes("ROLE PROMPT".to_string(), Some(&worktree), &found, darkmux_sandbox::BackendKind::Docker);
         assert!(noted.starts_with("ROLE PROMPT\n\n"), "{noted}");
         assert!(noted.contains("Git is not available in /workspace."), "{noted}");
         assert!(noted.contains("Do not run git"), "{noted}");
@@ -7055,9 +7068,9 @@ S(("127.0.0.1", port), H).serve_forever()
         let way_back = "darkmux config set runtime.sandbox docker";
         for kind in [darkmux_sandbox::BackendKind::Seatbelt, darkmux_sandbox::BackendKind::Landlock] {
             let refusals = [
-                host_runtime_for(kind, Some("rust:latest"), None, &at_start).unwrap_err(),
-                host_runtime_for(kind, None, None, &executable_at_start(Err(std::io::Error::other("gone")))).unwrap_err(),
-                host_runtime_for(kind, None, Some(root.path().join("nope").into_os_string()), &at_start).unwrap_err(),
+                host_runtime_for(kind, Some("rust:latest"), None, &at_start, darkmux_sandbox::way_back_to_docker_given(darkmux_sandbox::setting_value(kind), darkmux_types::config_access::Source::Config)).unwrap_err(),
+                host_runtime_for(kind, None, None, &executable_at_start(Err(std::io::Error::other("gone"))), darkmux_sandbox::way_back_to_docker_given(darkmux_sandbox::setting_value(kind), darkmux_types::config_access::Source::Config)).unwrap_err(),
+                host_runtime_for(kind, None, Some(root.path().join("nope").into_os_string()), &at_start, darkmux_sandbox::way_back_to_docker_given(darkmux_sandbox::setting_value(kind), darkmux_types::config_access::Source::Config)).unwrap_err(),
             ];
             let named = format!("`runtime.sandbox` is `{}`", darkmux_sandbox::setting_value(kind));
             for err in refusals.iter().map(|e| format!("{e:#}")) {
@@ -7065,7 +7078,7 @@ S(("127.0.0.1", port), H).serve_forever()
                 assert!(!err.contains("DARKMUX_SANDBOX=") && !err.contains("cargo build"), "{err}");
             }
             assert!(format!("{:#}", refusals[0]).contains("--image rust:latest"));
-            assert_eq!(host_runtime_for(kind, None, None, &at_start).unwrap().program, exe.canonicalize().unwrap());
+            assert_eq!(host_runtime_for(kind, None, None, &at_start, darkmux_sandbox::way_back_to_docker_given(darkmux_sandbox::setting_value(kind), darkmux_types::config_access::Source::Config)).unwrap().program, exe.canonicalize().unwrap());
         }
     }
 
@@ -7308,6 +7321,82 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(url_for(url, BackendKind::Docker), "http://host.docker.internal:1234/v1");
     }
 
+    /// Every model URL a dispatch hands its sandbox (the LM Studio base URL,
+    /// a hosted brain's chat URL, an unmanaged compactor's chat URL) is
+    /// written for the backend the dispatch resolved and launches, never for
+    /// `runtime.sandbox` read again: here the setting says `docker` while the
+    /// dispatch runs on the host, so loopback stays loopback.
+    #[test]
+    #[serial]
+    fn sandbox_urls_follow_the_resolved_backend_not_the_setting() {
+        use darkmux_sandbox::BackendKind;
+        let _state = darkmux_types::test_isolation::IsolatedState::new();
+        let keys = [darkmux_sandbox::SANDBOX_ENV, "DARKMUX_LMSTUDIO_URL"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: #[serial]; restored below.
+        unsafe {
+            std::env::set_var(darkmux_sandbox::SANDBOX_ENV, "docker");
+            std::env::set_var("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:1234");
+        }
+        let base = container_lmstudio_base_url(None, BackendKind::Seatbelt);
+        let pm = darkmux_types::ProfileModel::hosted_for_test("m", None, serde_json::json!({ "url": "http://127.0.0.1:8080/v1" }));
+        let brain = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
+        let (chat_url, _) = agentic_brain_flags(Some(&brain), BackendKind::Seatbelt);
+        let mut reg: darkmux_types::ProfileRegistry = serde_json::from_str(
+            r#"{"profiles":{},"endpoints":{"mlx":{"url":"http://127.0.0.1:8081/v1"}},
+                "internal":{"utility":{"id":"mlx-util","n_ctx":16384,"endpoint":"mlx"}}}"#,
+        )
+        .unwrap();
+        reg.materialize_endpoints();
+        let utility = crate::target::utility_target_in(&reg).unwrap().unwrap();
+        let mut compaction = crate::dispatch::CompactionDispatchArgs { compactor_model: Some("mlx-util".into()), ..Default::default() };
+        prepare_unmanaged_compactor(&mut compaction, &utility, BackendKind::Seatbelt).unwrap();
+        unsafe {
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        assert_eq!(base.as_deref(), Some("http://127.0.0.1:1234/v1"));
+        assert_eq!(chat_url.as_deref(), Some("http://127.0.0.1:8080/v1/chat/completions"));
+        assert_eq!(compaction.compactor_chat_url.as_deref(), Some("http://127.0.0.1:8081/v1/chat/completions"));
+    }
+
+    /// A caller's read of the setting reaches the dispatch as it was, a
+    /// refusal included: the dispatch is refused with that refusal and never
+    /// reads the setting again (here it says `docker`, which would run).
+    #[test]
+    #[serial]
+    fn a_callers_refused_read_is_the_dispatchs_refusal_not_a_second_read() {
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.sandbox = Some(Err("the caller's read: `runtime.sandbox` is `podman`".into()));
+        let prev = std::env::var_os(darkmux_sandbox::SANDBOX_ENV);
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var(darkmux_sandbox::SANDBOX_ENV, "docker") };
+        let refused = dispatch_sandbox(&opts).map(|s| s.kind);
+        opts.sandbox = Some(Ok(darkmux_sandbox::Selection { kind: darkmux_sandbox::BackendKind::Seatbelt, source: darkmux_types::config_access::Source::Config }));
+        let carried = dispatch_sandbox(&opts).map(|s| s.kind);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(darkmux_sandbox::SANDBOX_ENV, v),
+                None => std::env::remove_var(darkmux_sandbox::SANDBOX_ENV),
+            }
+        }
+        assert!(refused.unwrap_err().to_string().contains("the caller's read"));
+        assert_eq!(carried.unwrap(), darkmux_sandbox::BackendKind::Seatbelt);
+    }
+
+    /// A container dispatch launches in the backend it resolved, never one
+    /// read again; where else the workspace may read the setting is the
+    /// workspace guard's (`tests/sandbox_setting_reads.rs`).
+    #[test]
+    fn a_container_dispatch_launches_in_the_backend_it_resolved() {
+        let dispatch = include_str!("dispatch_internal.rs");
+        assert!(dispatch.contains("spawn_container(&argv_config, run_backend(&run.image), opts.max_turns_override)?"));
+    }
+
     /// (#2916 review M2) A job another machine submitted never mounts this
     /// machine's shared, writable toolchain cache; local work still does.
     #[test]
@@ -7398,7 +7487,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let prev = std::env::var_os("DARKMUX_LMSTUDIO_URL");
         // SAFETY: caller holds #[serial]; restored below.
         unsafe { std::env::set_var("DARKMUX_LMSTUDIO_URL", configured) };
-        let resolved = container_lmstudio_base_url(override_url);
+        let resolved = container_lmstudio_base_url(override_url, darkmux_sandbox::BackendKind::Docker);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_LMSTUDIO_URL", v),
@@ -7430,7 +7519,7 @@ S(("127.0.0.1", port), H).serve_forever()
         };
         let resolved = {
             let _guard = darkmux_types::config_access::set_config_for_test(cfg);
-            container_lmstudio_base_url(None)
+            container_lmstudio_base_url(None, darkmux_sandbox::BackendKind::Docker)
         };
         if let Some(v) = prev {
             unsafe { std::env::set_var("DARKMUX_LMSTUDIO_URL", v) };
@@ -8091,7 +8180,7 @@ S(("127.0.0.1", port), H).serve_forever()
     /// writes in production, so tests exercising the happy path (or the
     /// workspace gate specifically) don't have to hand-roll the JSON.
     fn write_origin(dir: &std::path::Path, workspace: &str, read_only: bool) {
-        write_resume_origin_meta(dir, std::path::Path::new(workspace), read_only, None, &darkmux_types::execution_id::ExecutionId::mint());
+        write_resume_origin_meta(dir, std::path::Path::new(workspace), read_only, None, &darkmux_types::execution_id::ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
     }
 
     /// (#2162) Test-only composition mirroring the OLD (pre-#2162)
@@ -8216,11 +8305,11 @@ S(("127.0.0.1", port), H).serve_forever()
         let ws = TempDir::new().unwrap();
         let first = TempDir::new().unwrap();
         let recorded = ExecutionId::mint();
-        write_resume_origin_meta(first.path(), ws.path(), false, None, &recorded);
+        write_resume_origin_meta(first.path(), ws.path(), false, None, &recorded, Some(darkmux_sandbox::BackendKind::Docker));
         assert_eq!(execution_for(Some(first.path())), recorded, "the resume continues the recorded execution");
 
         let second = TempDir::new().unwrap();
-        write_resume_origin_meta(second.path(), ws.path(), false, None, &execution_for(Some(first.path())));
+        write_resume_origin_meta(second.path(), ws.path(), false, None, &execution_for(Some(first.path())), Some(darkmux_sandbox::BackendKind::Docker));
         assert_eq!(execution_for(Some(second.path())), recorded, "a resume of a resume continues it too");
 
         assert_ne!(execution_for(None), recorded, "a fresh dispatch is a new execution");
@@ -8241,7 +8330,7 @@ S(("127.0.0.1", port), H).serve_forever()
     fn the_resume_origin_carries_its_schema_version_and_a_newer_one_is_refused() {
         let dir = TempDir::new().unwrap();
         let ws = TempDir::new().unwrap();
-        write_resume_origin_meta(dir.path(), ws.path(), false, None, &ExecutionId::mint());
+        write_resume_origin_meta(dir.path(), ws.path(), false, None, &ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
         let raw = std::fs::read_to_string(resume_origin_path(dir.path())).unwrap();
         let mut origin: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(origin["schema_version"], RESUME_ORIGIN_SCHEMA_VERSION);
@@ -8268,7 +8357,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let dir = TempDir::new().unwrap();
         let ws = TempDir::new().unwrap();
         let minted = ExecutionId::mint();
-        write_resume_origin_meta(dir.path(), ws.path(), false, None, &minted);
+        write_resume_origin_meta(dir.path(), ws.path(), false, None, &minted, Some(darkmux_sandbox::BackendKind::Docker));
         assert_eq!(execution_for(Some(dir.path())), minted, "a valid minted id is kept");
     }
 
@@ -8283,7 +8372,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let workspace = TempDir::new().unwrap();
         let prior = TempDir::new().unwrap();
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
-        write_resume_origin_meta(prior.path(), workspace.path(), false, Some("rust:latest"), &darkmux_types::execution_id::ExecutionId::mint());
+        write_resume_origin_meta(prior.path(), workspace.path(), false, Some("rust:latest"), &darkmux_types::execution_id::ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
 
         let hint = resume_hint_from_origin(prior.path(), "coder");
         let args = parse_hint_args(&hint);
@@ -8320,7 +8409,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let ws = TempDir::new().unwrap();
         let prior = TempDir::new().unwrap();
         let minted = darkmux_types::execution_id::ExecutionId::mint();
-        write_resume_origin_meta(prior.path(), ws.path(), false, Some("rust:latest"), &minted);
+        write_resume_origin_meta(prior.path(), ws.path(), false, Some("rust:latest"), &minted, Some(darkmux_sandbox::BackendKind::Docker));
 
         assert_eq!(
             resume_effective_image(prior.path(), None).unwrap().as_deref(),
@@ -8344,27 +8433,21 @@ S(("127.0.0.1", port), H).serve_forever()
     /// (#3112 review) A `${WORKSPACE_ROOT}` still in the message when the
     /// dispatch writes its prompt file (a step with no workdir, whose
     /// workspace is a fresh tempdir; a CLI `dispatch` message) names that
-    /// workspace where the sandbox sees it, through `selected()`. Under
-    /// `DARKMUX_SANDBOX=seatbelt` (on a Mac) it is the tempdir's own path.
+    /// workspace where the dispatch's sandbox sees it: `/workspace` in a
+    /// container, the tempdir's own path on the host.
     #[test]
-    #[serial]
     fn the_prompt_file_names_the_actual_workspace_for_the_placeholder() {
+        use darkmux_sandbox::BackendKind;
         let ws = TempDir::new().unwrap();
         let msg = "look in `${WORKSPACE_ROOT}/src`";
-        assert_eq!(prompt_file_text(msg, ws.path()), "look in `/workspace/src`");
-        assert_eq!(prompt_file_text("no placeholder", ws.path()), "no placeholder");
+        assert_eq!(prompt_file_text(msg, ws.path(), BackendKind::Docker), "look in `/workspace/src`");
+        assert_eq!(prompt_file_text("no placeholder", ws.path(), BackendKind::Seatbelt), "no placeholder");
         let src = include_str!("dispatch_internal.rs");
-        assert!(src.contains("fs::write(host_out.join(PROMPT_FILE_NAME), prompt_file_text(&opts.message, workspace))"));
-        if !darkmux_sandbox::SeatbeltBackend::available() {
-            return;
-        }
-        let prev = std::env::var_os("DARKMUX_SANDBOX");
-        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
-        let seatbelt = prompt_file_text(msg, ws.path());
-        unsafe {
-            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
-        }
-        assert_eq!(seatbelt, format!("look in `{}/src`", ws.path().canonicalize().unwrap().display()));
+        assert!(src.contains("fs::write(host_out.join(PROMPT_FILE_NAME), prompt_file_text(&opts.message, workspace, kind))"));
+        assert_eq!(
+            prompt_file_text(msg, ws.path(), BackendKind::Seatbelt),
+            format!("look in `{}/src`", ws.path().canonicalize().unwrap().display())
+        );
     }
 
     /// (#3112 review) A split-gitdir checkout is named where the sandbox
@@ -8393,7 +8476,7 @@ S(("127.0.0.1", port), H).serve_forever()
         use darkmux_sandbox::BackendKind;
         let ws = TempDir::new().unwrap();
         let prior = TempDir::new().unwrap();
-        write_resume_origin_meta(prior.path(), ws.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint());
+        write_resume_origin_meta(prior.path(), ws.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
         let origin: serde_json::Value = serde_json::from_str(&read_resume_origin(prior.path()).unwrap()).unwrap();
         assert_eq!(origin["sandbox"], "docker", "a test build runs in Docker: {origin}");
         assert_eq!(origin["schema_version"], "1.1");
@@ -8413,13 +8496,49 @@ S(("127.0.0.1", port), H).serve_forever()
         resume_sandbox_matches(prior.path(), None).unwrap();
     }
 
+    /// A resume is checked against the backend the dispatch resolved and
+    /// runs in, and a dispatch stamps that backend on its own origin and
+    /// names its workspace for it in the prompt file: all from the one
+    /// value it was handed, never `runtime.sandbox` read again. Here the
+    /// setting says `docker` while the dispatch runs on the host.
+    #[test]
+    #[serial]
+    fn the_resume_check_origin_stamp_and_prompt_follow_the_resolved_sandbox() {
+        use darkmux_sandbox::BackendKind;
+        let _state = darkmux_types::test_isolation::IsolatedState::new();
+        let ws = TempDir::new().unwrap();
+        let prior = TempDir::new().unwrap();
+        let fresh = TempDir::new().unwrap();
+        let prev = std::env::var_os(darkmux_sandbox::SANDBOX_ENV);
+        // SAFETY: #[serial]; restored below.
+        unsafe { std::env::set_var(darkmux_sandbox::SANDBOX_ENV, "docker") };
+        write_resume_origin_meta(prior.path(), ws.path(), false, None, &ExecutionId::mint(), Some(BackendKind::Seatbelt));
+        let resumed = resume_preflight(Some(prior.path()), None, BackendKind::Seatbelt).map(|_| ());
+        let refused = resume_preflight(Some(prior.path()), None, BackendKind::Docker).map(|_| ());
+        let mut lock = ExecutionLock { _guards: Vec::new() };
+        stamp_own_execution(&mut lock, fresh.path(), (ws.path(), false, None), &ExecutionId::mint(), BackendKind::Seatbelt).unwrap();
+        let prompt = prompt_file_text("look in `${WORKSPACE_ROOT}/src`", ws.path(), BackendKind::Seatbelt);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(darkmux_sandbox::SANDBOX_ENV, v),
+                None => std::env::remove_var(darkmux_sandbox::SANDBOX_ENV),
+            }
+        }
+        resumed.expect("the origin ran in the backend this resume runs in");
+        let refused = format!("{:#}", refused.unwrap_err());
+        assert!(refused.contains("RESUME SANDBOX MISMATCH"), "{refused}");
+        let origin: serde_json::Value = serde_json::from_str(&read_resume_origin(fresh.path()).unwrap()).unwrap();
+        assert_eq!(origin["sandbox"], "seatbelt", "{origin}");
+        assert!(!prompt.contains("/workspace/src"), "named for a container: {prompt}");
+    }
+
     /// An origin that ran the default image refuses a resume naming one, and
     /// a resume naming none stays on the default (`None`).
     #[test]
     fn a_resume_of_a_default_image_run_refuses_an_explicit_image() {
         let ws = TempDir::new().unwrap();
         let prior = TempDir::new().unwrap();
-        write_resume_origin_meta(prior.path(), ws.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint());
+        write_resume_origin_meta(prior.path(), ws.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
 
         assert_eq!(resume_effective_image(prior.path(), None).unwrap(), None);
         let msg = resume_effective_image(prior.path(), Some("rust:latest")).unwrap_err().to_string();
@@ -8440,7 +8559,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let ws = TempDir::new().unwrap();
         let prior = TempDir::new().unwrap();
         let minted = ExecutionId::mint();
-        write_resume_origin_meta(prior.path(), ws.path(), false, None, &minted);
+        write_resume_origin_meta(prior.path(), ws.path(), false, None, &minted, Some(darkmux_sandbox::BackendKind::Docker));
         (ws, prior, minted)
     }
 
@@ -8526,7 +8645,7 @@ S(("127.0.0.1", port), H).serve_forever()
         unsafe { std::env::set_var("DARKMUX_HOME", home.path()) };
         let ws = TempDir::new().unwrap();
         let prior = TempDir::new().unwrap();
-        write_resume_origin_meta(prior.path(), ws.path(), false, Some("rust:latest"), &ExecutionId::mint());
+        write_resume_origin_meta(prior.path(), ws.path(), false, Some("rust:latest"), &ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
         let run = |image: Option<&str>| {
             let mut opts = dispatch_preflight_probe_opts();
@@ -8586,7 +8705,7 @@ S(("127.0.0.1", port), H).serve_forever()
 
         let prior = TempDir::new().unwrap();
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
-        write_resume_origin_meta(prior.path(), &ws, false, None, &darkmux_types::execution_id::ExecutionId::mint());
+        write_resume_origin_meta(prior.path(), &ws, false, None, &darkmux_types::execution_id::ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
 
         let hint = resume_hint_from_origin(prior.path(), "coder");
         let args = parse_hint_args(&hint);
@@ -8620,7 +8739,7 @@ S(("127.0.0.1", port), H).serve_forever()
         ));
         std::fs::create_dir_all(&ws).unwrap();
         let prior = TempDir::new().unwrap();
-        write_resume_origin_meta(prior.path(), &ws, false, None, &darkmux_types::execution_id::ExecutionId::mint());
+        write_resume_origin_meta(prior.path(), &ws, false, None, &darkmux_types::execution_id::ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
         let body: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(resume_origin_path(prior.path())).unwrap(),
         )
@@ -8643,7 +8762,7 @@ S(("127.0.0.1", port), H).serve_forever()
     fn the_tier4_resume_hint_says_to_stop_the_held_dispatch_first() {
         let workspace = TempDir::new().unwrap();
         let prior = TempDir::new().unwrap();
-        write_resume_origin_meta(prior.path(), workspace.path(), false, None, &ExecutionId::mint());
+        write_resume_origin_meta(prior.path(), workspace.path(), false, None, &ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
         let hint = resume_hint_from_origin(prior.path(), "coder");
         assert!(hint.contains("stop this dispatch with Ctrl-C"), "{hint}");
         assert!(hint.contains("holds the execution lock"), "{hint}");
@@ -8665,7 +8784,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let workspace = TempDir::new().unwrap();
         let prior = TempDir::new().unwrap();
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
-        write_resume_origin_meta(prior.path(), workspace.path(), true, None, &darkmux_types::execution_id::ExecutionId::mint());
+        write_resume_origin_meta(prior.path(), workspace.path(), true, None, &darkmux_types::execution_id::ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
 
         let hint = resume_hint_from_origin(prior.path(), "coder");
         let args = parse_hint_args(&hint);
@@ -8694,7 +8813,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let workspace = TempDir::new().unwrap();
         let prior = TempDir::new().unwrap();
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
-        write_resume_origin_meta(prior.path(), workspace.path(), true, None, &darkmux_types::execution_id::ExecutionId::mint());
+        write_resume_origin_meta(prior.path(), workspace.path(), true, None, &darkmux_types::execution_id::ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
 
         // (#2774 round-3 MF2) `expected_workspace` is CANONICALIZED here
         // because that is what production passes — `dispatch()`'s
@@ -8722,7 +8841,7 @@ S(("127.0.0.1", port), H).serve_forever()
         std::fs::create_dir_all(&workspace).unwrap();
         let prior = TempDir::new().unwrap();
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
-        write_resume_origin_meta(prior.path(), &workspace, false, None, &darkmux_types::execution_id::ExecutionId::mint());
+        write_resume_origin_meta(prior.path(), &workspace, false, None, &darkmux_types::execution_id::ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
 
         let hint = resume_hint_from_origin(prior.path(), "coder");
         assert!(hint.contains("'"), "a path with a space must be quoted: {hint}");
@@ -9235,12 +9354,12 @@ S(("127.0.0.1", port), H).serve_forever()
             serde_json::json!({ "url": "https://h.example/v1", "dialect": "chat-completions-max-tokens" }),
         );
         let t = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
-        let (url, dialect) = super::agentic_brain_flags(Some(&t));
+        let (url, dialect) = super::agentic_brain_flags(Some(&t), darkmux_sandbox::BackendKind::Docker);
         assert_eq!(url.as_deref(), Some("https://h.example/v1/chat/completions"));
         assert_eq!(dialect, Some(darkmux_types::Dialect::ChatCompletionsMaxTokens));
-        assert_eq!(super::agentic_brain_flags(None), (None, None));
+        assert_eq!(super::agentic_brain_flags(None, darkmux_sandbox::BackendKind::Docker), (None, None));
         let mut config = base_argv_config();
-        (config.remote_chat_url, config.dialect) = super::agentic_brain_flags(Some(&t));
+        (config.remote_chat_url, config.dialect) = super::agentic_brain_flags(Some(&t), darkmux_sandbox::BackendKind::Docker);
         let argv = build_docker_run_argv(&config);
         assert!(argv.windows(2).any(|w| w[0] == "--dialect" && w[1] == "chat-completions-max-tokens"), "{argv:?}");
     }
@@ -9504,7 +9623,7 @@ S(("127.0.0.1", port), H).serve_forever()
         let url_for = |endpoint: &str| {
             let pm = darkmux_types::ProfileModel::hosted_for_test("m", None, serde_json::json!({ "url": endpoint }));
             let t = crate::target::target_for("p".into(), Default::default(), pm).unwrap();
-            super::agentic_brain_flags(Some(&t)).0.unwrap()
+            super::agentic_brain_flags(Some(&t), darkmux_sandbox::BackendKind::Docker).0.unwrap()
         };
         assert_eq!(url_for("http://127.0.0.1:8080/v1"), "http://host.docker.internal:8080/v1/chat/completions");
         assert_eq!(url_for("http://localhost:8080/v1"), "http://host.docker.internal:8080/v1/chat/completions");
@@ -23742,7 +23861,7 @@ fn an_identifier_taken_remedy_keeps_eject_for_a_darkmux_identifier() {
         fs::create_dir_all(&ws).unwrap();
         let ws_canon = ws.canonicalize().unwrap();
         fs::write(out.join(CHECKPOINT_FILENAME), sample_checkpoint_json_for_role("coder")).unwrap();
-        write_resume_origin_meta(&out, &ws_canon, true, None, &darkmux_types::execution_id::ExecutionId::mint());
+        write_resume_origin_meta(&out, &ws_canon, true, None, &darkmux_types::execution_id::ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
         // The model's forgery, in the place it can write.
         fs::write(
             out.join("resume_origin.json"),
@@ -23787,7 +23906,7 @@ fn an_identifier_taken_remedy_keeps_eject_for_a_darkmux_identifier() {
         let tmp = TempDir::new().unwrap();
         let out = tmp.path().join("out");
         fs::create_dir_all(&out).unwrap();
-        write_resume_origin_meta(&out, tmp.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint());
+        write_resume_origin_meta(&out, tmp.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
         let p = resume_origin_path(&out);
         assert!(p.is_file(), "{}", p.display());
         assert!(!p.starts_with(&out), "{}", p.display());
@@ -23806,7 +23925,7 @@ fn an_identifier_taken_remedy_keeps_eject_for_a_darkmux_identifier() {
         let victim = tmp.path().join("victim.txt");
         fs::write(&victim, "keep me").unwrap();
         std::os::unix::fs::symlink(&victim, resume_origin_path(&out)).unwrap();
-        write_resume_origin_meta(&out, tmp.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint());
+        write_resume_origin_meta(&out, tmp.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
         assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me", "the symlink target must be untouched");
         let meta = fs::symlink_metadata(resume_origin_path(&out)).unwrap();
         assert!(meta.file_type().is_file(), "the record is a regular file, not the symlink");
@@ -23822,7 +23941,7 @@ fn an_identifier_taken_remedy_keeps_eject_for_a_darkmux_identifier() {
         let tmp = TempDir::new().unwrap();
         let out = tmp.path().join("out");
         fs::create_dir_all(&out).unwrap();
-        write_resume_origin_meta(&out, tmp.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint());
+        write_resume_origin_meta(&out, tmp.path(), false, None, &darkmux_types::execution_id::ExecutionId::mint(), Some(darkmux_sandbox::BackendKind::Docker));
         let me = current_euid().unwrap();
         assert!(read_resume_origin_owned_by(&out, Some(me)).is_ok());
         let err = read_resume_origin_owned_by(&out, Some(me.wrapping_add(1))).unwrap_err();
@@ -24876,7 +24995,7 @@ fn a_dispatch_on_the_host_listening_beyond_the_loopback_is_stopped() {
     let seatbelt = |name: &str| darkmux_sandbox::SandboxHandle { backend: darkmux_sandbox::BackendKind::Seatbelt, id: name.into() };
     let wide = Listening::on("0.0.0.0");
     let stop = DispatchStop::new(seatbelt("darkmux-dispatch-b3559-wide"));
-    let watch = watch_dispatch_listeners(&stop.sandbox, wide.child.id(), &stop);
+    let watch = watch_dispatch_listeners(&stop.sandbox, wide.child.id(), &stop, String::new());
     assert!(watch.is_some(), "a sandbox on the host is watched");
     let deadline = Instant::now() + crate::sandbox_listeners::CHECK_EVERY * 5;
     while !stop.is_requested() && Instant::now() < deadline {
@@ -24888,11 +25007,11 @@ fn a_dispatch_on_the_host_listening_beyond_the_loopback_is_stopped() {
 
     let near = Listening::on("127.0.0.1");
     let stop = DispatchStop::new(seatbelt("darkmux-dispatch-b3559-near"));
-    let watch = watch_dispatch_listeners(&stop.sandbox, near.child.id(), &stop);
+    let watch = watch_dispatch_listeners(&stop.sandbox, near.child.id(), &stop, String::new());
     thread::sleep(crate::sandbox_listeners::CHECK_EVERY * 2 + Duration::from_millis(200));
     drop(watch);
     assert_eq!(stop.reason(), None, "a loopback listener stopped the dispatch");
-    assert!(watch_dispatch_listeners(&docker_sandbox("darkmux-dispatch-b3559"), near.child.id(), &stop).is_none(), "a container is not watched");
+    assert!(watch_dispatch_listeners(&docker_sandbox("darkmux-dispatch-b3559"), near.child.id(), &stop, String::new()).is_none(), "a container is not watched");
 }
 
 /// (#3559) `dispatch()` starts the listener watch once the sandbox and its
@@ -24904,7 +25023,7 @@ fn dispatch_watches_its_listeners_from_spawn_to_the_wait() {
     let full = include_str!("dispatch_internal.rs");
     let src = &full[..full.rfind("mod tests;").unwrap()];
     let pos = |needle: &str| src.find(needle).unwrap_or_else(|| panic!("{needle}"));
-    let started = pos("let listener_watch = watch_dispatch_listeners(&launched.sandbox, launched.child.id(), &local_stop);");
+    let started = pos("let listener_watch = watch_dispatch_listeners(&launched.sandbox, launched.child.id(), &local_stop, run.sandbox.way_back_to_docker());");
     assert!(pos("let local_stop = DispatchStop::new(launched.sandbox.clone());") < started);
     assert!(started < pos("let output = match launched.child.wait_with_output() {"));
     let ended = pos("drop(listener_watch);");

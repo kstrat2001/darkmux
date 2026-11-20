@@ -784,6 +784,7 @@ fn the_lab_run_step_grades_records_and_returns_the_verdict() {
         None,
         &loaded(None),
         Ok(None),
+        None,
     )
     .unwrap();
     assert!(untouched.is_none());
@@ -795,6 +796,7 @@ fn the_lab_run_step_grades_records_and_returns_the_verdict() {
         None,
         &loaded(Some(&s)),
         Ok(None),
+        None,
     )
     .unwrap()
     .unwrap();
@@ -865,6 +867,7 @@ fn the_lab_run_step_records_a_fail_when_the_gate_errs() {
         None,
         &loaded,
         Err(anyhow!("boom")),
+        None,
     )
     .unwrap()
     .unwrap();
@@ -899,6 +902,7 @@ fn the_lab_run_step_records_a_fail_when_the_gate_errs() {
         Some(&raw),
         &loaded,
         Ok(None),
+        None,
     )
     .unwrap()
     .unwrap();
@@ -1161,9 +1165,10 @@ fn the_grader_in_a_container_reaches_the_hosts_verdicts() {
     crate::lab::cow_clone::cow_clone_dir(&f, &weak).unwrap();
     write(&weak, "test/b.t", "other=2");
     let contained = Runner {
-        placement: Placement::Container("node:22-bookworm-slim".into()),
+        placement: Placement::Container("node:22-bookworm-slim".into(), darkmux_sandbox::BackendKind::Docker),
         user: None,
         sandbox: Some(darkmux_sandbox::BackendKind::Docker),
+        read: None,
     };
     for (result, passed) in [(&good, true), (&weak, false)] {
         let mut verdicts = vec![];

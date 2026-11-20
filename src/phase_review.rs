@@ -359,6 +359,7 @@ fn review_dispatch_opts(prompt: String, session_id: &SessionId) -> crate::crew::
         force_container: false,
         max_completion_tokens: None,
         image: None,
+        sandbox: None,
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,

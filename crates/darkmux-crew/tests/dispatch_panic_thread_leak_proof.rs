@@ -273,6 +273,7 @@ fn dispatch_panic_mid_run_leaves_no_tailer_sampler_watchdog_thread() {
         force_container: false,
         max_completion_tokens: None,
         image: None,
+        sandbox: None,
         // (mirrors mock_dispatch_proof.rs) Routes past the host-side
         // compactor-residency block entirely, so the only `lms` call this
         // dispatch can possibly make is the sampler's own periodic

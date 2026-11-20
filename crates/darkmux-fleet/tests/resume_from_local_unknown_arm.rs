@@ -69,6 +69,7 @@ fn opts_for(role_id: &str) -> DispatchOpts {
         force_container: false,
         max_completion_tokens: None,
         image: None,
+        sandbox: None,
         model_base_url_override: None,
         step_id: None,
         system_prompt_override: None,

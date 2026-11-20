@@ -858,6 +858,7 @@ impl StepKind for MissionCoderStepKind {
             force_container: false,
             max_completion_tokens: None,
             image,
+            sandbox: None,
             model_base_url_override: None,
             // (#1483) Stamp the graph step id so the live trajectory tailer
             // can attribute this AGENTIC seat's per-turn / per-tool /

@@ -85,7 +85,6 @@ fn resolved(cfg: &DarkmuxConfig) -> Vec<(&'static str, String)> {
         check_updates,
         feedback_injection,
         turn_delay_ms,
-        tests_on_host,
         sandbox_memory,
         sandbox_memory_problem,
         container_user_override,
@@ -96,7 +95,6 @@ fn resolved(cfg: &DarkmuxConfig) -> Vec<(&'static str, String)> {
         thermal_enabled,
         detection_degeneracy_policy,
         memory_pressure_gate,
-        sandbox,
         sandbox_default,
         thermal_pause_at,
         thermal_resume_at,
@@ -129,6 +127,9 @@ fn resolved(cfg: &DarkmuxConfig) -> Vec<(&'static str, String)> {
         skills_override_dirs,
         resolved_locations
     );
+    // Read only with its tier outside the types crate; the value is what
+    // `init` must complete. (`runtime.sandbox` is an enum setting, below.)
+    out.push(("tests_on_host", format!("{:?}", access::tests_on_host_with_source().0)));
     for setting in darkmux_types::config_enum::ENUM_SETTINGS
         .iter()
         .filter(|s| !s.is_per_item())

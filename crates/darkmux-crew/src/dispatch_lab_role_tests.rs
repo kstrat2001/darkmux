@@ -138,6 +138,7 @@ fn probe_opts() -> DispatchOpts {
         force_container: false,
         max_completion_tokens: None,
         image: None,
+        sandbox: None,
         model_base_url_override: None,
         step_id: None,
         system_prompt_override: None,
@@ -195,7 +196,7 @@ fn a_lab_dispatch_sends_the_evals_role_not_a_stale_copy_in_the_home_folder() {
     assert!(prompt.contains("PINNED-EVAL-PROMPT"), "the eval's role reaches the model: {prompt}");
     assert!(!prompt.contains("STALE-HOME-PROMPT"), "the home folder's copy never does: {prompt}");
 
-    let (_, _, _, prov) = container_role(&opts(&home, ROLE, lab), false, &[]).unwrap();
+    let (_, _, _, prov) = container_role(&opts(&home, ROLE, lab), false, &[], darkmux_sandbox::BackendKind::Docker).unwrap();
     let role = prov.role.expect("a lab dispatch records its role");
     assert_eq!(role.id, ROLE);
     assert_eq!(role.source, RoleInputSource::Eval);
@@ -271,7 +272,7 @@ fn writes_into_the_sandbox_after_the_role_is_read_cannot_change_the_prompt() {
         assert!(prompt.contains("PINNED-EVAL-PROMPT") && !prompt.contains("REPLACED-BY-SETUP"), "{key}: {prompt}");
         let mut o = opts(&home, ROLE, Some(lab.clone()));
         o.workdir = Some(sandbox.path().to_path_buf());
-        let (_, _, _, prov) = container_role(&o, false, &[]).unwrap();
+        let (_, _, _, prov) = container_role(&o, false, &[], darkmux_sandbox::BackendKind::Docker).unwrap();
         assert_eq!(prov.role.unwrap().md_sha256, darkmux_flow::sha256_hex(PINNED_EVAL_MD.as_bytes()), "{key}");
     }
 }
@@ -325,7 +326,7 @@ fn a_builtin_lab_dispatch_leaves_out_identity_and_every_home_override() {
     assert!(!prompt.contains(HOME_PREAMBLE), "no preamble override: {prompt}");
     assert!(!prompt.contains("STALE-HOME-PROMPT"), "no home role override: {prompt}");
 
-    let (_, _, _, prov) = container_role(&opts(&home, "coder", Some(LabInputs::Builtin)), false, &[]).unwrap();
+    let (_, _, _, prov) = container_role(&opts(&home, "coder", Some(LabInputs::Builtin)), false, &[], darkmux_sandbox::BackendKind::Docker).unwrap();
     assert_eq!(prov.additions, darkmux_flow::payload::PromptAdditions::default(), "every addition off");
     assert_eq!(prov.role.expect("recorded").source, RoleInputSource::Builtin);
 }
@@ -346,12 +347,12 @@ fn a_lab_dispatch_gets_no_workspace_note() {
     }];
     let mut o = opts(&home, "coder", Some(LabInputs::Builtin));
     o.workdir = Some(workdir.path().to_path_buf());
-    let (_, prompt, _, prov) = container_role(&o, false, &split).unwrap();
+    let (_, prompt, _, prov) = container_role(&o, false, &split, darkmux_sandbox::BackendKind::Docker).unwrap();
     assert!(!prompt.contains("<workspace-note>"), "{prompt}");
     assert!(!prov.additions.workspace_notes);
 
     o.lab_inputs = None;
-    let (_, prompt, _, prov) = container_role(&o, false, &split).unwrap();
+    let (_, prompt, _, prov) = container_role(&o, false, &split, darkmux_sandbox::BackendKind::Docker).unwrap();
     assert!(prompt.contains("<workspace-note>"), "a non-lab dispatch still gets it: {prompt}");
     assert!(prov.additions.workspace_notes, "and records it");
 }
@@ -372,7 +373,7 @@ fn a_non_lab_dispatch_still_gets_identity_and_the_home_overrides() {
         "byte for byte what a non-lab dispatch assembled before #3363"
     );
 
-    let (_, _, _, prov) = container_role(&opts(&home, ROLE, None), false, &[]).unwrap();
+    let (_, _, _, prov) = container_role(&opts(&home, ROLE, None), false, &[], darkmux_sandbox::BackendKind::Docker).unwrap();
     assert!(prov.additions.identity && prov.additions.role_override && prov.additions.preamble_override);
     assert!(!prov.additions.workspace_notes);
     assert_eq!(prov.role, None, "only a lab dispatch records the role block");
@@ -463,7 +464,7 @@ fn a_utility_eval_role_gets_no_preamble_and_records_a_null_hash() {
     let _env = env_for(&home);
 
     let o = opts(&home, ROLE, Some(eval_inputs(&eval)));
-    let (_, prompt, _, prov) = container_role(&o, false, &[]).unwrap();
+    let (_, prompt, _, prov) = container_role(&o, false, &[], darkmux_sandbox::BackendKind::Docker).unwrap();
     assert_eq!(prompt, PINNED_EVAL_MD, "the eval's prompt alone, byte for byte");
     let role = prov.role.clone().expect("recorded");
     assert_eq!(role.preamble_sha256, None);
@@ -484,7 +485,7 @@ fn the_container_start_payload_carries_the_hash_beside_system_chars() {
     let eval = eval_with_role(PINNED_EVAL_MD);
     let _env = env_for(&home);
     let o = opts(&home, ROLE, Some(eval_inputs(&eval)));
-    let (_, prompt, _, prov) = container_role(&o, false, &[]).unwrap();
+    let (_, prompt, _, prov) = container_role(&o, false, &[], darkmux_sandbox::BackendKind::Docker).unwrap();
     let payload =
         dispatch_start_payload("img", "msg", &prompt, std::path::Path::new("/ws"), false, None, None, None, &[], &prov)
             .unwrap();
@@ -628,7 +629,7 @@ fn a_legacy_eval_with_no_roles_runs_the_builtin_role_and_records_builtin() {
     let prompt = prompt.expect("dispatch() assembled a system prompt");
     assert!(prompt.contains(builtin_md("coder").trim_end()), "the compiled-in coder prompt");
     assert!(!prompt.contains("STALE-HOME-PROMPT"), "never the home folder's copy: {prompt}");
-    let (_, _, _, prov) = container_role(&opts(&home, "coder", Some(lab)), false, &[]).unwrap();
+    let (_, _, _, prov) = container_role(&opts(&home, "coder", Some(lab)), false, &[], darkmux_sandbox::BackendKind::Docker).unwrap();
     let role = prov.role.expect("recorded");
     assert_eq!(role.source, RoleInputSource::Builtin);
     assert_eq!(role.md_sha256, darkmux_flow::sha256_hex(builtin_md("coder").as_bytes()));
@@ -649,7 +650,7 @@ fn a_legacy_eval_with_root_roles_uses_them_and_records_legacy_root() {
     let (prompt, _) = dispatched_prompt(opts(&home, ROLE, Some(lab.clone())));
     let prompt = prompt.expect("dispatch() assembled a system prompt");
     assert!(prompt.contains("PINNED-EVAL-PROMPT") && !prompt.contains("STALE-HOME-PROMPT"), "{prompt}");
-    let (_, prompt, _, prov) = container_role(&opts(&home, ROLE, Some(lab)), false, &[]).unwrap();
+    let (_, prompt, _, prov) = container_role(&opts(&home, ROLE, Some(lab)), false, &[], darkmux_sandbox::BackendKind::Docker).unwrap();
     let role = prov.role.clone().expect("recorded");
     assert_eq!(role.source, RoleInputSource::LegacyRoot);
     assert_eq!(role.md_sha256, darkmux_flow::sha256_hex(PINNED_EVAL_MD.as_bytes()));

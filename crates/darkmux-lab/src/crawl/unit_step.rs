@@ -903,6 +903,10 @@ struct UnitContext {
     /// in a container, the tree's own path in a sandbox on the host. Every
     /// path the brief lists starts here, and findings map back from it.
     tree_seen: String,
+    /// The one read of `runtime.sandbox` `tree_seen` was written for, handed
+    /// to the dispatch (`DispatchOpts::sandbox`) so it runs where the
+    /// message says.
+    sandbox: Result<darkmux_sandbox::Selection, String>,
 }
 
 /// Resolve one unit out of an already-loaded plan: its source's sha and
@@ -962,6 +966,8 @@ fn unit_context(the_plan: &Plan, unit: &Unit, run: &RunId, role_id: &str, rule_s
             );
         }
     }
+    // The unit's one read of `runtime.sandbox`: its paths and its dispatch.
+    let sandbox = darkmux_sandbox::selection();
     Ok(UnitContext {
         workspace: the_plan.workspace.clone(),
         unit_id: unit.id().to_string(),
@@ -970,8 +976,9 @@ fn unit_context(the_plan: &Plan, unit: &Unit, run: &RunId, role_id: &str, rule_s
         rule_ids: unit_rules(unit),
         sites: planned_sites(unit),
         session_id: SessionId::adhoc(run.clone(), role_id, format!("{rule_segment}-{}", unit.id())),
-        tree_seen: darkmux_sandbox::seen_at_configured(&tree_root, CONTAINER_TREE_ROOT),
+        tree_seen: darkmux_sandbox::seen_at(sandbox.as_ref().ok().map(|s| s.kind), &tree_root, CONTAINER_TREE_ROOT),
         tree_root,
+        sandbox,
     })
 }
 
@@ -1449,6 +1456,7 @@ impl StepKind for DispatchUnitStepKind {
                 force_container: false,
                 max_completion_tokens: None,
                 image: None,
+                sandbox: Some(ctx.sandbox.clone()),
                 model_base_url_override: None,
                 step_id: Some(step.id.clone()),
                 system_prompt_override: None,

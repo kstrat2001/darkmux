@@ -1440,7 +1440,7 @@ fn read_preview_sandbox() -> Result<darkmux_sandbox::BackendKind, String> {
 
 /// [`read_preview_sandbox`] against the config at `path`.
 pub(crate) fn read_preview_sandbox_at(path: &Path) -> Result<darkmux_sandbox::BackendKind, String> {
-    darkmux_sandbox::selected_in(&read_config_at(path)?)
+    darkmux_sandbox::selection_in(&read_config_at(path)?).map(|s| s.kind)
 }
 
 /// [`read_preview_enabled`] against the config at `path`.

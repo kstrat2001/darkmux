@@ -197,7 +197,7 @@ pub(crate) fn workdir_git_read_only_mount(git_dir: Option<&Path>) -> Option<Moun
 
 /// One checkout whose `.git` points outside the workdir, as the
 /// `dispatch.workdir_git_unavailable` record names it.
-fn git_checkout(workdir: &Path, found: &darkmux_types::workdir::SplitGitdir) -> GitCheckout {
+fn git_checkout(workdir: &Path, found: &darkmux_types::workdir::SplitGitdir, kind: darkmux_sandbox::BackendKind) -> GitCheckout {
     GitCheckout {
         checkout: found.checkout.display().to_string(),
         gitdir_target: found.target.display().to_string(),
@@ -207,22 +207,16 @@ fn git_checkout(workdir: &Path, found: &darkmux_types::workdir::SplitGitdir) -> 
             darkmux_types::workdir::GitdirPointerKind::Separate => GitdirKind::Separate,
         },
         superproject: found.superproject.as_ref().map(|p| p.display().to_string()),
-        container_path: container_path_for(workdir, &found.checkout),
+        container_path: seen_path_for(Some(kind), workdir, &found.checkout),
     }
 }
 
-/// (#2294) The container path a split-gitdir checkout is mounted at, so
-/// both the operator warning and the model-facing note name a path the
-/// reader can actually see. `volume_mounts` above mounts the
-/// workdir at `/workspace`, so a checkout AT the workdir is `/workspace`
-/// and one one level under it is `/workspace/<child>`.
-pub(crate) fn container_path_for(workdir: &Path, checkout: &Path) -> String {
-    seen_path_for(darkmux_sandbox::selected().ok(), workdir, checkout)
-}
-
-/// (#3112 review) [`container_path_for`] under `kind`: beneath where the
-/// sandbox sees the workdir (`/workspace` in a container, the workdir's own
-/// host path in a sandbox on the host).
+/// (#2294, #3112 review) The path a split-gitdir checkout is seen at in a
+/// `kind` sandbox, so both the operator warning and the model-facing note
+/// name a path the reader can actually see: beneath where the sandbox sees
+/// the workdir (`/workspace` in a container, so a checkout AT the workdir
+/// is `/workspace` and one level under it `/workspace/<child>`; the
+/// workdir's own host path in a sandbox on the host).
 pub(crate) fn seen_path_for(kind: Option<darkmux_sandbox::BackendKind>, workdir: &Path, checkout: &Path) -> String {
     let root = darkmux_sandbox::seen_at(kind, workdir, "/workspace");
     match checkout.strip_prefix(workdir) {
@@ -303,6 +297,7 @@ fn split_gitdir_kind_label(kind: darkmux_types::workdir::GitdirPointerKind) -> &
 pub(crate) fn split_gitdir_warning(
     workdir: &Path,
     found: &[darkmux_types::workdir::SplitGitdir],
+    kind: darkmux_sandbox::BackendKind,
 ) -> String {
     match found {
         [] => String::new(),
@@ -326,7 +321,7 @@ pub(crate) fn split_gitdir_warning(
                 where_it_is,
                 split_gitdir_kind_label(one.kind),
                 one.target.display(),
-                container_path_for(workdir, &one.checkout),
+                seen_path_for(Some(kind), workdir, &one.checkout),
                 split_gitdir_remedy(one),
             )
         }
@@ -349,7 +344,7 @@ pub(crate) fn split_gitdir_warning(
                     f.checkout.display(),
                     split_gitdir_kind_label(f.kind),
                     f.target.display(),
-                    container_path_for(workdir, &f.checkout),
+                    seen_path_for(Some(kind), workdir, &f.checkout),
                     split_gitdir_remedy(f),
                 ));
             }
@@ -389,12 +384,13 @@ pub(crate) fn with_workspace_notes(
     system_prompt: String,
     workdir: Option<&Path>,
     found: &[darkmux_types::workdir::SplitGitdir],
+    kind: darkmux_sandbox::BackendKind,
 ) -> String {
     match workdir {
         Some(workdir) if !found.is_empty() => {
             let paths: Vec<String> = found
                 .iter()
-                .map(|f| container_path_for(workdir, &f.checkout))
+                .map(|f| seen_path_for(Some(kind), workdir, &f.checkout))
                 .collect();
             format!(
                 "{}\n\n{}",
@@ -1192,6 +1188,7 @@ pub(crate) fn write_resume_origin_meta(
     workspace_read_only: bool,
     image: Option<&str>,
     execution: &ExecutionId,
+    sandbox: Option<darkmux_sandbox::BackendKind>,
 ) {
     let recorded_workspace =
         workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
@@ -1202,7 +1199,7 @@ pub(crate) fn write_resume_origin_meta(
         "image": image,
         // (#3112, resume origin 1.1) The sandbox this dispatch runs in, so a
         // resume in another one is refused (`resume_sandbox_matches`).
-        "sandbox": darkmux_sandbox::selected().ok().map(darkmux_sandbox::setting_value),
+        "sandbox": sandbox.map(darkmux_sandbox::setting_value),
         "execution_id": execution,
     });
     let path = resume_origin_path(host_out);
@@ -1329,9 +1326,10 @@ fn stamp_own_execution(
     host_out: &Path,
     workspace: (&Path, bool, Option<&str>),
     execution: &ExecutionId,
+    kind: darkmux_sandbox::BackendKind,
 ) -> Result<()> {
     let (path, read_only, image) = workspace;
-    write_resume_origin_meta(host_out, path, read_only, image, execution);
+    write_resume_origin_meta(host_out, path, read_only, image, execution, Some(kind));
     hold_own_execution_lock(lock, host_out)
 }
 
@@ -1529,12 +1527,16 @@ fn resume_origin_completed(out_dir: &Path) -> bool {
 /// it runs on ([`resume_effective_image`], refusing a different `--image`) and
 /// the origin's execution lock ([`claim_resume_origin`]). A dispatch that is
 /// not a resume keeps its own `--image` and takes no origin lock.
-fn resume_preflight(resume_from: Option<&Path>, image: Option<&str>) -> Result<(Option<String>, ExecutionLock)> {
+fn resume_preflight(
+    resume_from: Option<&Path>,
+    image: Option<&str>,
+    kind: darkmux_sandbox::BackendKind,
+) -> Result<(Option<String>, ExecutionLock)> {
     let Some(resume_from) = resume_from else {
         return Ok((image.map(str::to_string), ExecutionLock { _guards: Vec::new() }));
     };
     let image = resume_effective_image(resume_from, image).context("darkmux dispatch --resume-from")?;
-    resume_sandbox_matches(resume_from, darkmux_sandbox::selected().ok()).context("darkmux dispatch --resume-from")?;
+    resume_sandbox_matches(resume_from, Some(kind)).context("darkmux dispatch --resume-from")?;
     let lock = claim_resume_origin(resume_from).context("darkmux dispatch --resume-from")?;
     Ok((image, lock))
 }
@@ -3174,7 +3176,10 @@ fn runtime_endpoint_and_shape_args(config: &DockerRunConfig) -> Vec<String> {
 /// Before #2904 the flag was emitted only for the override, so an operator
 /// on a non-default port had it honored by single-shot calls but not by
 /// agentic dispatches, which kept dialing the runtime's `:1234` default.
-pub(crate) fn container_lmstudio_base_url(override_url: Option<&str>) -> Option<String> {
+pub(crate) fn container_lmstudio_base_url(
+    override_url: Option<&str>,
+    kind: darkmux_sandbox::BackendKind,
+) -> Option<String> {
     if let Some(url) = override_url {
         return Some(url.to_string());
     }
@@ -3188,7 +3193,7 @@ pub(crate) fn container_lmstudio_base_url(override_url: Option<&str>) -> Option<
         return None;
     }
     let base = darkmux_types::endpoint::lmstudio_v1_base(&configured);
-    Some(url_for_sandbox(&base))
+    Some(url_for(&base, kind))
 }
 
 /// (#2902) The `--dialect` the container gets for a target: only a declared
@@ -3210,26 +3215,19 @@ pub(crate) fn container_dialect_flag(t: &crate::target::Target) -> Option<darkmu
 /// recorded address stays the one the operator wrote.
 pub(crate) fn agentic_brain_flags(
     agentic: Option<&crate::target::Target>,
+    kind: darkmux_sandbox::BackendKind,
 ) -> (Option<String>, Option<darkmux_types::Dialect>) {
     match agentic {
-        Some(t) => (Some(url_for_sandbox(&t.chat_url)), container_dialect_flag(t)),
+        Some(t) => (Some(url_for(&t.chat_url, kind)), container_dialect_flag(t)),
         None => (None, None),
     }
 }
 
-/// (#3112 step 2) `url` as the sandbox dials it: unchanged under a backend
-/// whose sandbox shares this host's loopback (Seatbelt and Landlock run on
-/// the host itself), else [`loopback_to_docker_host`].
-fn url_for_sandbox(url: &str) -> String {
-    // A refused selection refuses the dispatch before any sandbox starts
-    // (`resolve_runtime_image`), so this URL is then never dialed: it is
-    // left as written.
-    match darkmux_sandbox::selected() {
-        Ok(kind) => url_for(url, kind),
-        Err(_) => url.to_string(),
-    }
-}
-
+/// (#3112 step 2) `url` as a `kind` sandbox dials it: unchanged under a
+/// backend whose sandbox shares this host's loopback (Seatbelt and Landlock
+/// run on the host itself), else [`loopback_to_docker_host`]. `kind` is the
+/// backend the dispatch resolved and launches (`RuntimeImage::kind`), never
+/// `runtime.sandbox` read again.
 fn url_for(url: &str, kind: darkmux_sandbox::BackendKind) -> String {
     if kind.on_host() {
         url.to_string()
@@ -5787,13 +5785,15 @@ impl DispatchStop {
 /// the address and port, as any stop scoped to a dispatch does. `leader` is
 /// the process the backend's command started (its launcher, which leads
 /// the sandbox's process group). `None` for a container.
+/// `way_back` is the dispatch's own way back to Docker, from its one read.
 fn watch_dispatch_listeners(
     sandbox: &darkmux_sandbox::SandboxHandle,
     leader: u32,
     local_stop: &DispatchStop,
+    way_back: String,
 ) -> Option<crate::sandbox_listeners::ListenerWatch> {
     let stop = local_stop.clone();
-    crate::sandbox_listeners::watch(sandbox, leader, "a dispatch", move |why| stop.request(why))
+    crate::sandbox_listeners::watch(sandbox, leader, "a dispatch", way_back, move |why| stop.request(why))
 }
 
 /// The terminal record's payload and level for a container dispatch: a clean
@@ -7233,6 +7233,35 @@ struct ContainerRun {
     /// written (a first use fetches it, recorded on the run's session);
     /// empty in a container.
     toolchain: darkmux_sandbox::toolchain::Toolchain,
+    /// The dispatch's one read of `runtime.sandbox` ([`dispatch_sandbox`]),
+    /// for every message after the launch (the listener watch's way back).
+    sandbox: darkmux_sandbox::Selection,
+}
+
+/// The one read of `runtime.sandbox` for a container dispatch: the read
+/// the caller already made and rendered the message for
+/// (`DispatchOpts::sandbox`, a refusal included), else the setting now.
+/// Everything after it (the resume check, the origin stamp, the prompt, the
+/// runtime image and its Docker remedies, the model URLs, the launch) takes
+/// this value, so they agree by construction. Within one process every read
+/// returns the same value today (`config.json` is cached once per process,
+/// and nothing in darkmux sets `DARKMUX_SANDBOX`), so this is not a race
+/// fix: it keeps the agreement from resting on that cache. A setting that
+/// names no backend this host can run refuses the dispatch here (contract 9).
+fn dispatch_sandbox(opts: &DispatchOpts) -> Result<darkmux_sandbox::Selection> {
+    match &opts.sandbox {
+        Some(read) => read.clone().map_err(|why| anyhow!(why)),
+        None => darkmux_sandbox::selection().map_err(|why| anyhow!(why)),
+    }
+}
+
+/// The dispatch's sandbox ([`dispatch_sandbox`]), then, for a resume, the
+/// image it runs on and its origin's lock, checked against that sandbox
+/// ([`resume_preflight`]).
+fn sandbox_and_resume(opts: &DispatchOpts) -> Result<(darkmux_sandbox::Selection, Option<String>, ExecutionLock)> {
+    let sandbox = dispatch_sandbox(opts)?;
+    let (image_arg, lock) = resume_preflight(opts.resume_from.as_deref(), opts.image.as_deref(), sandbox.kind)?;
+    Ok((sandbox, image_arg, lock))
 }
 
 /// The container path up to its `dispatch.start`: the resume preflight and
@@ -7251,13 +7280,18 @@ fn prepare_container_run(
     // budget gate: a resume that is going to be refused must not first sit in
     // a `wait` on the endpoint's window, behind the very run it collides with.
     // The lock is held, with this dispatch's own, until the run returns.
-    let (image_arg, mut execution_lock) = resume_preflight(opts.resume_from.as_deref(), opts.image.as_deref())?;
+    let (sandbox, image_arg, mut execution_lock) = sandbox_and_resume(opts)?;
+    let kind = sandbox.kind;
     admit_container_start(opts, execution, brain.limits_pm())?;
-    let workdir_split_gitdirs = warn_split_gitdirs(opts);
+    let workdir_split_gitdirs = warn_split_gitdirs(opts, kind);
     warn_writable_git_dir(opts);
-    let image = resolve_runtime_image(image_arg.as_deref(), opts.skip_preflight)?;
-    let (role, system_prompt, allowed_tools, provenance) =
-        container_role(opts, brain.agentic_pm.as_ref().is_some_and(brain_leaves_this_machine), &workdir_split_gitdirs)?;
+    let image = resolve_runtime_image(image_arg.as_deref(), opts.skip_preflight, sandbox)?;
+    let (role, system_prompt, allowed_tools, provenance) = container_role(
+        opts,
+        brain.agentic_pm.as_ref().is_some_and(brain_leaves_this_machine),
+        &workdir_split_gitdirs,
+        kind,
+    )?;
     let workspace_plan = plan_workspace(opts, unix_micros)?;
     // (#3574) Where the hosted brain sends, decided before anything names it.
     let (brain, own_route, remote_auth) = container_brain_route(opts, brain)?;
@@ -7266,13 +7300,13 @@ fn prepare_container_run(
     let (lease, leased_job) = lease_lmstudio_job(opts, &brain, &model)?;
     // The run's own lease holds the job model now.
     drop(preflight_hold);
-    record_split_gitdirs(opts, execution, &model, &workdir_split_gitdirs);
+    record_split_gitdirs(opts, execution, &model, &workdir_split_gitdirs, kind);
     let (workspace, workspace_cleanup, host_out) = materialize_dirs(
         opts,
         unix_micros,
         workspace_plan,
         &mut execution_lock,
-        image_arg.as_deref(),
+        (image_arg.as_deref(), kind),
         execution,
     )?;
     let system_prompt = run_system_prompt(system_prompt, &image, &workspace);
@@ -7296,6 +7330,7 @@ fn prepare_container_run(
         lease,
         leased_job,
         toolchain: Default::default(),
+        sandbox,
     })
 }
 
@@ -7413,7 +7448,7 @@ fn lease_lmstudio_job(
 ///      ([`record_split_gitdirs`]), so the run record answers "why did this
 ///      run spend eight turns on git?" later. Record exhaustively, display
 ///      selectively.
-fn warn_split_gitdirs(opts: &DispatchOpts) -> Vec<darkmux_types::workdir::SplitGitdir> {
+fn warn_split_gitdirs(opts: &DispatchOpts, kind: darkmux_sandbox::BackendKind) -> Vec<darkmux_types::workdir::SplitGitdir> {
     let workdir_split_gitdirs = opts
         .workdir
         .as_deref()
@@ -7423,7 +7458,7 @@ fn warn_split_gitdirs(opts: &DispatchOpts) -> Vec<darkmux_types::workdir::SplitG
         if !workdir_split_gitdirs.is_empty() {
             // Once per process for an identical message — a crawl grows one
             // task per unit against the same tree root; see the sink's doc.
-            emit_preflight_warning_once(&split_gitdir_warning(workdir, &workdir_split_gitdirs));
+            emit_preflight_warning_once(&split_gitdir_warning(workdir, &workdir_split_gitdirs, kind));
         }
     }
     workdir_split_gitdirs
@@ -7575,8 +7610,9 @@ struct RuntimeImage {
     /// `None` under Docker.
     host_runtime: Option<HostRuntime>,
     /// The backend this image was resolved for: the one that launches the
-    /// dispatch ([`run_backend`]) and whose workspace path the system prompt
-    /// names ([`run_system_prompt`]), read once.
+    /// dispatch ([`run_backend`]), whose workspace path the system prompt
+    /// names ([`run_system_prompt`]) and whose network the model URLs it is
+    /// handed are written for, read once.
     kind: darkmux_sandbox::BackendKind,
 }
 
@@ -7738,13 +7774,17 @@ pub(crate) fn dispatch_toolchain(
 /// the setting that chose it and the way back: `--image` (such a sandbox
 /// runs this host's own programs and has no image), and any runtime this
 /// process cannot run.
+///
+/// `way_back` is the selection's own way back to Docker
+/// ([`darkmux_sandbox::Selection::way_back_to_docker`]), from the read the
+/// caller made.
 fn host_runtime_for(
     kind: darkmux_sandbox::BackendKind,
     image_arg: Option<&str>,
     override_program: Option<std::ffi::OsString>,
     at_start: &ExecutableAtStart,
+    way_back: String,
 ) -> Result<HostRuntime> {
-    let way_back = darkmux_sandbox::way_back_to_docker(kind);
     if let Some(image) = image_arg {
         bail!("--image {image}: the `{}` sandbox runs this machine's own programs, not an image. {way_back}", darkmux_sandbox::setting_value(kind));
     }
@@ -7755,9 +7795,12 @@ fn host_runtime_for(
 /// run, as `darkmux doctor` checks it: the same choice and identity check a
 /// dispatch makes ([`host_runtime`]), `Ok` naming the program, `Err` the
 /// refusal.
-pub fn host_runtime_status(kind: darkmux_sandbox::BackendKind) -> std::result::Result<String, String> {
+///
+/// `way_back` is the caller's way back to Docker, from its own read of the
+/// setting ([`darkmux_sandbox::way_back_to_docker_given`]).
+pub fn host_runtime_status(kind: darkmux_sandbox::BackendKind, way_back: String) -> std::result::Result<String, String> {
     let at_start = EXECUTABLE_AT_START.get_or_init(|| executable_at_start(std::env::current_exe()));
-    host_runtime_for(kind, None, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start)
+    host_runtime_for(kind, None, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start, way_back)
         .map(|r| std::iter::once(r.program.display().to_string()).chain(r.leading_args).collect::<Vec<_>>().join(" "))
         .map_err(|e| format!("{e:#}"))
 }
@@ -7765,9 +7808,10 @@ pub fn host_runtime_status(kind: darkmux_sandbox::BackendKind) -> std::result::R
 /// (#3112 step 2) What a dispatch on `kind`, a sandbox on the host, runs in
 /// place of an image: the [`host_runtime`]. No image is checked or pulled,
 /// and `--image` is refused: there is no image to name.
-fn host_runtime_image(kind: darkmux_sandbox::BackendKind, image_arg: Option<&str>) -> Result<RuntimeImage> {
+fn host_runtime_image(sandbox: darkmux_sandbox::Selection, image_arg: Option<&str>) -> Result<RuntimeImage> {
+    let kind = sandbox.kind;
     let at_start = EXECUTABLE_AT_START.get_or_init(|| executable_at_start(std::env::current_exe()));
-    let runtime = host_runtime_for(kind, image_arg, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start)?;
+    let runtime = host_runtime_for(kind, image_arg, std::env::var_os(SANDBOX_RUNTIME_ENV), at_start, sandbox.way_back_to_docker())?;
     let sandbox = darkmux_sandbox::setting_value(kind);
     let shown = std::iter::once(runtime.program.display().to_string()).chain(runtime.leading_args.iter().cloned()).collect::<Vec<_>>().join(" ");
     darkmux_types::diag_eprintln!("darkmux dispatch: runtime=internal, sandbox={sandbox}, runtime: {shown}");
@@ -7782,11 +7826,10 @@ fn host_runtime_image(kind: darkmux_sandbox::BackendKind, image_arg: Option<&str
 }
 
 /// Resolve and check the runtime image, then say which one runs.
-fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool) -> Result<RuntimeImage> {
-    // (#3112 step 2) A refused backend setting refuses the dispatch (contract 9).
-    let kind = darkmux_sandbox::selected().map_err(|why| anyhow!(why))?;
+fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool, sandbox: darkmux_sandbox::Selection) -> Result<RuntimeImage> {
+    let kind = sandbox.kind;
     if kind.on_host() {
-        return host_runtime_image(kind, image_arg);
+        return host_runtime_image(sandbox, image_arg);
     }
     // (#703) `inject` is true only when the operator named a NON-darkmux image
     // (e.g. `rust:slim`) — then darkmux's static runtime binary is injected
@@ -7817,7 +7860,7 @@ fn resolve_runtime_image(image_arg: Option<&str>, skip_preflight: bool) -> Resul
     let darkmux_image = if skip_preflight {
         ensure_darkmux_image_present(explicit_darkmux_image)?
     } else {
-        check_docker_preflight(explicit_darkmux_image)?
+        check_docker_preflight(explicit_darkmux_image, sandbox.docker_remedy())?
     };
 
     // The image we actually run: the operator's `--image` if given (injected),
@@ -7850,11 +7893,12 @@ fn container_role(
     opts: &DispatchOpts,
     leaves_this_machine: bool,
     workdir_split_gitdirs: &[darkmux_types::workdir::SplitGitdir],
+    kind: darkmux_sandbox::BackendKind,
 ) -> Result<(crate::types::Role, String, Option<Vec<String>>, crate::role_inputs::PromptProvenance)> {
     let resolved =
         crate::role_inputs::resolve_role(opts)?.ok_or_else(|| anyhow!("role not found: {}", opts.role_id))?;
     let (system_prompt, provenance) =
-        container_system_prompt(&resolved, opts, leaves_this_machine, workdir_split_gitdirs)?;
+        container_system_prompt(&resolved, opts, leaves_this_machine, (workdir_split_gitdirs, kind))?;
     let role = resolved.role;
     warn_unknown_role_vocab(&role, &opts.role_id);
     // Compute the runtime tool catalog from the role's tool_palette
@@ -7876,7 +7920,7 @@ fn container_system_prompt(
     resolved: &crate::role_inputs::ResolvedRole,
     opts: &DispatchOpts,
     leaves_this_machine: bool,
-    workdir_split_gitdirs: &[darkmux_types::workdir::SplitGitdir],
+    split_gitdirs: (&[darkmux_types::workdir::SplitGitdir], darkmux_sandbox::BackendKind),
 ) -> Result<(String, crate::role_inputs::PromptProvenance)> {
     // (#1550 cluster item 3) See the hosted-dispatch call site's comment —
     // `load_role_prompt_for` honors an explicit `role.prompt_path` first.
@@ -7908,7 +7952,7 @@ fn container_system_prompt(
     let system_prompt = resolved.with_workspace_notes(
         system_prompt,
         opts.workdir.as_deref(),
-        workdir_split_gitdirs,
+        split_gitdirs,
         &mut provenance,
     );
     // (#2294) A no-op in production; in tests this is the seam
@@ -8102,12 +8146,13 @@ fn record_split_gitdirs(
     execution: &ExecutionId,
     model: &str,
     workdir_split_gitdirs: &[darkmux_types::workdir::SplitGitdir],
+    kind: darkmux_sandbox::BackendKind,
 ) {
     // 3. The session is the caller's (`opts.session`): it names this
     // dispatch's run, so every record carries that run with no lookup.
     if let Some(workdir) = opts.workdir.as_deref() {
         if !workdir_split_gitdirs.is_empty() {
-            let checkouts: Vec<GitCheckout> = workdir_split_gitdirs.iter().map(|found| git_checkout(workdir, found)).collect();
+            let checkouts: Vec<GitCheckout> = workdir_split_gitdirs.iter().map(|found| git_checkout(workdir, found, kind)).collect();
             // Dotted, matching this crate's current record vocabulary.
             // The dispatch-liveness bookends are the only records in
             // `darkmux-crew` a consumer keys on by spelling; a new record
@@ -8198,9 +8243,10 @@ fn materialize_dirs(
     unix_micros: u128,
     workspace_plan: WorkspacePlan,
     execution_lock: &mut ExecutionLock,
-    image_arg: Option<&str>,
+    image: (Option<&str>, darkmux_sandbox::BackendKind),
     execution: &ExecutionId,
 ) -> Result<(PathBuf, AutoWorkspaceCleanup, PathBuf)> {
+    let (image_arg, kind) = image;
     let workspace = create_workspace(opts, workspace_plan.validated_workdir, &workspace_plan.intended_workspace)?;
 
     // (#888) Reclaim the auto-allocated scratch workspace if the dispatch
@@ -8215,7 +8261,7 @@ fn materialize_dirs(
         opts,
         unix_micros,
         execution_lock,
-        (&workspace, image_arg),
+        (&workspace, image_arg, kind),
         execution,
         workspace_plan.resume_checkpoint_contents.as_deref(),
     )?;
@@ -8242,20 +8288,20 @@ fn materialize_dirs(
 /// `${WORKSPACE_ROOT}` still in it (a step with no workdir, whose workspace
 /// is a fresh tempdir; a CLI `dispatch` message: the placeholder is
 /// darkmux's in any dispatch message) names `workspace` where the
-/// configured sandbox sees it. A message without it is unchanged.
-fn prompt_file_text(message: &str, workspace: &Path) -> String {
-    crate::step_kinds::builtins::expand_workspace_root(message, darkmux_sandbox::selected().ok(), Some(workspace))
+/// dispatch's `kind` sandbox sees it. A message without it is unchanged.
+fn prompt_file_text(message: &str, workspace: &Path, kind: darkmux_sandbox::BackendKind) -> String {
+    crate::step_kinds::builtins::expand_workspace_root(message, Some(kind), Some(workspace))
 }
 
 fn prepare_host_out(
     opts: &DispatchOpts,
     unix_micros: u128,
     execution_lock: &mut ExecutionLock,
-    mounted: (&Path, Option<&str>),
+    mounted: (&Path, Option<&str>, darkmux_sandbox::BackendKind),
     execution: &ExecutionId,
     resume_checkpoint_contents: Option<&str>,
 ) -> Result<PathBuf> {
-    let (workspace, image_arg) = mounted;
+    let (workspace, image_arg, kind) = mounted;
     let host_out = resolve_host_out(opts.host_out.as_deref(), &opts.role_id, unix_micros)?;
     darkmux_types::diag_eprintln!(
         "darkmux dispatch: out-dir={} (runtime bookkeeping → /darkmux-out)",
@@ -8271,6 +8317,7 @@ fn prepare_host_out(
         &host_out,
         (workspace, opts.workspace_read_only, image_arg),
         execution,
+        kind,
     )?;
     // (#3461) And whether its `.git` was writable, so a resume of it can
     // neither escalate that nor forget the opt-in. A failure is said: a
@@ -8303,7 +8350,7 @@ fn prepare_host_out(
     // substantial brief never lands on the `docker run` command line — where it
     // would both hit ARG_MAX (the very case `--message-from-file` exists for)
     // and be visible in `ps`. The container reads it back from the bind mount.
-    fs::write(host_out.join(PROMPT_FILE_NAME), prompt_file_text(&opts.message, workspace))
+    fs::write(host_out.join(PROMPT_FILE_NAME), prompt_file_text(&opts.message, workspace, kind))
         .with_context(|| format!("writing dispatch prompt file under {}", host_out.display()))?;
     Ok(host_out)
 }
@@ -8361,16 +8408,6 @@ struct ToolchainFor<'a> {
     workspace: &'a Path,
     model: &'a str,
     endpoint: Option<&'a str>,
-}
-
-/// (#3561) The sandbox `run` starts in: the selected one for a sandbox on
-/// the host, Docker otherwise (which gets no managed toolchain).
-fn sandbox_of(run: &ContainerRun) -> std::result::Result<darkmux_sandbox::BackendKind, String> {
-    if run.image.host_runtime.is_some() {
-        darkmux_sandbox::selected()
-    } else {
-        Ok(darkmux_sandbox::BackendKind::Docker)
-    }
 }
 
 /// (#3561) The toolchain the dispatch's sandbox gets ([`dispatch_toolchain`]:
@@ -8463,7 +8500,7 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
     let dispatch_start_instant = std::time::Instant::now();
     // (#3561) A sandbox on the host runs the workspace's verified Node,
     // settled before its model is made resident.
-    let ask = ToolchainFor { kind: sandbox_of(&run), workspace: &run.workspace, model: &run.model, endpoint: run.unmanaged_endpoint_raw_label.as_deref() };
+    let ask = ToolchainFor { kind: Ok(run.image.kind), workspace: &run.workspace, model: &run.model, endpoint: run.unmanaged_endpoint_raw_label.as_deref() };
     run.toolchain = container_toolchain(opts, execution, ask, &mut bookend, dispatch_start_instant)?;
     let _engine = container_model_resident(
         opts,
@@ -8529,7 +8566,7 @@ fn supervise_container(
     let local_stop = DispatchStop::new(launched.sandbox.clone());
     let (_observer_guards, threads) = spawn_observers(opts, execution, run, &launched, &local_stop)?;
     // (#3559) Watched while it runs, ended right after the wait.
-    let listener_watch = watch_dispatch_listeners(&launched.sandbox, launched.child.id(), &local_stop);
+    let listener_watch = watch_dispatch_listeners(&launched.sandbox, launched.child.id(), &local_stop, run.sandbox.way_back_to_docker());
     panic_after_guard_spawn_if_asked();
 
     let output = match launched.child.wait_with_output() {
@@ -8814,7 +8851,7 @@ fn launch_container(
     let DispatchCompaction { compaction, compactor_n_ctx, utility_model, unmanaged_compactor } =
         resolve_dispatch_compaction(&run.role, opts)?;
     let (compaction, mut compactor_auth, compactor_hold) =
-        prepare_compactor(opts, compaction, compactor_n_ctx, unmanaged_compactor.as_ref())?;
+        prepare_compactor(opts, compaction, compactor_n_ctx, unmanaged_compactor.as_ref(), run.image.kind)?;
     // (#3507) The compactor this run may call mid-run joins its lease.
     let local_compactor = compaction.compactor_model.as_deref().filter(|_| unmanaged_compactor.is_none());
     crate::lms_room::hold_dispatch_models(&run.lease, run.leased_job.as_deref(), local_compactor)?;
@@ -9004,6 +9041,7 @@ fn prepare_compactor(
     mut compaction: crate::dispatch::CompactionDispatchArgs,
     compactor_n_ctx: Option<u32>,
     unmanaged_compactor: Option<&crate::target::UtilityTarget>,
+    kind: darkmux_sandbox::BackendKind,
 ) -> Result<PreparedCompactor> {
     let mut compactor_auth: Option<(String, String)> = None;
     let hold = std::cell::RefCell::new(None);
@@ -9012,7 +9050,7 @@ fn prepare_compactor(
             // (#3207) An unmanaged utility endpoint: nothing is loaded, the
             // bare id goes on the wire, and the runtime's compactor client
             // dials that endpoint (as the container sees it).
-            compactor_auth = prepare_unmanaged_compactor(&mut compaction, utility)?;
+            compactor_auth = prepare_unmanaged_compactor(&mut compaction, utility, kind)?;
         } else if let Some(compactor_id) = compaction.compactor_model.clone() {
             let (load_window, used_fallback) =
                 apply_compactor_window(&mut compaction, compactor_n_ctx);
@@ -9099,7 +9137,7 @@ fn container_run_config(
     let agentic_pm = run.brain.agentic_pm.as_ref();
     let feedback_json = feedback_templates_json(&run.role);
     // (#2902) The container's hosted-brain flags, from the resolved target.
-    let agentic_brain = agentic_brain_flags(agentic_pm);
+    let agentic_brain = agentic_brain_flags(agentic_pm, run.image.kind);
     // (#2295) The attachment directories the briefed mods want readable
     // inside the container. Resolved off the SAME ref list the brief was
     // rendered from, so the paths the block names are the paths mounted.
@@ -9183,7 +9221,7 @@ fn container_run_config(
         dialect: agentic_brain.1,
         remote_needs_auth,
         compactor_needs_auth,
-        base_url_override: container_lmstudio_base_url(opts.model_base_url_override.as_deref()),
+        base_url_override: container_lmstudio_base_url(opts.model_base_url_override.as_deref(), run.image.kind),
         workspace_read_only: opts.workspace_read_only,
         workdir_git_read_only: read_only_git_dir(
             &run.workspace,
@@ -14697,7 +14735,10 @@ fn status_for_plan(plan: Result<crate::runtime_image::DefaultImagePlan>) -> Dock
 /// role-load / model-probe / workspace setup so a new user without Docker gets
 /// a clean, operator-actionable bail, and a `brew install` user without a
 /// local image gets a one-time pull instead of a "build from source" dead-end.
-fn check_docker_preflight(explicit: Option<&str>) -> Result<crate::runtime_image::ResolvedImage> {
+///
+/// `remedy` is why Docker was needed and the way to need none, from the
+/// caller's one read of the setting ([`darkmux_sandbox::Selection::docker_remedy`]).
+fn check_docker_preflight(explicit: Option<&str>, remedy: Option<String>) -> Result<crate::runtime_image::ResolvedImage> {
     match docker_runtime_status() {
         // Daemon up (image present OR absent) — resolve the darkmux image,
         // pulling the version-pinned GHCR image on demand if none is local.
@@ -14710,25 +14751,28 @@ fn check_docker_preflight(explicit: Option<&str>) -> Result<crate::runtime_image
         // (reuse the pure mapper, which returns Err for all of these). The
         // `.and_then` only adapts the Ok type so the signature lines up —
         // these variants never produce Ok.
-        other => preflight_result_for(other)
+        other => preflight_result_for(other, remedy.as_deref())
             .and_then(|()| Err(anyhow!("docker preflight produced no runtime image"))),
     }
-}
-
-/// (#906) The darkmux runtime image, resolved for running a lab run's tests
-/// in it: the same preflight and version check a dispatch gets. (#3355
-/// review) By the content id that was checked, like the dispatch (#2923
-/// review C6), so a tag re-pointed after the check cannot swap the image.
-pub(crate) fn test_runtime_image() -> Result<String> {
-    resolved_runtime_image()
 }
 
 /// The darkmux runtime image as a dispatch resolves it (Docker reachable,
 /// the version-checked local or pinned image, pulled when absent), by the
 /// content id that was checked. For containers darkmux runs beside
-/// dispatch: lab test runs, and client previews (#3456).
+/// dispatch: client previews (#3456). It reads `runtime.sandbox` for its
+/// Docker remedy; a run that already read it uses
+/// [`resolved_runtime_image_with`].
 pub fn resolved_runtime_image() -> Result<String> {
-    check_docker_preflight(None).map(|image| image.id)
+    resolved_runtime_image_with(darkmux_sandbox::selection().ok().and_then(|s| s.docker_remedy()))
+}
+
+/// (#906, #3355 review) [`resolved_runtime_image`] with the Docker remedy of
+/// the caller's own read of the setting (`None`: no remedy is named), for a
+/// lab run's tests: the same preflight and version check a dispatch gets,
+/// by the content id that was checked, so a tag re-pointed after the check
+/// cannot swap the image.
+pub fn resolved_runtime_image_with(remedy: Option<String>) -> Result<String> {
+    check_docker_preflight(None, remedy).map(|image| image.id)
 }
 
 /// The `--user` a darkmux container runs as, as the dispatch container
@@ -14744,14 +14788,15 @@ pub fn runtime_container_user() -> Result<Option<String>> {
 }
 
 /// (#3112) `\n<why Docker, and the way to need none>`, or nothing when the
-/// configured sandbox is not Docker.
-fn docker_remedy_line() -> String {
-    darkmux_sandbox::docker_remedy().map(|r| format!("\n{r}.")).unwrap_or_default()
+/// sandbox read is not Docker (`remedy` is `None`).
+fn docker_remedy_line(remedy: Option<&str>) -> String {
+    remedy.map(|r| format!("\n{r}.")).unwrap_or_default()
 }
 
 /// Map a probe result to the dispatch-time bail (pure — unit-testable
-/// without Docker on the host).
-fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
+/// without Docker on the host). `remedy` is the caller's
+/// [`darkmux_sandbox::Selection::docker_remedy`].
+fn preflight_result_for(status: DockerRuntimeStatus, remedy: Option<&str>) -> Result<()> {
     match status {
         DockerRuntimeStatus::Ready => Ok(()),
         // (#3112) Each names why Docker was asked for (the sandbox setting)
@@ -14760,12 +14805,12 @@ fn preflight_result_for(status: DockerRuntimeStatus) -> Result<()> {
             "darkmux's runtime requires Docker, but `docker version` failed:\n  {}\n\
              Start Docker Desktop and retry.{}",
             stderr,
-            docker_remedy_line()
+            docker_remedy_line(remedy)
         ),
         DockerRuntimeStatus::BinaryMissing => bail!(
             "darkmux's runtime requires Docker, but the `docker` binary isn't on PATH.\n\
              Install Docker Desktop (https://www.docker.com/products/docker-desktop) and retry.{}",
-            docker_remedy_line()
+            docker_remedy_line(remedy)
         ),
         DockerRuntimeStatus::ImageMissing => bail!(
             "no darkmux runtime image for darkmux {version} found locally. darkmux pulls the \
@@ -15684,9 +15729,10 @@ fn apply_compactor_residency(
 fn prepare_unmanaged_compactor(
     compaction: &mut crate::dispatch::CompactionDispatchArgs,
     utility: &crate::target::UtilityTarget,
+    kind: darkmux_sandbox::BackendKind,
 ) -> Result<Option<(String, String)>> {
     let compactor_id = compaction.compactor_model.clone().unwrap_or_default();
-    let chat_url = url_for_sandbox(&utility.chat_url);
+    let chat_url = url_for(&utility.chat_url, kind);
     match apply_unmanaged_compactor(compaction, &compactor_id, utility, chat_url) {
         Some(_refused) => Ok(None),
         None => remote_auth_header(&utility.endpoint),
