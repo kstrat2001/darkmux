@@ -1311,13 +1311,19 @@ impl<K: std::hash::Hash + Eq + Clone> KeySlots<K> {
     }
 
     pub(crate) fn try_take(self: &Arc<Self>, key: K) -> Option<KeySlot<K>> {
+        self.try_take_counted(key).map(|(slot, _)| slot)
+    }
+
+    /// A slot for `key`, with how many `key` held before it took this one.
+    pub(crate) fn try_take_counted(self: &Arc<Self>, key: K) -> Option<(KeySlot<K>, usize)> {
         let mut c = self.counts.lock().unwrap_or_else(|p| p.into_inner());
         let n = c.entry(key.clone()).or_insert(0);
         if *n >= self.max {
             return None;
         }
+        let held = *n;
         *n += 1;
-        Some(KeySlot { owner: Arc::clone(self), key })
+        Some((KeySlot { owner: Arc::clone(self), key }, held))
     }
 }
 
@@ -1346,7 +1352,7 @@ pub(crate) async fn serve_bounded(
 /// ([`close_after_answer`]) while it still holds its slots.
 async fn one_request(conn: crate::bounded_serve::Admitted, app: Router, limits: ConnLimits) {
     use hyper_util::rt::{TokioIo, TokioTimer};
-    let crate::bounded_serve::Admitted { stream, peer, slots: _slots } = conn;
+    let crate::bounded_serve::Admitted { stream, peer, slots: _slots, .. } = conn;
     let svc = crate::bounded_serve::connection_service(app, ConnectInfo(peer));
     let conn = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())

@@ -191,6 +191,16 @@ pub trait Platform: Send + Sync {
     /// connection.
     fn tcp_peers_of(&self, local: std::net::SocketAddr) -> Option<Vec<(std::net::SocketAddr, u32)>>;
 
+    /// (#3660) The own ends of every TCP connection process `pid` holds to
+    /// this process's listener at `local`, each read the same however it is
+    /// spelled (an IPv4-mapped address is its IPv4 one): `Some(vec![])` when
+    /// it holds none (or has exited), `None` when its descriptors cannot be
+    /// listed (another user's process). A descriptor that cannot be read is
+    /// skipped, so what is named is held. It reads that one process's
+    /// descriptors, not the whole machine's as [`Self::tcp_peers_of`] does;
+    /// its cost grows with how many that process has open.
+    fn tcp_ends_held_by(&self, pid: u32, local: std::net::SocketAddr) -> Option<Vec<std::net::SocketAddr>>;
+
     /// (#3112) Every TCP socket listening on `port`, whatever the process,
     /// with the address it is bound to and its owner when known, read from
     /// the kernel's socket table (no walk over processes, which one that

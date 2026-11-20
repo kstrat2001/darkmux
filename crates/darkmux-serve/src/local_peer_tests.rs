@@ -189,9 +189,15 @@ async fn the_client_listener_judges_a_loopback_peer_as_the_viewer_does() {
     let here = health_from_here("127.0.0.1", addr.port()).await;
     assert_eq!(here["operator"], true, "this process: {here}");
     let child = health_from_child("127.0.0.1", addr.port(), None).await;
-    assert_eq!(child["operator"], true, "a process outside any sandbox: {child}");
+    assert_eq!(
+        child["operator"], true,
+        "a process outside any sandbox: {child}"
+    );
     let sandboxed = health_from_child("127.0.0.1", addr.port(), Some(&dir)).await;
-    assert_eq!(sandboxed["operator"], false, "sandboxed work is not the operator: {sandboxed}");
+    assert_eq!(
+        sandboxed["operator"], false,
+        "sandboxed work is not the operator: {sandboxed}"
+    );
 }
 
 /// A fake machine: the operator's CLI (pid 51), a host sandbox led by 100
@@ -509,5 +515,171 @@ async fn a_round_reads_the_sandbox_launchers_once_and_a_hung_read_is_no_answer()
         begun.elapsed() < std::time::Duration::from_secs(4),
         "{:?}",
         begun.elapsed()
+    );
+}
+
+/// Only work darkmux contains is kept out of the judged slots: what could
+/// not be told is not contained, so a failed lookup never shuts the
+/// operator, or a peer this user cannot see, out.
+#[test]
+fn only_contained_work_is_kept_out_of_the_judged_slots() {
+    assert!(PeerProcess::SandboxedWork.is_contained());
+    assert!(PeerProcess::ContainerForwarder("com.docker.backend".into()).is_contained());
+    assert!(!PeerProcess::Operator.is_contained());
+    assert!(!PeerProcess::Unknown("no process this user can see").is_contained());
+}
+
+/// A remembered forwarder's connections are known from one read of its
+/// descriptors: the connections it held then are answered from that read
+/// with no other, each end once (a later connection reusing its port is
+/// another connection), the operator's is not its, and a miss reads again.
+#[tokio::test]
+async fn one_read_of_a_known_forwarder_answers_every_connection_it_holds() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let at = |s: &str| -> SocketAddr { s.parse().unwrap() };
+    let (a, b, mine) = (
+        at("127.0.0.1:50001"),
+        at("127.0.0.1:50002"),
+        at("127.0.0.1:50003"),
+    );
+    let local = at("127.0.0.1:8799");
+    let m: &'static darkmux_platform::FakePlatform =
+        Box::leak(Box::new(darkmux_platform::FakePlatform {
+            tcp_peers: vec![(a, 68948), (b, 68948), (mine, 51)],
+            ..machine()
+        }));
+    assert_eq!(
+        forwarders_among(m, &[51, 68948]),
+        vec![(68948, "com.docker.backend".to_string())]
+    );
+    let rounds = Rounds::new_for_test(Arc::new(|_| None), std::time::Duration::from_secs(1));
+    assert!(
+        !rounds.held_by_a_known_forwarder(m, a, local).await,
+        "none named yet"
+    );
+    assert_eq!(m.tcp_ends_reads.load(SeqCst), 0, "and nothing to read");
+    rounds.remember(forwarders_among(m, &[68948]));
+    assert!(rounds.held_by_a_known_forwarder(m, a, local).await);
+    assert_eq!(m.tcp_ends_reads.load(SeqCst), 1);
+    assert!(
+        rounds
+            .held_by_a_known_forwarder(m, b, at("[::ffff:127.0.0.1]:8799"))
+            .await,
+        "however the listener's address is spelled"
+    );
+    assert_eq!(
+        m.tcp_ends_reads.load(SeqCst),
+        1,
+        "answered by the same read"
+    );
+    assert_eq!(rounds.take_end(a, local), None, "an end is used once");
+    assert!(
+        !rounds.held_by_a_known_forwarder(m, mine, local).await,
+        "the operator's"
+    );
+    assert_eq!(m.tcp_ends_reads.load(SeqCst), 2, "a miss reads again");
+}
+
+/// A cached end answers only while its pid still runs the forwarder it was
+/// read for: one whose pid now runs something else is forgotten, with every
+/// end cached for it, so it never refuses another process's connection.
+#[tokio::test]
+async fn a_cached_end_answers_only_while_its_forwarder_runs() {
+    let at = |s: &str| -> SocketAddr { s.parse().unwrap() };
+    let (a, b, c) = (
+        at("127.0.0.1:50001"),
+        at("127.0.0.1:50002"),
+        at("127.0.0.1:50004"),
+    );
+    let local = at("127.0.0.1:8799");
+    let m: &'static darkmux_platform::FakePlatform =
+        Box::leak(Box::new(darkmux_platform::FakePlatform {
+            tcp_peers: vec![(a, 68948), (b, 68948), (c, 68948)],
+            ..machine()
+        }));
+    let rounds = Rounds::new_for_test(Arc::new(|_| None), std::time::Duration::from_secs(1));
+    rounds.remember(forwarders_among(m, &[68948]));
+    assert!(rounds.held_by_a_known_forwarder(m, a, local).await);
+    let reused: &'static darkmux_platform::FakePlatform =
+        Box::leak(Box::new(darkmux_platform::FakePlatform {
+            process_names: vec![(68948, "zsh".into())],
+            ..machine()
+        }));
+    assert!(
+        !rounds.held_by_a_known_forwarder(reused, b, local).await,
+        "its pid runs something else"
+    );
+    assert!(
+        rounds.forwarders.lock().unwrap().pids.is_empty(),
+        "forgotten"
+    );
+    assert_eq!(
+        rounds.take_end(c, local),
+        None,
+        "with every end cached for it"
+    );
+}
+
+/// A read of the forwarders for a listener may begin only once the last
+/// one has been over for as long as it took, and at least
+/// [`MIN_READ_GAP`]: reading takes at most half of the accept loop's time.
+#[test]
+fn reads_take_turns_with_the_accept_loop() {
+    let t = Instant::now();
+    let ms = std::time::Duration::from_millis;
+    assert_eq!(next_read_at(None), None, "no read yet");
+    assert_eq!(next_read_at(Some((t, ms(2)))), Some(t + MIN_READ_GAP));
+    assert_eq!(next_read_at(Some((t, ms(50)))), Some(t + ms(50)));
+}
+
+/// The rounds remember at most a handful of forwarders, newest kept, each
+/// once.
+#[test]
+fn the_known_forwarders_are_bounded() {
+    let rounds = Rounds::new_for_test(Arc::new(|_| None), std::time::Duration::from_secs(1));
+    rounds.remember((0..20).map(|pid| (pid, "vpnkit".to_string())).collect());
+    rounds.remember(vec![(19, "vpnkit".to_string())]);
+    let known = rounds.forwarders.lock().unwrap().pids.clone();
+    assert_eq!(known.len(), KNOWN_FORWARDERS);
+    assert_eq!(known.last(), Some(&(19, "vpnkit".to_string())));
+    assert_eq!(known.iter().filter(|(p, _)| *p == 19).count(), 1);
+}
+
+/// A round names the forwarders among every process in its table, each
+/// process looked at once.
+#[test]
+fn a_round_looks_at_each_process_once() {
+    let at = |s: &str| -> SocketAddr { s.parse().unwrap() };
+    let peers = [
+        (at("127.0.0.1:1"), 9),
+        (at("127.0.0.1:2"), 3),
+        (at("127.0.0.1:3"), 9),
+    ];
+    assert_eq!(pids_in(&peers), vec![3, 9]);
+}
+
+/// While the listener holds a connection, no read caches its end; once the
+/// connection is closed, a forwarder's later connection from that end is
+/// read again.
+#[tokio::test]
+async fn a_held_end_is_left_out_of_reads_until_its_connection_closes() {
+    let at = |s: &str| -> SocketAddr { s.parse().unwrap() };
+    let (theirs, local) = (at("127.0.0.1:50001"), at("127.0.0.1:8799"));
+    let m: &'static darkmux_platform::FakePlatform =
+        Box::leak(Box::new(darkmux_platform::FakePlatform {
+            tcp_peers: vec![(theirs, 68948)],
+            ..machine()
+        }));
+    let rounds = Rounds::new_for_test(Arc::new(|_| None), std::time::Duration::from_secs(1));
+    rounds.remember(forwarders_among(m, &[68948]));
+    let held = rounds.holding(theirs, local);
+    assert!(
+        !rounds.held_by_a_known_forwarder(m, theirs, local).await,
+        "held, so never cached"
+    );
+    drop(held);
+    assert!(
+        rounds.held_by_a_known_forwarder(m, theirs, local).await,
+        "closed, so a later connection from it is read"
     );
 }

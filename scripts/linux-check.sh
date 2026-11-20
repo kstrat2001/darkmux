@@ -24,6 +24,13 @@ else
   cargo test -p darkmux-platform -p darkmux-hardware -p darkmux-types
 fi
 
+step "tests: the listeners' connection caps, judged on Linux's /proc (#3660)"
+if command -v cargo-nextest >/dev/null; then
+  cargo nextest run -p darkmux-serve -E 'test(/^bounded_serve::/)'
+else
+  cargo test -p darkmux-serve -- bounded_serve::
+fi
+
 step "release build"
 cargo build --release --bin darkmux
 ./target/release/darkmux --version
@@ -35,4 +42,4 @@ if [ "${LINUX_CHECK_SKIP_DOCTOR:-}" != "1" ]; then
   ./target/release/darkmux doctor || echo "doctor exited $? (read the rows above)"
 fi
 
-printf '\nlinux-check: PASS (clippy, OS tests, release build). Doctor output is for review.\n'
+printf '\nlinux-check: PASS (clippy, OS tests, listener caps, release build). Doctor output is for review.\n'
