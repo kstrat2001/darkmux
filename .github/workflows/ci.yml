@@ -200,7 +200,8 @@ jobs:
       # retries, so a flake fails the gate instead of passing on luck, and a
       # per-test `terminate-after`, so a hung test fails loudly instead of
       # running the job into its timeout. nextest does not run doctests; the
-      # step after this one does.       - name: Install cargo-nextest
+      # step after this one does.
+      - name: Install cargo-nextest
         if: steps.gate.outputs.tests == 'true'
         uses: taiki-e/install-action@v2
         with:
