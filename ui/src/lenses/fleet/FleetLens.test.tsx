@@ -14,7 +14,7 @@ import { __runIndexBuilds } from "../../lib/runRef";
 import { ACTION, __asOfFilterRuns } from "../../lib/ingest";
 import { tokensOffMeter } from "./savings";
 import { closeOpenModal } from "../../lib/dialogManager";
-import { queryKeys } from "../../lib/queryKeys";
+import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { machineKeyHash } from "../../lib/machineKey";
 import { __clockDebug } from "../../lib/clock";
 import type { NormRecord } from "../../lib/ingest";
@@ -2158,7 +2158,15 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     await waitFor(() => expect(document.querySelector(".mach .stat")?.textContent).toBe("not streaming"));
     await waitFor(() => expect(document.querySelector(".mach .stat")?.textContent).toBe("idle"), { timeout: 8000 });
     expect(document.querySelector(".mach .spec")!.textContent).toBe("Apple M5 Max · 128 GB");
-  }, 12000);
+    // The retry stops once it answers: one more presence cycle asks nothing.
+    const specsCalls = () => vi.mocked(fetch).mock.calls.filter(([u]) => String(u) === "/machine/specs").length;
+    const answered = specsCalls();
+    expect(answered).toBe(2);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, PRESENCE_POLL_MS + 1500));
+    });
+    expect(specsCalls(), "no /machine/specs read after it answered").toBe(answered);
+  }, 20000);
 
   // (#3662 review) A peer nobody rostered, known only from records in the
   // window: with presence unreadable nothing read says it is up, so it reads
