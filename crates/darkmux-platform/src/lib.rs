@@ -191,14 +191,15 @@ pub trait Platform: Send + Sync {
     /// connection.
     fn tcp_peers_of(&self, local: std::net::SocketAddr) -> Option<Vec<(std::net::SocketAddr, u32)>>;
 
-    /// (#3660) Whether process `pid` holds the `peer` end of a TCP
-    /// connection to this process's listener at `local`: `Some(false)` when
-    /// it holds no such socket (or has exited), `None` when its sockets
-    /// cannot be read (another user's process). It reads that one process's
-    /// descriptors, not the whole machine's as [`Self::tcp_peers_of`] does,
-    /// so it is cheap enough to ask of every connection about a process
-    /// already named (a container engine's forwarder).
-    fn holds_tcp_peer(&self, pid: u32, peer: std::net::SocketAddr, local: std::net::SocketAddr) -> Option<bool>;
+    /// (#3660) The own ends of every TCP connection process `pid` holds to
+    /// this process's listener at `local`, each read the same however it is
+    /// spelled (an IPv4-mapped address is its IPv4 one): `Some(vec![])` when
+    /// it holds none (or has exited), `None` when its descriptors cannot be
+    /// listed (another user's process). A descriptor that cannot be read is
+    /// skipped, so what is named is held. It reads that one process's
+    /// descriptors, not the whole machine's as [`Self::tcp_peers_of`] does;
+    /// its cost grows with how many that process has open.
+    fn tcp_ends_held_by(&self, pid: u32, local: std::net::SocketAddr) -> Option<Vec<std::net::SocketAddr>>;
 
     /// (#3112) Every TCP socket listening on `port`, whatever the process,
     /// with the address it is bound to and its owner when known, read from

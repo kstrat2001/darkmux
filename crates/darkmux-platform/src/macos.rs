@@ -205,8 +205,8 @@ impl Platform for MacPlatform {
 
     /// (#3660) `pid`'s socket descriptors, each read with `proc_pidfdinfo`,
     /// as #3559's listener read does: no `lsof`, no walk over processes.
-    fn holds_tcp_peer(&self, pid: u32, peer: std::net::SocketAddr, local: std::net::SocketAddr) -> Option<bool> {
-        connection_held_by_pid(pid, peer, local)
+    fn tcp_ends_held_by(&self, pid: u32, local: std::net::SocketAddr) -> Option<Vec<std::net::SocketAddr>> {
+        connection_ends_held_by_pid(pid, local)
     }
 
     /// (#3112) One `netstat -anv -p tcp` (the kernel's `pcblist`, no walk
@@ -756,31 +756,30 @@ pub(crate) mod libproc {
         Some((own, other))
     }
 
-    /// (#3660) Whether one of the socket descriptors `fds`, each read by
-    /// `read` (as [`listeners_in_records`] reads them), is the `peer` end of
-    /// a connection to `local`, however either address is spelled (an
-    /// IPv4-mapped IPv6 address is its IPv4 one). A match found is the
-    /// answer whatever else could not be read (a process churning sockets
-    /// has some torn down mid-read); with no match, any refused read makes
-    /// it no answer. A descriptor gone since it was listed is skipped.
-    pub(crate) fn holds_connection_in_records(
+    /// (#3660) The own ends of the connections to `local` among the socket
+    /// descriptors `fds`, each read by `read` (as [`listeners_in_records`]
+    /// reads them), however either address is spelled (an IPv4-mapped IPv6
+    /// address is its IPv4 one). A descriptor that is gone or cannot be read
+    /// is skipped (a process churning sockets has some torn down mid-read),
+    /// so every end named is one it holds.
+    pub(crate) fn connection_ends_in_records(
         fds: &[i32],
         mut read: impl FnMut(i32, &mut [u8]) -> (i32, i32),
-        peer: std::net::SocketAddr,
         local: std::net::SocketAddr,
-    ) -> Option<bool> {
-        let same = |a: std::net::SocketAddr, b: std::net::SocketAddr| a.port() == b.port() && a.ip().to_canonical() == b.ip().to_canonical();
-        let mut unread = false;
+    ) -> Vec<std::net::SocketAddr> {
+        let canonical = |a: std::net::SocketAddr| std::net::SocketAddr::new(a.ip().to_canonical(), a.port());
+        let mut ends = Vec::new();
         for &fd in fds {
             let mut info = vec![0u8; SOCKET_FDINFO_SIZE];
             let (got, errno) = read(fd, &mut info);
-            match libproc_read(got, Some(SOCKET_FDINFO_SIZE as i32), errno) {
-                LibprocRead::Read if connection_in_fdinfo(&info).is_some_and(|(own, other)| same(own, peer) && same(other, local)) => return Some(true),
-                LibprocRead::Read | LibprocRead::Gone => {}
-                LibprocRead::Unreadable => unread = true,
+            if libproc_read(got, Some(SOCKET_FDINFO_SIZE as i32), errno) != LibprocRead::Read {
+                continue;
+            }
+            if let Some((own, _)) = connection_in_fdinfo(&info).filter(|(_, other)| canonical(*other) == canonical(local)) {
+                ends.push(canonical(own));
             }
         }
-        (!unread).then_some(false)
+        ends
     }
 
     /// Offsets in `struct socket_fdinfo`, measured with clang's `offsetof` on
@@ -894,7 +893,7 @@ pub(crate) mod libproc {
 }
 
 #[cfg(target_os = "macos")]
-use libproc::{holds_connection_in_records, listeners_in_records, socket_fds_in, PROC_PIDFDSOCKETINFO, PROC_PIDLISTFDS};
+use libproc::{connection_ends_in_records, listeners_in_records, socket_fds_in, PROC_PIDFDSOCKETINFO, PROC_PIDLISTFDS};
 
 /// `(pid, ppid, pgid, sid)` of every process this user's libproc reads
 /// answer for; `None` when the pid list cannot be read.
@@ -938,11 +937,11 @@ pub(crate) fn listeners_held_by_pid(pid: u32) -> Option<Vec<(u16, crate::PortLis
     listeners_in_records(pid, &socket_fds(p)?, read, interface_name)
 }
 
-/// (#3660) Whether `pid` holds the `peer` end of a connection to `local`
-/// ([`holds_connection_in_records`]); `None` when its sockets cannot be
-/// read. A process that exited since it was named holds none.
+/// (#3660) The own ends of `pid`'s connections to `local`
+/// ([`connection_ends_in_records`]); `None` when its descriptors cannot be
+/// listed. A process that exited since it was named holds none.
 #[cfg(target_os = "macos")]
-pub(crate) fn connection_held_by_pid(pid: u32, peer: std::net::SocketAddr, local: std::net::SocketAddr) -> Option<bool> {
+pub(crate) fn connection_ends_held_by_pid(pid: u32, local: std::net::SocketAddr) -> Option<Vec<std::net::SocketAddr>> {
     let p = libc::pid_t::try_from(pid).ok()?;
     let read = |fd: i32, info: &mut [u8]| {
         clear_errno();
@@ -950,11 +949,11 @@ pub(crate) fn connection_held_by_pid(pid: u32, peer: std::net::SocketAddr, local
         let got = unsafe { libc::proc_pidfdinfo(p, fd, PROC_PIDFDSOCKETINFO, info.as_mut_ptr().cast(), info.len() as libc::c_int) };
         (got, errno())
     };
-    holds_connection_in_records(&socket_fds(p)?, read, peer, local)
+    Some(connection_ends_in_records(&socket_fds(p)?, read, local))
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn connection_held_by_pid(_pid: u32, _peer: std::net::SocketAddr, _local: std::net::SocketAddr) -> Option<bool> {
+pub(crate) fn connection_ends_held_by_pid(_pid: u32, _local: std::net::SocketAddr) -> Option<Vec<std::net::SocketAddr>> {
     None
 }
 

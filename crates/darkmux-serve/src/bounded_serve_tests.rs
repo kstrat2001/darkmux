@@ -457,6 +457,11 @@ fn this_machine_is_every_peer_of_a_loopback_listener_and_counts_as_one() {
 ///   pass: within the production listeners' 10 s header deadline, so a
 ///   connection that deadline closes is never counted as refused), and
 ///   holds the rest until its stdin closes.
+/// - `flick <addr> <hold> <threads> <secs> <how>`: holds `hold` connections,
+///   prints `churning`, and for `secs` has each of `threads` threads connect
+///   and hang up at once, `reset` (SO_LINGER 0: a reset) or `fin` (a
+///   request sent, then an ordinary close), so the connection is gone before
+///   its judgment ends.
 /// - `churn <addr> <hold> <threads> <secs>`: holds `hold` connections, prints
 ///   `churning`, and for `secs` has each of `threads` threads connect, wait
 ///   for the other end to close, and connect again (a container reopening
@@ -478,6 +483,13 @@ fn container_forwarder_stand_in() {
             println!("closed {closed}");
             held
         }
+        "flick" => flick(
+            addr,
+            num(2),
+            num(3),
+            Duration::from_secs(num(4) as u64),
+            parts[5],
+        ),
         _ => churn(addr, num(2), num(3), Duration::from_secs(num(4) as u64)),
     };
     let _ = std::io::stdin().read_to_end(&mut Vec::new());
@@ -501,6 +513,68 @@ fn connect_from(addr: SocketAddr, source: Option<std::net::IpAddr>) -> std::net:
     let s = s.into_std().unwrap();
     s.set_nonblocking(false).unwrap();
     s
+}
+
+/// [`container_forwarder_stand_in`]'s `flick` mode: the held connections.
+fn flick(
+    addr: SocketAddr,
+    hold: usize,
+    threads: usize,
+    for_: Duration,
+    how: &str,
+) -> Vec<std::net::TcpStream> {
+    let held: Vec<_> = (0..hold)
+        .map(|_| std::net::TcpStream::connect(addr).unwrap())
+        .collect();
+    let until = std::time::Instant::now() + for_;
+    let reset = how == "reset";
+    for _ in 0..threads {
+        std::thread::spawn(move || {
+            while std::time::Instant::now() < until {
+                let Ok(mut c) = std::net::TcpStream::connect(addr) else {
+                    continue;
+                };
+                if reset {
+                    use std::os::fd::AsRawFd;
+                    let off = libc::linger {
+                        l_onoff: 1,
+                        l_linger: 0,
+                    };
+                    // SAFETY: a socket this thread owns, and a `linger` of
+                    // the size given.
+                    unsafe {
+                        libc::setsockopt(
+                            c.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            libc::SO_LINGER,
+                            (&off as *const libc::linger).cast(),
+                            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                        )
+                    };
+                } else {
+                    let _ = c.write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n");
+                }
+            }
+        });
+    }
+    println!("churning");
+    held
+}
+
+/// A container engine's forwarder holding `hold` connections to `addr` and,
+/// on `threads` threads for `for_secs`, connecting and hanging up at once
+/// (`how`: `reset` or `fin`; [`container_forwarder_stand_in`]'s `flick`
+/// mode), once it has begun.
+fn flicking_forwarder(
+    addr: SocketAddr,
+    hold: usize,
+    threads: usize,
+    for_secs: u64,
+    how: &str,
+) -> Forwarder {
+    let (held, mut lines) = stand_in(&format!("flick {addr} {hold} {threads} {for_secs} {how}"));
+    assert!(lines.any(|l| l.contains("churning")), "the stand-in began");
+    held
 }
 
 /// [`container_forwarder_stand_in`]'s `churn` mode: the held connections.
@@ -976,4 +1050,30 @@ fn a_listener_with_no_judged_share_still_knows_the_operators_connection() {
     }
     let got = String::from_utf8_lossy(&got);
     assert!(got.ends_with("true"), "judged the operator's: {got:?}");
+}
+
+/// A container that connects and hangs up at once cannot crowd the operator
+/// out of the viewer either: such a connection is gone before any process
+/// can be seen holding it, so it is never refused as a container's, but it
+/// gives its slots back as soon as the hang-up arrives, a reset or a request
+/// sent and closed alike, never after its judgment. With the forwarder
+/// holding the open share and 64, then 128, threads hanging up as fast as
+/// they connect, every one of this process's new connections is served.
+#[test]
+fn a_container_that_connects_and_hangs_up_never_crowds_the_operator_out_of_the_viewer() {
+    let _ = crate::raise_open_file_limit(8192);
+    for (how, threads) in [("reset", 64), ("reset", 128), ("fin", 128)] {
+        let (addr, _stop, _done) = serving_with(
+            Box::new(|l, app, rx| Box::pin(crate::serve_viewer(l, app, rx))),
+            ok_app(),
+        );
+        let open = VIEWER.per_ip - VIEWER.judged_share;
+        let _container = flicking_forwarder(addr, open, threads, 8, how);
+        std::thread::sleep(Duration::from_millis(300));
+        let served = served_of(addr, 20, Duration::from_millis(100));
+        assert_eq!(
+            served, 20,
+            "{threads} threads hanging up ({how}): the operator served {served} of 20"
+        );
+    }
 }

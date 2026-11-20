@@ -529,49 +529,80 @@ fn only_contained_work_is_kept_out_of_the_judged_slots() {
     assert!(!PeerProcess::Unknown("no process this user can see").is_contained());
 }
 
-/// A forwarder a verdict named is remembered, and a connection whose peer
-/// end it holds is known as a container's without a round; one it does not
-/// hold is not. A pid that no longer runs that forwarder is forgotten, so
-/// it never refuses another process's connection.
-#[test]
-fn a_named_forwarder_is_known_until_its_pid_runs_something_else() {
+/// A remembered forwarder's connections are known from one read of its
+/// descriptors: the connections it held then are answered from that read
+/// with no other, the operator's is not its, and a miss reads again. A pid
+/// that no longer runs that forwarder is forgotten, so it never refuses
+/// another process's connection.
+#[tokio::test]
+async fn one_read_of_a_known_forwarder_answers_every_connection_it_holds() {
+    use std::sync::atomic::Ordering::SeqCst;
     let at = |s: &str| -> SocketAddr { s.parse().unwrap() };
-    let (theirs, mine, local) = (
+    let (a, b, mine) = (
         at("127.0.0.1:50001"),
         at("127.0.0.1:50002"),
-        at("127.0.0.1:8799"),
+        at("127.0.0.1:50003"),
     );
-    let mut m = darkmux_platform::FakePlatform {
-        tcp_peers: vec![(theirs, 68948), (mine, 51)],
-        ..machine()
-    };
+    let local = at("127.0.0.1:8799");
+    let m: &'static darkmux_platform::FakePlatform =
+        Box::leak(Box::new(darkmux_platform::FakePlatform {
+            tcp_peers: vec![(a, 68948), (b, 68948), (mine, 51)],
+            ..machine()
+        }));
     assert_eq!(
-        forwarders_among(&m, &[51, 68948]),
+        forwarders_among(m, &[51, 68948]),
         vec![(68948, "com.docker.backend".to_string())]
     );
     let rounds = Rounds::new_for_test(Arc::new(|_| None), std::time::Duration::from_secs(1));
-    assert_eq!(
-        rounds.known_forwarder_holding(&m, theirs, local),
-        None,
+    assert!(
+        !rounds.held_by_a_known_forwarder(m, a, local).await,
         "none named yet"
     );
-    rounds.remember(forwarders_among(&m, &[68948]));
+    assert_eq!(m.tcp_ends_reads.load(SeqCst), 0, "and nothing to read");
+    rounds.remember(forwarders_among(m, &[68948]));
+    assert!(rounds.held_by_a_known_forwarder(m, a, local).await);
+    assert_eq!(m.tcp_ends_reads.load(SeqCst), 1);
+    assert!(rounds.held_by_a_known_forwarder(m, b, local).await);
     assert_eq!(
-        rounds.known_forwarder_holding(&m, theirs, local).as_deref(),
+        m.tcp_ends_reads.load(SeqCst),
+        1,
+        "answered by the same read"
+    );
+    assert_eq!(
+        rounds.seen_held_by_a_forwarder(b, local).as_deref(),
         Some("com.docker.backend")
     );
-    assert_eq!(
-        rounds.known_forwarder_holding(&m, mine, local),
-        None,
+    assert!(
+        !rounds.held_by_a_known_forwarder(m, mine, local).await,
         "the operator's"
     );
-    m.process_names.retain(|(pid, _)| *pid != 68948);
-    m.process_names.push((68948, "zsh".into()));
-    m.tcp_peers.push((mine, 68948));
+    assert_eq!(m.tcp_ends_reads.load(SeqCst), 2, "a miss reads again");
     assert_eq!(
-        rounds.known_forwarder_holding(&m, mine, local),
-        None,
+        rounds
+            .seen_held_by_a_forwarder(a, at("[::ffff:127.0.0.1]:8799"))
+            .as_deref(),
+        Some("com.docker.backend"),
+        "however the listener's address is spelled"
+    );
+
+    let reused: &'static darkmux_platform::FakePlatform =
+        Box::leak(Box::new(darkmux_platform::FakePlatform {
+            tcp_peers: vec![(mine, 68948)],
+            process_names: vec![(68948, "zsh".into())],
+            ..machine()
+        }));
+    assert!(
+        !rounds.held_by_a_known_forwarder(reused, mine, local).await,
         "a reused pid is no forwarder"
+    );
+    assert!(
+        rounds.forwarders.lock().unwrap().pids.is_empty(),
+        "and is forgotten"
+    );
+    assert_eq!(
+        rounds.seen_held_by_a_forwarder(a, local),
+        None,
+        "its ends with it"
     );
 }
 
@@ -582,7 +613,7 @@ fn the_known_forwarders_are_bounded() {
     let rounds = Rounds::new_for_test(Arc::new(|_| None), std::time::Duration::from_secs(1));
     rounds.remember((0..20).map(|pid| (pid, "vpnkit".to_string())).collect());
     rounds.remember(vec![(19, "vpnkit".to_string())]);
-    let known = rounds.forwarders.lock().unwrap().clone();
+    let known = rounds.forwarders.lock().unwrap().pids.clone();
     assert_eq!(known.len(), KNOWN_FORWARDERS);
     assert_eq!(known.last(), Some(&(19, "vpnkit".to_string())));
     assert_eq!(known.iter().filter(|(p, _)| *p == 19).count(), 1);

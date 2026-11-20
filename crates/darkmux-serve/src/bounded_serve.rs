@@ -23,22 +23,42 @@
 //! [`counted_as`]). Once this machine holds the rest (the open share), its
 //! next connection is served only after [`crate::local_peer`] has judged
 //! its process not to be contained work (a host sandbox's, or a container
-//! forwarder's); contained work is closed. A forwarder a verdict has named
-//! is remembered, and a later connection whose peer end it holds is closed
-//! as it is accepted, from one read of that process's descriptors, before
-//! it holds a slot: a container reopening every connection it loses never
-//! occupies the judged share while a round runs. Below the open share
-//! nothing is judged here and no other process is read, so a listener
-//! under no pressure pays one `getsockname` per connection for it.
+//! forwarder's); contained work is closed. Two things keep a container
+//! from holding the judged share while its connections wait for a round:
 //!
-//! **What it does not cover.** A sandboxed process is judged by a round
-//! each time (it is not remembered: its pid could be reused by the
-//! operator's next process of the same name), so sandboxed work reopening
-//! connections could keep judged slots busy while each waits for its
-//! round; the sandbox's network profile keeps it off darkmux's ports
-//! (#3640). A peer this user cannot see (tailscaled, another account's
-//! process) and an engine whose forwarder is not in
-//! `darkmux_platform::CONTAINER_FORWARDERS` read as unknown and are served.
+//! - A forwarder a round has named is remembered with the ends of its
+//!   connections here, and a later connection it holds is closed as it is
+//!   accepted, before it holds a slot. The accept loop waits for that
+//!   answer, so the container's next connections queue in the kernel's
+//!   backlog, not in this listener's slots. A connection the cached ends
+//!   hold costs no read; a miss reads the forwarders' descriptors once, off
+//!   the async workers, and that read answers every connection they hold
+//!   then. One read grows with their descriptors (about 30 ms for 20,000
+//!   on an M5 Max), and a burst of misses shares it.
+//! - A connection waiting for its judgment gives its slots back as soon as
+//!   its peer hangs up (a reset, or its end closed), so one opened and
+//!   dropped at once, which no process holds by the time anything looks,
+//!   holds nothing for long.
+//!
+//! Below the open share nothing is judged here and no other process is
+//! read, so a listener under no pressure pays one `getsockname` per
+//! connection for it.
+//!
+//! **What it does not cover.**
+//! - A sandboxed process is judged by a round each time (it is not
+//!   remembered: its pid could be reused by the operator's next process of
+//!   the same name), so sandboxed work keeping connections open past the
+//!   open share holds judged slots while each waits for its round; the
+//!   sandbox's network profile keeps it off darkmux's ports (#3640).
+//! - A peer this user cannot see (tailscaled, another account's process)
+//!   and an engine whose forwarder is not in
+//!   `darkmux_platform::CONTAINER_FORWARDERS` read as unknown and are
+//!   served.
+//! - A client that half-closes after sending its request, past the open
+//!   share, reads as hung up and is closed while it waits.
+//! - A forwarder this user cannot read (Linux's `docker-proxy`, as root)
+//!   has no descriptors to read, so its connections each wait for a
+//!   round.
 
 use crate::fleet_listener::{KeySlot, KeySlots};
 use axum::extract::ConnectInfo;
@@ -285,7 +305,7 @@ pub(crate) async fn serve_kept_alive_reading(
     let admission = Admission::new(limits.label, limits.max_conns, limits.per_ip)
         .with_judged_share(limits.judged_share);
     while let Some(conn) = admission.next(&listener, &mut shutdown).await {
-        if conn.judge_first && from_a_known_forwarder(&rounds, &conn) {
+        if conn.judge_first && from_a_known_forwarder(&rounds, &conn).await {
             continue;
         }
         tokio::spawn(kept_alive(
@@ -301,16 +321,23 @@ pub(crate) async fn serve_kept_alive_reading(
 }
 
 /// Whether `conn` is a container's, by a forwarder `rounds` already named
-/// ([`crate::local_peer::Rounds::known_forwarder_holding`]): read here,
+/// ([`crate::local_peer::Rounds::held_by_a_known_forwarder`]): asked here,
 /// as it is accepted, so it is closed before it holds a slot while a round
-/// runs. A container reopening every connection it loses therefore gets
-/// none of the judged share, whose slots stay free for the rest.
-fn from_a_known_forwarder(rounds: &crate::local_peer::Rounds, conn: &Admitted) -> bool {
-    conn.local.is_some_and(|local| {
-        rounds
-            .known_forwarder_holding(darkmux_platform::current(), conn.peer, local)
-            .is_some()
-    })
+/// runs. The accept loop waits for the answer, and that wait is the point:
+/// a container's next connections queue in the kernel's accept backlog
+/// behind it, in arrival order with everyone else's, instead of in this
+/// listener's slots. A connection the forwarders' cached ends already hold
+/// costs no read; a miss costs one read of their descriptors, on a
+/// blocking thread, which answers every connection they hold then.
+async fn from_a_known_forwarder(rounds: &Arc<crate::local_peer::Rounds>, conn: &Admitted) -> bool {
+    match conn.local {
+        Some(local) => {
+            rounds
+                .held_by_a_known_forwarder(darkmux_platform::current(), conn.peer, local)
+                .await
+        }
+        None => false,
+    }
 }
 
 /// Serves one admitted connection until it closes, or, once `shutdown`
@@ -333,7 +360,7 @@ async fn kept_alive(
     } = conn;
     let local = local.or_else(|| stream.local_addr().ok());
     let this_conn = crate::local_peer::PeerConn::new(peer, local, rounds);
-    if judge_first && !judged_in_time(&this_conn, &mut shutdown).await {
+    if judge_first && !judged_in_time(&this_conn, &stream, &mut shutdown).await {
         return;
     }
     let served = hyper::server::conn::http1::Builder::new()
@@ -357,14 +384,42 @@ async fn kept_alive(
 
 /// Whether `conn` may take a judged slot
 /// ([`crate::local_peer::may_take_a_judged_slot`]); not once `shutdown`
-/// says stop while it waits, so a stop never waits on a lookup.
+/// says stop while it waits, so a stop never waits on a lookup, and not
+/// once its peer has hung up (`stream`, [`hung_up`]), so a connection
+/// opened and dropped at once gives its slots back then, not after its
+/// judgment.
 async fn judged_in_time(
     conn: &crate::local_peer::PeerConn,
+    stream: &tokio::net::TcpStream,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     tokio::select! {
         may = crate::local_peer::may_take_a_judged_slot(conn) => may,
         () = stopped(shutdown) => false,
+        () = hung_up(stream) => false,
+    }
+}
+
+/// How often a connection with unread data is looked at again for its
+/// peer's hang-up while it waits for its judgment.
+const HANG_UP_CHECK: Duration = Duration::from_millis(20);
+
+/// Returns once `stream`'s peer has hung up: a reset, or its end closed
+/// (noticed behind unread data too: the reactor's read-closed readiness,
+/// kqueue's EOF or epoll's RDHUP), never while it is open. One with
+/// unread data stays readable, so it is looked at again every
+/// [`HANG_UP_CHECK`]; one with none waits for the reactor. Nothing is read:
+/// the request stays where hyper reads it. A peer that half-closes after
+/// sending its request reads as hung up too, so such a client past the
+/// open share is closed while it waits.
+async fn hung_up(stream: &tokio::net::TcpStream) {
+    loop {
+        match stream.ready(tokio::io::Interest::READABLE).await {
+            Ok(r) if !(r.is_read_closed() || r.is_error()) => {
+                tokio::time::sleep(HANG_UP_CHECK).await
+            }
+            _ => return,
+        }
     }
 }
 

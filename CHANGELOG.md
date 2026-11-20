@@ -223,12 +223,15 @@ darkmux release.
   container reaching `host.docker.internal` and a sandboxed process. Once the other half is in use, each
   further connection from this machine is checked first (the look at who holds it that decides what a
   local caller may read, about 70 ms on a Mac), and one held by a container's forwarder or a host sandbox
-  is closed. A forwarder found once is remembered, and its later connections are closed as they arrive,
-  so a container that reopens every connection it loses still leaves the browser and the tailnet their
-  half. Nothing is checked while the first half has room. Not covered: sandboxed work that reopens
-  connections is checked each time (the sandbox's network rules keep it off darkmux's ports), and a
-  container engine whose forwarder darkmux does not know by name (OrbStack, rootless Podman's
-  slirp4netns or pasta) is not told apart from your own processes.
+  is closed. A forwarder found once is remembered and its later connections are closed as they arrive,
+  and a connection whose sender hangs up while it is checked is let go at once. So a container that
+  holds connections open, reopens every one it loses, or opens and drops them as fast as it can still
+  leaves the browser and the tailnet their half, at some added delay on a busy machine. Nothing is
+  checked while the first half has room. Not covered: sandboxed work holding connections open past the
+  first half is checked each time (the sandbox's network rules keep it off darkmux's ports); a container
+  engine whose forwarder darkmux does not know by name (OrbStack, rootless Podman's slirp4netns or
+  pasta) is not told apart from your own processes; and a client that half-closes its connection after
+  sending a request is closed if it arrives while the first half is full.
 - **A preview's streaming answer ends with its session.** An answer a preview was still streaming
   through the tailnet entry (a long download, a dev server's event stream) kept streaming after its
   session ended; it is now cut within a second of the session ending (previews turned off, the device

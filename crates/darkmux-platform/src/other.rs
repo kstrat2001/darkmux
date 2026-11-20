@@ -121,7 +121,7 @@ impl Platform for OtherPlatform {
         None
     }
 
-    fn holds_tcp_peer(&self, _pid: u32, _peer: std::net::SocketAddr, _local: std::net::SocketAddr) -> Option<bool> {
+    fn tcp_ends_held_by(&self, _pid: u32, _local: std::net::SocketAddr) -> Option<Vec<std::net::SocketAddr>> {
         None
     }
 
