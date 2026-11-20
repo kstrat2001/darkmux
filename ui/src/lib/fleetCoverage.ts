@@ -1,13 +1,15 @@
 /**
- * (#2725, extracted from `components/FleetCoverageNotice.tsx`) The ONE
- * predicate and the ONE sentence this app uses for "the fleet presence
- * substrate could not be read".
+ * (#2725) The ONE predicate and the ONE caveat this app uses for "the fleet
+ * presence substrate could not be read".
  *
- * It lived inside the notice component, which was fine while the notice was
- * the only thing that asked the question. Two readers now do — the notice
- * (and the masthead marker that shares its hook) over
- * `/fleet/machines/live`, and `hooks/useLiveSessionIds` over
- * `/fleet/dispatches/live` — and those endpoints sit on the SAME Redis
+ * (#3662) There is no warning box for it any more: each surface that derives
+ * a claim from presence says what it knows. The masthead count carries the
+ * caveat below; the fleet cards and the machine page read a peer as "not
+ * streaming" / "not reported" (`useDegradedFleetSource`).
+ *
+ * Several readers ask the question — the masthead count, the fleet cards and
+ * the machine page over `/fleet/machines/live`, and `hooks/useLiveSessionIds`
+ * over `/fleet/dispatches/live` — and those endpoints sit on the SAME Redis
  * substrate and fail in the same state (`fleet_sessions_live_handler` and
  * `fleet_machines_live_handler` both emit `source_state::coverage_meta`).
  * A hook importing a component to borrow its predicate would have been the
@@ -21,9 +23,9 @@
 import type { CoverageMeta } from "../types/generated/CoverageMeta";
 import type { SourceState } from "../types/generated/SourceState";
 
-/** The fleet source state when it is worth warning about, `null` otherwise
+/** The fleet source state when it is degraded, `null` otherwise
  * (`ok`/`off`/nothing tracked/no answer yet). One predicate, so the masthead's
- * headline marker, the notice, and the session-liveness hook can never
+ * count, the cards, the machine page and the session-liveness hook can never
  * disagree about whether coverage is degraded. */
 export type DegradedFleetSource = Extract<SourceState, { state: "stale" } | { state: "unavailable" }>;
 
@@ -38,7 +40,7 @@ export type DegradedFleetSource = Extract<SourceState, { state: "stale" } | { st
  * being able to read the DAEMON (#2683 — a mid-session daemon death, where
  * the hooks hand every consumer an empty map/set that is indistinguishable
  * from a genuinely empty fleet). Both mean "presence could not be read",
- * which is what `fleetCoverageMessage` says; splitting them would be a second
+ * which is what `presenceCaveat` says; splitting them would be a second
  * vocabulary for one operator-visible condition.
  *
  * `off` and `ok` say nothing, deliberately: a standalone machine has no fleet
@@ -51,11 +53,11 @@ export function degradedFleetSource(meta: CoverageMeta | null, unreadable: boole
   return fleet as DegradedFleetSource;
 }
 
-/** The one sentence this app says about degraded presence, in its two
- * shapes. Verbatim from #1729 — the headline's marker reuses it as its
- * `title` rather than paraphrasing. */
-export function fleetCoverageMessage(fleet: DegradedFleetSource): string {
-  return fleet.state === "stale"
-    ? `Fleet presence is stale${"age_ms" in fleet ? ` (${Math.round(fleet.age_ms / 1000)}s old)` : ""} — machines and run counts below may have moved on.`
-    : "Fleet presence could not be read — machines and run counts below cover THIS MACHINE only, and are not the whole fleet.";
+/** (#3662) What the masthead count says about degraded presence, in a few
+ * words: the count still shows (the last answer beats no answer), and this
+ * says why it is not asserted bare. An unreadable presence leaves only this
+ * machine in the count (`metaLine.ts::machineCount` always counts self). */
+export function presenceCaveat(fleet: DegradedFleetSource): string {
+  if (fleet.state === "unavailable") return "this machine only: fleet presence unreadable";
+  return `fleet presence ${Math.round(fleet.age_ms / 1000)}s old`;
 }

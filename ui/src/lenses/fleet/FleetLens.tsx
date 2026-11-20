@@ -10,7 +10,7 @@ import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useNowMs } from "../../lib/clock";
 import { useLiveOverlay } from "../../lib/liveChannel";
 import { useCountUp } from "../../hooks/useCountUp";
-import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
+import { useDegradedFleetSource, useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useFleetView } from "../../hooks/useFleetView";
 import { useFlip } from "../../hooks/useFlip";
 import { orderCards } from "./cardOrder";
@@ -23,11 +23,13 @@ import { NO_UID_KEY, findUid, isSelfMachine, machineMatch, machineUids, uidForNa
 import type { FleetMachinesLiveResponse } from "../../types/generated/FleetMachinesLiveResponse";
 import type { FleetDispatchesLiveResponse } from "../../types/generated/FleetDispatchesLiveResponse";
 import type { RunsResponse } from "../../types/generated/RunsResponse";
+import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
+import type { FleetMachine } from "../../types/generated/FleetMachine";
 import { fmtN, fmtC } from "../../lib/format";
 import { Shimmer } from "../../components/Placeholder";
 import { usePlaybackClock } from "../../lib/pageClockRate";
 import { tokensOffMeter } from "./savings";
-import { buildFleetCardBase, withLiveReadings, shownExecution, cardFace, notStreamedNames, type CardSourcesAnswered } from "./cards";
+import { buildFleetCardBase, withLiveReadings, withPresenceUnread, shownExecution, cardFace, notStreamedNames, type CardSourcesAnswered } from "./cards";
 import { MachineCard } from "./MachineCard";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
@@ -35,14 +37,43 @@ import { rowFacts, rowSpecs } from "./viewRows";
 import { runsForMachine } from "../runs/format";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { workStatusKind } from "../../components/WorkStatus";
+import { HUB_UNREAD } from "../../lib/machineAvailability";
 
 /** (#3213) A flow-only card's absence as `buildFleetCardBase` reads it. The
  *  bucket of records with no hardware uid (`uidOf`'s "unknown") can never
  *  carry presence evidence (beats and online/offline edges always carry a
  *  uid), so with none it reads `null`: standing unknown, never online. Every
- *  other machine keeps reading absent only on positive evidence. */
-export const absentOrUnknown = (present: boolean | null, m: string): boolean | null =>
-  m === NO_UID_KEY && present === null ? null : present === false;
+ *  other machine keeps reading absent only on positive evidence.
+ *  `presenceUnread` (#3662): this page's presence read is stale or
+ *  unreadable, so no evidence is not "up" either: every machine reads `null`
+ *  (this machine is exempt by `cardIdentity`'s self rule once it is known). */
+export const absentOrUnknown = (present: boolean | null, m: string, presenceUnread = false): boolean | null =>
+  (m === NO_UID_KEY || presenceUnread) && present === null ? null : present === false;
+
+/** This machine's specs: its own row of the fleet view, else (#3662 review),
+ *  when the view holds no row for it (its read failed), `/machine/specs`.
+ *  `App` reads the same query key once per live page; this observer adds one
+ *  request at most when the cache is empty, and while the last read FAILED
+ *  re-asks at the presence cadence (`fetchJson` settles a failure as a
+ *  successful query, so nothing else would ever ask again), stopping once it
+ *  answers. Without it this machine's card was drawn as a stranger's
+ *  whenever the view failed. `live`: a daemon to ask. A row's own uid is not
+ *  used for self here: unless its card stated it (then the specs carry it
+ *  already), it came from the roster or the flow history, which can name an
+ *  older uid than the one this machine stamps now. */
+function useSelfSpecs(viewRows: readonly FleetMachine[] | null, live: boolean): MachineSpecsResponse | null {
+  const query = useQuery({
+    enabled: live,
+    queryKey: queryKeys.machineSpecs(),
+    queryFn: () => fetchJson<MachineSpecsResponse>("/machine/specs"),
+    refetchInterval: (q) => (q.state.data?.ok === false ? PRESENCE_POLL_MS : false),
+  });
+  const probed = live && query.data?.ok ? query.data.data : null;
+  return useMemo(() => {
+    const self = viewRows?.find((r) => r.is_this_machine);
+    return self ? rowSpecs(self) : probed;
+  }, [viewRows, probed]);
+}
 
 /** `sc()`. One token-class chip (value over label).
  *
@@ -73,12 +104,21 @@ type OffRow = { calls: number; tokens: number };
 /** (#3067) The hover text under the total: what it leaves out (machines not
  *  streaming here) and what it includes that no run's row shows (calls with no
  *  session, radio routing). A tooltip, so the hero keeps its height. */
-export function totalHint(noRun: OffRow, unlisted: OffRow, notStreaming: readonly string[]): string | undefined {
+export function totalHint(noRun: OffRow, unlisted: OffRow, notStreaming: readonly string[], hubUnread = false): string | undefined {
   const parts: string[] = [];
+  // (#3662) Records written since the hub went unread cannot be here.
+  if (hubUnread) parts.push(`Counts only records that reached this viewer: ${HUB_UNREAD}.`);
   if (notStreaming.length > 0) parts.push(`Counts only machines whose records reach this viewer. Not streaming here: ${notStreaming.join(", ")}.`);
   if (noRun.calls > 0) parts.push(`Includes ${fmtC(noRun.tokens)} tokens with no run (radio routing and probes).`);
   if (unlisted.calls > 0) parts.push(`Includes ${fmtC(unlisted.tokens)} tokens on runs not listed here.`);
   return parts.length > 0 ? parts.join(" ") : undefined;
+}
+
+/** The total's word: "all tokens" only when every machine's records can be
+ *  here; "tokens seen" when some machine does not stream here or (#3662) this
+ *  viewer cannot read the fleet hub. */
+function totalWord(notStreaming: readonly string[], hubUnread: boolean): string {
+  return notStreaming.length > 0 || hubUnread ? "tokens seen" : "all tokens";
 }
 
 /**
@@ -102,9 +142,14 @@ const SavingsHero = memo(function SavingsHero({
   liveMode,
   settled,
   notStreaming,
+  hubUnread,
 }: {
   tokens: ReturnType<typeof tokensOffMeter>;
   liveMode: boolean;
+  /** (#3662) This page's presence read is stale or unreadable: this viewer
+   *  cannot read the fleet hub, so whatever was written since cannot be in
+   *  the total, and it says it counts what is seen rather than "all". */
+  hubUnread: boolean;
   /** (5.0 R3) The names of machines whose records never reach this viewer.
    *  The total cannot include their tokens, so it says it counts what is
    *  seen rather than "all". */
@@ -196,9 +241,9 @@ const SavingsHero = memo(function SavingsHero({
           <div className="savlblwrap">
             <div
               className="savlbl"
-              title={totalHint(t.noRun, t.unlisted, notStreaming)}
+              title={totalHint(t.noRun, t.unlisted, notStreaming, hubUnread)}
             >
-              {notStreaming.length > 0 ? "tokens seen" : "all tokens"}
+              {totalWord(notStreaming, hubUnread)}
               {liveMode ? ` · last ${hours}h` : ""}
             </div>
             {t.utility && settled ? <div className="savpart"><span className="savpartv">{fmtC(t.utility)}</span> utility</div> : null}
@@ -241,13 +286,9 @@ const SavingsHero = memo(function SavingsHero({
  * `/fleet/dispatches/live` (presence), `/machine/specs` (this machine's own
  * hardware string).
  */
-// (#1729) The presence-coverage notice this lens used to own MOVED to
-// `components/FleetCoverageNotice.tsx` in #2683 and now mounts once, from
-// `App.tsx`, above every lens. It is not re-mounted here: the masthead makes
-// the same presence-derived claim this view does, one shared indicator covers
-// both, and two copies on the fleet route would have shown the identical
-// banner twice. The reasoning (and the unchanged wording) lives in that
-// component's own doc.
+// (#3662) Presence coverage has no notice here or above: when presence is
+// stale or unreadable each card says what is known (`withPresenceUnread`),
+// and the masthead count carries its own caveat.
 
 /**
  * (#1923 review) The `/runs` read failed — say so, rather than letting the
@@ -255,21 +296,13 @@ const SavingsHero = memo(function SavingsHero({
  *
  * The cards' lab-run count comes from `GET /runs`; a failed read yields the
  * same empty list a healthy idle machine does, so the card falls back to
- * exactly the "idle while a lab run is live" reading #1923 removed. It is
- * the sibling of the app-level `FleetCoverageNotice` (presence unreadable,
- * mounted from `App.tsx` since #2683) applied
- * to the other source this lens depends on, and follows `RunsBoard`'s own
- * habit of naming what it could not read instead of rendering the absence
- * as data.
+ * exactly the "idle while a lab run is live" reading #1923 removed. This
+ * follows `RunsBoard`'s own habit of naming what it could not read instead
+ * of rendering the absence as data.
  *
  * Deliberately does NOT say the machine IS running lab work — the whole
- * point is that this page no longer knows. `role="status"`, same as the
- * coverage notice: informational, never an interruption.
- *
- * Worded to share NO phrase with `FleetCoverageNotice`'s "could not be
- * read": the two can legitimately fire together (a machine that can reach
- * neither Redis nor its own `/runs`), and a reader — or a test's
- * `getByText` — has to be able to tell which source is missing.
+ * point is that this page no longer knows. `role="status"`: informational,
+ * never an interruption.
  */
 function RunsUnreadableNotice({ unreadable, message }: { unreadable: boolean; message?: string | null }) {
   if (!unreadable) return null;
@@ -403,8 +436,8 @@ const TimelineLanes = memo(function TimelineLanes({ timeline }: { timeline: Retu
  * Presence is the fifth: `liveMachines`/`liveSessionIds` are LIVE endpoints
  * describing NOW, so a replay must neither fetch nor consult them. Asserting
  * today's presence over a past day is exactly the "confidently WRONG:
- * machines read idle, running work reads zero" failure this file's own
- * coverage notice exists to warn about.
+ * machines read idle, running work reads zero" failure the cards' own
+ * presence handling (`withPresenceUnread`) exists to prevent.
  *
  * (#1869) `tMax` was a fixed ceiling (`computeTMax(records)`, the day's true
  * max) AND the de facto playhead until this packet — the two were always
@@ -583,15 +616,15 @@ export function FleetLens({
   // the property true in the composed app rather than only in this lens's own
   // isolated test.
   const liveMachines = useLiveMachines(livePolling);
-  // (#2725) `coverage` is deliberately NOT read here: this lens sits under
-  // the app-wide `FleetCoverageNotice` (`App.tsx` mounts it for every route),
-  // which already says the one sentence this app has about a degraded
-  // presence read — and it derives that from the machines half of the same
-  // substrate, so a sessions read that failed means the machines read failed
-  // too. A second marker on this page would be the duplicate wording #2683
-  // removed. Destructured explicitly rather than ignored implicitly so the
-  // choice is visible: the hook no longer discards the signal, this caller
-  // does, on the record, for a stated reason.
+  // (#3662) Whether that presence read can be believed. Same query key as
+  // the line above (one request answers both), gated identically. Under a
+  // stale or unreadable read a peer's card reads "not streaming"
+  // (`withPresenceUnread`); there is no notice above the cards to say it for
+  // them.
+  const presenceDegraded = useDegradedFleetSource(livePolling) !== null;
+  // The sessions half of the same substrate: a sessions read that failed
+  // means the machines read above failed too, so the caveat is taken from
+  // that one predicate rather than a second.
   const { sessions: liveSessionIds } = useLiveSessionIds(livePolling);
   // (#1855) The operator's DECLARED roster, gated the same way as presence
   // above — a replay must not assert the CURRENT roster over a past day.
@@ -611,10 +644,7 @@ export function FleetLens({
   // its card's specs are the self identity the naming and key rules read.
   const fleetView = useFleetView(liveMode);
   const viewRows = fleetView.rows;
-  const specs = useMemo(() => {
-    const self = viewRows?.find((r) => r.is_this_machine);
-    return self ? rowSpecs(self) : null;
-  }, [viewRows]);
+  const specs = useSelfSpecs(viewRows, livePolling);
   // (#1923) `GET /runs` — already fleet-aware, already unions lab + flow
   // sources server-side (`build_runs`) — read here ONLY to fill the gap
   // flow presence structurally cannot: a lab run in flight, which
@@ -657,9 +687,8 @@ export function FleetLens({
   // committed fixture) is NOT a failure: nothing was asked, so `isError` is
   // false and `data` is undefined, and both arms below stay quiet.
   //
-  // LIVE MODE ONLY, for the same reason `FleetCoverageNotice` is historical-
-  // gated: a replayed day is drawn from its records, so a failed `/runs` costs
-  // it nothing, and warning about it there would be the bug.
+  // LIVE MODE ONLY: a replayed day is drawn from its records, so a failed
+  // `/runs` costs it nothing, and warning about it there would be the bug.
   const runsUnreadable = liveMode && (runsQuery.isError || runsQuery.data?.ok === false);
   const runsErrorMessage = runsQuery.data && !runsQuery.data.ok ? runsQuery.data.message : null;
 
@@ -834,7 +863,7 @@ export function FleetLens({
         liveMachines,
         specs,
         presence,
-        absentOrUnknown(machPresent(flowWindow.data, liveMachines, playheadT, m), m),
+        absentOrUnknown(machPresent(flowWindow.data, liveMachines, playheadT, m), m, presenceDegraded),
         m,
         playheadT,
         null,
@@ -846,9 +875,10 @@ export function FleetLens({
     // The ONE place the card order is decided (`cardOrder.ts`): neither the
     // view's order nor the flow window's, so which source answered first
     // never moves a card.
-    return orderCards([...viewBases, ...flowBases], (b) => b.order).map((b) => b.base);
+    const bases = orderCards([...viewBases, ...flowBases], (b) => b.order).map((b) => b.base);
+    return presenceDegraded ? bases.map(withPresenceUnread) : bases;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
-  }, [viewCards, flowOnlyUids, flowWindow.data, liveEdgeClock, liveMachines, specs, presence, runs, roster, policy]);
+  }, [viewCards, flowOnlyUids, flowWindow.data, liveEdgeClock, liveMachines, specs, presence, runs, roster, policy, presenceDegraded]);
   const cards = useMemo(
     () => baseCards.map((b) => withLiveReadings(b, playheadT, connected, lastContactMs, liveOverlay)),
     [baseCards, playheadT, connected, lastContactMs, liveOverlay],
@@ -924,6 +954,7 @@ export function FleetLens({
         // one keeps the loading silhouette rather than counting up to "0".
         settled={flowWindow.settled && flowWindow.failure === null}
         notStreaming={notStreaming}
+        hubUnread={presenceDegraded}
       />
       <RunsUnreadableNotice unreadable={runsUnreadable} message={runsErrorMessage} />
       <RosterUnreadableNotice error={rosterError} />

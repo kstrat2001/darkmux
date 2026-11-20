@@ -199,6 +199,18 @@ darkmux release.
 
 ### Changed
 
+- **The viewer no longer shows a warning box when fleet presence can't be read (#3662).** The cards say
+  what is known instead. A peer reads "not streaming" (under "online" when its card was read), with static
+  in its scope, never "idle" or "0 running", and its tooltip says this viewer can't read the fleet hub
+  right now, so its live state is unknown; any recorded activity still shows and still counts. A peer
+  nothing says is up reads plain "not streaming"; a peer known to be down still reads "offline". The token
+  total reads "tokens seen", since records written while the hub is unread can't be in it. This machine's
+  card keeps showing its own records, also when the fleet view can't be read, as long as the daemon names
+  this machine (`/machine/specs`, asked again until it answers); until then no card claims "idle". A
+  peer's machine page reads "not reported · this viewer can't read the fleet hub right now", and `darkmux
+  machine list` gives a read peer the same reason. The masthead's machine count keeps its small ⚠, and its
+  tooltip now says why in a few words.
+
 - **A `procedural.shell` step gets every dependency's output as a file, and a variable too large for the
   environment is unset.** Each input is written whole to `$DARKMUX_STEP_INPUTS_DIR/<DEP-ID>`, an
   owner-only directory removed when the command finishes, whatever its size. An input that fits the

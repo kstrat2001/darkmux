@@ -7,12 +7,12 @@ import type { FlowReadFailure } from "../hooks/useFlowWindow";
  * the machine page hold "checking…" for the claims that read backs (see
  * `cardFace`'s doc, #2958); this says why.
  *
- * Mounted once, from `App.tsx`'s notice row beside `FleetCoverageNotice`,
- * because the window is app-wide: the masthead, the fleet cards and the
- * machine page all read it. Same `.fleetcov` shape and `role="status"` as its
- * siblings, and worded to share no phrase with any of them ("could not be
- * read", "unavailable", "unreadable"), so a reader, or a test's `getByText`,
- * can tell which source failed when more than one fires at once.
+ * Mounted once, from `App.tsx`'s notice row, because the window is app-wide:
+ * the masthead, the fleet cards and the machine page all read it. Same
+ * `.fleetcov` shape and `role="status"` as its siblings, and worded to share
+ * no phrase with any of them ("unavailable", "unreadable"), so a reader, or a
+ * test's `getByText`, can tell which source failed when more than one fires
+ * at once.
  */
 export function FlowReadNotice({ failure }: { failure: FlowReadFailure | null }) {
   if (failure === null) return null;

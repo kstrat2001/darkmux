@@ -27,13 +27,12 @@ import { PlaybackLens } from "./lenses/catalog/PlaybackLens";
 import { useFlowWindow } from "./hooks/useFlowWindow";
 import { useRouteRecords } from "./hooks/useRouteRecords";
 import { useLiveSessionIds } from "./hooks/useLiveSessionIds";
-import { useLiveMachines } from "./hooks/useLiveMachines";
+import { useDegradedFleetSource, useLiveMachines } from "./hooks/useLiveMachines";
 import { useLiveTail } from "./hooks/useLiveTail";
 import type { LiveTailStatus } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
 import { replayMetaLines, replayMetaParts } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
-import { FleetCoverageNotice, useDegradedFleetSource } from "./components/FleetCoverageNotice";
 import { FlowReadNotice } from "./components/FlowReadNotice";
 import { earliestRecordDate, firstRecordDate, missionReplayDate, todayUTC } from "./lib/flow";
 import { displayNameOf, localMachineUid, selfUidOf } from "./lib/machineIdentity";
@@ -524,8 +523,7 @@ export function App() {
   const liveMachines = useLiveMachines(isLiveRoute(route));
   // (#2683) Whether that map can be believed. Same query key as the line
   // above — one request answers both — gated identically, so this adds no
-  // poll a replay had just switched off. Feeds the headline's own marker;
-  // `FleetCoverageNotice` below renders the full sentence off the same hook.
+  // poll a replay had just switched off. Feeds the headline's own marker.
   const fleetCoverage = useDegradedFleetSource(isLiveRoute(route));
   // Gated for the SAME reason, and via the same two-sided rule: `/machine/specs`
   // is live-only,
@@ -628,10 +626,9 @@ export function App() {
   // "○ waiting for a machine" — a statement that presence answered and
   // nobody is there. Under degraded coverage presence did NOT answer (or
   // answered from a snapshot too old to trust), so the sentence is a claim
-  // this page cannot back up. The `FleetCoverageNotice` below the masthead
-  // says what is actually known; saying nothing here is the honest
-  // alternative, the same call `staticIdle` already makes for a build with
-  // no daemon to wait for.
+  // this page cannot back up. Saying nothing here is the honest alternative,
+  // the same call `staticIdle` already makes for a build with no daemon to
+  // wait for; the cards below say what is known (#3662).
   const metaLines = useMemo(
     () =>
       replayMeta
@@ -911,19 +908,12 @@ export function App() {
           phones so the lens above gets the full height" requirement — the
           lens in `#stage` is no longer followed by a full-width event-log
           section pushing the page's scroll further down. */}
-      {/* (#2683) Presence coverage, once, for the whole app. Every surface on
-          this page that counts machines or calls work "running" reads the
-          same presence substrate — the masthead headline right above this,
-          `MachineLens`, `RunsBoard`, and `FleetLens` — so the caveat belongs
-          where all four are covered by it, not in the one lens that happened
-          to get it first (#1729). Deliberately OUTSIDE `#meta`: that region
-          is parity-extracted by `innerText`, and it is a right-aligned corner
-          of the sticky tab row with no room for a sentence.
-
-          `:empty` on the wrapper is what keeps a healthy page from paying a
-          padded row for a notice that renders nothing — see `styles.css`. */}
+      {/* App-level notices. (#3662) Presence coverage has none: the cards and
+          the masthead count each say what is known when presence cannot be
+          read. `:empty` on the wrapper is what keeps a healthy page from
+          paying a padded row for a notice that renders nothing — see
+          `styles.css`. */}
       <div className="app-shell__notices">
-        <FleetCoverageNotice historical={!isLiveRoute(route)} />
         {/* (#2965) A failed `/flow/<day>` read. Live routes only: a replay
             reads its own day's records, not this window. */}
         <FlowReadNotice failure={isLiveRoute(route) ? flowWindow.failure : null} />
