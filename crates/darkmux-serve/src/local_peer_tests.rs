@@ -3,14 +3,38 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 
-/// The viewer daemon's router serving on a real loopback listener, wired
-/// the way `run` serves it; its address.
+/// The viewer daemon's router serving on a real loopback listener, through
+/// the entry point `run` serves it with (`serve_viewer`); its address.
 async fn viewer(flows: &Path) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     crate::record_bound_addr(Some(addr));
     let app = crate::build_router(flows.to_path_buf());
-    tokio::spawn(async move { axum::serve(listener, make_service(app)).await });
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let _running = stop;
+        crate::serve_viewer(listener, app, stopped).await
+    });
+    addr
+}
+
+/// A probe app served through the client listener's entry point
+/// (`client_pairing::serve_client_listener`): `/health` answers whether
+/// the request's peer was judged the operator's. Its address.
+async fn client_listener_probe() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = axum::Router::new().route(
+        "/health",
+        axum::routing::get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move {
+            axum::Json(serde_json::json!({ "operator": is_operator(peer) }))
+        }),
+    );
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let _running = stop;
+        crate::client_pairing::serve_client_listener(listener, app, stopped).await
+    });
     addr
 }
 
@@ -150,6 +174,24 @@ async fn a_process_in_a_host_sandbox_is_not_local() {
         mapped["fleet_token_set"].is_null(),
         "and over the mapped address: {mapped}"
     );
+}
+
+/// The client listener judges a loopback peer as the viewer does: this
+/// process and a process outside any sandbox are the operator's, a process
+/// in a host sandbox's session is not.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_client_listener_judges_a_loopback_peer_as_the_viewer_does() {
+    let root = tempfile::TempDir::new().unwrap();
+    let _state = StateDir::at(root.path());
+    let dir = sandbox_dir(root.path());
+    let addr = client_listener_probe().await;
+    let here = health_from_here("127.0.0.1", addr.port()).await;
+    assert_eq!(here["operator"], true, "this process: {here}");
+    let child = health_from_child("127.0.0.1", addr.port(), None).await;
+    assert_eq!(child["operator"], true, "a process outside any sandbox: {child}");
+    let sandboxed = health_from_child("127.0.0.1", addr.port(), Some(&dir)).await;
+    assert_eq!(sandboxed["operator"], false, "sandboxed work is not the operator: {sandboxed}");
 }
 
 /// A fake machine: the operator's CLI (pid 51), a host sandbox led by 100

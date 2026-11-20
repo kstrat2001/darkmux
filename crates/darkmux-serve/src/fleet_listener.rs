@@ -1323,55 +1323,39 @@ impl<K: std::hash::Hash + Eq + Clone> KeySlots<K> {
 
 /// Serve `app` on `listener` with [`ConnLimits`]: a connection past the cap
 /// is closed at once (so the listener never holds more than `max_conns`
-/// descriptors), headers must arrive within `header_read_timeout`, one
-/// request per connection, and no connection outlives `conn_deadline` plus
-/// `linger` (the answer, then the drain after it; the connection keeps its
-/// slots through both). The peer address is attached as `ConnectInfo` for
-/// the gate.
+/// descriptors; [`crate::bounded_serve::Admission`], which the viewer and
+/// the client listener share), headers must arrive within
+/// `header_read_timeout`, one request per connection, and no connection
+/// outlives `conn_deadline` plus `linger` (the answer, then the drain after
+/// it; the connection keeps its slots through both). The peer address is
+/// attached as `ConnectInfo` for the gate.
 pub(crate) async fn serve_bounded(
     listener: tokio::net::TcpListener,
     app: Router,
     limits: ConnLimits,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    let admission =
+        crate::bounded_serve::Admission::new("darkmux serve: fleet listener", limits.max_conns, limits.per_ip);
+    while let Some(conn) = admission.next(&listener, &mut shutdown).await {
+        tokio::spawn(one_request(conn, app.clone(), limits));
+    }
+}
+
+/// Serves one request on an admitted connection, then closes it
+/// ([`close_after_answer`]) while it still holds its slots.
+async fn one_request(conn: crate::bounded_serve::Admitted, app: Router, limits: ConnLimits) {
     use hyper_util::rt::{TokioIo, TokioTimer};
-    use hyper_util::service::TowerToHyperService;
-    let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_conns));
-    let per_ip = Arc::new(KeySlots::<std::net::IpAddr>::new(limits.per_ip));
-    loop {
-        let (stream, peer) = tokio::select! {
-            r = listener.accept() => match r {
-                Ok(x) => x,
-                Err(e) => {
-                    eprintln!("darkmux serve: fleet listener: accept failed ({e}); pausing 100ms");
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    continue;
-                }
-            },
-            _ = async { let _ = shutdown.wait_for(|v| *v).await; } => return,
-        };
-        let Some(ip_slot) = per_ip.try_take(peer.ip().to_canonical()) else {
-            drop(stream);
-            continue;
-        };
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
-            drop(stream);
-            continue;
-        };
-        let svc = TowerToHyperService::new(app.clone().layer(Extension(ConnectInfo(peer))));
-        tokio::spawn(async move {
-            let _permit = permit;
-            let _ip_slot = ip_slot;
-            let conn = hyper::server::conn::http1::Builder::new()
-                .timer(TokioTimer::new())
-                .header_read_timeout(limits.header_read_timeout)
-                .keep_alive(false)
-                .serve_connection(TokioIo::new(stream), svc)
-                .without_shutdown();
-            if let Ok(Ok(parts)) = tokio::time::timeout(limits.conn_deadline, conn).await {
-                close_after_answer(parts.io.into_inner(), limits.linger, limits.linger_bytes).await;
-            }
-        });
+    let crate::bounded_serve::Admitted { stream, peer, slots: _slots } = conn;
+    let svc = crate::bounded_serve::connection_service(app, ConnectInfo(peer));
+    let conn = hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.header_read_timeout)
+        .keep_alive(false)
+        .serve_connection(TokioIo::new(stream), svc)
+        .without_shutdown();
+    if let Ok(Ok(parts)) = tokio::time::timeout(limits.conn_deadline, conn).await {
+        close_after_answer(parts.io.into_inner(), limits.linger, limits.linger_bytes).await;
     }
 }
 

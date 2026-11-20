@@ -7,7 +7,8 @@
 //! 127.0.0.1. Neither is the operator, and neither may read what only the
 //! operator's side reads. So every listener that trusts a request from this
 //! machine ([`crate::is_local_at`]) also asks who holds the other end of its
-//! connection, once per connection ([`make_service`]):
+//! connection, once per connection ([`judged`], with a [`PeerConn`] the
+//! listener makes for each connection, `bounded_serve::serve_kept_alive`):
 //!
 //! - **The operator** ([`PeerProcess::Operator`]): a process of this user
 //!   outside every host sandbox, and not a container engine's forwarder
@@ -65,11 +66,9 @@
 //! - Another user's process on this machine is never the operator: the
 //!   socket lookup cannot see it, so it reads as remote.
 
-use axum::extract::connect_info::{Connected, IntoMakeServiceWithConnectInfo};
 use axum::extract::{ConnectInfo, Request};
 use axum::middleware::Next;
 use axum::response::Response;
-use axum::serve::IncomingStream;
 use axum::Router;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -218,8 +217,8 @@ impl Drop for Verdict {
     }
 }
 
-/// What a listener served through [`make_service`] knows of a connection:
-/// both its ends, when it was accepted, and its verdict.
+/// What a listener knows of a connection ([`PeerConn::new`], once per
+/// connection): both its ends, when it was accepted, and its verdict.
 #[derive(Clone)]
 pub(crate) struct PeerConn {
     remote: SocketAddr,
@@ -228,29 +227,33 @@ pub(crate) struct PeerConn {
     verdict: Arc<Verdict>,
 }
 
-impl Connected<IncomingStream<'_>> for PeerConn {
-    fn connect_info(target: IncomingStream<'_>) -> Self {
-        let remote = target.remote_addr();
+impl PeerConn {
+    /// A connection just accepted from `remote`, on the listener's own
+    /// address `local` (`None`: it could not be read, and a loopback peer
+    /// then reads as unknown), not judged yet. Made once per connection
+    /// and put on each of its requests as `ConnectInfo<PeerConn>`.
+    pub(crate) fn new(remote: SocketAddr, local: Option<SocketAddr>) -> Self {
         let verdict = Arc::new(Verdict {
             remote,
             judged: tokio::sync::OnceCell::new(),
         });
         PeerConn {
             remote,
-            local: target.local_addr().ok(),
+            local,
             accepted: Instant::now(),
             verdict,
         }
     }
 }
 
-/// `app` as every listener that trusts this machine serves it: each
-/// request carries its peer's address (`ConnectInfo<SocketAddr>`, as the
-/// handlers read it), and a loopback connection is judged
-/// ([`judge_peer`]) before any of its requests reaches a route.
-pub(crate) fn make_service(app: Router) -> IntoMakeServiceWithConnectInfo<Router, PeerConn> {
+/// `app` as every listener that trusts this machine serves it: given a
+/// request carrying its connection's [`PeerConn`], each request carries its
+/// peer's address instead (`ConnectInfo<SocketAddr>`, as the handlers read
+/// it), and a loopback connection is judged ([`judge_peer`]) before any of
+/// its requests reaches a route. Applied once to the app, not per
+/// connection.
+pub(crate) fn judged(app: Router) -> Router {
     app.layer(axum::middleware::from_fn(judge_peer))
-        .into_make_service_with_connect_info::<PeerConn>()
 }
 
 /// Puts the peer's address on the request and, for a loopback peer, waits

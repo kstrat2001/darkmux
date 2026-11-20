@@ -211,6 +211,25 @@ darkmux release.
 
 ### Fixed
 
+- **The viewer and the client listener cap their connections and close an idle one.** `darkmux serve`
+  and `darkmux client serve` now serve as the fleet listener does: at most 256 connections at once for
+  the viewer (128 from one address) and 64 for the client listener, one past the cap closed as it is
+  accepted, and a connection that sends no complete request within 10 seconds (an idle kept-alive one
+  included) closed. A peer that opened connections and sent nothing could otherwise hold them all open
+  and use up the file descriptors the process needs. Keep-alive, streamed answers (the viewer's live
+  feeds) and WebSocket upgrades work as before.
+- **A preview's streaming answer ends with its session.** An answer a preview was still streaming
+  through the tailnet entry (a long download, a dev server's event stream) kept streaming after its
+  session ended; it is now cut within a second of the session ending (previews turned off, the device
+  revoked, the preview stopped or restarted, `client serve` stopping), as an open WebSocket is.
+- **Checking a client's token no longer locks the client store for writing.** Every request with a
+  bearer token took `clients.json`'s exclusive lock and set its mode; it now reads the store under its
+  shared lock and writes nothing, so requests no longer queue on each other. A revoked token is still
+  refused on its next request.
+- **A pairing request's code and device name refuse characters that would show other than as sent.** A
+  `device_name` with a bidirectional control or mark or a zero-width character, and a `code` with any
+  invisible, formatting or right-to-left character, are refused `bad_request`: the operator compares
+  the code character for character before approving.
 - **A typo in a hook rule's `match` is refused instead of widening the rule.** A `match` takes its
   named fields and `payload.<path>` predicates; any other key (`"levle": "error"`) was dropped on load,
   so a webhook meant for errors fired on every matching action. Every entry point now refuses it at
