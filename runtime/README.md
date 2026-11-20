@@ -38,6 +38,8 @@ A container-bounded in-house runtime replaces both layers:
 | `write` | `{ path, content }` | Canonical |
 | `bash` | `{ command, timeout_seconds? }` | Runs with cwd=/workspace |
 
+Under a sandbox on the host (Seatbelt, Landlock) the workspace is wherever the host has it, which `DARKMUX_RUNTIME_WORKSPACE` names. Model-facing text then never names that path (#3654). The tool descriptions and the user's message call the workspace the current directory (`/workspace/x` reads `./x`). Every tool runs there, and each path a tool returns is relative to it (`tools::workspace::shown`). A container's text is byte for byte unchanged, and both are pinned in `testdata/request-bytes/`.
+
 Every file tool opens with `O_NOFOLLOW | O_NONBLOCK` and refuses anything but a regular file (a directory, a named pipe, a socket, a device) before it reads or writes a byte: a named pipe would otherwise block a call that has no deadline.
 
 Tool order in the request: `[Search, Read, Edit, Write, Bash]` — search first (positional preference).

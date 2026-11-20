@@ -640,13 +640,14 @@ const WORKSPACE_AT: &str = "/workspace";
 
 /// The prompt as the dispatch gives it to the model, whose workspace is
 /// `sandbox_dir`, under `kind`: `/workspace` in a container (byte for
-/// byte what every Docker run was told), the workspace's own host path in a
-/// sandbox on the host (#3112 review: a Seatbelt brief that said
-/// `/workspace` sent the model looking for files that are not there). The
-/// same answer the dispatch's own mount gives (`SandboxBackend::place`).
+/// byte what every Docker run was told), the current directory in a sandbox
+/// on the host, where the runtime runs every tool (#3112 review: a Seatbelt
+/// brief that said `/workspace` sent the model looking for files that are
+/// not there; #3654: the host path names the user). The dispatch's own
+/// system prompt names it the same way (`workspace_paths::model_root`).
 pub(crate) fn dispatched_prompt_for(loaded: &LoadedWorkload, sandbox_dir: &Path, kind: Option<darkmux_sandbox::BackendKind>) -> Result<String> {
-    let seen = darkmux_sandbox::seen_at(kind, sandbox_dir, WORKSPACE_AT);
-    Ok(expand_placeholders_with(&resolve_prompt(loaded)?, &seen))
+    let named = darkmux_crew::mission_config::workspace_paths::model_root(kind, sandbox_dir);
+    Ok(expand_placeholders_with(&resolve_prompt(loaded)?, named))
 }
 
 /// The prompt as the eval wrote it for grading: the placeholders expanded
@@ -3005,13 +3006,14 @@ mod tests {
         assert!(run_verify_command(None, tmp.path(), tmp.path()).unwrap().is_none());
     }
 
-    /// (#3112 review, live-proven) The dispatched prompt names the
-    /// workspace where the sandbox sees it: `/workspace` in a container,
-    /// byte for byte as before; its own host path in a sandbox on the host.
-    /// A Seatbelt brief that said `/workspace` sent the model looking for a
-    /// file that is not there. The graded prompt keeps the eval's own words.
+    /// (#3112 review, #3654) The dispatched prompt names the workspace as
+    /// its model sees it: `/workspace` in a container, byte for byte as
+    /// before; the current directory in a sandbox on the host, where every
+    /// tool runs (a Seatbelt brief that said `/workspace` sent the model
+    /// looking for a file that is not there, and the host path names the
+    /// user). The graded prompt keeps the eval's own words.
     #[test]
-    fn the_prompt_names_the_workspace_where_the_sandbox_sees_it() {
+    fn the_prompt_names_the_workspace_as_its_model_sees_it() {
         use darkmux_sandbox::BackendKind;
         let tmp = TempDir::new().unwrap();
         let sandbox = tmp.path().join("sb");
@@ -3019,15 +3021,17 @@ mod tests {
         let mut spec = basic_spec();
         spec.prompt = Some("Fix ${SANDBOX}/bug.py so the tests in ${SANDBOX_DIR} pass.".into());
         let loaded = make_loaded(spec, tmp.path().to_path_buf());
-        let real = sandbox.canonicalize().unwrap().display().to_string();
         assert_eq!(
             dispatched_prompt_for(&loaded, &sandbox, Some(BackendKind::Docker)).unwrap(),
             "Fix /workspace/bug.py so the tests in /workspace pass."
         );
-        assert_eq!(
-            dispatched_prompt_for(&loaded, &sandbox, Some(BackendKind::Seatbelt)).unwrap(),
-            format!("Fix {real}/bug.py so the tests in {real} pass.")
-        );
+        for kind in [BackendKind::Seatbelt, BackendKind::Landlock] {
+            assert_eq!(
+                dispatched_prompt_for(&loaded, &sandbox, Some(kind)).unwrap(),
+                "Fix ./bug.py so the tests in . pass.",
+                "{kind:?}"
+            );
+        }
         assert_eq!(graded_prompt(&loaded).unwrap(), "Fix /workspace/bug.py so the tests in /workspace pass.");
     }
 
@@ -3066,7 +3070,7 @@ mod tests {
         }
         assert_eq!(docker.unwrap(), "Fix /workspace/bug.py");
         let (prompt, plan) = host.unwrap();
-        assert_eq!(prompt, format!("Fix {}/bug.py", sandbox.canonicalize().unwrap().display()));
+        assert_eq!(prompt, "Fix ./bug.py");
         let runner = plan.expect("a verify plan").runner;
         assert_eq!((runner.placement, runner.sandbox), (Placement::Container("host".into(), darkmux_sandbox::BackendKind::Seatbelt), Some(BackendKind::Seatbelt)));
     }

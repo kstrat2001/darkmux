@@ -134,8 +134,11 @@ describe("machine lens — at-rest prose budget", () => {
     const words = visibleWords(container.querySelector(".machine-lens") as HTMLElement);
     // Measured 293 before the trim, 256 after. The ceiling sits just above
     // the post-trim figure: an honest one-word copy fix must not fail the
-    // suite, and restoring either deleted paragraph must.
-    expect(words).toBeLessThanOrEqual(262);
+    // suite, and restoring either deleted paragraph must. (#3662) +3: the demo
+    // fixture now carries this machine's uid, so the header names its own
+    // hardware ("— Apple M5 Ultra · 256 GB") as a live machine's page does.
+    // A fact the page was missing, not prose.
+    expect(words).toBeLessThanOrEqual(265);
   });
 
   it("an unpriced resident adds a short row hint; an estimated resident adds one machine-wide line, not a paragraph each", async () => {
@@ -166,8 +169,10 @@ describe("machine lens — at-rest prose budget", () => {
     // recorded exception: (#2915) the Utility section the operator asked for
     // (2026-09-26) adds its model, facts, live and per-job lines (a fixed
     // row per known job plus one "other"), measured at 339 here. That is a
-    // new section, not prose regrowing on an old one.
-    expect(words).toBeLessThanOrEqual(339);
+    // new section, not prose regrowing on an old one. (#3662) +6: the
+    // header's hardware line, as in the case above (the fixture now carries
+    // its uid). A fact, not prose.
+    expect(words).toBeLessThanOrEqual(345);
   });
 
   // (#2440 cut 4 supersedes fix-loop 4's finding above) The operator's own

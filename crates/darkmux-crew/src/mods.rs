@@ -588,6 +588,10 @@ pub fn attachments_dir_at(root: &Path, key: &str) -> PathBuf {
 /// keeps the two from drifting apart while both stay green.
 pub const CONTAINER_MODS_BASE: &str = "/darkmux-mods";
 
+/// (#3654) The environment variable a sandbox on the host names the mod
+/// store with.
+pub const MODS_ENV: &str = "DARKMUX_MODS";
+
 /// The container path one mod's `attachments/` is mounted at.
 pub fn attachments_container_dir(key: &str) -> String {
     format!("{CONTAINER_MODS_BASE}/{key}/attachments")
@@ -2052,6 +2056,13 @@ mod tests {
         assert_eq!(strip_kit_source_prefix_under(Some("/Users/op/tree"), "app", host), strip_kit_source_prefix("app", docker));
         assert_eq!(kit_in_container_coords(Some("/Users/op/tree"), host), docker);
         assert_eq!(kit_in_container_coords(None, host), host);
+        // (#3654) A kit written from the current directory (`./<source>/…`,
+        // with or without the `a/`/`b/` markers) maps the same way.
+        let dotted = "diff --git a/./app/src/a.ts b/./app/src/a.ts\n--- a/./app/src/a.ts\n+++ b/./app/src/a.ts\n@@ -1 +1 @@\n-./app/x\n+y\n";
+        let plain = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-./app/x\n+y\n";
+        assert_eq!(strip_kit_source_prefix_under(Some("/Users/op/tree"), "app", dotted), plain);
+        assert_eq!(strip_kit_source_prefix("app", dotted), plain);
+        assert_eq!(strip_kit_source_prefix("app", "--- ./app/x.ts\n"), "--- x.ts\n");
         // Case 2 — the SAME string as a repo-relative path in a repo with a
         // top-level `app/`. Indistinguishable, so it is over-stripped.
         // KNOWN LIMITATION, not a desired behavior.

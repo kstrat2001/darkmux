@@ -186,9 +186,10 @@ pub fn record_path_at(root: &Path, execution: &str, seq: u64) -> PathBuf {
 /// A dispatch sees its workspace at `/workspace/<source-id>/…`; every
 /// host-side consumer of a finding — the diff, `mods.gate`'s scratch
 /// checkout, `deliver.github_review`'s in-diff test — speaks the
-/// repo-relative path. Both container forms map: the absolute one the
-/// unit's own instructions ask for, and the bare `<source-id>/<rel>` a
-/// model produces by copying its scope listing verbatim. Anything else
+/// repo-relative path. Every container form maps: the absolute one the
+/// unit's own instructions ask for, the bare `<source-id>/<rel>` a model
+/// produces by copying its scope listing verbatim, and `./<source-id>/<rel>`,
+/// which a sandbox on the host's brief lists (#3654). Anything else
 /// falls through unchanged — this maps a KNOWN prefix, it never guesses at
 /// a leading path segment.
 ///
@@ -227,6 +228,9 @@ pub fn strip_source_prefix(source_id: &str, raw: &str) -> String {
     if let Some(rel) = raw.strip_prefix(&format!("/workspace/{source_id}/")) {
         return rel.to_string();
     }
+    // (#3654) A sandbox on the host's brief names the tree as the current
+    // directory, so its model cites `./<source>/<rel>`.
+    let raw = raw.strip_prefix("./").filter(|rest| rest.starts_with(&format!("{source_id}/"))).unwrap_or(raw);
     if let Some(rel) = raw.strip_prefix(&format!("{source_id}/")) {
         return rel.to_string();
     }
@@ -400,7 +404,11 @@ pub fn load_at(root: &Path, execution: &str, seq: u64) -> Result<Option<FindingR
 /// doctrine in `CLAUDE.md`).
 pub fn brief_block(record: &FindingRecord) -> String {
     let pretty = |v: &serde_json::Value| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
-    let context = serde_json::to_value(&record.context).unwrap_or(serde_json::Value::Null);
+    // (#3654) `root` is the host path a sandbox on the host saw the workspace
+    // at, kept for mapping the record's paths: it names the user's home and
+    // is never handed to a model. A container's record has none.
+    let context = record.context.as_ref().map(|c| darkmux_flow::payload::RecordContext { root: None, ..c.clone() });
+    let context = serde_json::to_value(&context).unwrap_or(serde_json::Value::Null);
     format!(
         "<finding key=\"{key}\">\n\
          <darkmux-term name=\"finding\">something an earlier agent observed and \
@@ -835,6 +843,58 @@ mod tests {
         assert!(block.contains("unnamed-predicate"), "the launcher's context is present: {block}");
         assert!(block.contains("create_mod"), "tells the model how to record a change: {block}");
         assert!(block.contains("in `for`"), "and which field names this finding: {block}");
+    }
+
+    /// (#3654) A brief that names the tree as the current directory teaches
+    /// the model to cite `./<source>/<rel>`: the store maps it to the repo
+    /// path exactly as `/workspace/<source>/<rel>`, under a host root or none.
+    #[test]
+    fn a_finding_cited_from_the_current_directory_is_stored_as_the_repo_path() {
+        let rec = |context: serde_json::Value, file: &str| {
+            build_record(
+                "sess-dot",
+                1,
+                "2026-09-05T00:00:00Z".into(),
+                "create_finding",
+                Proposer { handle: "reviewer".into(), model: "m".into(), machine_id: None },
+                Scope::default(),
+                Some(ctx(context)),
+                serde_json::json!({"file": file, "line": 3}),
+            )
+        };
+        let host = rec(serde_json::json!({"source": "app", "root": "/Users/op/tree"}), "./app/src/auth.ts");
+        assert_eq!(host.emitted["file"], "src/auth.ts");
+        assert_eq!(rec(serde_json::json!({"source": "app"}), "./app/src/auth.ts").emitted["file"], "src/auth.ts");
+        // `./` names the current directory, never a source: only `./<source>/` maps.
+        assert_eq!(rec(serde_json::json!({"source": "app"}), "./lib/x.ts").emitted["file"], "./lib/x.ts");
+        assert_eq!(strip_source_prefix("app", "./app/x"), "x");
+    }
+
+    /// (#3654) A finding recorded under a sandbox on the host carries the
+    /// host path its sandbox saw the workspace at (`context.root`, for
+    /// mapping its file back to the source). The brief block never hands
+    /// that to the next model: it names the user's home. The rest of the
+    /// context is there, and a record with no root (a container's) renders
+    /// as it always has.
+    #[test]
+    fn a_brief_block_never_carries_the_host_root_a_finding_was_recorded_under() {
+        let record = |context: serde_json::Value| {
+            build_record(
+                "sess-a",
+                7,
+                "2026-09-03T00:00:00Z".into(),
+                "create_finding",
+                Proposer { handle: "crawler".into(), model: "m".into(), machine_id: None },
+                Scope::default(),
+                Some(ctx(context)),
+                serde_json::json!({"file": "src/x.ts", "line": 82}),
+            )
+        };
+        let hosted = brief_block(&record(serde_json::json!({"source": "app", "root": "/Users/op/tree"})));
+        assert!(!hosted.contains("/Users/op") && !hosted.contains("\"root\""), "{hosted}");
+        assert!(hosted.contains("\"source\": \"app\""), "{hosted}");
+        let contained = brief_block(&record(serde_json::json!({"source": "app"})));
+        assert_eq!(hosted, contained, "the root is the only difference");
     }
 
     use super::*;

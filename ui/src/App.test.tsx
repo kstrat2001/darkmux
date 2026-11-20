@@ -1933,12 +1933,10 @@ describe("App", () => {
  * #1729; the masthead, which makes the same claim on every other route, had
  * not.
  *
- * These are the MOUNT assertions — that the shared notice is actually on
- * screen, and that the headline itself is marked. The component's own state
- * matrix lives in `components/FleetCoverageNotice.test.tsx`. Both halves
- * exist because the regression this whole marker has already suffered once
- * was precisely a component whose own tests kept passing while it stopped
- * being mounted.
+ * (#3662) The shared notice under the masthead is gone: the cards say what
+ * is known (`FleetLens.test.tsx`, `MachineLens.test.tsx`), and the headline
+ * itself carries its caveat in a few words. These pin that the headline is
+ * marked and that no presence warning box renders, in every degraded state.
  */
 describe("App — presence coverage on the masthead", () => {
   // Two pieces of leaked state, both of which turned these cases into a
@@ -2002,25 +2000,42 @@ describe("App — presence coverage on the masthead", () => {
     expect(container.querySelector(".fleetcov")).toBeNull();
   });
 
-  it("marks the count AND shows the shared notice when presence is stale", async () => {
+  // (#3662) No warning box under the masthead: the cards say what is known.
+  // The count is still marked (the last answer beats no answer), and says in
+  // a few words why it is not asserted bare. The long #1729 sentence is gone
+  // from the page entirely, not moved.
+  it("marks the count, with no warning box, when presence is stale", async () => {
     mockPresence({
       machines: [BEAT("a"), BEAT("b")],
       meta: { sources: { fleet: { state: "stale", age_ms: 41200, detail: "x" } }, complete: false },
     });
     const { container } = renderApp();
-    await waitFor(() => expect(container.querySelector('.fleetcov[data-state="stale"]')).toBeTruthy());
-    // The wording is #1729's, unchanged — the point of sharing the component
-    // rather than writing a second staleness vocabulary for the masthead.
-    expect(
-      container.querySelector(".fleetcov")?.textContent,
-    ).toContain("Fleet presence is stale (41s old) — machines and run counts below may have moved on.");
-    // …and the claim itself carries the caveat, not just the banner: the
-    // count is still shown (the last answer beats no answer) but it is no
-    // longer asserted bare.
+    await waitFor(() => expect(container.querySelector('.mco[data-coverage="stale"]')).toBeTruthy());
     const mco = container.querySelector(".mco") as HTMLElement;
-    expect(mco.getAttribute("data-coverage")).toBe("stale");
     expect(mco.textContent).toContain("2");
-    expect(mco.getAttribute("title")).toBe("Fleet presence is stale (41s old) — machines and run counts below may have moved on.");
+    expect(mco.getAttribute("title")).toBe("fleet presence 41s old");
+    expect(container.querySelector(".fleetcov"), "no presence warning box").toBeNull();
+    expect(document.body.innerHTML).not.toContain("may have moved on");
+  });
+
+  it("counts only this machine, marked, with no warning box, when the daemon cannot read presence", async () => {
+    mockPresence({ machines: [], meta: { sources: { fleet: { state: "unavailable", detail: "x" } }, complete: false } });
+    const presence = vi.mocked(fetch).getMockImplementation()!;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) =>
+        String(url) === "/machine/specs"
+          ? Promise.resolve(new Response(JSON.stringify({ machine_id: "MacBook-Pro", machine_uid: "u-self" }), { status: 200 }))
+          : presence(url),
+      ),
+    );
+    const { container } = renderApp();
+    await waitFor(() => expect(container.querySelector('.mco[data-coverage="unavailable"]')).toBeTruthy());
+    const mco = container.querySelector(".mco") as HTMLElement;
+    expect(mco.textContent).toContain("1");
+    expect(mco.getAttribute("title")).toBe("this machine only: fleet presence unreadable");
+    expect(container.querySelector(".fleetcov"), "no presence warning box").toBeNull();
+    expect(document.body.innerHTML).not.toContain("could not be read");
   });
 
   it("stops claiming the fleet is empty when the presence READ failed — a daemon death mid-session", async () => {
@@ -2032,9 +2047,13 @@ describe("App — presence coverage on the masthead", () => {
     // nobody is there — off a read that never happened.
     mockPresence(null, 503);
     const { container } = renderApp();
-    await waitFor(() => expect(container.querySelector('.fleetcov[data-state="unavailable"]')).toBeTruthy());
-    expect(container.querySelector(".fleetcov")?.textContent).toContain("Fleet presence could not be read");
+    await waitFor(() =>
+      expect(vi.mocked(fetch).mock.calls.filter(([u]) => String(u).includes("/fleet/machines/live")).length).toBeGreaterThan(0),
+    );
+    await new Promise((r) => setTimeout(r, 50));
     expect(screen.queryByText(/waiting for a machine/i), "no claim beats a false one").not.toBeInTheDocument();
+    expect(container.querySelector(".fleetcov"), "no presence warning box").toBeNull();
+    expect(document.body.innerHTML).not.toContain("could not be read");
   });
 
   // (#2965) A failed `/flow/<day>` read has its own notice, in the same

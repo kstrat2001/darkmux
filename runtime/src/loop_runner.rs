@@ -2781,15 +2781,12 @@ fn detector_code_hash(canonical_args: &str) -> Option<String> {
     /// 10 MiB — far above any source file a coder dispatch edits; a larger
     /// "file" is almost certainly not code, so skip rather than read it all.
     const MAX_HASH_BYTES: u64 = 10 * 1024 * 1024;
-    // The model's `path` is resolved by the file tools against the container
-    // workspace root (`/workspace`, the Dockerfile `WORKDIR`). This bare
-    // `std::fs` read resolves a relative path against the process cwd — which
-    // is that same `/workspace` because of the `WORKDIR`. The coupling is
-    // implicit: a relative path lands on the right file ONLY while cwd ==
-    // `/workspace`. If a future change adds a configurable workspace root, this
-    // must resolve against it too. Failing that, the worst case is a `None`
-    // hash (a missed staleness signal), never a wrong-file hash for a path that
-    // doesn't resolve — best-effort by design.
+    // The model's `path` is resolved as the file tools resolve it: a relative
+    // one against the run's workspace root (`/workspace` in a container, the
+    // host path a sandbox on the host names, #3654), an absolute one as
+    // itself. The worst case is a `None` hash (a missed staleness signal),
+    // never a wrong-file hash for a path that doesn't resolve — best-effort
+    // by design.
     let path = serde_json::from_str::<serde_json::Value>(canonical_args)
         .ok()?
         .get("path")?
@@ -2797,7 +2794,8 @@ fn detector_code_hash(canonical_args: &str) -> Option<String> {
         .to_owned();
     // One open, never a named pipe or device (a swap after a separate check
     // could block the loop for ever), refused unread over the cap.
-    let bytes = crate::tools::workspace::read_whole_regular_bytes(std::path::Path::new(&path), MAX_HASH_BYTES).ok()?;
+    let path = crate::tools::workspace::root().join(path);
+    let bytes = crate::tools::workspace::read_whole_regular_bytes(&path, MAX_HASH_BYTES).ok()?;
     Some(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -15099,6 +15097,23 @@ mod tests {
         // Content change → different hash (the staleness signal).
         std::fs::write(&file, b"fn main() { changed }").unwrap();
         assert_ne!(detector_code_hash(&args).as_deref(), Some(h1.as_str()));
+    }
+
+    /// (#3654) A relative `path` is the file the tools resolved it to, under
+    /// the run's workspace root: a model in a sandbox on the host is told to
+    /// work in the current directory, and the runtime's own process does not
+    /// run there.
+    #[test]
+    #[serial_test::serial(runtime_workspace_env)]
+    fn detector_code_hash_resolves_a_relative_path_against_the_workspace_root() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("a.rs"), b"fn main() {}").unwrap();
+        std::env::set_var(crate::tools::workspace::WORKSPACE_ENV, ws.path());
+        let relative = detector_code_hash(r#"{"path":"a.rs"}"#);
+        std::env::remove_var(crate::tools::workspace::WORKSPACE_ENV);
+        let absolute = serde_json::json!({ "path": ws.path().join("a.rs").to_str().unwrap() }).to_string();
+        assert!(relative.is_some());
+        assert_eq!(relative, detector_code_hash(&absolute));
     }
 
     #[test]

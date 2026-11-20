@@ -36,7 +36,7 @@ import type { PresenceBeat } from "../../types/generated/PresenceBeat";
 // machine lens and the app shell need the identical self-identity rule and a
 // second copy of it is how the two surfaces disagree about which machine
 // they are on.
-import { displayNameOf, isSelfMachine, uidOf } from "../../lib/machineIdentity";
+import { NO_UID_KEY, displayNameOf, isSelfMachine, uidOf } from "../../lib/machineIdentity";
 import type { RosterName } from "../../lib/machineIdentity";
 import type { Run } from "../../types/generated/Run";
 import { utilityReading, utilityStrip, type UtilityReading, type UtilityStrip } from "../../lib/utilityJobs";
@@ -44,7 +44,7 @@ import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { DEFAULT_POLICY, isRunning, lifecycleAt, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
 import { currentRun, runIndex, type RunGroup } from "../../lib/runRef";
-import { machineAvailability, type MachineAvailability } from "../../lib/machineAvailability";
+import { HUB_UNREAD, machineAvailability, underUnreadPresence, type MachineAvailability } from "../../lib/machineAvailability";
 import { CardStatus } from "./cardStatus";
 import { RUNNING_WORD } from "../../components/WorkStatus";
 import type { CardResidents } from "../../lib/machineEngine";
@@ -202,8 +202,7 @@ function runningLabRunCount(machineRuns: Run[]): number {
  *   and the old string made its card assert that the machine had answered
  *   and withheld its hardware.
  *
- * The distinction is the same one the fleet-coverage notice draws one level
- * up, and the same one `specOf`'s `unknown`-uid branch already draws for
+ * The distinction is the same one `specOf`'s `unknown`-uid branch already draws for
  * identity: "we looked and it said nothing" is not "we could not look". */
 export type SpecUnknownReason = "not-reported" | "not-seen";
 
@@ -400,9 +399,18 @@ export interface FleetCard {
  *  never have any), so it reads unknown, never online, and carries a reason:
  *  a `null` note would say the card was read and the status line would claim
  *  "online". */
-function flowOnlyStanding(machAbsent: boolean | null): { standing: Standing; note: string | null } {
-  if (machAbsent === null) return { standing: "unknown", note: "it carries no machine id, so nothing can say whether it is up" };
+function flowOnlyStanding(machAbsent: boolean | null, m: string, selfKnown: boolean): { standing: Standing; note: string | null } {
+  if (machAbsent === null) return { standing: "unknown", note: unknownStandingNote(m, selfKnown) };
   return { standing: machAbsent ? "offline" : "online", note: null };
+}
+
+/** Why a flow-only card's standing is unknown. (#3662) Under an unread hub,
+ *  "nothing says whether it is up" only once this machine is known
+ *  (`selfKnown`): until then the card may be this machine, which is up by
+ *  definition, so it says only that the hub cannot be read. */
+function unknownStandingNote(m: string, selfKnown: boolean): string {
+  if (m === NO_UID_KEY) return "it carries no machine id, so nothing can say whether it is up";
+  return selfKnown ? `${HUB_UNREAD}, so nothing says whether it is up` : HUB_UNREAD;
 }
 
 /** What a card says about WHO the machine is and whether it is up. A machine
@@ -420,19 +428,23 @@ function cardIdentity(
 ) {
   if (!row) {
     const spec = specOf(data, liveMachines, specs, m);
+    // (#3662 review) This machine drawn from the flow window alone (the view
+    // did not answer) is still this machine: the same self rule every other
+    // surface uses, and self is never unknown.
+    const self = isSelfMachine(data, liveMachines, specs, m);
     return {
       name: displayNameOf(data, liveMachines, specs, m, roster),
       spec,
       // (#1855) `specUnknown` says whether a beat existed to carry hardware.
       specUnknown: spec ? null : liveMachines.has(m) ? ("not-reported" as const) : ("not-seen" as const),
-      ...flowOnlyStanding(machAbsent),
+      ...(self ? { standing: "online" as const, note: null } : flowOnlyStanding(machAbsent, m, specs !== null)),
       hub: false,
       servesRadio: false,
       servesProfiles: 0,
       engineServers: [],
       residents: null,
       availability: "known" as const,
-      self: false,
+      self,
     };
   }
   const spec = row.spec || specOf(data, liveMachines, specs, m);
@@ -585,11 +597,26 @@ export function buildFleetCardBase(
   };
 }
 
+/** (#3662) A card's base once this page's presence read is stale or
+ *  unreadable (`degradedFleetSource`). This viewer cannot read the fleet hub,
+ *  so a peer's live state is unknown: it is `hub_unread`, which looks like
+ *  "not streaming" (static in the scope, no "idle" or "0 running") and whose
+ *  reason says the hub cannot be read, not that the peer's stream is off. Its
+ *  records in the window still count (the hero does not list it as missing).
+ *  This machine's own card is unchanged, whether the view or only the flow
+ *  window drew it (`cardIdentity`'s `self`): its records are its own. A peer
+ *  is `hub_unread` whether the window holds its records or not (the hub can
+ *  have been down longer than the window); one known to be down keeps
+ *  `not_reporting` (`underUnreadPresence`). */
+export function withPresenceUnread(base: FleetCardBase): FleetCardBase {
+  return { ...base, availability: underUnreadPresence(base.availability, base.liveInputs.self) };
+}
+
 /** (#2958) Which of a fleet card's sources have answered at least once on
  *  this mount (success or failure; a source this mount never reads counts
- *  as answered). A failed read counts: it has its own notice
- *  (`RunsUnreadableNotice`, `FleetCoverageNotice`), and waiting on it would
- *  hold "checking…" forever. The flow window is the exception (#2965): its
+ *  as answered). A failed read counts: `/runs` has its own notice
+ *  (`RunsUnreadableNotice`), presence its own card form (`withPresenceUnread`),
+ *  and waiting on either would hold "checking…" forever. The flow window is the exception (#2965): its
  *  failed read yields an empty window, which every negative claim here would
  *  read as "nothing happened", so `flow` is false while a day's read is
  *  failing (and `FlowReadNotice` names it). `/fleet/roster` is not a

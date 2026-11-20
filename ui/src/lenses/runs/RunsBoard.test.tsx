@@ -215,6 +215,28 @@ describe("RunsBoard", () => {
     });
   });
 
+  // (#3662) The board takes no claim from presence: each row's status is the
+  // daemon's (`/runs`), so an unreadable presence read changes no row, and
+  // there is no warning box to stand in for one.
+  it("with presence unreadable, every row keeps the status /runs gave it", async () => {
+    mockFetch();
+    const runs = vi.mocked(fetch).getMockImplementation()!;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) =>
+        String(url).startsWith("/fleet/")
+          ? Promise.resolve(new Response("gone", { status: 503, statusText: "Service Unavailable" }))
+          : runs(url),
+      ),
+    );
+    renderBoard();
+    await waitFor(() => expect(screen.getByText("d1")).toBeInTheDocument());
+    const badge = (id: string) => screen.getByText(id).closest(".labrunrow")!.querySelector(".labbadge")!.textContent;
+    expect(badge("d1")).toBe("running");
+    expect(badge("m1")).toBe("complete");
+    expect(document.querySelector(".fleetcov")).toBeNull();
+  });
+
   /** (F10/F11) A cut-off or partial run is `degraded`, never `complete`: its
    *  badge says so, in the same caution color `stopped` and `escalated` use. */
   it("renders the degraded status badge in the caution color, with its own word", async () => {

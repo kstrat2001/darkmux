@@ -44,8 +44,9 @@ use std::sync::Mutex;
 pub const WORKSPACE_ROOT_PLACEHOLDER: &str = "${WORKSPACE_ROOT}";
 
 /// (#3112 review) `message` with [`WORKSPACE_ROOT_PLACEHOLDER`] replaced by
-/// where a `kind` sandbox sees `workdir`: `/workspace` in a container, the
-/// workdir's own path in a sandbox on the host. With no workdir yet (a
+/// how a `kind` sandbox's model names `workdir`: `/workspace` in a
+/// container, the current directory in a sandbox on the host (#3654: never
+/// the workdir's host path). With no workdir yet (a
 /// fresh tempdir the dispatch makes later) the placeholder is left for the
 /// dispatch, which expands it against that tempdir when it writes the
 /// prompt file (`dispatch_internal::prompt_file_text`). A message without
@@ -59,10 +60,21 @@ pub(crate) fn expand_workspace_root(
 ) -> String {
     match workdir {
         Some(w) if message.contains(WORKSPACE_ROOT_PLACEHOLDER) => {
-            message.replace(WORKSPACE_ROOT_PLACEHOLDER, &darkmux_sandbox::seen_at(kind, w, "/workspace"))
+            message.replace(WORKSPACE_ROOT_PLACEHOLDER, crate::mission_config::workspace_paths::model_root(kind, w))
         }
         _ => message.to_string(),
     }
+}
+
+/// (#3654) The dependency outputs a model-facing step composes into its
+/// message: every one but its grow source's. A grown step already carries
+/// its own item (its config's `{{item.*}}`); the source's whole output is a
+/// host artifact (a crawl's summary names the tree each finding was seen in
+/// and each unit's out-dir by host path, under the user's home) that the
+/// host reads and a model must never be sent.
+fn model_inputs(step: &Step, input: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let source = step.config.get(crate::mission_config::grow::GROWN_FROM_KEY).and_then(|g| g.get("task")).and_then(|t| t.as_str());
+    input.iter().filter(|(dep, _)| Some(dep.as_str()) != source).map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
 fn compose_message(base: &str, input: &BTreeMap<String, String>) -> String {
@@ -580,7 +592,7 @@ pub(crate) fn dispatch_opts_for(
     let sandbox = darkmux_sandbox::selection();
     let kind = sandbox.as_ref().ok().map(|s| s.kind);
     let base = expand_workspace_root(cfg.message.as_deref().unwrap_or_default(), kind, workdir.as_deref());
-    let message = compose_message(&base, input);
+    let message = compose_message(&base, &model_inputs(step, input));
     // The owning Task names the phase for every step minted from a mission
     // config; the step config's own `phase_id` (the crew-of-one's way of
     // passing the CLI's `--phase`) wins when present. Without the task
@@ -1175,7 +1187,7 @@ impl DispatchSingleShotStepKind {
         let is_hosted = endpoint.is_some();
         let wire_model = step_wire_model(call, is_hosted);
         let system = call.system.as_deref().unwrap_or("");
-        let user = compose_message(cfg.user.as_deref().unwrap_or_default(), input);
+        let user = compose_message(cfg.user.as_deref().unwrap_or_default(), &model_inputs(step, input));
         let max_tokens = call.max_tokens.map_or(4096, |c| c.saturating_u32());
         let timeout_seconds = call.timeout_seconds.map_or(120, |c| c.saturating_u32());
 
@@ -4554,23 +4566,26 @@ mod tests {
     }
 
     #[test]
-    fn a_step_message_names_the_workspace_where_the_sandbox_sees_it() {
-        // (#3112 review) `${WORKSPACE_ROOT}` in a step's message is where its
-        // dispatch's sandbox sees the workdir: `/workspace` in a container
-        // (the shipped configs' old literal, byte for byte), the workdir's own
-        // path in a sandbox on the host. A message without it is untouched.
+    fn a_step_message_names_the_workspace_as_its_model_sees_it() {
+        // (#3112 review, #3654) `${WORKSPACE_ROOT}` in a step's message is
+        // how its dispatch's model names the workdir: `/workspace` in a
+        // container (the shipped configs' old literal, byte for byte), the
+        // current directory in a sandbox on the host, which never names the
+        // workdir's host path. A message without it is untouched.
         use darkmux_sandbox::BackendKind;
         let dir = tempfile::TempDir::new().unwrap();
-        let real = dir.path().canonicalize().unwrap().display().to_string();
         let msg = "mounted at `${WORKSPACE_ROOT}/<source>`, so `${WORKSPACE_ROOT}/<source>/src/x.ts`";
         assert_eq!(
             expand_workspace_root(msg, Some(BackendKind::Docker), Some(dir.path())),
             "mounted at `/workspace/<source>`, so `/workspace/<source>/src/x.ts`"
         );
-        assert_eq!(
-            expand_workspace_root(msg, Some(BackendKind::Seatbelt), Some(dir.path())),
-            format!("mounted at `{real}/<source>`, so `{real}/<source>/src/x.ts`")
-        );
+        for kind in [BackendKind::Seatbelt, BackendKind::Landlock] {
+            assert_eq!(
+                expand_workspace_root(msg, Some(kind), Some(dir.path())),
+                "mounted at `./<source>`, so `./<source>/src/x.ts`",
+                "{kind:?}"
+            );
+        }
         let plain = "a user's own message names /workspace";
         assert_eq!(expand_workspace_root(plain, Some(BackendKind::Seatbelt), Some(dir.path())), plain);
     }
@@ -4610,8 +4625,7 @@ mod tests {
         unsafe {
             match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
         }
-        let real = dir.path().canonicalize().unwrap().display().to_string();
-        assert_eq!(seatbelt, format!("read `{real}/<source>/x`"));
+        assert_eq!(seatbelt, "read `./<source>/x`");
         assert_eq!(seatbelt_opts.sandbox.and_then(Result::ok).map(|s| s.kind), Some(darkmux_sandbox::BackendKind::Seatbelt));
     }
 
@@ -4624,6 +4638,78 @@ mod tests {
             let text = std::fs::read_to_string(&path).unwrap();
             assert!(text.contains("${WORKSPACE_ROOT}/<source>"), "{name}");
             assert!(!text.contains("`/workspace/<source>"), "{name} still names the container path");
+        }
+    }
+
+    /// A grow source's whole output, as `dispatch.summary` writes it: host
+    /// paths (the tree a finding was seen in, each unit's out-dir) that the
+    /// host reads and a model must never be sent (#3654).
+    const SUMMARY_WITH_HOST_PATHS: &str = r#"{"finding_refs":[{"key":"exec-1/1","id":"exec-1-1","rule":"r","tree_root":"/Users/op/.darkmux/runs/m/tree"}],"units":[{"out_dir":"/Users/op/.darkmux/runs/m/out"}]}"#;
+
+    /// (#3654) A step grown from a task is handed its item (its config's
+    /// `{{item.*}}`), never that task's whole output: the grow source is a
+    /// host artifact, and its paths name the user's home. Any other
+    /// dependency's output is still composed, as before.
+    #[test]
+    fn a_grown_steps_message_never_carries_its_grow_sources_output() {
+        let cfg = json!({"role_id": "coder", "message": "propose the mod",
+            "grown_from": {"task": "summary", "item": "exec-1-1", "index": 0}});
+        let mut input = BTreeMap::new();
+        input.insert("summary".to_string(), SUMMARY_WITH_HOST_PATHS.to_string());
+        input.insert("notes".to_string(), "keep me".to_string());
+        let opts = dispatch_opts_for(&step("s1", "dispatch.internal", cfg), &empty_task(), &input, &StepRunCtx::for_test()).unwrap();
+        assert!(!opts.message.contains("/Users/op") && !opts.message.contains("tree_root"), "{}", opts.message);
+        assert!(opts.message.contains("keep me") && opts.message.ends_with("propose the mod"), "{}", opts.message);
+        // A step not grown from it still reads it, as any dependency.
+        let plain = dispatch_opts_for(&step("s1", "dispatch.internal", json!({"role_id": "coder", "message": "m"})), &empty_task(), &input, &StepRunCtx::for_test()).unwrap();
+        assert!(plain.message.contains("tree_root"), "{}", plain.message);
+    }
+
+    /// (#3654) Every shipped mission config (the embedded set) whose task
+    /// composes a model message (`dispatch.internal`, `dispatch.single_shot`,
+    /// and `dispatch.map`, which renders a dependency's items into its user
+    /// message) reads no dependency but its own grow source; grown as the
+    /// launcher grows it, from an output that names host paths, its message
+    /// carries none. The create-mod seat (the hosted one included) never
+    /// receives the summary's host paths, and a shipped dispatch that read
+    /// any other dependency would be a new way for a host artifact to reach a
+    /// model.
+    #[test]
+    fn no_shipped_dispatch_is_fed_a_host_artifact() {
+        use crate::mission_config::{grow::grow_task, MissionConfig};
+        const COMPOSING: [&str; 3] = ["dispatch.internal", "dispatch.single_shot", "dispatch.map"];
+        let shipped = crate::mission_config::load::embedded_all();
+        let on_disk = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/mission-configs"))
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "json"))
+            .count();
+        assert_eq!(shipped.len(), on_disk, "every shipped mission config is embedded, so none is skipped here");
+        for (name, text) in shipped {
+            let config: MissionConfig = serde_json::from_str(text).unwrap();
+            for task in config.phases.iter().flat_map(|p| &p.tasks) {
+                if !task.steps.iter().any(|s| COMPOSING.contains(&s.kind.as_str())) {
+                    continue;
+                }
+                let from = task.grow.as_ref().map(|g| g.from.clone());
+                for dep in task.depends_on.iter().chain(task.reads.iter()) {
+                    assert_eq!(Some(dep), from.as_ref(), "{name}: `{}` composes `{dep}`'s output into a model message", task.id);
+                }
+                let Some(spec) = task.grow.as_ref() else { continue };
+                let item = json!({ "id": "f1", "key": "exec-1/1", "rule": "r", "tree_root": "/Users/op/.darkmux/runs/m/tree" });
+                let growth = grow_task(task, spec, &[item], SUMMARY_WITH_HOST_PATHS).unwrap();
+                let mut input = BTreeMap::new();
+                input.insert(spec.from.clone(), SUMMARY_WITH_HOST_PATHS.to_string());
+                let copy = &growth.tasks[0];
+                for s in copy.steps.iter().filter(|s| s.kind == "dispatch.internal") {
+                    let mut config = s.config.clone();
+                    config.as_object_mut().unwrap().remove("brief_refs");
+                    let mut t = empty_task();
+                    t.role_id = copy.role_id.clone();
+                    let opts = dispatch_opts_for(&step(&s.id, &s.kind, config), &t, &input, &StepRunCtx::for_test()).unwrap();
+                    assert!(!opts.message.contains("/Users/op"), "{name}: `{}`: {}", copy.id, opts.message);
+                    assert!(opts.message.contains("A finding recorded earlier"), "{name}: the copy's own message: {}", opts.message);
+                }
+            }
         }
     }
 

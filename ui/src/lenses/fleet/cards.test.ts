@@ -2,13 +2,14 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { withPresenceUnread, type FleetCardBase } from "./cards";
 import { machActive, specOf, busiestExecution, isStrictlyBusier, specUnknownLabel, cardFace, notStreamedNames, servesLine, servesParts, executionCountText, countLine, shownExecution } from "./cards";
 import { CardStatus, STATUS_WORD, lampOf, secondLineOf, statusReason } from "./cardStatus";
 import { buildFleetCard, faceOf } from "../../testing/fleetCard";
 import { LampForm } from "../../lib/lamp";
 import { utilityReading, UtilityResidency } from "../../lib/utilityJobs";
 import { outcomeLine, rowStanding, type RowFacts } from "./viewRows";
-import { machineAvailability } from "../../lib/machineAvailability";
+import { machineAvailability, underUnreadPresence } from "../../lib/machineAvailability";
 import type { FleetMachine } from "../../types/generated/FleetMachine";
 import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
 import type { PresenceBeat } from "../../types/generated/PresenceBeat";
@@ -1560,6 +1561,8 @@ describe("the card's status, for the rows the Rust twin also answers", () => {
   interface SharedCase {
     name: string;
     row: FleetMachine;
+    /** (#3662) The view's presence read was stale or unreadable. */
+    presence_unread?: boolean;
     expect: { status: string; word: string; second_line: string | null; reason: string | null };
   }
   const cases = JSON.parse(
@@ -1573,18 +1576,19 @@ describe("the card's status, for the rows the Rust twin also answers", () => {
     const standing = rowStanding(c.row);
     // The view-only stand-in for "records reach this viewer": a live beat, or this machine.
     const seen = c.row.is_this_machine || c.row.liveness === "live";
+    const read = machineAvailability({ self: c.row.is_this_machine, seen, standing });
     const card = {
       active: aModelIsWorking(c.row),
       runsCount: 0,
       standing,
-      availability: machineAvailability({ self: c.row.is_this_machine, seen, standing }),
+      availability: c.presence_unread ? underUnreadPresence(read, c.row.is_this_machine) : read,
       note: outcomeLine(c.row.card),
     };
     const face = cardFace(card, false, answered);
     expect(face.status).toBe(c.expect.status);
     expect(STATUS_WORD[face.status]).toBe(c.expect.word);
     expect(secondLineOf(face.status)).toBe(c.expect.second_line);
-    expect(statusReason(card.note, face.status) ?? null).toBe(c.expect.reason);
+    expect(statusReason(card.note, face.status, card.availability) ?? null).toBe(c.expect.reason);
   });
 
   it("the shared rows cover every status the console shows", () => {
@@ -1774,5 +1778,25 @@ describe("(#3210) a peer's relayed beats, a local silence between them", () => {
     const last = G0 + 43_000;
     expect(read(last + STALL_AFTER_MS + HUB_RELAY_INTERVAL_MS - 1_000)).toBe("generating");
     expect(read(last + STALL_AFTER_MS + HUB_RELAY_INTERVAL_MS + 1_000)).toBe("stalled");
+  });
+});
+
+// (#3662) The card base under a stale or unreadable presence read: a peer
+// that read as seen goes to `hub_unread` (it looks "not streaming"); this
+// machine, and a peer already unseen or down, keep what they had.
+describe("withPresenceUnread", () => {
+  const base = (availability: FleetCardBase["availability"], self: boolean) =>
+    ({ availability, liveInputs: { self } }) as unknown as FleetCardBase;
+  it("a peer the window held reads hub_unread: its live state unknown, not its stream blamed", () => {
+    expect(withPresenceUnread(base("known", false)).availability).toBe("hub_unread");
+  });
+  it("this machine's own card is unchanged: its records are its own", () => {
+    expect(withPresenceUnread(base("known", true)).availability).toBe("known");
+  });
+  it("a peer whose records never reached the window reads hub_unread too: the hub is what is unread", () => {
+    expect(withPresenceUnread(base("not_streamed", false)).availability).toBe("hub_unread");
+  });
+  it("a peer already not reporting (down) stays not reporting, never 'check its stream'", () => {
+    expect(withPresenceUnread(base("not_reporting", false)).availability).toBe("not_reporting");
   });
 });
