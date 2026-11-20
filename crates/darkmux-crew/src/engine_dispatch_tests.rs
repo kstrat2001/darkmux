@@ -60,8 +60,21 @@ S(("127.0.0.1", port), H).serve_forever()
     bin
 }
 
+/// A port for a fake engine server to bind: a fixture port, reserved for
+/// this process's life and below every OS ephemeral range, never a dropped
+/// `bind(0)`. An ephemeral port is the kind the next `bind(0)` anywhere on the
+/// machine can be given, so another test's server could answer on it first
+/// (`port_in_use`: "something darkmux did not start already answers").
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    darkmux_types::test_ports::fixture_port()
+}
+
+/// The fake engines' port is one no other test process can be handed.
+#[test]
+fn a_fake_engines_port_cannot_be_handed_to_another_listener() {
+    let port = free_port();
+    assert!(darkmux_types::test_ports::FIXTURE_PORT_RANGE.contains(&port), "{port} is an ephemeral port another bind(0) can be given");
+    assert!(darkmux_types::test_ports::reserve(port).is_none(), "{port} is not reserved, so another test process can be handed it");
 }
 
 fn target(model: &str, port: u16) -> crate::target::Target {
