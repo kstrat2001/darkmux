@@ -586,7 +586,11 @@ async fn one_read_of_a_known_forwarder_answers_every_connection_it_holds() {
 #[tokio::test]
 async fn a_cached_end_answers_only_while_its_forwarder_runs() {
     let at = |s: &str| -> SocketAddr { s.parse().unwrap() };
-    let (a, b, c) = (at("127.0.0.1:50001"), at("127.0.0.1:50002"), at("127.0.0.1:50004"));
+    let (a, b, c) = (
+        at("127.0.0.1:50001"),
+        at("127.0.0.1:50002"),
+        at("127.0.0.1:50004"),
+    );
     let local = at("127.0.0.1:8799");
     let m: &'static darkmux_platform::FakePlatform =
         Box::leak(Box::new(darkmux_platform::FakePlatform {
@@ -609,7 +613,11 @@ async fn a_cached_end_answers_only_while_its_forwarder_runs() {
         rounds.forwarders.lock().unwrap().pids.is_empty(),
         "forgotten"
     );
-    assert_eq!(rounds.take_end(c, local), None, "with every end cached for it");
+    assert_eq!(
+        rounds.take_end(c, local),
+        None,
+        "with every end cached for it"
+    );
 }
 
 /// A read of the forwarders for a listener may begin only once the last

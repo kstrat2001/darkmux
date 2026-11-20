@@ -457,7 +457,7 @@ fn this_machine_is_every_peer_of_a_loopback_listener_and_counts_as_one() {
 ///   pass: within the production listeners' 10 s header deadline, so a
 ///   connection that deadline closes is never counted as refused), and
 ///   holds the rest until its stdin closes.
-/// - `flick <addr> <hold> <threads> <secs> <how>`: holds `hold` connections,
+/// - `flick <addr> <hold> <threads> <secs>`: holds `hold` connections,
 ///   prints `churning`, and for `secs` has each of `threads` threads connect
 ///   and reset it at once (SO_LINGER 0), so the peer is gone before the
 ///   judgment ends. A reset leaves no closed connection waiting on this
@@ -487,13 +487,7 @@ fn container_forwarder_stand_in() {
             println!("closed {closed}");
             held
         }
-        "flick" => flick(
-            addr,
-            num(2),
-            num(3),
-            Duration::from_secs(num(4) as u64),
-            parts[5],
-        ),
+        "flick" => flick(addr, num(2), num(3), Duration::from_secs(num(4) as u64)),
         "tag" => {
             tag(addr, num(2), num(3) as u16);
             return;
@@ -529,20 +523,18 @@ fn flick(
     hold: usize,
     threads: usize,
     for_: Duration,
-    how: &str,
 ) -> Vec<std::net::TcpStream> {
     let held: Vec<_> = (0..hold)
         .map(|_| std::net::TcpStream::connect(addr).unwrap())
         .collect();
     let until = std::time::Instant::now() + for_;
-    let reset = how == "reset";
     for _ in 0..threads {
         std::thread::spawn(move || {
             while std::time::Instant::now() < until {
-                let Ok(mut c) = std::net::TcpStream::connect(addr) else {
+                let Ok(c) = std::net::TcpStream::connect(addr) else {
                     continue;
                 };
-                if reset {
+                {
                     use std::os::fd::AsRawFd;
                     let off = libc::linger {
                         l_onoff: 1,
@@ -607,16 +599,10 @@ fn connect_from_port(addr: SocketAddr, port: u16) -> std::net::TcpStream {
 
 /// A container engine's forwarder holding `hold` connections to `addr` and,
 /// on `threads` threads for `for_secs`, connecting and hanging up at once
-/// (`how`: `reset`; [`container_forwarder_stand_in`]'s `flick`
+/// ([`container_forwarder_stand_in`]'s `flick`
 /// mode), once it has begun.
-fn flicking_forwarder(
-    addr: SocketAddr,
-    hold: usize,
-    threads: usize,
-    for_secs: u64,
-    how: &str,
-) -> Forwarder {
-    let (held, mut lines) = stand_in(&format!("flick {addr} {hold} {threads} {for_secs} {how}"));
+fn flicking_forwarder(addr: SocketAddr, hold: usize, threads: usize, for_secs: u64) -> Forwarder {
+    let (held, mut lines) = stand_in(&format!("flick {addr} {hold} {threads} {for_secs}"));
     assert!(lines.any(|l| l.contains("churning")), "the stand-in began");
     held
 }
@@ -970,27 +956,26 @@ fn get_answer(s: &mut std::net::TcpStream) -> String {
 
 /// A container that reopens every connection it loses cannot crowd the
 /// operator out of the viewer: with its forwarder holding the open share
-/// and 64, then 128, threads reconnecting as fast as they are closed,
-/// every one of this process's new connections is served. Once a round
+/// and 64 threads (as many as the judged share) reconnecting as fast as
+/// they are closed, every one of this process's new connections is served.
+/// Once a round
 /// has named the forwarder, its connections past the open share are refused
 /// as they are accepted, without waiting for a round while holding a slot.
 #[test]
 fn a_reconnecting_container_never_crowds_the_operator_out_of_the_viewer() {
     let _ = crate::raise_open_file_limit(8192);
-    for threads in [64] {
-        let (addr, _stop, _done) = serving_with(
-            Box::new(|l, app, rx| Box::pin(crate::serve_viewer(l, app, rx))),
-            ok_app(),
-        );
-        let open = VIEWER.per_ip - VIEWER.judged_share;
-        let _container = churning_forwarder(addr, open, threads, 4);
-        std::thread::sleep(Duration::from_millis(300));
-        let served = served_of(addr, 10, Duration::from_millis(100));
-        assert_eq!(
-            served, 10,
-            "{threads} reconnecting threads: the operator served {served} of 10"
-        );
-    }
+    let (addr, _stop, _done) = serving_with(
+        Box::new(|l, app, rx| Box::pin(crate::serve_viewer(l, app, rx))),
+        ok_app(),
+    );
+    let open = VIEWER.per_ip - VIEWER.judged_share;
+    let _container = churning_forwarder(addr, open, 64, 4);
+    std::thread::sleep(Duration::from_millis(300));
+    let served = served_of(addr, 10, Duration::from_millis(100));
+    assert_eq!(
+        served, 10,
+        "64 reconnecting threads: the operator served {served} of 10"
+    );
 }
 
 /// This machine is every peer of a listener bound to loopback, whatever
@@ -1107,21 +1092,18 @@ fn a_listener_with_no_judged_share_still_knows_the_operators_connection() {
 #[test]
 fn a_container_that_connects_and_hangs_up_never_crowds_the_operator_out_of_the_viewer() {
     let _ = crate::raise_open_file_limit(8192);
-    for how in ["reset"] {
-        let threads = 64;
-        let (addr, _stop, _done) = serving_with(
-            Box::new(|l, app, rx| Box::pin(crate::serve_viewer(l, app, rx))),
-            ok_app(),
-        );
-        let open = VIEWER.per_ip - VIEWER.judged_share;
-        let _container = flicking_forwarder(addr, open, threads, 4, how);
-        std::thread::sleep(Duration::from_millis(300));
-        let served = served_of(addr, 10, Duration::from_millis(100));
-        assert_eq!(
-            served, 10,
-            "{threads} threads hanging up ({how}): the operator served {served} of 10"
-        );
-    }
+    let (addr, _stop, _done) = serving_with(
+        Box::new(|l, app, rx| Box::pin(crate::serve_viewer(l, app, rx))),
+        ok_app(),
+    );
+    let open = VIEWER.per_ip - VIEWER.judged_share;
+    let _container = flicking_forwarder(addr, open, 64, 4);
+    std::thread::sleep(Duration::from_millis(300));
+    let served = served_of(addr, 10, Duration::from_millis(100));
+    assert_eq!(
+        served, 10,
+        "64 threads resetting: the operator served {served} of 10"
+    );
 }
 
 /// A forwarder's cached connection end never refuses a later connection
