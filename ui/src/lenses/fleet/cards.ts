@@ -36,7 +36,7 @@ import type { PresenceBeat } from "../../types/generated/PresenceBeat";
 // machine lens and the app shell need the identical self-identity rule and a
 // second copy of it is how the two surfaces disagree about which machine
 // they are on.
-import { displayNameOf, isSelfMachine, uidOf } from "../../lib/machineIdentity";
+import { NO_UID_KEY, displayNameOf, isSelfMachine, uidOf } from "../../lib/machineIdentity";
 import type { RosterName } from "../../lib/machineIdentity";
 import type { Run } from "../../types/generated/Run";
 import { utilityReading, utilityStrip, type UtilityReading, type UtilityStrip } from "../../lib/utilityJobs";
@@ -44,7 +44,7 @@ import { mergeLive, type LiveOverlay } from "../../lib/liveChannel";
 import { recordsAsOf, type NormRecord } from "../../lib/ingest";
 import { DEFAULT_POLICY, isRunning, lifecycleAt, type LifecyclePolicy, type Presence } from "../../lib/lifecycle";
 import { currentRun, runIndex, type RunGroup } from "../../lib/runRef";
-import { machineAvailability, type MachineAvailability } from "../../lib/machineAvailability";
+import { HUB_UNREAD, machineAvailability, type MachineAvailability } from "../../lib/machineAvailability";
 import { CardStatus } from "./cardStatus";
 import { RUNNING_WORD } from "../../components/WorkStatus";
 import type { CardResidents } from "../../lib/machineEngine";
@@ -399,8 +399,8 @@ export interface FleetCard {
  *  never have any), so it reads unknown, never online, and carries a reason:
  *  a `null` note would say the card was read and the status line would claim
  *  "online". */
-function flowOnlyStanding(machAbsent: boolean | null): { standing: Standing; note: string | null } {
-  if (machAbsent === null) return { standing: "unknown", note: "it carries no machine id, so nothing can say whether it is up" };
+function flowOnlyStanding(machAbsent: boolean | null, m: string): { standing: Standing; note: string | null } {
+  if (machAbsent === null) return { standing: "unknown", note: m === NO_UID_KEY ? "it carries no machine id, so nothing can say whether it is up" : `${HUB_UNREAD}, so nothing says whether it is up` };
   return { standing: machAbsent ? "offline" : "online", note: null };
 }
 
@@ -419,19 +419,23 @@ function cardIdentity(
 ) {
   if (!row) {
     const spec = specOf(data, liveMachines, specs, m);
+    // (#3662 review) This machine drawn from the flow window alone (the view
+    // did not answer) is still this machine: the same self rule every other
+    // surface uses, and self is never unknown.
+    const self = isSelfMachine(data, liveMachines, specs, m);
     return {
       name: displayNameOf(data, liveMachines, specs, m, roster),
       spec,
       // (#1855) `specUnknown` says whether a beat existed to carry hardware.
       specUnknown: spec ? null : liveMachines.has(m) ? ("not-reported" as const) : ("not-seen" as const),
-      ...flowOnlyStanding(machAbsent),
+      ...(self ? { standing: "online" as const, note: null } : flowOnlyStanding(machAbsent, m)),
       hub: false,
       servesRadio: false,
       servesProfiles: 0,
       engineServers: [],
       residents: null,
       availability: "known" as const,
-      self: false,
+      self,
     };
   }
   const spec = row.spec || specOf(data, liveMachines, specs, m);
@@ -585,14 +589,16 @@ export function buildFleetCardBase(
 }
 
 /** (#3662) A card's base once this page's presence read is stale or
- *  unreadable (`degradedFleetSource`). A peer's records in the window came
- *  through the same hub presence could not be read from, so they are
- *  history, not a stream: the card reads "not streaming", the same form as a
- *  peer whose stream never reached this viewer, rather than an "idle" or
- *  "0 running" nothing now backs. This machine's own card is unchanged: its
- *  records are its own. */
+ *  unreadable (`degradedFleetSource`). This viewer cannot read the fleet hub,
+ *  so a peer's live state is unknown: it is `hub_unread`, which looks like
+ *  "not streaming" (static in the scope, no "idle" or "0 running") and whose
+ *  reason says the hub cannot be read, not that the peer's stream is off. Its
+ *  records in the window still count (the hero does not list it as missing).
+ *  This machine's own card is unchanged, whether the view or only the flow
+ *  window drew it (`cardIdentity`'s `self`): its records are its own. A peer
+ *  already unseen or down keeps what it had. */
 export function withPresenceUnread(base: FleetCardBase): FleetCardBase {
-  return base.liveInputs.self || base.availability !== "known" ? base : { ...base, availability: "not_streamed" };
+  return base.liveInputs.self || base.availability !== "known" ? base : { ...base, availability: "hub_unread" };
 }
 
 /** (#2958) Which of a fleet card's sources have answered at least once on

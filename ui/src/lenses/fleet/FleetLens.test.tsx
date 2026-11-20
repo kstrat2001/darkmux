@@ -243,6 +243,8 @@ function mockFleetFetch(opts: {
   /** (#3662) The fleet source state both presence routes report. Omitted
    *  keeps each route's healthy default. */
   presence?: Record<string, unknown>;
+  /** (#3662) `GET /machine/specs`. Omitted keeps the 404. */
+  machineSpecs?: Partial<MachineSpecsResponse>;
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -310,9 +312,14 @@ function mockFleetFetch(opts: {
         new Response(JSON.stringify({ machines: opts.roster ?? [], error: opts.rosterError ?? null }), { status: 200 }),
       );
     }
+    if (path === "/machine/specs" && opts.machineSpecs) return Promise.resolve(new Response(JSON.stringify(opts.machineSpecs), { status: 200 }));
     return Promise.resolve(new Response("not recorded\n", { status: 404 }));
   }
 }
+
+/** (#3662) The status tooltips under a stale or unreadable presence read. */
+const HUB_UNREAD_ONLINE = "online · not streaming: this viewer can't read the fleet hub right now, so its live state is unknown; its recorded activity still shows.";
+const HUB_UNREAD_UNKNOWN = "not streaming: this viewer can't read the fleet hub right now, so nothing says whether it is up";
 
 /** (#2958) A promise and the function that resolves it. */
 function gate(): { promise: Promise<void>; open: () => void } {
@@ -1985,9 +1992,57 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
       expect(studio.querySelector(".stat")!.textContent).toBe("online");
       expect(studio.querySelector(".runs")!.textContent).toBe("not streaming");
       expect(studio.textContent).not.toMatch(/idle|0 running/);
+      // The reason names what is true: this viewer cannot read the hub. It
+      // does not blame the peer's stream, and the hero, which counts the
+      // peer's records, does not list it as missing.
+      expect(studio.querySelector(".stat")!.getAttribute("title")).toBe(HUB_UNREAD_ONLINE);
+      expect(document.querySelector(".savlbl")!.getAttribute("title") ?? "").not.toContain("studio");
       expect(document.querySelector(".fleetcov")).toBeNull();
     });
   }
+
+  // (#3662 review) A peer nobody rostered, known only from records in the
+  // window: with presence unreadable nothing read says it is up, so it reads
+  // plain "not streaming" with the hub reason, never "online".
+  it("with presence unreadable, an unrostered peer with records reads not streaming, never online", async () => {
+    const day = todayUTC();
+    mockFleetFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max" },
+      flowToday: [
+        { ts: `${day}T09:00:00.000Z`, action: "dispatch.start", session_id: "p1", machine_uid: "u-mini", machine_id: "mini", handle: "coder" },
+        { ts: `${day}T09:01:00.000Z`, action: "dispatch.complete", session_id: "p1", machine_uid: "u-mini", machine_id: "mini", handle: "coder" },
+      ],
+      runs: [],
+      presence: { state: "unavailable", detail: "could not read presence beats from Redis" },
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
+    const mini = [...document.querySelectorAll(".mach")].find((c) => c.querySelector(".mach-name")!.textContent === "mini")!;
+    await waitFor(() => expect(mini.querySelector(".stat")!.textContent).toBe("not streaming"));
+    expect(mini.querySelector(".stat")!.getAttribute("title")).toBe(HUB_UNREAD_UNKNOWN);
+    expect(mini.textContent).not.toMatch(/online|idle|0 running/);
+  });
+
+  // (#3662 review) With `/fleet/view` failing, this machine's card is drawn
+  // from the flow window alone. It is still this machine (`/machine/specs`
+  // names it), so its own records stand: "idle", never "not streaming".
+  it("with presence unreadable and the view failing, this machine's flow-only card still reads its own records", async () => {
+    const day = todayUTC();
+    mockFleetFetch({
+      machineSpecs: { machine_id: "MacBook-Pro", machine_uid: "u-self", cpu_brand: "Apple M5 Max" },
+      flowToday: [
+        { ts: `${day}T09:30:00.000Z`, action: "dispatch.start", session_id: "s1", machine_uid: "u-self", machine_id: "MacBook-Pro", handle: "coder" },
+        { ts: `${day}T09:31:00.000Z`, action: "dispatch.complete", session_id: "s1", machine_uid: "u-self", machine_id: "MacBook-Pro", handle: "coder" },
+      ],
+      runs: [],
+      presence: { state: "unavailable", detail: "could not read presence beats from Redis" },
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(1));
+    const self = document.querySelector(".mach")!;
+    await waitFor(() => expect(self.querySelector(".stat")!.textContent).toBe("idle"));
+    expect(self.textContent).not.toContain("not streaming");
+  });
 
   // (#3662) What presence cannot read is not the whole page: a run open in
   // THIS machine's own records still counts as running on its card and draws
@@ -3841,6 +3896,12 @@ describe("absentOrUnknown (#3213)", () => {
     expect(absentOrUnknown(null, "00000000-0000-4000-8000-ABCDEF000001")).toBe(false);
     expect(absentOrUnknown(false, "00000000-0000-4000-8000-ABCDEF000001")).toBe(true);
     expect(absentOrUnknown(true, "00000000-0000-4000-8000-ABCDEF000001")).toBe(false);
+  });
+
+  it("(#3662) with presence unread, no evidence is not up either: any machine reads unknown", () => {
+    expect(absentOrUnknown(null, "00000000-0000-4000-8000-ABCDEF000001", true)).toBeNull();
+    expect(absentOrUnknown(true, "00000000-0000-4000-8000-ABCDEF000001", true)).toBe(false);
+    expect(absentOrUnknown(false, "00000000-0000-4000-8000-ABCDEF000001", true)).toBe(true);
   });
 });
 

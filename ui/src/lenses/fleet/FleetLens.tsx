@@ -23,6 +23,8 @@ import { NO_UID_KEY, findUid, isSelfMachine, machineMatch, machineUids, uidForNa
 import type { FleetMachinesLiveResponse } from "../../types/generated/FleetMachinesLiveResponse";
 import type { FleetDispatchesLiveResponse } from "../../types/generated/FleetDispatchesLiveResponse";
 import type { RunsResponse } from "../../types/generated/RunsResponse";
+import type { MachineSpecsResponse } from "../../types/generated/MachineSpecsResponse";
+import type { FleetMachine } from "../../types/generated/FleetMachine";
 import { fmtN, fmtC } from "../../lib/format";
 import { Shimmer } from "../../components/Placeholder";
 import { usePlaybackClock } from "../../lib/pageClockRate";
@@ -40,9 +42,29 @@ import { workStatusKind } from "../../components/WorkStatus";
  *  bucket of records with no hardware uid (`uidOf`'s "unknown") can never
  *  carry presence evidence (beats and online/offline edges always carry a
  *  uid), so with none it reads `null`: standing unknown, never online. Every
- *  other machine keeps reading absent only on positive evidence. */
-export const absentOrUnknown = (present: boolean | null, m: string): boolean | null =>
-  m === NO_UID_KEY && present === null ? null : present === false;
+ *  other machine keeps reading absent only on positive evidence.
+ *  `presenceUnread` (#3662): this page's presence read is stale or
+ *  unreadable, so no evidence is not "up" either: every machine reads `null`. */
+export const absentOrUnknown = (present: boolean | null, m: string, presenceUnread = false): boolean | null =>
+  (m === NO_UID_KEY || presenceUnread) && present === null ? null : present === false;
+
+/** This machine's specs: its own row of the fleet view, else (#3662 review),
+ *  when the view holds no row for it (its read failed), `/machine/specs`.
+ *  That is the query `App` runs on every live route, so this shares its cache
+ *  slot rather than adding a request. Without it this machine's card was
+ *  drawn as a stranger's whenever the view failed. `live`: a daemon to ask. */
+function useSelfSpecs(viewRows: readonly FleetMachine[] | null, live: boolean): MachineSpecsResponse | null {
+  const query = useQuery({
+    enabled: live,
+    queryKey: queryKeys.machineSpecs(),
+    queryFn: () => fetchJson<MachineSpecsResponse>("/machine/specs"),
+  });
+  const probed = live && query.data?.ok ? query.data.data : null;
+  return useMemo(() => {
+    const self = viewRows?.find((r) => r.is_this_machine);
+    return self ? rowSpecs(self) : probed;
+  }, [viewRows, probed]);
+}
 
 /** `sc()`. One token-class chip (value over label).
  *
@@ -599,10 +621,7 @@ export function FleetLens({
   // its card's specs are the self identity the naming and key rules read.
   const fleetView = useFleetView(liveMode);
   const viewRows = fleetView.rows;
-  const specs = useMemo(() => {
-    const self = viewRows?.find((r) => r.is_this_machine);
-    return self ? rowSpecs(self) : null;
-  }, [viewRows]);
+  const specs = useSelfSpecs(viewRows, livePolling);
   // (#1923) `GET /runs` — already fleet-aware, already unions lab + flow
   // sources server-side (`build_runs`) — read here ONLY to fill the gap
   // flow presence structurally cannot: a lab run in flight, which
@@ -821,7 +840,7 @@ export function FleetLens({
         liveMachines,
         specs,
         presence,
-        absentOrUnknown(machPresent(flowWindow.data, liveMachines, playheadT, m), m),
+        absentOrUnknown(machPresent(flowWindow.data, liveMachines, playheadT, m), m, presenceDegraded),
         m,
         playheadT,
         null,

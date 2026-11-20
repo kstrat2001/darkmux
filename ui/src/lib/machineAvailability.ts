@@ -10,6 +10,9 @@
  *   off, or it points at another hub). Quiet here proves nothing.
  * - `not_reporting`: it is down or silent (records from it may once have
  *   arrived). Its last readings are history.
+ * - `hub_unread` (#3662): this viewer cannot read the fleet hub right now
+ *   (presence stale or unreadable), so the machine's live state is unknown.
+ *   Its records already in the window still show; they are history.
  *
  * Unknown is never shown as a confident fact: a surface that gets anything
  * but `known` shows an explicit "not reported" state, never "idle", "0" or
@@ -19,7 +22,11 @@ import type { PresenceBeat } from "../types/generated/PresenceBeat";
 import type { NormRecord } from "./ingest";
 import { windowHoldsMachine } from "./machineIdentity";
 
-export type MachineAvailability = "known" | "not_streamed" | "not_reporting";
+export type MachineAvailability = "known" | "not_streamed" | "not_reporting" | "hub_unread";
+
+/** (#3662) Why a `hub_unread` machine's live state is unknown, in the words
+ *  every surface uses for it. */
+export const HUB_UNREAD = "this viewer can't read the fleet hub right now";
 
 export interface AvailabilityFacts {
   /** The machine this daemon runs on: it never needs a stream to know itself. */
@@ -56,8 +63,8 @@ export const isUnseen = (a: MachineAvailability | undefined): boolean => a !== u
  *  answered and the page knows whose machine it is (until then `known`: the
  *  pending forms already say "checking…"). `self`: the page is about the
  *  machine serving it. `presenceDegraded` (#3662): this page's presence read
- *  is stale or unreadable, so another machine's records in the window came
- *  through a hub this page cannot read: history, not a stream. */
+ *  is stale or unreadable, so another machine the window holds is
+ *  `hub_unread`: its records are history, its live state unknown. */
 export function windowAvailability(
   data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
@@ -65,14 +72,16 @@ export function windowAvailability(
   opts: { self: boolean; answered: boolean; presenceDegraded?: boolean },
 ): MachineAvailability {
   if (!opts.answered || uid === null) return "known";
-  const seen = !opts.presenceDegraded && windowHoldsMachine(data, liveMachines, uid);
-  return machineAvailability({ self: opts.self, seen, standing: "unknown" });
+  const seen = windowHoldsMachine(data, liveMachines, uid);
+  const a = machineAvailability({ self: opts.self, seen, standing: "unknown" });
+  return opts.presenceDegraded && a === "known" && !opts.self ? "hub_unread" : a;
 }
 
 /** A remote machine's live-load line when it has no samples: the page says
  *  what it cannot see before it says "idle". `answered`: the window and the
  *  page's identity are both settled. */
 export function remoteIdleLine(a: MachineAvailability, answered: boolean): string {
+  if (a === "hub_unread") return `${NOT_REPORTED} · ${HUB_UNREAD}`;
   if (isUnseen(a)) return `${NOT_REPORTED} · no records from this machine reach this viewer`;
   return answered ? "idle · no samples in the last 10 min" : "checking…";
 }

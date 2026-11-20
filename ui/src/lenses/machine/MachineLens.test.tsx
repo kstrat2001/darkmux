@@ -681,10 +681,14 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
       presence: { state: "unavailable", detail: "could not read presence beats from Redis" },
     });
     const { container } = renderMachine("u-studio");
-    await waitFor(() => expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toMatch(/not reported/));
+    // What is true: this viewer cannot read the hub. Not "no records reach
+    // this viewer": the window holds them.
+    await waitFor(() =>
+      expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("not reported · this viewer can't read the fleet hub right now"),
+    );
     const section = container.querySelector('[data-testid="machine-utility"]')!;
     expect(section.querySelector(".mm-utility__live")?.textContent).toBe("not reported");
-    expect(container.textContent).not.toMatch(/0 calls|idle/);
+    expect(container.textContent).not.toMatch(/0 calls|idle|no records from this machine/);
   });
 
   // The inverted case: the same page with presence healthy is a peer whose

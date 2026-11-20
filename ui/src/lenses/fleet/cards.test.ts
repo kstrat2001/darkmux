@@ -1779,13 +1779,13 @@ describe("(#3210) a peer's relayed beats, a local silence between them", () => {
 });
 
 // (#3662) The card base under a stale or unreadable presence read: a peer
-// that read as seen goes to "not streaming"; this machine, and a peer already
-// unseen or down, keep what they had.
+// that read as seen goes to `hub_unread` (it looks "not streaming"); this
+// machine, and a peer already unseen or down, keep what they had.
 describe("withPresenceUnread", () => {
   const base = (availability: FleetCardBase["availability"], self: boolean) =>
     ({ availability, liveInputs: { self } }) as unknown as FleetCardBase;
-  it("a peer the window held reads not streamed", () => {
-    expect(withPresenceUnread(base("known", false)).availability).toBe("not_streamed");
+  it("a peer the window held reads hub_unread: its live state unknown, not its stream blamed", () => {
+    expect(withPresenceUnread(base("known", false)).availability).toBe("hub_unread");
   });
   it("this machine's own card is unchanged: its records are its own", () => {
     expect(withPresenceUnread(base("known", true)).availability).toBe("known");
