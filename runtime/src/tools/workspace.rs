@@ -43,23 +43,64 @@ pub fn root() -> PathBuf {
     }
 }
 
-/// Model-facing text with [`DEFAULT_WORKSPACE`] named as this run's
-/// [`root`]: byte-identical when the root is the default (contract 6), so
-/// a container's tool definitions never change.
-pub fn naming_root(text: &str) -> String {
-    naming(text, &root())
+/// (#3654) What model-facing text calls the workspace when the root moved:
+/// the current directory, where every tool runs and against which every
+/// relative path resolves. A sandbox on the host sees the workspace at its
+/// host path, under the user's home, and that path must never reach a model.
+pub const CURRENT_DIR: &str = ".";
+
+/// Whether `root` is somewhere other than [`DEFAULT_WORKSPACE`]: a sandbox
+/// on the host, which names no path of its own to a model.
+fn moved(root: &Path) -> bool {
+    root.as_os_str() != DEFAULT_WORKSPACE
 }
 
-/// `text` with [`DEFAULT_WORKSPACE`] named as `root`, wherever it is the
+/// (#3654) The runtime's own sentences that name `/workspace`, and what each
+/// says when the workspace is the current directory instead. Applied before
+/// the path rename in [`describing_root`], so the tool descriptions read as
+/// sentences rather than as `./...`; every entry matches the runtime's own
+/// text (`every_host_phrase_matches_the_runtimes_own_text`).
+const HOST_PHRASES: &[(&str, &str)] = &[
+    ("(cwd = /workspace)", "(the workspace is its current directory)"),
+    ("Path may be absolute (/workspace/...) or relative.", "Path is relative to the current directory, which is the workspace."),
+    ("Absolute /workspace/... or workspace-relative.", "Relative to the current directory, which is the workspace."),
+    ("Runs with cwd=/workspace.", "Runs with the workspace as its current directory."),
+    ("with cwd=/workspace", "with the workspace as its current directory"),
+    ("inside /workspace", "inside the workspace"),
+    ("outside /workspace", "outside the workspace"),
+];
+
+/// Model-facing text from outside the runtime (the user's message) for this
+/// run's [`root`]: byte-identical when the root is the default (contract 6).
+/// Under a moved root (a sandbox on the host) every `/workspace` at a path
+/// boundary becomes [`CURRENT_DIR`], so `/workspace/src/x.rs` reads
+/// `./src/x.rs` (#3654): no host path is ever written into it.
+pub fn naming_root(text: &str) -> String {
+    if !moved(&root()) {
+        return text.to_string();
+    }
+    naming(text, CURRENT_DIR)
+}
+
+/// The runtime's own model-facing text (its tool definitions and its
+/// default system prompt) for this run's [`root`]: [`naming_root`], after
+/// its sentences that name `/workspace` are said for a workspace that is the
+/// current directory ([`HOST_PHRASES`]), so they read as sentences rather
+/// than as `./...`. Byte-identical under the default root.
+pub fn describing_root(text: &str) -> String {
+    if !moved(&root()) {
+        return text.to_string();
+    }
+    let phrased = HOST_PHRASES.iter().fold(text.to_string(), |t, (from, to)| t.replace(from, to));
+    naming(&phrased, CURRENT_DIR)
+}
+
+/// `text` with [`DEFAULT_WORKSPACE`] named as `name`, wherever it is the
 /// path itself (#3112 review): preceded by the start or a character that
 /// cannot be part of a path, and followed by the end, `/`, or a character
 /// that cannot continue a name. `/workspace2`, `/workspaces`, `/workspace_x`
 /// and `/data/workspace` are other paths and are left alone.
-fn naming(text: &str, root: &Path) -> String {
-    if root.as_os_str() == DEFAULT_WORKSPACE {
-        return text.to_string();
-    }
-    let root = root.to_string_lossy();
+fn naming(text: &str, name: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut from = 0;
     while let Some(found) = text[from..].find(DEFAULT_WORKSPACE) {
@@ -71,11 +112,65 @@ fn naming(text: &str, root: &Path) -> String {
         let before_ok = text[..at].chars().next_back().is_none_or(|c| !is_path_char(c));
         let after_ok = text[end..].chars().next().is_none_or(|c| c == '/' || !is_name_char(c));
         out.push_str(&text[from..at]);
-        out.push_str(if before_ok && after_ok { &root } else { DEFAULT_WORKSPACE });
+        out.push_str(if before_ok && after_ok { name } else { DEFAULT_WORKSPACE });
         from = end;
     }
     out.push_str(&text[from..]);
     out
+}
+
+/// (#3654) How a path a tool touched is named in what the tool returns to
+/// the model. Under the default root it is the path itself, so a
+/// container's tool results never change; under a moved root it is the path
+/// relative to the workspace ([`CURRENT_DIR`] for the workspace itself), or
+/// only that it is outside the workspace: never the host path.
+#[derive(PartialEq, Eq)]
+pub enum Shown {
+    Path(PathBuf),
+    Relative(PathBuf),
+    Outside,
+}
+
+/// [`Shown`] for `path` under this run's [`root`].
+pub fn shown(path: &Path) -> Shown {
+    shown_under(path, &root())
+}
+
+/// [`Shown`] for `path` under the workspace root `root`.
+pub fn shown_under(path: &Path, root: &Path) -> Shown {
+    if !moved(root) {
+        return Shown::Path(path.to_path_buf());
+    }
+    let canonical = root.canonicalize().ok();
+    let inside = [Some(root), canonical.as_deref()].into_iter().flatten().find_map(|r| path.strip_prefix(r).ok());
+    match inside {
+        Some(rel) if rel.as_os_str().is_empty() => Shown::Relative(CURRENT_DIR.into()),
+        Some(rel) => Shown::Relative(rel.to_path_buf()),
+        None => Shown::Outside,
+    }
+}
+
+/// What [`Shown::Outside`] reads as.
+const OUTSIDE: &str = "a path outside the workspace";
+
+impl std::fmt::Display for Shown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Shown::Path(p) | Shown::Relative(p) => write!(f, "{}", p.display()),
+            Shown::Outside => f.write_str(OUTSIDE),
+        }
+    }
+}
+
+/// `{:?}` as a path's own `Debug` (quoted), so a container's messages are
+/// byte for byte what they were.
+impl std::fmt::Debug for Shown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Shown::Path(p) | Shown::Relative(p) => write!(f, "{p:?}"),
+            Shown::Outside => f.write_str(OUTSIDE),
+        }
+    }
 }
 
 /// A character that can continue a file name (`/workspace2`, `/workspace_x`).
@@ -114,11 +209,11 @@ pub fn resolve_read(input: &str, workspace_root: &Path) -> Result<PathBuf> {
 
     let canonical_root = workspace_root
         .canonicalize()
-        .with_context(|| format!("workspace root unavailable: {workspace_root:?}"))?;
+        .with_context(|| format!("workspace root unavailable: {:?}", shown(workspace_root)))?;
 
     if !canonical.starts_with(&canonical_root) {
         return Err(anyhow!(
-            "path escapes workspace: {input} → {canonical:?}"
+            "path escapes workspace: {input} → {:?}", shown(&canonical)
         ));
     }
 
@@ -155,15 +250,15 @@ pub fn resolve_write(input: &str, workspace_root: &Path) -> Result<PathBuf> {
 
     let canonical_parent = parent
         .canonicalize()
-        .with_context(|| format!("resolving parent of {input}: {parent:?}"))?;
+        .with_context(|| format!("resolving parent of {input}: {:?}", shown(parent)))?;
 
     let canonical_root = workspace_root
         .canonicalize()
-        .with_context(|| format!("workspace root unavailable: {workspace_root:?}"))?;
+        .with_context(|| format!("workspace root unavailable: {:?}", shown(workspace_root)))?;
 
     if !canonical_parent.starts_with(&canonical_root) {
         return Err(anyhow!(
-            "write parent escapes workspace: {input} → {canonical_parent:?}"
+            "write parent escapes workspace: {input} → {:?}", shown(&canonical_parent)
         ));
     }
 
@@ -180,7 +275,7 @@ pub fn resolve_write(input: &str, workspace_root: &Path) -> Result<PathBuf> {
     if let Ok(meta) = std::fs::symlink_metadata(&target) {
         if meta.file_type().is_symlink() {
             return Err(anyhow!(
-                "refusing to write through a symlink: {input} → {target:?}"
+                "refusing to write through a symlink: {input} → {:?}", shown(&target)
             ));
         }
     }
@@ -202,7 +297,7 @@ pub struct NotRegular {
 
 impl std::fmt::Display for NotRegular {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?} is {}, not a regular file; read, edit, write and search work only on regular files", self.path, self.kind)
+        write!(f, "{:?} is {}, not a regular file; read, edit, write and search work only on regular files", shown(&self.path), self.kind)
     }
 }
 
@@ -221,7 +316,7 @@ impl std::fmt::Display for TooLarge {
         write!(
             f,
             "{:?} is {} bytes, over the {}-byte limit of a tool that takes a whole file; work on it with `bash` instead",
-            self.path, self.size, self.cap
+            shown(&self.path), self.size, self.cap
         )
     }
 }
@@ -281,8 +376,8 @@ fn no_follow_no_block(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenO
 fn open_regular(path: &Path) -> Result<(std::fs::File, u64)> {
     let file = no_follow_no_block(std::fs::OpenOptions::new().read(true))
         .open(path)
-        .with_context(|| format!("opening {path:?} with O_NOFOLLOW"))?;
-    let meta = file.metadata().with_context(|| format!("stat {path:?}"))?;
+        .with_context(|| format!("opening {:?} with O_NOFOLLOW", shown(path)))?;
+    let meta = file.metadata().with_context(|| format!("stat {:?}", shown(path)))?;
     regular(path, &meta)?;
     Ok((file, meta.len()))
 }
@@ -311,7 +406,7 @@ fn read_capped(file: std::fs::File, size: u64, cap: u64, path: &Path) -> Result<
     let mut bytes = Vec::with_capacity(size.min(cap) as usize);
     file.take(cap.saturating_add(1))
         .read_to_end(&mut bytes)
-        .with_context(|| format!("reading {path:?}"))?;
+        .with_context(|| format!("reading {:?}", shown(path)))?;
     let whole = bytes.len() as u64 <= cap;
     let size = size.max(bytes.len() as u64);
     bytes.truncate(cap as usize);
@@ -334,7 +429,7 @@ pub fn read_whole_regular_bytes(path: &Path, cap: u64) -> Result<Vec<u8>> {
 
 /// [`read_whole_regular_bytes`] as text.
 pub fn read_whole_regular(path: &Path, cap: u64) -> Result<String> {
-    String::from_utf8(read_whole_regular_bytes(path, cap)?).with_context(|| format!("reading {path:?}: not UTF-8 text"))
+    String::from_utf8(read_whole_regular_bytes(path, cap)?).with_context(|| format!("reading {:?}: not UTF-8 text", shown(path)))
 }
 
 /// Open and write to a regular file, never through a symlink at the final
@@ -350,9 +445,9 @@ pub fn write_file_nofollow(path: &Path, content: &[u8]) -> Result<()> {
     }
     let mut file = open_regular_for_write(path)?;
     file.write_all(content)
-        .with_context(|| format!("writing to {path:?}"))?;
+        .with_context(|| format!("writing to {:?}", shown(path)))?;
     file.flush()
-        .with_context(|| format!("flushing {path:?}"))?;
+        .with_context(|| format!("flushing {:?}", shown(path)))?;
     Ok(())
 }
 
@@ -361,8 +456,8 @@ pub fn write_file_nofollow(path: &Path, content: &[u8]) -> Result<()> {
 fn open_regular_for_write(path: &Path) -> Result<std::fs::File> {
     let file = no_follow_no_block(std::fs::OpenOptions::new().write(true).create(true).truncate(true))
         .open(path)
-        .with_context(|| format!("opening {path:?} with O_NOFOLLOW"))?;
-    regular(path, &file.metadata().with_context(|| format!("stat {path:?}"))?)?;
+        .with_context(|| format!("opening {:?} with O_NOFOLLOW", shown(path)))?;
+    regular(path, &file.metadata().with_context(|| format!("stat {:?}", shown(path)))?)?;
     Ok(file)
 }
 
@@ -372,33 +467,40 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
 
-    /// (#3112 step 2) Under the default root, model-facing text is byte
-    /// for byte what it was (contract 6); under another, every mention of
-    /// `/workspace` names that root.
+    /// (#3654) Under the default root, model-facing text is byte for byte
+    /// what it was (contract 6); under a moved one, every mention of
+    /// `/workspace` names the current directory and never the root's path.
     #[test]
-    fn model_facing_text_names_the_root_only_when_it_moved() {
+    #[serial_test::serial(runtime_workspace_env)]
+    fn model_facing_text_names_the_current_directory_only_when_the_root_moved() {
         let text = "runs with cwd=/workspace; paths inside /workspace/...";
-        assert_eq!(naming(text, Path::new(DEFAULT_WORKSPACE)), text);
-        assert_eq!(
-            naming(text, Path::new("/Users/op/ws")),
-            "runs with cwd=/Users/op/ws; paths inside /Users/op/ws/..."
-        );
+        std::env::remove_var(WORKSPACE_ENV);
+        assert_eq!(naming_root(text), text);
+        assert_eq!(describing_root(text), text);
+        std::env::set_var(WORKSPACE_ENV, "/Users/op/ws");
+        let (named, described) = (naming_root(text), describing_root(text));
+        // A sentence no phrase covers still names no path of the host's.
+        let uncovered = describing_root("then read /workspace/a.rs");
+        std::env::remove_var(WORKSPACE_ENV);
+        assert_eq!(named, "runs with cwd=.; paths inside ./...");
+        assert_eq!(described, "runs with the workspace as its current directory; paths inside the workspace/...");
+        assert_eq!(uncovered, "then read ./a.rs");
     }
 
-    /// (#3112 review) A user's message is renamed at a path boundary: a
-    /// mission config copied before `${WORKSPACE_ROOT}` says "mounted at
-    /// `/workspace/<source>`". (contract 6) `--system` is not: the host
-    /// hashed it, so it already names where the sandbox sees the workspace
-    /// (`darkmux-crew`'s `system_prompt_as_sent`) and is sent as passed.
+    /// (#3654) The user's message is renamed at a path boundary, to the
+    /// current directory: a mission config copied before `${WORKSPACE_ROOT}`
+    /// says "mounted at `/workspace/<source>`". (contract 6) `--system` is
+    /// not: the host hashed it, so it already names the workspace for its
+    /// sandbox (`darkmux-crew`'s `system_prompt_as_sent`) and is sent as
+    /// passed.
     #[test]
     fn the_users_message_is_renamed_and_the_system_prompt_is_sent_as_passed() {
-        let prompt = naming("the repository is mounted at `/workspace/<source>`, not /workspace2", Path::new("/Users/op/ws"));
-        assert_eq!(prompt, "the repository is mounted at `/Users/op/ws/<source>`, not /workspace2");
-        assert_eq!(naming("b /workspace/x", Path::new(DEFAULT_WORKSPACE)), "b /workspace/x");
+        let prompt = naming("the repository is mounted at `/workspace/<source>`, not /workspace2", CURRENT_DIR);
+        assert_eq!(prompt, "the repository is mounted at `./<source>`, not /workspace2");
         let entry = include_str!("../lib.rs");
         assert!(entry.contains("let prompt = tools::workspace::naming_root(&prompt);"), "the entry renames the user's message");
         assert!(
-            entry.contains("let system_prompt = args.system.take().unwrap_or_else(|| tools::workspace::naming_root(&default_system_prompt()));"),
+            entry.contains("let system_prompt = args.system.take().unwrap_or_else(|| tools::workspace::describing_root(&default_system_prompt()));"),
             "the entry sends `--system` as passed and renames only its own default"
         );
     }
@@ -408,23 +510,39 @@ mod tests {
     /// `/workspaces`, `/workspace_x` or `/data/workspace`.
     #[test]
     fn workspace_is_renamed_only_at_a_path_boundary() {
-        let root = Path::new("/Users/op/ws");
-        let renamed = |t: &str| naming(t, root);
-        assert_eq!(renamed("/workspace"), "/Users/op/ws");
-        assert_eq!(renamed("at `/workspace/<source>`."), "at `/Users/op/ws/<source>`.");
-        assert_eq!(renamed("cd /workspace && ls /workspace/src"), "cd /Users/op/ws && ls /Users/op/ws/src");
-        assert_eq!(renamed("(/workspace), /workspace."), "(/Users/op/ws), /Users/op/ws.");
+        let renamed = |t: &str| naming(t, CURRENT_DIR);
+        assert_eq!(renamed("/workspace"), ".");
+        assert_eq!(renamed("at `/workspace/<source>`."), "at `./<source>`.");
+        assert_eq!(renamed("cd /workspace && ls /workspace/src"), "cd . && ls ./src");
+        assert_eq!(renamed("(/workspace), /workspace."), "(.), ..");
         for kept in ["/workspace2/x", "/workspaces", "/workspace_x", "/workspace-y", "/data/workspace/x", "a/workspace"] {
             assert_eq!(renamed(kept), kept, "{kept}");
         }
         // A directory named `workspace` inside the workspace: only the root
         // is renamed, the next match's boundary read from the whole text.
-        assert_eq!(renamed("/workspace/workspace/x"), "/Users/op/ws/workspace/x");
+        assert_eq!(renamed("/workspace/workspace/x"), "./workspace/x");
         assert_eq!(renamed("/workspace2/workspace"), "/workspace2/workspace");
     }
 
-    /// (#3112 step 2) The root is the env override when set and non-empty,
-    /// else `/workspace`; the tool definitions the model sees follow it.
+    /// (#3654) Every sentence [`HOST_PHRASES`] rewrites is one the runtime
+    /// itself says (a tool description, a parameter's, its default system
+    /// prompt), so none is dead and each says what it was written for.
+    #[test]
+    fn every_host_phrase_matches_the_runtimes_own_text() {
+        let mut own = vec![crate::default_system_prompt()];
+        for tool in crate::tools::Tool::ALL {
+            own.push(tool.description().to_string());
+            own.push(tool.parameters_schema().to_string());
+        }
+        for (from, _) in HOST_PHRASES {
+            assert!(own.iter().any(|t| t.contains(from)), "{from:?} matches none of the runtime's own text");
+        }
+    }
+
+    /// (#3112 step 2, #3654) The root is the env override when set and
+    /// non-empty, else `/workspace`. The tool definitions the model sees name
+    /// `/workspace` under the default root and, under a moved one, the
+    /// current directory: never `/workspace`, never the root's path.
     #[test]
     #[serial_test::serial(runtime_workspace_env)]
     fn the_root_and_the_tool_definitions_follow_the_env_override() {
@@ -436,11 +554,68 @@ mod tests {
         assert_eq!(root(), Path::new(DEFAULT_WORKSPACE), "empty is unset");
         std::env::set_var(WORKSPACE_ENV, "/Users/op/ws");
         assert_eq!(root(), Path::new("/Users/op/ws"));
-        let read = serde_json::to_string(&crate::tools::Tool::Read.to_tool_def()).unwrap();
-        let bash = serde_json::to_string(&crate::tools::Tool::Bash.to_tool_def()).unwrap();
+        let defs: Vec<String> = crate::tools::Tool::ALL.iter().map(|t| serde_json::to_string(&t.to_tool_def()).unwrap()).collect();
+        let default_prompt = describing_root(&crate::default_system_prompt());
         std::env::remove_var(WORKSPACE_ENV);
-        assert!(read.contains("/Users/op/ws/") && !read.contains("/workspace"), "{read}");
-        assert!(bash.contains("cwd=/Users/op/ws") && !bash.contains("/workspace"), "{bash}");
+        for text in defs.iter().chain([&default_prompt]) {
+            assert!(!text.contains("/workspace") && !text.contains("/Users/op"), "{text}");
+        }
+        let bash = &defs[crate::tools::Tool::ALL.iter().position(|t| t.name() == "bash").unwrap()];
+        assert!(bash.contains("Runs with the workspace as its current directory."), "{bash}");
+    }
+
+    /// (#3654) A path in a tool's result is the path itself under the
+    /// default root (a container's results are unchanged), and under a
+    /// moved one is relative to the workspace, `.` for the workspace itself,
+    /// or only "outside the workspace": never the host path, by either
+    /// spelling of the root.
+    #[test]
+    fn a_path_is_shown_relative_to_a_moved_root_and_as_itself_in_a_container() {
+        let ws = fresh_workspace();
+        let real = ws.path().canonicalize().unwrap();
+        let container = shown_under(Path::new("/workspace/src/a.rs"), Path::new(DEFAULT_WORKSPACE));
+        assert_eq!(format!("{container:?} {container}"), format!("{:?} /workspace/src/a.rs", Path::new("/workspace/src/a.rs")));
+        for root in [ws.path(), real.as_path()] {
+            for inside in [root.join("src/a.rs"), real.join("src/a.rs")] {
+                let s = shown_under(&inside, root);
+                assert_eq!(format!("{s:?} {s}"), "\"src/a.rs\" src/a.rs");
+            }
+            assert_eq!(format!("{}", shown_under(&real, root)), ".");
+            let outside = shown_under(Path::new("/Users/op/.ssh/id"), root);
+            assert_eq!(format!("{outside:?} {outside}"), "a path outside the workspace a path outside the workspace");
+        }
+    }
+
+    /// (#3654) A refusal a file tool returns under a moved root names no
+    /// path of the host's: an escape, a missing parent, a symlink, a
+    /// directory, a file over a cap.
+    #[test]
+    #[serial_test::serial(runtime_workspace_env)]
+    fn a_refusal_under_a_moved_root_names_no_host_path() {
+        let ws = fresh_workspace();
+        let outside = fresh_workspace();
+        fs::write(outside.path().join("secret"), "s").unwrap();
+        symlink(outside.path().join("secret"), ws.path().join("link")).unwrap();
+        fs::create_dir(ws.path().join("dir")).unwrap();
+        fs::write(ws.path().join("big"), "0123456789").unwrap();
+        std::env::set_var(WORKSPACE_ENV, ws.path());
+        let errors = [
+            resolve_read(&format!("../{}/secret", outside.path().file_name().unwrap().to_string_lossy()), ws.path()).unwrap_err(),
+            resolve_read("link", ws.path()).unwrap_err(),
+            resolve_write("missing/x", ws.path()).unwrap_err(),
+            resolve_write("link", ws.path()).unwrap_err(),
+            read_regular(&ws.path().canonicalize().unwrap().join("dir"), 4).unwrap_err(),
+            read_whole_regular(&ws.path().canonicalize().unwrap().join("big"), 4).unwrap_err(),
+        ]
+        .map(|e| format!("{e:#}"));
+        std::env::remove_var(WORKSPACE_ENV);
+        let real = ws.path().canonicalize().unwrap();
+        let tmp = std::env::temp_dir().canonicalize().unwrap();
+        for text in errors {
+            for private in [ws.path(), real.as_path(), outside.path(), tmp.as_path()] {
+                assert!(!text.contains(&private.display().to_string()), "{text}");
+            }
+        }
     }
 
     /// Create a fresh tempdir to serve as the workspace root for one

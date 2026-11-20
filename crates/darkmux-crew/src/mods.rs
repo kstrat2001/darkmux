@@ -589,6 +589,10 @@ pub fn attachments_dir_at(root: &Path, key: &str) -> PathBuf {
 pub const CONTAINER_MODS_BASE: &str = "/darkmux-mods";
 
 /// The container path one mod's `attachments/` is mounted at.
+/// (#3654) The environment variable a sandbox on the host names the mod
+/// store with.
+pub const MODS_ENV: &str = "DARKMUX_MODS";
+
 pub fn attachments_container_dir(key: &str) -> String {
     format!("{CONTAINER_MODS_BASE}/{key}/attachments")
 }

@@ -8,17 +8,38 @@ use serde_json::Value;
 
 const CONTAINER_WORKSPACE: &str = "/workspace";
 
+/// (#3654) What model-facing text calls the workspace in a sandbox on the
+/// host: the current directory, where the runtime runs every tool. Such a
+/// sandbox sees the workspace at its own host path, which is under the
+/// user's home and names the user, so that path is never written into a
+/// prompt, a message or a brief.
+pub const CURRENT_DIR: &str = ".";
+
+/// (#3654) How model-facing text names `workspace` in a `kind` sandbox:
+/// `/workspace` where the sandbox mounts it there (a container, byte for
+/// byte as before), [`CURRENT_DIR`] where it sees it anywhere else (a
+/// sandbox on the host). The runtime makes the same choice for its own text
+/// (`runtime/src/tools/workspace.rs`, `naming_root`), keyed on the same
+/// fact: whether the host had to tell it where the workspace is.
+pub fn model_root(kind: Option<darkmux_sandbox::BackendKind>, workspace: &std::path::Path) -> &'static str {
+    if darkmux_sandbox::seen_at(kind, workspace, CONTAINER_WORKSPACE) == CONTAINER_WORKSPACE {
+        CONTAINER_WORKSPACE
+    } else {
+        CURRENT_DIR
+    }
+}
+
 /// Whether `text` names `/workspace` as a path: the runtime's rename rule
 /// (`runtime/src/tools/workspace.rs`, `naming`), a boundary on both sides.
 pub fn names_container_workspace(text: &str) -> bool {
     text.match_indices(CONTAINER_WORKSPACE).any(|(at, _)| is_the_path_at(text, at))
 }
 
-/// (contract 6) `text` with `/workspace` named as `root` wherever it is the
-/// path itself, by the runtime's rule. The host names the system prompt so
-/// before it records its hash and passes it as `--system`, which the runtime
-/// sends byte for byte: the recorded hash is then the hash of what is sent.
-/// Unchanged when `root` is `/workspace`.
+/// (contract 6) `text` with `/workspace` named as `root` (a [`model_root`])
+/// wherever it is the path itself, by the runtime's rule. The host names the
+/// system prompt so before it records its hash and passes it as `--system`,
+/// which the runtime sends byte for byte: the recorded hash is then the hash
+/// of what is sent. Unchanged when `root` is `/workspace`.
 pub fn named_as(text: &str, root: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut from = 0;

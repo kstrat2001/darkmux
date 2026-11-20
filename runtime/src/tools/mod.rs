@@ -485,7 +485,7 @@ impl Tool {
             kind: "function".into(),
             function: FunctionDef {
                 name: self.name().into(),
-                description: workspace::naming_root(self.description()),
+                description: workspace::describing_root(self.description()),
                 parameters: schema_naming_root(self.parameters_schema()),
             },
         }
@@ -513,10 +513,10 @@ impl Tool {
 }
 
 /// A parameters schema with its descriptions naming this run's workspace
-/// root ([`workspace::naming_root`]); unchanged under the default root.
+/// root ([`workspace::describing_root`]); unchanged under the default root.
 fn schema_naming_root(schema: serde_json::Value) -> serde_json::Value {
     match schema {
-        serde_json::Value::String(s) => serde_json::Value::String(workspace::naming_root(&s)),
+        serde_json::Value::String(s) => serde_json::Value::String(workspace::describing_root(&s)),
         serde_json::Value::Array(items) => items.into_iter().map(schema_naming_root).collect(),
         serde_json::Value::Object(map) => map.into_iter().map(|(k, v)| (k, schema_naming_root(v))).collect(),
         other => other,
@@ -602,7 +602,7 @@ fn format_dispatch_error(tool: Tool, name: &str, e: &anyhow::Error) -> String {
     let arg_parse_marker = format!("parsing {name} arguments");
     if err_str.contains(&arg_parse_marker) {
         // (#3112) Model-facing text: the key order the standalone build shows.
-        let schema = crate::key_order::sorted(tool.parameters_schema());
+        let schema = crate::key_order::sorted(schema_naming_root(tool.parameters_schema()));
         let schema_text = serde_json::to_string_pretty(&schema)
             .unwrap_or_else(|_| schema.to_string());
         format!(
@@ -1111,7 +1111,7 @@ fn execute_read(raw_args: &str, workspace_root: &Path) -> Result<String> {
     // of defense against a model accidentally asking for an enormous binary;
     // the offset/limit pair is the first.
     let start = read_regular(&path, READ_MAX_BYTES as u64)
-        .with_context(|| format!("reading file: {path:?}"))?;
+        .with_context(|| format!("reading file: {:?}", workspace::shown(&path)))?;
 
     if !start.whole {
         let truncated = String::from_utf8_lossy(&start.bytes);
@@ -1246,12 +1246,12 @@ fn execute_write_hooked(
 fn write_resolved(path: &Path, content_str: &str) -> Result<String> {
     let path = path.to_path_buf();
     write_file_nofollow(&path, content_str.as_bytes())
-        .with_context(|| format!("writing file: {path:?}"))?;
+        .with_context(|| format!("writing file: {:?}", workspace::shown(&path)))?;
 
     Ok(format!(
         "Wrote {} bytes to {}",
         content_str.len(),
-        path.display()
+        workspace::shown(&path)
     ))
 }
 
@@ -1306,17 +1306,17 @@ fn execute_edit_hooked(
 fn edit_resolved(path: &Path, edits: &[EditOp]) -> Result<String> {
     let path = path.to_path_buf();
     let original = read_whole_regular(&path, WHOLE_FILE_MAX_BYTES)
-        .with_context(|| format!("reading file for edit: {path:?}"))?;
+        .with_context(|| format!("reading file for edit: {:?}", workspace::shown(&path)))?;
 
     let (content, total_replacements) = apply_edits(original, edits, &path)?;
 
     write_file_nofollow(&path, content.as_bytes())
-        .with_context(|| format!("writing edited file: {path:?}"))?;
+        .with_context(|| format!("writing edited file: {:?}", workspace::shown(&path)))?;
 
     let edit_count = edits.len();
     Ok(format!(
         "Edited {} ({edit_count} edit{} applied; {total_replacements} replacement{} total)",
-        path.display(),
+        workspace::shown(&path),
         if edit_count == 1 { "" } else { "s" },
         if total_replacements == 1 { "" } else { "s" }
     ))
@@ -1345,16 +1345,18 @@ fn apply_edits(
         let count = content.matches(&op.old_string).count();
         if count == 0 {
             return Err(anyhow!(
-                "edit: edits[{idx}].old_string not found in {path:?} \
+                "edit: edits[{idx}].old_string not found in {:?} \
                  (checked against the current state after prior edits in this call). \
-                 Did you mean to use `write` to create a new file?"
+                 Did you mean to use `write` to create a new file?",
+                workspace::shown(path)
             ));
         }
         if count > 1 && !op.replace_all {
             return Err(anyhow!(
-                "edit: edits[{idx}].old_string appears {count} times in {path:?}. \
+                "edit: edits[{idx}].old_string appears {count} times in {:?}. \
                  Pass replace_all=true to replace every occurrence, or \
-                 provide more surrounding context to make old_string unique."
+                 provide more surrounding context to make old_string unique.",
+                workspace::shown(path)
             ));
         }
 
@@ -1410,10 +1412,10 @@ fn execute_search(raw_args: &str, workspace_root: &Path) -> Result<String> {
     let resolved = resolve_read(&args.path, workspace_root)?;
     let canonical_root = workspace_root
         .canonicalize()
-        .with_context(|| format!("workspace root unavailable: {workspace_root:?}"))?;
+        .with_context(|| format!("workspace root unavailable: {:?}", workspace::shown(workspace_root)))?;
 
     let meta = std::fs::symlink_metadata(&resolved)
-        .with_context(|| format!("stat: {resolved:?}"))?;
+        .with_context(|| format!("stat: {:?}", workspace::shown(&resolved)))?;
 
     let mut found = Found::default();
     if meta.is_file() {
@@ -1422,7 +1424,7 @@ fn execute_search(raw_args: &str, workspace_root: &Path) -> Result<String> {
         search_dir(&resolved, &canonical_root, &args.pattern, &mut found, max_results);
     } else {
         return Err(anyhow!(
-            "search: path is neither a file nor a directory: {resolved:?}"
+            "search: path is neither a file nor a directory: {:?}", workspace::shown(&resolved)
         ));
     }
 
@@ -4051,10 +4053,10 @@ fn execute_create_finding_with(
         .create(true)
         .append(true)
         .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
+        .with_context(|| format!("opening {}", workspace::shown(&path)))?;
     use std::io::Write as _;
     f.write_all(line.as_bytes())
-        .with_context(|| format!("appending to {}", path.display()))?;
+        .with_context(|| format!("appending to {}", workspace::shown(&path)))?;
 
     let recorded = count + 1;
     let remaining = MAX_FINDINGS_PER_DISPATCH.saturating_sub(recorded);
@@ -4388,10 +4390,10 @@ fn execute_create_mod_with(
         .create(true)
         .append(true)
         .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
+        .with_context(|| format!("opening {}", workspace::shown(&path)))?;
     use std::io::Write as _;
     f.write_all(line.as_bytes())
-        .with_context(|| format!("appending to {}", path.display()))?;
+        .with_context(|| format!("appending to {}", workspace::shown(&path)))?;
 
     let recorded = count + 1;
     Ok(ToolRun {

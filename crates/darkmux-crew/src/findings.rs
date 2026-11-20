@@ -400,7 +400,11 @@ pub fn load_at(root: &Path, execution: &str, seq: u64) -> Result<Option<FindingR
 /// doctrine in `CLAUDE.md`).
 pub fn brief_block(record: &FindingRecord) -> String {
     let pretty = |v: &serde_json::Value| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
-    let context = serde_json::to_value(&record.context).unwrap_or(serde_json::Value::Null);
+    // (#3654) `root` is the host path a sandbox on the host saw the workspace
+    // at, kept for mapping the record's paths: it names the user's home and
+    // is never handed to a model. A container's record has none.
+    let context = record.context.as_ref().map(|c| darkmux_flow::payload::RecordContext { root: None, ..c.clone() });
+    let context = serde_json::to_value(&context).unwrap_or(serde_json::Value::Null);
     format!(
         "<finding key=\"{key}\">\n\
          <darkmux-term name=\"finding\">something an earlier agent observed and \
@@ -835,6 +839,33 @@ mod tests {
         assert!(block.contains("unnamed-predicate"), "the launcher's context is present: {block}");
         assert!(block.contains("create_mod"), "tells the model how to record a change: {block}");
         assert!(block.contains("in `for`"), "and which field names this finding: {block}");
+    }
+
+    /// (#3654) A finding recorded under a sandbox on the host carries the
+    /// host path its sandbox saw the workspace at (`context.root`, for
+    /// mapping its file back to the source). The brief block never hands
+    /// that to the next model: it names the user's home. The rest of the
+    /// context is there, and a record with no root (a container's) renders
+    /// as it always has.
+    #[test]
+    fn a_brief_block_never_carries_the_host_root_a_finding_was_recorded_under() {
+        let record = |context: serde_json::Value| {
+            build_record(
+                "sess-a",
+                7,
+                "2026-09-03T00:00:00Z".into(),
+                "create_finding",
+                Proposer { handle: "crawler".into(), model: "m".into(), machine_id: None },
+                Scope::default(),
+                Some(ctx(context)),
+                serde_json::json!({"file": "src/x.ts", "line": 82}),
+            )
+        };
+        let hosted = brief_block(&record(serde_json::json!({"source": "app", "root": "/Users/op/tree"})));
+        assert!(!hosted.contains("/Users/op") && !hosted.contains("\"root\""), "{hosted}");
+        assert!(hosted.contains("\"source\": \"app\""), "{hosted}");
+        let contained = brief_block(&record(serde_json::json!({"source": "app"})));
+        assert_eq!(hosted, contained, "the root is the only difference");
     }
 
     use super::*;

@@ -403,10 +403,26 @@ pub fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit, intent: 
 /// Where a container sees the unit's tree.
 const CONTAINER_TREE_ROOT: &str = "/workspace";
 
-/// (#3112 review) [`build_message`] naming the tree at `root`, where the
-/// unit's sandbox sees it: `/workspace` in a container (the frozen message,
-/// byte for byte), the tree's own host path in a sandbox on the host, where
-/// `/workspace` is a directory that does not exist.
+/// (#3654) How a unit's brief names its tree to its model: `/workspace` in a
+/// container, the current directory in a sandbox on the host, never the
+/// tree's host path, which names the user.
+pub(crate) fn tree_named(kind: Option<darkmux_sandbox::BackendKind>, tree_root: &Path) -> String {
+    darkmux_crew::mission_config::workspace_paths::model_root(kind, tree_root).to_string()
+}
+
+/// A finding's `file` as the source names it: mapped from where the unit's
+/// sandbox saw the tree (`tree_seen`), after the `./` a brief that named
+/// the tree as the current directory taught the model to write (#3654).
+fn source_file(ctx: &UnitContext, raw: &str) -> String {
+    let named_here = ctx.tree_named == darkmux_crew::mission_config::workspace_paths::CURRENT_DIR;
+    let raw = if named_here { raw.strip_prefix("./").unwrap_or(raw) } else { raw };
+    strip_source_prefix_under(Some(&ctx.tree_seen), &ctx.source, raw)
+}
+
+/// (#3112 review) [`build_message`] naming the tree at `root`, as the unit's
+/// model sees it ([`tree_named`]): `/workspace` in a container (the frozen
+/// message, byte for byte), the current directory in a sandbox on the host,
+/// where `/workspace` is a directory that does not exist (#3654).
 pub fn build_message_at(root: &str, rules_by_id: &BTreeMap<String, Rule>, unit: &Unit, intent: Option<&str>) -> Result<String> {
     let mut out = String::new();
     if let Some(text) = intent {
@@ -745,7 +761,7 @@ fn readback_findings(
         if let Some(obj) = rec.as_object_mut() {
             let raw_file = obj.get(FINDING_FILE_KEY).and_then(Value::as_str).unwrap_or("").to_string();
             obj.insert("file_raw".to_string(), json!(raw_file));
-            obj.insert(FINDING_FILE_KEY.to_string(), json!(strip_source_prefix_under(Some(&ctx.tree_seen), &ctx.source, &raw_file)));
+            obj.insert(FINDING_FILE_KEY.to_string(), json!(source_file(ctx, &raw_file)));
             obj.insert("workspace".to_string(), json!(ctx.workspace));
             obj.insert("unit".to_string(), json!(ctx.unit_id));
             obj.insert("source".to_string(), json!(ctx.source));
@@ -903,6 +919,8 @@ struct UnitContext {
     /// in a container, the tree's own path in a sandbox on the host. Every
     /// path the brief lists starts here, and findings map back from it.
     tree_seen: String,
+    /// (#3654) How the unit's brief names `tree_root` to its model.
+    tree_named: String,
     /// The one read of `runtime.sandbox` `tree_seen` was written for, handed
     /// to the dispatch (`DispatchOpts::sandbox`) so it runs where the
     /// message says.
@@ -977,6 +995,7 @@ fn unit_context(the_plan: &Plan, unit: &Unit, run: &RunId, role_id: &str, rule_s
         sites: planned_sites(unit),
         session_id: SessionId::adhoc(run.clone(), role_id, format!("{rule_segment}-{}", unit.id())),
         tree_seen: darkmux_sandbox::seen_at(sandbox.as_ref().ok().map(|s| s.kind), &tree_root, CONTAINER_TREE_ROOT),
+        tree_named: tree_named(sandbox.as_ref().ok().map(|s| s.kind), &tree_root),
         tree_root,
         sandbox,
     })
@@ -1340,7 +1359,7 @@ impl StepKind for DispatchUnitStepKind {
         });
         // (#3112 review) Every path the brief lists starts where this unit's
         // sandbox sees the tree.
-        let message = build_message_at(&ctx.tree_seen, &rules_by_id, unit, intent_text.as_deref())?;
+        let message = build_message_at(&ctx.tree_named, &rules_by_id, unit, intent_text.as_deref())?;
 
         // Mint this unit's own out dir BEFORE dispatch (#2153): the dir is
         // then known and recorded even if the dispatch returns `Err` with

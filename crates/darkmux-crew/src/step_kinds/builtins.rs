@@ -44,8 +44,9 @@ use std::sync::Mutex;
 pub const WORKSPACE_ROOT_PLACEHOLDER: &str = "${WORKSPACE_ROOT}";
 
 /// (#3112 review) `message` with [`WORKSPACE_ROOT_PLACEHOLDER`] replaced by
-/// where a `kind` sandbox sees `workdir`: `/workspace` in a container, the
-/// workdir's own path in a sandbox on the host. With no workdir yet (a
+/// how a `kind` sandbox's model names `workdir`: `/workspace` in a
+/// container, the current directory in a sandbox on the host (#3654: never
+/// the workdir's host path). With no workdir yet (a
 /// fresh tempdir the dispatch makes later) the placeholder is left for the
 /// dispatch, which expands it against that tempdir when it writes the
 /// prompt file (`dispatch_internal::prompt_file_text`). A message without
@@ -59,7 +60,7 @@ pub(crate) fn expand_workspace_root(
 ) -> String {
     match workdir {
         Some(w) if message.contains(WORKSPACE_ROOT_PLACEHOLDER) => {
-            message.replace(WORKSPACE_ROOT_PLACEHOLDER, &darkmux_sandbox::seen_at(kind, w, "/workspace"))
+            message.replace(WORKSPACE_ROOT_PLACEHOLDER, crate::mission_config::workspace_paths::model_root(kind, w))
         }
         _ => message.to_string(),
     }
@@ -4554,23 +4555,26 @@ mod tests {
     }
 
     #[test]
-    fn a_step_message_names_the_workspace_where_the_sandbox_sees_it() {
-        // (#3112 review) `${WORKSPACE_ROOT}` in a step's message is where its
-        // dispatch's sandbox sees the workdir: `/workspace` in a container
-        // (the shipped configs' old literal, byte for byte), the workdir's own
-        // path in a sandbox on the host. A message without it is untouched.
+    fn a_step_message_names_the_workspace_as_its_model_sees_it() {
+        // (#3112 review, #3654) `${WORKSPACE_ROOT}` in a step's message is
+        // how its dispatch's model names the workdir: `/workspace` in a
+        // container (the shipped configs' old literal, byte for byte), the
+        // current directory in a sandbox on the host, which never names the
+        // workdir's host path. A message without it is untouched.
         use darkmux_sandbox::BackendKind;
         let dir = tempfile::TempDir::new().unwrap();
-        let real = dir.path().canonicalize().unwrap().display().to_string();
         let msg = "mounted at `${WORKSPACE_ROOT}/<source>`, so `${WORKSPACE_ROOT}/<source>/src/x.ts`";
         assert_eq!(
             expand_workspace_root(msg, Some(BackendKind::Docker), Some(dir.path())),
             "mounted at `/workspace/<source>`, so `/workspace/<source>/src/x.ts`"
         );
-        assert_eq!(
-            expand_workspace_root(msg, Some(BackendKind::Seatbelt), Some(dir.path())),
-            format!("mounted at `{real}/<source>`, so `{real}/<source>/src/x.ts`")
-        );
+        for kind in [BackendKind::Seatbelt, BackendKind::Landlock] {
+            assert_eq!(
+                expand_workspace_root(msg, Some(kind), Some(dir.path())),
+                "mounted at `./<source>`, so `./<source>/src/x.ts`",
+                "{kind:?}"
+            );
+        }
         let plain = "a user's own message names /workspace";
         assert_eq!(expand_workspace_root(plain, Some(BackendKind::Seatbelt), Some(dir.path())), plain);
     }
@@ -4610,8 +4614,7 @@ mod tests {
         unsafe {
             match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
         }
-        let real = dir.path().canonicalize().unwrap().display().to_string();
-        assert_eq!(seatbelt, format!("read `{real}/<source>/x`"));
+        assert_eq!(seatbelt, "read `./<source>/x`");
         assert_eq!(seatbelt_opts.sandbox.and_then(Result::ok).map(|s| s.kind), Some(darkmux_sandbox::BackendKind::Seatbelt));
     }
 
