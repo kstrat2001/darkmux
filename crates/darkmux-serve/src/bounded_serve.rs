@@ -222,11 +222,12 @@ pub(crate) fn counted_as(peer: SocketAddr, here: bool) -> IpAddr {
 
 /// Closes a connection this listener refuses with a reset (`SO_LINGER` 0),
 /// never an ordinary close: the side that closes first keeps the
-/// connection in TIME_WAIT for a minute or so, and on a Mac one held on
-/// 127.0.0.1 keeps its port from every other loopback connection on this
-/// machine. A peer that opens connections as fast as they are refused
-/// could otherwise use up those ports, and with them the operator's
-/// browser's way in. The reset is immediate; nothing blocks.
+/// connection in TIME_WAIT for a minute or so, and while it does, that
+/// connection's source port cannot be used for a new connection to this
+/// same listener. A peer that opens connections as fast as they are
+/// refused could otherwise tie up the ports this machine's clients, the
+/// operator's browser among them, need to reach this listener. The reset
+/// is immediate; nothing blocks.
 pub(crate) fn refused<T>(stream: tokio::net::TcpStream) -> Option<T> {
     let _ = stream.set_zero_linger();
     None

@@ -242,7 +242,7 @@ darkmux release.
   a few hundred milliseconds measured on an M5 Max, and from one to several seconds (1.4 to 6 s
   measured) when the container engine holds tens of thousands of open files. Every connection a listener
   refuses is now closed with a reset rather than an ordinary close, so a flood leaves no closed
-  connections holding this Mac's loopback ports. Nothing is
+  connections tying up the ports your browser needs to reach that listener. Nothing is
   checked while the first half has room. Not covered: sandboxed work holding connections open past the
   first half is checked each time (the sandbox's network rules keep it off darkmux's ports); a container
   engine whose forwarder darkmux does not know by name (OrbStack, rootless Podman's slirp4netns or
