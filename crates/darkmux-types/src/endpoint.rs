@@ -1103,6 +1103,30 @@ pub fn lmstudio_chat_url(base: &str) -> String {
     format!("{}/chat/completions", lmstudio_v1_base(base))
 }
 
+/// The port `url` is dialed on: the one it names, else its scheme's.
+pub fn url_port(url: &str) -> Option<u16> {
+    let (scheme, _) = url.split_once("://")?;
+    // A host `url_host` accepts closes any `[` it opens.
+    let hostport = url_host(url)?;
+    let after_host = match hostport.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').map_or("", |(_, tail)| tail),
+        None => hostport.find(':').map_or("", |i| &hostport[i..]),
+    };
+    match after_host.strip_prefix(':').filter(|p| !p.is_empty()) {
+        Some(port) => port.parse().ok(),
+        None => scheme_port(scheme),
+    }
+}
+
+/// The port a URL scheme dials when the URL names none.
+fn scheme_port(scheme: &str) -> Option<u16> {
+    match scheme.to_ascii_lowercase().as_str() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
+}
+
 /// The authority of `url` with any userinfo stripped: `https://tok@h:1/p`
 /// → `h:1`. `None` when `url` has no `scheme://`.
 pub fn url_host(url: &str) -> Option<String> {
@@ -2319,5 +2343,97 @@ mod tests {
         assert_eq!(refused.len(), 1);
         assert!(refused[0].to_string().contains("`flint` endpoint"), "{}", refused[0]);
         assert!(!r.needs_lmstudio(), "a Flint model and binding need no LM Studio");
+    }
+
+    /// LM Studio names a load made without an identifier (its app, a bare
+    /// `lms load`) by the model key, so an opt-out `identifier` equal to that
+    /// key collides with the operator's own load of the model. Refused at
+    /// preflight naming the key and the fix; a namespaced or distinct
+    /// identifier, or none, passes.
+    #[test]
+    fn an_identifier_equal_to_the_bare_model_key_is_refused() {
+        let r = registry(
+            r#"{"profiles":{"p":{"models":[
+                {"id":"qwen/qwen3.8-27b","n_ctx":8192,"identifier":"qwen/qwen3.8-27b"},
+                {"id":"qwen/qwen3.8-27b@4bit","n_ctx":8192,"identifier":"qwen/qwen3.8-27b"},
+                {"id":"qwen/qwen3.8-27b@8bit","n_ctx":8192,"identifier":"qwen/qwen3.8-27b@8bit"},
+                {"id":"darkmux:phi-4","n_ctx":8192,"identifier":"phi-4"},
+                {"id":"qwen/qwen3.8-27b","n_ctx":8192,"identifier":"darkmux:qwen/qwen3.8-27b"},
+                {"id":"qwen/qwen3.8-27b","n_ctx":8192,"identifier":"my-qwen"},
+                {"id":"qwen/qwen3.8-27b","n_ctx":8192},
+                {"id":"hosted","endpoint":"hosted","identifier":"hosted"}]}},
+                "endpoints":{"hosted":{"url":"https://h.example/v1"}}}"#,
+        );
+        let models = &r.profiles["p"].models;
+        for (i, key) in [(0, "qwen/qwen3.8-27b"), (1, "qwen/qwen3.8-27b"), (2, "qwen/qwen3.8-27b@8bit"), (3, "phi-4")] {
+            let why = models[i].identifier_problem().unwrap_or_else(|| panic!("model {i}: refused"));
+            for n in [&format!("`{key}`")[..], "LM Studio", "darkmux:"] {
+                assert!(why.contains(n), "model {i}: expected {n:?} in: {why}");
+            }
+        }
+        for (i, m) in models.iter().enumerate().skip(4) {
+            assert_eq!(m.identifier_problem(), None, "model {i}");
+        }
+        let invalid = crate::config_enum::colliding_identifiers(&r);
+        let paths: Vec<String> = invalid.iter().map(|v| v.set_in.to_string()).collect();
+        assert_eq!(paths, (0..4).map(|i| format!("profiles.json key `profiles.p.models[{i}].identifier`")).collect::<Vec<_>>());
+        assert!(invalid.iter().all(|v| v.valid.contains("darkmux:")), "the fix names a namespaced identifier");
+    }
+
+    /// Two models with different ids under one `darkmux:` identifier (an
+    /// explicit one, or one equal to another model's default) would let one
+    /// model's dispatch reuse the other's load. Refused at preflight naming
+    /// both; the same id in two profiles shares its identifier by design.
+    #[test]
+    fn two_models_sharing_one_darkmux_identifier_are_refused() {
+        let r = registry(
+            r#"{"profiles":{
+                "a":{"models":[{"id":"qwen3.6-27b","n_ctx":8192,"identifier":"darkmux:coder"},{"id":"y","n_ctx":8192}]},
+                "b":{"models":[{"id":"qwen/qwen3.8-27b","n_ctx":8192,"identifier":"darkmux:coder"},
+                               {"id":"x","n_ctx":8192,"identifier":"darkmux:y"},
+                               {"id":"qwen3.6-27b","n_ctx":4096,"identifier":"darkmux:coder"},
+                               {"id":"darkmux:y","n_ctx":4096}]},
+                "c":{"models":[{"id":"p","n_ctx":8192,"identifier":"my-coder"},{"id":"q","n_ctx":8192,"identifier":"my-coder"},
+                               {"id":"h1","endpoint":"hosted","identifier":"darkmux:h"},
+                               {"id":"h2","endpoint":"hosted","identifier":"darkmux:h"}]}},
+                "endpoints":{"hosted":{"url":"https://h.example/v1"}}}"#,
+        );
+        // An opt-out identifier outside the namespace is matched with its key
+        // (never reused across ids), and a hosted model loads nothing, so
+        // neither pair is refused.
+        let invalid = crate::config_enum::shared_darkmux_identifiers(&r);
+        let found: Vec<(String, &str)> = invalid.iter().map(|v| (v.set_in.to_string(), v.problem.as_str())).collect();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].0.contains("profiles.b.models[0].identifier"), "{found:?}");
+        assert!(found[0].1.contains("`darkmux:coder`") && found[0].1.contains("profiles.a.models[0]"), "{found:?}");
+        assert!(found[1].0.contains("profiles.b.models[1].identifier"), "{found:?}");
+        assert!(found[1].1.contains("`darkmux:y`") && found[1].1.contains("profiles.a.models[1]"), "{found:?}");
+    }
+
+    /// An explicit `identifier` on a variant id cannot tell this variant's
+    /// load from another quantization's when LM Studio lists both under the
+    /// base key, so it is refused at preflight with the remedy: drop it, the
+    /// default `darkmux:<id>` names the variant exactly. The default, and an
+    /// explicit identifier on a non-variant id, pass.
+    #[test]
+    fn an_explicit_identifier_on_a_variant_id_is_refused() {
+        let r = registry(
+            r#"{"profiles":{"p":{"models":[
+                {"id":"q@4bit","n_ctx":8192,"identifier":"darkmux:coder"},
+                {"id":"darkmux:q@8bit","n_ctx":8192,"identifier":"my-coder"},
+                {"id":"q@4bit","n_ctx":8192},
+                {"id":"q","n_ctx":8192,"identifier":"darkmux:coder"}]}}}"#,
+        );
+        let models = &r.profiles["p"].models;
+        for (i, id) in [(0, "q@4bit"), (1, "q@8bit")] {
+            let why = models[i].identifier_problem().unwrap_or_else(|| panic!("model {i}: refused"));
+            for n in [&format!("`{id}`")[..], "variant", "Drop the identifier", &format!("`darkmux:{id}`")[..]] {
+                assert!(why.contains(n), "model {i}: expected {n:?} in: {why}");
+            }
+        }
+        assert_eq!(models[2].identifier_problem(), None);
+        assert_eq!(models[3].identifier_problem(), None);
+        let paths: Vec<String> = crate::config_enum::colliding_identifiers(&r).iter().map(|v| v.set_in.to_string()).collect();
+        assert_eq!(paths, (0..2).map(|i| format!("profiles.json key `profiles.p.models[{i}].identifier`")).collect::<Vec<_>>());
     }
 }

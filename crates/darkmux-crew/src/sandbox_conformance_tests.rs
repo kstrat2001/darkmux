@@ -98,6 +98,20 @@ pub struct Host {
     /// they are host processes (a sandbox on the host): `None` for a
     /// container, whose processes are gone with it.
     pub host_group: fn(&str) -> Option<u32>,
+    /// (#3112) Starts up to 30 children that each sleep 3 s, stopping at the
+    /// first fork refused (never a shell that retries a fork for seconds),
+    /// and prints how many it started.
+    pub fork_30: &'static str,
+    /// (#3112) Holds 128 MiB, every page touched, for 3 s, then prints
+    /// `survived`.
+    pub hold_128_mib: &'static str,
+    /// Whether `limits.pids` holds the sandbox's forks: in a container (its
+    /// cgroup) and under Seatbelt (its user's `RLIMIT_NPROC`), not under
+    /// Landlock. Recorded, so a change shows.
+    pub holds_processes: bool,
+    /// Whether `limits.memory` stops a sandbox over it: a container's cgroup
+    /// kills it, Seatbelt's watch stops it, Landlock does neither.
+    pub holds_memory: bool,
 }
 
 /// How many live processes are in host process group `group`, from the
@@ -146,6 +160,8 @@ fn policy(backend: &dyn SandboxBackend, image: &str, tree: &Path, script: &str) 
         mounts: vec![Mount { host: tree.to_path_buf(), at: "/workspace".to_string(), access: Access::ReadWrite }],
         ports: Vec::new(),
         stdin: false,
+        host_services: Vec::new(),
+        refused_ports: Vec::new(),
         host_alias: None,
         user: None,
         env: Vec::new(),
@@ -960,6 +976,46 @@ fn a_listing_by_name_matches_the_name_literally(backend: &dyn SandboxBackend, ho
     assert_eq!(names(Having::NamePrefix(format!("{base}."))), vec![format!("{base}.a")], "by prefix");
 }
 
+/// (#3112) Under a process limit of 8, no more than a few of 30 forks
+/// succeed; with none, all 30 do. Small numbers only: a backend that holds
+/// nothing starts 30 sleeps, never a fork bomb.
+fn a_sandbox_cannot_fork_past_its_process_limit(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let started = |pids: Option<u64>| -> usize {
+        let mut p = policy(backend, host.image, tree.path(), host.fork_30);
+        p.limits = Limits { memory: None, pids };
+        let (cmd, handle) = backend.run(&p);
+        let _removed = Removed(backend, handle);
+        // A shell that ends at a refused fork may exit non-zero: the count
+        // it printed is the answer, not its status.
+        match run_bounded(cmd, Duration::from_secs(60)) {
+            Bounded::Finished { stdout, .. } => String::from_utf8_lossy(&stdout).trim().parse().unwrap_or(usize::MAX),
+            other => panic!("{} did not finish: {}", p.name, describe(&other)),
+        }
+    };
+    let held = started(Some(8));
+    assert_eq!(held < 30, host.holds_processes, "{held} of 30 forks started under a process limit of 8");
+    assert_eq!(started(None), 30, "with no process limit every fork starts");
+}
+
+/// (#3112) A sandbox holding 128 MiB under a 64 MiB limit is stopped before
+/// its program ends; under a 512 MiB limit it runs to the end.
+fn a_sandbox_over_its_memory_limit_is_stopped(backend: &dyn SandboxBackend, host: &Host) {
+    let tree = tempfile::TempDir::new().unwrap();
+    let ran = |memory: &str| {
+        let mut p = policy(backend, host.image, tree.path(), host.hold_128_mib);
+        p.limits = Limits { memory: Some(memory.to_string()), pids: None };
+        let (cmd, handle) = backend.run(&p);
+        let _removed = Removed(backend, handle);
+        run_bounded(cmd, Duration::from_secs(60))
+    };
+    let survived = |ran: &Bounded| matches!(ran, Bounded::Finished { success: true, stdout, .. } if String::from_utf8_lossy(stdout).contains("survived"));
+    let over = ran("64m");
+    assert_eq!(!survived(&over), host.holds_memory, "128 MiB under a 64 MiB limit: {}", describe(&over));
+    let under = ran("512m");
+    assert!(survived(&under), "128 MiB under a 512 MiB limit: {}", describe(&under));
+}
+
 macro_rules! conformance {
     ($backend:ident, $make:expr, $host:expr, $needs:literal) => {
         mod $backend {
@@ -1088,6 +1144,16 @@ macro_rules! conformance {
             fn a_listing_by_name_matches_the_name_literally() {
                 super::a_listing_by_name_matches_the_name_literally(&$make, &$host)
             }
+            #[test]
+            #[ignore = $needs]
+            fn a_sandbox_cannot_fork_past_its_process_limit() {
+                super::a_sandbox_cannot_fork_past_its_process_limit(&$make, &$host)
+            }
+            #[test]
+            #[ignore = $needs]
+            fn a_sandbox_over_its_memory_limit_is_stopped() {
+                super::a_sandbox_over_its_memory_limit_is_stopped(&$make, &$host)
+            }
         }
     };
 }
@@ -1131,6 +1197,11 @@ conformance!(
         new_group: |script| format!("setsid sh -c '{script}' &"),
         a_new_group_outlives_the_program: false,
         host_group: |_| None,
+        // busybox `sh` ends at a refused fork, so the count is printed on exit.
+        fork_30: "n=0; trap 'echo $n' EXIT; i=0; while [ $i -lt 30 ]; do sleep 3 & n=$((n + 1)); i=$((i + 1)); done; wait",
+        hold_128_mib: "x=$(head -c 134217728 /dev/zero | tr '\\0' a); sleep 3; echo survived",
+        holds_processes: true,
+        holds_memory: true,
     },
     "needs Docker and alpine:3.22"
 );
@@ -1174,6 +1245,12 @@ conformance!(
             let pid = std::fs::read_to_string(darkmux_sandbox::seatbelt::state_root().join(name).join("pid")).ok()?;
             pid.trim().parse().ok()
         },
+        // The system's perl: its `fork` fails at once, where macOS's `sh`
+        // retries a refused fork for seconds.
+        fork_30: "/usr/bin/perl -e 'my $n = 0; for (1 .. 30) { my $p = fork(); last unless defined $p; if ($p == 0) { sleep 3; exit 0 } $n++ } print \"$n\\n\"; 1 while wait() > 0;'",
+        hold_128_mib: "/usr/bin/perl -e 'my $x = \"a\" x (128 * 1024 * 1024); sleep 3; print \"survived\\n\";'",
+        holds_processes: true,
+        holds_memory: true,
     },
     "needs macOS sandbox-exec"
 );
@@ -1221,6 +1298,11 @@ conformance!(
         // it, as a container's does.
         a_new_group_outlives_the_program: false,
         host_group: |_| None,
+        fork_30: "python3 -c \"import os, time\nn = 0\nfor _ in range(30):\n    try:\n        p = os.fork()\n    except OSError:\n        break\n    if p == 0:\n        time.sleep(3); os._exit(0)\n    n += 1\nprint(n)\nwhile True:\n    try:\n        os.wait()\n    except ChildProcessError:\n        break\"",
+        hold_128_mib: "python3 -c \"import time\nx = b'a' * (128 << 20)\ntime.sleep(3); print('survived')\"",
+        // Recorded, not wanted: `limits` is unused (the backend's doc).
+        holds_processes: false,
+        holds_memory: false,
     },
     "needs Linux with Landlock ABI 6 and unprivileged user namespaces"
 );

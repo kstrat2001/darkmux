@@ -91,9 +91,28 @@ fn bin() -> PathBuf {
     .clone()
 }
 
-/// A port nothing holds right now (bind 0, read, release).
+/// A port nothing holds right now, for a daemon to bind: from the fleet
+/// harness's allocator, never an OS ephemeral port (see the test below).
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    e2e::fixture_port::pick_fixture_port().expect("a free fixture port")
+}
+
+/// (#2898) A daemon's port is chosen here and bound by the daemon a moment
+/// later. An OS ephemeral port is the wrong kind to choose: in that gap every
+/// `bind(0)` in this process (each mock server) and every outgoing
+/// connection's source port can take it, and the daemon then exits with
+/// "Address already in use" (CI runs 42815806083 and 43417255743). Every
+/// port this file hands a daemon must lie outside the OS's ephemeral range.
+#[test]
+fn every_port_handed_to_a_daemon_is_outside_the_os_ephemeral_range() {
+    let ephemeral = e2e::fixture_port::os_ephemeral_range().expect("reading the OS ephemeral port range");
+    for _ in 0..8 {
+        let port = free_port();
+        assert!(
+            !ephemeral.contains(&port),
+            "port {port} is in the OS ephemeral range {ephemeral:?}: a bind(0) or an outgoing connection can take it before the daemon binds"
+        );
+    }
 }
 
 /// A minimal OpenAI-compatible chat server: every POST gets one completion
@@ -299,16 +318,41 @@ impl Drop for Fleet {
     }
 }
 
-fn wait_for_port(port: u16, what: &str, log: &Path) {
+/// Waits until `child` ITSELF listens on `port`. A connect alone is not
+/// enough: it succeeds against whatever holds the port, which is how a daemon
+/// that had already exited on "Address already in use" once read as ready
+/// (#2898).
+fn wait_for_port(child: &mut Child, port: u16, what: &str, log: &Path) {
     let deadline = Instant::now() + Duration::from_secs(30);
-    while TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(200)).is_err() {
-        assert!(
-            Instant::now() < deadline,
-            "{what} never listened on {port}; daemon log:\n{}",
-            std::fs::read_to_string(log).unwrap_or_default()
-        );
+    let said = || std::fs::read_to_string(log).unwrap_or_default();
+    while !listens(child.id(), port) {
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("{what} exited ({status}) before listening on {port}; daemon log:\n{}", said());
+        }
+        assert!(Instant::now() < deadline, "{what} never listened on {port}; daemon log:\n{}", said());
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// (#2898) The second half of the CI failure: the daemon had already exited
+/// on "Address already in use", but whatever took its port answered, so a
+/// connect-only wait read it as ready and the test failed later, somewhere
+/// else. Here the port's holder is a listener in this process and the
+/// "daemon" exits at once: the wait must report the exit, not readiness.
+#[test]
+#[should_panic(expected = "exited")]
+fn a_daemon_that_exited_is_not_ready_because_something_else_holds_its_port() {
+    let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = holder.local_addr().unwrap().port();
+    let mut child = Command::new("sh").args(["-c", "exit 3"]).spawn().unwrap();
+    let log = tempfile::NamedTempFile::new().unwrap();
+    wait_for_port(&mut child, port, "the daemon", log.path());
+}
+
+/// Whether `pid` holds a listener on `port` that accepts a connection.
+fn listens(pid: u32, port: u16) -> bool {
+    TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(200)).is_ok()
+        && e2e::fixture_port::listener_pids(port).contains(&pid)
 }
 
 fn boot(busy_policy: &str) -> Fleet {
@@ -453,11 +497,13 @@ fn boot_setup(setup: &Setup) -> Fleet {
         let child = cmd.spawn().expect("spawning darkmux serve");
         group.register(&child).unwrap();
         daemons.push(child);
-        wait_for_port(port, &format!("{}'s viewer", node.name), &log);
+        let child = daemons.last_mut().expect("the daemon just pushed");
+        wait_for_port(child, port, &format!("{}'s viewer", node.name), &log);
     }
-    let fleet = Fleet { alpha, beta, alpha_port, beta_port, fleet_port, daemons, group, mock, _root: root };
+    let mut fleet = Fleet { alpha, beta, alpha_port, beta_port, fleet_port, daemons, group, mock, _root: root };
     if beta_listener {
-        wait_for_port(fleet_port, "beta's fleet listener", &fleet.beta.home.join("daemon.log"));
+        let log = fleet.beta.home.join("daemon.log");
+        wait_for_port(&mut fleet.daemons[1], fleet_port, "beta's fleet listener", &log);
     }
     fleet
 }

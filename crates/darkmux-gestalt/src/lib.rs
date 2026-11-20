@@ -49,6 +49,7 @@
 pub mod desired;
 pub mod estimator;
 pub mod facts;
+pub mod load_check;
 pub mod mock;
 pub mod ownership;
 pub mod plan;
@@ -65,13 +66,14 @@ pub use estimator::{
 };
 pub use facts::{Budget, CallerIntent, CatalogFact, Facts, PoolFact, PoolId, Pools, ResidentFact};
 pub use ownership::{
-    bare_model_key, ctx_sufficient, is_darkmux_owned, namespaced_identifier, DARKMUX_NAMESPACE,
+    bare_model_key, ctx_sufficient, is_darkmux_owned, is_own_instance, namespaced_identifier, DARKMUX_NAMESPACE,
 };
 pub use plan::{
     Action, EvictionOrder, ForeignTargetError, OwnedTarget, Plan, PlannedAction,
     Precondition, Reason, Warning,
 };
 pub use planner::{plan_acquire, plan_release, AcquireOpts, AcquireScope};
+pub use load_check::{check_context_limit, load_verified, refuse_beyond_limit};
 pub use ports::{Deadline, HostError, LoadReport, ModelArch, ModelHost, ProbeError, ResourceProbe};
 pub use residency::{decide_residency, ResidencyDecision};
 pub use room::{plan_room, PlanRoom};

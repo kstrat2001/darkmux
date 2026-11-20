@@ -49,6 +49,7 @@ pub mod mission_graph;
 /// Client pairing: a loopback-only listener that pairs an app and runs its
 /// scoped work through `darkmux dispatch` (local prototype).
 pub mod client_edit;
+pub mod client_engines;
 pub mod client_image;
 pub mod client_image_ref;
 pub mod client_git;
@@ -79,9 +80,11 @@ mod redaction_stream;
 /// for the full attribution → roster → presence → fetch decision chain.
 mod peer_graph;
 mod fleet_window;
+mod hub_conn;
 mod flow_window;
 mod day_index;
 mod host_gate;
+mod local_peer;
 pub use fleet_window::{FleetRecord, FleetRecords, RecordIdentity};
 pub(crate) use fleet_window::{read_fleet_cached, FleetCaches, FleetScope};
 mod routes;
@@ -452,8 +455,9 @@ pub(crate) fn build_router_full(
 #[cfg(test)]
 async fn assume_loopback_peer(mut req: Request, next: Next) -> Response {
     if req.extensions().get::<ConnectInfo<SocketAddr>>().is_none() {
-        req.extensions_mut()
-            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+        let peer = SocketAddr::from(([127, 0, 0, 1], 5555));
+        local_peer::state_operator(peer);
+        req.extensions_mut().insert(ConnectInfo(peer));
     }
     if !req.headers().contains_key(axum::http::header::HOST) {
         req.headers_mut().insert(axum::http::header::HOST, axum::http::HeaderValue::from_static("localhost"));
@@ -629,9 +633,15 @@ pub(crate) fn record_bound_addr(addr: Option<SocketAddr>) {
 
 /// (#2916 stage 2 review C5, #2988 review) Whether a request comes from THIS
 /// machine, judged by the one predicate every local decision in this daemon
-/// uses. All three must hold:
+/// uses. All four must hold:
 ///
 /// - a loopback peer address (an IPv4-mapped `::ffff:127.0.0.1` included);
+/// - whose connection is the operator's: held by a process of this user
+///   outside every sandbox on the host and not a container engine's
+///   forwarder ([`local_peer`]). Sandboxed work runs on this machine too,
+///   and a container reaches the host's loopback through the engine's
+///   forwarder; neither is the operator. A peer no connection here was
+///   judged for (a lookup that failed included) is not;
 /// - no header a reverse proxy adds ([`PROXY_HEADERS`]);
 /// - a `Host` header naming this daemon: `localhost`, `127.0.0.1`, `[::1]`
 ///   or the bound address, each with or without the bound port. A page an
@@ -660,9 +670,14 @@ pub(crate) fn is_local_at(
     headers: &axum::http::HeaderMap,
     bound: Option<SocketAddr>,
 ) -> bool {
-    peer.is_some_and(|p| p.ip().to_canonical().is_loopback())
-        && !PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
+    peer.is_some_and(|p| p.ip().to_canonical().is_loopback() && local_peer::is_operator(p))
+        && !carries_proxy_header(headers)
         && host_names_this_daemon(headers, bound)
+}
+
+/// Whether `headers` hold any header a reverse proxy adds ([`PROXY_HEADERS`]).
+pub(crate) fn carries_proxy_header(headers: &axum::http::HeaderMap) -> bool {
+    PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
 }
 
 /// The host part of a `Host` header value.
@@ -832,7 +847,7 @@ serve token ({TOKEN_REMEDY}), or bind to 127.0.0.1 (the default) and reach it th
 /// per [`source_state`]; `machines` holds the beats as before.
 async fn fleet_machines_live_handler() -> axum::Json<wire::FleetMachinesLiveResponse> {
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
-    let redis_url = darkmux_flow::redis_url();
+    let redis_url = presence_hub_url();
     let (beats, state) = match redis_url {
         Some(url) => tokio::task::spawn_blocking(move || machine_beats(&url, PresenceRead::ROUTE))
             .await
@@ -1011,20 +1026,11 @@ fn read_presence_beats<T, F>(
     read: F,
 ) -> (Vec<T>, source_state::SourceState)
 where
-    F: FnOnce(&redis::Client) -> Result<Vec<T>, anyhow::Error>,
+    F: FnOnce(&darkmux_flow::RawRedisUrl) -> Result<Vec<T>, anyhow::Error>,
 {
-    // Never interpolate the url into a log (#661 Slice 5) — it can carry an
+    // Never interpolate the url into a log (#661 Slice 5): it can carry an
     // inline password. `kind` is the non-secret context.
-    let client = match redis::Client::open(url.expose_for_probe()) {
-        Ok(c) => c,
-        Err(e) => {
-            if log {
-                eprintln!("darkmux serve: live-{kind} presence — opening the Redis client failed ({e})");
-            }
-            return (Vec::new(), source_state::SourceState::Unavailable { detail: PRESENCE_READ_FAILED });
-        }
-    };
-    match read(&client) {
+    match read(url) {
         Ok(beats) => (beats, source_state::SourceState::Ok),
         Err(e) => {
             if log {
@@ -1079,7 +1085,7 @@ fn shared_presence<T: Clone>(
     url: &darkmux_flow::RawRedisUrl,
     kind: &str,
     how: PresenceRead,
-    read: impl FnOnce(&redis::Client) -> Result<Vec<T>, anyhow::Error>,
+    read: impl FnOnce(&darkmux_flow::RawRedisUrl) -> Result<Vec<T>, anyhow::Error>,
 ) -> (Vec<T>, source_state::SourceState) {
     let hub = *blake3::hash(url.expose_for_probe().as_bytes()).as_bytes();
     let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
@@ -1106,13 +1112,38 @@ fn shared_presence<T: Clone>(
 /// The live machines' beats, shared ([`shared_presence`]).
 pub(crate) fn machine_beats(url: &darkmux_flow::RawRedisUrl, how: PresenceRead) -> (Vec<darkmux_flow::presence::PresenceBeat>, source_state::SourceState) {
     static SLOT: PresenceSlot<darkmux_flow::presence::PresenceBeat> = std::sync::Mutex::new(None);
-    shared_presence(&SLOT, url, "machines", how, darkmux_flow::presence::read_live)
+    shared_presence(&SLOT, url, "machines", how, |url| {
+        on_presence_connection(url, "live-machines presence", darkmux_flow::presence::read_live_on)
+    })
 }
 
 /// The live sessions' beats, shared ([`shared_presence`]).
 pub(crate) fn session_beats(url: &darkmux_flow::RawRedisUrl, how: PresenceRead) -> (Vec<darkmux_flow::session_presence::SessionBeat>, source_state::SourceState) {
     static SLOT: PresenceSlot<darkmux_flow::session_presence::SessionBeat> = std::sync::Mutex::new(None);
-    shared_presence(&SLOT, url, "sessions", how, darkmux_flow::session_presence::read_live_sessions)
+    shared_presence(&SLOT, url, "sessions", how, |url| {
+        on_presence_connection(url, "live-sessions presence", darkmux_flow::session_presence::read_live_sessions_on)
+    })
+}
+
+/// The hub URL for a presence or hub-clock read; with none configured, the
+/// connection those reads keep is closed (#3432).
+pub(crate) fn presence_hub_url() -> Option<darkmux_flow::RawRedisUrl> {
+    hub_conn::url_or_forget(darkmux_flow::redis_url(), &hub_conn::PRESENCE_READS)
+}
+
+/// `read` on the connection the daemon's presence and hub-clock reads keep
+/// (#3432: each read opened its own).
+fn on_presence_connection<T>(
+    url: &darkmux_flow::RawRedisUrl,
+    what: &str,
+    read: impl FnMut(&mut redis::Connection) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    hub_conn::PRESENCE_READS.read(url.expose_for_probe(), what, read)
+}
+
+/// The hub's clock (`TIME`), for the fleet view's clock skews.
+pub(crate) fn hub_time_ms(url: &darkmux_flow::RawRedisUrl) -> Option<u64> {
+    on_presence_connection(url, "the hub clock", darkmux_flow::presence::hub_time_ms_on).ok()
 }
 
 /// The session and mission ids with a live beat right now (a mission's own
@@ -1127,7 +1158,7 @@ pub fn live_session_ids() -> Option<std::collections::HashSet<String>> {
 
 /// [`live_session_ids`] from the shared read (`QUIET`) or a new one (`FRESH`).
 fn live_session_ids_read(how: PresenceRead) -> Option<std::collections::HashSet<String>> {
-    let Some(url) = darkmux_flow::redis_url() else { return Some(Default::default()) };
+    let Some(url) = presence_hub_url() else { return Some(Default::default()) };
     let (beats, state) = session_beats(&url, how);
     matches!(state, source_state::SourceState::Ok)
         .then(|| beats.into_iter().flat_map(|b| [Some(b.session_id), b.mission_id]).flatten().collect())
@@ -1194,7 +1225,7 @@ pub fn apply_not_reporting(
 /// are distinguishable by the client.
 async fn fleet_dispatches_live_handler() -> axum::Json<wire::FleetDispatchesLiveResponse> {
     // env(DARKMUX_REDIS_URL) > config-assembled (#661 Slice 5).
-    let redis_url = darkmux_flow::redis_url();
+    let redis_url = presence_hub_url();
     let (beats, state) = match redis_url {
         Some(url) => tokio::task::spawn_blocking(move || session_beats(&url, PresenceRead::ROUTE))
         .await
@@ -1542,6 +1573,22 @@ fn sandbox_configured_now() -> Option<darkmux_sandbox::BackendKind> {
     darkmux_sandbox::selected_in(&darkmux_types::config::DarkmuxConfig::load_from(&path)).ok()
 }
 
+/// The ASCII-art wordmark and tagline the startup banner opens with, each
+/// line ended, then a blank line: only for a terminal (`terminal`), so piped
+/// or redirected logs stay clean; empty otherwise.
+fn wordmark(terminal: bool) -> String {
+    if !terminal {
+        return String::new();
+    }
+    let art = r#"██████╗  █████╗ ██████╗ ██╗  ██╗███╗   ███╗██╗   ██╗██╗  ██╗
+██╔══██╗██╔══██╗██╔══██╗██║ ██╔╝████╗ ████║██║   ██║╚██╗██╔╝
+██║  ██║███████║██████╔╝█████╔╝ ██╔████╔██║██║   ██║ ╚███╔╝ 
+██║  ██║██╔══██║██╔══██╗██╔═██╗ ██║╚██╔╝██║██║   ██║ ██╔██╗ 
+██████╔╝██║  ██║██║  ██║██║  ██╗██║ ╚═╝ ██║╚██████╔╝██╔╝ ██╗
+╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝"#;
+    format!("{}\n  🤖 Mission control for your AI fleet.\n\n", darkmux_types::style::accent(art))
+}
+
 pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>) -> Result<()> {
     // (#2988 review) The config gate every entry point runs: a wrong-typed
     // value (`serve.read_auth: "true"`) or a retired key would otherwise be
@@ -1608,19 +1655,9 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         let flows_dir_exists = flows_dir.exists();
         let missions_dir = darkmux_crew::loader::missions_dir();
         let missions_dir_exists = missions_dir.exists();
-        // Print the ASCII-art wordmark + tagline only when stdout is a real
+        // The ASCII-art wordmark + tagline, only when stdout is a real
         // terminal (so piped / redirected logs stay clean).
-        if std::io::stdout().is_terminal() {
-            let art = r#"██████╗  █████╗ ██████╗ ██╗  ██╗███╗   ███╗██╗   ██╗██╗  ██╗
-██╔══██╗██╔══██╗██╔══██╗██║ ██╔╝████╗ ████║██║   ██║╚██╗██╔╝
-██║  ██║███████║██████╔╝█████╔╝ ██╔████╔██║██║   ██║ ╚███╔╝ 
-██║  ██║██╔══██║██╔══██╗██╔═██╗ ██║╚██╔╝██║██║   ██║ ██╔██╗ 
-██████╔╝██║  ██║██║  ██║██║  ██╗██║ ╚═╝ ██║╚██████╔╝██╔╝ ██╗
-╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝"#;
-            println!("{}", darkmux_types::style::accent(art));
-            println!("  🤖 Mission control for your AI fleet.");
-            println!();
-        }
+        print!("{}", wordmark(std::io::stdout().is_terminal()));
 
         // Print the startup panel (viewer URL, counts, warnings).
         let phases_dir = darkmux_crew::loader::phases_dir();
@@ -1706,6 +1743,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             darkmux_types::config_access::host_sampler_interval_ms(),
             host_sampler::ring().clone(),
             Arc::clone(&host_sampler_stop),
+            host_sampler::real_probe,
         );
         // (#3200) The dispatch-container reaper: same thread shape, and it
         // stops on the same flag.
@@ -1777,10 +1815,11 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             let _ = shutdown_rx_axum.wait_for(|&v| v).await;
         };
 
-        // (#881) `into_make_service_with_connect_info` populates each request's
+        // (#881) `local_peer::make_service` populates each request's
         // `ConnectInfo<SocketAddr>` from the real TCP peer — that's how
         // `auth_mw` tells a remote peer (token required) from a loopback one
-        // (exempt).
+        // (exempt). It also judges whose process a loopback peer is, so
+        // sandboxed work on this machine is not taken for the operator.
         //
         // (#1663) This used to be SECURITY-load-bearing: `auth_mw` treated an
         // absent `ConnectInfo` as loopback, so downgrading to a plain
@@ -1790,10 +1829,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         // the operator's own loopback viewer once a token is configured.
         // Still don't change it without re-reading `auth_mw`; the failure just
         // announces itself now rather than hiding.
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
+        axum::serve(listener, local_peer::make_service(app))
         .with_graceful_shutdown(axum_shutdown)
         .await?;
 

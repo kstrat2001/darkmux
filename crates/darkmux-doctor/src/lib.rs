@@ -24,6 +24,7 @@ mod checks_power;
 // (#2093) The flow-record hook sink's rows — see the module doc.
 mod checks_hooks;
 mod checks_engines;
+mod checks_installed;
 mod checks_clients;
 // (#3112) The configured sandbox, and the Docker rows that apply only under it.
 mod checks_sandbox;
@@ -185,6 +186,8 @@ fn run_on(
         checks_engines::check_tensorfold_engine(),
         // (#3453) Only asks rec when an endpoint declares Flint.
         checks_engines::check_flint_engine(),
+        // (#3569) An installed engine no endpoint declares, and how to add it.
+        checks_installed::check_installed_engines(),
         sandbox_row,
         docker_runtime,
         check_models_loaded(),
@@ -237,9 +240,14 @@ fn run_on(
     let after_sandbox = checks.iter().position(|c| c.name == checks_sandbox::SANDBOX_CHECK_NAME).map_or(checks.len(), |i| i + 1);
     let runtimes: Vec<Check> = checks_sandbox::managed_runtimes_on(&sandbox, platform);
     checks.splice(after_sandbox..after_sandbox, runtimes);
+    // (#3112) What every sandbox may hold (`sandbox.memory`), after the
+    // sandbox's own rows.
+    checks.push(checks_sandbox::check_sandbox_memory());
     // (#2947) `None` when a thermal threshold is bad config; that value's
     // own enum-settings row reports it.
     checks.extend(check_thermal_governor());
+    // Seatbelt sandboxes darkmux cannot decide on, each with its remedy.
+    checks.extend(checks_sandbox::check_undecided_sandboxes());
     // What `darkmux client serve` reads on every request (`clients.*`).
     checks.extend(checks_clients::check_clients_settings());
     // (#3560) What `client serve` does on the tailnet (`clients.remote`).
@@ -258,6 +266,7 @@ fn run_on(
         check_default_engine(),
         check_env_masks_config(),
         check_binary_split_brain(),
+        check_flows_dir_writable(),
         check_audit_integrity(),
         check_audit_write_drops(),
         check_unknown_flow_actions(),
@@ -276,7 +285,7 @@ fn run_on(
         check_relative_home(),
         check_mission_envelope_readability(),
     ]);
-    let checks = [checks, check_enum_settings(), check_user_file_keys(), check_hooks(), eureka_checks()].concat();
+    let checks = [checks, check_enum_settings(), check_numeric_env(), check_user_file_keys(), check_hooks(), eureka_checks()].concat();
     DoctorReport { checks }
 }
 
@@ -582,23 +591,9 @@ fn summarize_audit_reports(reports: &[darkmux_flow::IntegrityReport]) -> Check {
         .iter()
         .flat_map(|r| r.torn_tails.iter().map(String::as_str))
         .collect();
-    if !torn.is_empty() {
-        let restarted = reports.iter().filter(|r| r.chain_restarted).count();
-        let restart_note = if restarted == 0 {
-            String::new()
-        } else {
-            format!(" ({restarted} restarted its chain: the verified chain covers only what was written after)")
-        };
-        return Check {
-            name: "audit integrity".into(),
-            status: Status::Warn,
-            message: format!(
-                "{} torn audit tail(s) set aside after an interrupted write{restart_note}: {}",
-                torn.len(),
-                torn.join(", ")
-            ),
-            hint: Some("A write was interrupted mid-line; the incomplete bytes were moved to the named sidecar file and the chain continues from the last complete line. Inspect or delete the sidecar once reviewed. The chain check does not detect records removed from the end of a day file.".into()),
-        };
+    let restarted: Vec<&str> = reports.iter().filter(|r| r.chain_restarted).map(|r| r.path.as_str()).collect();
+    if !torn.is_empty() || !restarted.is_empty() {
+        return torn_or_restarted_check(&torn, &restarted);
     }
 
     let total_records: u64 = reports.iter().map(|r| r.records_checked).sum();
@@ -615,6 +610,34 @@ fn summarize_audit_reports(reports: &[darkmux_flow::IntegrityReport]) -> Check {
             reports.len()
         ),
         hint: None,
+    }
+}
+
+/// The `audit integrity` warning for a walk whose chains all verify but where
+/// bytes were set aside (`torn`, the sidecars) or a day file's chain started
+/// over (`restarted`, the day files): an emptied or whitespace-only file, or
+/// one whose first line was set aside. `flow integrity-check` exits 3 for a
+/// restart.
+fn torn_or_restarted_check(torn: &[&str], restarted: &[&str]) -> Check {
+    let restart_note = if restarted.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{} day file(s) restarted their chain, so the verified chain covers only what was written after: {}",
+            restarted.len(),
+            restarted.join(", ")
+        )
+    };
+    let message = match (torn.is_empty(), restart_note.is_empty()) {
+        (true, _) => restart_note,
+        (false, true) => format!("{} torn audit tail(s) set aside after an interrupted write: {}", torn.len(), torn.join(", ")),
+        (false, false) => format!("{} torn audit tail(s) set aside after an interrupted write ({restart_note}): {}", torn.len(), torn.join(", ")),
+    };
+    Check {
+        name: "audit integrity".into(),
+        status: Status::Warn,
+        message,
+        hint: Some("A write was interrupted mid-line, or a day file was found cut (emptied, whitespace only, or its first line set aside), and the chain continued or started over. Set-aside bytes are in the named sidecar files (an empty restart sidecar means the file was found empty); inspect or delete them once reviewed. The chain check does not detect records removed from the end of a day file.".into()),
     }
 }
 
@@ -662,32 +685,83 @@ fn unknown_flow_actions_check(tally: &darkmux_flow::reader::UnknownActions) -> C
 /// (#877) Surface DROPPED audit writes. An `AuditFileSink` write failure leaves
 /// a durable `audit.write_failed` breadcrumb in the local flow sink — the hash
 /// chain itself still validates clean (the next record re-seeds `prev_hash`
-/// from the file tail), so `integrity-check` cannot see the gap. Counting
-/// today's breadcrumbs makes the dropped write DETECTABLE: the audit log is
-/// INCOMPLETE for those records even though the surviving chain passes.
+/// from the file tail), so the chain walk cannot see the gap. Every breadcrumb
+/// over the days the audit trail covers is counted, not only today's, so a
+/// dropped write stays visible after UTC midnight.
 fn check_audit_write_drops() -> Check {
-    let n = darkmux_flow::count_audit_write_failures_today();
-    if n == 0 {
-        Check {
-            name: "audit write integrity".into(),
+    audit_write_drops_check(&darkmux_flow::dropped_audit_writes())
+}
+
+fn audit_write_drops_check(dropped: &[darkmux_flow::DroppedAuditWrites]) -> Check {
+    let name = "audit write integrity".to_string();
+    if dropped.is_empty() {
+        return Check {
+            name,
             status: Status::Pass,
-            message: "no dropped audit writes recorded today".into(),
+            message: "no dropped audit writes recorded over the days the audit trail covers".into(),
             hint: None,
-        }
-    } else {
-        Check {
-            name: "audit write integrity".into(),
-            status: Status::Warn,
-            message: format!(
-                "{n} audit write(s) FAILED today — the hash chain is INCOMPLETE for those records (the records that were written still link)"
-            ),
-            hint: Some(
-                "An AuditFileSink write failed (audit dir unwritable / ENOSPC / flock contention). \
-                 Confirm DARKMUX_AUDIT_DIR (or ~/.darkmux/audit) is writable; the dropped records are \
-                 in today's flow file as `action=audit.write_failed`."
-                    .into(),
-            ),
-        }
+        };
+    }
+    let total: u64 = dropped.iter().map(|d| d.count).sum();
+    let days: Vec<String> = dropped.iter().map(|d| format!("{} ({})", d.day, d.count)).collect();
+    Check {
+        name,
+        status: Status::Warn,
+        message: format!(
+            "{total} audit write(s) FAILED on {}: the hash chain is INCOMPLETE for those records (the records that were written still link)",
+            days.join(", ")
+        ),
+        hint: Some(
+            "An AuditFileSink write failed (audit dir unwritable / ENOSPC / flock contention). \
+             Confirm DARKMUX_AUDIT_DIR (or ~/.darkmux/audit) is writable; each dropped record is \
+             in that day's flow file as `action=audit.write_failed`. It stays reported, and \
+             `darkmux flow integrity-check` exits 3, while the audit trail covers that day; \
+             once reviewed, archive the audit files through that day to retire it."
+                .into(),
+        ),
+    }
+}
+
+/// Whether the local sink can write today's day file under the flows dir,
+/// and, when audit is on, the audit sink its own. In the default setup the
+/// local sink is the only sink, and every caller discards a failed write, so
+/// an unwritable flows dir drops every record (the dispatch bookends included)
+/// with one stderr line per process as its only trace. A full disk is not
+/// probed (`day_file_write_problem`).
+fn check_flows_dir_writable() -> Check {
+    use darkmux_flow::DayFileAccess;
+    let today = darkmux_flow::day_utc_now();
+    let flows = darkmux_types::config_access::flows_dir();
+    let flows_problem = darkmux_flow::day_file_write_problem(&flows, &today, DayFileAccess::Append);
+    let audit = darkmux_types::config_access::audit_enabled().then(darkmux_flow::audit_dir);
+    let audit_problem = audit.and_then(|dir| darkmux_flow::day_file_write_problem(&dir, &today, DayFileAccess::ReadWrite));
+    flows_dir_writable_check(&flows, flows_problem, audit_problem)
+}
+
+fn flows_dir_writable_check(dir: &std::path::Path, flows: Option<String>, audit: Option<String>) -> Check {
+    let name = "flow records writable".to_string();
+    if flows.is_none() && audit.is_none() {
+        return Check {
+            name,
+            status: Status::Pass,
+            message: format!("day files can be written under {}", dir.display()),
+            hint: None,
+        };
+    }
+    let flows = flows.map(|p| format!("flow records cannot be written under {}: {p}", dir.display()));
+    let audit = audit.map(|p| format!("audit records cannot be written: {p}"));
+    Check {
+        name,
+        status: Status::Fail,
+        message: [flows, audit].into_iter().flatten().collect::<Vec<_>>().join("; "),
+        hint: Some(
+            "While this holds, every record to that sink is dropped (for the flows dir, the \
+             dispatch bookends included); the work itself still runs. Fix the path or its \
+             permissions (a day file left read-only or owned by root by a `sudo darkmux` run \
+             counts), or point the dir at a writable one: `darkmux config set dirs.flows <dir>` \
+             or `audit.dir` (an exported DARKMUX_FLOWS_DIR or DARKMUX_AUDIT_DIR wins over it)."
+                .into(),
+        ),
     }
 }
 
@@ -1211,55 +1285,170 @@ fn utility_binding_status(
             ),
             hint: Some("Start LMStudio and ensure `lms ps` returns successfully.".into()),
         },
-        Some(models) => {
-            let is_loaded = models.iter().any(|m| m.model == id || m.identifier == id);
-            if is_loaded {
-                Check {
-                    name,
-                    status: Status::Pass,
-                    message: match n_ctx {
-                        Some(n) => format!("utility model `{id}` registered and loaded (n_ctx {n})"),
-                        None => format!("utility model `{id}` registered and loaded (no window declared)"),
-                    },
-                    hint: bare_binding_window_hint(id, n_ctx),
-                }
-            } else {
-                Check {
-                    name,
-                    status: Status::Warn,
-                    message: format!("utility model `{id}` registered but NOT loaded"),
-                    // (#1676/#1616) This hint has now been wrong twice, in
-                    // opposite directions, so the mechanism is worth stating.
-                    //
-                    // Originally it claimed compaction would FAIL without a
-                    // manual load, and suggested a bare `lms load <id>`. Both
-                    // aged badly: #1616 made the internal dispatch path
-                    // self-load the compactor at its own declared `n_ctx`
-                    // under the `darkmux:` namespace, and a BARE `lms load`
-                    // produces the non-namespaced resident the namespace
-                    // contract calls the #1135 ghost (unknown load config,
-                    // never reused, invisible to `machine eject`) — so
-                    // following it could CREATE the problem the namespace
-                    // exists to prevent.
-                    //
-                    // The first correction then drew a contrast that does not
-                    // exist: "not needed for dispatch, but needed for the
-                    // utility-agent verbs". `utility_model_id()` has exactly
-                    // three consumers — this check, a serve-side display read,
-                    // and `apply_utility_model`, which sets `compactor_model`.
-                    // That is ALL the binding does. Every other verb resolves
-                    // its own model from the profile and reaches the SAME
-                    // self-loading dispatch path, so no verb needs this
-                    // resident first.
-                    //
-                    // What remains true is only that a hand-load moves the
-                    // cost earlier. Say that and nothing more.
-                    hint: Some(
-                        "No verb needs this loaded first: the binding names the model darkmux's own jobs run on (compaction, and radio/ACP routing since #2914), and every path that uses it self-loads it at the binding's `n_ctx` under the `darkmux:` namespace (#1616). Loading it by hand just pays that cost now instead of during the first dispatch or route; if you do, keep the namespace and the context: `lms load <id> --context-length <n> --identifier darkmux:<id>`: since a bare `lms load` creates a resident darkmux won't reuse and `machine eject` can't reclaim. (#590, #1616, #1675, #2914)".into(),
-                    ),
-                }
-            }
+        Some(models) => utility_residency_status(id, n_ctx, models),
+    }
+}
+
+/// (Contract 4) The `utility model` row from what LM Studio holds, as a
+/// utility job's residency preflight decides it
+/// (`darkmux_crew::dispatch_internal::decide_preflight`, the one owner of the
+/// rule): only darkmux's own instance (`darkmux:<id>`) at the binding's
+/// window or more is used, and a copy darkmux did not load never is. With no
+/// window declared, any instance of darkmux's counts, since a job then takes
+/// its window from elsewhere (#2914).
+fn utility_residency_status(id: &str, n_ctx: Option<u32>, models: &[darkmux_types::LoadedModel]) -> Check {
+    use darkmux_crew::dispatch_internal::{decide_preflight, PreflightDecision};
+    let want = n_ctx.unwrap_or(0);
+    match decide_preflight(id, None, want, models) {
+        PreflightDecision::Reuse { identifier, resident_ctx } => utility_loaded(id, &identifier, resident_ctx, n_ctx),
+        PreflightDecision::Reload { stale_identifier, stale_ctx } => {
+            utility_undersized(id, &stale_identifier, stale_ctx, want)
         }
+        PreflightDecision::LoadFresh { foreign_identifier: Some(foreign) } => {
+            let ctx = models.iter().find(|m| m.identifier == foreign).map_or(0, |m| m.context);
+            utility_foreign(id, &foreign, ctx, n_ctx)
+        }
+        PreflightDecision::LoadFresh { foreign_identifier: None } => utility_not_loaded(id, n_ctx),
+    }
+}
+
+/// The exact namespaced load of the utility model at `n_ctx` (a placeholder
+/// when the binding declares no window): the instance a utility job uses.
+fn utility_load_command(id: &str, n_ctx: Option<u32>) -> String {
+    let window = n_ctx.map_or_else(|| "<window>".to_string(), |n| n.to_string());
+    namespaced_load_command(id, &window, &darkmux_gestalt::namespaced_identifier(id, None))
+}
+
+/// (Contract 4) The exact `lms load` of darkmux's own instance of `model_id`
+/// at `window` under `identifier`, the one a dispatch or a utility job
+/// uses. A bare `lms load` makes a copy darkmux never uses.
+fn namespaced_load_command(model_id: &str, window: &str, identifier: &str) -> String {
+    format!("lms load {} --context-length {window} --identifier {identifier}", darkmux_gestalt::bare_model_key(model_id))
+}
+
+/// [`namespaced_load_command`] for a profile model, at its `n_ctx` and under
+/// the identifier it declares (`darkmux:<id>`, or its explicit opt-out).
+fn profile_model_load_command(pm: &darkmux_types::ProfileModel) -> String {
+    let window = pm.n_ctx.map_or_else(|| "<n_ctx>".to_string(), |n| n.to_string());
+    namespaced_load_command(&pm.id, &window, &darkmux_profiles::ownership::namespaced_identifier(pm))
+}
+
+/// (Contract 4) What a dispatch's residency preflight does about `loaded`
+/// for `pm` (`darkmux_crew::dispatch_internal::decide_preflight`, the one
+/// owner of the rule).
+fn preflight_for(
+    pm: &darkmux_types::ProfileModel,
+    loaded: &[darkmux_types::LoadedModel],
+) -> darkmux_crew::dispatch_internal::PreflightDecision {
+    darkmux_crew::dispatch_internal::decide_preflight(&pm.id, pm.identifier.as_deref(), pm.n_ctx.unwrap_or(0), loaded)
+}
+
+/// Whether a dispatch would use a resident instance of `pm` as it is:
+/// darkmux's own, at `pm`'s window or more. A copy darkmux did not load
+/// never counts.
+fn darkmux_reuses(pm: &darkmux_types::ProfileModel, loaded: &[darkmux_types::LoadedModel]) -> bool {
+    matches!(preflight_for(pm, loaded), darkmux_crew::dispatch_internal::PreflightDecision::Reuse { .. })
+}
+
+/// A window as `lms ps` reported it: `0` is one it did not report.
+fn reported_ctx(ctx: u64) -> String {
+    if ctx == 0 {
+        "an unreported n_ctx".to_string()
+    } else {
+        format!("n_ctx {ctx}")
+    }
+}
+
+/// darkmux's own instance at the binding's window or more: what a job uses.
+fn utility_loaded(id: &str, identifier: &str, resident_ctx: u64, n_ctx: Option<u32>) -> Check {
+    let declared = n_ctx.map_or_else(|| "no window declared".to_string(), |n| format!("the binding declares {n}"));
+    Check {
+        name: "utility model".into(),
+        status: Status::Pass,
+        message: format!(
+            "utility model `{id}` registered and loaded as `{identifier}` at {} ({declared})",
+            reported_ctx(resident_ctx)
+        ),
+        hint: bare_binding_window_hint(id, n_ctx),
+    }
+}
+
+/// darkmux's own instance below the binding's window: the next job reloads it.
+fn utility_undersized(id: &str, stale: &str, stale_ctx: u64, want: u32) -> Check {
+    Check {
+        name: "utility model".into(),
+        status: Status::Warn,
+        message: format!(
+            "utility model `{id}` is loaded as `{stale}` at {}, below the binding's {want}: the next job that \
+             uses it unloads that instance and loads it again at {want}",
+            reported_ctx(stale_ctx)
+        ),
+        hint: Some(format!(
+            "No action needed: compaction and radio routing reload it themselves. To pay that now: `lms unload \
+             {stale}`, then `{}`. (contract 4)",
+            utility_load_command(id, Some(want))
+        )),
+    }
+}
+
+/// Only a copy darkmux did not load: never used, so a job loads darkmux's own
+/// beside it.
+fn utility_foreign(id: &str, foreign: &str, ctx: u64, n_ctx: Option<u32>) -> Check {
+    let key = darkmux_gestalt::bare_model_key(id);
+    Check {
+        name: "utility model".into(),
+        status: Status::Warn,
+        message: format!(
+            "utility model `{id}` is loaded only as `{foreign}` ({}), a copy darkmux did not load and never uses: \
+             the next job that uses it loads `{}` beside it",
+            reported_ctx(ctx),
+            darkmux_gestalt::namespaced_identifier(key, None)
+        ),
+        hint: Some(format!(
+            "No action needed: compaction and radio routing load darkmux's own instance themselves and leave \
+             `{foreign}` alone. To pay that load now: `{}`. If you loaded `{foreign}` only for darkmux, `lms unload \
+             {foreign}` frees its memory. (contract 4)",
+            utility_load_command(id, n_ctx)
+        )),
+    }
+}
+
+/// No instance of the utility model at all.
+fn utility_not_loaded(id: &str, n_ctx: Option<u32>) -> Check {
+    Check {
+        name: "utility model".into(),
+        status: Status::Warn,
+        message: format!("utility model `{id}` registered but NOT loaded"),
+        // (#1676/#1616) This hint has now been wrong twice, in
+        // opposite directions, so the mechanism is worth stating.
+        //
+        // Originally it claimed compaction would FAIL without a
+        // manual load, and suggested a bare `lms load <id>`. Both
+        // aged badly: #1616 made the internal dispatch path
+        // self-load the compactor at its own declared `n_ctx`
+        // under the `darkmux:` namespace, and a BARE `lms load`
+        // produces the non-namespaced resident the namespace
+        // contract calls the #1135 ghost (unknown load config,
+        // never reused, invisible to `machine eject`) — so
+        // following it could CREATE the problem the namespace
+        // exists to prevent.
+        //
+        // The first correction then drew a contrast that does not
+        // exist: "not needed for dispatch, but needed for the
+        // utility-agent verbs". `utility_model_id()` has exactly
+        // three consumers — this check, a serve-side display read,
+        // and `apply_utility_model`, which sets `compactor_model`.
+        // That is ALL the binding does. Every other verb resolves
+        // its own model from the profile and reaches the SAME
+        // self-loading dispatch path, so no verb needs this
+        // resident first.
+        //
+        // What remains true is only that a hand-load moves the
+        // cost earlier. Say that and nothing more.
+        hint: Some(format!(
+            "No verb needs this loaded first: the binding names the model darkmux's own jobs run on (compaction, and radio/ACP routing since #2914), and every path that uses it self-loads it at the binding's `n_ctx` under the `darkmux:` namespace (#1616). Loading it by hand just pays that cost now instead of during the first dispatch or route; if you do, keep the namespace and the context: `{}`: since a bare `lms load` creates a resident darkmux won't reuse and `machine eject` can't reclaim. (#590, #1616, #1675, #2914)",
+            utility_load_command(id, n_ctx)
+        )),
     }
 }
 
@@ -2137,23 +2326,15 @@ fn user_file_problems(kind: darkmux_types::user_files::UserFileKind) -> Vec<dark
 /// unknown key does nothing, but broken JSON, a wrong-type value or a
 /// missing required key makes the whole file fail to load.
 fn user_file_hint(p: &darkmux_types::user_files::FileProblem) -> String {
-    use darkmux_types::user_files::{Issue, Problem, UserFileKind};
-    let unloaded = match p.kind {
-        UserFileKind::Config => "the whole file fails to load, so every setting falls back to its default",
-        UserFileKind::Profiles => "the entry is quarantined, or the whole registry fails to load",
-        UserFileKind::Role | UserFileKind::Skill | UserFileKind::Crew | UserFileKind::Rule => {
-            "the file fails to load and is skipped, so a builtin of the same id runs in its place"
-        }
-        UserFileKind::MissionConfig | UserFileKind::Workload | UserFileKind::LabFixture | UserFileKind::WorkspaceSpec => {
-            "the file fails to load"
-        }
-    };
+    use darkmux_types::user_files::{Issue, Problem};
+    let unloaded = unloaded_words(p.kind);
     match &p.problem {
         Problem::Unreadable(_) => format!("make it readable (and under the size cap); until then {unloaded}"),
         Problem::NotJson(_) => format!("fix the JSON syntax; until then {unloaded}"),
         Problem::Newer { .. } => {
             "upgrade darkmux to the version that wrote it; until then every command that starts work refuses it at preflight".to_string()
         }
+        Problem::Keys(keys) if keys.iter().any(|k| matches!(k.issue, Issue::Duplicate(_))) => duplicate_key_hint(keys, unloaded),
         Problem::Keys(keys) if keys.iter().any(|k| matches!(k.issue, Issue::WrongType { .. } | Issue::Missing { .. })) => {
             format!("fix each value named and add each missing key; until then {unloaded}")
         }
@@ -2162,6 +2343,36 @@ fn user_file_hint(p: &darkmux_types::user_files::FileProblem) -> String {
         }
         Problem::Keys(_) => "rename each key to the valid one named, or delete it; until then it does nothing".to_string(),
     }
+}
+
+/// What a kind's file does while its typed load fails.
+fn unloaded_words(kind: darkmux_types::user_files::UserFileKind) -> &'static str {
+    use darkmux_types::user_files::UserFileKind;
+    match kind {
+        UserFileKind::Config => "the whole file fails to load, so every setting falls back to its default",
+        UserFileKind::Profiles => "the entry is quarantined, or the whole registry fails to load",
+        UserFileKind::Role | UserFileKind::Skill | UserFileKind::Crew | UserFileKind::Rule => {
+            "the file fails to load and is skipped, so a builtin of the same id runs in its place"
+        }
+        UserFileKind::MissionConfig | UserFileKind::Workload | UserFileKind::LabFixture | UserFileKind::WorkspaceSpec => {
+            "the file fails to load"
+        }
+    }
+}
+
+/// The fix for a key written twice, and what it does meanwhile: a repeated
+/// struct field fails the typed load (`unloaded`); a repeated map entry or
+/// unknown key, or any key of a file read through a `serde_json::Value`,
+/// loads with only the last copy used.
+fn duplicate_key_hint(keys: &[darkmux_types::user_files::KeyIssue], unloaded: &str) -> String {
+    use darkmux_types::user_files::{Issue, Repeat};
+    let has = |r: Repeat| keys.iter().any(|k| k.issue == Issue::Duplicate(r));
+    let meanwhile = match (has(Repeat::Field), has(Repeat::Unjudged)) {
+        (true, _) => unloaded,
+        (false, true) => "the file may fail to load, or load with only the last copy of each used",
+        (false, false) => "the file loads with only the last copy of each used",
+    };
+    format!("delete all but one copy of each duplicate key; until then {meanwhile}")
 }
 
 /// Pure row builder for [`check_user_file_keys`].
@@ -2263,6 +2474,31 @@ pub fn check_enum_settings() -> Vec<Check> {
         }
     }
     rows
+}
+
+/// One Fail row per numeric env var set to a value that does not read
+/// (`darkmux_types::numeric_env`), with the line every preflight refuses
+/// with; no row otherwise. The accessor reads such a var as unset, so this,
+/// the preflight and the warning every other command prints are where it
+/// surfaces. Names the value's kind, never the value.
+pub fn check_numeric_env() -> Vec<Check> {
+    numeric_env_rows(&darkmux_types::numeric_env::bad_values())
+}
+
+/// The rows for `bad` ([`check_numeric_env`]).
+fn numeric_env_rows(bad: &[darkmux_types::config_enum::InvalidSetting]) -> Vec<Check> {
+    bad.iter()
+        .map(|b| Check {
+            name: b.set_in.to_string(),
+            status: Status::Fail,
+            message: format!(
+                "{}. Every command that starts work refuses to start over it; any other command reads it as \
+                 unset and warns on stderr",
+                b.problem
+            ),
+            hint: Some(format!("valid: {}", b.valid)),
+        })
+        .collect()
 }
 
 /// The Pass row for an enum setting with no bad value.
@@ -2860,25 +3096,8 @@ fn check_turn_delay() -> Check {
     };
     let ms = darkmux_types::config_access::turn_delay_ms();
     let timeout_ms = darkmux_types::config_access::inactivity_timeout_seconds().saturating_mul(1000);
-    // An env var IS set but did not parse as an integer — this is a
-    // config mistake, not silence, and it must say so rather than quietly
-    // reporting whatever lower tier resolved instead.
-    if let Some(raw) = env_raw.as_deref() {
-        if !env_parses {
-            return Check {
-                name: name.into(),
-                status: Status::Warn,
-                message: format!(
-                    "DARKMUX_TURN_DELAY_MS=`{raw}` is not an integer; using {ms}ms ({provenance})"
-                ),
-                hint: Some(
-                    "Set DARKMUX_TURN_DELAY_MS to a plain integer number of milliseconds \
-                     (e.g. `3000`), or unset it to fall through to config.json / the default."
-                        .into(),
-                ),
-            };
-        }
-    }
+    // An env var set but unparseable is `check_numeric_env`'s one Fail row
+    // (it never quotes the value); this row reports what resolved.
     if ms == 0 {
         return Check {
             name: name.into(),
@@ -3014,23 +3233,7 @@ fn check_host_sampler_interval() -> Check {
         "default"
     };
     let ms = darkmux_types::config_access::host_sampler_interval_ms();
-    if let Some(raw) = env_raw.as_deref() {
-        if !env_parses {
-            return Check {
-                name: name.into(),
-                status: Status::Warn,
-                message: format!(
-                    "DARKMUX_HOST_SAMPLER_INTERVAL_MS=`{raw}` is not an integer; using {ms}ms ({provenance})"
-                ),
-                hint: Some(
-                    "Set DARKMUX_HOST_SAMPLER_INTERVAL_MS to a plain integer number of \
-                     milliseconds (e.g. `5000`), or unset it to fall through to config.json / \
-                     the default."
-                        .into(),
-                ),
-            };
-        }
-    }
+    // An env var set but unparseable is `check_numeric_env`'s Fail row.
     if ms == 0 {
         return Check {
             name: name.into(),
@@ -3256,24 +3459,7 @@ fn check_generation_checkpoint_interval() -> Check {
     const CONSERVATIVE_TOKENS_PER_SECOND: f64 = 10.0;
     let tokens = darkmux_types::config_access::generation_checkpoint_interval_tokens()
         .unwrap_or(RUNTIME_BUILTIN_DEFAULT);
-    if let Some(raw) = env_raw.as_deref() {
-        if !env_parses {
-            return Check {
-                name: name.into(),
-                status: Status::Warn,
-                message: format!(
-                    "DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL=`{raw}` is not a positive \
-                     integer; using {tokens} ({provenance})"
-                ),
-                hint: Some(
-                    "Set DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL to a positive integer \
-                     token count (e.g. `4000`), or unset it to fall through to config.json / \
-                     the default."
-                        .into(),
-                ),
-            };
-        }
-    }
+    // An env var set but unparseable is `check_numeric_env`'s Fail row.
     if tokens == 0 {
         return Check {
             name: name.into(),
@@ -4249,6 +4435,10 @@ fn endpoints_status(
     invalid.extend(darkmux_types::config_enum::invalid_endpoint_hosts(registry));
     invalid.extend(darkmux_types::config_enum::misplaced_endpoint_hardware(registry));
     invalid.extend(darkmux_types::config_enum::invalid_engine_args(registry));
+    // An `identifier` that is LM Studio's name for a load made without one.
+    invalid.extend(darkmux_types::config_enum::colliding_identifiers(registry));
+    // Two models with different ids under one `darkmux:` identifier.
+    invalid.extend(darkmux_types::config_enum::shared_darkmux_identifiers(registry));
     // (#3453) rec runs one Flint server per machine.
     invalid.extend(darkmux_types::config_enum::extra_flint_endpoints(registry));
     // Two servers cannot listen on one port.
@@ -6823,12 +7013,30 @@ fn lms_binary_status(lmstudio_unneeded: bool) -> Check {
 }
 
 fn check_models_loaded() -> Check {
-    models_loaded_status(engine::local().loaded())
+    let registry = darkmux_profiles::profiles::load_registry_quiet(None).ok().map(|l| l.registry);
+    models_loaded_status(engine::local().loaded(), registry.as_ref())
 }
 
-/// Pure decision for [`check_models_loaded`].
-fn models_loaded_status(loaded: anyhow::Result<Vec<darkmux_types::LoadedModel>>) -> Check {
+/// Pure decision for [`check_models_loaded`]. (Contract 4) It passes only
+/// when an instance darkmux loaded is resident: copies the operator loaded
+/// are never dispatched to, so they alone warn. `registry` (when it loads)
+/// names the explicit identifiers profiles declare, which are darkmux's
+/// loads too, and the model the remedy's exact load command names.
+fn models_loaded_status(
+    loaded: anyhow::Result<Vec<darkmux_types::LoadedModel>>,
+    registry: Option<&darkmux_types::ProfileRegistry>,
+) -> Check {
     match loaded {
+        Ok(models) if !models.is_empty() && !models.iter().any(|m| darkmux_loaded(m, registry)) => Check {
+            name: "models loaded".into(),
+            status: Status::Warn,
+            message: format!(
+                "{} model(s) loaded, none of them by darkmux, which never dispatches to a copy it did not load: {}",
+                models.len(),
+                models.iter().map(|m| m.identifier.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+            hint: Some(models_load_hint(registry)),
+        },
         Ok(models) if !models.is_empty() => Check {
             name: "models loaded".into(),
             status: Status::Pass,
@@ -6847,12 +7055,7 @@ fn models_loaded_status(loaded: anyhow::Result<Vec<darkmux_types::LoadedModel>>)
             name: "models loaded".into(),
             status: Status::Warn,
             message: "no models loaded in LMStudio".into(),
-            hint: Some(
-                "load a model via the LMStudio GUI or `lms load <id> --context-length <N>` — \
-                 or just dispatch: a `darkmux dispatch` / `mission launch` loads what its \
-                 staffing needs, under the resident budget"
-                    .into(),
-            ),
+            hint: Some(models_load_hint(registry)),
         },
         // (#316) The engine cannot say (a server with no residency report):
         // not a failure, and never "nothing loaded".
@@ -6864,6 +7067,49 @@ fn models_loaded_status(loaded: anyhow::Result<Vec<darkmux_types::LoadedModel>>)
             hint: Some("ensure LMStudio is running and reachable".into()),
         },
     }
+}
+
+/// Whether darkmux loaded `m`: a `darkmux:` identifier, or the explicit
+/// `identifier` a profile model declares (the namespace opt-out).
+fn darkmux_loaded(m: &darkmux_types::LoadedModel, registry: Option<&darkmux_types::ProfileRegistry>) -> bool {
+    darkmux_profiles::ownership::is_darkmux_owned(&m.identifier)
+        || registry.is_some_and(|r| {
+            r.profiles.values().flat_map(|p| &p.models).any(|pm| pm.identifier.as_deref() == Some(m.identifier.as_str()))
+        })
+}
+
+/// The `models loaded` remedy: a dispatch loads what it needs; by hand, the
+/// exact namespaced load of the default profile's default model when it runs
+/// on LM Studio, else the command's shape.
+fn models_load_hint(registry: Option<&darkmux_types::ProfileRegistry>) -> String {
+    let by_hand = default_lmstudio_model(registry).map_or_else(
+        || "`lms load <model-key> --context-length <its n_ctx> --identifier darkmux:<model-key>`".to_string(),
+        |(name, pm)| format!("`{}` (profile `{name}`'s default model)", profile_model_load_command(pm)),
+    );
+    format!(
+        "just dispatch: a `darkmux dispatch` / `mission launch` loads what its staffing needs under the `darkmux:` \
+         namespace, within the resident budget. To load one by hand, keep the namespace and the window: {by_hand}; a \
+         bare `lms load` makes a copy darkmux never uses. (contract 4)"
+    )
+}
+
+/// The default profile's default model, when it runs on LM Studio: the
+/// remedy names an `lms load`, which only LM Studio runs.
+fn default_lmstudio_model(
+    registry: Option<&darkmux_types::ProfileRegistry>,
+) -> Option<(&str, &darkmux_types::ProfileModel)> {
+    let (name, profile) = registry?.resolve_active(None)?;
+    let pm = profile_default_model(profile)?;
+    let lmstudio = darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Lmstudio);
+    (pm.endpoint_kind().ok() == Some(lmstudio)).then_some((name, pm))
+}
+
+/// (#590) A profile's default model (`default_model`, or its first model):
+/// the one doctor's residency rows read for that profile. Not a model
+/// choice for a dispatch, which selects through `target::resolve_in`.
+fn profile_default_model(profile: &darkmux_types::Profile) -> Option<&darkmux_types::ProfileModel> {
+    let id = profile.default_model_id()?;
+    profile.models.iter().find(|m| m.id == id)
 }
 
 fn check_profile_loaded_match() -> Check {
@@ -6904,31 +7150,82 @@ fn check_profile_loaded_match() -> Check {
         };
     }
 
+    profile_match_status(&registry.registry, &loaded)
+}
+
+/// Pure decision for [`check_profile_loaded_match`] over a non-empty
+/// `loaded`. (Contract 4) A profile matches only when its default model is
+/// resident as a dispatch would use it ([`darkmux_reuses`]); one resident
+/// only as a copy darkmux did not load, or as darkmux's own below the
+/// profile's window, is named with the exact fix.
+fn profile_match_status(registry: &darkmux_types::ProfileRegistry, loaded: &[darkmux_types::LoadedModel]) -> Check {
     let mut matching: Vec<&str> = Vec::new();
-    for (name, profile) in &registry.registry.profiles {
-        // (#590) The profile's default model (default_model, or first model)
-        // is the load-bearing match — the old Primary-role check.
-        let default_id = profile.default_model_id();
-        let primaries = profile
-            .models
-            .iter()
-            .filter(|m| Some(m.id.as_str()) == default_id);
-        // (#544) Use the shared matcher so doctor agrees with the lab
-        // surfaces — crucially, this also matches a `darkmux:`-namespaced
-        // load, which the old inline check (`identifier == id || model ==
-        // id`) silently missed.
-        let primary_match = primaries.clone().any(|p| {
-            loaded
-                .iter()
-                .any(|l| darkmux_profiles::envelope::loaded_matches(l, p))
-        });
-        if primary_match {
-            matching.push(name);
+    let mut near: Vec<(String, String)> = Vec::new();
+    for (name, profile) in &registry.profiles {
+        // (#590) The profile's default model is the load-bearing match.
+        let Some(pm) = profile_default_model(profile) else { continue };
+        match standing(name, pm, loaded) {
+            Standing::Usable => matching.push(name),
+            Standing::Unusable { why, fix } => near.push((why, fix)),
+            Standing::Absent => {}
         }
     }
+    if !matching.is_empty() {
+        return Check {
+            name: "profile match".into(),
+            status: Status::Pass,
+            message: format!("loaded state matches profile(s): {}", matching.join(", ")),
+            hint: None,
+        };
+    }
+    no_profile_match(&near)
+}
 
-    if matching.is_empty() {
-        Check {
+/// How a profile's default model stands in what LM Studio holds.
+enum Standing {
+    /// A dispatch would use a resident instance as it is.
+    Usable,
+    /// No instance of it is resident.
+    Absent,
+    /// It is resident, but not as a dispatch would use it: `why`, and the
+    /// exact `fix`.
+    Unusable { why: String, fix: String },
+}
+
+/// How `pm` (profile `name`'s default model) stands in `loaded`.
+fn standing(name: &str, pm: &darkmux_types::ProfileModel, loaded: &[darkmux_types::LoadedModel]) -> Standing {
+    use darkmux_crew::dispatch_internal::PreflightDecision;
+    let load = profile_model_load_command(pm);
+    match preflight_for(pm, loaded) {
+        PreflightDecision::Reuse { .. } => Standing::Usable,
+        PreflightDecision::Reload { stale_identifier, stale_ctx } => Standing::Unusable {
+            why: format!(
+                "profile `{name}`'s default model `{}` is loaded as `{stale_identifier}` at {}, below its n_ctx {}: a \
+                 dispatch unloads it and loads it again",
+                pm.id,
+                reported_ctx(stale_ctx),
+                pm.n_ctx.unwrap_or(0)
+            ),
+            fix: format!("`lms unload {stale_identifier}`, then `{load}`"),
+        },
+        PreflightDecision::LoadFresh { foreign_identifier: Some(foreign) } => Standing::Unusable {
+            why: format!(
+                "profile `{name}`'s default model `{}` is loaded only as `{foreign}`, a copy darkmux did not load and \
+                 never uses: a dispatch loads `{}` beside it",
+                pm.id,
+                darkmux_profiles::ownership::namespaced_identifier(pm)
+            ),
+            fix: format!("`{load}`"),
+        },
+        PreflightDecision::LoadFresh { foreign_identifier: None } => Standing::Absent,
+    }
+}
+
+/// The `profile match` warning when no profile matches, naming each default
+/// model that is resident but not as a dispatch would use it.
+fn no_profile_match(near: &[(String, String)]) -> Check {
+    if near.is_empty() {
+        return Check {
             name: "profile match".into(),
             status: Status::Warn,
             message: "loaded models don't match any profile".into(),
@@ -6937,14 +7234,19 @@ fn check_profile_loaded_match() -> Check {
                  LMStudio is serving (compare `darkmux machine status` and `darkmux profile list`)"
                     .into(),
             ),
-        }
-    } else {
-        Check {
-            name: "profile match".into(),
-            status: Status::Pass,
-            message: format!("loaded state matches profile(s): {}", matching.join(", ")),
-            hint: None,
-        }
+        };
+    }
+    let whys: Vec<&str> = near.iter().map(|(why, _)| why.as_str()).collect();
+    let fixes: Vec<&str> = near.iter().map(|(_, fix)| fix.as_str()).collect();
+    Check {
+        name: "profile match".into(),
+        status: Status::Warn,
+        message: format!("loaded models don't match any profile: {}", whys.join("; ")),
+        hint: Some(format!(
+            "No action needed: a dispatch loads darkmux's own instance at the profile's n_ctx itself. To load it now: \
+             {}. (contract 4)",
+            fixes.join("; ")
+        )),
     }
 }
 
@@ -7318,12 +7620,9 @@ fn check_ram_headroom_load_projection(platform: &dyn darkmux_platform::Platform)
     let unloaded: Vec<&darkmux_types::ProfileModel> = profile
         .models
         .iter()
-        .filter(|pm| {
-            let ns = darkmux_profiles::ownership::namespaced_identifier(pm);
-            !loaded
-                .iter()
-                .any(|l| l.identifier == pm.id || l.model == pm.id || l.identifier == ns)
-        })
+        // (Contract 4) A copy darkmux did not load, or darkmux's own below
+        // the model's window, is still to load: a dispatch loads its own.
+        .filter(|pm| !darkmux_reuses(pm, &loaded))
         .collect();
     if unloaded.is_empty() {
         return Check {
@@ -7340,19 +7639,13 @@ fn check_ram_headroom_load_projection(platform: &dyn darkmux_platform::Platform)
     // partial picture rather than a missing check.
     let catalog = engine::lmstudio().catalog().unwrap_or_default();
     let mut total_unloaded_gb = 0.0_f64;
+    let mut freed_gb = 0.0_f64;
     let mut pending: Vec<String> = Vec::new();
     for pm in &unloaded {
-        let size_gb = catalog
-            .iter()
-            .find(|m| m.model_key == pm.id)
-            .map(|m| m.size_bytes as f64 / 1_000_000_000.0)
-            .unwrap_or(0.0);
+        let (size_gb, freed, entry) = pending_load(pm, &catalog, &loaded);
         total_unloaded_gb += size_gb;
-        if size_gb > 0.0 {
-            pending.push(format!("{} ~{:.1} GB", pm.id, size_gb));
-        } else {
-            pending.push(format!("{} (size unknown)", pm.id));
-        }
+        freed_gb += freed;
+        pending.push(entry);
     }
 
     let reclaimable_gb = match reclaimable_gb_from(platform) {
@@ -7360,7 +7653,34 @@ fn check_ram_headroom_load_projection(platform: &dyn darkmux_platform::Platform)
         None => return skip("could not read reclaimable memory on this machine"),
     };
 
-    classify_load_projection(reclaimable_gb, total_unloaded_gb, &pending, profile_name)
+    // A reload unloads darkmux's undersized instance before it loads the new
+    // one, so what that instance holds is reclaimable for the load.
+    classify_load_projection(reclaimable_gb + freed_gb, total_unloaded_gb, &pending, profile_name)
+}
+
+/// One model the projection still has to load: its catalog size (0 when
+/// unknown), the memory its load frees first (what darkmux's undersized
+/// instance holds, unloaded before a reload), and how the summary names it.
+fn pending_load(
+    pm: &darkmux_types::ProfileModel,
+    catalog: &[darkmux_profiles::engine::ModelMeta],
+    loaded: &[darkmux_types::LoadedModel],
+) -> (f64, f64, String) {
+    let size_gb = catalog
+        .iter()
+        .find(|m| m.model_key == pm.id)
+        .map_or(0.0, |m| m.size_bytes as f64 / 1_000_000_000.0);
+    let named = if size_gb > 0.0 { format!("{} ~{size_gb:.1} GB", pm.id) } else { format!("{} (size unknown)", pm.id) };
+    let darkmux_crew::dispatch_internal::PreflightDecision::Reload { stale_identifier, .. } = preflight_for(pm, loaded)
+    else {
+        return (size_gb, 0.0, named);
+    };
+    let held = loaded
+        .iter()
+        .find(|m| m.identifier == stale_identifier)
+        .and_then(|m| darkmux_types::size::parse_size_gb(&m.size))
+        .unwrap_or(0.0);
+    (size_gb, held, format!("{named}, reloads `{stale_identifier}`, freeing ~{held:.1} GB"))
 }
 
 /// Pure verdict logic for the load-projection check. Extracted so the
@@ -7423,9 +7743,9 @@ fn classify_load_projection(
 
 /// Pick the active profile from a registry given currently-loaded models.
 /// Prefers the registry's `default_profile` when it matches; otherwise the
-/// first profile whose primary model is loaded. Mirrors the matching shape
-/// in `check_profile_loaded_match` so the two checks agree on what
-/// "active" means.
+/// first profile whose primary model is resident as a dispatch would use it
+/// ([`darkmux_reuses`], the rule [`profile_match_status`] matches on), so
+/// the two checks agree on what "active" means.
 fn pick_active_profile<'a>(
     registry: &'a darkmux_profiles::profiles::LoadedRegistry,
     loaded: &[darkmux_types::LoadedModel],
@@ -7434,18 +7754,7 @@ fn pick_active_profile<'a>(
         .registry
         .profiles
         .iter()
-        .filter(|(_, p)| {
-            let default_id = p.default_model_id();
-            p.models
-                .iter()
-                .filter(|m| Some(m.id.as_str()) == default_id)
-                .any(|pm| {
-                    let ns = darkmux_profiles::ownership::namespaced_identifier(pm);
-                    loaded
-                        .iter()
-                        .any(|l| l.identifier == pm.id || l.model == pm.id || l.identifier == ns)
-                })
-        })
+        .filter(|(_, p)| profile_default_model(p).is_some_and(|pm| darkmux_reuses(pm, loaded)))
         .map(|(name, p)| (name.as_str(), p))
         .collect();
     if matches.is_empty() {
@@ -8812,40 +9121,30 @@ mod tests {
         }
     }
 
-    /// (#2094 finding 9) An env var set to garbage must not be silently
-    /// reported as `"from ... env"` — `config_access::turn_delay_ms()`
-    /// falls through to a lower tier on a parse failure, and provenance
-    /// claiming "env" while the resolved value came from config/default
-    /// is a doctor surface actively lying about where a number came from.
+    /// (#2094 finding 9) An env var set to garbage must not be reported as
+    /// `"from ... env"`: the accessor falls through to a lower tier. The
+    /// unparseable value is reported once, by the numeric-env Fail row
+    /// (`check_numeric_env`), which never quotes it; each knob's own row shows
+    /// the value that resolved, from the tier that resolved it, and does not
+    /// quote the value either.
     #[serial_test::serial]
     #[test]
-    fn check_turn_delay_unparseable_env_warns_and_names_the_raw_value() {
-        let prev_d = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
-        unsafe {
-            std::env::set_var("DARKMUX_TURN_DELAY_MS", "3s");
-        }
-        let check = check_turn_delay();
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(
-            check.message.contains("DARKMUX_TURN_DELAY_MS") && check.message.contains("3s"),
-            "must name the raw unparseable value: {}",
-            check.message
-        );
-        assert!(
-            check.message.contains("not an integer"),
-            "must say WHY it's rejected, not just show a resolved number: {}",
-            check.message
-        );
-        assert!(
-            !check.message.contains("from DARKMUX_TURN_DELAY_MS env"),
-            "must NOT claim provenance is env when the env value didn't parse: {}",
-            check.message
-        );
-        unsafe {
-            match prev_d {
-                Some(v) => std::env::set_var("DARKMUX_TURN_DELAY_MS", v),
-                None => std::env::remove_var("DARKMUX_TURN_DELAY_MS"),
-            }
+    fn an_unparseable_knob_env_var_gets_one_fail_row_and_its_value_is_never_quoted() {
+        type Case = (&'static str, &'static str, fn() -> Check);
+        let cases: [Case; 3] = [
+            ("DARKMUX_TURN_DELAY_MS", "3s", check_turn_delay),
+            ("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "5s", check_host_sampler_interval),
+            ("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL", "4k", check_generation_checkpoint_interval),
+        ];
+        for (var, garbage, check) in cases {
+            let _bad = EnvGuard::set(var, garbage);
+            let row = check();
+            assert_eq!(row.status, Status::Pass, "{var}: the knob row reports the resolved value: {}", row.message);
+            assert!(!row.message.contains(garbage), "{var}: never the value: {}", row.message);
+            assert!(!row.message.contains(&format!("from {var} env")), "{var}: not env provenance: {}", row.message);
+            let fails: Vec<Check> = check_numeric_env().into_iter().filter(|c| c.name.contains(var)).collect();
+            assert_eq!(fails.len(), 1, "{var}: one Fail row: {fails:?}");
+            assert_eq!(fails[0].status, Status::Fail);
         }
     }
 
@@ -10495,34 +10794,6 @@ mod tests {
         }
     }
 
-    /// Mirrors `check_turn_delay_unparseable_env_warns_and_names_the_raw_value`
-    /// — a set-but-garbage env var must not be silently reported as "from
-    /// ... env" while the resolved value actually came from a lower tier.
-    #[serial_test::serial]
-    #[test]
-    fn check_host_sampler_interval_unparseable_env_warns_and_names_the_raw_value() {
-        let prev = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
-        unsafe { std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "5s") };
-        let check = check_host_sampler_interval();
-        assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(
-            check.message.contains("DARKMUX_HOST_SAMPLER_INTERVAL_MS") && check.message.contains("5s"),
-            "must name the raw unparseable value: {}",
-            check.message
-        );
-        assert!(
-            !check.message.contains("from DARKMUX_HOST_SAMPLER_INTERVAL_MS env"),
-            "must NOT claim provenance is env when the env value didn't parse: {}",
-            check.message
-        );
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
-                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
-            }
-        }
-    }
-
     // ─── (#1769) summarize_audit_reports — Fail / Warn / Pass split ────────
     //
     // Pure-function tests: no filesystem, no `DARKMUX_AUDIT_DIR`. Each test
@@ -10619,6 +10890,50 @@ mod tests {
              doctor's exit code to 1, and it must not be softened by a torn tail elsewhere"
         );
         assert!(check.message.contains("BROKEN"));
+    }
+
+    /// A day file that restarted its chain with nothing set aside (it was
+    /// emptied) still warns, naming the day file: it is not a clean walk.
+    #[test]
+    fn summarize_audit_reports_restart_without_a_sidecar_warns_naming_the_file() {
+        let emptied = darkmux_flow::IntegrityReport { chain_restarted: true, ..mk_clean_report(0) };
+        let check = summarize_audit_reports(&[mk_clean_report(2), emptied]);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("restarted") && check.message.contains("2026-08-11.jsonl"), "{}", check.message);
+    }
+
+    /// Dropped audit writes warn with their days and counts, whatever day
+    /// they fell on; none passes.
+    #[test]
+    fn audit_write_drops_name_each_day_and_none_pass() {
+        assert_eq!(audit_write_drops_check(&[]).status, Status::Pass);
+        let day = |day: &str, count| darkmux_flow::DroppedAuditWrites { day: day.into(), path: format!("/flows/{day}.jsonl"), count };
+        let check = audit_write_drops_check(&[day("2026-11-12", 2), day("2026-11-17", 1)]);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.starts_with("3 audit write(s) FAILED on 2026-11-12 (2), 2026-11-17 (1)"), "{}", check.message);
+        assert!(check.hint.unwrap().contains("exits 3"));
+    }
+
+    /// An unwritable flows dir fails doctor, naming the dir and why, and so
+    /// does an audit day file the audit sink cannot open; a writable setup
+    /// passes.
+    #[test]
+    fn an_unwritable_flows_dir_fails_naming_it() {
+        use darkmux_flow::DayFileAccess;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("a-regular-file");
+        std::fs::write(&blocker, "").unwrap();
+        let dir = blocker.join("flows");
+        let problem = darkmux_flow::day_file_write_problem(&dir, "2026-11-17", DayFileAccess::Append);
+        let check = flows_dir_writable_check(&dir, problem, None);
+        assert_eq!(check.status, Status::Fail, "{}", check.message);
+        assert!(check.message.contains(&dir.display().to_string()) && check.message.contains("not a directory"), "{}", check.message);
+        assert!(check.hint.unwrap().contains("dirs.flows"));
+        let audit = flows_dir_writable_check(tmp.path(), None, Some("cannot open /audit/2026-11-17.jsonl for writing".into()));
+        assert_eq!(audit.status, Status::Fail);
+        assert!(audit.message.starts_with("audit records cannot be written: cannot open /audit/"), "{}", audit.message);
+        let ok = flows_dir_writable_check(tmp.path(), darkmux_flow::day_file_write_problem(tmp.path(), "2026-11-17", DayFileAccess::Append), None);
+        assert_eq!(ok.status, Status::Pass, "{}", ok.message);
     }
 
     #[test]
@@ -11019,6 +11334,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A numeric env var set to a value that does not read (the accessor
+    /// reads it as unset: `50k` meant no token cap) is a Fail row in the
+    /// whole doctor, naming the variable, the value's kind and the accepted
+    /// form, never the value.
+    #[test]
+    #[serial_test::serial]
+    fn the_whole_doctor_fails_a_numeric_env_var_that_does_not_read() {
+        use darkmux_sandbox::BackendKind;
+        let _bad = EnvGuard::set("DARKMUX_RUNTIME_MAX_TOKENS", "50k");
+        let r = with_isolated_darkmux_home(|| run_with((Ok(BackendKind::Seatbelt), darkmux_types::config_access::Source::Config)));
+        let row = r.checks.iter().find(|c| c.name == "env var DARKMUX_RUNTIME_MAX_TOKENS").expect("a row for the var");
+        assert_eq!(row.status, Status::Fail, "{}", row.message);
+        assert!(row.message.contains("set to text that is not an integer from 0 to 4294967295"), "{}", row.message);
+        assert!(row.message.contains("Every command that starts work refuses"), "{}", row.message);
+        assert!(row.message.contains("any other command reads it as unset and warns"), "{}", row.message);
+        assert!(row.hint.as_deref().is_some_and(|h| h.contains("unset DARKMUX_RUNTIME_MAX_TOKENS")), "{:?}", row.hint);
+        assert!(!format!("{} {:?}", row.message, row.hint).contains("50k"), "never the value");
+        drop(_bad);
+        assert!(check_numeric_env().is_empty(), "no row when every var reads");
     }
 
     /// (#2774 round-8 MF1, first half) `max_pause_ms = 0` means an
@@ -12447,6 +12783,35 @@ mod tests {
         assert!(c.message.contains("profiles.p.models[0].engine_args") && c.message.contains("--host"), "{}", c.message);
     }
 
+    /// An LM Studio model's `identifier` equal to its model key, which every
+    /// preflight refuses, is Fail here too, naming its path.
+    #[test]
+    fn an_identifier_equal_to_the_model_key_fails() {
+        let bad = materialized(r#"{"profiles":{"p":{"models":[{"id":"phi-4","n_ctx":8,"identifier":"phi-4"}]}}}"#);
+        let c = endpoints_status(&bad, &[], &mut no_spend, REGISTRY);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("profiles.p.models[0].identifier") && c.message.contains("`phi-4`"), "{}", c.message);
+        let ok = materialized(r#"{"profiles":{"p":{"models":[{"id":"phi-4","n_ctx":8,"identifier":"darkmux:phi-4"}]}}}"#);
+        assert_eq!(endpoints_status(&ok, &[], &mut no_spend, REGISTRY).status, Status::Pass);
+        // Any explicit identifier on a variant id fails, with the fix.
+        let variant = materialized(r#"{"profiles":{"p":{"models":[{"id":"q@4bit","n_ctx":8,"identifier":"darkmux:coder"}]}}}"#);
+        let c = endpoints_status(&variant, &[], &mut no_spend, REGISTRY);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("profiles.p.models[0].identifier") && c.message.contains("Drop the identifier"), "{}", c.message);
+    }
+
+    /// Two models with different ids under one `darkmux:` identifier, which
+    /// every preflight refuses, are Fail here too, naming the path.
+    #[test]
+    fn a_darkmux_identifier_shared_by_two_models_fails() {
+        let bad = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"old","n_ctx":8,"identifier":"darkmux:coder"},{"id":"new","n_ctx":8,"identifier":"darkmux:coder"}]}}}"#,
+        );
+        let c = endpoints_status(&bad, &[], &mut no_spend, REGISTRY);
+        assert_eq!(c.status, Status::Fail, "{}", c.message);
+        assert!(c.message.contains("profiles.p.models[1].identifier") && c.message.contains("`darkmux:coder`"), "{}", c.message);
+    }
+
     /// (#3453) A Flint endpoint is labeled as a server darkmux starts, and a
     /// second Flint endpoint, which every preflight refuses, is Fail here
     /// too, naming its path.
@@ -12548,12 +12913,12 @@ mod tests {
     fn models_loaded_is_not_applicable_on_an_engine_that_does_not_report_it() {
         let unreported: anyhow::Error =
             darkmux_profiles::engine::NotReported { engine: "mlx".into(), question: "which models it has loaded" }.into();
-        let c = models_loaded_status(Err(unreported));
+        let c = models_loaded_status(Err(unreported), None);
         assert_eq!(
             (c.status, c.message.as_str()),
             (Status::Pass, "(not applicable: mlx does not report which models it has loaded)")
         );
-        let c = models_loaded_status(Err(anyhow::anyhow!("lms: connection refused")));
+        let c = models_loaded_status(Err(anyhow::anyhow!("lms: connection refused")), None);
         assert_eq!(c.status, Status::Warn, "{}", c.message);
     }
 
@@ -12561,14 +12926,44 @@ mod tests {
     /// warns that nothing is loaded and says a dispatch loads what it needs.
     #[test]
     fn models_loaded_names_each_loaded_model_and_warns_when_none_are() {
-        let c = models_loaded_status(Ok(vec![lm("darkmux:qwen", "qwen"), lm("gemma", "gemma")]));
+        let c = models_loaded_status(Ok(vec![lm("darkmux:qwen", "qwen"), lm("gemma", "gemma")]), None);
         assert_eq!(
             (c.status, c.message.as_str(), c.hint),
             (Status::Pass, "2 model(s) loaded: darkmux:qwen, gemma", None)
         );
-        let c = models_loaded_status(Ok(Vec::new()));
+        let c = models_loaded_status(Ok(Vec::new()), None);
         assert_eq!((c.status, c.message.as_str()), (Status::Warn, "no models loaded in LMStudio"));
         assert!(c.hint.as_deref().is_some_and(|h| h.contains("darkmux dispatch")), "{:?}", c.hint);
+    }
+
+    /// (Contract 4) Only copies darkmux did not load is not a pass: darkmux
+    /// never dispatches to one. Each remedy is the namespaced load of the
+    /// default profile's default model at its window, never a bare
+    /// `lms load`, which makes another copy darkmux never uses.
+    #[test]
+    fn models_loaded_does_not_pass_on_user_copies_and_gives_the_namespaced_load() {
+        let reg = materialized(r#"{"profiles":{"p":{"models":[{"id":"qwen","n_ctx":32768}]}},"default_profile":"p"}"#);
+        let exact = "lms load qwen --context-length 32768 --identifier darkmux:qwen";
+        let c = models_loaded_status(Ok(vec![lm("gemma", "gemma"), lm("qwen", "qwen")]), Some(&reg));
+        assert_eq!(c.status, Status::Warn, "{}", c.message);
+        assert!(c.message.contains("gemma, qwen") && c.message.contains("none"), "{}", c.message);
+        assert!(c.hint.as_deref().is_some_and(|h| h.contains(exact)), "{:?}", c.hint);
+        let c = models_loaded_status(Ok(Vec::new()), Some(&reg));
+        assert!(c.hint.as_deref().is_some_and(|h| h.contains(exact)), "{:?}", c.hint);
+        let c = models_loaded_status(Ok(Vec::new()), None);
+        let hint = c.hint.unwrap_or_default();
+        assert!(hint.contains("--identifier darkmux:<model-key>") && hint.contains("darkmux dispatch"), "{hint}");
+        // A default model darkmux does not load on LM Studio gets no `lms load`.
+        let remote = materialized(
+            r#"{"profiles":{"p":{"models":[{"id":"qwen","n_ctx":32768,"endpoint":"far"}]}},"default_profile":"p",
+                "endpoints":{"far":{"url":"http://10.0.0.2:1234/v1"}}}"#,
+        );
+        let hint = models_loaded_status(Ok(Vec::new()), Some(&remote)).hint.unwrap_or_default();
+        assert!(hint.contains("<model-key>") && !hint.contains("lms load qwen"), "{hint}");
+        // A profile's explicit `identifier` opt-out is darkmux's own load.
+        let opt = materialized(r#"{"profiles":{"p":{"models":[{"id":"qwen","n_ctx":32768,"identifier":"mine"}]}}}"#);
+        let c = models_loaded_status(Ok(vec![lm("mine", "qwen")]), Some(&opt));
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
     }
 
     /// (#316) `default_engine`: LM Studio passes with its tier; an endpoint
@@ -12966,8 +13361,16 @@ mod tests {
         //
         // (#3560) 83: `checks_clients::check_clients_remote`, the
         // `clients.remote` row (what `client serve` does on the tailnet).
+        //
+        // (#3569) 84: `checks_installed::check_installed_engines` joined
+        // beside the Flint row.
+        //
+        // (#3112) 85: `checks_sandbox::check_sandbox_memory` joined after
+        // the sandbox's own rows.
+        //
+        // 86: `check_flows_dir_writable`, before the audit rows.
         let expected =
-            83 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
+            86 + darkmux_types::config_enum::ENUM_SETTINGS.len() + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -14115,14 +14518,14 @@ mod tests {
         assert_eq!(needed.status, Status::Fail, "{}", needed.message);
     }
 
-    /// (#2914) The binding check reports the declared window, and points a
-    /// binding with no window at declaring one.
+    /// (#2914) The binding check reports the loaded window beside the
+    /// declared one, and points a binding with no window at declaring one.
     #[test]
     fn utility_binding_reports_its_window_and_nudges_one_with_no_window() {
-        let loaded = vec![lm("darkmux:util-4b", "util-4b")];
+        let loaded = vec![darkmux_types::LoadedModel { context: 131_072, ..lm("darkmux:util-4b", "util-4b") }];
         let c = super::utility_binding_status(Some("util-4b"), Some(120_000), Some(&loaded));
-        assert_eq!(c.status, Status::Pass);
-        assert!(c.message.contains("120000"), "{}", c.message);
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.message.contains("131072") && c.message.contains("120000"), "{}", c.message);
         let c = super::utility_binding_status(Some("util-4b"), None, Some(&loaded));
         assert_eq!(c.status, Status::Pass, "a binding with no window still works: {}", c.message);
         assert!(
@@ -14130,6 +14533,30 @@ mod tests {
             "but the hint says to declare the window: {:?}",
             c.hint
         );
+    }
+
+    /// (Contract 4) The row passes only on the instance a utility job would
+    /// use: darkmux's own (`darkmux:<id>`) at the binding's window or more.
+    /// A copy darkmux did not load is never used, at any window, and an
+    /// instance of darkmux's below the window is reloaded; each warns with
+    /// the window it is loaded at and the exact command.
+    #[test]
+    fn utility_binding_passes_only_on_darkmuxs_own_instance_at_its_window() {
+        let at = |identifier: &str, context: u64| vec![darkmux_types::LoadedModel { context, ..lm(identifier, "qwen3-4b") }];
+        for ctx in [4096, 65_536] {
+            let c = super::utility_binding_status(Some("qwen3-4b"), Some(32_768), Some(&at("qwen3-4b", ctx)));
+            assert_eq!(c.status, Status::Warn, "a user copy at {ctx} is never used: {}", c.message);
+            assert!(c.message.contains("`qwen3-4b`") && c.message.contains(&ctx.to_string()), "{}", c.message);
+            let hint = c.hint.unwrap_or_default();
+            assert!(hint.contains("lms load qwen3-4b --context-length 32768 --identifier darkmux:qwen3-4b"), "{hint}");
+        }
+        let c = super::utility_binding_status(Some("qwen3-4b"), Some(32_768), Some(&at("darkmux:qwen3-4b", 4096)));
+        assert_eq!(c.status, Status::Warn, "darkmux's own below the window is reloaded: {}", c.message);
+        assert!(c.message.contains("4096") && c.message.contains("32768"), "{}", c.message);
+        assert!(c.hint.unwrap_or_default().contains("lms unload darkmux:qwen3-4b"));
+        let c = super::utility_binding_status(Some("qwen3-4b"), Some(32_768), Some(&at("darkmux:qwen3-4b", 65_536)));
+        assert_eq!(c.status, Status::Pass, "{}", c.message);
+        assert!(c.message.contains("`darkmux:qwen3-4b`") && c.message.contains("65536"), "{}", c.message);
     }
 
     // ─── check_utility_model_binding (#590) ───────────────────────────
@@ -14248,6 +14675,9 @@ mod tests {
             hint.contains("--context-length"),
             "and the declared context, or the hand-load lands at the model default: {hint}"
         );
+        let c = super::utility_binding_status(Some("util-4b"), Some(32_768), Some(&loaded));
+        let hint = c.hint.unwrap_or_default();
+        assert!(hint.contains("`lms load util-4b --context-length 32768 --identifier darkmux:util-4b`"), "{hint}");
         // (#2912/#2913) A third assertion used to pin that the hint named no
         // verb as needing this resident first; the two verbs it named are
         // gone, and `utility_model_id()` still only ever names the compactor.
@@ -17685,7 +18115,54 @@ mod user_file_key_tests {
         let problem = darkmux_types::user_files::config_json_problem_at(&path).unwrap();
         let rows = user_file_key_rows(&[problem], &[]);
         assert_eq!(rows[0].status, Status::Fail);
-        assert!(rows[0].message.contains("`redis.port` must be an integer from 0 to 65535, got \"x\""), "{}", rows[0].message);
+        assert!(rows[0].message.contains("`redis.port` must be an integer from 0 to 65535, got a string"), "{}", rows[0].message);
+    }
+
+    /// A key written twice is a Fail row, and its fix says the file fails to
+    /// load until one copy is deleted: `config.json` drops every setting to
+    /// its default over it, so "it does nothing" would be false.
+    #[test]
+    fn a_duplicate_config_key_is_a_fail_row_whose_fix_says_the_file_fails_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"machine_id": "a", "redis": {"enabled": true}, "machine_id": "b"}"#).unwrap();
+        let problem = darkmux_types::user_files::config_json_problem_at(&path).expect("a duplicate key is a problem");
+        let rows = user_file_key_rows(&[problem], &[]);
+        assert_eq!(rows[0].status, Status::Fail);
+        assert!(rows[0].message.contains("duplicate key `machine_id`"), "{}", rows[0].message);
+        let hint = rows[0].hint.clone().unwrap_or_default();
+        assert!(hint.contains("delete") && hint.contains("every setting falls back to its default"), "{hint}");
+        assert!(!hint.contains("it does nothing"), "{hint}");
+    }
+
+    /// A repeated map entry loads with only the last copy used, so its fix
+    /// says that, never that the file fails to load.
+    #[test]
+    fn a_duplicate_map_entry_is_a_fail_row_whose_fix_says_the_last_copy_is_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"role_profiles": {"coder": "p", "coder": "q"}}"#).unwrap();
+        let problem = darkmux_types::user_files::config_json_problem_at(&path).expect("a duplicate entry is a problem");
+        let rows = user_file_key_rows(&[problem], &[]);
+        assert_eq!(rows[0].status, Status::Fail);
+        assert!(rows[0].message.contains("duplicate key `role_profiles.coder`") && rows[0].message.contains("only the last copy is used"), "{}", rows[0].message);
+        let hint = rows[0].hint.clone().unwrap_or_default();
+        assert!(hint.contains("delete") && hint.contains("only the last copy of each used"), "{hint}");
+        assert!(!hint.contains("falls back") && !hint.contains("fails to load"), "{hint}");
+    }
+
+    /// Past the trial cap a repeat is not judged, so with no repeated field
+    /// among the judged ones the fix says the file MAY fail to load.
+    #[test]
+    fn past_the_trial_cap_the_fix_says_the_file_may_fail_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let n = darkmux_types::user_files::MAX_REPEAT_TRIALS + 1;
+        let entries: Vec<String> = (0..n).map(|i| format!(r#""r{i}": "p", "r{i}": "q""#)).collect();
+        std::fs::write(&path, format!(r#"{{"role_profiles": {{{}}}}}"#, entries.join(", "))).unwrap();
+        let problem = darkmux_types::user_files::config_json_problem_at(&path).expect("refused");
+        let hint = user_file_key_rows(&[problem], &[])[0].hint.clone().unwrap_or_default();
+        assert!(hint.contains("may fail to load, or load with only the last copy"), "{hint}");
     }
 
     /// (review C2) A file name cannot forge a doctor line either.

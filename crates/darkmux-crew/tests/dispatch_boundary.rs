@@ -28,7 +28,8 @@
 //!   atomically; a re-created file is a new file to XProtect, the reason
 //!   `tests/cli.rs::stable_cli_fakes` does the same). `docker` is found on
 //!   `PATH`, `lms` through `DARKMUX_LMS_BIN`. The fake `docker run` plays the
-//!   container: it copies a scripted trajectory into the mounted out-dir,
+//!   container: it reads the secret off stdin (or, scripted, exits without
+//!   reading it), copies a scripted trajectory into the mounted out-dir,
 //!   sources an optional run script (to sleep, or to change what `lms ps`
 //!   reports mid-run), prints scripted stdout/stderr and exits with a
 //!   scripted code. Every call's argv is logged NUL-separated, one file per
@@ -47,15 +48,18 @@
 //! # What this file cannot see
 //!
 //! - The sampler's clock and cadence: it ticks every 2s of real time on its
-//!   own thread, so the sampler tests hold the fake container open for a few
-//!   seconds and assert what happened, never how many ticks.
+//!   own thread, so the sampler tests hold the fake container open (a few
+//!   seconds for one tick, until the asserted records land for more) and
+//!   assert what happened, never how many ticks.
 //! - The session-presence heartbeat (Redis is unset by the isolation guard).
 //! - Whether a kill reached a container: the fake `docker kill` always
 //!   succeeds, so only that a kill was ISSUED, by name, is pinned.
 //! - The `?` arms that need an I/O fault or a race to fire: a workspace-name
 //!   collision, the origin stamp, the checkpoint staging and prompt writes,
-//!   the container spawn, the secret write to a container that closed its
-//!   stdin, `wait_with_output` itself failing.
+//!   the container spawn, `wait_with_output` itself failing. (The secret
+//!   write to a container that closed its stdin IS reached: a secret larger
+//!   than a pipe holds makes it fail every time, not only when the race
+//!   goes that way.)
 //! - A sampler heartbeat lost to another process's steal of the sampler lock.
 //!
 //! Every test runs in a process of its own (`own_process!`) and `#[serial]`:
@@ -126,6 +130,7 @@ case "$1" in
   create) echo fakecid; exit 0 ;;
   cp) for last; do :; done; printf '#!/bin/sh\n' > "$last"; exit 0 ;;
   run)
+    if [ -f "$state/run-refuses-stdin" ]; then exit 1; fi
     case " $* " in *" -i "*) cat > "$state/docker.stdin" ;; esac
     out=""
     for a; do case "$a" in *:/darkmux-out) out="${a%:/darkmux-out}" ;; esac; done
@@ -327,25 +332,26 @@ impl Rig {
 
     /// Every flow record written under the isolated flows dir.
     fn flows(&self) -> Vec<Value> {
-        let mut out = Vec::new();
-        let mut stack = vec![self.state.join("flows")];
-        while let Some(d) = stack.pop() {
-            let Ok(rd) = fs::read_dir(&d) else { continue };
-            let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
-            entries.sort();
-            for p in entries {
-                if p.is_dir() {
-                    stack.push(p);
-                } else if p.extension().is_some_and(|e| e == "jsonl") {
-                    for line in fs::read_to_string(&p).unwrap_or_default().lines() {
-                        if let Ok(v) = serde_json::from_str::<Value>(line) {
-                            out.push(v);
-                        }
-                    }
-                }
+        flows_under(&self.state.join("flows"))
+    }
+
+    /// Holds the fake container open (its run script is [`HELD_OPEN`]) until
+    /// `done` reads true over the dispatch's flow records, then lets it exit.
+    /// `done` sees every new read, so it may also act on the way (change what
+    /// `lms ps` reports once a first tick is recorded). A sampler test waits
+    /// on what it asserts, never on a fixed sleep the sampler's tick could
+    /// outrun on a slow host (#3621). Join the watcher after the dispatch.
+    fn hold_open_until(&self, mut done: impl FnMut(&[Value]) -> bool + Send + 'static) -> std::thread::JoinHandle<()> {
+        let (root, release) = (self.state.join("flows"), self.fakes.join("release"));
+        let _ = fs::remove_file(&release);
+        self.fake("run-script", HELD_OPEN);
+        std::thread::spawn(move || {
+            let hang_guard = std::time::Instant::now() + HANG_GUARD;
+            while !done(&flows_under(&root)) && std::time::Instant::now() < hang_guard {
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-        }
-        out
+            fs::write(&release, "").unwrap();
+        })
     }
 
     fn actions(&self) -> Vec<String> {
@@ -381,6 +387,38 @@ impl Rig {
     fn opts(&self) -> DispatchOpts {
         opts_with(&self.profiles)
     }
+}
+
+/// How long a held container waits before calling the dispatch hung: never
+/// the thing a test measures.
+const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The fake container's run script for [`Rig::hold_open_until`]: wait for
+/// the release file, or [`HANG_GUARD`]'s 60 s (1200 naps of 50 ms).
+const HELD_OPEN: &str =
+    "i=0\nwhile [ ! -f \"$FAKE_DOCKER_STATE_DIR/release\" ] && [ \"$i\" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n";
+
+/// Every flow record written under `root`.
+fn flows_under(root: &Path) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        entries.sort();
+        for p in entries {
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|e| e == "jsonl") {
+                for line in fs::read_to_string(&p).unwrap_or_default().lines() {
+                    if let Ok(v) = serde_json::from_str::<Value>(line) {
+                        out.push(v);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A loopback port with no listener: bind, read it, drop it.
@@ -684,10 +722,14 @@ fn a_model_that_will_not_load_fails_before_a_record() {
     let (res, _) = run(&rig, rig.opts());
     let err = format!("{:#}", res.expect_err("load failure"));
     assert!(err.starts_with("model selection failed: darkmux: model `model-a` could not load at n_ctx=32000"), "{err}");
-    // The load is priced off the catalog for its reservation (#3514), its
-    // memory decided as a wave's on LM Studio's residents read again under
-    // the residency lock.
-    assert_eq!(rig.lms_log(), vec!["ps --json", "ps --json", "ls --json", "load model-a --context-length 32000 --identifier darkmux:model-a -y"]);
+    // The model's maximum context is read off the catalog before anything
+    // is unloaded or loaded (#1135 class). The load is priced off the
+    // catalog for its reservation (#3514), its memory decided as a wave's
+    // on LM Studio's residents read again under the residency lock.
+    assert_eq!(
+        rig.lms_log(),
+        vec!["ps --json", "ls --json", "ps --json", "ls --json", "load model-a --context-length 32000 --identifier darkmux:model-a -y"]
+    );
     assert!(rig.docker_run().is_none());
     assert!(bookends(&rig).is_empty(), "records: {:?}", rig.actions());
 }
@@ -1012,6 +1054,22 @@ fn a_base_url_override_skips_residency_and_addresses_the_bare_model() {
     assert_eq!(payload(&rig.record("telemetry.tokens"))["endpoint"], "http://127.0.0.1:9/v1", "usage names the override");
 }
 
+/// (#1135 class) A model resident at its context is reused, and the model's
+/// maximum context is read only for a load: a reuse asks LM Studio's
+/// catalog nothing (no `lms ls`) and loads nothing.
+#[test]
+#[serial]
+fn a_reuse_reads_no_catalog_and_loads_nothing() {
+    own_process!();
+    let rig = Rig::new();
+    rig.container(ONE_TURN, ENVELOPE, "", 0);
+    let (res, _) = run(&rig, rig.opts());
+    assert_eq!(res.expect("reuses the resident at 32000").exit_code, 0);
+    let lms = rig.lms_log();
+    assert!(lms.iter().any(|l| l == "ps --json"), "residency was read: {lms:?}");
+    assert!(lms.iter().all(|l| !l.starts_with("ls") && !l.starts_with("load")), "{lms:?}");
+}
+
 #[test]
 #[serial]
 fn a_model_that_is_not_resident_is_loaded_namespaced_at_its_context() {
@@ -1024,6 +1082,29 @@ fn a_model_that_is_not_resident_is_loaded_namespaced_at_its_context() {
     res.unwrap();
     let lms = rig.lms_log();
     assert!(lms.contains(&"load model-a --context-length 32000 --identifier darkmux:model-a -y".to_string()), "{lms:?}");
+}
+
+/// (#1135 class) LM Studio finishes the load but holds the model at 4096,
+/// not the 32000 the profile declares: the dispatch fails before a record,
+/// naming the instance, what was asked and what it got, and no container
+/// runs truncated.
+#[test]
+#[serial]
+fn a_load_lm_studio_holds_below_the_profiles_context_fails_before_a_record() {
+    own_process!();
+    let rig = Rig::new();
+    rig.resident(&[]);
+    rig.fake("lms-ps-after-load.json", lms_ps(&[("darkmux:model-a", "model-a", 4096)]));
+    rig.container(ONE_TURN, ENVELOPE, "", 0);
+    let (res, _) = run(&rig, rig.opts());
+    let err = format!("{:#}", res.expect_err("held at 4096"));
+    assert!(
+        err.starts_with("model selection failed: darkmux: `darkmux:model-a` loaded at context 4096, below the n_ctx=32000 asked"),
+        "{err}"
+    );
+    assert!(err.contains("set the profile's `n_ctx` to 4096 or less"), "{err}");
+    assert!(rig.docker_run().is_none(), "no container ran on the short model");
+    assert!(bookends(&rig).is_empty(), "records: {:?}", rig.actions());
 }
 
 /// (#3514) The same reload while another dispatch holds that instance (its
@@ -1273,6 +1354,27 @@ fn an_error_after_start_closes_with_dispatch_error_and_reclaims_the_auto_workspa
     assert_eq!(left.len(), 3, "{left:?}");
     assert!(left.iter().all(|n| n.starts_with("darkmux-out-coder-")), "{left:?}");
     assert!(left.iter().any(|n| n.ends_with(".execution.lock")) && left.iter().any(|n| n.ends_with(".resume_origin.json")), "{left:?}");
+}
+
+/// A dispatch that reaches `dispatch()` after the run was stopped starts
+/// nothing: no `docker` call (no container spawn, no model call) and no
+/// record, since an execution that never started opens no `dispatch.start`
+/// (a `dispatch.map` item the stop kept from starting opens none either). A
+/// crawl unit's next draw after a clean draw, a lab repeat, a mission step
+/// already past the wave check: each would otherwise start one more container
+/// the tailer then kills at its first poll.
+#[test]
+#[serial]
+fn a_dispatch_after_a_stop_spawns_nothing_and_writes_no_record() {
+    own_process!();
+    let rig = Rig::new();
+    rig.container(ONE_TURN, ENVELOPE, "", 0);
+    darkmux_types::interrupt::raise_for_test();
+    let (res, _) = run(&rig, rig.opts());
+    let err = format!("{:#}", res.expect_err("a stopped run starts no dispatch"));
+    assert!(err.contains(darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL) && err.contains("did not start"), "{err}");
+    assert_eq!(rig.docker_verbs(), Vec::<String>::new(), "no docker call after the stop");
+    assert_eq!(rig.actions(), Vec::<String>::new(), "no record for an execution that never started");
 }
 
 #[test]
@@ -1544,6 +1646,39 @@ fn a_tool_granting_role_on_a_hosted_endpoint_runs_in_the_container_with_the_secr
     assert!(!arg_after(&argv, "--system").unwrap().contains("PIN-IDENTITY-MARKER"), "identity never leaves the machine");
 }
 
+/// (#2233, #2247) The secret write is the one `?` between the spawn and the
+/// threads that watch the container, so when it fails the kill guard is all
+/// that stops a container that may still be up. Arming the guard late, or
+/// disarming it early, leaves no kill here while every other test stays
+/// green. The secret is larger than a pipe holds (64 KiB on Linux and macOS)
+/// and under Linux's 128 KiB limit on one environment string, so the write
+/// blocks until the container's end of the pipe closes and then fails, every
+/// time, instead of landing in the pipe's buffer.
+/// That holds where a pipe holds 64 KiB: macOS, and Linux with 4 KiB pages
+/// (CI's runners). On Linux with 16 or 64 KiB pages (Asahi, some aarch64
+/// distributions) a pipe holds 256 KiB to 1 MiB, the secret fits, and this
+/// test fails without a defect; the environment-string limit rules out a
+/// larger secret.
+#[test]
+#[serial]
+fn a_secret_write_the_container_refuses_kills_the_container_by_name() {
+    own_process!();
+    let mut rig = Rig::new();
+    rig.env().set("PIN_HOSTED_KEY", "k".repeat(96 * 1024));
+    hosted_profiles(&rig, "http://127.0.0.1:9/v1");
+    rig.fake("run-refuses-stdin", "");
+    let (res, _) = run(&rig, rig.opts());
+    let err = res.expect_err("a secret the container never read fails the dispatch");
+    assert!(format!("{err:#}").contains("writing remote auth header to container stdin"), "{err:#}");
+    assert!(rig.stdin_blob().is_none(), "the fake container never read its stdin");
+    assert_eq!(
+        rig.docker_verbs(),
+        vec!["image inspect", "run --rm", "kill darkmux-dispatch-boundary.solo.adhoc.coder.pin"],
+        "the run, then the armed guard's kill by name"
+    );
+    assert_eq!(bookends(&rig), vec!["dispatch.start", "dispatch.error"]);
+}
+
 #[test]
 #[serial]
 fn force_container_puts_a_tool_less_hosted_role_in_the_container() {
@@ -1703,12 +1838,27 @@ fn a_resume_stages_the_origin_checkpoint_and_a_clean_finish_closes_the_origin() 
 
 // ─── 7. the telemetry sampler, seen through the dispatch ────────────────
 //
-// The sampler ticks every 2s of real time on its own thread. These hold the
-// fake container open long enough for at least one more tick and assert what
-// was recorded, never how many ticks ran.
+// The sampler ticks every 2s of real time on its own thread, plus whatever
+// one tick costs on this host. A test needing a single tick holds the fake
+// container open a few seconds: the tick that starts before the container
+// exits finishes. A test needing a later tick holds it open until the
+// records it asserts on have landed (`Rig::hold_open_until`), because a
+// fixed sleep is outrun by a slow tick (#3621). Each asserts what was
+// recorded, never how many ticks ran.
 
 fn telemetry_lms(rig: &Rig) -> Vec<Value> {
-    rig.flows().into_iter().filter(|r| r["action"] == "telemetry.lms").map(|r| payload(&r).clone()).collect()
+    lms_events(&rig.flows())
+}
+
+fn lms_events(flows: &[Value]) -> Vec<Value> {
+    flows.iter().filter(|r| r["action"] == "telemetry.lms").map(|r| payload(r).clone()).collect()
+}
+
+/// Writes `body` to `path` whole: a reader sees the old file or the new one.
+fn replace_file(path: &Path, body: &str) {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, body).unwrap();
+    fs::rename(&tmp, path).unwrap();
 }
 
 #[test]
@@ -1746,10 +1896,21 @@ fn the_first_lms_sample_is_a_baseline_tagged_by_seat() {
 fn a_residency_change_mid_run_is_recorded_as_an_unload_and_a_load() {
     own_process!();
     let rig = Rig::new();
-    rig.fake("lms-ps-mid.json", lms_ps(&[("darkmux:model-b", "model-b", 8192)]));
     rig.container(ONE_TURN, ENVELOPE, "", 0);
-    rig.fake("run-script", "sleep 1\ncp \"$FAKE_DOCKER_STATE_DIR/lms-ps-mid.json\" \"$FAKE_DOCKER_STATE_DIR/lms-ps.json\"\nsleep 3\n");
+    // Once a first tick has recorded the baseline, model-b replaces model-a;
+    // the run ends once a later tick has recorded the change.
+    let (ps, mid) = (rig.fakes.join("lms-ps.json"), lms_ps(&[("darkmux:model-b", "model-b", 8192)]));
+    let mut swapped = false;
+    let watcher = rig.hold_open_until(move |flows| {
+        let lms = lms_events(flows);
+        if !swapped && !lms.is_empty() {
+            replace_file(&ps, &mid);
+            swapped = true;
+        }
+        lms.iter().any(|p| p["event"] == "unload")
+    });
     let (res, _) = run(&rig, rig.opts());
+    watcher.join().unwrap();
     res.unwrap();
     assert_eq!(
         telemetry_lms(&rig),
@@ -1823,7 +1984,16 @@ fn engine_server_stand_in(endpoint: &str) -> ServerStandIn {
 }
 
 fn rests(rig: &Rig) -> Vec<Value> {
-    rig.flows().into_iter().filter(|r| r["action"] == "dispatch.rest").collect()
+    rests_in(&rig.flows())
+}
+
+fn rests_in(flows: &[Value]) -> Vec<Value> {
+    flows.iter().filter(|r| r["action"] == "dispatch.rest").cloned().collect()
+}
+
+/// Whether a `dispatch.rest` record's payload has `key` == `value`.
+fn rested_with(flows: &[Value], key: &str, value: &str) -> bool {
+    rests_in(flows).iter().any(|r| payload(r)[key] == value)
 }
 
 #[test]
@@ -1881,8 +2051,9 @@ fn a_serious_machine_pauses_the_run_and_resumes_it_when_nominal() {
     rig.env().set("DARKMUX_THERMAL_RESUME_HOLD_MS", "1");
     scenario(&mut rig, "{\"hold_ms\": 2500, \"thermal\": {\"state\": \"serious\"}}\n{\"hold_ms\": 600000, \"thermal\": {\"state\": \"nominal\"}}\n");
     rig.container(ONE_TURN, ENVELOPE, "", 0);
-    rig.fake("run-script", "sleep 7\n");
+    let watcher = rig.hold_open_until(|flows| rested_with(flows, "state", "nominal"));
     let (res, _) = run(&rig, rig.opts());
+    watcher.join().unwrap();
     let out = res.unwrap().out_dir.unwrap();
     let r: Vec<(String, String, bool)> = rests(&rig)
         .iter()
@@ -1905,8 +2076,9 @@ fn a_fair_machine_enters_the_duty_cycle_and_leaves_it_when_nominal() {
     rig.env().set("DARKMUX_THERMAL_RESUME_HOLD_MS", "1");
     scenario(&mut rig, "{\"hold_ms\": 2500, \"thermal\": {\"state\": \"fair\"}}\n{\"hold_ms\": 600000, \"thermal\": {\"state\": \"nominal\"}}\n");
     rig.container(ONE_TURN, ENVELOPE, "", 0);
-    rig.fake("run-script", "sleep 7\n");
+    let watcher = rig.hold_open_until(|flows| rested_with(flows, "state", "nominal"));
     let (res, _) = run(&rig, rig.opts());
+    watcher.join().unwrap();
     res.unwrap();
     let r: Vec<Value> = rests(&rig).iter().map(|r| payload(r).clone()).collect();
     assert_eq!(r.len(), 2, "{r:?}");
@@ -2202,8 +2374,9 @@ fn a_pause_held_past_its_limit_trips_the_breaker_without_an_eject() {
     rig.env().set("DARKMUX_THERMAL_MAX_PAUSE_MS", "1");
     scenario(&mut rig, r#"{"hold_ms": 600000, "thermal": {"state": "serious"}}"#);
     rig.container(ONE_TURN, ENVELOPE, "", 0);
-    rig.fake("run-script", "sleep 5\n");
+    let watcher = rig.hold_open_until(|flows| rested_with(flows, "reason", "thermal-critical"));
     let (res, _) = run(&rig, rig.opts());
+    watcher.join().unwrap();
     res.unwrap();
     let r: Vec<(String, String, bool)> = rests(&rig)
         .iter()
@@ -2239,8 +2412,9 @@ fn a_one_ms_machine_interval_stamps_the_previous_writes_cost_on_the_next_sample(
     let mut rig = Rig::new();
     rig.env().set("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "1");
     rig.container(ONE_TURN, ENVELOPE, "", 0);
-    rig.fake("run-script", "sleep 3\n");
+    let watcher = rig.hold_open_until(|flows| flows.iter().filter(|r| r["action"] == "machine.telemetry").count() >= 2);
     let (res, _) = run(&rig, rig.opts());
+    watcher.join().unwrap();
     res.unwrap();
     let curve: Vec<Value> = rig.flows().into_iter().filter(|r| r["action"] == "machine.telemetry").map(|r| payload(&r).clone()).collect();
     assert!(curve.len() >= 2, "{curve:?}");
@@ -2277,8 +2451,18 @@ fn a_sampler_lock_released_mid_run_is_taken_over() {
     )
     .unwrap();
     rig.container(ONE_TURN, ENVELOPE, "", 0);
-    rig.fake("run-script", format!("sleep 1\nrm -f '{}'\nsleep 5\n", lock.display()));
+    // Released once, after a first tick is recorded, so the sampler started
+    // while it was held.
+    let mut released = false;
+    let watcher = rig.hold_open_until(move |flows| {
+        if !released && !lms_events(flows).is_empty() {
+            fs::remove_file(&lock).unwrap();
+            released = true;
+        }
+        flows.iter().any(|r| r["action"] == "machine.telemetry")
+    });
     let (res, _) = run(&rig, rig.opts());
+    watcher.join().unwrap();
     res.unwrap();
     assert!(rig.actions().contains(&"machine.telemetry".to_string()), "{:?}", rig.actions());
 }

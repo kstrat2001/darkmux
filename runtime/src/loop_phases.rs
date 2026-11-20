@@ -135,6 +135,7 @@ impl<'a> AgentLoop<'a> {
                 is_reasoning: hb.is_reasoning,
                 carries_own_opener: hb.carries_own_opener,
                 prefill_at: messages.len().checked_sub(1),
+                superseded: false,
             },
             None => TurnAccum::default(),
         };
@@ -2478,14 +2479,9 @@ impl<'a> AgentLoop<'a> {
         // tool turn; this is the only place it is read.
         self.compaction_repeat.compacted();
         if reread_loop_escalates(self.compaction_repeat.consecutive()) {
-            announce_reread_loop(
-                self.trajectory,
-                self.state.turns,
-                self.compaction_repeat.consecutive(),
-                self.model,
-                self.state.latest_prompt_tokens,
-            );
-            return Some(self.finish(None, TerminalReason::EscalationTriggered(EscalationReason::CompactionRereadLoop)));
+            announce_reread_loop(self.compaction_repeat.consecutive());
+            let final_answer = self.turn.pending_answer();
+            return Some(self.escalate(EscalationReason::CompactionRereadLoop, final_answer));
         }
         // (#854) The thread just shrank, so the next report should
         // move again — restart staleness tracking so a fresh freeze
@@ -2539,13 +2535,14 @@ impl<'a> AgentLoop<'a> {
         //
         // This is a GRACEFUL terminal, not a kill: the same
         // `EscalationTriggered` shape `bail_after_compactions`
-        // uses, carrying every banked turn and the partial
-        // answer out through `LoopOutcome` for the
-        // `darkmux-escalation-handler` hand-off. The
+        // uses, carrying the thread and the turn's pending
+        // answer (`pending_answer`) out through `LoopOutcome`
+        // for the `darkmux-escalation-handler` hand-off. The
         // difference from that bound is that it does not
         // require the operator to have predicted this
         // failure and set a number in advance.
-        self.escalate(EscalationReason::CompactionUnproductive, None)
+        let final_answer = self.turn.pending_answer();
+        self.escalate(EscalationReason::CompactionUnproductive, final_answer)
     }
 
     // ─── the length arm ──────────────────────────────────────────────────

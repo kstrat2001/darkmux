@@ -2619,6 +2619,14 @@ impl DebriefPhase {
     }
 }
 
+/// The debrief's description line: the mission description's first line,
+/// escaped (`escape_text`), or nothing when it is blank. A description can
+/// come from a ticket or a routed request, not only the operator.
+fn debrief_description_line(description: &str) -> Option<String> {
+    let desc = description.lines().next().unwrap_or("").trim();
+    (!desc.is_empty()).then(|| format!("  {}", darkmux_types::user_files::escape_text(desc)))
+}
+
 /// Print a bullet list, or a dim "(none)" when empty — the debrief's
 /// section renderer. The collected strings are already bullet-formatted
 /// (`- …`) by the caution / correction collectors.
@@ -2627,17 +2635,25 @@ fn print_bullets_or_none(items: &[String]) {
         println!("  {}", style::dim("(none)"));
         return;
     }
+    for line in bullet_lines(items) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_bullets_or_none`] prints for `items`. A correction is
+/// the reviewer's own words, so each line is escaped (`escape_text`): an
+/// escape sequence in it is shown, never acted on.
+fn bullet_lines(items: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
     for it in items {
         for (i, line) in it.lines().enumerate() {
             // First line carries the collector's own `- ` bullet; indent it
             // two spaces. Continuation lines indent under the bullet.
-            if i == 0 {
-                println!("  {line}");
-            } else {
-                println!("    {line}");
-            }
+            let indent = if i == 0 { "  " } else { "    " };
+            out.push(format!("{indent}{}", darkmux_types::user_files::escape_text(line)));
         }
     }
+    out
 }
 
 /// The mission a debrief is about.
@@ -2795,9 +2811,8 @@ pub fn debrief(mission_id: &str, json: bool) -> Result<i32> {
         "{}",
         style::header(&format!("debrief: mission `{}`", report.mission.id))
     );
-    let desc = report.mission.description.lines().next().unwrap_or("").trim();
-    if !desc.is_empty() {
-        println!("  {desc}");
+    if let Some(line) = debrief_description_line(&report.mission.description) {
+        println!("{line}");
     }
     println!();
 
@@ -3114,13 +3129,20 @@ fn print_review_summary(review: &crate::phase_review::PhaseReviewOutput) {
         review.by_severity.nit,
     );
     for f in &review.findings {
-        let marker = match f.severity.as_str() {
-            "BLOCK" | "block" => style::error("✗ BLOCK"),
-            "FLAG" | "flag" => style::warn("⚠ FLAG"),
-            _ => style::dim("· nit"),
-        };
-        println!("    {} {}", marker, f.text);
+        println!("{}", review_finding_line(f));
     }
+}
+
+/// One finding of the QA review: its severity marker and the reviewer
+/// model's own text, escaped (`escape_text`) so an escape sequence in it is
+/// shown and never acted on.
+fn review_finding_line(f: &crate::phase_review::ReviewFinding) -> String {
+    let marker = match f.severity.as_str() {
+        "BLOCK" | "block" => style::error("✗ BLOCK"),
+        "FLAG" | "flag" => style::warn("⚠ FLAG"),
+        _ => style::dim("· nit"),
+    };
+    format!("    {} {}", marker, darkmux_types::user_files::escape_text(&f.text))
 }
 
 #[cfg(test)]

@@ -707,11 +707,27 @@ fn machine_telemetry_effective_interval_ms(
     }
 }
 
-pub(crate) fn spawn(
+/// The production host reading: a [`HostProbe`] built on the sampler thread
+/// (see [`spawn`]), sampled once per tick.
+pub(crate) fn real_probe() -> impl FnMut() -> HostSampleFull {
+    let mut probe = HostProbe::new();
+    move || probe.sample()
+}
+
+/// `source` runs once, on the sampler thread, and returns what each tick
+/// calls for its reading: [`real_probe`] in production, a fake in a test, so
+/// a test's cadence and record assertions never hinge on how long this
+/// host takes to read itself (#3621).
+pub(crate) fn spawn<F, S>(
     interval_ms: u64,
     ring: HostSamplerRing,
     stop_flag: Arc<AtomicBool>,
-) -> Option<std::thread::JoinHandle<()>> {
+    source: F,
+) -> Option<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() -> S + Send + 'static,
+    S: FnMut() -> HostSampleFull,
+{
     if interval_ms == 0 {
         return None;
     }
@@ -721,7 +737,7 @@ pub(crate) fn spawn(
     ring.configured_interval_ms.store(interval_ms, Ordering::Relaxed);
     let interval = Duration::from_millis(interval_ms);
     Some(std::thread::spawn(move || {
-        let mut probe = HostProbe::new();
+        let mut sample_host = source();
         // (#2111) The known thermal state carried between ticks for
         // `thermal_edge`'s edge detection — see that function's own doc.
         let mut known_thermal_state: Option<String> = None;
@@ -777,7 +793,7 @@ pub(crate) fn spawn(
                 break;
             }
 
-            let sample = probe.sample();
+            let sample = sample_host();
             // (#2111 review finding) The shared epoch-ms read — the same
             // one the machine-scoped telemetry record below (and a
             // dispatch process's own sampler) uses for `sampled_at_ms`, so
@@ -1437,7 +1453,7 @@ mod tests {
     fn interval_zero_disables_the_sampler_no_thread_spawned() {
         let ring = HostSamplerRing::new();
         let stop = Arc::new(AtomicBool::new(false));
-        let handle = spawn(0, ring.clone(), stop);
+        let handle = spawn(0, ring.clone(), stop, test_source);
         assert!(handle.is_none(), "0ms interval must not spawn a thread");
         assert!(ring.snapshot_json().is_none(), "and the ring stays empty");
     }
@@ -1460,12 +1476,11 @@ mod tests {
         let ring = HostSamplerRing::new();
         let stop = Arc::new(AtomicBool::new(false));
         // A tight interval so the test doesn't wait long for a sample to land.
-        let handle = spawn(50, ring.clone(), Arc::clone(&stop));
+        let handle = spawn(50, ring.clone(), Arc::clone(&stop), test_source);
         assert!(handle.is_some(), "non-zero interval spawns a thread");
 
-        // Wait (bounded) for at least one sample. The bound allows for the
-        // probe's one-time construction cost (~100ms on macOS).
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Wait for at least one sample; the deadline is only a hang guard.
+        let deadline = Instant::now() + HANG_GUARD;
         while ring.snapshot_json().is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1482,6 +1497,17 @@ mod tests {
     }
 
     // ─── (#2413) spawn() — the singleton machine.telemetry emitter ─────
+
+    /// How long a test waits for the sampler before calling it hung: never
+    /// the thing a test measures.
+    const HANG_GUARD: Duration = Duration::from_secs(60);
+
+    /// The tests' host reading: instant and empty, so no test here waits on
+    /// how long this machine takes to read itself (#3621). A test about the
+    /// probe's own readings lives with the probe.
+    fn test_source() -> impl FnMut() -> HostSampleFull {
+        HostSampleFull::default
+    }
 
     /// Isolate `DARKMUX_HOME` (the lock path) and `DARKMUX_FLOWS_DIR` (where
     /// records land) to fresh tempdirs for the duration of `f`, restoring
@@ -1591,9 +1617,9 @@ mod tests {
         with_isolated_env(|flows_dir| {
             let ring = HostSamplerRing::new();
             let stop = Arc::new(AtomicBool::new(false));
-            let handle = spawn(50, ring.clone(), Arc::clone(&stop)).unwrap();
+            let handle = spawn(50, ring.clone(), Arc::clone(&stop), test_source).unwrap();
 
-            let rec = wait_for_machine_telemetry_record(flows_dir, Duration::from_secs(10));
+            let rec = wait_for_machine_telemetry_record(flows_dir, HANG_GUARD);
 
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap();
@@ -1619,28 +1645,28 @@ mod tests {
     #[test]
     fn spawn_emits_at_10x_the_base_interval_while_idle() {
         with_isolated_env(|flows_dir| {
-            // Nothing live on this machine — `any_dispatch_live_locally`
-            // must read false, so emissions land at 10x the base 50ms
-            // cadence (every ~500ms). (#2413 round 4 MF1) The FIRST
-            // emission has no prior emission to measure a gap against, so
-            // it stamps the CONFIGURED cadence (500 = 50 * 10x); the
-            // SECOND stamps the MEASURED gap since the first — which,
-            // running for real on a real clock, lands close to but not
-            // necessarily bit-identical to 500, so this asserts it's in a
-            // generous neighborhood rather than exact-equal (a flaky
-            // scheduler pause must not fail this test).
+            // Nothing live on this machine: `any_dispatch_live_locally`
+            // reads false, so an emission lands every 10th tick. (#2413
+            // round 4 MF1) The FIRST emission has no prior emission to
+            // measure a gap against, so it stamps the CONFIGURED cadence
+            // (500 = 50 * 10x); the SECOND stamps the MEASURED gap since the
+            // first. (#3621) Both claims are read in the sampler's own ticks
+            // and stamps, never against the wall clock, so a slow reading
+            // cannot fail them; the deadline is only a hang guard.
             let ring = HostSamplerRing::new();
             let stop = Arc::new(AtomicBool::new(false));
-            let handle = spawn(50, ring.clone(), Arc::clone(&stop)).unwrap();
-            let recs = wait_for_n_machine_telemetry_records(flows_dir, 2, Duration::from_secs(10));
+            let handle = spawn(50, ring.clone(), Arc::clone(&stop), test_source).unwrap();
+            let recs = wait_for_n_machine_telemetry_records(flows_dir, 2, HANG_GUARD);
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap();
             assert_eq!(recs[0]["payload"]["interval_ms"], 500, "first emission stamps the configured 10x cadence");
-            let second = recs[1]["payload"]["interval_ms"].as_u64().expect("interval_ms is a number");
-            assert!(
-                (400..=2000).contains(&second),
-                "second emission must stamp the MEASURED gap, in the neighborhood of 500ms: got {second}"
+            let (first, second) = (sampled_at(&recs[0]), sampled_at(&recs[1]));
+            assert_eq!(
+                recs[1]["payload"]["interval_ms"].as_u64(),
+                Some(second - first),
+                "second emission stamps the MEASURED gap since the first"
             );
+            assert_eq!(ticks_between(&ring, first, second), IDLE_EMIT_MULTIPLIER as usize, "idle emits every 10th tick");
         });
     }
 
@@ -1667,20 +1693,22 @@ mod tests {
 
             let ring = HostSamplerRing::new();
             let stop = Arc::new(AtomicBool::new(false));
-            let handle = spawn(50, ring.clone(), Arc::clone(&stop)).unwrap();
+            let handle = spawn(50, ring.clone(), Arc::clone(&stop), test_source).unwrap();
             // (#2413 round 4 MF1) First emission stamps the CONFIGURED 1x
             // cadence (no prior gap to measure); the second stamps the
-            // MEASURED gap, which on a real clock lands close to but not
-            // necessarily bit-identical to 50ms.
-            let recs = wait_for_n_machine_telemetry_records(flows_dir, 2, Duration::from_secs(10));
+            // MEASURED gap. (#3621) Read in ticks and stamps, not wall
+            // clock; the deadline is only a hang guard.
+            let recs = wait_for_n_machine_telemetry_records(flows_dir, 2, HANG_GUARD);
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap();
             assert_eq!(recs[0]["payload"]["interval_ms"], 50, "first emission stamps the configured 1x cadence");
-            let second = recs[1]["payload"]["interval_ms"].as_u64().expect("interval_ms is a number");
-            assert!(
-                (20..=500).contains(&second),
-                "second emission must stamp the MEASURED gap, in the neighborhood of 50ms: got {second}"
+            let (first, second) = (sampled_at(&recs[0]), sampled_at(&recs[1]));
+            assert_eq!(
+                recs[1]["payload"]["interval_ms"].as_u64(),
+                Some(second - first),
+                "second emission stamps the MEASURED gap since the first"
             );
+            assert_eq!(ticks_between(&ring, first, second), 1, "a live dispatch emits every tick");
         });
     }
 
@@ -1696,17 +1724,16 @@ mod tests {
             let ring = HostSamplerRing::new();
             let stop = Arc::new(AtomicBool::new(false));
             let interval_ms = 50u64;
-            let handle = spawn(interval_ms, ring.clone(), Arc::clone(&stop)).unwrap();
+            let handle = spawn(interval_ms, ring.clone(), Arc::clone(&stop), test_source).unwrap();
 
             // Let the sampler land its first (idle, 10x-cadence) emission —
             // confirms it has settled into steady idle state — before the
-            // dispatch appears.
-            let _first = wait_for_n_machine_telemetry_records(flows_dir, 1, Duration::from_secs(5));
+            // dispatch appears. The deadline is only a hang guard.
+            let _first = wait_for_n_machine_telemetry_records(flows_dir, 1, Duration::from_secs(60));
 
             // A dispatch appears right after.
             let day_path = flows_dir.join(format!("{}.jsonl", darkmux_flow::day_utc_now()));
             let live_start = darkmux_flow::ts_utc_now();
-            let appeared_at = Instant::now();
             {
                 use std::io::Write;
                 let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&day_path).unwrap();
@@ -1721,47 +1748,62 @@ mod tests {
                 )
                 .unwrap();
             }
+            // Stamped once the line is written: a tick before this moment
+            // may not have seen the dispatch yet, so none is counted.
+            let appeared_at_ms = darkmux_crew::host_probe::epoch_ms_now();
 
-            // The next emission after the dispatch appears must land well
-            // under the OLD idle cadence (10x interval = 500ms) — with the
-            // per-tick re-probe it lands within roughly 1-2 ticks.
-            let deadline = Duration::from_secs(5);
-            let poll_start = Instant::now();
-            let mut waited = None;
-            loop {
-                if let Ok(text) = std::fs::read_to_string(&day_path) {
-                    let count = text
-                        .lines()
-                        .filter(|l| {
-                            serde_json::from_str::<serde_json::Value>(l)
-                                .ok()
-                                .and_then(|v| v.get("action").and_then(|a| a.as_str().map(str::to_string)))
-                                .as_deref()
-                                == Some("machine.telemetry")
-                        })
-                        .count();
-                    if count >= 2 {
-                        waited = Some(appeared_at.elapsed());
-                        break;
-                    }
+            // (#2823) The first emission sampled after the dispatch appeared.
+            // How soon it came is counted in the sampler's own TICKS (ring
+            // entries, each stamped on the same clock as the emission), not
+            // in wall-clock time, so a loaded host that slows every tick
+            // cannot fail it, and an observer starved for a while cannot
+            // either. The deadline is only a hang guard.
+            let hang_guard = Instant::now() + Duration::from_secs(60);
+            let emitted_at_ms = loop {
+                let after = emissions_sampled_after(&day_path, appeared_at_ms);
+                if let Some(&at) = after.first() {
+                    break at;
                 }
-                if poll_start.elapsed() > deadline {
-                    break;
-                }
+                assert!(Instant::now() < hang_guard, "no emission landed after the dispatch appeared");
                 std::thread::sleep(Duration::from_millis(5));
-            }
+            };
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap();
 
-            let waited = waited.expect("a second emission landed after the dispatch appeared");
-            // Generous slack for scheduler jitter, but well short of the
-            // pre-fix ~500ms (10x interval) an idle-cadence wait would take.
+            let ticks = ring.inner.lock().unwrap().iter().filter(|e| e.at_ms > appeared_at_ms && e.at_ms <= emitted_at_ms).count();
+            // Re-probed every tick, the first tick to start after the
+            // dispatch appeared emits. Probed only before an idle emission
+            // (the pre-fix scheme), it would wait out up to
+            // `IDLE_EMIT_MULTIPLIER` ticks.
             assert!(
-                waited <= Duration::from_millis(interval_ms * 6),
-                "expected the next emission within a few intervals of the dispatch appearing \
-                 (pre-fix this would wait out the whole idle 10x window, ~500ms), took {waited:?}"
+                ticks <= 2,
+                "expected the next emission within a couple of ticks of the dispatch appearing \
+                 (an idle-cadence wait takes up to {IDLE_EMIT_MULTIPLIER}), took {ticks}"
             );
         });
+    }
+
+    /// A `machine.telemetry` record's `sampled_at_ms`.
+    fn sampled_at(rec: &serde_json::Value) -> u64 {
+        rec["payload"]["sampled_at_ms"].as_u64().expect("sampled_at_ms is a number")
+    }
+
+    /// Ring entries (one per tick, stamped on the emission's clock) taken
+    /// after `after_ms` and at or before `upto_ms`.
+    fn ticks_between(ring: &HostSamplerRing, after_ms: u64, upto_ms: u64) -> usize {
+        ring.inner.lock().unwrap().iter().filter(|e| e.at_ms > after_ms && e.at_ms <= upto_ms).count()
+    }
+
+    /// The `sampled_at_ms` of each `machine.telemetry` record in `day_path`
+    /// sampled after `after_ms`, in file order.
+    fn emissions_sampled_after(day_path: &std::path::Path, after_ms: u64) -> Vec<u64> {
+        let text = std::fs::read_to_string(day_path).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["action"] == "machine.telemetry")
+            .filter_map(|v| v["payload"]["sampled_at_ms"].as_u64())
+            .filter(|&at| at > after_ms)
+            .collect()
     }
 
     #[serial_test::serial]
@@ -1789,16 +1831,18 @@ mod tests {
 
             let ring = HostSamplerRing::new();
             let stop = Arc::new(AtomicBool::new(false));
-            let handle = spawn(50, ring.clone(), Arc::clone(&stop)).unwrap();
+            let handle = spawn(50, ring.clone(), Arc::clone(&stop), test_source).unwrap();
 
-            // Give the sampler well past the IDLE emission threshold
-            // (`IDLE_EMIT_MULTIPLIER` x the 50ms base interval = 500ms
-            // nominal — measured in practice as needing real headroom:
-            // each tick's own work pushes real per-tick wall-clock
-            // noticeably above the nominal 50ms, so far fewer than the
-            // nominal 10 ticks land in a short sleep). 3s is comfortably
-            // past the threshold either way, and still fast enough not to
-            // slow the suite.
+            // (#2786) The window is counted in TICKS, not wall-clock: the
+            // test waits until the sampler has finished
+            // `IDLE_EMIT_MULTIPLIER` ticks (each tick pushes one ring entry
+            // after its emit decision), the point by which a sampler that
+            // held the lock would have emitted. A fixed 3s sleep made both
+            // claims below hostage to scheduling: with ~10 sibling samplers
+            // starving the probe, no tick landed in the window, so the ring
+            // was empty (failing every first try under a full-crate run)
+            // and the no-emission check passed without the threshold ever
+            // being reached. The deadline is only a hang guard.
             //
             // (#2475) A real dispatch holder keeps this lock fresh by
             // heartbeating every tick. An earlier round of this fixture
@@ -1828,7 +1872,7 @@ mod tests {
             //
             //   * Freshness is STRUCTURAL, not maintained. The declared
             //     interval is 60s, so this holder's own staleness threshold
-            //     (3x = 180s) outlives the 3s window by 60x with no
+            //     (3x = 180s) outlives the ten 50ms ticks waited for with no
             //     refreshing whatsoever — which is what the `other_pid`
             //     comment above already said before the refresh loop was
             //     layered on top of it.
@@ -1843,7 +1887,11 @@ mod tests {
             // detect.
             let lock_path_at_acquire = darkmux_types::config_access::host_sampler_lock_path();
             let home_at_acquire = std::env::var("DARKMUX_HOME").ok();
-            std::thread::sleep(Duration::from_millis(3000));
+            let ticks = || ring.inner.lock().unwrap().len();
+            let hang_guard = Instant::now() + Duration::from_secs(60);
+            while ticks() < IDLE_EMIT_MULTIPLIER as usize && Instant::now() < hang_guard {
+                std::thread::sleep(Duration::from_millis(20));
+            }
 
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap();
@@ -1905,9 +1953,13 @@ mod tests {
                 same_path = darkmux_types::config_access::host_sampler_lock_path() == lock_path_at_acquire,
                 now_home = std::env::var("DARKMUX_HOME").ok(),
             );
-            // Still samples its OWN ring regardless (the ring is
-            // unconditional, per the issue's own rule).
-            assert!(ring.snapshot_json().is_some(), "the ring keeps sampling regardless of who holds the lock");
+            // The ring samples regardless of who holds the lock: every one
+            // of the ticks above pushed an entry while the lock was held.
+            assert!(
+                ticks() >= IDLE_EMIT_MULTIPLIER as usize,
+                "the ring keeps sampling regardless of who holds the lock: {} ticks in 60 s",
+                ticks()
+            );
         });
     }
 

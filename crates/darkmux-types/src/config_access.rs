@@ -223,7 +223,8 @@ fn pick_string(env_key: &str, cfg: Option<&str>, default: Option<&str>) -> Optio
 }
 
 /// Precedence for a parseable (numeric) setting. A set-but-unparseable env
-/// var falls through (matching today's `.parse().ok()` sites).
+/// var falls through here; every preflight refuses it and doctor fails it
+/// (`crate::numeric_env`, which lists every var read through this).
 fn pick_parsed<T: FromStr + Copy>(env_key: &str, cfg: Option<T>, default: Option<T>) -> Option<T> {
     env_str(env_key)
         .and_then(|s| s.parse::<T>().ok())
@@ -457,6 +458,10 @@ pub fn fleet_listener_enabled_with_source() -> (bool, Source) {
         None => (false, Source::BuiltIn),
     }
 }
+
+/// The port `darkmux client serve` listens on (loopback) and publishes on
+/// the overlay network when `--port` names none.
+pub const CLIENT_SERVE_PORT: u16 = 8767;
 
 /// The work-submission port, `env(DARKMUX_FLEET_LISTENER_PORT) >
 /// config.fleet.listener.port > 8766`. A SENDER dials the target's roster
@@ -1814,6 +1819,45 @@ pub fn tests_on_host_with_source() -> (bool, Source) {
     }
 }
 
+/// (#3112) The default `sandbox.memory`: Docker's dispatch limit since the
+/// first container, now every backend's.
+pub const SANDBOX_MEMORY_DEFAULT: &str = "4g";
+
+/// The env var over `sandbox.memory`.
+pub const SANDBOX_MEMORY_ENV: &str = "DARKMUX_SANDBOX_MEMORY";
+
+/// (#3112) The memory every sandbox may hold, as written:
+/// `env(DARKMUX_SANDBOX_MEMORY) > config.sandbox.memory > "4g"`. Every
+/// entry point refuses one that is not a size ([`sandbox_memory_problem`]),
+/// and every backend refuses it again, so it is never read as no limit.
+pub fn sandbox_memory() -> String {
+    sandbox_memory_with_source().0
+}
+/// `sandbox_memory` plus WHICH tier resolved it.
+pub fn sandbox_memory_with_source() -> (String, Source) {
+    let written = config().sandbox.as_ref().and_then(|s| s.memory.as_deref());
+    let (value, source) = pick_string_with_source(SANDBOX_MEMORY_ENV, written, Some(SANDBOX_MEMORY_DEFAULT));
+    (value.unwrap_or_else(|| SANDBOX_MEMORY_DEFAULT.to_string()), source)
+}
+
+/// (#3112) `sandbox.memory` as an operator problem when it is not a
+/// sandbox memory limit: where it was set, why, and the accepted form.
+pub fn sandbox_memory_problem() -> Option<crate::config_enum::InvalidSetting> {
+    let (value, source) = sandbox_memory_with_source();
+    sandbox_memory_problem_of(&value, source)
+}
+/// [`sandbox_memory_problem`] for `value` from `source`.
+pub fn sandbox_memory_problem_of(value: &str, source: Source) -> Option<crate::config_enum::InvalidSetting> {
+    use crate::config_enum::{InvalidSetting, SetIn};
+    let why = crate::size::sandbox_memory_bytes(value).err()?;
+    let set_in = if source == Source::Env { SetIn::Env(SANDBOX_MEMORY_ENV) } else { SetIn::Config("sandbox.memory".to_string()) };
+    Some(InvalidSetting {
+        set_in,
+        problem: why,
+        valid: format!("{} (`darkmux config set sandbox.memory 16g`)", crate::size::SANDBOX_MEMORY_FORM),
+    })
+}
+
 /// (#3275) The operator's override for which user the dispatch container
 /// runs as, unparsed: `env(DARKMUX_CONTAINER_USER) > config.runtime.
 /// container_user > none`. There is no built-in default here: with no
@@ -2885,6 +2929,12 @@ mod location_guard {
         ("machine_id", "this machine's public name, which every viewer reads"),
         ("default_engine", "an engine's name: `lmstudio` or an endpoint id, which viewers read"),
         ("container_user_override", "a numeric user and group id, or `image`"),
+        ("SANDBOX_MEMORY_DEFAULT", "the default memory size, public in the source"),
+        ("SANDBOX_MEMORY_ENV", "an env var's name"),
+        ("sandbox_memory", "a memory size"),
+        ("sandbox_memory_with_source", "a memory size and its tier"),
+        ("sandbox_memory_problem", "a bad memory size, where it was set and the accepted form"),
+        ("sandbox_memory_problem_of", "a bad memory size, where it was set and the accepted form"),
         ("fleet_mode", "an enum value"),
         ("declared_fleet_mode", "an enum value"),
         ("fleet_busy_policy", "an enum value (withheld where printed, as the execution surface)"),
@@ -3991,6 +4041,66 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    // ── sandbox.memory (#3112): env > config > "4g", and a value that is
+    //    not a size of at least 6m refuses every entry point ──
+    #[serial_test::serial]
+    #[test]
+    fn sandbox_memory_env_then_config_then_4g_and_a_bad_value_is_refused() {
+        let k = SANDBOX_MEMORY_ENV;
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+        assert_eq!(sandbox_memory_with_source(), ("4g".to_string(), Source::BuiltIn), "the default");
+        assert!(sandbox_memory_problem().is_none());
+        let with = |memory: &str| DarkmuxConfig {
+            sandbox: Some(crate::config::SandboxConfig { memory: Some(memory.into()), ..Default::default() }),
+            ..Default::default()
+        };
+        let guard = set_config_for_test(with("16g"));
+        assert_eq!(sandbox_memory_with_source(), ("16g".to_string(), Source::Config));
+        unsafe { std::env::set_var(k, "32g") };
+        assert_eq!(sandbox_memory_with_source(), ("32g".to_string(), Source::Env), "env wins live");
+        unsafe { std::env::set_var(k, "lots") };
+        let env_bad = sandbox_memory_problem().expect("`lots` is refused").to_string();
+        assert!(env_bad.contains("DARKMUX_SANDBOX_MEMORY") && env_bad.contains("`lots` is not a size"), "{env_bad}");
+        unsafe { std::env::remove_var(k) };
+        drop(guard);
+        for bad in ["0", "-1g", "lots", "262145g"] {
+            let _guard = set_config_for_test(with(bad));
+            let problem = sandbox_memory_problem().unwrap_or_else(|| panic!("{bad} was accepted")).to_string();
+            assert!(problem.contains("config.json key `sandbox.memory`"), "{problem}");
+            assert!(problem.contains("a whole number followed by k, m or g"), "the accepted form is named: {problem}");
+            assert!(problem.contains("darkmux config set sandbox.memory 16g"), "{problem}");
+        }
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// (#3112) A bad `sandbox.memory` refuses every scope's preflight.
+    #[serial_test::serial]
+    #[test]
+    fn a_bad_sandbox_memory_refuses_every_preflight() {
+        let prev = std::env::var(SANDBOX_MEMORY_ENV).ok();
+        unsafe { std::env::set_var(SANDBOX_MEMORY_ENV, "0") };
+        let refused: Vec<_> = crate::config_enum::Scope::ALL.iter().map(|s| crate::config_enum::preflight(*s)).collect();
+        unsafe { std::env::set_var(SANDBOX_MEMORY_ENV, "8g") };
+        let accepted = crate::config_enum::preflight(crate::config_enum::Scope::Dispatch);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(SANDBOX_MEMORY_ENV, v),
+                None => std::env::remove_var(SANDBOX_MEMORY_ENV),
+            }
+        }
+        for r in &refused {
+            let e = r.as_ref().expect_err("`0` is refused");
+            assert!(e.to_string().contains("DARKMUX_SANDBOX_MEMORY"), "{e}");
+        }
+        assert!(accepted.is_ok(), "{accepted:?}");
     }
 
     // ── container_user (#3275): env > config > none. No default here:

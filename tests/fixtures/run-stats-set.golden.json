@@ -1,7 +1,7 @@
 {
   "runs": [
     {
-      "schema_version": "2.3.0",
+      "schema_version": "2.5.0",
       "run": "run-a",
       "model": "m",
       "result": "stop",
@@ -62,6 +62,7 @@
       },
       "bounds": {},
       "gpu_w_busy": null,
+      "gpu_w_max": null,
       "cpu_w_busy": null,
       "pkg_w_busy": null,
       "gpu_duty_pct": null,
@@ -80,6 +81,9 @@
       "throttled_samples": 0,
       "mem_pct_busy_max": null,
       "telemetry_max_gap_ms": null,
+      "hardware": null,
+      "this_machine": null,
+      "compactor_calls_here": 0,
       "flow_records_in_window": 0,
       "flow_scan": {
         "files_total": 0,
@@ -104,7 +108,7 @@
       }
     },
     {
-      "schema_version": "2.3.0",
+      "schema_version": "2.5.0",
       "run": "run-b",
       "model": "m",
       "result": "stop",
@@ -165,6 +169,7 @@
       },
       "bounds": {},
       "gpu_w_busy": null,
+      "gpu_w_max": null,
       "cpu_w_busy": null,
       "pkg_w_busy": null,
       "gpu_duty_pct": null,
@@ -183,6 +188,9 @@
       "throttled_samples": 0,
       "mem_pct_busy_max": null,
       "telemetry_max_gap_ms": null,
+      "hardware": null,
+      "this_machine": null,
+      "compactor_calls_here": 0,
       "flow_records_in_window": 0,
       "flow_scan": {
         "files_total": 0,
@@ -277,7 +285,7 @@
         [
           "NO-TELEM",
           "NO-FLOW",
-          "OVERLAP"
+          "NO-HW"
         ]
       ],
       [
@@ -285,7 +293,7 @@
         [
           "NO-TELEM",
           "NO-FLOW",
-          "OVERLAP"
+          "NO-HW"
         ]
       ]
     ]
@@ -295,7 +303,7 @@
   "baseline": {
     "runs": [
       {
-        "schema_version": "2.3.0",
+        "schema_version": "2.5.0",
         "run": "run-b",
         "model": "m",
         "result": "stop",
@@ -356,6 +364,7 @@
         },
         "bounds": {},
         "gpu_w_busy": null,
+        "gpu_w_max": null,
         "cpu_w_busy": null,
         "pkg_w_busy": null,
         "gpu_duty_pct": null,
@@ -374,6 +383,9 @@
         "throttled_samples": 0,
         "mem_pct_busy_max": null,
         "telemetry_max_gap_ms": null,
+        "hardware": null,
+        "this_machine": null,
+        "compactor_calls_here": 0,
         "flow_records_in_window": 0,
         "flow_scan": {
           "files_total": 0,
@@ -467,7 +479,8 @@
           "run-b",
           [
             "NO-TELEM",
-            "NO-FLOW"
+            "NO-FLOW",
+            "NO-HW"
           ]
         ]
       ]

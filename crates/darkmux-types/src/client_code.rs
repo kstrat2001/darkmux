@@ -70,6 +70,7 @@ pub enum ClientCode {
     /// `client serve` restarted. Ask the app for a new preview link.
     NoPreviewSession,
     UnsupportedMediaType,
+    /// A body, query or path the route cannot take as sent.
     BadRequest,
     PayloadTooLarge,
     /// No such route, id or workspace.

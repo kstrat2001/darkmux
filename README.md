@@ -31,7 +31,7 @@ Local seats run on [LMStudio](https://lmstudio.ai/) (one downloaded model minimu
 darkmux profile scan                  # match your downloaded models into profiles
 darkmux lab characterize              # "QA my Mac": smoke workload in, verdict out
 darkmux dispatch coder "add a smoke test for src/lib.rs"
-darkmux mission launch review         # your working-tree diff, reviewed by a local crew
+darkmux radio "review this branch"    # its committed changes, reviewed by a local crew (asks first)
 darkmux serve                         # live fleet view at http://localhost:8765
 ```
 
@@ -46,7 +46,7 @@ Every mission runs as a live task graph you can watch from any device on your ta
 - 🔍 **PR review by local models.** `mission launch review` bundles the change, fans probe seats across it, double-confirms every finding with an independent judge, and posts an anchored review. darkmux [reviews its own PRs in public](.github/workflows/darkmux-review.yml) this way.
 - 🧪 **The lab.** `darkmux lab run <workload>` captures wall clock, trajectory, and verify outcome on *your* hardware: baseline, change one knob, measure again. The [published findings](https://darklyenergized.substack.com) are re-runnable claims, not anecdotes.
 - 📊 **A fleet you can see.** One live view across every machine: what's loaded, what's running, and how many tokens each endpoint and model used. Phone-ready over your tailnet.
-- 🔒 **Provenance by default.** Every dispatch emits a structured record (machine, model, role, mission). Opt-in BLAKE3 hash-chained audit log with edit detection, cron-friendly (`flow integrity-check` exits 2 on a chain break).
+- 🔒 **Provenance by default.** Every dispatch emits a structured record (machine, model, role, mission). Opt-in BLAKE3 hash-chained audit log with edit detection, cron-friendly (`flow integrity-check` exits 2 on a chain break, 3 when the trail is incomplete).
 - 🖥️ **Editor-embedded**: darkmux as a Zed agent over ACP: `/mission launch review` from the panel, sign-off dialogs in the editor, and RADIO, the free-text voice on the console.
 
 ## What darkmux is for

@@ -3079,7 +3079,7 @@ mod tests {
             Path("role-list".to_string()),
             axum::extract::RawQuery(None),
             Query(HashMap::new()),
-            Some(axum::extract::ConnectInfo(peer.parse().unwrap())),
+            Some(axum::extract::ConnectInfo(crate::local_peer::operator(peer.parse().unwrap()))),
             headers,
             State(state),
         )
@@ -3099,6 +3099,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn the_handler_filters_a_remote_caller_and_leaves_this_machine_alone() {
+        darkmux_types::run_in_own_process!();
         let remote = served_to("100.64.1.2:50000", "localhost:8765").await;
         let all = format!("{}{}", remote.ansi_text, remote.stderr_tail);
         assert!(!all.contains("tailnet.example") && !all.contains("/Users/"), "{all}");
@@ -3177,7 +3178,7 @@ mod tests {
                 Path("role-list".to_string()),
                 axum::extract::RawQuery(None),
                 Query(HashMap::new()),
-                Some(axum::extract::ConnectInfo(peer.parse().unwrap())),
+                Some(axum::extract::ConnectInfo(crate::local_peer::operator(peer.parse().unwrap()))),
                 headers,
                 State(state.clone()),
             )
@@ -3220,7 +3221,7 @@ mod tests {
                 Path("role-list".to_string()),
                 axum::extract::RawQuery(Some(format!("cols={cols}"))),
                 Query(params),
-                Some(axum::extract::ConnectInfo("127.0.0.1:50000".parse().unwrap())),
+                Some(axum::extract::ConnectInfo(crate::local_peer::operator("127.0.0.1:50000".parse().unwrap()))),
                 headers,
                 State(state.clone()),
             )
@@ -3243,7 +3244,7 @@ mod tests {
             Path(id.to_string()),
             axum::extract::RawQuery(Some(format!("cols={cols}"))),
             Query(params),
-            Some(axum::extract::ConnectInfo(peer.parse().unwrap())),
+            Some(axum::extract::ConnectInfo(crate::local_peer::operator(peer.parse().unwrap()))),
             headers,
             State(state.clone()),
         )
@@ -3359,7 +3360,7 @@ mod tests {
                 Path("doctor".to_string()),
                 axum::extract::RawQuery(None),
                 Query(HashMap::new()),
-                Some(axum::extract::ConnectInfo(peer.parse().unwrap())),
+                Some(axum::extract::ConnectInfo(crate::local_peer::operator(peer.parse().unwrap()))),
                 headers,
                 State(state.clone()),
             )
@@ -3424,7 +3425,7 @@ mod tests {
                 Path(id.to_string()),
                 axum::extract::RawQuery(None),
                 Query(HashMap::new()),
-                Some(axum::extract::ConnectInfo(peer.parse().unwrap())),
+                Some(axum::extract::ConnectInfo(crate::local_peer::operator(peer.parse().unwrap()))),
                 headers,
                 State(state),
             )
@@ -3479,6 +3480,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_remote_caller_never_reads_a_location_rotated_inside_the_cache_ttl() {
+        darkmux_types::run_in_own_process!();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("dm");
         std::fs::create_dir_all(&root).unwrap();

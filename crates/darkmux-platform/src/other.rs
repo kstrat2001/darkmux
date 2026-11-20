@@ -55,12 +55,8 @@ impl Platform for OtherPlatform {
         Vec::new()
     }
 
-    fn package_power_mw(&self) -> Option<f64> {
-        None
-    }
-
-    fn board_sensors(&self) -> Option<crate::BoardSensors> {
-        None
+    fn board_readings(&self) -> crate::BoardReadings {
+        crate::BoardReadings::default()
     }
 
     fn reclaimable_memory_bytes(&self) -> Option<u64> {
@@ -100,6 +96,11 @@ impl Platform for OtherPlatform {
         None
     }
 
+    /// No limit darkmux knows of, which is how it treated every OS before.
+    fn exec_env_limits(&self) -> crate::ExecEnvLimits {
+        crate::ExecEnvLimits::default()
+    }
+
     fn node_release_platform(&self) -> Option<&'static str> {
         None
     }
@@ -124,11 +125,23 @@ impl Platform for OtherPlatform {
         None
     }
 
+    fn tcp_listening_ports(&self) -> Option<Vec<u16>> {
+        None
+    }
+
     fn tcp_listeners_held_by(&self, _leader: u32) -> Option<Vec<(u16, crate::PortListener)>> {
         None
     }
 
     fn process_group(&self, _pid: u32) -> Option<u32> {
+        None
+    }
+
+    fn in_sandbox_of(&self, _pid: u32, _leaders: &[u32]) -> Option<bool> {
+        None
+    }
+
+    fn process_name(&self, _pid: u32) -> Option<String> {
         None
     }
 

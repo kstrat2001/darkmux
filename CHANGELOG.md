@@ -16,6 +16,41 @@ darkmux release.
 
 ### Added
 
+- **Seatbelt sandboxes are held to a process and a memory limit, and the memory limit is a setting
+  (#3112).** New setting `sandbox.memory` (CONFIG 2.11, `DARKMUX_SANDBOX_MEMORY`; Docker's size syntax,
+  from `6m` to `262144g`, default `4g`, written by `init`): the memory every sandbox may hold (a dispatch, a
+  contained command, a client preview), under Docker and Seatbelt alike. `darkmux config set
+  sandbox.memory 16g` changes it; a value that is not such a size (`lots`, `0`, a negative) is refused
+  by `config set`, at every entry point's preflight and by doctor's new `sandbox memory` row, which shows
+  the value in effect and where it came from. Docker holds it in the container's cgroup. Seatbelt, which
+  has no kernel memory ceiling on macOS, adds up the sandbox's resident memory once a second and stops
+  it (exit 137) when it is over, its last stderr line saying what it used, the limit and the setting.
+  Seatbelt also holds a sandbox's processes with `RLIMIT_NPROC`: macOS counts that per user, so the
+  sandbox may start about 512 processes beyond what you ran when it started, room it shares with every
+  other process of yours (another sandbox or a parallel build can use it up, and a fork then fails with
+  a bare "Resource temporarily unavailable"). Landlock holds neither. An older darkmux refuses a config
+  carrying `sandbox.memory`.
+- **The runtime's file tools never read past their cap and never wait on a named pipe.** `read` reads
+  at most its 1 MB cap, `search` at most the first 1 MB of each file (naming the files it cut), `edit`
+  and `create_finding` refuse a file over 16 MB unread, and every file tool (and the detector's code
+  hash) refuses a named pipe, socket or device at its one open instead of blocking the dispatch.
+- **Setup finds the engines darkmux can start, adds one on request, and says when none is usable (#3569).**
+  darkmux now looks for installed engines it can run work on: rec's Flint (rec 0.1.0 with a runtime and
+  a pulled revision), Tensorfold (a 1.2.x release that lists a model), LM Studio with a downloaded model,
+  and the default engine's server. It asks each only read-only questions (its version and its model
+  listing) and starts, loads and pulls nothing. `darkmux init` lists the Flint and Tensorfold installs it
+  finds; `darkmux init --add-engine flint` (or `tensorfold`, with `--engine-model` and `--n-ctx` where
+  darkmux cannot fill them in) adds an endpoint and a profile running the model, and writes
+  `profiles.json` only after you confirm on the terminal. A new doctor row, `installed engines`, names an
+  engine found but not configured and the command that adds it (informational: it passes). The client API gains `GET
+  /client/engines` (each engine found, and `usable` when any can run work) and `POST /client/engines`
+  (the add, once the app's user confirms; from an app on the Mac or a device paired over the tailnet,
+  and every add is recorded in the `client serve` log naming the client and where it came from), under the new `engines`
+  capability. Every `profiles.json` write darkmux makes (`init`'s and the add) now goes through one
+  path: a lock all writers share, a compare with what was read, and an atomic replace that keeps a
+  symlinked registry a symlink and refuses one the operator made read-only. darkmux recommends no
+  engine or model: it adds the model the request names (or the engine's only one) at the context named
+  (or the one the engine states).
 - **A Flint dispatch uses rec's own server when it already serves the model (#3574).** When rec's own
   server is up and `rec status` says it is ready, serving the profile model's revision at a context of
   at least its `n_ctx`, on this machine's loopback, and the model declares no `engine_args`, the
@@ -158,12 +193,182 @@ darkmux release.
   `crates/darkmux-serve/client-openapi.golden.json` pins the document, so a route, reply or body that
   changes shows in the diff.
 
+- **Run stats 2.4.0: the highest GPU draw of the run (#3402).** `run stats --json` adds
+  `gpu_w_max`, the highest GPU-rail watts any telemetry sample in the run window read, busy or
+  not. `None`, and listed in `host_unmeasured`, where no sample reads a GPU rail. Additive.
+
+### Changed
+
+- **A `procedural.shell` step gets every dependency's output as a file, and a variable too large for the
+  environment is unset.** Each input is written whole to `$DARKMUX_STEP_INPUTS_DIR/<DEP-ID>`, an
+  owner-only directory removed when the command finishes, whatever its size. An input that fits the
+  environment is still `$DARKMUX_STEP_INPUT_<DEP-ID>`, as before: up to about 120 KiB each on Linux
+  (its per-variable limit) and 768 KiB for all of them on macOS (three quarters of `ARG_MAX`). One past
+  that leaves its variable **unset**, where it used to fail the step's spawn with `Argument list too
+  long`. darkmux says so on stderr, and a step whose command names an unset variable is recorded as
+  degraded, naming the file to read instead, so the run's verdict does not read Clean. Read the file
+  when an input can be large; see the missions guide.
+
 ### Fixed
 
+- **A typo in a hook rule's `match` is refused instead of widening the rule.** A `match` takes its
+  named fields and `payload.<path>` predicates; any other key (`"levle": "error"`) was dropped on load,
+  so a webhook meant for errors fired on every matching action. Every entry point now refuses it at
+  preflight and `darkmux doctor` fails it, naming the key and the closest valid one (`level`, or
+  `payload.ok` for `paylod.ok`). A command that runs no preflight disables that rule in its hooks sink,
+  with one stderr line naming the rule and the key.
+- **A numeric `DARKMUX_*` env var that does not read as its number is refused, not ignored.**
+  `DARKMUX_RUNTIME_MAX_TOKENS=50k` was read as unset (no cap), while the same value in `config.json` is
+  refused. Every command that starts work now refuses it at preflight, every other command warns on
+  stderr, and `darkmux doctor` fails it, naming the
+  variable, what kind of value it holds and the accepted form; the value itself is never printed. The
+  older doctor warnings for `DARKMUX_TURN_DELAY_MS`, `DARKMUX_HOST_SAMPLER_INTERVAL_MS` and
+  `DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL`, which quoted the value, are gone: each bad var gets
+  that one row.
+- **`DARKMUX_VERBOSE=0` turns off `runtime.verbose: true`** for one shell, as env wins over
+  `config.json` for every other setting.
+- **A dispatch's recorded system-prompt hash is the hash of the bytes sent, under every sandbox.**
+  Under `seatbelt` or `landlock` the runtime renamed `/workspace` in the system prompt to the
+  workspace's host path after darkmux had hashed it, so `dispatch.start`'s `system_sha256` named
+  text the model never received. darkmux now writes that path into the system prompt before it
+  hashes it, and the runtime sends the prompt exactly as passed. A container run is unchanged. The
+  model still sees the workspace's true host path under a sandbox on the host, so request bodies
+  there still carry the path (under your home folder), including those sent to a hosted endpoint.
+- **Flow records: lab runs stay off hooks, a failed write is said, and the audit trail's gaps stay
+  visible.** Found by the 2026-11-17 layer review. A hook rule that matched everything delivered a lab
+  run's records off the machine; hooks now drop them by the same rule that keeps them off the fleet hub
+  (contract 3). A flow record that could not be written (a full disk, a read-only volume, a flows dir
+  under a regular file) vanished without a trace when no audit, Redis or hooks sink was set; the local
+  sink now says it on stderr once per day file per process, naming the file and the OS error, and the
+  work still runs. A tee says a failing child once per process instead of once per record. `darkmux
+  doctor` gains `flow records writable`, which fails when the flows dir cannot be written. A dropped
+  audit write is no longer visible only until UTC midnight: doctor's `audit write integrity` and `flow
+  integrity-check` read the `audit.write_failed` breadcrumbs over every day the audit trail covers, and
+  `flow integrity-check --json` gains `dropped_writes` (additive). An audit day file emptied or cut to
+  whitespace now restarts its chain with a restart sidecar and is flagged `chain_restarted` (before the
+  next write too), and doctor warns on a restart even with nothing set aside. **Exit code change:** `flow
+  integrity-check` exits **3** when every chain verifies but the trail is incomplete (a restarted chain
+  or a recorded dropped write); it used to exit 0. A break still exits 2.
+
+- **A loopback caller is this machine only when its process is not sandboxed work (#3645).** The viewer
+  daemon and `darkmux client serve` took any loopback request with a local `Host` and no proxy header for
+  the operator. A process in a sandbox on the host (a Seatbelt or Landlock dispatch's bash, a host-run
+  preview) and a container reaching `host.docker.internal` (Docker Desktop's `com.docker.backend` holds
+  that connection) arrive the same way, so they read every engagement's records and panels unredacted.
+  Each listener now looks up the process holding a loopback connection, once per connection: one in a
+  host sandbox, a container engine's forwarder, or one the lookup cannot find is not this machine. The
+  viewer answers it as a remote reader (redacted, the token required with `serve.read_auth` on) and
+  `client serve` refuses it. The first request on a new loopback connection takes one socket lookup
+  longer (about 75 ms on macOS); a lookup that does not answer within 5 s reads as remote. This is a
+  second line behind the sandbox's own network profile, not a barrier: a sandboxed process that
+  double-forks into a session of its own, or an app the sandbox has the system open, still reads as the
+  operator. **Behavior change:** another OS user's process on the same machine now reads as remote,
+  because the lookup cannot see it.
+
+- **Run stats 2.5.0: a run another machine served no longer reports this machine's power as its own.**
+  A hosted-seat or remote-peer lab run, while this machine's GPU was busy (a parallel local lab run),
+  reported this machine's watts, energy per 1k tokens and thermal states as the run's, and `lab
+  submit` published them in a bundle marked `stack.hardware: "unknown"`. On a host with no GPU
+  utilization reading (Omarchy), a sample taken while the run's model stream was open counts as busy,
+  so it happened on every such run with telemetry. `run stats` now
+  reads which machine served the run's model from the run manifest's `model_hardware` snapshot and
+  adds `hardware` (`submitting-machine`, `unknown`, or `null` when the run did not record it). For
+  `unknown` and for `null`, every host power, energy and thermal figure is `null` (or empty, or 0 for
+  `throttled_samples`), each listed in `host_unmeasured` with the reason, and the new `this_machine`
+  object keeps this machine's own readings over the window (no energy per token: this machine's watts
+  against another machine's tokens measure nothing). **This withholds the host figures of every run
+  that recorded no hardware**: runs from before run manifest 1.3, and runs on an endpoint that declared
+  no `hardware` (set `"hardware"` on the endpoint for later runs). The text view prints "not measured
+  for this run" with the reason, and the set table flags `ELSEWHERE` or `NO-HW`. `lab submit` publishes
+  null for every host detail field of a run whose bundle says `unknown`, including a run `--hardware
+  unknown` corrects, and of a run `run stats` withheld them from. Additive
+  to the `run stats --json` shape; the meaning of the host fields narrows to "the machine that served
+  the run". The submit bundle's shape and format version are unchanged (those fields were already
+  nullable). Both `run stats` and `lab submit` pick the run's snapshot entry by the name the run sent:
+  `darkmux:<id>` is the managed model and a bare name the endpoint's, so a profile listing the same
+  model managed here and on a peer is no longer decided by its order. Several entries a name matches
+  decide when they agree on the machine (one hosted id on two providers, the same managed model listed
+  twice), and decide nothing when they disagree (`run stats` reads `hardware: null`; `lab submit`
+  takes `--hardware` under the same contradiction checks as one entry, and otherwise asks for it). A run
+  from before the snapshot reads the registry by the same rule, and `flint` (the name a managed Flint
+  server always answers to) names the managed Flint model. `run stats` adds `compactor_calls_here` for a
+  run whose figures are withheld: its compactions on a model this machine served, each `compaction.start`
+  counting whether or not a reply followed (`null` when one's model is not placed by the snapshot). In
+  a set, a run whose figures are withheld (`ELSEWHERE` or `NO-HW`) with no compaction here no longer
+  counts as overlapping a local run, and an energy cost withheld because of one says why.
+
+- **A step command's output is bounded, not only its time.** `procedural.shell`, the `mods.gate`
+  `test_command`, lab verify commands and grader suites kept everything a command wrote; a chatty one
+  could fill memory within the 600 s default bound. Each stream now keeps its first 768 KiB and last
+  256 KiB, with a note where the middle was naming the bytes cut, and a shell step whose output was cut
+  is recorded as degraded.
+
+- **Text a model, a peer or an endpoint wrote can no longer drive your terminal.** `mod list` and
+  `mod show` (a kit a local seat wrote through `create_mod`), `finding list` and `finding show`,
+  `run list` (its rows, the `--usage` breakdown and an endpoint's `reported model`), `run show`,
+  `mission show`, the fleet rows of `mission status`, `radio` (the answer, the command it asks you to
+  confirm, and its failure lines), `dispatch`'s human output (the model's reply), the QA review and
+  `mission debrief` lines, `doctor`'s rows, `lab run`, `lab characterize`, `lab tune` and `lab submit`,
+  and the `Error:` line any failing command ends with (an interrupted run's too) all
+  print an escape sequence, a C1 control or a bidirectional override or isolate as text (`\u{1b}`)
+  instead of passing it to the terminal, so none of them can set the window title, clear the screen
+  or write the clipboard. Lines and tabs still read as written, and a column cell is held to its
+  display width. For readable prose, emoji joined with ZWJ and the direction marks Hebrew and Arabic
+  need are kept (a mark or a right-to-left letter can still change how nearby text is laid out).
+  What you approve or must check exactly is shown strictly, so it reads left to right in the order
+  it will run: every default-ignorable character (joiners, marks, variation selectors) and every
+  right-to-left letter or Arabic-Indic digit shows as `\u{..}`. That covers the command `radio` asks
+  you to confirm, the editor's run and sign-off dialogs (now one fenced block, so markdown in a
+  step's output shows as typed), a mission's sign-off prompt, and `init --add-engine`'s question.
+  Invisible tag characters and blank fillers are shown. `--json` output is unchanged. Found by the
+  2026-11-17 layer review.
+
+- **A mission step waiting its turn reads waiting, not running (#3195).** Steps admitted together
+  behind one slot (an endpoint with no `limits.concurrent_calls` runs its calls one at a time), or a
+  local step waiting for its wave's model (a later wave, or its own wave's load), all read running from
+  their `step.start`, each with a timer counting the whole wait. The scheduler now writes
+  `step.queue.wait` on a step's task session when it is queued and `step.queue.resume` when its work
+  starts (none when the run is stopped first: its terminal closes the wait), and the mission graph's
+  step row (`graph.json`, and `mission show --json`) gains `waiting: true` for a step admitted but not
+  yet dispatching, by the rule its task already used; its `status` keeps the scheduler's word. The viewer shows such a step and its task as
+  waiting with no timer, takes a step's start from when its work began, and gives each phase heading
+  its own running total beside the mission's. `FLOW_SCHEMA_VERSION` 2.8.0 -> 2.9.0, additive: a step
+  that started at once writes neither record.
+- **A paired device's long names no longer push the rest of a line off screen (#3626).**
+  Each tailnet user, device and host name that `client serve`'s log, the pairing dialog,
+  `client approve` and `client list` show, and the device name an app sends when it asks to pair,
+  is now cut to 40 display columns at a `…`, keeping its start and end, and is shown on one line
+  with no invisible or blank-looking character. Full-width text, combining marks and emoji are
+  measured by the columns they take, not their bytes, and a cut never splits a flag, a skin tone or
+  a joined emoji.
+- **`lab submit`'s GPU note no longer fires on background GPU use (#3402).** It said a hosted run's
+  GPU "was busy" from utilization alone, so window compositing or video (0.6 W at 60.5% duty in
+  one hosted run) tripped it. It now also needs the busy samples to draw more than 2.5 W on
+  average, and says a this-machine run's GPU "stayed idle" only when no sample drew more than that.
+  The line is measured, not guessed: on an M5 Max, background use reads under 2 W and model
+  generation 5 W and up. Still a note, never a refusal.
+- **`lab submit` takes `--weights-dir` (and `--engine`, `--quant` and the rest) beside a provider's
+  run (#3402).** The flags that describe a model apply to the one model the runs not on a
+  provider's host used; a provider's run takes none of them. Before, a submit with a hosted run
+  and one LM Studio run refused them ("describe one model; these runs used claude-haiku-5-5,
+  qwen/qwen3.8-27b"). A submit of provider runs alone still refuses them, naming each run.
 - **`GET /client/profiles` answers a query it cannot read with the coded `ClientError` (#3494).** A
   repeated `role` was axum's plain-text 400; it is now `{"error": "...", "code": "bad_request"}` like
   every other refusal. `GET /client/recipe` now names a query it cannot read the same way (still
   `bad_request`) instead of asking for `workdir` or `workspace`.
+
+- **A clean preview start answers at once, whatever the size of `node_modules` (#3585).** `POST
+  /client/workspaces/{name}/preview` with `{"clean": true}` deleted the `install.unless_exists` path
+  while the request waited, so a large `node_modules` could outlast the app's request timeout. The
+  path is now moved out of the workspace in one rename, into `.darkmux-moved-aside` in the worktrees
+  base, and deleted in the background; the install never sees part of the old tree. The background
+  delete gives up when `client serve` stops, and what it left is deleted when `client serve` next
+  starts. A clean start is refused while `client serve` stops, as a start is. A tree that cannot be
+  moved there (another filesystem) is deleted in place as before. A moved tree deeper than 128
+  folders no longer refuses the clean start: it stays in `.darkmux-moved-aside` and the serve log
+  says so. darkmux moves into and deletes from that folder only when it made it (a marker file
+  inside), never through a link; a clean start that has to delete in place says why in the serve
+  log.
 
 ## [5.11.0] - 2026-11-14
 

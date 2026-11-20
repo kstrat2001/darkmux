@@ -12,6 +12,30 @@ use std::collections::BTreeMap;
 use std::fs;
 use tempfile::TempDir;
 
+#[path = "e2e/fixture_port.rs"]
+mod fixture_port;
+
+/// (#2898) A port for a daemon this file spawns (`serve`, `client serve`)
+/// to bind. Chosen here and bound by the child a moment later, so it must
+/// not be an OS ephemeral port: in that gap any `bind(0)` or outgoing
+/// connection's source port can take one, and the child then exits with
+/// "Address already in use". From the fleet harness's allocator.
+fn daemon_port() -> u16 {
+    fixture_port::pick_fixture_port().expect("a free fixture port")
+}
+
+#[test]
+fn every_port_handed_to_a_spawned_daemon_is_outside_the_os_ephemeral_range() {
+    let ephemeral = fixture_port::os_ephemeral_range().expect("reading the OS ephemeral port range");
+    for _ in 0..8 {
+        let port = daemon_port();
+        assert!(
+            !ephemeral.contains(&port),
+            "port {port} is in the OS ephemeral range {ephemeral:?}: a bind(0) or an outgoing connection can take it before the daemon binds"
+        );
+    }
+}
+
 // ===== DARKMUX-SPAWN-HELPERS: BEGIN (#2184) ==========================
 //
 // The only place this file names the darkmux binary. Every child process
@@ -504,9 +528,9 @@ fn darkmux_cmd_keeps_a_child_out_of_the_process_home() {
     );
 }
 
-/// Every `.rs` file under `tests/`, recursively. Sorted, so a failure
-/// message is stable run to run.
-fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
+/// Every `.rs` file under `rel` (a path relative to this crate's root),
+/// recursively. Sorted, so a failure message is stable run to run.
+fn rust_sources_under(rel: &str) -> Vec<std::path::PathBuf> {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let entries = fs::read_dir(dir)
             .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
@@ -519,11 +543,16 @@ fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
             }
         }
     }
-    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests"));
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
     let mut out = Vec::new();
-    walk(root, &mut out);
+    walk(&root, &mut out);
     out.sort();
     out
+}
+
+/// Every `.rs` file under `tests/`, recursively.
+fn rust_sources_under_tests() -> Vec<std::path::PathBuf> {
+    rust_sources_under("tests")
 }
 
 /// (#2184/#2710) The structural half of the fix: a source-scanning
@@ -814,6 +843,102 @@ fn every_darkmux_spawn_in_the_tests_dir_goes_through_an_isolating_helper() {
 }
 
 // ===== DARKMUX-SPAWN-HELPERS: END (#2184) ============================
+
+/// The source roots whose tests never get `CARGO_BIN_EXE_darkmux`: the
+/// root crate's `src/` (unit tests), and every workspace crate's
+/// `crates/<name>/src/` and `crates/<name>/tests/` (cargo sets the variable
+/// only for the package that owns the binary, and only in its integration
+/// targets, which are the root `tests/`).
+fn sources_without_the_darkmux_binary() -> Vec<String> {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut roots = vec!["src".to_string()];
+    for entry in fs::read_dir(manifest.join("crates")).expect("reading crates/") {
+        let name = entry.expect("dir entry").file_name().to_string_lossy().to_string();
+        for sub in ["src", "tests"] {
+            if manifest.join("crates").join(&name).join(sub).is_dir() {
+                roots.push(format!("crates/{name}/{sub}"));
+            }
+        }
+    }
+    roots.sort();
+    roots
+}
+
+/// The code lines (comments skipped) of `src` that contain any of `tokens`,
+/// as `rel:line: text`.
+fn code_lines_naming(rel: &str, src: &str, tokens: &[&str]) -> Vec<String> {
+    src.lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim_start().starts_with("//") && tokens.iter().any(|t| l.contains(t)))
+        .map(|(i, l)| format!("  {rel}:{}: {}", i + 1, l.trim()))
+        .collect()
+}
+
+/// (#2513) No test outside the root `tests/` resolves the darkmux binary
+/// through cargo. Cargo sets `CARGO_BIN_EXE_darkmux` only for this
+/// package's integration targets, so a unit test, or a workspace crate's
+/// own test, that asks for it gets `assert_cmd`'s fallback: a lookup of
+/// `target/debug/darkmux` that passes or panics on whether an earlier
+/// build happened to leave that file behind. Such a test drives the code
+/// in process; a test that needs the binary lives under the root `tests/`.
+///
+/// What this text scan does NOT catch, stated rather than discovered:
+/// - A literal path lookup (`target/debug/darkmux`,
+///   `target/release/darkmux`) or a `Command::new("darkmux")` resolved
+///   from `PATH`. Both have the same ambient dependence, but matching them
+///   as text also matches strings that only mention such a path (a
+///   fixture answer in `src/radio_answer.rs` does), so they are not tokens
+///   here. The one known path lookup is the `#[ignore]`d
+///   `fleet_snapshot_cli_end_to_end_matches_a_bare_invocation` in
+///   `crates/darkmux-serve/src/lib_tests.rs`, which skips when the release
+///   binary is missing.
+/// - Only lines whose first characters are `//` are skipped as comments.
+///   A token inside a block comment, after code on the same line, or in a
+///   string literal is reported, so a false positive is possible; reword
+///   or split the token with `concat!` as the constant below does.
+#[test]
+fn no_test_outside_the_root_tests_dir_resolves_the_darkmux_binary() {
+    // Split with `concat!` so these lines do not name the binary
+    // themselves and trip the spawn guard above.
+    const TOKENS: [&str; 2] = [concat!("cargo", "_bin"), concat!("CARGO_BIN_EXE_", "darkmux")];
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let roots = sources_without_the_darkmux_binary();
+    let files: Vec<std::path::PathBuf> = roots.iter().flat_map(|r| rust_sources_under(r)).collect();
+    // Anti-vacuity: the walk must reach the root crate, a workspace crate's
+    // source and a workspace crate's integration tests.
+    for expected in [
+        "src/acp_panel.rs",
+        "crates/darkmux-types/src/test_isolation.rs",
+        "crates/darkmux-crew/tests/mock_dispatch_proof.rs",
+    ] {
+        assert!(files.iter().any(|p| p.ends_with(expected)), "the walk over {roots:?} missed {expected}");
+    }
+    // Positive control: the scan fires on each form it exists to catch, so a
+    // typo in a token cannot switch the guard off.
+    for planted in [
+        concat!("    let mut cmd = Command::", "cargo", "_bin(\"dark", "mux\").unwrap();"),
+        concat!("    let bin = env!(\"CARGO_BIN_EXE_", "darkmux\");"),
+    ] {
+        assert_eq!(code_lines_naming("planted.rs", planted, &TOKENS).len(), 1, "the scan missed: {planted}");
+    }
+    let offenders: Vec<String> = files
+        .iter()
+        .flat_map(|path| {
+            let rel = path.strip_prefix(manifest).unwrap_or(path).display().to_string();
+            let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {rel}: {e}"));
+            code_lines_naming(&rel, &src, &TOKENS)
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "(#2513) {} line(s) outside the root tests/ resolve the darkmux binary. Those tests \
+         never get `{}`, so this passes or fails on whether `target/debug/darkmux` happens to \
+         exist. Drive the code in process, or move the test under the root tests/:\n{}",
+        offenders.len(),
+        TOKENS[1],
+        offenders.join("\n")
+    );
+}
 
 fn fixture_json() -> &'static str {
     r#"{
@@ -1902,7 +2027,7 @@ fn mission_config_show_review_param_override_is_reported_ignored_with_a_warning(
         })
         .expect("a reviewer task must be present");
     assert_ne!(
-        reviewer_role["provenance"], "launch override (--param)",
+        reviewer_role["provenance"], "overridden",
         "no launcher applies --param role overrides any more: {reviewer_role}"
     );
 }
@@ -1946,8 +2071,8 @@ fn mission_config_show_coder_phase_param_is_neutered_with_warning() {
         })
         .expect("coder task must be present");
     assert_ne!(
-        coder_role["provenance"], "launch override (--param)",
-        "a non-review-route config must never claim the launch-override provenance from --param"
+        coder_role["provenance"], "overridden",
+        "a non-review-route config must never claim the overridden provenance from --param"
     );
 }
 
@@ -4846,12 +4971,8 @@ fn spawn_fleet_daemon(profiles_json: &str, nofile: Option<u64>) -> Option<FleetD
         docker_shim_dir().display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let free_port = || {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port");
-        l.local_addr().unwrap().port()
-    };
-    let serve_port = free_port();
-    let fleet_port = free_port();
+    let serve_port = daemon_port();
+    let fleet_port = daemon_port();
     let mut cmd = darkmux_std_cmd();
     cmd.env("HOME", &home)
         .env("DARKMUX_HOME", &darkmux_home)
@@ -4907,10 +5028,7 @@ fn serve_raises_its_open_file_soft_limit_at_start() {
         return;
     }
     let (home, darkmux_home) = isolated_roots();
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     let mut cmd = darkmux_std_cmd();
     cmd.env("HOME", &home)
         .env("DARKMUX_HOME", &darkmux_home)
@@ -4946,10 +5064,7 @@ fn serve_raises_its_open_file_soft_limit_at_start() {
 /// its environment only) and passes, and a clean shutdown removes the record.
 #[test]
 fn a_daemon_started_with_a_port_flag_is_found_by_doctor_and_unrecorded_on_exit() {
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     assert_ne!(port, 8765, "the test needs a port the built-in default does not name");
     let mut cmd = darkmux_std_cmd();
     let env_of = |cmd: &std::process::Command, key: &str| {
@@ -7337,6 +7452,79 @@ fn integrity_check_reports_a_header_without_the_marker_as_a_break_at_line_1() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("--strict"));
 }
 
+/// Through the real binary: a day file cut to 0 bytes, and a dropped audit
+/// write the local flow files recorded on an earlier day, each make
+/// `flow integrity-check` exit 3 (chains verify, the trail is incomplete),
+/// and `--json` names the dropped writes.
+#[test]
+fn integrity_check_exits_3_for_an_emptied_day_file_and_for_a_dropped_write() {
+    let audit = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let check = |args: &[&str]| {
+        darkmux_cmd()
+            .env("DARKMUX_AUDIT_DIR", audit.path())
+            .env("DARKMUX_FLOWS_DIR", flows.path())
+            .args(["flow", "integrity-check"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let emptied = audit.path().join("2026-01-02.jsonl");
+    fs::write(&emptied, "x").unwrap();
+    // Emptied after it was born, as a real cut file is: Linux stamps files
+    // from a coarse clock (one tick, at most 10 ms), and a file created and
+    // emptied within one tick reads as just created.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::File::create(&emptied).unwrap();
+    let out = check(&[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("chain restarted"), "{stdout}");
+    assert_eq!(check(&["--path", emptied.to_str().unwrap()]).status.code(), Some(3), "one file, walked alone");
+    let fresh = audit.path().join("2026-01-03.jsonl");
+    fs::File::create(&fresh).unwrap();
+    assert_eq!(check(&["--path", fresh.to_str().unwrap()]).status.code(), Some(0), "another file's restart is not this one's");
+
+    fs::remove_file(&emptied).unwrap();
+    assert_eq!(check(&[]).status.code(), Some(0), "an empty audit dir with no breadcrumbs is clean");
+    fs::write(audit.path().join("2026-01-01.jsonl"), "").unwrap();
+    fs::write(
+        flows.path().join("2026-01-02.jsonl"),
+        "{\"ts\":\"2026-01-02T00:00:00Z\",\"action\":\"audit.write_failed\",\"category\":\"audit\",\"level\":\"error\"}\n",
+    )
+    .unwrap();
+    let out = check(&[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("1 audit write(s) dropped on 2026-01-02"), "{stdout}");
+    let out = check(&["--json"]);
+    assert_eq!(out.status.code(), Some(3));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dropped_writes"][0]["day"], "2026-01-02", "{v}");
+    assert_eq!(v["dropped_writes"][0]["count"], 1, "{v}");
+    let one_day = audit.path().join("2026-01-01.jsonl");
+    assert_eq!(check(&["--path", one_day.to_str().unwrap()]).status.code(), Some(0), "another day's drop is not this file's");
+}
+
+/// Through the real binary: a flows dir that cannot be written is said on
+/// stderr, naming the day file and the OS error. The default sink setup (no
+/// audit, Redis or hooks) is the bare local sink.
+#[test]
+fn an_unwritable_flows_dir_is_said_on_stderr() {
+    let tmp = TempDir::new().unwrap();
+    let blocker = tmp.path().join("a-regular-file");
+    fs::write(&blocker, "").unwrap();
+    let out = darkmux_cmd()
+        .env("DARKMUX_FLOWS_DIR", blocker.join("flows"))
+        .args(["flow", "note", "--text", "probe"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let said: Vec<&str> = stderr.lines().filter(|l| l.contains("flow records cannot be written to")).collect();
+    assert_eq!(said.len(), 1, "{stderr}");
+    assert!(said[0].contains(&blocker.display().to_string()) && said[0].contains("os error"), "{stderr}");
+}
+
 /// (#2093, folded into `flow status` by #1959's flow-hooks-family
 /// retirement) `darkmux flow status` wires the hooks section end-to-end:
 /// parses, dispatches, and prints valid JSON naming the resolved
@@ -8024,6 +8212,106 @@ fn crawl_dry_run_prunes_the_rules_the_launch_did_not_select() {
     );
     // Mutation guard: if the selection stopped pruning, these would match.
     assert_ne!(all_out, one_out, "`--param rules=` must change the minted graph");
+}
+
+/// (#3631) A `rules=` name the document declares no task for is refused at
+/// preflight, naming the input, the unknown value and the closest declared
+/// rule. Before this, the name pruned every rule task silently and the dry
+/// run exited 0 with nothing planned.
+#[test]
+fn crawl_dry_run_refuses_a_rule_the_document_does_not_declare() {
+    let workdir = TempDir::new().unwrap();
+    let app = workdir.path().join("app");
+    let lib = workdir.path().join("lib");
+    write_app_repo(&app, "^1.0.0");
+    write_lib_repo(&lib, "1.2.0");
+    let spec_path = workdir.path().join("workspace.json");
+    write_workspace_spec(&spec_path, workdir.path(), &app, &lib);
+
+    let out = crawl_dry_run(&workdir, &spec_path, &["--param", "rules=swallowed-eror"]);
+    assert!(!out.status.success(), "an unknown rule must refuse the dry run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("`rules`"), "the refusal names the input:\n{stderr}");
+    assert!(stderr.contains("`swallowed-eror`"), "and the unknown value:\n{stderr}");
+    assert!(stderr.contains("`swallowed-error`"), "and the closest declared rule:\n{stderr}");
+    assert!(!workdir.path().join("missions").exists(), "a refused dry run mints nothing");
+}
+
+/// The review document's own launch, as the ACP panel synthesizes it.
+fn review_launch_with_rules(home: &TempDir, workdir: &TempDir, rules: &str, dry_run: bool) -> std::process::Output {
+    let app = workdir.path().join("app");
+    write_app_repo(&app, "^1.0.0");
+    let spec_path = workdir.path().join("workspace.json");
+    fs::write(
+        &spec_path,
+        serde_json::json!({
+            "name": "review-unknown-rule",
+            "sources": [{"id": "app", "path": app.to_string_lossy(), "ref": "main"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let diff_path = workdir.path().join("d.diff");
+    fs::write(&diff_path, "").unwrap();
+    let mut args = vec![
+        "mission".to_string(),
+        "launch".to_string(),
+        "review".to_string(),
+        "--param".to_string(),
+        format!("workspace={}", spec_path.display()),
+        "--param".to_string(),
+        format!("diff_file={}", diff_path.display()),
+        "--param".to_string(),
+        format!("rules={rules}"),
+    ];
+    if dry_run {
+        args.push("--dry-run".to_string());
+    }
+    darkmux_cmd()
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", home.path().join("flows"))
+        .env("DARKMUX_LMS_BIN", "/usr/bin/false")
+        .env("DARKMUX_LMSTUDIO_URL", "http://127.0.0.1:9")
+        .args(&args)
+        .output()
+        .expect("mission launch review runs")
+}
+
+#[test]
+fn review_dry_run_refuses_an_unknown_rule_naming_the_closest_one() {
+    let home = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+    let out = review_launch_with_rules(&home, &workdir, "test-gap,no-such-rule", true);
+    assert!(!out.status.success(), "an unknown rule must refuse the dry run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("`rules`") && stderr.contains("`no-such-rule`"), "{stderr}");
+    assert!(stderr.contains("the closest is `"), "the refusal suggests a declared rule:\n{stderr}");
+    assert!(!stderr.contains("`test-gap` is"), "a declared rule beside it is not refused:\n{stderr}");
+    assert_nothing_minted(&home);
+}
+
+/// The real launch is refused at the same preflight, before anything mints.
+#[test]
+fn review_real_launch_refuses_an_unknown_rule_before_any_mint() {
+    let home = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+    let out = review_launch_with_rules(&home, &workdir, "test-gapp", false);
+    assert!(!out.status.success(), "an unknown rule must refuse the real launch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("`test-gapp`") && stderr.contains("`test-gap`"), "{stderr}");
+    assert_nothing_minted(&home);
+}
+
+/// Every declared rule, and the explicitly empty selection (the operator's
+/// own no-op), still pass the preflight.
+#[test]
+fn review_dry_run_accepts_declared_rules_and_an_empty_selection() {
+    for rules in ["swallowed-error,test-gap", ""] {
+        let home = TempDir::new().unwrap();
+        let workdir = TempDir::new().unwrap();
+        let out = review_launch_with_rules(&home, &workdir, rules, true);
+        assert!(out.status.success(), "rules={rules:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
 }
 
 /// (#2310 P4c-2 item 4 — proven structurally) A SYNTHETIC config (not
@@ -14300,6 +14588,40 @@ fn darkmux_home_of(cmd: &std::process::Command) -> std::path::PathBuf {
         .expect("the spawn helper sets DARKMUX_HOME")
 }
 
+/// A command that runs no preflight (a read such as `mission status`, or
+/// `darkmux acp`'s idle timer) reads a numeric env var that does not parse
+/// as unset. It still starts, but says so on stderr, naming the variable
+/// and the accepted form and never the value, as it does for a bad
+/// `config.json`; a command that starts work refuses instead.
+#[test]
+fn a_command_with_no_preflight_warns_about_an_unreadable_numeric_env_var() {
+    let out = darkmux_cmd().env("DARKMUX_MISSION_STALE_ACTIVE_DAYS", "2w").args(["mission", "status"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "a read still runs: {stderr}");
+    assert!(
+        stderr.contains("warning: env var DARKMUX_MISSION_STALE_ACTIVE_DAYS: set to text that is not a non-negative integer"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("a command that starts work refuses"), "{stderr}");
+    assert!(!stderr.contains("2w"), "never the value: {stderr}");
+    let clean = darkmux_cmd().args(["mission", "status"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&clean.stderr).contains("env var DARKMUX_"), "no warning when every var reads");
+}
+
+/// On a command that starts work the same warning precedes the refusal, so
+/// it must not claim the var is read as unset there: it says what each kind
+/// of command does, and the refusal follows. Never the value.
+#[test]
+fn a_command_that_starts_work_refuses_and_its_warning_agrees() {
+    let out = darkmux_cmd().env("DARKMUX_RUNTIME_MAX_TOKENS", "secret50k").args(["dispatch", "coder", "hi"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "refused: {stderr}");
+    assert!(stderr.contains("refusing to start"), "{stderr}");
+    assert!(stderr.contains("warning: env var DARKMUX_RUNTIME_MAX_TOKENS"), "{stderr}");
+    assert!(!stderr.contains("read as unset here"), "the warning must not contradict the refusal: {stderr}");
+    assert!(!stderr.contains("secret50k"), "never the value: {stderr}");
+}
+
 /// (4.0) A user file with a key its schema does not know is refused at
 /// preflight by every CLI entry point that consumes it, naming the file,
 /// the key and the closest valid key, before anything is minted. `PATH` is
@@ -14402,7 +14724,7 @@ fn a_mistyped_value_in_a_user_file_is_refused_by_every_consuming_entry_point() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{args:?} succeeded: {stderr}");
         assert!(stderr.contains("refusing to start: bad config") && stderr.contains(&path.display().to_string()), "{args:?}: {stderr}");
-        assert!(stderr.contains("`skills` must be a list, got \"code-reviewing\""), "{args:?}: {stderr}");
+        assert!(stderr.contains("`skills` must be a list, got a string"), "{args:?}: {stderr}");
         let mut written = Vec::new();
         collect_files(&home, &mut written);
         written.retain(|p| p != &path && !p.components().any(|c| c.as_os_str() == "liveness"));
@@ -15227,12 +15549,15 @@ fn doctor_keeps_its_rows_and_withholds_the_execution_surface_from_a_remote_viewe
     assert!(remote.contains("lms binary"), "{remote}");
     assert!(remote.contains("→"), "remedies stay: {remote}");
     let local = console_run(&["doctor", "-v"], false, &listener);
-    // The fixture's wrong-typed `runtime.max_turns` makes config.json fail
-    // the typed load, so this machine's `fleet trust` row names the value in
-    // its parse error; the remote form above names it nowhere.
-    for s in ["8766", "/opt/fake-wrongtype-path", "/opt/fake"] {
+    for s in ["8766", "/opt/fake"] {
         assert!(local.contains(s), "this machine reads `{s}` in doctor:\n{local}");
     }
+    // The fixture's wrong-typed `runtime.max_turns` makes config.json fail
+    // the typed load, and the `fleet trust` row names that parse error by
+    // type and position, never the value, on this machine too: a
+    // wrong-typed value may be a pasted credential.
+    assert!(local.contains("does not parse"), "{local}");
+    assert!(!local.contains("/opt/fake-wrongtype-path"), "the wrong-typed value is quoted nowhere:\n{local}");
     assert!(names_tmpdir(&local), "this machine reads its temp directory:\n{local}");
 }
 
@@ -15260,10 +15585,7 @@ fn flow_status_withholds_its_directories_from_a_remote_viewer() {
 /// pointer is spelled the same.
 #[test]
 fn every_console_panel_serves_a_remote_viewer_redacted_and_this_machine_in_full() {
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     let mut cmd = darkmux_std_cmd();
     console_env(&mut cmd);
     let home = spawn_env(&cmd, "HOME");
@@ -15886,10 +16208,7 @@ fn profile_list_machine_names_an_unknown_peer() {
 #[test]
 fn client_serve_shuts_down_cleanly_on_sigterm_sighup_and_sigint() {
     for (signal, name) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGHUP, "SIGHUP"), (libc::SIGINT, "SIGINT")] {
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
+        let port = daemon_port();
         let log = tempfile::NamedTempFile::new().unwrap();
         let mut cmd = darkmux_std_cmd();
         cmd.args(["client", "serve", "--port", &port.to_string()])
@@ -15964,10 +16283,7 @@ const FAKE_TAILNET_OPERATOR: &str =
 #[test]
 fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed_ones() {
     let tmp = TempDir::new().unwrap();
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     let home = tmp.path().join("darkmux-home");
     fs::create_dir_all(&home).unwrap();
     let fake = fake_tailnet_tool(&tmp.path().join("fake"), &home, port);
@@ -16132,10 +16448,7 @@ fn client_serve_publishes_on_the_tailnet_removes_it_on_ctrl_c_and_reaps_a_killed
 #[test]
 fn a_signal_while_client_serve_is_starting_still_runs_its_cleanup() {
     let tmp = TempDir::new().unwrap();
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     let home = tmp.path().join("darkmux-home");
     fs::create_dir_all(&home).unwrap();
     let fake = fake_tailnet_tool(&tmp.path().join("fake"), &home, port);
@@ -16178,10 +16491,7 @@ fn a_signal_while_client_serve_is_starting_still_runs_its_cleanup() {
 /// Spawns `client serve` on an isolated HOME and its own port; returns the
 /// child, its port and its stderr log once it listens.
 fn a_listening_client_serve() -> (DirectChildGuard, u16, tempfile::NamedTempFile) {
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = daemon_port();
     let log = tempfile::NamedTempFile::new().unwrap();
     let mut cmd = darkmux_std_cmd();
     cmd.args(["client", "serve", "--port", &port.to_string()])

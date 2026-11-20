@@ -55,7 +55,7 @@ fn cmd_init_with(
     force: bool,
     dry_run: bool,
 ) -> Result<i32> {
-    crate::cmd_init(InitOptions { with_hook, with_claude_md, with_agents_md, force, dry_run, engine_url: None })
+    crate::cmd_init(InitOptions { with_hook, with_claude_md, with_agents_md, force, dry_run, ..Default::default() })
 }
 
 struct InitEnv {
@@ -99,6 +99,13 @@ impl InitEnv {
         // (#316) No server answers unless a test serves one, so a server this
         // machine runs (on 8080, or at a registry endpoint) cannot answer a test.
         env.set(crate::init_engine::TEST_SERVERS_HOOK, OsString::new());
+        // (#3569) No engine darkmux starts servers for is installed unless a
+        // test installs one: this machine's own rec or Tensorfold is never
+        // asked.
+        let (rec, tf) = (env.stub.path().join("no-such-rec"), env.stub.path().join("no-such-tensorfold"));
+        env.set("DARKMUX_FLINT_BIN", rec.into_os_string());
+        env.set("DARKMUX_TENSORFOLD_BIN", tf.into_os_string());
+        env.set("XDG_DATA_HOME", env.home.path().join("share").into_os_string());
         // A skills override would change which source `init` installs from;
         // the target is what matters here, and it is under HOME.
         env.unset("DARKMUX_SKILLS_DIR");
@@ -141,6 +148,29 @@ impl InitEnv {
     fn lms_missing(&mut self) {
         let missing = self.stub.path().join("no-such-lms");
         self.set("DARKMUX_LMS_BIN", missing.into_os_string());
+    }
+
+    /// (#3569) Install a fake rec 0.1.0 with one runtime and the revision
+    /// `flint-int4` pulled, read-only to darkmux.
+    fn install_rec(&mut self) {
+        let data = self.home.path().join("share").join("rec");
+        fs::create_dir_all(data.join("runtimes/0906aa")).unwrap();
+        fs::write(data.join("runtimes/0906aa/rec-mlx"), "").unwrap();
+        fs::create_dir_all(data.join("models/fdc852")).unwrap();
+        fs::write(data.join("models/fdc852/flint-int4.json"), r#"{"model_id":"flint-int4","max_context":262144}"#).unwrap();
+        let rec = self.stub.path().join("rec");
+        fs::write(&rec, "#!/bin/sh\n[ \"$1\" = --version ] && echo 'rec 0.1.0' || exit 9\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&rec, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // macOS checks a file on its first exec (measured: about 0.1 to 0.4 s
+        // for a new script, 0.02 s after), and on a loaded machine that check
+        // can outlast init's bounded probe. Run it once here, so the probe
+        // `init` makes times rec, not the first-exec check.
+        assert!(std::process::Command::new(&rec).arg("--version").status().unwrap().success());
+        self.set("DARKMUX_FLINT_BIN", rec.into_os_string());
     }
 
     /// Every `lms` invocation so far, one per line.
@@ -300,7 +330,7 @@ fn a_dry_run_reports_intent_writes_nothing_and_asks_lms_only_whether_it_answers(
         with_agents_md: Some(agents_md.clone()),
         force: false,
         dry_run: true,
-        engine_url: None,
+        ..opts()
     })
     .unwrap();
 
@@ -339,18 +369,83 @@ fn a_dry_run_over_an_existing_install_reports_it_present_and_touches_nothing() {
     assert_eq!(env.lms_calls(), "ps --json\n");
 }
 
+/// An operator's own value is never replaced, even with `--force`: a re-run
+/// only adds the defaults the file is missing.
 #[test]
 #[serial_test::serial]
-fn an_existing_config_is_never_overwritten_even_with_force() {
+fn an_existing_configs_values_are_never_overwritten_even_with_force() {
     darkmux_types::run_in_own_process!();
     let env = InitEnv::new();
     env.lms(&[model("tiny-llm", TINY, "llm")], &[]);
-    fs::write(env.config(), "{ \"machine_id\": \"operator-named\" }\n").unwrap();
+    fs::write(env.config(), "{ \"machine_id\": \"operator-named\", \"redis\": { \"port\": 7000 } }\n").unwrap();
 
     let r = init(&InitOptions { force: true, ..opts() }).unwrap();
 
     assert!(r.config_already_present && !r.config_created);
-    assert_eq!(fs::read_to_string(env.config()).unwrap(), "{ \"machine_id\": \"operator-named\" }\n");
+    let cfg: Value = serde_json::from_str(&fs::read_to_string(env.config()).unwrap()).unwrap();
+    assert_eq!(cfg["machine_id"], "operator-named");
+    assert_eq!(cfg["redis"]["port"], 7000, "a nested value of the operator's is kept");
+    assert_eq!(cfg["redis"]["enabled"], false, "the block's missing default is added beside it");
+}
+
+/// `config set` before `init` leaves a one-key file. `init` completes it with
+/// every default it lacks, keeping the key the operator set, and says what it
+/// added. It never adds a key whose absence reads differently from its
+/// default: `machine_id` (absent, the machine is named by its hostname, and
+/// seeding another name would rename it on the fleet), `redis.host` (absent,
+/// nothing assembles a Redis URL), and the two directories derived from the
+/// darkmux root (`audit.dir`, `hooks.outbox_dir`), which a literal would
+/// freeze.
+#[test]
+#[serial_test::serial]
+fn a_partial_config_is_completed_with_the_defaults_it_lacks() {
+    darkmux_types::run_in_own_process!();
+    let env = InitEnv::new();
+    env.lms(&[model("tiny-llm", TINY, "llm")], &[]);
+    fs::write(env.config(), "{\n  \"lms_bin\": \"/opt/lms\"\n}\n").unwrap();
+
+    let r = init(&opts()).unwrap();
+
+    assert!(r.config_already_present && !r.config_created);
+    assert!(r.config_completed.iter().any(|k| k.starts_with("redis")), "{:?}", r.config_completed);
+    assert!(!r.config_completed.contains(&"lms_bin".to_string()), "the operator's own key is not added");
+    let cfg: darkmux_types::config::DarkmuxConfig =
+        serde_json::from_str(&fs::read_to_string(env.config()).unwrap()).unwrap();
+    assert_eq!(cfg.lms_bin.as_deref(), Some("/opt/lms"));
+    assert_eq!(cfg.machine_id, None, "the machine keeps its hostname name: {:?}", r.config_completed);
+    assert_eq!(cfg.redis.as_ref().and_then(|x| x.enabled), Some(false));
+    assert_eq!(cfg.redis.as_ref().and_then(|x| x.host.clone()), None, "absent host assembles no Redis URL");
+    assert_eq!(cfg.audit.as_ref().and_then(|x| x.dir.clone()), None, "the audit dir stays derived from the root");
+    assert_eq!(cfg.hooks.as_ref().and_then(|x| x.outbox_dir.clone()), None, "the outbox stays derived from the root");
+    for kept_absent in ["machine_id", "redis.host", "audit.dir", "hooks.outbox_dir"] {
+        assert!(!r.config_completed.iter().any(|k| k == kept_absent), "{kept_absent}: {:?}", r.config_completed);
+    }
+    assert!(cfg.schema_version.is_some());
+
+    // A second run has nothing left to add and writes nothing.
+    let before = fs::read_to_string(env.config()).unwrap();
+    let again = init(&opts()).unwrap();
+    assert!(again.config_completed.is_empty(), "{:?}", again.config_completed);
+    assert_eq!(fs::read_to_string(env.config()).unwrap(), before);
+}
+
+/// A dry run says what it would add and writes nothing; a file that is not a
+/// JSON object is left for the operator (doctor names the problem).
+#[test]
+#[serial_test::serial]
+fn a_dry_run_or_an_unreadable_config_is_not_completed() {
+    darkmux_types::run_in_own_process!();
+    let env = InitEnv::new();
+    env.lms(&[model("tiny-llm", TINY, "llm")], &[]);
+    fs::write(env.config(), "{\"lms_bin\": \"/opt/lms\"}\n").unwrap();
+    let r = init(&InitOptions { dry_run: true, ..opts() }).unwrap();
+    assert!(r.config_completed.contains(&"default_engine".to_string()), "{:?}", r.config_completed);
+    assert_eq!(fs::read_to_string(env.config()).unwrap(), "{\"lms_bin\": \"/opt/lms\"}\n");
+
+    fs::write(env.config(), "not json\n").unwrap();
+    let r = init(&opts()).unwrap();
+    assert!(r.config_completed.is_empty());
+    assert_eq!(fs::read_to_string(env.config()).unwrap(), "not json\n");
 }
 
 // ── fill_worker_model, through init ───────────────────────────────────────
@@ -439,12 +534,31 @@ fn an_unreachable_lms_leaves_both_bindings_and_names_the_fix() {
 
     let reason = r.worker_model_unfilled_reason.expect("a reason");
     assert!(reason.starts_with("could not ask LM Studio what is downloaded"), "{reason}");
-    assert!(reason.contains("lms bootstrap"), "{reason}");
+    assert_eq!(reason.matches("lms bootstrap").count(), 1, "the fix is said once: {reason}");
+    assert!(reason.contains("darkmux config set lms_bin <path>"), "{reason}");
+    assert!(!reason.contains("config.json"), "no hand edit: {reason}");
     assert_eq!(r.worker_model_filled, None);
     // The utility half stays quiet: the worker already reported lms.
     assert_eq!(r.utility_model_filled, None);
     assert_eq!(r.utility_model_unfilled_reason, None);
     assert_eq!(env.read_registry(), EXAMPLE_PROFILES_JSON);
+}
+
+/// An `lms_bin` whose file is named `lms` but is missing gets its fix from
+/// the spawn error itself; init's own reason must not say it a second time.
+#[test]
+#[serial_test::serial]
+fn a_missing_lms_binary_names_the_fix_once() {
+    darkmux_types::run_in_own_process!();
+    let mut env = InitEnv::new();
+    let missing = env.stub.path().join("absent").join("lms");
+    env.set("DARKMUX_LMS_BIN", missing.into_os_string());
+
+    let reason = init(&opts()).unwrap().worker_model_unfilled_reason.expect("a reason");
+
+    assert_eq!(reason.matches("lms bootstrap").count(), 1, "the fix is said once: {reason}");
+    assert!(reason.contains("darkmux config set lms_bin <path>"), "{reason}");
+    assert!(!reason.contains("config.json"), "no hand edit: {reason}");
 }
 
 #[test]
@@ -1393,4 +1507,59 @@ fn a_refused_input_fails_init_before_anything_is_written() {
         assert!(!p.exists(), "settings.json: {} was written before the refusal", p.display());
     }
     assert_eq!(fs::read_to_string(env.settings()).unwrap(), "[]\n");
+}
+
+/// (#3569) `init` lists an installed engine darkmux starts servers for, and
+/// `--add-engine` without a terminal to confirm on writes nothing.
+#[test]
+#[serial_test::serial]
+fn init_lists_an_installed_engine_and_adds_it_only_when_confirmed() {
+    darkmux_types::run_in_own_process!();
+    let mut env = InitEnv::new();
+    env.install_rec();
+    let mine = example_without_placeholder();
+    env.write_registry(&mine);
+
+    let r = init(&opts()).unwrap();
+    let found = r.detected.expect("detection ran");
+    assert_eq!(found.detected.len(), 1, "{found:?}");
+    assert!(found.detected[0].can_add, "{found:?}");
+    assert!(r.engine_add.is_none());
+
+    let r = init(&InitOptions { add_engine: Some("flint".into()), ..opts() }).unwrap();
+    let (outcome, path) = r.engine_add.expect("an add was asked for");
+    assert_eq!(path, env.registry());
+    match outcome {
+        crate::init_detect::AddOutcome::NotWritten { planned, why } => {
+            assert!(why.contains("no terminal"), "{why}");
+            assert_eq!((planned.endpoint.as_str(), planned.model.as_str()), ("flint", "flint-int4"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(env.read_registry(), mine, "nothing written without a confirmation");
+
+    let r = init(&InitOptions { add_engine: Some("tensorfold".into()), ..opts() }).unwrap();
+    assert!(matches!(r.engine_add, Some((crate::init_detect::AddOutcome::Refused(ref m), _)) if m.contains("not installed")));
+    assert!(init(&InitOptions { add_engine: Some("ollama".into()), ..opts() }).is_err(), "refused before any write");
+}
+
+/// (#3569 review) `init`'s registry writes go through the shared write
+/// path: a symlinked registry stays a link, and the file it names gets the
+/// fill.
+#[test]
+#[serial_test::serial]
+fn a_symlinked_registry_stays_a_link_when_init_fills_it() {
+    darkmux_types::run_in_own_process!();
+    let env = InitEnv::new();
+    let real = env.home.path().join("dotfiles-profiles.json");
+    fs::write(&real, EXAMPLE_PROFILES_JSON).unwrap();
+    fs::create_dir_all(env.registry().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, env.registry()).unwrap();
+    env.lms(&[model("tiny-llm", TINY, "llm")], &[]);
+
+    let r = init(&opts()).unwrap();
+
+    assert_eq!(r.worker_model_filled.as_deref(), Some("tiny-llm"));
+    assert!(fs::symlink_metadata(env.registry()).unwrap().file_type().is_symlink(), "still a link");
+    assert!(fs::read_to_string(&real).unwrap().contains("tiny-llm"));
 }

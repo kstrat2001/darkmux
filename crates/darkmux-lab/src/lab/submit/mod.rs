@@ -379,16 +379,19 @@ fn fields_count(v: &Value) -> (Value, Value, Value) {
     (json!(correct), json!(expected), json!(names))
 }
 
-/// The detail beyond the basics. Host figures need busy samples: with none
-/// they are null, never zero.
 /// Whether every stream's tokens were billed: a rate over only some of the
 /// generation is not quoted.
 fn all_streams_billed(stats: &Value) -> bool {
     stats.get("checks").and_then(|c| c.get("all_streams_billed")) != Some(&Value::Bool(false))
 }
 
-pub fn detail_from(manifest: &Value, stats: &Value, names: &[String]) -> Value {
-    let sampled = stats.get("samples_busy").and_then(Value::as_u64).is_some_and(|n| n > 0);
+/// The detail beyond the basics. Host figures describe the machine that
+/// served the run, or are null: null for a run another machine served
+/// (`hardware`, the stack's), whatever this machine's telemetry read while
+/// it ran, and null with no busy samples, never zero.
+pub fn detail_from(manifest: &Value, stats: &Value, names: &[String], hardware: darkmux_types::Hardware) -> Value {
+    let served_here = hardware == darkmux_types::Hardware::SubmittingMachine;
+    let sampled = served_here && stats.get("samples_busy").and_then(Value::as_u64).is_some_and(|n| n > 0);
     let host = |v: Value| if sampled { v } else { Value::Null };
     let thermal = stats.get("thermal_states_busy").and_then(Value::as_object).map(|states| {
         let mut kept: Vec<(&String, u64)> = states
@@ -551,7 +554,7 @@ pub fn bundle_run(run_id: &str, manifest: &Value, stats: &Value, ran_by: &RanBy,
         "peakMemoryGb": null,
         "startedAt": started.map(iso_utc),
         "stack": with_reply_cap(stack.to_json(), manifest),
-        "detail": detail_from(manifest, stats, names),
+        "detail": detail_from(manifest, stats, names, stack.hardware),
         "criteria": criteria_from(manifest),
     })
 }
@@ -910,7 +913,7 @@ pub fn gather(runs: &[String], stated: &Stated, progress: &mut dyn FnMut(&str)) 
 pub fn gather_on(machine: &Machine, runs: &[String], stated: &Stated, flows_dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<Built> {
     refuse_repeats(runs)?;
     let inputs = read_runs(runs, flows_dir)?;
-    let source = one_fixture(&inputs, stated)?;
+    let source = one_fixture(&inputs)?;
     let served = machine.served_all(&inputs, stated)?;
     let Bundled { runs: mut bundled, mut notes, starts } = bundle_all(machine, &inputs, &served, stated, progress)?;
     let (repo, commit_sha, fixture_manifest) = fixture_at(&source, &starts, stated.commit.as_deref())?;
@@ -1007,17 +1010,106 @@ impl ServedBy {
 /// before the snapshot (run manifest 1.3) reads the registry as it is now for
 /// a managed model or a listed host only: an endpoint's declaration today is
 /// not the run's. A model the registry does not list reads as LM Studio's,
-/// as before.
+/// as before. `dispatched` is the model name the run sent, namespace and
+/// all: it picks the snapshot entries, or with none the registry's models
+/// (`current`, from [`profile_models_named`]), that it could be
+/// ([`crate::lab::manifest::by_wire_name`]). Each answers by the rules above;
+/// several that agree decide ([`one_answer`]).
 pub fn served_by(
     run_id: &str,
-    model_id: &str,
+    dispatched: &str,
     snapshot: Option<&[crate::lab::manifest::ModelHardware]>,
-    current: Option<&darkmux_types::ProfileModel>,
+    current: &[darkmux_types::ProfileModel],
     flag: Option<darkmux_types::Hardware>,
 ) -> std::result::Result<ServedBy, String> {
-    let entry = snapshot
-        .and_then(|s| s.iter().find(|e| e.model == model_id || e.identifier.as_deref() == Some(model_id)));
-    served_by_entry(run_id, model_id, entry, current, flag)
+    let model_id = model_id_from(Some(dispatched)).unwrap_or_default();
+    let entries = snapshot.map(|s| crate::lab::manifest::snapshot_matches(s, dispatched)).unwrap_or_default();
+    let answers: Vec<_> = match (entries.is_empty(), current.is_empty()) {
+        (false, _) => entries.iter().map(|e| served_by_entry(run_id, &model_id, Some(e), None, flag)).collect(),
+        (true, false) => current.iter().map(|m| served_by_entry(run_id, &model_id, None, Some(m), flag)).collect(),
+        (true, true) => vec![served_by_entry(run_id, &model_id, None, None, flag)],
+    };
+    one_answer(run_id, &model_id, answers, flag.is_some())
+}
+
+/// The `n_ctx` every one of `models` declares, when they agree.
+fn agreed_n_ctx(models: &[darkmux_types::ProfileModel]) -> Option<u64> {
+    let first = models.first()?.n_ctx;
+    models.iter().all(|m| m.n_ctx == first).then_some(first).flatten().map(u64::from)
+}
+
+/// The models of a profile a dispatched name could be, by the same rule
+/// as the run's snapshot: the wire name's kind first, and `flint` names a
+/// managed Flint model.
+pub fn profile_models_named(models: &[darkmux_types::ProfileModel], dispatched: &str) -> Vec<darkmux_types::ProfileModel> {
+    let managed = |m: &darkmux_types::ProfileModel| m.is_managed();
+    // A managed Flint server answers to `flint` whatever its model's id.
+    let flint = |m: &darkmux_types::ProfileModel| {
+        m.endpoint.as_ref().is_some_and(|e| {
+            e.kind() == Ok(darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Flint))
+        })
+    };
+    let names = |m: &darkmux_types::ProfileModel, id: &str| {
+        m.id == id || m.identifier.as_deref() == Some(id) || (id == darkmux_profiles::engine::flint::SERVED_NAME && flint(m))
+    };
+    crate::lab::manifest::by_wire_name(models, dispatched, names, managed)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+/// One run's machine from what each model it could be answered, each
+/// under the same `--hardware` guards as a single one. One answer stands
+/// as it is. With a flag, the models it does not contradict decide (each
+/// answers the flag's value), and when it contradicts every one the first
+/// refusal stands. Without one, every model must answer and agree.
+fn one_answer(
+    run_id: &str,
+    model_id: &str,
+    mut answers: Vec<std::result::Result<ServedBy, String>>,
+    flagged: bool,
+) -> std::result::Result<ServedBy, String> {
+    if answers.len() == 1 {
+        return answers.remove(0);
+    }
+    let mut ok = Vec::new();
+    let mut first_refusal = None;
+    for answer in answers {
+        match answer {
+            Ok(by) => ok.push(by),
+            Err(why) => {
+                first_refusal.get_or_insert(why);
+            }
+        }
+    }
+    match first_refusal {
+        Some(why) if ok.is_empty() => Err(why),
+        Some(_) if !flagged => Err(ambiguous(run_id, model_id)),
+        _ => merged(&ok).ok_or_else(|| ambiguous(run_id, model_id)),
+    }
+}
+
+/// Several answers as one, when they name one machine: the provider and
+/// correction they share, and LM Studio's provenance only when every one
+/// is a managed model.
+fn merged(answers: &[ServedBy]) -> Option<ServedBy> {
+    let first = answers.first()?;
+    let all = |same: &dyn Fn(&ServedBy) -> bool| answers.iter().all(same);
+    all(&|a| a.hardware == first.hardware).then(|| ServedBy {
+        hardware: first.hardware,
+        provider: all(&|a| a.provider == first.provider).then(|| first.provider.clone()).flatten(),
+        lmstudio: all(&|a| a.lmstudio),
+        corrected: all(&|a| a.corrected == first.corrected).then_some(first.corrected).flatten(),
+    })
+}
+
+/// The refusal for a name whose models do not agree on a machine.
+fn ambiguous(run_id: &str, model_id: &str) -> String {
+    format!(
+        "{run_id}: {model_id} names more than one model of the run's profile, and they do not agree on which machine \
+         served it. Pass --hardware submitting-machine (this machine served it) or --hardware unknown (another \
+         machine did); --hardware applies to every run of a submit, so submit this run in a `lab submit` of its own"
+    )
 }
 
 /// [`served_by`] for the run's own snapshot entry, when it has one.
@@ -1133,27 +1225,37 @@ fn endpoint_hardware(
 }
 
 /// (#3397, macOS) What the run's own GPU reading says against the stated
-/// hardware, when they disagree: the GPU never busy (no telemetry sample at
-/// or above the busy line, `stats::BUSY_GPU_PCT`) while stated as served on
-/// the submitting machine, or busy while stated as served elsewhere. `None`
-/// when they agree, and when the run has no GPU reading (Omarchy, or no
-/// telemetry): a note, never a refusal. The reading is the whole machine's,
-/// so a hosted run that overlapped a local one (on this machine, in another
-/// process) can read busy, and the note then misfires; it asks a person to
-/// look, nothing more.
+/// hardware, when they disagree: the GPU idle while stated as served on the
+/// submitting machine, or busy while stated as served elsewhere. Busy needs
+/// both readings to say so (#3402): samples at or above the utilization
+/// line (`stats::BUSY_GPU_PCT`), drawing on average more than background
+/// work does (`stats::IDLE_GPU_W`); idle needs no busy sample and no sample
+/// drawing more than that. `None` when they agree, and when the run has no
+/// GPU utilization or power reading (Omarchy, or no telemetry): a note,
+/// never a refusal. The reading is the whole machine's, so a hosted run that
+/// overlapped a local one (on this machine, in another process) can read
+/// busy, and the note then misfires; it asks a person to look, nothing more.
 pub fn hardware_check(hardware: darkmux_types::Hardware, stats: &Value) -> Option<String> {
-    let duty = stats.get("gpu_duty_pct").and_then(Value::as_f64)?;
+    let duty = machine_reading(stats, "gpu_duty_pct")?;
     let busy = stats.get("samples_busy").and_then(Value::as_u64)?;
-    let line = crate::lab::stats::BUSY_GPU_PCT;
+    let watts = |key: &str| machine_reading(stats, key);
+    let (line, idle_w) = (crate::lab::stats::BUSY_GPU_PCT, crate::lab::stats::IDLE_GPU_W);
     match hardware {
-        darkmux_types::Hardware::SubmittingMachine if busy == 0 => Some(format!(
-            "stated as served on the submitting machine (submitting-machine), but this machine's GPU stayed idle through the run (no sample at or above {line}% GPU)"
+        darkmux_types::Hardware::SubmittingMachine if busy == 0 && watts("gpu_w_max").is_some_and(|w| w <= idle_w) => Some(format!(
+            "stated as served on the submitting machine (submitting-machine), but this machine's GPU stayed idle through the run (no sample at or above {line}% GPU or above {idle_w} W)"
         )),
-        darkmux_types::Hardware::Unknown if busy > 0 => Some(format!(
-            "stated as served elsewhere (unknown), but this machine's GPU was busy for {duty}% of the run"
-        )),
+        darkmux_types::Hardware::Unknown => watts("gpu_w_busy").filter(|w| *w > idle_w).map(|w| {
+            format!("stated as served elsewhere (unknown), but this machine's GPU was busy for {duty}% of the run, at {w} W")
+        }),
         _ => None,
     }
+}
+
+/// This machine's own reading of `key` over a run's window: from
+/// `this_machine`, where `run stats` keeps it for a run another machine
+/// served, or else the run's own figure.
+fn machine_reading(stats: &Value, key: &str) -> Option<f64> {
+    stats.pointer(&format!("/this_machine/{key}")).and_then(Value::as_f64).or_else(|| stats.get(key).and_then(Value::as_f64))
 }
 
 /// (#3361) Each run states the eval workload it used, proven against the
@@ -1255,9 +1357,8 @@ fn read_run(run: &str, flows_dir: &Path) -> Result<std::result::Result<Input, St
     })
 }
 
-/// The one fixture checkout the runs share; refuses runs of several, or a
-/// model stated by hand when they used several.
-fn one_fixture(inputs: &[Input], stated: &Stated) -> Result<PathBuf> {
+/// The one fixture checkout the runs share; refuses runs of several.
+fn one_fixture(inputs: &[Input]) -> Result<PathBuf> {
     let sources: BTreeSet<Option<String>> = inputs.iter().map(|i| fixture_field(&i.manifest, "source_path")).collect();
     let baselines: BTreeSet<Option<String>> = inputs.iter().map(|i| fixture_field(&i.manifest, "baseline_hash")).collect();
     let source = match sources.iter().next() {
@@ -1267,14 +1368,37 @@ fn one_fixture(inputs: &[Input], stated: &Stated) -> Result<PathBuf> {
     if baselines.len() != 1 {
         bail!("these runs started from different fixture contents; submit them separately");
     }
-    let models: BTreeSet<Option<String>> = inputs.iter().map(Input::model_id).collect();
-    if stated.describes_a_model() && models.len() > 1 {
+    Ok(source)
+}
+
+/// (#3402) The flags that describe a model hold for the one model the runs
+/// not on a provider's host used; a provider's run takes none of them. With
+/// only provider runs they describe nothing, and each run says so.
+fn refuse_stated_model(inputs: &[Input], served: &[ServedBy], stated: &Stated) -> Result<()> {
+    if !stated.describes_a_model() {
+        return Ok(());
+    }
+    let models: BTreeSet<Option<String>> =
+        inputs.iter().zip(served).filter(|(_, by)| by.provider.is_none()).map(|(i, _)| i.model_id()).collect();
+    if models.len() > 1 {
         bail!(
             "--engine, --engine-backend, --engine-version, --quant and --weights-dir describe one model; these runs used {}",
             models.iter().flatten().cloned().collect::<Vec<_>>().join(", ")
         );
     }
-    Ok(source)
+    if models.is_empty() {
+        let refused: Vec<String> = inputs.iter().zip(served).filter_map(|(i, by)| Some(provider_refusal(i, by.provider.as_deref()?))).collect();
+        bail!("not submitted:\n  {}", refused.join("\n  "));
+    }
+    Ok(())
+}
+
+fn provider_refusal(input: &Input, provider: &str) -> String {
+    format!(
+        "{}: {provider} served {}, and darkmux names it itself: --engine, --engine-backend, --engine-version, --quant and --weights-dir describe a model this machine served; drop them",
+        input.run_id,
+        input.model_id().unwrap_or_default()
+    )
 }
 
 impl Stated {
@@ -1406,24 +1530,19 @@ impl Machine {
         })
     }
 
-    /// (#3397) Which machine served each run, every refusal named at once.
-    /// A run on a provider's host cannot also take the flags that describe
-    /// a model this machine served.
+    /// (#3397) Which machine served each run, every refusal named at once;
+    /// then whether the flags that describe a model fit those runs (#3402).
     fn served_all(&self, inputs: &[Input], stated: &Stated) -> Result<Vec<ServedBy>> {
         let mut served = Vec::new();
         let mut refused = Vec::new();
         for input in inputs {
-            let model_id = input.model_id().unwrap_or_default();
+            let dispatched = input.stats.get("model").and_then(Value::as_str).unwrap_or_default();
             let snapshot = input
                 .manifest
                 .get("model_hardware")
                 .and_then(|v| serde_json::from_value::<Vec<crate::lab::manifest::ModelHardware>>(v.clone()).ok());
-            let current = self.profile_model(&input.manifest, &model_id);
-            match served_by(&input.run_id, &model_id, snapshot.as_deref(), current.as_ref(), stated.hardware) {
-                Ok(ServedBy { provider: Some(p), .. }) if stated.describes_a_model() => refused.push(format!(
-                    "{}: {p} served {model_id}, and darkmux names it itself: --engine, --engine-backend, --engine-version, --quant and --weights-dir describe a model this machine served; drop them",
-                    input.run_id
-                )),
+            let current = self.profile_models(&input.manifest, dispatched);
+            match served_by(&input.run_id, dispatched, snapshot.as_deref(), &current, stated.hardware) {
                 Ok(by) => served.push(by),
                 Err(why) => refused.push(why),
             }
@@ -1431,6 +1550,7 @@ impl Machine {
         if !refused.is_empty() {
             bail!("not submitted:\n  {}", refused.join("\n  "));
         }
+        refuse_stated_model(inputs, &served, stated)?;
         Ok(served)
     }
 
@@ -1446,7 +1566,9 @@ impl Machine {
         let started = input.started();
         let mut why = Vec::new();
         let model_id = input.model_id().unwrap_or_default();
-        let profile_model = self.profile_model(&input.manifest, &model_id);
+        let dispatched = input.stats.get("model").and_then(Value::as_str).unwrap_or_default();
+        // The context the profile's models give, when every one it could be agrees.
+        let profile_n_ctx = agreed_n_ctx(&self.profile_models(&input.manifest, dispatched));
         if let Some(was) = served.corrected {
             why.push(format!("--hardware {} corrects the recorded {}", served.hardware.as_str(), was.as_str()));
         }
@@ -1476,7 +1598,7 @@ impl Machine {
             model: (!model_id.is_empty()).then(|| model_id.clone()),
             weights_hash,
             quant: engine.quant,
-            context_length: recorded_n_ctx(&input.manifest).or_else(|| profile_model.and_then(|m| m.n_ctx).map(u64::from)),
+            context_length: recorded_n_ctx(&input.manifest).or(profile_n_ctx),
             cpu_cores: self.config.cpu_clusters.clone(),
             gpu_cores: self.config.gpu_cores,
             model_id: self.config.model_id.clone(),
@@ -1530,10 +1652,12 @@ impl Machine {
         Ok((provenance, weights_hash, weights_changed))
     }
 
-    /// The model as the run's profile declares it, when it does.
-    fn profile_model(&self, manifest: &Value, model_id: &str) -> Option<darkmux_types::ProfileModel> {
-        let profile = self.registry.as_ref()?.profiles.get(manifest.get("profile").and_then(Value::as_str)?)?;
-        profile.models.iter().find(|m| m.id == model_id || m.identifier.as_deref() == Some(model_id)).cloned()
+    /// The models of the run's profile its dispatched name could be.
+    fn profile_models(&self, manifest: &Value, dispatched: &str) -> Vec<darkmux_types::ProfileModel> {
+        let Some(profile) = self.registry.as_ref().and_then(|r| r.profiles.get(manifest.get("profile").and_then(Value::as_str)?)) else {
+            return Vec::new();
+        };
+        profile_models_named(&profile.models, dispatched)
     }
 
     /// The darkmux that ran it: stated, recorded in the manifest, or the

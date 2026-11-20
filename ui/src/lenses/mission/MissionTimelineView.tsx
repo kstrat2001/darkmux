@@ -8,7 +8,7 @@
  * it.
  */
 import type { StepPhases } from "./graph";
-import { StepMeterEl, StepRow } from "./StepRow";
+import { PhaseTime, StepMeterEl, StepRow } from "./StepRow";
 import { WorkStatus, workStatusKind } from "../../components/WorkStatus";
 import { groupTimeline, type TaskAggMetrics } from "./timeline";
 import type { GraphEdge, GraphNode, MetricsMap } from "./graph";
@@ -114,13 +114,14 @@ export function MissionTimelineView({
   return (
     <div className="timeline missionlens__timeline">
       {note ? <div className="tlnote">{note}</div> : null}
-      {groups.map(({ phase, tasks }) => (
+      {groups.map(({ phase, tasks, elapsed }) => (
         <div key={phase.id} className={`tlphase s-${phase.status}`} data-status-kind={workStatusKind(phase.status, phase.abandonedReason)}>
           <div className="tlph-hd">
             <span className="tlph-dot" />
             <span className="tlph-name" title={phase.description || phase.label}>
               {phase.label}
             </span>
+            <PhaseTime elapsed={elapsed} className="tlph-time" />
             <WorkStatus status={phase.status} abandonReason={phase.abandonedReason} className="tlph-tag" />
             {/* (#2406, post-review) The counts breakdown ("7 complete · 1
                errored · 4 running") renders as REAL TEXT, not a `title=`:

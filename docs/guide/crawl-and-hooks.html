@@ -126,6 +126,8 @@ graph:
 phase.start
 step.complete           <span class="comment"># one per rule: the plan it wrote</span>
 step.start
+step.queue.wait         <span class="comment"># only when the unit waits its turn: its model's wave, or its endpoint's call slot</span>
+step.queue.resume       <span class="comment"># it took its slot; its work starts here</span>
 dispatch.start          <span class="comment"># local-tier: role=crawler, the assembled prompt, the model</span>
 dispatch.turn / dispatch.tool / dispatch.reasoning   <span class="comment"># the loop, repeated per turn</span>
 dispatch.rest           <span class="comment"># only when runtime.turn_delay_ms is set — see the knobs table below</span>

@@ -574,7 +574,7 @@ fn post_json_with(
     let agent = base_agent(&target.0)
         .timeout_connect(Duration::from_secs(5))
         .timeout_read(read_timeout)
-        .timeout_write(Duration::from_secs(30))
+        .timeout_write(crate::SUBMISSION_WRITE_TIMEOUT)
         .build();
     let req = agent
         .post(&format!("{}{path}", target.base()))

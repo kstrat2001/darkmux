@@ -47,6 +47,14 @@
 //!    itself exited, something it spawned is holding the pipe; that
 //!    process group is killed before the runner returns, so a
 //!    `test_command` that starts a daemon leaks nothing.
+//!
+//! 4. **The output is bounded as well as the time.** Each stream keeps its
+//!    first and last bytes, [`OUTPUT_CAP_BYTES`] in all, while the drains
+//!    keep reading so the child never blocks on a full pipe. A stream that
+//!    wrote more carries a note where its middle was, naming how many bytes
+//!    were cut and the cap (see [`CappedStream`]). Without it a chatty
+//!    command (`yes`) buffered everything it wrote for the whole 600 s
+//!    default bound.
 
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -69,8 +77,102 @@ enum DrainSource {
     Err(std::process::ChildStderr),
 }
 
-fn snapshot(buf: &std::sync::Mutex<Vec<u8>>) -> Vec<u8> {
-    buf.lock().map(|b| b.clone()).unwrap_or_default()
+/// A stream's kept bytes and how many the cap cut, read under one lock so
+/// the two always agree.
+fn snapshot(buf: &std::sync::Mutex<CappedStream>, name: &str) -> (Vec<u8>, u64) {
+    buf.lock().map(|b| (b.to_bytes(name), b.cut())).unwrap_or_default()
+}
+
+/// How many bytes the output cap cut from each stream of a finished
+/// command; zero for a stream that fit, and for every other outcome.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OutputCut {
+    pub stdout: u64,
+    pub stderr: u64,
+}
+
+/// How every cut note begins, so a reader that fails on cut text (a JSON
+/// parse) can say the text was cut rather than only that it is malformed.
+pub const CUT_NOTE_PREFIX: &str = "[darkmux cut ";
+
+/// Whether `text` carries a cut note: it is a bounded command's output that
+/// lost its middle to [`OUTPUT_CAP_BYTES`].
+pub fn carries_cut_note(text: &str) -> bool {
+    text.contains(CUT_NOTE_PREFIX)
+}
+
+/// The most bytes of each stream (stdout, stderr) a bounded command keeps.
+///
+/// Sized for every reader of that output: `procedural.shell`'s step output
+/// (what `{{from.output}}`, a `grow` and the viewer read; the shipped
+/// commands print a few KiB), a lab verify command's `verify-output.txt`
+/// (whose test summary and coverage table are at the end, inside the
+/// kept tail), and the Docker, `curl` and `tar` calls darkmux makes itself
+/// (an id, a short JSON document, an error line). The gate reads only the
+/// exit code. At the dispatch-free concurrency default of 8, the whole
+/// mission holds at most 16 MiB of command output at once.
+pub const OUTPUT_CAP_BYTES: usize = 1024 * 1024;
+
+/// One stream of a bounded command: its first bytes, its last bytes, and
+/// how many it wrote in all. Three quarters of the cap go to the head
+/// (where a command echoes what it is doing and a JSON document starts)
+/// and one quarter to the tail (where a test run prints its verdict), the
+/// same split `dispatch_internal`'s `cap_result_middle` uses for a tool
+/// result. It never holds more than its cap, whatever the command writes.
+struct CappedStream {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    total: u64,
+    cap: usize,
+}
+
+impl CappedStream {
+    fn new(cap: usize) -> Self {
+        Self { head: Vec::new(), tail: std::collections::VecDeque::new(), total: 0, cap }
+    }
+
+    fn head_cap(&self) -> usize {
+        self.cap / 4 * 3
+    }
+
+    fn tail_cap(&self) -> usize {
+        self.cap - self.head_cap()
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.total += chunk.len() as u64;
+        let room = self.head_cap().saturating_sub(self.head.len());
+        let (to_head, rest) = chunk.split_at(chunk.len().min(room));
+        self.head.extend_from_slice(to_head);
+        self.tail.extend(rest);
+        let over = self.tail.len().saturating_sub(self.tail_cap());
+        self.tail.drain(..over);
+    }
+
+    /// How many bytes the cap dropped from the middle.
+    fn cut(&self) -> u64 {
+        self.total - (self.head.len() + self.tail.len()) as u64
+    }
+
+    /// The kept bytes, with a note between head and tail when the cap cut
+    /// any. The cut is by byte, so a multi-byte character at either edge
+    /// reads as a replacement character once decoded.
+    fn to_bytes(&self, name: &str) -> Vec<u8> {
+        let mut out = self.head.clone();
+        if self.cut() > 0 {
+            out.extend_from_slice(cut_note(self.cut(), name, self.cap).as_bytes());
+        }
+        out.extend(self.tail.iter());
+        out
+    }
+}
+
+/// The in-band note standing where a stream's middle was cut.
+fn cut_note(cut: u64, name: &str, cap: usize) -> String {
+    format!(
+        "\n{CUT_NOTE_PREFIX}{cut} bytes from the middle of {name}: a step command keeps the first and last \
+         bytes of each stream, up to a {cap}-byte cap]\n"
+    )
 }
 
 /// What a bounded run produced. Every arm is a fact a caller can record —
@@ -97,13 +199,14 @@ pub enum Bounded {
 }
 
 /// The shared buffer a drain thread fills, and the channel it signals EOF on.
-type DrainBuf = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+type DrainBuf = std::sync::Arc<std::sync::Mutex<CappedStream>>;
 
 /// Start one drain thread per pipe (see the comment at its call site for why
-/// they signal rather than being joined).
-fn spawn_drains(child: &mut std::process::Child) -> (DrainBuf, DrainBuf, std::sync::mpsc::Receiver<()>) {
-    let out_buf = DrainBuf::default();
-    let err_buf = DrainBuf::default();
+/// they signal rather than being joined). Each keeps reading to EOF however
+/// much the cap drops, so the child never blocks on a full pipe.
+fn spawn_drains(child: &mut std::process::Child, cap: usize) -> (DrainBuf, DrainBuf, std::sync::mpsc::Receiver<()>) {
+    let out_buf = DrainBuf::new(std::sync::Mutex::new(CappedStream::new(cap)));
+    let err_buf = DrainBuf::new(std::sync::Mutex::new(CappedStream::new(cap)));
     let (eof_tx, eof_rx) = std::sync::mpsc::channel::<()>();
     for (pipe, buf) in [
         (child.stdout.take().map(DrainSource::Out), out_buf.clone()),
@@ -122,7 +225,7 @@ fn spawn_drains(child: &mut std::process::Child) -> (DrainBuf, DrainBuf, std::sy
                         break;
                     }
                     if let Ok(mut b) = buf.lock() {
-                        b.extend_from_slice(&chunk[..n]);
+                        b.push(&chunk[..n]);
                     }
                 }
             }
@@ -162,17 +265,24 @@ pub fn configured_timeout() -> Duration {
 /// business) for the same reason `run_security_bounded` does: the runner
 /// owns the BOUND, not the command.
 pub fn run_bounded(cmd: Command, timeout: Duration) -> Bounded {
+    run_bounded_with_cuts(cmd, timeout).0
+}
+
+/// [`run_bounded`], also saying how many bytes the output cap cut from each
+/// stream, for a caller that records an incomplete output as such.
+pub fn run_bounded_with_cuts(cmd: Command, timeout: Duration) -> (Bounded, OutputCut) {
     // (#3074) A signal that landed before this spawn must stop the command
     // from ever starting; the poll in `spawn_and_poll` only notices it after
     // the child is already running.
     if darkmux_types::interrupt::is_set() {
-        return Bounded::Interrupted;
+        return (Bounded::Interrupted, OutputCut::default());
     }
-    spawn_and_poll(cmd, timeout)
+    spawn_and_poll(cmd, timeout, OUTPUT_CAP_BYTES)
 }
 
-/// [`run_bounded`]'s spawn, drain and poll loop.
-fn spawn_and_poll(mut cmd: Command, timeout: Duration) -> Bounded {
+/// [`run_bounded`]'s spawn, drain and poll loop, keeping at most `cap`
+/// bytes of each stream.
+fn spawn_and_poll(mut cmd: Command, timeout: Duration, cap: usize) -> (Bounded, OutputCut) {
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -192,7 +302,7 @@ fn spawn_and_poll(mut cmd: Command, timeout: Duration) -> Bounded {
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return Bounded::SpawnFailed(e),
+        Err(e) => return (Bounded::SpawnFailed(e), OutputCut::default()),
     };
     let pid = child.id();
     darkmux_types::child_registry::register(pid);
@@ -205,7 +315,7 @@ fn spawn_and_poll(mut cmd: Command, timeout: Duration) -> Bounded {
     // then never returns — reintroducing exactly the unbounded wait this
     // module exists to remove. Proven by this module's own tests: the
     // first cut joined, and the grandchild test hung the whole suite.
-    let (out_buf, err_buf, eof_rx) = spawn_drains(&mut child);
+    let (out_buf, err_buf, eof_rx) = spawn_drains(&mut child, cap);
     // (#2479 audit) `Instant`, deliberately: `started` bounds THIS spawned
     // child (an operator's `test_command`), not wall-clock time. Same
     // reasoning as its sibling in `gestalt_host::lms_host` — if the host
@@ -253,30 +363,30 @@ fn spawn_and_poll(mut cmd: Command, timeout: Duration) -> Bounded {
                     // signal fails with ESRCH and reaches nothing — so the
                     // window is a no-op, not a mis-target.
                     kill_group(pid);
+                    sweep_group(pid);
                 }
-                break Bounded::Finished {
-                    success: status.success(),
-                    code: status.code(),
-                    stdout: snapshot(&out_buf),
-                    stderr: snapshot(&err_buf),
-                };
+                let ((stdout, out_cut), (stderr, err_cut)) = (snapshot(&out_buf, "stdout"), snapshot(&err_buf, "stderr"));
+                let finished = Bounded::Finished { success: status.success(), code: status.code(), stdout, stderr };
+                break (finished, OutputCut { stdout: out_cut, stderr: err_cut });
             }
             Ok(None) => {}
             // The child is unwaitable (already reaped by something else) —
             // treat it as finished-unknown rather than spinning forever.
             Err(e) => {
-                break Bounded::SpawnFailed(e);
+                break (Bounded::SpawnFailed(e), OutputCut::default());
             }
         }
         if darkmux_types::interrupt::is_set() {
             kill_group(pid);
             let _ = child.wait();
-            break Bounded::Interrupted;
+            sweep_group(pid);
+            break (Bounded::Interrupted, OutputCut::default());
         }
         if started.elapsed() >= timeout {
             kill_group(pid);
             let _ = child.wait();
-            break Bounded::TimedOut { seconds: timeout.as_secs() };
+            sweep_group(pid);
+            break (Bounded::TimedOut { seconds: timeout.as_secs() }, OutputCut::default());
         }
         std::thread::sleep(POLL);
     };
@@ -300,6 +410,53 @@ fn kill_group(pid: u32) {
 
 #[cfg(not(unix))]
 fn kill_group(_pid: u32) {}
+
+/// How many times [`sweep_group`] looks for a member left in the group.
+const SWEEP_ROUNDS: u32 = 50;
+
+/// (#2823) After [`kill_group`] and the reap of its leader: SIGKILL the
+/// group again for as long as a member is left in it. A child the command
+/// was forking at the moment of the first kill is not yet a member that
+/// kill reaches, and lives on in the dead group (measured on macOS: 7 of
+/// 10 single kills against a shell forking in a loop left one). The group
+/// id stays reserved while any member is left (see `kill_group`'s F2 note
+/// in `run_bounded`), and each kill follows a look that found a member, so
+/// it never reaches another group. Bounded: a command that keeps forking
+/// faster than it is killed is left after [`SWEEP_ROUNDS`] looks.
+///
+/// On Linux a group kill does reach a child forked during it, so the sweep
+/// finds nothing left to kill there. Linux does count a group whose only
+/// members are zombies (exited, not yet reaped by init) as having members,
+/// so the sweep can look again for up to [`SWEEP_ROUNDS`] x 10 ms (about
+/// 0.5 s) while they are reaped: a bounded delay, never a leak.
+#[cfg(unix)]
+fn sweep_group(pid: u32) {
+    sweep_group_with(|| group_has_members(pid), || kill_group(pid), Duration::from_millis(10));
+}
+
+/// [`sweep_group`]'s loop: `kill` only after `has_members` said yes, and
+/// `nap` between rounds.
+#[cfg(unix)]
+fn sweep_group_with(mut has_members: impl FnMut() -> bool, mut kill: impl FnMut(), nap: Duration) {
+    for _ in 0..SWEEP_ROUNDS {
+        if !has_members() {
+            return;
+        }
+        kill();
+        std::thread::sleep(nap);
+    }
+}
+
+#[cfg(not(unix))]
+fn sweep_group(_pid: u32) {}
+
+/// Whether process group `pid` has a member this process may signal.
+/// macOS answers `EPERM` for a group whose only members are zombies, which
+/// reads as empty here: there is nothing left to kill.
+#[cfg(unix)]
+fn group_has_members(pid: u32) -> bool {
+    unsafe { libc::kill(-(pid as libc::pid_t), 0) == 0 }
+}
 
 #[cfg(test)]
 mod tests {
@@ -436,6 +593,181 @@ mod tests {
         assert!(left.is_empty(), "a forked grandchild survived the group kill: {left}");
     }
 
+    /// (#2823) A command that forks in a loop, at most four live children at
+    /// a time (it kills each batch itself), so a run holds the burst small
+    /// on any machine. It writes `started` first. On macOS one group kill
+    /// against it left a child forked mid-kill alive in 6 of 20 tries.
+    fn forking_loop(m: &str, started: &std::path::Path) -> String {
+        format!(
+            ": > '{}'; while :; do sleep {m} & a=$!; sleep {m} & b=$!; sleep {m} & c=$!; sleep {m} & d=$!; \
+             kill $a $b $c $d 2>/dev/null; done",
+            started.display()
+        )
+    }
+
+    /// How many runs each kill-path test makes at once: one run's kill lands
+    /// mid-fork about a third of the time, so with the sweep removed these
+    /// leave a survivor all but certainly.
+    const FORK_TRIALS: usize = 16;
+
+    /// `run(i, started_i)` for each trial on threads of its own, each with
+    /// its own `started` file under `dir`; their outcomes.
+    fn run_trials(dir: &std::path::Path, run: impl Fn(&std::path::Path) -> Bounded + Sync) -> Vec<Bounded> {
+        std::thread::scope(|scope| {
+            let runs: Vec<_> = (0..FORK_TRIALS)
+                .map(|i| {
+                    let (run, started) = (&run, dir.join(format!("started-{i}")));
+                    scope.spawn(move || run(&started))
+                })
+                .collect();
+            runs.into_iter().map(|r| r.join().unwrap()).collect()
+        })
+    }
+
+    /// Nothing named `sleep <m>` is left running half a second on.
+    fn assert_none_left(m: &str, path: &str) {
+        std::thread::sleep(Duration::from_millis(500));
+        let left = survivors_now(m);
+        let _ = Command::new("pkill").args(["-f", &format!("sleep {m}")]).status();
+        assert!(left.is_empty(), "children of a command killed on the {path} path were left running: {left}");
+    }
+
+    /// (#2823) Each `run_bounded` kill path sweeps the group: a command
+    /// forking when it is killed leaves nothing running. With that path's
+    /// sweep removed these fail on macOS. Linux's group kill reaches a child
+    /// forked during it, so there they hold either way.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn a_command_forking_when_its_bound_runs_out_leaves_nothing_running() {
+        let (m, dir) = (marker(9), tempfile::tempdir().unwrap());
+        let outs = run_trials(dir.path(), |started| run_bounded(sh(&forking_loop(&m, started)), Duration::from_millis(100)));
+        assert!(outs.iter().all(|o| matches!(o, Bounded::TimedOut { .. })), "{outs:?}");
+        assert_none_left(&m, "timeout");
+    }
+
+    /// (#2823) The interrupt path, as above.
+    #[test]
+    #[serial_test::serial] // the interrupt flag is process-wide
+    #[cfg(unix)]
+    fn a_command_forking_when_a_signal_is_caught_leaves_nothing_running() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        let (m, dir) = (marker(10), tempfile::tempdir().unwrap());
+        darkmux_types::interrupt::reset_for_test();
+        let raiser = {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while (0..FORK_TRIALS).any(|i| !dir.join(format!("started-{i}")).exists()) {
+                    assert!(Instant::now() < deadline, "the commands never all started");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                darkmux_types::interrupt::simulate_sigterm_for_test();
+            })
+        };
+        let outs = run_trials(dir.path(), |started| run_bounded(sh(&forking_loop(&m, started)), Duration::from_secs(60)));
+        let raised = raiser.join();
+        darkmux_types::interrupt::reset_for_test();
+        raised.expect("the raiser must see every command running, then raise the flag");
+        assert!(outs.iter().all(|o| matches!(o, Bounded::Interrupted)), "{outs:?}");
+        assert_none_left(&m, "interrupt");
+    }
+
+    /// (#2823) The finished path, as above: the command exits at once and
+    /// leaves the forking loop holding its output, which `run_bounded` kills
+    /// once the drain grace is out.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn a_finished_command_whose_leftover_is_forking_leaves_nothing_running() {
+        let (m, dir) = (marker(11), tempfile::tempdir().unwrap());
+        let outs = run_trials(dir.path(), |started| {
+            run_bounded(sh(&format!("( {} ) & :", forking_loop(&m, started))), Duration::from_secs(60))
+        });
+        assert!(outs.iter().all(|o| matches!(o, Bounded::Finished { success: true, .. })), "{outs:?}");
+        assert_none_left(&m, "finished");
+    }
+
+    /// (#2823) The sweep kills only after a look found a member, and stops
+    /// at the first look that finds none, so it never signals a group that
+    /// has emptied (whose id could be reused).
+    #[test]
+    #[cfg(unix)]
+    fn the_sweep_kills_only_after_a_look_finds_a_member() {
+        for (members, kills) in [(vec![false], 0), (vec![true, true, false], 2), (vec![true; 60], SWEEP_ROUNDS as usize)] {
+            let looks = std::cell::RefCell::new(members.clone().into_iter());
+            let log = std::cell::RefCell::new(Vec::new());
+            sweep_group_with(
+                || {
+                    log.borrow_mut().push("look");
+                    looks.borrow_mut().next().unwrap_or(false)
+                },
+                || log.borrow_mut().push("kill"),
+                Duration::ZERO,
+            );
+            let log = log.into_inner();
+            assert_eq!(log.iter().filter(|e| **e == "kill").count(), kills, "{members:?}: {log:?}");
+            assert!(log.windows(2).all(|w| w != ["kill", "kill"]) && log.first() != Some(&"kill"), "a kill with no look before it: {log:?}");
+        }
+    }
+
+    /// (#2823) A live group has members; once its only member is killed and
+    /// reaped it has none.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn a_group_has_members_until_its_last_one_is_reaped() {
+        use std::os::unix::process::CommandExt as _;
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        assert!(group_has_members(child.id()), "a running group leader is a member");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!group_has_members(child.id()), "a reaped group with no one left has no members");
+    }
+
+    /// (#2823) A member left in the group after its leader is killed and
+    /// reaped is killed too. This is the state a group kill leaves when the
+    /// command was forking at that moment: the new child was not yet a
+    /// member the kill reached (measured on macOS: one `kill(-pgid)` against
+    /// a shell forking in a loop left a survivor in 7 of 10 tries, a second
+    /// kill after the reap in 0 of 10), and it lives on in the dead group.
+    /// Built here without the race: only the leader is killed.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn a_member_left_after_the_leader_is_reaped_is_swept() {
+        use std::os::unix::process::CommandExt as _;
+        let m = marker(8);
+        let mut cmd = sh(&format!("sleep {m} & wait"));
+        // SAFETY: as in `run_bounded`: only the forked child's own group.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+        let mut leader = cmd.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let member_running = || {
+            let found = Command::new("pgrep").args(["-f", &format!("^sleep {m}")]).output().unwrap();
+            !found.stdout.is_empty()
+        };
+        while !member_running() {
+            assert!(Instant::now() < deadline, "the member `sleep {m}` never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        unsafe { libc::kill(leader.id() as libc::pid_t, libc::SIGKILL) };
+        let _ = leader.wait();
+        sweep_group(leader.id());
+        let left = survivors(&m);
+        let _ = Command::new("pkill").args(["-f", &format!("sleep {m}")]).status();
+        assert!(left.is_empty(), "a member left in the group outlived the sweep: {left}");
+    }
+
     /// (#2361, S4-4) A caught SIGTERM/SIGINT reaches the command: the run
     /// stops promptly, the child's whole group is killed (nothing
     /// orphaned), and the caller gets a fact it can record — which is what
@@ -449,9 +781,12 @@ mod tests {
     /// survivors check had nothing to find, and the poll loop's own
     /// interrupt branch ran only when some other test's timing happened to
     /// reach it (a CRAP wobble on `spawn_and_poll`, 12.1 to 12.3). The
-    /// raiser waits until `pgrep` sees the command (its `sh -c` or its
-    /// `sleep`), which can only exist after `spawn`, so the pre-spawn guard
-    /// is already behind it and the poll loop is the one that sees the flag.
+    /// raiser waits until the command has written a file, which can only
+    /// happen after `spawn`, so the pre-spawn guard is already behind it and
+    /// the poll loop is the one that sees the flag. A file, not `pgrep`:
+    /// a process listing that stalls on a busy host left the flag unraised
+    /// and the test waiting out its bound. That bound is 60 s, so a raiser
+    /// that never raises fails the test rather than hanging it.
     #[test]
     #[serial_test::serial] // the interrupt flag is process-wide
     #[cfg(unix)]
@@ -459,20 +794,23 @@ mod tests {
         // (#3100) It raises the process-wide interrupt flag.
         darkmux_types::run_in_own_process!();
         let m = marker(4);
+        let dir = tempfile::tempdir().unwrap();
+        let started_file = dir.path().join("started");
         darkmux_types::interrupt::reset_for_test();
         let raiser = {
-            let m = m.clone();
+            let started_file = started_file.clone();
             std::thread::spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(10);
-                while survivors_now(&m).is_empty() {
-                    assert!(Instant::now() < deadline, "the command `sleep {m} & wait` never started");
+                while !started_file.exists() {
+                    assert!(Instant::now() < deadline, "the command never started");
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 darkmux_types::interrupt::simulate_sigterm_for_test();
             })
         };
         let started = Instant::now();
-        let out = run_bounded(sh(&format!("sleep {m} & wait")), Duration::from_secs(600));
+        let command = format!(": > '{}'; sleep {m} & wait", started_file.display());
+        let out = run_bounded(sh(&command), Duration::from_secs(60));
         let elapsed = started.elapsed();
         let raised = raiser.join();
         darkmux_types::interrupt::reset_for_test();
@@ -584,6 +922,79 @@ mod tests {
             None => std::env::remove_var(k),
         }
         assert_eq!(timeout, Duration::from_secs(7));
+    }
+
+    /// A command that writes 1 MiB to each stream under a 64 KiB cap keeps
+    /// the head and the tail of each, with a note in between naming how many
+    /// bytes were cut and the cap. The first and last bytes are distinct
+    /// markers, so a head-only or tail-only cut fails here.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn a_command_writing_past_the_output_cap_keeps_its_head_and_tail_and_names_the_cut() {
+        const CAP: usize = 64 * 1024;
+        const BODY: usize = 1024 * 1024;
+        let script = format!(
+            "printf OUT-HEAD; head -c {BODY} /dev/zero | tr '\\0' x; printf OUT-TAIL; \
+             printf ERR-HEAD >&2; head -c {BODY} /dev/zero | tr '\\0' y >&2; printf ERR-TAIL >&2"
+        );
+        let Bounded::Finished { success: true, stdout, stderr, .. } = spawn_and_poll(sh(&script), Duration::from_secs(60), CAP).0 else {
+            panic!("expected a successful Finished");
+        };
+        for (bytes, name, head, tail) in [(&stdout, "stdout", "OUT-HEAD", "OUT-TAIL"), (&stderr, "stderr", "ERR-HEAD", "ERR-TAIL")] {
+            let text = String::from_utf8_lossy(bytes);
+            let cut = BODY + head.len() + tail.len() - CAP;
+            assert!(bytes.len() <= CAP + 512, "{name} kept {} bytes under a {CAP}-byte cap", bytes.len());
+            assert!(text.starts_with(head), "{name} lost its head");
+            assert!(text.ends_with(tail), "{name} lost its tail");
+            assert!(text.contains(&format!("cut {cut} bytes from the middle of {name}")), "{name} has no cut note: {}", &text[..200.min(text.len())]);
+            assert!(text.contains(&format!("{CAP}-byte cap")), "{name}'s note does not name the cap");
+        }
+    }
+
+    /// The cut each stream took is reported alongside the output, and
+    /// agrees with its note; a stream that fit reports none.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn the_cut_is_reported_per_stream() {
+        let (out, cut) = spawn_and_poll(sh("head -c 100 /dev/zero; printf small >&2"), Duration::from_secs(30), 64);
+        assert!(matches!(out, Bounded::Finished { success: true, .. }), "{out:?}");
+        assert_eq!(cut, OutputCut { stdout: 36, stderr: 0 });
+        let Bounded::Finished { stdout, .. } = out else { unreachable!() };
+        assert!(carries_cut_note(&String::from_utf8_lossy(&stdout)));
+        assert!(!carries_cut_note("plain output"));
+    }
+
+    /// The stream never holds more than its cap while a command writes
+    /// past it, which is what bounds memory: checked after every chunk, not
+    /// only at the end.
+    #[test]
+    fn a_capped_stream_never_holds_more_than_its_cap() {
+        const CAP: usize = 64 * 1024;
+        let mut stream = CappedStream::new(CAP);
+        let chunk = [b'x'; 8192];
+        for _ in 0..128 {
+            stream.push(&chunk);
+            assert!(stream.head.len() + stream.tail.len() <= CAP, "held {} bytes", stream.head.len() + stream.tail.len());
+        }
+        assert_eq!(stream.total, 128 * 8192);
+        assert_eq!(stream.cut(), 128 * 8192 - CAP as u64);
+        assert_eq!((stream.head.len(), stream.tail.len()), (CAP / 4 * 3, CAP / 4), "three quarters head, one quarter tail");
+    }
+
+    /// Output that fits the cap comes back byte for byte, with no note; one
+    /// byte over is cut and says so.
+    #[test]
+    fn output_within_the_cap_is_untouched_and_one_byte_over_is_marked() {
+        let mut fits = CappedStream::new(16);
+        fits.push(b"0123456789abcdef");
+        assert_eq!(fits.to_bytes("stdout"), b"0123456789abcdef");
+        let mut over = CappedStream::new(16);
+        over.push(b"0123456789abcdefg");
+        let text = String::from_utf8(over.to_bytes("stdout")).unwrap();
+        assert!(text.starts_with("0123456789ab\n[") && text.ends_with("]\ndefg"), "{text}");
+        assert!(text.contains("cut 1 bytes from the middle of stdout") && text.contains("16-byte cap"), "{text}");
     }
 
     #[test]

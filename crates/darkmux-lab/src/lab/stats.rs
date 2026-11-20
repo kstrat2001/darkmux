@@ -62,7 +62,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Data-shape semver for [`RunStats`], per the repo's additive-minor rule.
-pub const RUN_STATS_SCHEMA_VERSION: &str = "2.3.0";
+pub const RUN_STATS_SCHEMA_VERSION: &str = "2.5.0";
 
 use darkmux_trajectory::DEGENERATE_TAIL_RATIO;
 
@@ -72,6 +72,19 @@ use darkmux_trajectory::DEGENERATE_TAIL_RATIO;
 /// 96-97% at 28-46 W against idle at 0-2% and 0-43 mW. Anything in the middle
 /// would be an artifact of a sample landing on a boundary, not a real state.
 pub const BUSY_GPU_PCT: u64 = 20;
+
+/// (#3402) GPU-rail watts at or under which the GPU drew no more than
+/// background work does (window compositing, a browser, video), whatever
+/// its utilization read.
+///
+/// Measured on an M5 Max over 82,388 telemetry samples (2026-10-01 to
+/// 2026-11-15; the query is in #3613): samples at or above [`BUSY_GPU_PCT`]
+/// utilization fall in two groups, background use under 2 W (6,809 samples)
+/// and model generation from 5 W up (21,177), with 2.5 to 4.5 W nearly
+/// empty (78 samples).
+/// The line sits at the bottom of that gap. Another chip's generation draw
+/// was not measured; a smaller GPU's could sit lower.
+pub const IDLE_GPU_W: f64 = 2.5;
 
 /// Decimal places a renderer must keep when printing a tail ratio.
 ///
@@ -326,6 +339,9 @@ pub struct RunStats {
 
     // --- host -------------------------------------------------------------
     pub gpu_w_busy: Option<f64>,
+    /// (2.4.0, #3402) The highest GPU-rail watts any telemetry sample in the
+    /// run window read, busy or not. `None` where no sample reads a GPU rail.
+    pub gpu_w_max: Option<f64>,
     pub cpu_w_busy: Option<f64>,
     pub pkg_w_busy: Option<f64>,
     /// GPU utilization's duty cycle. `None` where the host reads no GPU
@@ -366,6 +382,33 @@ pub struct RunStats {
     /// Machine-wide, so a PRESSURE reading rather than this run's footprint.
     pub mem_pct_busy_max: Option<u64>,
     pub telemetry_max_gap_ms: Option<u64>,
+    /// (2.5.0) Which machine served the run's model, from the run manifest's
+    /// `model_hardware` snapshot ([`served_hardware`]). `unknown` (a hosted
+    /// seat, another Mac): every host power, energy and thermal figure above
+    /// is absent, each listed in `host_unmeasured`, because this machine's
+    /// telemetry does not describe the machine that did the work; a parallel
+    /// local run can keep this machine busy throughout. `None` when the run
+    /// did not record it (a run from before run manifest 1.3, an endpoint
+    /// that declared no `hardware`, or snapshot entries that disagree): the
+    /// same figures are absent, because this machine's readings cannot be
+    /// attributed to a run that does not say where its model ran. The
+    /// sample counts, `busy_basis` and `telemetry_max_gap_ms` still describe
+    /// the telemetry that was read.
+    pub hardware: Option<darkmux_types::Hardware>,
+    /// (2.5.0) This machine's own readings over the run's window, for a run
+    /// this machine is not known to have served (`hardware` is `unknown` or
+    /// `None`), so what this machine was doing meanwhile is still on record;
+    /// never the run's figures. `None` for a run this machine served, and
+    /// with no telemetry in the window.
+    pub this_machine: Option<MachineReadings>,
+    /// (2.5.0) For a run this machine is not known to have served
+    /// (`hardware` is `unknown` or `None`): how many of its compactions
+    /// (each `compaction.start`, answered or not) went to a model the
+    /// snapshot says this machine served, the run's own draw on this
+    /// machine. `Some(0)` when it made none; `None` when one's model is one
+    /// the snapshot does not place (darkmux cannot say where it ran), and for
+    /// every run this machine served.
+    pub compactor_calls_here: Option<u64>,
 
     /// This session's flow records inside the scanned window. A provenance
     /// count, bounded by the same window as everything else here.
@@ -401,11 +444,7 @@ impl RunStats {
         if !c.streams_terminated {
             out.push("a stream never ended");
         }
-        if !c.have_telemetry_samples {
-            out.push("no host telemetry in the run window");
-        } else if !c.telemetry_covers_run {
-            out.push("host telemetry does not cover the whole run; busy time and energy are withheld");
-        }
+        self.host_caveats(&mut out);
         if c.policy_consistent == Some(false) {
             out.push("the detection policy that ran differs from the one the host resolved");
         }
@@ -420,6 +459,169 @@ impl RunStats {
         }
         out
     }
+
+    /// The caveats about the host figures: whether telemetry landed in the
+    /// run's window, and covered it.
+    fn host_caveats(&self, out: &mut Vec<&'static str>) {
+        let c = &self.checks;
+        if !c.have_telemetry_samples {
+            out.push("no host telemetry in the run window");
+            return;
+        }
+        if !c.telemetry_covers_run {
+            out.push("host telemetry does not cover the whole run; busy time and energy are withheld");
+        }
+    }
+}
+
+/// (2.5.0) This machine's telemetry over a run's window, for a run another
+/// machine served: the same readings as the run's host figures, by the same
+/// busy rule. Energy per token is left out: this machine's watts against
+/// another machine's tokens measure nothing.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct MachineReadings {
+    pub gpu_w_busy: Option<f64>,
+    pub gpu_w_max: Option<f64>,
+    pub cpu_w_busy: Option<f64>,
+    pub pkg_w_busy: Option<f64>,
+    pub gpu_duty_pct: Option<f64>,
+    pub busy_ms: Option<u64>,
+    pub thermal_states_busy: BTreeMap<String, usize>,
+    pub cpu_speed_limit_min: Option<u64>,
+    pub throttled_samples: usize,
+    pub mem_pct_busy_max: Option<u64>,
+    pub board_temp_c_max_busy: Option<f64>,
+    pub fan_rpm_max_busy: Option<u32>,
+}
+
+/// (2.5.0) Which machine served a run's model, from the run's own
+/// `model_hardware` snapshot: what the entries the dispatched name `model`
+/// could be ([`crate::lab::manifest::snapshot_matches`]) agree on, or, when
+/// no entry names it, what every entry agrees on. `None` when the run
+/// recorded no snapshot, an entry declared no hardware, or the entries
+/// disagree. Never read from the registry as it is now: that is not the
+/// run's record.
+pub(crate) fn served_hardware(
+    snapshot: Option<&[crate::lab::manifest::ModelHardware]>,
+    model: Option<&str>,
+) -> Option<darkmux_types::Hardware> {
+    let snapshot = snapshot?;
+    let matches = crate::lab::manifest::snapshot_matches(snapshot, model.unwrap_or_default());
+    match matches.is_empty() {
+        true => agreed(snapshot.iter().map(|e| e.hardware)),
+        false => agreed(matches.into_iter().map(|e| e.hardware)),
+    }
+}
+
+/// (2.5.0) How many of the run's compactions went to a model the snapshot
+/// says this machine served; `None` when one went to a model it does not
+/// place. Each `compaction.start` counts, placed by its `requested_model`,
+/// whether or not a reply followed: a call that timed out, errored or was
+/// killed drew here too, and only one that got a reply writes
+/// `compaction.call`. A trajectory with replies and no starts counts its
+/// replies. Only the entries naming the model place it: a compactor outside
+/// the profile is not placed by what the profile's models say.
+pub(crate) fn compactor_calls_here(trajectory: &str, snapshot: Option<&[crate::lab::manifest::ModelHardware]>) -> Option<u64> {
+    compactor_models(trajectory).iter().try_fold(0, |here, model| match placed(snapshot?, model.as_deref()?)? {
+        darkmux_types::Hardware::SubmittingMachine => Some(here + 1),
+        darkmux_types::Hardware::Unknown => Some(here),
+    })
+}
+
+/// The model each compaction asked for: one per `compaction.start` (`None`
+/// where a start named none), or per `compaction.call` in a trajectory
+/// with no starts.
+fn compactor_models(trajectory: &str) -> Vec<Option<String>> {
+    use darkmux_trajectory::event::{parse_line, TrajectoryEvent};
+    let (mut starts, mut replies) = (Vec::new(), Vec::new());
+    for event in trajectory.lines().filter_map(parse_line) {
+        match event {
+            TrajectoryEvent::CompactionStart(s) => starts.push(s.requested_model),
+            TrajectoryEvent::CompactionCall(c) => replies.push(Some(c.requested_model)),
+            _ => {}
+        }
+    }
+    if starts.is_empty() { replies } else { starts }
+}
+
+/// The machine the snapshot entries naming `model` agree on.
+fn placed(snapshot: &[crate::lab::manifest::ModelHardware], model: &str) -> Option<darkmux_types::Hardware> {
+    agreed(crate::lab::manifest::snapshot_matches(snapshot, model).into_iter().map(|e| e.hardware))
+}
+
+/// The one value every item is, when there is at least one.
+fn agreed(mut all: impl Iterator<Item = Option<darkmux_types::Hardware>>) -> Option<darkmux_types::Hardware> {
+    let first = all.next()??;
+    all.all(|h| h == Some(first)).then_some(first)
+}
+
+/// Why a host figure is absent from a run another machine served.
+const SERVED_ELSEWHERE: &str = "another machine served the run's model (hardware: unknown), so this machine's telemetry does not describe it";
+
+/// Why a host figure is absent from a run that recorded no hardware.
+const NO_HARDWARE: &str = "this run recorded no hardware, so this machine's readings can't be attributed to it";
+
+/// Why this machine's readings are not the run's, or `None` when this
+/// machine served it.
+pub(crate) fn not_attributed(hardware: Option<darkmux_types::Hardware>) -> Option<&'static str> {
+    match hardware {
+        Some(darkmux_types::Hardware::SubmittingMachine) => None,
+        Some(darkmux_types::Hardware::Unknown) => Some(SERVED_ELSEWHERE),
+        None => Some(NO_HARDWARE),
+    }
+}
+
+/// The host figures withheld from a run this machine is not known to have served.
+const WITHHELD_ELSEWHERE: [&str; 15] = [
+    "gpu_w_busy",
+    "gpu_w_max",
+    "cpu_w_busy",
+    "pkg_w_busy",
+    "gpu_duty_pct",
+    "busy_ms",
+    "pkg_j_busy",
+    "pkg_j_per_1k_tokens",
+    "pkg_j_per_1k_reasoning_chars",
+    "thermal_states_busy",
+    "cpu_speed_limit_min",
+    "throttled_samples",
+    "mem_pct_busy_max",
+    "board_temp_c_max_busy",
+    "fan_rpm_max_busy",
+];
+
+/// (2.5.0) Record which machine served the run, and for a run this
+/// machine is not known to have served, move this machine's readings out
+/// of the run's figures.
+fn attribute_host(stats: &mut RunStats, hardware: Option<darkmux_types::Hardware>) {
+    stats.hardware = hardware;
+    if let Some(why) = not_attributed(hardware).filter(|_| stats.checks.have_telemetry_samples) {
+        stats.this_machine = Some(withhold_host(stats, why));
+    }
+}
+
+/// This machine's readings, taken out of `s`, with the energy built on them
+/// cleared and each withheld figure listed in `host_unmeasured`.
+fn withhold_host(s: &mut RunStats, why: &str) -> MachineReadings {
+    let kept = MachineReadings {
+        gpu_w_busy: s.gpu_w_busy.take(),
+        gpu_w_max: s.gpu_w_max.take(),
+        cpu_w_busy: s.cpu_w_busy.take(),
+        pkg_w_busy: s.pkg_w_busy.take(),
+        gpu_duty_pct: s.gpu_duty_pct.take(),
+        busy_ms: s.busy_ms.take(),
+        thermal_states_busy: std::mem::take(&mut s.thermal_states_busy),
+        cpu_speed_limit_min: s.cpu_speed_limit_min.take(),
+        throttled_samples: std::mem::take(&mut s.throttled_samples),
+        mem_pct_busy_max: s.mem_pct_busy_max.take(),
+        board_temp_c_max_busy: s.board_temp_c_max_busy.take(),
+        fan_rpm_max_busy: s.fan_rpm_max_busy.take(),
+    };
+    (s.pkg_j_busy, s.pkg_j_per_1k_tokens, s.pkg_j_per_1k_reasoning_chars) = (None, None, None);
+    for field in WITHHELD_ELSEWHERE {
+        s.host_unmeasured.insert(field.to_string(), why.to_string());
+    }
+    kept
 }
 
 // ---------------------------------------------------------------------------
@@ -860,7 +1062,21 @@ pub fn compute_from_dir(run_dir: &Path, flows_dir: &Path) -> Result<RunStats> {
     let run_id = run_dir.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
     let mut stats = derive_stats(run_id, &fold, flows, verify, ok);
     stats.verify_ungated = verify_ungated;
+    attribute_run(&mut stats, run_dir, manifest.as_ref().and_then(|m| m.model_hardware.as_deref()));
     Ok(stats)
+}
+
+/// (2.5.0) Which machine served the run, from its snapshot, and for a run
+/// this machine is not known to have served, its compactions here.
+fn attribute_run(stats: &mut RunStats, run_dir: &Path, snapshot: Option<&[crate::lab::manifest::ModelHardware]>) {
+    let hardware = served_hardware(snapshot, stats.model.as_deref());
+    attribute_host(stats, hardware);
+    if not_attributed(hardware).is_some() {
+        // Read again only for such a run: the fold keeps no compactor
+        // model names.
+        let trajectory = std::fs::read_to_string(run_dir.join(darkmux_trajectory::TRAJECTORY_FILE)).unwrap_or_default();
+        stats.compactor_calls_here = compactor_calls_here(&trajectory, snapshot);
+    }
 }
 
 pub(crate) fn derive_stats(
@@ -960,6 +1176,7 @@ pub(crate) fn derive_stats(
         },
         bounds: flows.bounds.clone(),
         gpu_w_busy: host.gpu_w_busy,
+        gpu_w_max: host.gpu_w_max,
         cpu_w_busy: host.cpu_w_busy,
         pkg_w_busy: host.pkg_w.map(|v| round(v, 1)),
         gpu_duty_pct: host.duty,
@@ -978,6 +1195,11 @@ pub(crate) fn derive_stats(
         throttled_samples: host.throttled_samples,
         mem_pct_busy_max: host.mem_pct_busy_max,
         telemetry_max_gap_ms: host.max_gap_ms,
+        // Set by `compute_from_dir` from the run manifest, which
+        // `derive_stats` does not read.
+        hardware: None,
+        this_machine: None,
+        compactor_calls_here: None,
         flow_records_in_window: flows.records_for_session,
         flow_scan: flows.scan.clone(),
         checks: RunChecks {
@@ -1198,6 +1420,7 @@ fn host_unmeasured(samples: &[Sample], host: &HostFigures) -> BTreeMap<String, S
     }
     let unread = [
         ("gpu_w_busy", host.gpu_w_busy.is_none() && samples.iter().all(|s| s.w_gpu.is_none()), "a GPU power rail"),
+        ("gpu_w_max", host.gpu_w_max.is_none(), "a GPU power rail"),
         ("cpu_w_busy", host.cpu_w_busy.is_none() && samples.iter().all(|s| s.w_cpu.is_none()), "a CPU power rail"),
         ("thermal_states_busy", samples.iter().all(|s| s.thermal_state.is_none()), "a thermal pressure state"),
         ("cpu_speed_limit_min", samples.iter().all(|s| s.cpu_speed_limit_pct.is_none()), "a CPU speed limit"),
@@ -1226,6 +1449,7 @@ struct HostFigures {
     samples_busy: usize,
     pkg_w: Option<f64>,
     gpu_w_busy: Option<f64>,
+    gpu_w_max: Option<f64>,
     cpu_w_busy: Option<f64>,
     duty: Option<f64>,
     busy_ms: Option<u64>,
@@ -1268,6 +1492,7 @@ impl HostFigures {
             samples_busy: busy.len(),
             pkg_w: mean(busy.iter().map(|s| s.w_total)),
             gpu_w_busy: mean(busy.iter().filter_map(|s| s.w_gpu)).map(|v| round(v, 1)),
+            gpu_w_max: flows.samples.iter().filter_map(|s| s.w_gpu).reduce(f64::max).map(|v| round(v, 1)),
             cpu_w_busy: mean(busy.iter().filter_map(|s| s.w_cpu)).map(|v| round(v, 1)),
             // A duty from stream bookends is not a GPU figure, so it is not
             // reported as one; `busy_ms` still carries it.

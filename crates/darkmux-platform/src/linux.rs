@@ -100,16 +100,13 @@ impl Platform for LinuxPlatform {
         tiers_from_policies(read_policies_with_freq(), &online_cpus()).into_iter().map(|(_, mhz)| mhz).collect()
     }
 
-    /// The SMC's `Heatpipe Power` sensor (hwmon, Asahi's `macsmc_hwmon`):
-    /// it follows SoC load, ~2.6 W idle to ~20 W with every CPU busy on an
-    /// M2 (#3331), and there is no CPU, GPU or ANE split beside it.
-    fn package_power_mw(&self) -> Option<f64> {
-        package_mw_from_hwmon(&read_hwmon())
-    }
-
-    /// Every labeled hwmon temperature, and the fastest fan.
-    fn board_sensors(&self) -> Option<crate::BoardSensors> {
-        board_sensors_from_hwmon(&read_hwmon())
+    /// One hwmon read (#3621). Power is the SMC's `Heatpipe Power` sensor
+    /// (Asahi's `macsmc_hwmon`): it follows SoC load, ~2.6 W idle to ~20 W
+    /// with every CPU busy on an M2 (#3331), and there is no CPU, GPU or ANE
+    /// split beside it. Sensors are every labeled hwmon temperature, and the
+    /// fastest fan.
+    fn board_readings(&self) -> crate::BoardReadings {
+        board_readings_from(read_hwmon)
     }
 
     /// `/proc/<pid>/stat` field 22: the start time in clock ticks since
@@ -170,6 +167,12 @@ impl Platform for LinuxPlatform {
     /// From `/bin/sh`'s ELF interpreter: musl where it is `ld-musl-*`
     /// (Alpine's busybox, `gcompat` installed or not), glibc otherwise and
     /// when it cannot be read ([`crate::c_library_of_program`]).
+    /// `ARG_MAX` (a quarter of the stack limit) bounds everything together,
+    /// and `MAX_ARG_STRLEN` (32 pages) bounds each string on its own.
+    fn exec_env_limits(&self) -> crate::ExecEnvLimits {
+        crate::ExecEnvLimits { per_string: crate::page_size().map(crate::linux_max_arg_strlen), total: crate::arg_max() }
+    }
+
     fn c_library(&self) -> Option<crate::CLibrary> {
         Some(crate::c_library_of_program(&shell()))
     }
@@ -233,6 +236,16 @@ impl Platform for LinuxPlatform {
         )
     }
 
+    /// The LISTEN sockets in `/proc/net/tcp` and `tcp6`, every owner's.
+    fn tcp_listening_ports(&self) -> Option<Vec<u16>> {
+        let mut listening = listening_sockets(&read_to_string("/proc/net/tcp")?);
+        listening.extend(listening_sockets(&read_to_string("/proc/net/tcp6").unwrap_or_default()));
+        let mut ports: Vec<u16> = listening.iter().map(|(at, _)| at.port()).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        Some(ports)
+    }
+
     /// The ESTABLISHED sockets in `/proc/net/tcp` and `tcp6` (where a
     /// dual-stack client's socket shows its v4-mapped address) whose other
     /// end is `local`, matched in one pass over every process's fds to the
@@ -273,6 +286,19 @@ impl Platform for LinuxPlatform {
 
     fn process_group(&self, pid: u32) -> Option<u32> {
         crate::unix_process_group(pid)
+    }
+
+    /// The process table from every `/proc/<pid>/stat`.
+    fn in_sandbox_of(&self, pid: u32, leaders: &[u32]) -> Option<bool> {
+        proc_table().map(|table| crate::in_sandbox_of_table(pid, leaders, &table))
+    }
+
+    /// `/proc/<pid>/exe`'s file name, else `/proc/<pid>/comm` (which another
+    /// user's process, a root `docker-proxy` say, still shows).
+    fn process_name(&self, pid: u32) -> Option<String> {
+        let exe = read_link(&format!("/proc/{pid}/exe"));
+        let comm = || read_to_string(&format!("/proc/{pid}/comm"));
+        name_from_exe_or_comm(exe, comm)
     }
 
     /// (#3453) The XDG layout, read from this process's environment.
@@ -592,6 +618,19 @@ fn list_dir(path: &str) -> Vec<String> {
 #[cfg(not(target_os = "linux"))]
 fn list_dir(_path: &str) -> Vec<String> {
     Vec::new()
+}
+
+/// A process's name from its `/proc/<pid>/exe` link (`exe`), else from
+/// `comm`: the link's file name, a deleted binary's ` (deleted)` mark
+/// dropped; the command name, trimmed, when there is no link to read.
+/// Compiled on every OS for its test.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn name_from_exe_or_comm(exe: Option<String>, comm: impl FnOnce() -> Option<String>) -> Option<String> {
+    let from_exe = exe.as_deref().map(|l| l.trim_end_matches(" (deleted)")).and_then(|l| l.rsplit('/').next()).filter(|n| !n.is_empty());
+    match from_exe {
+        Some(name) => Some(name.to_string()),
+        None => comm().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1018,6 +1057,22 @@ pub(crate) fn board_sensors_from_hwmon(inputs: &[HwmonInput]) -> Option<crate::B
     (!temps_c.is_empty() || fan_rpm.is_some()).then_some(crate::BoardSensors { temps_c, fan_rpm })
 }
 
+/// Power and board sensors from ONE hwmon read (#3621): `read` runs once,
+/// so a host sample pays each sensor read once, not once per answer.
+pub(crate) fn board_readings_from(read: impl FnOnce() -> Vec<HwmonInput>) -> crate::BoardReadings {
+    let inputs = read();
+    crate::BoardReadings { package_power_mw: package_mw_from_hwmon(&inputs), sensors: board_sensors_from_hwmon(&inputs) }
+}
+
+/// Whether an input is of a kind [`board_readings_from`]'s answers use:
+/// power, temperature or fan. Voltages, currents and the rest are never
+/// read: a sensor read can be a device round trip (an NVMe drive's
+/// temperature is a SMART log query), so a sample reads only what it keeps.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn hwmon_kind_is_read(sensor: &str) -> bool {
+    ["power", "temp", "fan"].iter().any(|kind| sensor.starts_with(kind))
+}
+
 /// Every `*_input` under `/sys/class/hwmon`. An input that can't be read or
 /// parsed is left out; that is what an absent sensor reads as.
 #[cfg(target_os = "linux")]
@@ -1030,7 +1085,7 @@ fn read_hwmon() -> Vec<HwmonInput> {
         let Ok(files) = std::fs::read_dir(&dir) else { continue };
         for f in files.flatten() {
             let file = f.file_name().to_string_lossy().into_owned();
-            let Some(sensor) = file.strip_suffix("_input") else { continue };
+            let Some(sensor) = file.strip_suffix("_input").filter(|s| hwmon_kind_is_read(s)) else { continue };
             let Some(value) = std::fs::read_to_string(f.path()).ok().and_then(|v| v.trim().parse().ok()) else { continue };
             let label = std::fs::read_to_string(dir.join(format!("{sensor}_label"))).ok().map(|l| l.trim().to_string());
             out.push(HwmonInput { chip: name.clone(), sensor: sensor.to_string(), label, value });

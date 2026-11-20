@@ -24,6 +24,7 @@ pub mod model_ledger;
 pub mod ownership;
 pub mod process;
 pub mod profiles;
+pub mod registry_write;
 
 /// (#2902 step 5) THE preflight for an entry point that starts work: every
 /// registered `config.json` enum setting its scope consumes and `config.json`'s
@@ -37,6 +38,10 @@ pub mod profiles;
 /// every unmanaged endpoint whose host it cannot read unambiguously
 /// (`config_enum::invalid_endpoint_hosts`), every profile model's `engine_args`
 /// that cannot be used as written (`config_enum::invalid_engine_args`, #3448),
+/// every LM Studio model's `identifier` equal to the model key LM Studio names
+/// a load made without one (`config_enum::colliding_identifiers`),
+/// two models with different ids under one `darkmux:` identifier
+/// (`config_enum::shared_darkmux_identifiers`),
 /// a utility binding on a server darkmux starts (Tensorfold, Flint), whose jobs
 /// do not start servers (`config_enum::utility_on_engine_server`), a second
 /// Flint endpoint (`config_enum::extra_flint_endpoints`, #3453: rec runs one
@@ -77,6 +82,8 @@ pub fn preflight_with(
                 refusal.invalid.extend(config_enum::invalid_endpoint_hosts(&loaded.registry));
                 refusal.invalid.extend(config_enum::misplaced_endpoint_hardware(&loaded.registry));
                 refusal.invalid.extend(config_enum::invalid_engine_args(&loaded.registry));
+                refusal.invalid.extend(config_enum::colliding_identifiers(&loaded.registry));
+                refusal.invalid.extend(config_enum::shared_darkmux_identifiers(&loaded.registry));
                 refusal.invalid.extend(config_enum::utility_on_engine_server(&loaded.registry));
                 refusal.invalid.extend(config_enum::extra_flint_endpoints(&loaded.registry));
                 refusal
@@ -254,6 +261,45 @@ mod user_file_tests {
         assert_eq!(crate::preflight_with(Scope::LabRun, Some(&clean)), Ok(()));
     }
 
+    /// An LM Studio model's `identifier` equal to its model key is the name LM
+    /// Studio gives the operator's own load of it, and any explicit one on a
+    /// variant id cannot tell quantizations apart: every dispatching
+    /// preflight refuses both, naming the key path and the fix.
+    #[test]
+    #[serial_test::serial] // the preflight reads DARKMUX_DEFAULT_ENGINE, which a sibling test sets
+    fn an_identifier_equal_to_the_model_key_is_refused_by_every_dispatching_preflight() {
+        let (_d, path) = write(
+            r#"{"profiles": {"p": {"models": [{"id": "qwen/q", "n_ctx": 1, "identifier": "qwen/q"},
+                {"id": "qwen/q@4bit", "n_ctx": 1, "identifier": "darkmux:coder"}]}}}"#,
+        );
+        for scope in [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun] {
+            let msg = crate::preflight_with(scope, Some(&path)).expect_err("refused").to_string();
+            assert!(msg.contains("profiles.json key `profiles.p.models[0].identifier`"), "{msg}");
+            assert!(msg.contains("`qwen/q`") && msg.contains("darkmux:qwen/q"), "{msg}");
+            // An explicit identifier on a variant id: drop it for the default.
+            assert!(msg.contains("profiles.json key `profiles.p.models[1].identifier`"), "{msg}");
+            assert!(msg.contains("Drop the identifier") && msg.contains("`darkmux:qwen/q@4bit`"), "{msg}");
+        }
+        let (_d, clean) = write(r#"{"profiles": {"p": {"models": [{"id": "qwen/q", "n_ctx": 1, "identifier": "my-q"}]}}}"#);
+        assert_eq!(crate::preflight_with(Scope::Dispatch, Some(&clean)), Ok(()));
+    }
+
+    /// Two models with different ids under one `darkmux:` identifier are
+    /// refused by every dispatching preflight, naming both.
+    #[test]
+    #[serial_test::serial] // the preflight reads DARKMUX_DEFAULT_ENGINE, which a sibling test sets
+    fn a_darkmux_identifier_shared_by_two_models_is_refused_by_every_dispatching_preflight() {
+        let (_d, path) = write(
+            r#"{"profiles": {"p": {"models": [{"id": "old", "n_ctx": 1, "identifier": "darkmux:coder"},
+                {"id": "new", "n_ctx": 1, "identifier": "darkmux:coder"}]}}}"#,
+        );
+        for scope in [Scope::Dispatch, Scope::MissionLaunch, Scope::LabRun] {
+            let msg = crate::preflight_with(scope, Some(&path)).expect_err("refused").to_string();
+            assert!(msg.contains("profiles.json key `profiles.p.models[1].identifier`"), "{msg}");
+            assert!(msg.contains("`darkmux:coder`") && msg.contains("profiles.p.models[0]"), "{msg}");
+        }
+    }
+
     #[test]
     fn the_file_check_reports_every_unknown_key() {
         let (_d, path) = write(&with_key("/profiles/p", "modles"));
@@ -294,6 +340,30 @@ mod wrong_type_tests {
         std::fs::write(&path, with_typo).unwrap();
         let msg = crate::profiles::user_file_problem(&path).unwrap().to_string();
         assert!(msg.contains("unknown key `profiles.bad.models[0].n_ctxx`") && !msg.contains("must be"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod duplicate_key_tests {
+    /// A key written twice in the registry, top level or inside a profile's
+    /// model, is refused naming its path. The registry loader reads a
+    /// `serde_json::Value`, which silently keeps the last copy: the
+    /// operator's first value is dropped with no word, so the gate says it.
+    #[test]
+    fn a_duplicate_registry_key_is_refused_naming_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let doc = serde_json::json!({"profiles": {"p": {"models": [{"n_ctx": 32000, "id": "m"}]}}});
+        for (pointer, want) in [("", "profiles"), ("/profiles/p/models/0", "profiles.p.models[0].n_ctx")] {
+            let (text, key) = darkmux_types::user_files::with_duplicate_key(&doc, pointer);
+            assert_eq!(key, want);
+            std::fs::write(&path, &text).unwrap();
+            assert!(crate::profiles::load_registry_quiet(path.to_str()).is_ok(), "precondition: the lenient load keeps the last copy");
+            let msg = crate::profiles::user_file_problem(&path).expect("refused").to_string();
+            assert!(msg.contains(&format!("duplicate key `{want}`")), "{msg}");
+            let refusal = crate::preflight_with(darkmux_types::config_enum::Scope::Dispatch, Some(path.to_str().unwrap())).unwrap_err();
+            assert!(refusal.to_string().contains(&format!("duplicate key `{want}`")), "{refusal}");
+        }
     }
 }
 

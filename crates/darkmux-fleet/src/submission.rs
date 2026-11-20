@@ -36,6 +36,7 @@
 use crate::job::{Boundary, SubmissionMode, WorkJob, WorkVersion, WORK_JOB_SCHEMA_VERSION};
 use crate::identity::{IdentityProvider, NodeIdentity};
 use crate::peer::TargetError;
+use crate::wait_budget::reply_wait;
 use anyhow::{anyhow, Context, Result};
 use darkmux_types::config::AcceptWorkEntry;
 use darkmux_types::session_id::SessionId;
@@ -318,6 +319,13 @@ pub enum Refusal {
     NoWorkProfile { role: String, detail: String },
     SchemaMismatch { got: String },
     BadRequest(String),
+    /// A waited-on job whose run does not fit one connection here
+    /// ([`crate::WaitBudget::fits`]): refused before it runs, since its
+    /// answer could not reach the sender. `detail` names the bound.
+    TooLongToWait { detail: String },
+    /// A request body over the listener's size limit: refused 413 before
+    /// the rest is read. `detail` is what the limit said.
+    BodyTooLarge { detail: String },
     /// (#2916 stage 2) The job's seat is busy and this machine refuses
     /// (`fleet.busy_policy = refuse`). `what` names what is running.
     Busy { what: String },
@@ -448,8 +456,9 @@ impl Refusal {
     pub fn http_status(&self) -> u16 {
         match self {
             Refusal::Token => 401,
+            Refusal::BodyTooLarge { .. } => 413,
             Refusal::Misaddressed { .. } | Refusal::UidUnconfirmable { .. } => 421,
-            Refusal::SchemaMismatch { .. } | Refusal::BadRequest(_) => 400,
+            Refusal::SchemaMismatch { .. } | Refusal::BadRequest(_) | Refusal::TooLongToWait { .. } => 400,
             Refusal::NoWorkProfile { .. } => 422,
             Refusal::Busy { .. }
             | Refusal::QueueFull { .. }
@@ -484,7 +493,7 @@ impl Refusal {
             Refusal::UtilityProfile { .. } => RefusalCode::ProfileNotAllowed,
             Refusal::NoWorkProfile { .. } => RefusalCode::ProfileUndefined,
             Refusal::SchemaMismatch { .. } => RefusalCode::Version,
-            Refusal::BadRequest(_) => RefusalCode::BadRequest,
+            Refusal::BadRequest(_) | Refusal::TooLongToWait { .. } | Refusal::BodyTooLarge { .. } => RefusalCode::BadRequest,
             Refusal::Busy { .. } | Refusal::QueueFull { .. } | Refusal::TooManyAtOnce { .. } => RefusalCode::Busy,
             Refusal::SeatChanged { .. } => RefusalCode::SeatChanged,
             Refusal::BoundaryUnmanaged { .. } | Refusal::BoundaryUnknown => RefusalCode::Boundary,
@@ -604,6 +613,8 @@ impl Refusal {
                  major version on both machines, and the newer minor on the receiver"
             ),
             Refusal::BadRequest(detail) => format!("{receiver} refused a malformed request: {detail}"),
+            Refusal::TooLongToWait { detail } => format!("{receiver} cannot hold the answer's connection that long: {detail}"),
+            Refusal::BodyTooLarge { detail } => format!("{receiver} refused a request body over its size limit: {detail}"),
             Refusal::ResolutionFailed { detail } => {
                 format!("{receiver} could not resolve a profile for this job ({detail}); retry, and if it repeats, look at {receiver}'s `darkmux serve` log")
             }
@@ -755,7 +766,7 @@ pub fn read_allow_list(path: &std::path::Path) -> std::result::Result<BTreeMap<S
         Err(e) => return Err(format!("reading {}: {e}", path.display())),
     };
     let cfg: darkmux_types::config::DarkmuxConfig =
-        serde_json::from_str(&raw).map_err(|e| format!("{} does not parse: {e}", path.display()))?;
+        serde_json::from_str(&raw).map_err(|e| format!("{} does not parse: {}", path.display(), darkmux_types::user_files::load_error(&e)))?;
     Ok(cfg.fleet.and_then(|f| f.accept_work).unwrap_or_default())
 }
 
@@ -1382,11 +1393,25 @@ fn send_job(mut job: WorkJob, wait: bool, pins: PinPolicy) -> Result<(u16, Submi
     // never binds loopback, so a real provider refuses it).
     let peer = crate::peer::peer_target(&target, &entry, None, port, false, provider.as_ref())?.at_listener(port);
     let peer = settle_pin(peer, &entry, &target, pins, provider.provider_name())?;
-    let read_timeout = if wait {
-        Duration::from_secs(u64::from(job.timeout_seconds).saturating_add(120))
-    } else {
-        Duration::from_secs(60)
-    };
+    deliver(&peer, job, wait, &target, &send_submission)
+}
+
+/// How [`deliver`] sends: [`send_submission`], or a test's recorder.
+type SendSubmission<'a> =
+    &'a dyn Fn(&crate::peer::SettledTarget, &WorkSubmission, Duration, &mut dyn FnMut(&SubmissionReply)) -> Result<(u16, SubmissionReply)>;
+
+/// Send `job` to the settled `peer` (the machine `target`) with
+/// [`reply_wait`]'s read deadline, reporting a waited-on job's `queued`
+/// lines as they arrive, and naming the session to follow when the answer
+/// was lost.
+fn deliver(
+    peer: &crate::peer::SettledTarget,
+    job: WorkJob,
+    wait: bool,
+    target: &str,
+    send: SendSubmission<'_>,
+) -> Result<(u16, SubmissionReply)> {
+    let read_timeout = reply_wait(&job, wait);
     let session_id = job.session_id.clone();
     let submission = WorkSubmission::new(job, wait);
     // (#2916 stage 2) A waited-on job the receiver queued says so as it
@@ -1399,7 +1424,7 @@ fn send_job(mut job: WorkJob, wait: bool, pins: PinPolicy) -> Result<(u16, Submi
             }
         }
     };
-    send_submission(&peer, &submission, read_timeout, &mut on_progress).map_err(|e| match e.downcast::<AnswerLost>() {
+    send(peer, &submission, read_timeout, &mut on_progress).map_err(|e| match e.downcast::<AnswerLost>() {
         Ok(lost) => {
             // The receiver names the run after the allow-list entry it
             // trusts this machine under, normally this machine_id.
@@ -1619,6 +1644,7 @@ fn check_outcome(target: &str, code: u16, reply: SubmissionReply) -> CheckOutcom
 mod tests {
     use super::*;
     use crate::identity::test_node;
+    use crate::wait_budget::{ANSWER_SLACK, SANDBOX_FIRST_USE};
 
     /// (#2988 review) A machine whose Keychain item exists can still have no
     /// token, because `serve.token_keychain` is the switch that reads it. The
@@ -1689,6 +1715,175 @@ mod tests {
             check_scope("studio", None, &a, &j, work("host")),
             Err(Refusal::OutOfScope { item: OutOfScope::Workspace, .. })
         ));
+    }
+
+    /// (#3429) A waited-on agentic job may first wait on its target getting
+    /// what its sandbox needs: a Docker target pulls the runtime image, a
+    /// sandbox on the host fetches its managed toolchain. The sender cannot
+    /// see which, so its wait outlasts either, with the answer's slack after.
+    #[test]
+    fn a_waited_job_outlasts_the_longest_first_use_on_any_sandbox() {
+        use darkmux_crew::managed_toolchain::FIRST_USE_BOUND;
+        use darkmux_crew::runtime_image::PULL_TIMEOUT;
+        for timeout_seconds in [1, 60, 300, 600, crate::job::MAX_WORK_TIMEOUT_SECONDS] {
+            let j = WorkJob { timeout_seconds, ..job(None) };
+            let own = Duration::from_secs(u64::from(timeout_seconds));
+            let wait = reply_wait(&j, true);
+            let at = format!("{wait:?} at --timeout {timeout_seconds}");
+            assert!(wait >= own + PULL_TIMEOUT + ANSWER_SLACK, "a Docker target's pull outlasts {at}");
+            assert!(wait >= own + FIRST_USE_BOUND + ANSWER_SLACK, "a host sandbox's toolchain fetch outlasts {at}");
+            assert_eq!(wait, own + SANDBOX_FIRST_USE + ANSWER_SLACK, "--timeout {timeout_seconds}");
+        }
+    }
+
+    /// (#3429) The read deadline a job is actually sent with is
+    /// [`reply_wait`]'s, waited on or not.
+    #[test]
+    fn a_job_is_sent_with_reply_waits_deadline() {
+        let peer = crate::peer::unverified_target_for_test("http://127.0.0.1:1");
+        for (wait, single_shot) in [(true, false), (true, true), (false, false)] {
+            let single = crate::SingleShotJob {
+                humor: 0,
+                surface: darkmux_flow::payload::RadioSurface::Cli,
+                max_completion_tokens: 512,
+            };
+            let j = WorkJob { timeout_seconds: 300, single_shot: single_shot.then_some(single), ..job(None) };
+            let expected = reply_wait(&j, wait);
+            let sent = std::cell::Cell::new(None);
+            let record = |_: &crate::peer::SettledTarget, _: &WorkSubmission, t: Duration, _: &mut dyn FnMut(&SubmissionReply)| {
+                sent.set(Some(t));
+                Err(anyhow!("recorded"))
+            };
+            assert!(deliver(&peer, j, wait, "studio", &record).is_err());
+            assert_eq!(sent.get(), Some(expected), "wait {wait}, single-shot {single_shot}");
+        }
+    }
+
+    /// (#3429) The one place the sender's allowance comes from: the longer
+    /// of the two first-use bounds, read from where each is enforced.
+    #[test]
+    fn the_first_use_allowance_is_the_longer_enforced_bound() {
+        use darkmux_crew::managed_toolchain::FIRST_USE_BOUND;
+        use darkmux_crew::runtime_image::PULL_TIMEOUT;
+        assert_eq!(SANDBOX_FIRST_USE, PULL_TIMEOUT.max(FIRST_USE_BOUND));
+    }
+
+    /// (#3429) A single-shot job is one tool-less exchange: no sandbox
+    /// starts, so nothing is pulled or fetched, and its wait adds no
+    /// allowance for it.
+    #[test]
+    fn a_single_shot_job_waits_its_own_timeout_and_the_slack() {
+        let single = crate::SingleShotJob {
+            humor: 0,
+            surface: darkmux_flow::payload::RadioSurface::Cli,
+            max_completion_tokens: 512,
+        };
+        let j = WorkJob { timeout_seconds: 300, single_shot: Some(single), ..job(None) };
+        assert_eq!(reply_wait(&j, true), Duration::from_secs(300) + ANSWER_SLACK);
+    }
+
+    /// An unwaited job's one reply is the receiver's acknowledgment: it
+    /// comes before anything runs, so its wait does not grow with the job.
+    #[test]
+    fn an_unwaited_job_waits_only_for_the_acknowledgment() {
+        let j = WorkJob { timeout_seconds: 3600, ..job(None) };
+        assert_eq!(reply_wait(&j, false), Duration::from_secs(60));
+    }
+
+    /// What [`send_job`] reads from this machine, for one test: a roster
+    /// file holding `roster`, the fleet token (or none), a fleet port
+    /// nothing listens on, and the identity provider the sender verifies
+    /// with. Restored on drop.
+    struct SenderEnv {
+        _dir: tempfile::TempDir,
+        prev: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl SenderEnv {
+        fn new(roster: &str, token: Option<&str>) -> Self {
+            let keys = ["DARKMUX_FLEET_FILE", "DARKMUX_SERVE_TOKEN", "DARKMUX_FLEET_LISTENER_PORT"];
+            let prev = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+            let dir = tempfile::TempDir::new().unwrap();
+            let file = dir.path().join("fleet.json");
+            std::fs::write(&file, roster).unwrap();
+            unsafe {
+                std::env::set_var("DARKMUX_FLEET_FILE", &file);
+                std::env::set_var("DARKMUX_FLEET_LISTENER_PORT", "1");
+                match token {
+                    Some(t) => std::env::set_var("DARKMUX_SERVE_TOKEN", t),
+                    None => std::env::remove_var("DARKMUX_SERVE_TOKEN"),
+                }
+            }
+            test_sender_provider::set(Box::new(crate::identity::StaticIdentityProvider {
+                local: test_node("nLOCAL", "macbook-pro", "100.64.0.1"),
+                peers: vec![],
+                down: None,
+            }));
+            SenderEnv { _dir: dir, prev }
+        }
+    }
+
+    impl Drop for SenderEnv {
+        fn drop(&mut self) {
+            test_sender_provider::take();
+            unsafe {
+                for (k, v) in &self.prev {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    const STUDIO_ROSTER: &str =
+        r#"{"version":"2","machines":{"studio":{"id":"studio","address":"127.0.0.1","added_unix_ms":1}}}"#;
+
+    /// Why [`send_job`] sent `job` nowhere, every cause in the chain, with
+    /// [`SenderEnv`] holding `roster` and `token`.
+    fn unsent(roster: &str, token: Option<&str>, job: WorkJob) -> String {
+        let _env = SenderEnv::new(roster, token);
+        format!("{:#}", send_job(job, false, PinPolicy::RequirePinned).unwrap_err())
+    }
+
+    /// Each reason a job cannot leave is named, and nothing is sent: an
+    /// invalid job, an unreadable roster, a machine the roster lacks or
+    /// holds twice, no fleet token, and a target whose address does not
+    /// verify.
+    #[test]
+    #[serial_test::serial]
+    fn a_job_that_cannot_leave_names_why() {
+        let said = unsent(STUDIO_ROSTER, Some("t"), WorkJob { timeout_seconds: 0, ..job(None) });
+        assert!(said.starts_with("validating the job before it leaves"), "{said}");
+
+        let said = unsent("not json", Some("t"), job(None));
+        assert!(said.starts_with("reading the fleet roster"), "{said}");
+
+        let said = unsent(r#"{"version":"2","machines":{}}"#, Some("t"), job(None));
+        assert!(
+            said.contains("machine `studio` is not in this machine's roster")
+                && said.contains("darkmux machine add studio --address"),
+            "{said}"
+        );
+
+        let twice = r#"{"version":"2","machines":{
+            "Studio":{"id":"Studio","address":"127.0.0.1","added_unix_ms":1},
+            "STUDIO":{"id":"STUDIO","address":"127.0.0.1","added_unix_ms":1}}}"#;
+        let said = unsent(twice, Some("t"), job(None));
+        assert!(said.contains("several entries for `studio`"), "{said}");
+
+        let said = unsent(STUDIO_ROSTER, None, job(None));
+        assert!(said.starts_with("no fleet token on this machine: submitting work to studio"), "{said}");
+
+        // The token is there and the roster names the machine; the provider
+        // knows no node at its address, so it is never contacted.
+        let _env = SenderEnv::new(STUDIO_ROSTER, Some("t"));
+        let err = send_job(job(None), false, PinPolicy::RequirePinned).unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<crate::peer::TargetError>(), Some(crate::peer::TargetError::NotOnOverlay { .. })),
+            "{err:#}"
+        );
     }
 
     fn job(profile: Option<&str>) -> WorkJob {
@@ -2100,6 +2295,19 @@ mod tests {
         assert!(read_allow_list(&p).is_err());
     }
 
+    /// An allow-list read failure reaches doctor and the refusal a sender
+    /// gets back, so it never quotes the file: serde's own message for a
+    /// wrong value quotes the value, and a Redis URL carries its password.
+    #[test]
+    fn an_unreadable_allow_list_never_quotes_the_file() {
+        let d = tempfile::TempDir::new().unwrap();
+        let p = d.path().join("config.json");
+        std::fs::write(&p, r#"{"redis":"redis://:hunter2@10.0.0.5:6379/0"}"#).unwrap();
+        let err = read_allow_list(&p).unwrap_err();
+        assert!(err.contains(&p.display().to_string()) && err.contains("line 1"), "names the file and where: {err}");
+        assert!(!err.contains("hunter2") && !err.contains("10.0.0.5"), "the value leaked: {err}");
+    }
+
     /// A 3.x sender speaks v6, whose `session_id` is a free-form string.
     /// Its job must get the version remedy, never a field error from the
     /// 4.0 session grammar it could not have known.
@@ -2176,6 +2384,8 @@ mod tests {
             (Refusal::NoWorkProfile { role: s(), detail: s() }, RefusalCode::ProfileUndefined),
             (Refusal::SchemaMismatch { got: s() }, RefusalCode::Version),
             (Refusal::BadRequest(s()), RefusalCode::BadRequest),
+            (Refusal::TooLongToWait { detail: s() }, RefusalCode::BadRequest),
+            (Refusal::BodyTooLarge { detail: s() }, RefusalCode::BadRequest),
             (Refusal::Busy { what: s() }, RefusalCode::Busy),
             (Refusal::QueueFull { peer: s(), what: s() }, RefusalCode::Busy),
             (Refusal::SeatChanged { profile: s() }, RefusalCode::SeatChanged),

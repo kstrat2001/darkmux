@@ -32,6 +32,18 @@ impl DockerBackend {
         Self::args("run", policy)
     }
 
+    /// `docker <verb>` for `policy`, or a command that fails naming a
+    /// memory limit every backend refuses (`docker` itself reads `0` as no
+    /// limit).
+    fn planned(verb: &str, policy: &SandboxPolicy) -> (Command, SandboxHandle) {
+        if let Some(Err(why)) = policy.limits.memory.as_deref().map(crate::memory_bytes) {
+            return (crate::failing(&why), Self::handle(&policy.name));
+        }
+        let mut cmd = Command::new(PROGRAM);
+        cmd.args(Self::args(verb, policy));
+        (cmd, Self::handle(&policy.name))
+    }
+
     /// `run_args` under another verb (`create` takes the same line).
     fn args(verb: &str, policy: &SandboxPolicy) -> Vec<String> {
         let mut args = strings(&[verb, "--rm", "--init", "--name", &policy.name]);
@@ -236,15 +248,11 @@ impl SandboxBackend for DockerBackend {
     }
 
     fn run(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle) {
-        let mut cmd = Command::new(PROGRAM);
-        cmd.args(Self::run_args(policy));
-        (cmd, Self::handle(&policy.name))
+        Self::planned("run", policy)
     }
 
     fn create(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle) {
-        let mut cmd = Command::new(PROGRAM);
-        cmd.args(Self::args("create", policy));
-        (cmd, Self::handle(&policy.name))
+        Self::planned("create", policy)
     }
 
     fn start(&self, handle: &SandboxHandle) -> Command {
@@ -316,6 +324,8 @@ mod tests {
             mounts: Vec::new(),
             ports: Vec::new(),
             stdin: false,
+            host_services: Vec::new(),
+            refused_ports: Vec::new(),
             host_alias: None,
             user: None,
             env: Vec::new(),
@@ -349,6 +359,8 @@ mod tests {
             ],
             ports: vec![4100, 4200],
             stdin: true,
+            host_services: Vec::new(),
+            refused_ports: Vec::new(),
             host_alias: Some("host.docker.internal".into()),
             user: Some("501:20".into()),
             env: vec![("HOME".into(), "/tmp".into()), ("K".into(), "v w".into())],

@@ -10,11 +10,75 @@ use darkmux_types::config_access::Source;
 /// The row's name in doctor's output and `--json`.
 pub(crate) const SANDBOX_CHECK_NAME: &str = "sandbox";
 
+/// The row naming Seatbelt sandboxes darkmux cannot decide on.
+pub(crate) const UNDECIDED_CHECK_NAME: &str = "undecided sandboxes";
+
+/// A warning row for this host's Seatbelt sandboxes that may still run but
+/// whose launcher darkmux cannot show is its own
+/// ([`darkmux_sandbox::seatbelt::Undecided`]), each with its remedy; no row
+/// when there is none, or this host runs no Seatbelt.
+pub(crate) fn check_undecided_sandboxes() -> Option<Check> {
+    if !darkmux_sandbox::SeatbeltBackend::available() {
+        return None;
+    }
+    undecided_row(&darkmux_sandbox::seatbelt::undecided_sandboxes())
+}
+
+/// [`check_undecided_sandboxes`]'s row for `found`.
+pub(crate) fn undecided_row(found: &[darkmux_sandbox::seatbelt::Undecided]) -> Option<Check> {
+    if found.is_empty() {
+        return None;
+    }
+    let names = found.iter().map(|u| format!("`{}`", u.name)).collect::<Vec<_>>().join(", ");
+    Some(Check {
+        name: UNDECIDED_CHECK_NAME.into(),
+        status: Status::Warn,
+        message: format!("{names} may still run, and darkmux cannot show it started them, so it will neither stop nor remove them"),
+        hint: Some(found.iter().map(|u| u.remedy()).collect::<Vec<_>>().join("\n")),
+    })
+}
+
 /// The sandbox `runtime.sandbox` resolves to here, as every entry point
 /// that starts one resolves it, and the tier that decided.
 pub(crate) fn configured() -> (Result<BackendKind, String>, Source) {
     let source = darkmux_types::config_access::sandbox_with_source().map_or(Source::BuiltIn, |(_, s)| s);
     (darkmux_sandbox::selected(), source)
+}
+
+/// (#3112) The row's name for `sandbox.memory`.
+pub(crate) const SANDBOX_MEMORY_CHECK_NAME: &str = "sandbox memory";
+
+/// (#3112) `sandbox.memory` as every sandbox reads it: the resolved value,
+/// in bytes for a person, and the tier that decided; Fail, naming the form,
+/// when it is not a size every backend takes (every entry point refuses it).
+pub(crate) fn check_sandbox_memory() -> Check {
+    let (value, source) = darkmux_types::config_access::sandbox_memory_with_source();
+    sandbox_memory_row(&value, source)
+}
+
+/// The row for `value` from `source`.
+pub(crate) fn sandbox_memory_row(value: &str, source: Source) -> Check {
+    let name = SANDBOX_MEMORY_CHECK_NAME.to_string();
+    if let Some(problem) = darkmux_types::config_access::sandbox_memory_problem_of(value, source) {
+        return Check { name, status: Status::Fail, message: format!("every entry point refuses it: {problem}"), hint: None };
+    }
+    let bytes = darkmux_types::size::sandbox_memory_bytes(value).unwrap_or_default();
+    let from = match source {
+        Source::Env => format!("`{}`", darkmux_types::config_access::SANDBOX_MEMORY_ENV),
+        Source::Config => "`sandbox.memory` in config.json".to_string(),
+        Source::BuiltIn => "the built-in default".to_string(),
+    };
+    Check {
+        name,
+        status: Status::Pass,
+        message: format!(
+            "`{value}` ({}, from {from}): a sandbox whose processes hold more is stopped. \
+             `darkmux config set sandbox.memory <size>` changes it; a running `darkmux client serve` \
+             keeps the value it started with for its previews until it is restarted",
+            darkmux_types::size::human_bytes(bytes)
+        ),
+        hint: None,
+    }
 }
 
 /// What this host could run besides the configured sandbox, for the row.
@@ -261,6 +325,24 @@ pub(crate) fn docker_only(selected: &Result<BackendKind, String>, name: &str, pr
 
 #[cfg(test)]
 mod tests {
+
+    /// (#3112) The resolved value, for a person, with the tier that
+    /// decided; a value no sandbox takes fails, naming where it was set.
+    #[test]
+    fn the_sandbox_memory_row_names_the_value_and_where_it_came_from() {
+        let default = sandbox_memory_row("4g", Source::BuiltIn);
+        assert_eq!(default.status, Status::Pass);
+        assert!(default.message.contains("`4g` (4 GiB, from the built-in default)"), "{}", default.message);
+        assert!(default.message.contains("`darkmux client serve` keeps the value it started with"), "{}", default.message);
+        let config = sandbox_memory_row("16g", Source::Config);
+        assert!(config.message.contains("16 GiB, from `sandbox.memory` in config.json"), "{}", config.message);
+        let env = sandbox_memory_row("8g", Source::Env);
+        assert!(env.message.contains("from `DARKMUX_SANDBOX_MEMORY`"), "{}", env.message);
+        let bad = sandbox_memory_row("lots", Source::Config);
+        assert_eq!(bad.status, Status::Fail);
+        assert!(bad.message.contains("config.json key `sandbox.memory`") && bad.message.contains("`lots` is not a size"), "{}", bad.message);
+    }
+
     use super::*;
 
     /// (#3112 review) A user mission config whose step message names the
@@ -427,5 +509,20 @@ mod tests {
         assert_eq!(rows.len(), 1, "one row per runtime even when not applicable");
         assert!(rows[0].message.contains("not applicable") && !asked.get(), "{}", rows[0].message);
         assert!(managed_runtime_rows(&Err("no".into()), Vec::new, None)[0].message.contains("not applicable"));
+    }
+
+    /// No undecided sandbox, no row; each one is named in a warning, its
+    /// remedy in the hint.
+    #[test]
+    fn undecided_sandboxes_warn_with_their_remedies() {
+        use darkmux_sandbox::seatbelt::Undecided;
+        assert!(undecided_row(&[]).is_none());
+        let u = |name: &str| Undecided { name: name.into(), dir: std::path::PathBuf::from(format!("/s/{name}")), pid: Some(9) };
+        let row = undecided_row(&[u("a"), u("b")]).unwrap();
+        assert_eq!((row.name.as_str(), row.status), (UNDECIDED_CHECK_NAME, Status::Warn));
+        assert!(row.message.contains("`a`, `b`"), "{}", row.message);
+        let hint = row.hint.unwrap();
+        assert_eq!(hint.lines().count(), 2, "{hint}");
+        assert!(hint.contains("rm -rf '/s/a'") && hint.contains("rm -rf '/s/b'"), "{hint}");
     }
 }

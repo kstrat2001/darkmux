@@ -472,7 +472,12 @@ use std::path::Path;
 //           published on this machine's tailnet over HTTPS by `tailscale
 //           serve`, and removed on shutdown. An older binary refuses a
 //           config carrying it.
-pub const CONFIG_SCHEMA_VERSION: &str = "2.10";
+//   2.11 (#3112): additive `sandbox.memory` (`DARKMUX_SANDBOX_MEMORY`; a
+//           size in Docker's syntax, `6m` to `262144g`, default `4g`), the memory
+//           every sandbox may hold before it is stopped, under Docker and
+//           Seatbelt alike. Written by `init`. An older binary refuses a
+//           config carrying it.
+pub const CONFIG_SCHEMA_VERSION: &str = "2.11";
 
 /// A `config.json` key an older darkmux read (and `init` may have written)
 /// that this one does not. The unknown-key gate (`user_files`) names it with
@@ -861,6 +866,9 @@ pub struct DarkmuxConfig {
     pub audit: Option<AuditConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeBehaviorConfig>,
+    /// (#3112, 2.11) What every sandbox may use: see [`SandboxConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet: Option<FleetConfig>,
     /// (#2706) The battery-charge policy gate — see [`PowerConfig`]'s own
@@ -1467,6 +1475,22 @@ pub struct DetectionConfig {
     pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
+/// (#3112, 2.11) What every sandbox darkmux starts (a dispatch, a contained
+/// command such as a lab run's tests or the mods gate, a client preview) may
+/// use, whichever backend runs it. Visible: `init` writes the default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SandboxConfig {
+    /// The memory a sandbox may hold before it is stopped, in Docker's size
+    /// syntax (`crate::size::SANDBOX_MEMORY_FORM`). Default `4g`
+    /// (`DARKMUX_SANDBOX_MEMORY`). Docker holds it in the container's cgroup;
+    /// Seatbelt watches the sandbox's resident memory once a second. A value
+    /// that is not a size from 6m to 262144g refuses every entry point.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub memory: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schemars(skip)]
+    pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
 /// (#3538) What darkmux does about memory pressure when it starts an engine
 /// server or loads a model into LM Studio. Visible and on by default, like
 /// the thermal block: the operator tunes the file, not the source.
@@ -1820,7 +1844,9 @@ pub struct ServeConfig {
     /// Whether a READ that is not from this machine needs the serve token.
     /// Default `false`: reads are open to whatever reaches the daemon (the
     /// tailnet, behind `tailscale serve`). When `true`, a request is exempt
-    /// only if it arrives on loopback with no reverse-proxy header, and
+    /// only if it arrives on loopback with no reverse-proxy header from a
+    /// process outside every sandbox on the host (`darkmux-serve`'s
+    /// `local_peer`), and
     /// `darkmux serve` refuses to start unless a token resolves. A
     /// non-loopback bind requires it. Never governs execution (#2988).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub read_auth: Option<bool>,
@@ -2193,7 +2219,8 @@ pub struct HookMatch {
     /// permits exactly one flattened field per struct, so a genuinely
     /// nested second field would collide with this one). See
     /// [`HookMatch::payload_predicates`] for the accessor that reads
-    /// them back out.
+    /// them back out. Any other key here is a typo the config gate refuses
+    /// (`user_files::hook_match_issues`): dropped, it would widen the rule.
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -2216,14 +2243,40 @@ impl HookMatch {
     /// field, e.g. `{"action": "dispatch.tool", "payload.tool_name":
     /// "create_finding", "payload.ok": true}` yields `("tool_name",
     /// "create_finding")` and `("ok", true)`. A remaining `extras` key that
-    /// does NOT start with `payload.` is unrelated forward-compat overflow
-    /// and is not a predicate — see the struct doc.
+    /// does NOT start with `payload.` is not a predicate; the config gate
+    /// refuses it (see the field doc).
     pub fn payload_predicates(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
         self.extras
             .iter()
-            .filter_map(|(k, v)| k.strip_prefix("payload.").map(|rest| (rest, v)))
+            .filter_map(|(k, v)| k.strip_prefix(PAYLOAD_PREDICATE_PREFIX).map(|rest| (rest, v)))
+    }
+
+    /// Whether `key` is valid in a hook rule's `match`: a field this struct
+    /// names, a `payload.<path>` predicate with a path, or a `_comment` note.
+    /// THE rule: the config gate (`user_files::hook_match_issues`) refuses
+    /// any other key, and the hooks sink disables a rule that carries one,
+    /// since it would be dropped and widen the rule.
+    pub fn is_match_key(key: &str, fields: &[String]) -> bool {
+        let predicate = key.strip_prefix(PAYLOAD_PREDICATE_PREFIX).is_some_and(|path| !path.is_empty());
+        predicate || key == crate::user_files::COMMENT_KEY || fields.iter().any(|f| f == key)
+    }
+
+    /// The keys this struct names, the `fields` [`Self::is_match_key`] takes.
+    pub fn field_names() -> Vec<String> {
+        crate::user_files::top_level_keys::<HookMatch>()
+    }
+
+    /// Every key this match carries that [`Self::is_match_key`] refuses: the
+    /// named fields are never in `extras`, so these are its typos.
+    pub fn refused_keys(&self) -> Vec<&str> {
+        let fields = Self::field_names();
+        self.extras.keys().map(String::as_str).filter(|k| !Self::is_match_key(k, &fields)).collect()
     }
 }
+
+/// The key form a hook rule's `match` takes beside the fields it names: a
+/// predicate on the record's payload ([`HookMatch::payload_predicates`]).
+pub const PAYLOAD_PREDICATE_PREFIX: &str = "payload.";
 
 /// A machine's declared fleet position. Its one consumer is
 /// `darkmux_doctor::viewer_link_base`: `Standalone` (default) makes viewer
@@ -2561,6 +2614,11 @@ impl DarkmuxConfig {
                 verbose: Some(false),
                 extras: Default::default(),
             }),
+            // (#3112) Visible `4g`, the default, one edit from more.
+            sandbox: Some(SandboxConfig {
+                memory: Some(crate::config_access::SANDBOX_MEMORY_DEFAULT.to_string()),
+                extras: Default::default(),
+            }),
             fleet: Some(FleetConfig {
                 mode: Some("standalone".to_string()),
                 // (#2916) Visible, so the submission surface is discoverable:
@@ -2681,8 +2739,14 @@ impl DarkmuxConfig {
         Self::load_from(&path)
     }
 
-    /// Load from an explicit path (used by tests + `load_resolved`). Silent
-    /// default on missing/unreadable/unparseable file.
+    /// Load from an explicit path (used by tests + `load_resolved`). Default
+    /// on a missing, unreadable or unparseable file, so a bad config never
+    /// bricks the CLI (contract 7). The default is never the only word: the
+    /// user-file gate refuses every document this load fails on (a wrong
+    /// type, a key written twice; `whatever_the_gate_passes_the_typed_load_accepts`
+    /// pins that), so every command that starts work refuses at preflight,
+    /// a command with no preflight prints it as a warning, and doctor fails
+    /// it.
     pub fn load_from(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),

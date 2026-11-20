@@ -1881,17 +1881,38 @@ async fn announce_and_confirm_route(
     }
 }
 
+/// The body of the dialog that asks to run `command_line`. The routing model
+/// chose its params, so it goes through the strict escape (`escape_text_strict`):
+/// a direction mark or joiner in a param is shown as text, so the command
+/// the operator allows reads in the order it will run.
+fn permission_command_text(command_line: &str) -> String {
+    fenced(&darkmux_types::user_files::escape_text_strict(command_line))
+}
+
 /// `text` in a fenced code block, so backticks, `*` and newlines in it render
 /// literally. The fence is longer than any backtick run inside.
 fn fenced(text: &str) -> String {
-    let mut longest = 0;
-    let mut run = 0;
+    let fence = "`".repeat((longest_backtick_run(text) + 1).max(3));
+    format!("{fence}\n{text}\n{fence}")
+}
+
+/// `text` as a markdown code span no backtick inside can close: delimited by
+/// one more backtick than its longest run, padded when it starts or ends
+/// with one.
+fn code_span(text: &str) -> String {
+    let delimiter = "`".repeat(longest_backtick_run(text) + 1);
+    let pad = if text.starts_with('`') || text.ends_with('`') { " " } else { "" };
+    format!("{delimiter}{pad}{text}{pad}{delimiter}")
+}
+
+/// The longest run of consecutive backticks in `text`.
+fn longest_backtick_run(text: &str) -> usize {
+    let (mut longest, mut run) = (0, 0);
     for c in text.chars() {
         run = if c == '`' { run + 1 } else { 0 };
         longest = longest.max(run);
     }
-    let fence = "`".repeat((longest + 1).max(3));
-    format!("{fence}\n{text}\n{fence}")
+    longest
 }
 
 /// The router's pick is never the consent to run it. The inputs are prepared
@@ -1911,7 +1932,7 @@ async fn confirm_then_execute(
     let Some(prepared) = prepare_or_report(session_id, &plan, cwd, cx)? else { return Ok(()) };
     let command_line = crate::radio_cli::launch_command_line(&plan.config_id, &prepared.params);
     let title = format!("darkmux: run this command chosen from your text? `{}`", plan.config_id);
-    let answer = request_permission(cx, session_id, &plan.config_id, title, &fenced(&command_line)).await;
+    let answer = request_permission(cx, session_id, &plan.config_id, title, &permission_command_text(&command_line)).await;
     match answer.refusal_reason("radio launch", "confirmation") {
         None => run_prepared_launch(session_id, plan, prepared, cwd, cx, sessions).await,
         Some(reason) => {
@@ -2265,15 +2286,23 @@ async fn request_permission(
 
 /// The async half of [`acp_gate_handler`]: ask the client to sign off on a
 /// gated step and translate the answer to a `GateDecision`.
+/// The sign-off dialog's title: the step id through the strict escape, as
+/// the terminal prompt shows it, in a code span its own text cannot close.
+fn sign_off_title(step_id: &str) -> String {
+    let shown = darkmux_types::user_files::escape_text_strict(step_id);
+    format!("darkmux: operator sign-off required: {}", code_span(&shown))
+}
+
 async fn request_operator_sign_off(
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
     step_id: &str,
     facts_text: &str,
 ) -> crate::crew::gate::GateDecision {
-    let title = format!("darkmux: operator sign-off required: `{step_id}`");
+    let title = sign_off_title(step_id);
     let answer = request_permission(cx, session_id, step_id, title, facts_text).await;
-    match answer.refusal_reason(&format!("step `{step_id}`"), "sign-off") {
+    let step = format!("step {}", code_span(&darkmux_types::user_files::escape_text_strict(step_id)));
+    match answer.refusal_reason(&step, "sign-off") {
         None => crate::crew::gate::GateDecision::Approved,
         Some(reason) => crate::crew::gate::GateDecision::Declined { reason },
     }
@@ -2368,7 +2397,8 @@ fn acp_gate_handler(
 }
 
 /// Render a step's composed upstream input facts as the `session/
-/// request_permission` dialog body — one `key: value` line per fact,
+/// request_permission` dialog body, one fenced block ([`fenced`]) of
+/// `key: value` lines, one per fact,
 /// sorted (the map is already a `BTreeMap`, so iteration order IS sort
 /// order — no separate sort needed). A step with no upstream facts (e.g.
 /// the FIRST step in a panel command's graph) still gets a dialog, just
@@ -2377,7 +2407,11 @@ fn render_gate_facts(facts: &BTreeMap<String, String>) -> String {
     if facts.is_empty() {
         return "(no upstream facts)".to_string();
     }
-    facts.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n")
+    // A fact is an upstream step's output, which a model wrote, and the
+    // operator signs off on it as read: strict, so every mark shows as text,
+    // and fenced, so markdown in it shows as typed rather than rendered.
+    let strict = darkmux_types::user_files::escape_text_strict;
+    fenced(&facts.iter().map(|(k, v)| format!("{}: {}", strict(k), strict(v))).collect::<Vec<_>>().join("\n"))
 }
 
 /// (#2476 review round 2, MUST FIX 2) The pids of every currently-live
@@ -2634,19 +2668,13 @@ async fn host_shutdown_reap_loop_ready(
 /// launched mission's own model dispatches take (the retired review
 /// launcher streamed a `Plan` immediately for the same reason).
 ///
-/// **`args` honesty note (#1684 QA finding — MUST-FIX 5).** The raw text
-/// forwards as `--param args=<raw>` (omitted when empty) — the standard
-/// `mission launch` CLI mechanism (`collect_inputs`). This is a
-/// forward-compatible HOOK, not (yet) a wired delivery: today NO shipped
-/// config declares `args` as a `MissionInput` or consumes it via
-/// `task_overrides` (`build_launch_params` only produces overrides for the
-/// coder-phase-shaped kinds), so a Launch-routed panel command that takes
-/// arguments will see `mission launch` warn on stderr about an undeclared
-/// input and the value will not reach any step's config. #1685's verb
-/// configs are expected to declare `args` for real; wiring the actual
-/// delivery mechanism (however #1685 chooses to shape it — task_overrides,
-/// a generic step-config substitution, or something else) is that packet's
-/// job, not this one's.
+/// **`args` (#1684 QA finding MUST-FIX 5, #1685).** The raw text forwards
+/// as `--param args=<raw>` (omitted when empty), the standard `mission
+/// launch` mechanism (`collect_inputs`). `mission launch` delivers it into a
+/// graph that reads `__panel_args__` (`inject_panel_args_task_if_referenced`)
+/// and into a `cmd` config's audit record; any other config refuses `args`
+/// as an undeclared input, so the panel sends it only to a config that takes
+/// panel text (`acp_panel::map_launch_args`).
 ///
 /// **A gated step in this route can never be approved (#1684 QA
 /// CONSIDER, a deliberate boundary, not a bug).** The subprocess below
@@ -3558,6 +3586,48 @@ mod tests {
         assert_ne!(next["method"], "session/request_permission", "must not ask: {next}");
         assert!(!chunk_text(&next).is_empty());
         assert_end_turn(&recv_json(&mut f.reader).await);
+    }
+
+    /// The command a permission dialog asks the operator to allow, and the
+    /// facts a sign-off shows, carry every direction mark and joiner as
+    /// text, so the dialog cannot show `500 / 5` for a stored `5 / 500`.
+    #[test]
+    fn permission_dialogs_show_direction_marks_and_escapes_as_text() {
+        let body = permission_command_text("darkmux mission launch review --param 'budget=\u{200f}5 / 500\u{200f}'");
+        assert_eq!(body, "```\ndarkmux mission launch review --param 'budget=\\u{200f}5 / 500\\u{200f}'\n```");
+        let mut facts = BTreeMap::new();
+        facts.insert("ids".to_string(), "\u{61c}17, 42\u{61c}\x1b]0;x\x07".to_string());
+        assert_eq!(render_gate_facts(&facts), "```\nids: \\u{61c}17, 42\\u{61c}\\u{1b}]0;x\\u{7}\n```");
+        assert_eq!(permission_command_text("darkmux mission launch review"), "```\ndarkmux mission launch review\n```");
+    }
+
+    /// The sign-off facts are one fenced block, so markdown in a fact
+    /// (`[500](x)`, `5<!--x-->00`) shows as typed, and a fact holding a
+    /// backtick fence cannot close the block early: the fence is longer
+    /// than any backtick run inside, and it is the only line of its kind.
+    #[test]
+    fn sign_off_facts_are_one_fenced_block_a_fact_cannot_break_out_of() {
+        let mut facts = BTreeMap::new();
+        facts.insert("budget".to_string(), "[500](x) 5<!--x-->00".to_string());
+        facts.insert("note".to_string(), "```\nforged: yes\n````".to_string());
+        let body = render_gate_facts(&facts);
+        let lines: Vec<&str> = body.lines().collect();
+        let fence = lines[0];
+        assert!(fence.len() >= 5 && fence.chars().all(|c| c == '`'), "{body}");
+        assert_eq!(lines.iter().filter(|l| **l == fence).count(), 2, "{body}");
+        assert_eq!(*lines.last().unwrap(), fence, "{body}");
+        assert!(body.contains("budget: [500](x) 5<!--x-->00"), "{body}");
+        assert!(body.contains("note: ```\\n"), "a fact's newline is shown, not followed: {body}");
+        assert_eq!(render_gate_facts(&BTreeMap::new()), "(no upstream facts)");
+    }
+
+    /// The sign-off title names the step through the strict escape, in a
+    /// code span no backtick in the id can close.
+    #[test]
+    fn the_sign_off_title_shows_the_step_id_strictly() {
+        assert_eq!(sign_off_title("review"), "darkmux: operator sign-off required: `review`");
+        assert_eq!(sign_off_title("a\u{200f}b\x1b"), "darkmux: operator sign-off required: `a\\u{200f}b\\u{1b}`");
+        assert_eq!(sign_off_title("a`b"), "darkmux: operator sign-off required: ``a`b``");
     }
 
     #[test]

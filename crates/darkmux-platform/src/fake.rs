@@ -47,6 +47,11 @@ pub struct FakePlatform {
     pub held_listeners_reads: std::sync::Mutex<std::collections::VecDeque<bool>>,
     /// `(pid, group)` pairs [`Platform::process_group`] answers.
     pub process_groups: Vec<(u32, u32)>,
+    /// The `(pid, ppid, pgid, sid)` table [`Platform::in_sandbox_of`] reads;
+    /// `None`: it cannot be read.
+    pub process_table: Option<Vec<(u32, u32, u32, u32)>>,
+    /// `(pid, name)` pairs [`Platform::process_name`] answers.
+    pub process_names: Vec<(u32, String)>,
     /// `(pid, app)` pairs [`Platform::signed_app`] names; any other pid is unsigned.
     pub signed_apps: Vec<(u32, crate::SignedApp)>,
     /// What [`Platform::ask_allow`] answers.
@@ -55,6 +60,7 @@ pub struct FakePlatform {
     pub node_release_platform: Option<&'static str>,
     /// What [`Platform::c_library`] answers.
     pub c_library: Option<crate::CLibrary>,
+    pub exec_env_limits: crate::ExecEnvLimits,
     /// What [`Platform::overlay_tool_locations`] answers.
     pub overlay_tool_locations: Vec<String>,
 }
@@ -89,10 +95,13 @@ impl Default for FakePlatform {
             held_listeners: Vec::new(),
             held_listeners_reads: Default::default(),
             process_groups: Vec::new(),
+            process_table: None,
+            process_names: Vec::new(),
             signed_apps: Vec::new(),
             allow_answer: crate::AllowAnswer::NoDialog("a fake platform shows no dialog".to_string()),
             node_release_platform: None,
             c_library: None,
+            exec_env_limits: crate::ExecEnvLimits::default(),
             overlay_tool_locations: Vec::new(),
         }
     }
@@ -148,12 +157,8 @@ impl Platform for FakePlatform {
         Vec::new()
     }
 
-    fn package_power_mw(&self) -> Option<f64> {
-        None
-    }
-
-    fn board_sensors(&self) -> Option<crate::BoardSensors> {
-        None
+    fn board_readings(&self) -> crate::BoardReadings {
+        crate::BoardReadings::default()
     }
 
     fn reclaimable_memory_bytes(&self) -> Option<u64> {
@@ -192,6 +197,10 @@ impl Platform for FakePlatform {
         self.c_library
     }
 
+    fn exec_env_limits(&self) -> crate::ExecEnvLimits {
+        self.exec_env_limits
+    }
+
     fn node_release_platform(&self) -> Option<&'static str> {
         self.node_release_platform
     }
@@ -221,6 +230,14 @@ impl Platform for FakePlatform {
         Some(self.tcp_peers.clone())
     }
 
+    /// The ports [`Self::port_listeners`] names.
+    fn tcp_listening_ports(&self) -> Option<Vec<u16>> {
+        let mut ports: Vec<u16> = self.port_listeners.iter().map(|(p, _)| *p).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        Some(ports)
+    }
+
     fn tcp_port_listeners(&self, port: u16) -> Option<Vec<crate::PortListener>> {
         use std::sync::atomic::Ordering;
         if self.port_listeners_unreadable_reads.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
@@ -238,6 +255,14 @@ impl Platform for FakePlatform {
 
     fn process_group(&self, pid: u32) -> Option<u32> {
         self.process_groups.iter().find(|(p, _)| *p == pid).map(|(_, g)| *g)
+    }
+
+    fn in_sandbox_of(&self, pid: u32, leaders: &[u32]) -> Option<bool> {
+        self.process_table.as_ref().map(|table| crate::in_sandbox_of_table(pid, leaders, table))
+    }
+
+    fn process_name(&self, pid: u32) -> Option<String> {
+        self.process_names.iter().find(|(p, _)| *p == pid).map(|(_, n)| n.clone())
     }
 
     fn secret_store(&self) -> crate::SecretStore {

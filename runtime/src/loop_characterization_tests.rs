@@ -677,6 +677,125 @@ fn a_resume_dispatches_only_the_pending_calls_then_continues() {
     assert_golden(s);
 }
 
+// ─── escalations carry the turn's banked answer ──────────────────────────
+//
+// A turn that checkpoints banks its text in the turn's accumulation. When a
+// later call of that turn is cut at the cap with a well-formed tool call, the
+// salvage dispatches the call and removes the prefill message, but the
+// accumulation is still the turn's work and is in no message. An escalation
+// on that tool turn (every compaction escalation fires there) must hand it
+// over, or the operator gets nothing for the turn.
+
+/// The text the last turn banks at its checkpoint.
+const BANKED: &str = "the first part of a long answer that ";
+
+/// `lead` tool turns that each compact, then one turn that checkpoints and is
+/// then salvaged; the compaction after the salvage is the run's last call.
+fn banked_turn_after(lead: u32, summary: &str) -> Vec<Reply> {
+    let mut replies = Vec::new();
+    for i in 0..lead {
+        replies.push(reply(None, Some(read_x()), "tool_calls", 9_000 + i, 50));
+        replies.push(reply(Some(summary), None, "stop", 500, 30));
+    }
+    replies.push(reply(Some(BANKED), None, "length", 9_000, 500));
+    replies.push(reply(Some("cut mid-sentence while calling"), Some(read_x()), "length", 9_000, 500));
+    replies.push(reply(Some(summary), None, "stop", 500, 30));
+    replies
+}
+
+fn banked_turn_scenario(name: &'static str, lead: u32, summary: &str, cfg: compaction::CompactionConfig) -> Scenario {
+    let mut s = Scenario::new(name, banked_turn_after(lead, summary));
+    let filler = "seed content ".repeat(80);
+    s.initial = (0..10)
+        .map(|i| if i == 0 { Message::system("test system") } else { Message::user(format!("turn {i}: {filler}")) })
+        .collect();
+    s.cfg = cfg;
+    s.tools = vec![Tool::Read];
+    s.max_tokens_per_call = Some(500);
+    s
+}
+
+fn assert_escalates_with_the_banked_answer(s: Scenario, reason: EscalationReason) {
+    let ran = run_scenario(s);
+    let outcome = ran.result.unwrap_or_else(|e| panic!("{}: {e}; requests {}", ran.name, ran.requests.len()));
+    assert_eq!(outcome.terminal_reason, TerminalReason::EscalationTriggered(reason), "{}", ran.name);
+    let escalations =
+        render_events(ran.out_dir.path()).iter().filter(|e| e.contains("\"dispatch.escalation.triggered\"")).count();
+    assert_eq!(escalations, 1, "{}: the escalation is recorded once", ran.name);
+    assert_eq!(
+        outcome.final_answer.as_deref(),
+        Some(BANKED),
+        "{}: the escalation must carry the answer the salvaged turn had banked",
+        ran.name
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn the_compaction_bound_carries_a_salvaged_turns_banked_answer() {
+    let cfg = compaction::CompactionConfig { threshold_tokens: 1, ..compaction_cfg(Some(1)) };
+    assert_escalates_with_the_banked_answer(
+        banked_turn_scenario("banked_compaction_bound", 0, SUMMARY, cfg),
+        EscalationReason::CompactionLimitReached,
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn an_unproductive_compaction_escalation_carries_a_salvaged_turns_banked_answer() {
+    // A trigger of one token: every installed compaction leaves the thread
+    // above it, so each one is unproductive and the fifth escalates.
+    let cfg = compaction::CompactionConfig { threshold_tokens: 1, ..compaction_cfg(None) };
+    assert_escalates_with_the_banked_answer(
+        banked_turn_scenario("banked_unproductive", UNPRODUCTIVE_COMPACTION_TURNS - 1, SUMMARY, cfg),
+        EscalationReason::CompactionUnproductive,
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn a_reread_loop_escalation_carries_a_salvaged_turns_banked_answer() {
+    // Every compaction is productive (far under a 5,000-token trigger), and
+    // every turn reads the same file, so only the re-read detector ends it:
+    // after the compaction that the fifth re-read follows.
+    let cfg = compaction::CompactionConfig { threshold_tokens: 5_000, ..compaction_cfg(None) };
+    assert_escalates_with_the_banked_answer(
+        banked_turn_scenario("banked_reread", 5, SUMMARY, cfg),
+        EscalationReason::CompactionRereadLoop,
+    );
+}
+
+/// A budget stop runs before the next call, so the salvaged turn's banked
+/// text is still pending when the cumulative cap ends the run. (`max_turns`
+/// cannot reach this point: it is checked before the salvaged continuation,
+/// while the prefill is still live.) The checkpoint and the salvage spend 500
+/// tokens each, so a 1,000-token cap is reached after the salvage only.
+#[test]
+#[serial_test::serial]
+fn a_budget_stop_after_a_salvage_carries_the_banked_answer() {
+    let mut s = banked_turn_scenario("banked_budget_stop", 0, SUMMARY, compaction::CompactionConfig::never_compact());
+    s.replies.pop(); // no compaction, so no compactor reply
+    s.max_cumulative_tokens = Some(1_000);
+    assert_escalates_with_the_banked_answer(s, EscalationReason::CumulativeTokensExceeded);
+}
+
+/// The malformed-call escalation fires on the salvaged call itself: two
+/// turns of ungranted names, then a turn that checkpoints and whose salvaged
+/// call is ungranted too.
+#[test]
+#[serial_test::serial]
+fn a_malformed_call_escalation_after_a_salvage_carries_the_banked_answer() {
+    let bogus = || calls(&[("not_a_tool", READ_X)]);
+    let mut replies: Vec<Reply> =
+        (0..MAX_CONSECUTIVE_MALFORMED_TURNS - 1).map(|i| reply(None, Some(bogus()), "tool_calls", 100 + i, 50)).collect();
+    replies.push(reply(Some(BANKED), None, "length", 200, 500));
+    replies.push(reply(Some("cut mid-sentence while calling"), Some(bogus()), "length", 200, 500));
+    let mut s = Scenario::new("banked_malformed", replies);
+    s.tools = vec![Tool::Read];
+    s.max_tokens_per_call = Some(500);
+    assert_escalates_with_the_banked_answer(s, EscalationReason::MalformedToolCallsExhausted);
+}
+
 // ─── the structured compactor's budget ───────────────────────────────────
 //
 // A structured-slot compaction renders a budget block into the SYSTEM

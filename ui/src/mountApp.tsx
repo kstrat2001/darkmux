@@ -93,8 +93,68 @@ export function isExtensionOrigin(reason: unknown): boolean {
   return /\b(?:chrome|moz|safari-web|ms-browser)-extension:\/\//.test(stack);
 }
 
-export function mountApp(): void {
-  window.addEventListener("error", (event) => {
+/**
+ * Mount the viewer into `#root`, and return the function that takes down
+ * everything this call set up: the React root, the queries and their timers,
+ * and the two global listeners `installSafetyNet` added. It resolves once
+ * the queries' in-flight fetches have settled and nothing they scheduled is
+ * left pending.
+ *
+ * What it does NOT do: unmounting a root does not cancel a render React has
+ * already queued. `createRoot(...).render()` is concurrent, so a render
+ * requested and then unmounted in the same tick still commits on a later
+ * scheduler task (into the now-empty root). A host that unmounts must let
+ * the first render commit first; under test that is React's `act`.
+ *
+ * `main.tsx` never calls it, because the page itself is the app's lifetime.
+ * A test does: an app left mounted keeps working after the test is over, and
+ * fails the run once its environment is torn down (#2501).
+ */
+export function mountApp(): () => Promise<void> {
+  const removeSafetyNet = installSafetyNet();
+
+  const rootEl = document.getElementById("root");
+  if (!rootEl) {
+    // Known, anticipated failure — paint directly rather than throwing and
+    // hoping the `error` listener `installSafetyNet` just added catches it. (It would: an uncaught throw at
+    // module scope becomes exactly the "error" event that listener handles.
+    // Calling `paintBootError` here directly is simpler to test and skips
+    // one throw/catch round trip for a case we already know about.)
+    paintBootError(new Error("darkmux: #root element missing from index.html"), "boot");
+    return async () => removeSafetyNet();
+  }
+
+  const queryClient = createQueryClient();
+  const root = createRoot(rootEl);
+
+  root.render(
+    <StrictMode>
+      <BootErrorBoundary>
+        <QueryClientProvider client={queryClient}>
+          <App />
+        </QueryClientProvider>
+      </BootErrorBoundary>
+    </StrictMode>,
+  );
+
+  return async () => {
+    root.unmount();
+    removeSafetyNet();
+    // A fetch still in flight schedules its query's garbage collection when
+    // it settles, even on a query already removed from the cache, so clearing
+    // first would leave that five-minute timer behind. Wait for the canceled
+    // fetches to settle, then clear the cache and every timer it holds.
+    await queryClient.cancelQueries();
+    queryClient.clear();
+  };
+}
+
+/**
+ * Register the `error` and `unhandledrejection` listeners described in this
+ * file's own doc, and return the function that removes them again.
+ */
+function installSafetyNet(): () => void {
+  const onError = (event: ErrorEvent) => {
     // A cross-origin script error carries NO information: the browser sets
     // `error` to null and `message` to the literal string "Script error." —
     // its own privacy behavior for a resource served without CORS headers,
@@ -111,8 +171,8 @@ export function mountApp(): void {
       return;
     }
     paintBootError(event.error, "script error");
-  });
-  window.addEventListener("unhandledrejection", (event: PromiseRejectionEvent) => {
+  };
+  const onRejection = (event: PromiseRejectionEvent) => {
     // (#2816) A rejection thrown by a browser EXTENSION is not darkmux
     // failing, and must not paint over a working viewer.
     //
@@ -142,30 +202,13 @@ export function mountApp(): void {
       return;
     }
     paintBootError(event.reason, "unhandled promise rejection");
-  });
-
-  const rootEl = document.getElementById("root");
-  if (!rootEl) {
-    // Known, anticipated failure — paint directly rather than throwing and
-    // hoping the listener above catches it. (It would: an uncaught throw at
-    // module scope becomes exactly the "error" event that listener handles.
-    // Calling `paintBootError` here directly is simpler to test and skips
-    // one throw/catch round trip for a case we already know about.)
-    paintBootError(new Error("darkmux: #root element missing from index.html"), "boot");
-    return;
-  }
-
-  const queryClient = createQueryClient();
-
-  createRoot(rootEl).render(
-    <StrictMode>
-      <BootErrorBoundary>
-        <QueryClientProvider client={queryClient}>
-          <App />
-        </QueryClientProvider>
-      </BootErrorBoundary>
-    </StrictMode>,
-  );
+  };
+  window.addEventListener("error", onError);
+  window.addEventListener("unhandledrejection", onRejection);
+  return () => {
+    window.removeEventListener("error", onError);
+    window.removeEventListener("unhandledrejection", onRejection);
+  };
 }
 
 /**
