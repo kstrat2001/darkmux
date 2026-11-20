@@ -731,13 +731,14 @@ pub(crate) mod libproc {
         Some((port, crate::PortListener { addr: Some(addr), text: addr.to_string(), scope, pid: Some(pid) }))
     }
 
-    /// (#3660) One socket's `struct socket_fdinfo` as a TCP connection's two
-    /// ends, `(own, other)`: `None` for any other socket (a listener, UDP,
-    /// a local socket). The foreign port and address sit just before their
+    /// (#3660) One socket's `struct socket_fdinfo` as an ESTABLISHED TCP
+    /// connection's two ends, `(own, other)`: `None` for any other socket (a
+    /// listener, one still connecting or closing, UDP, a local socket), as
+    /// Linux's `/proc/net/tcp` rows are read. The foreign port and address sit just before their
     /// local forms (`insi_fport`, `insi_faddr`).
     pub(crate) fn connection_in_fdinfo(info: &[u8]) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
         let int = |at: usize| info.get(at..at + 4).map(|b| i32::from_ne_bytes([b[0], b[1], b[2], b[3]]));
-        if info.len() < SOCKET_FDINFO_SIZE || int(SOI_KIND)? != SOCKINFO_TCP || int(TCPSI_STATE)? == TSI_S_LISTEN {
+        if info.len() < SOCKET_FDINFO_SIZE || int(SOI_KIND)? != SOCKINFO_TCP || int(TCPSI_STATE)? != TSI_S_ESTABLISHED {
             return None;
         }
         let port = |at: usize| u16::from_be_bytes([info[at], info[at + 1]]);
@@ -801,6 +802,7 @@ pub(crate) mod libproc {
     /// address family flags of `insi_vflag`.
     const SOCKINFO_TCP: i32 = 2;
     const TSI_S_LISTEN: i32 = 1;
+    const TSI_S_ESTABLISHED: i32 = 4;
     const INI_IPV4: u8 = 1;
     const INI_IPV6: u8 = 2;
 

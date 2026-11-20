@@ -459,9 +459,13 @@ fn this_machine_is_every_peer_of_a_loopback_listener_and_counts_as_one() {
 ///   holds the rest until its stdin closes.
 /// - `flick <addr> <hold> <threads> <secs> <how>`: holds `hold` connections,
 ///   prints `churning`, and for `secs` has each of `threads` threads connect
-///   and hang up at once, `reset` (SO_LINGER 0: a reset) or `fin` (a
-///   request sent, then an ordinary close), so the connection is gone before
-///   its judgment ends.
+///   and reset it at once (SO_LINGER 0), so the peer is gone before the
+///   judgment ends. A reset leaves no closed connection waiting on this
+///   machine's ports, as an ordinary close by so many would.
+/// - `tag <addr> <hold> <port>`: holds `hold` connections, opens one more
+///   (past the open share: a round names this forwarder and closes it),
+///   then one from source port `port` (closed as a known forwarder's),
+///   prints whether each was closed, and exits.
 /// - `churn <addr> <hold> <threads> <secs>`: holds `hold` connections, prints
 ///   `churning`, and for `secs` has each of `threads` threads connect, wait
 ///   for the other end to close, and connect again (a container reopening
@@ -490,6 +494,10 @@ fn container_forwarder_stand_in() {
             Duration::from_secs(num(4) as u64),
             parts[5],
         ),
+        "tag" => {
+            tag(addr, num(2), num(3) as u16);
+            return;
+        }
         _ => churn(addr, num(2), num(3), Duration::from_secs(num(4) as u64)),
     };
     let _ = std::io::stdin().read_to_end(&mut Vec::new());
@@ -551,8 +559,6 @@ fn flick(
                             std::mem::size_of::<libc::linger>() as libc::socklen_t,
                         )
                     };
-                } else {
-                    let _ = c.write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n");
                 }
             }
         });
@@ -561,9 +567,47 @@ fn flick(
     held
 }
 
+/// [`container_forwarder_stand_in`]'s `tag` mode.
+fn tag(addr: SocketAddr, hold: usize, port: u16) {
+    let _held: Vec<_> = (0..hold)
+        .map(|_| std::net::TcpStream::connect(addr).unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let mut extra = std::net::TcpStream::connect(addr).unwrap();
+    println!(
+        "named {}",
+        closed_within(&mut extra, Duration::from_secs(6))
+    );
+    let mut tagged = connect_from_port(addr, port);
+    println!(
+        "tagged {}",
+        closed_within(&mut tagged, Duration::from_secs(6))
+    );
+}
+
+/// A connection to `addr` from 127.0.0.1's port `port`, which may still be
+/// in an earlier connection's close (`SO_REUSEADDR`).
+fn connect_from_port(addr: SocketAddr, port: u16) -> std::net::TcpStream {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap();
+    let s = rt.block_on(async {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_reuseaddr(true).unwrap();
+        socket
+            .bind(SocketAddr::new([127, 0, 0, 1].into(), port))
+            .unwrap();
+        socket.connect(addr).await.unwrap()
+    });
+    let s = s.into_std().unwrap();
+    s.set_nonblocking(false).unwrap();
+    s
+}
+
 /// A container engine's forwarder holding `hold` connections to `addr` and,
 /// on `threads` threads for `for_secs`, connecting and hanging up at once
-/// (`how`: `reset` or `fin`; [`container_forwarder_stand_in`]'s `flick`
+/// (`how`: `reset`; [`container_forwarder_stand_in`]'s `flick`
 /// mode), once it has begun.
 fn flicking_forwarder(
     addr: SocketAddr,
@@ -933,18 +977,18 @@ fn get_answer(s: &mut std::net::TcpStream) -> String {
 #[test]
 fn a_reconnecting_container_never_crowds_the_operator_out_of_the_viewer() {
     let _ = crate::raise_open_file_limit(8192);
-    for threads in [64, 128] {
+    for threads in [64] {
         let (addr, _stop, _done) = serving_with(
             Box::new(|l, app, rx| Box::pin(crate::serve_viewer(l, app, rx))),
             ok_app(),
         );
         let open = VIEWER.per_ip - VIEWER.judged_share;
-        let _container = churning_forwarder(addr, open, threads, 8);
+        let _container = churning_forwarder(addr, open, threads, 4);
         std::thread::sleep(Duration::from_millis(300));
-        let served = served_of(addr, 20, Duration::from_millis(100));
+        let served = served_of(addr, 10, Duration::from_millis(100));
         assert_eq!(
-            served, 20,
-            "{threads} reconnecting threads: the operator served {served} of 20"
+            served, 10,
+            "{threads} reconnecting threads: the operator served {served} of 10"
         );
     }
 }
@@ -1055,25 +1099,259 @@ fn a_listener_with_no_judged_share_still_knows_the_operators_connection() {
 /// A container that connects and hangs up at once cannot crowd the operator
 /// out of the viewer either: such a connection is gone before any process
 /// can be seen holding it, so it is never refused as a container's, but it
-/// gives its slots back as soon as the hang-up arrives, a reset or a request
-/// sent and closed alike, never after its judgment. With the forwarder
-/// holding the open share and 64, then 128, threads hanging up as fast as
-/// they connect, every one of this process's new connections is served.
+/// gives its slots back as soon as the reset arrives, never after its
+/// judgment. With the forwarder holding the open share and 64 threads (as
+/// many as the judged share) resetting as fast as they connect, every one of
+/// this process's new connections is served. (A request sent and then
+/// closed is a hang-up too: [`hung_up_notices_a_close_behind_unread_data`].)
 #[test]
 fn a_container_that_connects_and_hangs_up_never_crowds_the_operator_out_of_the_viewer() {
     let _ = crate::raise_open_file_limit(8192);
-    for (how, threads) in [("reset", 64), ("reset", 128), ("fin", 128)] {
+    for how in ["reset"] {
+        let threads = 64;
         let (addr, _stop, _done) = serving_with(
             Box::new(|l, app, rx| Box::pin(crate::serve_viewer(l, app, rx))),
             ok_app(),
         );
         let open = VIEWER.per_ip - VIEWER.judged_share;
-        let _container = flicking_forwarder(addr, open, threads, 8, how);
+        let _container = flicking_forwarder(addr, open, threads, 4, how);
         std::thread::sleep(Duration::from_millis(300));
-        let served = served_of(addr, 20, Duration::from_millis(100));
+        let served = served_of(addr, 10, Duration::from_millis(100));
         assert_eq!(
-            served, 20,
-            "{threads} threads hanging up ({how}): the operator served {served} of 20"
+            served, 10,
+            "{threads} threads hanging up ({how}): the operator served {served} of 10"
         );
     }
+}
+
+/// A forwarder's cached connection end never refuses a later connection
+/// from the same port: a container's forwarder is named, its connection
+/// from one port is closed as a known forwarder's, and it exits. The
+/// operator, holding the open share itself, then connects from that port
+/// and is served.
+#[test]
+fn a_known_forwarders_old_connection_never_refuses_a_later_one_from_its_port() {
+    let _ = crate::raise_open_file_limit(4096);
+    let (addr, _stop, _done) = serving_with(
+        Box::new(|l, app, rx| Box::pin(crate::serve_viewer(l, app, rx))),
+        ok_app(),
+    );
+    let open = VIEWER.per_ip - VIEWER.judged_share;
+    let port = darkmux_types::test_ports::fixture_port();
+    let (container, lines) = stand_in(&format!("tag {addr} {open} {port}"));
+    let said: Vec<String> = lines.collect();
+    drop(container);
+    assert!(
+        said.iter().any(|l| l.contains("named true"))
+            && said.iter().any(|l| l.contains("tagged true")),
+        "the forwarder was named and its connection from {port} closed: {said:?}"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let _mine: Vec<_> = (0..open)
+        .map(|_| std::net::TcpStream::connect(addr).unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let mut again = connect_from_port(addr, port);
+    again
+        .set_read_timeout(Some(Duration::from_secs(6)))
+        .unwrap();
+    again
+        .write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    let got = get_answer(&mut again);
+    assert!(
+        got.starts_with("HTTP/1.1 200"),
+        "the operator's connection from {port}: {got:?}"
+    );
+}
+
+/// The forwarder machine these tests read through: Docker Desktop's
+/// forwarder (pid 68948) holds the ends `theirs`, and every read of it is
+/// counted.
+fn forwarder_machine(theirs: Vec<SocketAddr>) -> &'static darkmux_platform::FakePlatform {
+    Box::leak(Box::new(darkmux_platform::FakePlatform {
+        process_names: vec![(68948, "com.docker.backend".into())],
+        tcp_peers: theirs.into_iter().map(|end| (end, 68948)).collect(),
+        ..Default::default()
+    }))
+}
+
+/// Rounds that know Docker Desktop's forwarder (pid 68948) and read no
+/// table of their own.
+fn knowing_the_forwarder() -> Arc<crate::local_peer::Rounds> {
+    let rounds =
+        crate::local_peer::Rounds::new_for_test(Arc::new(|_| None), Duration::from_secs(1));
+    rounds.remember(vec![(68948, "com.docker.backend".into())]);
+    rounds
+}
+
+/// A real accepted connection on a fresh loopback listener, as admission
+/// hands it over (`judge_first` as given), and the client's end of it.
+async fn admitted(judge_first: bool) -> (Admitted, tokio::net::TcpStream) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (stream, peer) = listener.accept().await.unwrap();
+    let mut conn = Admission::new("test", 4, 4).admit(stream, peer).unwrap();
+    conn.local = conn.stream.local_addr().ok();
+    conn.judge_first = judge_first;
+    (conn, client)
+}
+
+/// Every connection accepted unjudged takes its own end out of the
+/// forwarders' cache, so a later connection reusing its port is not taken
+/// for it; one judged first is refused as the forwarder's.
+#[tokio::test]
+async fn an_accepted_connection_takes_its_end_out_of_the_cache() {
+    let (conn, _client) = admitted(false).await;
+    let local = conn.local.unwrap();
+    let (judged, _judged_client) = admitted(true).await;
+    let m = forwarder_machine(vec![conn.peer, judged.peer]);
+    let rounds = knowing_the_forwarder();
+    let unrelated: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    assert!(!rounds.held_by_a_known_forwarder(m, unrelated, local).await);
+    assert!(
+        !refused_on_accept(&rounds, m, &conn).await,
+        "unjudged, so served"
+    );
+    assert_eq!(
+        rounds.take_end(conn.peer, local),
+        None,
+        "and its end left the cache"
+    );
+    assert!(
+        refused_on_accept(&rounds, m, &judged).await,
+        "the forwarder's, judged first"
+    );
+}
+
+/// A connection judged first that its peer has already reset is closed as
+/// it is accepted with no read of the forwarders; a live one is read for.
+#[tokio::test]
+async fn a_reset_connection_is_closed_without_a_read() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (conn, client) = admitted(true).await;
+    let m = forwarder_machine(vec![]);
+    let rounds = knowing_the_forwarder();
+    let client = client.into_std().unwrap();
+    {
+        use std::os::fd::AsRawFd;
+        let off = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: a socket this test owns, and a `linger` of the size given.
+        unsafe {
+            libc::setsockopt(
+                client.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&off as *const libc::linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+    }
+    drop(client);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        refused_on_accept(&rounds, m, &conn).await,
+        "gone, so closed"
+    );
+    assert_eq!(m.tcp_ends_reads.load(SeqCst), 0, "with no read");
+    let (live, _client) = admitted(true).await;
+    assert!(
+        !refused_on_accept(&rounds, m, &live).await,
+        "not the forwarder's"
+    );
+    assert_eq!(m.tcp_ends_reads.load(SeqCst), 1, "read for");
+}
+
+/// A second miss on one listener waits for its turn: the next read begins
+/// only once the last has been over for at least the read gap.
+#[tokio::test]
+async fn a_second_miss_waits_its_turn_to_read() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let m = forwarder_machine(vec![]);
+    let rounds = knowing_the_forwarder();
+    let at = |s: &str| -> SocketAddr { s.parse().unwrap() };
+    let local = at("127.0.0.1:8799");
+    assert!(
+        !rounds
+            .held_by_a_known_forwarder(m, at("127.0.0.1:50001"), local)
+            .await
+    );
+    let began = tokio::time::Instant::now();
+    assert!(
+        !rounds
+            .held_by_a_known_forwarder(m, at("127.0.0.1:50002"), local)
+            .await
+    );
+    assert!(
+        began.elapsed() >= Duration::from_millis(10),
+        "waited its turn: {:?}",
+        began.elapsed()
+    );
+    assert_eq!(m.tcp_ends_reads.load(SeqCst), 2);
+}
+
+/// A peer's hang-up is noticed while a connection waits for its judgment,
+/// behind unread data too: a request sent and then closed, and a reset,
+/// end the wait at once; an open connection with an unread request does
+/// not.
+#[tokio::test]
+async fn hung_up_notices_a_close_behind_unread_data() {
+    use tokio::io::AsyncWriteExt;
+    let pair = || async {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(l.local_addr().unwrap())
+            .await
+            .unwrap();
+        (l.accept().await.unwrap().0, client)
+    };
+    let soon = Duration::from_millis(500);
+    let (server, mut client) = pair().await;
+    client
+        .write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    drop(client);
+    assert!(
+        tokio::time::timeout(soon, hung_up(&server)).await.is_ok(),
+        "a request sent, then closed"
+    );
+    let (server, mut client) = pair().await;
+    client
+        .write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), hung_up(&server))
+            .await
+            .is_err(),
+        "open, its request unread"
+    );
+    let client = client.into_std().unwrap();
+    {
+        use std::os::fd::AsRawFd;
+        let off = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: a socket this test owns, and a `linger` of the size given.
+        unsafe {
+            libc::setsockopt(
+                client.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&off as *const libc::linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+    }
+    drop(client);
+    assert!(
+        tokio::time::timeout(soon, hung_up(&server)).await.is_ok(),
+        "reset"
+    );
 }

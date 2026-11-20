@@ -226,7 +226,9 @@ darkmux release.
   is closed. A forwarder found once is remembered and its later connections are closed as they arrive,
   and a connection whose sender hangs up while it is checked is let go at once. So a container that
   holds connections open, reopens every one it loses, or opens and drops them as fast as it can still
-  leaves the browser and the tailnet their half, at some added delay on a busy machine. Nothing is
+  leaves the browser and the tailnet their half. Under such a flood a page's new connection waits longer:
+  a few hundred milliseconds measured on an M5 Max, and up to about a second when the container engine
+  holds tens of thousands of open files. Nothing is
   checked while the first half has room. Not covered: sandboxed work holding connections open past the
   first half is checked each time (the sandbox's network rules keep it off darkmux's ports); a container
   engine whose forwarder darkmux does not know by name (OrbStack, rootless Podman's slirp4netns or

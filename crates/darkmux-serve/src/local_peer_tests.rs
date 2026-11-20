@@ -531,9 +531,8 @@ fn only_contained_work_is_kept_out_of_the_judged_slots() {
 
 /// A remembered forwarder's connections are known from one read of its
 /// descriptors: the connections it held then are answered from that read
-/// with no other, the operator's is not its, and a miss reads again. A pid
-/// that no longer runs that forwarder is forgotten, so it never refuses
-/// another process's connection.
+/// with no other, each end once (a later connection reusing its port is
+/// another connection), the operator's is not its, and a miss reads again.
 #[tokio::test]
 async fn one_read_of_a_known_forwarder_answers_every_connection_it_holds() {
     use std::sync::atomic::Ordering::SeqCst;
@@ -562,48 +561,67 @@ async fn one_read_of_a_known_forwarder_answers_every_connection_it_holds() {
     rounds.remember(forwarders_among(m, &[68948]));
     assert!(rounds.held_by_a_known_forwarder(m, a, local).await);
     assert_eq!(m.tcp_ends_reads.load(SeqCst), 1);
-    assert!(rounds.held_by_a_known_forwarder(m, b, local).await);
+    assert!(
+        rounds
+            .held_by_a_known_forwarder(m, b, at("[::ffff:127.0.0.1]:8799"))
+            .await,
+        "however the listener's address is spelled"
+    );
     assert_eq!(
         m.tcp_ends_reads.load(SeqCst),
         1,
         "answered by the same read"
     );
-    assert_eq!(
-        rounds.seen_held_by_a_forwarder(b, local).as_deref(),
-        Some("com.docker.backend")
-    );
+    assert_eq!(rounds.take_end(a, local), None, "an end is used once");
     assert!(
         !rounds.held_by_a_known_forwarder(m, mine, local).await,
         "the operator's"
     );
     assert_eq!(m.tcp_ends_reads.load(SeqCst), 2, "a miss reads again");
-    assert_eq!(
-        rounds
-            .seen_held_by_a_forwarder(a, at("[::ffff:127.0.0.1]:8799"))
-            .as_deref(),
-        Some("com.docker.backend"),
-        "however the listener's address is spelled"
-    );
+}
 
+/// A cached end answers only while its pid still runs the forwarder it was
+/// read for: one whose pid now runs something else is forgotten, with every
+/// end cached for it, so it never refuses another process's connection.
+#[tokio::test]
+async fn a_cached_end_answers_only_while_its_forwarder_runs() {
+    let at = |s: &str| -> SocketAddr { s.parse().unwrap() };
+    let (a, b, c) = (at("127.0.0.1:50001"), at("127.0.0.1:50002"), at("127.0.0.1:50004"));
+    let local = at("127.0.0.1:8799");
+    let m: &'static darkmux_platform::FakePlatform =
+        Box::leak(Box::new(darkmux_platform::FakePlatform {
+            tcp_peers: vec![(a, 68948), (b, 68948), (c, 68948)],
+            ..machine()
+        }));
+    let rounds = Rounds::new_for_test(Arc::new(|_| None), std::time::Duration::from_secs(1));
+    rounds.remember(forwarders_among(m, &[68948]));
+    assert!(rounds.held_by_a_known_forwarder(m, a, local).await);
     let reused: &'static darkmux_platform::FakePlatform =
         Box::leak(Box::new(darkmux_platform::FakePlatform {
-            tcp_peers: vec![(mine, 68948)],
             process_names: vec![(68948, "zsh".into())],
             ..machine()
         }));
     assert!(
-        !rounds.held_by_a_known_forwarder(reused, mine, local).await,
-        "a reused pid is no forwarder"
+        !rounds.held_by_a_known_forwarder(reused, b, local).await,
+        "its pid runs something else"
     );
     assert!(
         rounds.forwarders.lock().unwrap().pids.is_empty(),
-        "and is forgotten"
+        "forgotten"
     );
-    assert_eq!(
-        rounds.seen_held_by_a_forwarder(a, local),
-        None,
-        "its ends with it"
-    );
+    assert_eq!(rounds.take_end(c, local), None, "with every end cached for it");
+}
+
+/// A read of the forwarders for a listener may begin only once the last
+/// one has been over for as long as it took, and at least
+/// [`MIN_READ_GAP`]: reading takes at most half of the accept loop's time.
+#[test]
+fn reads_take_turns_with_the_accept_loop() {
+    let t = Instant::now();
+    let ms = std::time::Duration::from_millis;
+    assert_eq!(next_read_at(None), None, "no read yet");
+    assert_eq!(next_read_at(Some((t, ms(2)))), Some(t + MIN_READ_GAP));
+    assert_eq!(next_read_at(Some((t, ms(50)))), Some(t + ms(50)));
 }
 
 /// The rounds remember at most a handful of forwarders, newest kept, each
@@ -617,28 +635,6 @@ fn the_known_forwarders_are_bounded() {
     assert_eq!(known.len(), KNOWN_FORWARDERS);
     assert_eq!(known.last(), Some(&(19, "vpnkit".to_string())));
     assert_eq!(known.iter().filter(|(p, _)| *p == 19).count(), 1);
-}
-
-/// A verdict that could not be told becomes a container's when a forwarder
-/// already named holds the connection (a judgment that ran out of time
-/// never lets a known container in); a verdict that was told stands, and
-/// the forwarders are asked only for an unknown one.
-#[test]
-fn an_unknown_verdict_held_by_a_known_forwarder_is_a_containers() {
-    let fwd = || Some("com.docker.backend".to_string());
-    assert_eq!(
-        settled(
-            PeerProcess::Unknown("the lookup did not finish in time"),
-            fwd
-        ),
-        PeerProcess::ContainerForwarder("com.docker.backend".into())
-    );
-    let unknown = PeerProcess::Unknown("no process this user can see holds the connection");
-    assert_eq!(settled(unknown.clone(), || None), unknown);
-    assert_eq!(
-        settled(PeerProcess::Operator, || panic!("asked for a told verdict")),
-        PeerProcess::Operator
-    );
 }
 
 /// A round names the forwarders among every process in its table, each

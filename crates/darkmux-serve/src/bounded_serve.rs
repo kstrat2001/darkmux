@@ -30,11 +30,15 @@
 //!   connections here, and a later connection it holds is closed as it is
 //!   accepted, before it holds a slot. The accept loop waits for that
 //!   answer, so the container's next connections queue in the kernel's
-//!   backlog, not in this listener's slots. A connection the cached ends
-//!   hold costs no read; a miss reads the forwarders' descriptors once, off
-//!   the async workers, and that read answers every connection they hold
-//!   then. One read grows with their descriptors (about 30 ms for 20,000
-//!   on an M5 Max), and a burst of misses shares it.
+//!   backlog, not in this listener's slots. A cached end is used once (a
+//!   port reused later is another connection) and only while its process
+//!   still runs that forwarder. A miss reads the forwarders' descriptors,
+//!   off the async workers; that read answers every connection they hold
+//!   then, and the next may begin only once the last has been over for as
+//!   long as it took, so reading takes at most half of the accept loop's
+//!   time and the connections queued meanwhile share it. One read grows
+//!   with their descriptors (about 30 ms for 20,000 on an M5 Max). A
+//!   connection already reset is closed without one.
 //! - A connection waiting for its judgment gives its slots back as soon as
 //!   its peer hangs up (a reset, or its end closed), so one opened and
 //!   dropped at once, which no process holds by the time anything looks,
@@ -305,7 +309,7 @@ pub(crate) async fn serve_kept_alive_reading(
     let admission = Admission::new(limits.label, limits.max_conns, limits.per_ip)
         .with_judged_share(limits.judged_share);
     while let Some(conn) = admission.next(&listener, &mut shutdown).await {
-        if conn.judge_first && from_a_known_forwarder(&rounds, &conn).await {
+        if refused_on_accept(&rounds, darkmux_platform::current(), &conn).await {
             continue;
         }
         tokio::spawn(kept_alive(
@@ -320,24 +324,34 @@ pub(crate) async fn serve_kept_alive_reading(
     admission.drained().await;
 }
 
-/// Whether `conn` is a container's, by a forwarder `rounds` already named
-/// ([`crate::local_peer::Rounds::held_by_a_known_forwarder`]): asked here,
-/// as it is accepted, so it is closed before it holds a slot while a round
-/// runs. The accept loop waits for the answer, and that wait is the point:
-/// a container's next connections queue in the kernel's accept backlog
-/// behind it, in arrival order with everyone else's, instead of in this
-/// listener's slots. A connection the forwarders' cached ends already hold
-/// costs no read; a miss costs one read of their descriptors, on a
-/// blocking thread, which answers every connection they hold then.
-async fn from_a_known_forwarder(rounds: &Arc<crate::local_peer::Rounds>, conn: &Admitted) -> bool {
-    match conn.local {
-        Some(local) => {
-            rounds
-                .held_by_a_known_forwarder(darkmux_platform::current(), conn.peer, local)
-                .await
-        }
-        None => false,
+/// Whether `conn` is closed as it is accepted: one judged first that has
+/// already been reset (it is gone; nothing to read for it), or one a known
+/// container forwarder holds
+/// ([`crate::local_peer::Rounds::held_by_a_known_forwarder`], read through
+/// `platform`). Every other connection takes its own end out of the
+/// forwarders' cache, since a port it reuses later is another connection.
+///
+/// Asked as the connection is accepted, so a container's is closed before
+/// it holds a slot while a round runs. The accept loop waits for the
+/// answer, and that wait is the point: a container's next connections
+/// queue in the kernel's accept backlog behind it, in arrival order with
+/// everyone else's, instead of in this listener's slots.
+async fn refused_on_accept(
+    rounds: &Arc<crate::local_peer::Rounds>,
+    platform: &'static dyn darkmux_platform::Platform,
+    conn: &Admitted,
+) -> bool {
+    let Some(local) = conn.local else {
+        return false;
+    };
+    if !conn.judge_first {
+        rounds.take_end(conn.peer, local);
+        return false;
     }
+    matches!(conn.stream.take_error(), Ok(Some(_)))
+        || rounds
+            .held_by_a_known_forwarder(platform, conn.peer, local)
+            .await
 }
 
 /// Serves one admitted connection until it closes, or, once `shutdown`

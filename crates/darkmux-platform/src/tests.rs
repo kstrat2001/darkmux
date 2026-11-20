@@ -2865,6 +2865,8 @@ fn a_socket_fdinfo_record_reads_as_a_connections_two_ends() {
     let (own6, other6) = (at("[::1]:50123"), at("[::1]:8799"));
     assert_eq!(connection_in_fdinfo(&record(4, 2, own6, other6)), Some((own6, other6)));
     assert_eq!(connection_in_fdinfo(&record(1, 1, own, other)), None, "a listener");
+    assert_eq!(connection_in_fdinfo(&record(2, 1, own, other)), None, "still connecting (SYN_SENT)");
+    assert_eq!(connection_in_fdinfo(&record(8, 1, own, other)), None, "closing (CLOSE_WAIT)");
     assert_eq!(connection_in_fdinfo(&record(4, 0, own, other)), None, "no family");
     let mut udp = record(4, 1, own, other);
     udp[256..260].copy_from_slice(&1i32.to_ne_bytes());
