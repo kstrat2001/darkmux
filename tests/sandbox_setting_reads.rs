@@ -20,11 +20,13 @@
 //! A token match still sees an alias (`sb::selection`), a function value
 //! (`let f = darkmux_sandbox::selection;`) and a `{self as sb}` import,
 //! since each spells the name; renaming one on import (`selection as f`) is
-//! refused everywhere, as is a raw field path (`runtime.sandbox`,
-//! `runtime.tests_on_host` as code). Comments and string literals are not
-//! code; test code (a `#[cfg(test)]` item, a `_tests.rs` or `tests.rs`
-//! file, a `tests/` directory) is not scanned. Every other `cfg` attribute,
-//! `cfg(not(test))` and `cfg(any(test, ...))` included, is scanned.
+//! refused everywhere, as is the field path spelled `runtime.sandbox` or
+//! `runtime.tests_on_host` in code (a binding named `runtime`, as in
+//! `if let Some(runtime) = &cfg.runtime`). Comments and string literals are
+//! not code; test code (an item under `cfg(test)` or `cfg(all(test, ...))`,
+//! a `_tests.rs` or `tests.rs` file, a `tests/` directory) is not scanned.
+//! Every other `cfg` attribute, `cfg(not(test))` and `cfg(any(test, ...))`
+//! included, may build into a shipped binary, so it is scanned.
 //!
 //! What it does NOT catch, stated so nobody reads more into a green run:
 //! - calling an entry point (or any function that calls one, such as
@@ -41,7 +43,8 @@
 //!   source is not scanned), until something outside calls it by a name
 //!   not on the list;
 //! - a raw config read through a closure or a chain
-//!   (`cfg.runtime.as_ref().and_then(|r| r.sandbox)`), and the bare names
+//!   (`cfg.runtime.as_ref().and_then(|r| r.sandbox)`,
+//!   `cfg.runtime.as_ref()?.sandbox`), and the bare names
 //!   `sandbox` / `tests_on_host`, which every variable and field so named
 //!   would match.
 
@@ -239,17 +242,67 @@ fn ident_byte(b: &[u8], i: usize) -> bool {
     i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')
 }
 
-/// `code` with every item under exactly `#[cfg(test)]` blanked: a test
-/// module, a test-only function or import. Any other `cfg` attribute
-/// (`not(test)`, `any(test, ...)`) may build into a shipped binary, so its
-/// item is scanned.
+/// The index of the `)` that closes a group whose `(` comes just before `s`.
+fn closing_paren(s: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    for (k, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth == 1 => return Some(k),
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether a whitespace-free `cfg` predicate holds only under test: `test`,
+/// or `all(...)` with `test` among its top-level arguments.
+fn test_only_predicate(pred: &str) -> bool {
+    let Some(args) = pred.strip_prefix("all(").and_then(|r| r.strip_suffix(')')) else {
+        return pred == "test";
+    };
+    let (mut depth, mut start) = (0usize, 0usize);
+    let mut parts = Vec::new();
+    for (k, c) in args.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&args[start..k]);
+                start = k + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&args[start..]);
+    parts.contains(&"test")
+}
+
+/// The end of the `#[cfg(...)]` attribute at `at` when its item builds only
+/// under test.
+fn test_only_cfg_end(code: &str, at: usize) -> Option<usize> {
+    let open = at + "#[cfg(".len();
+    let close = open + closing_paren(&code[open..])?;
+    let pred: String = code[open..close].chars().filter(|c| !c.is_whitespace()).collect();
+    let end = close + code[close..].find(']')? + 1;
+    test_only_predicate(&pred).then_some(end)
+}
+
+/// `code` with every item that builds only under test blanked (`cfg(test)`,
+/// `cfg(all(test, ...))`): a test module, a test-only function or import.
+/// Any other `cfg` attribute (`not(test)`, `any(test, ...)`) may build into
+/// a shipped binary, so its item is scanned.
 fn production(code: &str) -> String {
     let b = code.as_bytes();
     let mut out = b.to_vec();
     let mut from = 0;
-    while let Some(p) = code[from..].find("#[cfg(test)]") {
+    while let Some(p) = code[from..].find("#[cfg(") {
         let at = from + p;
-        let attr_end = at + "#[cfg(test)]".len();
+        let Some(attr_end) = test_only_cfg_end(code, at) else {
+            from = at + 1;
+            continue;
+        };
         let rest = &code[attr_end..];
         let semi = rest.find(';');
         let brace = rest.find('{');
@@ -355,7 +408,7 @@ fn the_scan_finds_a_read_however_it_is_spelled() {
         ("types.rs", "use darkmux_types::config_access as ca;\nfn f() { ca::sandbox_with_source(); }\n"),
         ("on_host.rs", "fn f() -> bool { darkmux_types::config_access::tests_on_host_with_source().0 }\n"),
         ("enum.rs", "fn f() { let _ = darkmux_types::config_access::resolve_enum::<K>(\"runtime.sandbox\"); }\n"),
-        ("raw_field.rs", "fn f(c: &Config) -> bool { c.runtime.tests_on_host.unwrap_or(false) }\n"),
+        ("raw_field.rs", "fn f(c: &Config) -> bool {\n    if let Some(runtime) = &c.runtime { runtime.tests_on_host.unwrap_or(false) } else { false }\n}\n"),
         ("not_test.rs", "#[cfg(not(test))]\nfn f() { darkmux_sandbox::selection(); }\n"),
         ("any_test.rs", "#[cfg(any(test, feature = \"x\"))]\nfn f() { darkmux_sandbox::selection(); }\n"),
     ] {
@@ -366,6 +419,8 @@ fn the_scan_finds_a_read_however_it_is_spelled() {
         ("string.rs", "fn f() { let _ = \"selection-read\"; let _ = r#\"selection\"#; }\n"),
         ("carried.rs", "fn f(s: darkmux_sandbox::Selection) { let _ = s.kind; }\n"),
         ("test_only.rs", "#[cfg(test)]\nmod tests {\n    fn f() { darkmux_sandbox::selection(); }\n}\n"),
+        ("all_test.rs", "#[cfg(all(test, unix))]\nfn f() { darkmux_sandbox::selection(); }\n"),
+        ("spaced_test.rs", "#[cfg( test )]\nfn f() { darkmux_sandbox::selection(); }\n"),
     ] {
         assert_eq!(case(name, body), Vec::<String>::new(), "{name}");
     }

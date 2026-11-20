@@ -324,8 +324,8 @@ pub fn remove_container(handle: &SandboxHandle) {
 /// version-checked the same way, pulled if absent). Refuses when Docker is
 /// not reachable, naming the opt-out. `sandbox` is the backend the run
 /// resolved: on the host there is no image. `read` is the run's own read of
-/// the setting, for why Docker was needed (`None`, a run recorded earlier:
-/// no setting is named).
+/// the setting, for why Docker was needed (`None`, a placement built without
+/// a read: no setting is named).
 pub fn lab_test_image_in(
     sandbox: darkmux_sandbox::BackendKind,
     workload_image: Option<&str>,
