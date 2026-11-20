@@ -49,6 +49,13 @@ import { HUB_UNREAD } from "../../lib/machineAvailability";
 export const absentOrUnknown = (present: boolean | null, m: string, presenceUnread = false): boolean | null =>
   (m === NO_UID_KEY || presenceUnread) && present === null ? null : present === false;
 
+/** (#3662 review) This machine's own row names its uid even when its card's
+ *  specs do not (a degraded specs gather): the self join then compares uids
+ *  rather than falling back to a name a peer could share. */
+function withRowUid(specs: MachineSpecsResponse | null, row: FleetMachine): MachineSpecsResponse | null {
+  return specs && !specs.machine_uid && row.machine_uid ? { ...specs, machine_uid: row.machine_uid } : specs;
+}
+
 /** This machine's specs: its own row of the fleet view, else (#3662 review),
  *  when the view holds no row for it (its read failed), `/machine/specs`.
  *  That is the query `App` runs on every live route, so this shares its cache
@@ -63,7 +70,7 @@ function useSelfSpecs(viewRows: readonly FleetMachine[] | null, live: boolean): 
   const probed = live && query.data?.ok ? query.data.data : null;
   return useMemo(() => {
     const self = viewRows?.find((r) => r.is_this_machine);
-    return self ? rowSpecs(self) : probed;
+    return self ? withRowUid(rowSpecs(self), self) : probed;
   }, [viewRows, probed]);
 }
 

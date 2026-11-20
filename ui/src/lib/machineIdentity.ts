@@ -262,13 +262,7 @@ export function machineNames(
  * Note the fallback is also strictly WEAKER, which is the second defect this
  * closes rather than merely routes around: a remote peer logging under the
  * same name this daemon reports passes the name join and gets credited with
- * this host's CPU and RAM. The uid join cannot make that mistake.
- *
- * (#3662 review) So the name join now applies only to the records that carry
- * no uid (`NO_UID_KEY`). Specs without a uid means this machine's probe has
- * none, and the same probe stamps its records (`darkmux_hardware::machine_uid`,
- * which never falls back to a name): a machine whose records carry a uid is
- * another machine, whatever it is called. */
+ * this host's CPU and RAM. The uid join cannot make that mistake. */
 export function isSelfMachine(
   data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
@@ -277,7 +271,7 @@ export function isSelfMachine(
 ): boolean {
   if (!specs) return false;
   if (specs.machine_uid) return sameUid(specs.machine_uid, m);
-  return !!specs.machine_id && m === NO_UID_KEY && uidForName(data, liveMachines, specs.machine_id) === NO_UID_KEY;
+  return !!specs.machine_id && sameUid(uidForName(data, liveMachines, specs.machine_id), m);
 }
 
 /** The one machine in the window that answers to `name`; `null` when none

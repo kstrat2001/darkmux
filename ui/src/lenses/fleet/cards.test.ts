@@ -176,13 +176,9 @@ describe("specOf", () => {
     generated_at_ms: 0,
   };
 
-  // (#3662 review) Specs without a uid stamp no uid on this machine's
-  // records either: these cases carry the uid both sides share.
-  const specsU1 = { ...specs, machine_uid: "u1" };
-
   it("prefers the live /machine/specs probe for THIS machine", () => {
     const data: NormRecord[] = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro" })];
-    expect(specOf(data, new Map(), specsU1, "u1")).toBe("Apple M5 Max · 128 GB");
+    expect(specOf(data, new Map(), specs, "u1")).toBe("Apple M5 Max · 128 GB");
   });
 
   it("still recognizes THIS machine when its records use a different alias than specs reports", () => {
@@ -195,7 +191,7 @@ describe("specOf", () => {
       rec({ machine_uid: "u1", machine_id: "MacBook-Pro.local" }),
       rec({ machine_uid: "u1", machine_id: "MacBook-Pro" }),
     ];
-    expect(specOf(data, new Map(), specsU1, "u1")).toBe("Apple M5 Max · 128 GB");
+    expect(specOf(data, new Map(), specs, "u1")).toBe("Apple M5 Max · 128 GB");
   });
 
   it("does NOT claim this daemon's hardware for a machine that merely shares no alias", () => {
@@ -262,9 +258,12 @@ describe("specOf", () => {
     expect(specOf(data, live, specsWithUid, "u2")).toBe("M1 Max · 32 GB");
   });
 
-  it("(#3662 review) with no specs uid, a uid-bearing machine of this name is another machine", () => {
-    const data: NormRecord[] = [rec({ machine_uid: "u2", machine_id: "MacBook-Pro" })];
-    expect(specOf(data, new Map(), specs, "u2")).not.toBe("Apple M5 Max · 128 GB");
+  it("(#2814) keeps the alias join when specs reports no uid at all", () => {
+    // Non-macOS, a failed `ioreg`, or a peer/static fixture built before the
+    // field existed. Absence degrades to the pre-#2814 behavior; it never
+    // means "not this machine".
+    const data: NormRecord[] = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro" })];
+    expect(specOf(data, new Map(), specs, "u1")).toBe("Apple M5 Max · 128 GB");
   });
 });
 
@@ -864,7 +863,7 @@ describe("(#1855) the spec line says WHICH kind of unknown", () => {
     // probe, not from a beat, and must not be pushed into either unknown
     // bucket just because presence is switched off.
     const data = [rec({ machine_uid: "u1", machine_id: "MacBook-Pro", action: "dispatch.start" })];
-    const specs = machineSpecs({ machine_id: "MacBook-Pro", machine_uid: "u1", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 });
+    const specs = machineSpecs({ machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 });
     const card = buildFleetCard(data, new Map(), specs, new Set(), false, "u1", T);
     expect(card.spec).toBe("Apple M5 Max · 128 GB");
     expect(card.specUnknown).toBeNull();

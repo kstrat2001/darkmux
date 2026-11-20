@@ -969,8 +969,8 @@ describe("FleetLens", () => {
         { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
         { ts: `${today}T10:00:01.000Z`, machine_uid: "u2", machine_id: "studio", session_id: "s2", action: "dispatch.start", handle: "coder" },
       ],
-      // specs names THIS daemon as MacBook-Pro (u1), so u2 is positively remote.
-      specs: { machine_id: "MacBook-Pro", machine_uid: "u1" },
+      // specs names THIS daemon as MacBook-Pro, so u2 is positively remote.
+      specs: { machine_id: "MacBook-Pro" },
     });
     renderFleetLens();
     await waitFor(() => expect(document.querySelectorAll(".mach").length).toBe(2));
@@ -2048,6 +2048,63 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     renderFleetLens();
     await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
     await waitFor(() => expect(document.querySelector(".savlbl")!.textContent).toBe("all tokens · last 24h"));
+  });
+
+  // (#3662 review 3) A real daemon can send specs without a uid beside records
+  // that carry one (`degraded_specs`, older recordings). This machine still
+  // recognizes itself: one card, its own hardware line, its own records, with
+  // presence healthy or unreadable.
+  for (const [label, presence] of [
+    ["healthy", { state: "ok" }],
+    ["unreadable", { state: "unavailable", detail: "could not read presence beats from Redis" }],
+  ] as const) {
+    it(`with uid-less specs and uid-bearing own records, presence ${label}: one card for this machine, with its hardware`, async () => {
+      const day = todayUTC();
+      mockFleetFetch({
+        specs: { machine_id: "MacBook-Pro", machine_uid: null, cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 },
+        flowToday: [
+          { ts: `${day}T09:30:00.000Z`, action: "dispatch.start", session_id: "s1", machine_uid: "u1", machine_id: "MacBook-Pro", handle: "coder" },
+          { ts: `${day}T09:31:00.000Z`, action: "dispatch.complete", session_id: "s1", machine_uid: "u1", machine_id: "MacBook-Pro", handle: "coder" },
+        ],
+        runs: [],
+        presence,
+      });
+      renderFleetLens();
+      await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
+      await waitFor(() => expect(document.querySelector(".mach .stat")?.textContent).toBe("idle"));
+      const cards = [...document.querySelectorAll(".mach")];
+      expect(cards.map((c) => c.querySelector(".mach-name")!.textContent)).toEqual(["MacBook-Pro"]);
+      expect(cards[0].querySelector(".spec")!.textContent).toBe("Apple M5 Max · 128 GB");
+      expect(document.body.textContent).not.toContain("nothing says whether it is up");
+    });
+  }
+
+  // (#3662 review 3) Where the view row names this machine's uid, the self
+  // join uses it even though the card's specs carry none: a peer logging
+  // under the same hostname is a separate card and never gets this
+  // machine's hardware.
+  it("with uid-less specs, this machine's view row uid keeps a same-named peer from being taken for it", async () => {
+    const day = todayUTC();
+    mockFleetFetch({
+      view: [viewRow({ machine_id: "MacBook-Pro", machine_uid: null, cpu_brand: "Apple M5 Max", ram_total_bytes: 137438953472 }, { is_this_machine: true, machine_uid: "u1", accepts: { state: "this_machine" } })],
+      // This machine has no records in the window; the peer's are the only
+      // ones named MacBook-Pro, so a name join alone would take it for self.
+      flowToday: [
+        { ts: `${day}T09:40:00.000Z`, action: "dispatch.start", session_id: "p1", machine_uid: "u2", machine_id: "MacBook-Pro", handle: "coder" },
+        { ts: `${day}T09:41:00.000Z`, action: "dispatch.complete", session_id: "p1", machine_uid: "u2", machine_id: "MacBook-Pro", handle: "coder" },
+      ],
+      runs: [],
+      presence: { state: "unavailable", detail: "could not read presence beats from Redis" },
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach")).toHaveLength(2));
+    await waitFor(() => expect(document.querySelector('.savings[data-settled="true"]')).not.toBeNull());
+    const withHardware = [...document.querySelectorAll(".mach .spec")].filter((e) => e.textContent === "Apple M5 Max · 128 GB");
+    expect(withHardware).toHaveLength(1);
+    // The peer is a peer: under unread presence it reads not streaming,
+    // never this machine's "idle".
+    const peer = [...document.querySelectorAll(".mach")].find((c) => !c.contains(withHardware[0]))!;
+    await waitFor(() => expect(peer.querySelector(".stat")!.textContent).toBe("not streaming"));
   });
 
   // (#3662 review) A peer nobody rostered, known only from records in the
