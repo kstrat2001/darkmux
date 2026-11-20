@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { withPresenceUnread, type FleetCardBase } from "./cards";
 import { machActive, specOf, busiestExecution, isStrictlyBusier, specUnknownLabel, cardFace, notStreamedNames, servesLine, servesParts, executionCountText, countLine, shownExecution } from "./cards";
 import { CardStatus, STATUS_WORD, lampOf, secondLineOf, statusReason } from "./cardStatus";
 import { buildFleetCard, faceOf } from "../../testing/fleetCard";
@@ -1774,5 +1775,22 @@ describe("(#3210) a peer's relayed beats, a local silence between them", () => {
     const last = G0 + 43_000;
     expect(read(last + STALL_AFTER_MS + HUB_RELAY_INTERVAL_MS - 1_000)).toBe("generating");
     expect(read(last + STALL_AFTER_MS + HUB_RELAY_INTERVAL_MS + 1_000)).toBe("stalled");
+  });
+});
+
+// (#3662) The card base under a stale or unreadable presence read: a peer
+// that read as seen goes to "not streaming"; this machine, and a peer already
+// unseen or down, keep what they had.
+describe("withPresenceUnread", () => {
+  const base = (availability: FleetCardBase["availability"], self: boolean) =>
+    ({ availability, liveInputs: { self } }) as unknown as FleetCardBase;
+  it("a peer the window held reads not streamed", () => {
+    expect(withPresenceUnread(base("known", false)).availability).toBe("not_streamed");
+  });
+  it("this machine's own card is unchanged: its records are its own", () => {
+    expect(withPresenceUnread(base("known", true)).availability).toBe("known");
+  });
+  it("a peer already not reporting (down) stays not reporting, never 'check its stream'", () => {
+    expect(withPresenceUnread(base("not_reporting", false)).availability).toBe("not_reporting");
   });
 });

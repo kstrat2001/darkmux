@@ -10,7 +10,7 @@ import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useNowMs } from "../../lib/clock";
 import { useLiveOverlay } from "../../lib/liveChannel";
 import { useCountUp } from "../../hooks/useCountUp";
-import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
+import { useDegradedFleetSource, useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useFleetView } from "../../hooks/useFleetView";
 import { useFlip } from "../../hooks/useFlip";
 import { orderCards } from "./cardOrder";
@@ -27,7 +27,7 @@ import { fmtN, fmtC } from "../../lib/format";
 import { Shimmer } from "../../components/Placeholder";
 import { usePlaybackClock } from "../../lib/pageClockRate";
 import { tokensOffMeter } from "./savings";
-import { buildFleetCardBase, withLiveReadings, shownExecution, cardFace, notStreamedNames, type CardSourcesAnswered } from "./cards";
+import { buildFleetCardBase, withLiveReadings, withPresenceUnread, shownExecution, cardFace, notStreamedNames, type CardSourcesAnswered } from "./cards";
 import { MachineCard } from "./MachineCard";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
@@ -241,13 +241,9 @@ const SavingsHero = memo(function SavingsHero({
  * `/fleet/dispatches/live` (presence), `/machine/specs` (this machine's own
  * hardware string).
  */
-// (#1729) The presence-coverage notice this lens used to own MOVED to
-// `components/FleetCoverageNotice.tsx` in #2683 and now mounts once, from
-// `App.tsx`, above every lens. It is not re-mounted here: the masthead makes
-// the same presence-derived claim this view does, one shared indicator covers
-// both, and two copies on the fleet route would have shown the identical
-// banner twice. The reasoning (and the unchanged wording) lives in that
-// component's own doc.
+// (#3662) Presence coverage has no notice here or above: when presence is
+// stale or unreadable each card says what is known (`withPresenceUnread`),
+// and the masthead count carries its own caveat.
 
 /**
  * (#1923 review) The `/runs` read failed — say so, rather than letting the
@@ -255,21 +251,13 @@ const SavingsHero = memo(function SavingsHero({
  *
  * The cards' lab-run count comes from `GET /runs`; a failed read yields the
  * same empty list a healthy idle machine does, so the card falls back to
- * exactly the "idle while a lab run is live" reading #1923 removed. It is
- * the sibling of the app-level `FleetCoverageNotice` (presence unreadable,
- * mounted from `App.tsx` since #2683) applied
- * to the other source this lens depends on, and follows `RunsBoard`'s own
- * habit of naming what it could not read instead of rendering the absence
- * as data.
+ * exactly the "idle while a lab run is live" reading #1923 removed. This
+ * follows `RunsBoard`'s own habit of naming what it could not read instead
+ * of rendering the absence as data.
  *
  * Deliberately does NOT say the machine IS running lab work — the whole
- * point is that this page no longer knows. `role="status"`, same as the
- * coverage notice: informational, never an interruption.
- *
- * Worded to share NO phrase with `FleetCoverageNotice`'s "could not be
- * read": the two can legitimately fire together (a machine that can reach
- * neither Redis nor its own `/runs`), and a reader — or a test's
- * `getByText` — has to be able to tell which source is missing.
+ * point is that this page no longer knows. `role="status"`: informational,
+ * never an interruption.
  */
 function RunsUnreadableNotice({ unreadable, message }: { unreadable: boolean; message?: string | null }) {
   if (!unreadable) return null;
@@ -403,8 +391,8 @@ const TimelineLanes = memo(function TimelineLanes({ timeline }: { timeline: Retu
  * Presence is the fifth: `liveMachines`/`liveSessionIds` are LIVE endpoints
  * describing NOW, so a replay must neither fetch nor consult them. Asserting
  * today's presence over a past day is exactly the "confidently WRONG:
- * machines read idle, running work reads zero" failure this file's own
- * coverage notice exists to warn about.
+ * machines read idle, running work reads zero" failure the cards' own
+ * presence handling (`withPresenceUnread`) exists to prevent.
  *
  * (#1869) `tMax` was a fixed ceiling (`computeTMax(records)`, the day's true
  * max) AND the de facto playhead until this packet — the two were always
@@ -583,15 +571,15 @@ export function FleetLens({
   // the property true in the composed app rather than only in this lens's own
   // isolated test.
   const liveMachines = useLiveMachines(livePolling);
-  // (#2725) `coverage` is deliberately NOT read here: this lens sits under
-  // the app-wide `FleetCoverageNotice` (`App.tsx` mounts it for every route),
-  // which already says the one sentence this app has about a degraded
-  // presence read — and it derives that from the machines half of the same
-  // substrate, so a sessions read that failed means the machines read failed
-  // too. A second marker on this page would be the duplicate wording #2683
-  // removed. Destructured explicitly rather than ignored implicitly so the
-  // choice is visible: the hook no longer discards the signal, this caller
-  // does, on the record, for a stated reason.
+  // (#3662) Whether that presence read can be believed. Same query key as
+  // the line above (one request answers both), gated identically. Under a
+  // stale or unreadable read a peer's card reads "not streaming"
+  // (`withPresenceUnread`); there is no notice above the cards to say it for
+  // them.
+  const presenceDegraded = useDegradedFleetSource(livePolling) !== null;
+  // The sessions half of the same substrate: a sessions read that failed
+  // means the machines read above failed too, so the caveat is taken from
+  // that one predicate rather than a second.
   const { sessions: liveSessionIds } = useLiveSessionIds(livePolling);
   // (#1855) The operator's DECLARED roster, gated the same way as presence
   // above — a replay must not assert the CURRENT roster over a past day.
@@ -657,9 +645,8 @@ export function FleetLens({
   // committed fixture) is NOT a failure: nothing was asked, so `isError` is
   // false and `data` is undefined, and both arms below stay quiet.
   //
-  // LIVE MODE ONLY, for the same reason `FleetCoverageNotice` is historical-
-  // gated: a replayed day is drawn from its records, so a failed `/runs` costs
-  // it nothing, and warning about it there would be the bug.
+  // LIVE MODE ONLY: a replayed day is drawn from its records, so a failed
+  // `/runs` costs it nothing, and warning about it there would be the bug.
   const runsUnreadable = liveMode && (runsQuery.isError || runsQuery.data?.ok === false);
   const runsErrorMessage = runsQuery.data && !runsQuery.data.ok ? runsQuery.data.message : null;
 
@@ -846,9 +833,10 @@ export function FleetLens({
     // The ONE place the card order is decided (`cardOrder.ts`): neither the
     // view's order nor the flow window's, so which source answered first
     // never moves a card.
-    return orderCards([...viewBases, ...flowBases], (b) => b.order).map((b) => b.base);
+    const bases = orderCards([...viewBases, ...flowBases], (b) => b.order).map((b) => b.base);
+    return presenceDegraded ? bases.map(withPresenceUnread) : bases;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
-  }, [viewCards, flowOnlyUids, flowWindow.data, liveEdgeClock, liveMachines, specs, presence, runs, roster, policy]);
+  }, [viewCards, flowOnlyUids, flowWindow.data, liveEdgeClock, liveMachines, specs, presence, runs, roster, policy, presenceDegraded]);
   const cards = useMemo(
     () => baseCards.map((b) => withLiveReadings(b, playheadT, connected, lastContactMs, liveOverlay)),
     [baseCards, playheadT, connected, lastContactMs, liveOverlay],

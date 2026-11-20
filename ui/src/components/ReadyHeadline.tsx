@@ -23,7 +23,7 @@
  * it for free, and the test pins the exact text so parity stays honest.
  */
 import { MachineIcon } from "./MachineIcon";
-import { fleetCoverageMessage, type DegradedFleetSource } from "./FleetCoverageNotice";
+import { presenceCaveat, type DegradedFleetSource } from "../lib/fleetCoverage";
 
 /** (5.0 R3) What "last dispatch" is the newest of: the line reads as the
  *  fleet's (the count beside it is machines online), and it is computed over
@@ -39,8 +39,8 @@ const LAST_DISPATCH_SCOPE = "The newest dispatch start in the loaded window, on 
  * stale or unreadable the count still renders (the last answer beats no
  * answer, and blanking it would read as "zero machines", a worse lie), but it
  * stops being asserted bare: the ⚠ says the number is not being backed up,
- * and the title carries the same sentence the shared `FleetCoverageNotice`
- * under the masthead is spelling out in full.
+ * and the title says why in a few words (`presenceCaveat`, #3662: there is
+ * no warning box under the masthead any more).
  *
  * The healthy render is byte-identical to before — marker and substituted
  * title appear only in the degraded states, so the parity goldens (`#meta` is
@@ -57,7 +57,7 @@ export function ReadyHeadline({ n, ago, coverage = null }: { n: number; ago: str
       <span
         className="mco"
         data-coverage={coverage ? coverage.state : undefined}
-        title={coverage ? fleetCoverageMessage(coverage) : `${n} machine${n === 1 ? "" : "s"} online`}
+        title={coverage ? presenceCaveat(coverage) : `${n} machine${n === 1 ? "" : "s"} online`}
       >
         {coverage ? <span className="mco__warn">⚠ </span> : null}
         {n} <MachineIcon />

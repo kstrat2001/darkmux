@@ -202,8 +202,7 @@ function runningLabRunCount(machineRuns: Run[]): number {
  *   and the old string made its card assert that the machine had answered
  *   and withheld its hardware.
  *
- * The distinction is the same one the fleet-coverage notice draws one level
- * up, and the same one `specOf`'s `unknown`-uid branch already draws for
+ * The distinction is the same one `specOf`'s `unknown`-uid branch already draws for
  * identity: "we looked and it said nothing" is not "we could not look". */
 export type SpecUnknownReason = "not-reported" | "not-seen";
 
@@ -585,11 +584,22 @@ export function buildFleetCardBase(
   };
 }
 
+/** (#3662) A card's base once this page's presence read is stale or
+ *  unreadable (`degradedFleetSource`). A peer's records in the window came
+ *  through the same hub presence could not be read from, so they are
+ *  history, not a stream: the card reads "not streaming", the same form as a
+ *  peer whose stream never reached this viewer, rather than an "idle" or
+ *  "0 running" nothing now backs. This machine's own card is unchanged: its
+ *  records are its own. */
+export function withPresenceUnread(base: FleetCardBase): FleetCardBase {
+  return base.liveInputs.self || base.availability !== "known" ? base : { ...base, availability: "not_streamed" };
+}
+
 /** (#2958) Which of a fleet card's sources have answered at least once on
  *  this mount (success or failure; a source this mount never reads counts
- *  as answered). A failed read counts: it has its own notice
- *  (`RunsUnreadableNotice`, `FleetCoverageNotice`), and waiting on it would
- *  hold "checking…" forever. The flow window is the exception (#2965): its
+ *  as answered). A failed read counts: `/runs` has its own notice
+ *  (`RunsUnreadableNotice`), presence its own card form (`withPresenceUnread`),
+ *  and waiting on either would hold "checking…" forever. The flow window is the exception (#2965): its
  *  failed read yields an empty window, which every negative claim here would
  *  read as "nothing happened", so `flow` is false while a day's read is
  *  failing (and `FlowReadNotice` names it). `/fleet/roster` is not a

@@ -55,15 +55,18 @@ export const isUnseen = (a: MachineAvailability | undefined): boolean => a !== u
 /** What a page about `uid` can see of it, judged only once the flow window has
  *  answered and the page knows whose machine it is (until then `known`: the
  *  pending forms already say "checking…"). `self`: the page is about the
- *  machine serving it. */
+ *  machine serving it. `presenceDegraded` (#3662): this page's presence read
+ *  is stale or unreadable, so another machine's records in the window came
+ *  through a hub this page cannot read: history, not a stream. */
 export function windowAvailability(
   data: NormRecord[],
   liveMachines: Map<string, PresenceBeat>,
   uid: string | null,
-  opts: { self: boolean; answered: boolean },
+  opts: { self: boolean; answered: boolean; presenceDegraded?: boolean },
 ): MachineAvailability {
   if (!opts.answered || uid === null) return "known";
-  return machineAvailability({ self: opts.self, seen: windowHoldsMachine(data, liveMachines, uid), standing: "unknown" });
+  const seen = !opts.presenceDegraded && windowHoldsMachine(data, liveMachines, uid);
+  return machineAvailability({ self: opts.self, seen, standing: "unknown" });
 }
 
 /** A remote machine's live-load line when it has no samples: the page says
