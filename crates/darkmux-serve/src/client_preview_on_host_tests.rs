@@ -503,13 +503,15 @@ while time.time() < d:
     if os.fork(): os._exit(0)
     time.sleep(0.005)";
 
-/// Kills the process group it names when dropped.
-struct GroupKill(i32);
+/// A child leading its own process group: dropping it kills the whole group
+/// and reaps the child.
+struct GroupKill(std::process::Child);
 
 impl Drop for GroupKill {
     fn drop(&mut self) {
         // SAFETY: kill has no memory preconditions; a negative pid names a group.
-        unsafe { libc::kill(-self.0, libc::SIGKILL) };
+        unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+        let _ = self.0.wait();
     }
 }
 
@@ -519,14 +521,13 @@ impl Drop for GroupKill {
 fn the_fork_hopper_fixture_ends_by_itself() {
     use std::os::unix::process::CommandExt;
     let port = darkmux_types::test_ports::fixture_port();
-    let child = std::process::Command::new("python3")
+    let _group = GroupKill(std::process::Command::new("python3")
         .args(["-c", HOPPER])
         .env("PORT", port.to_string())
         .env("HOP_FOR", "1")
         .process_group(0)
         .spawn()
-        .expect("python3 runs");
-    let _group = GroupKill(child.id() as i32);
+        .expect("python3 runs"));
     let held = (0..40).any(|_| {
         std::thread::sleep(Duration::from_millis(50));
         std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
