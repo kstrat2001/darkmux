@@ -190,7 +190,7 @@ fn prepare_dispatch(argv: &[String]) -> Result<Dispatch, Refusal> {
     // (#3112 review) A user's message names `/workspace` too (a mission config
     // written before `${WORKSPACE_ROOT}`): renamed at a path boundary only, and
     // byte-identical under the default root.
-    let system_prompt = args.system.take().unwrap_or_else(|| tools::workspace::naming_root(&default_system_prompt()));
+    let system_prompt = args.system.take().unwrap_or_else(|| tools::workspace::describing_root(&default_system_prompt()));
     let prompt = tools::workspace::naming_root(&prompt);
 
     // (#2386) The finding-key identity this dispatch mints under, plus the

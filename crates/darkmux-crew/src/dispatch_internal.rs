@@ -229,6 +229,21 @@ pub(crate) fn seen_path_for(kind: Option<darkmux_sandbox::BackendKind>, workdir:
     }
 }
 
+/// (#3654) The path a split-gitdir checkout is named by in model-facing
+/// text: [`seen_path_for`] in a container (unchanged), and in a sandbox on
+/// the host the checkout under the current directory (`.` for the workdir
+/// itself), never its host path.
+pub(crate) fn model_path_for(kind: Option<darkmux_sandbox::BackendKind>, workdir: &Path, checkout: &Path) -> String {
+    let root = crate::mission_config::workspace_paths::model_root(kind, workdir);
+    if root != "/workspace" {
+        return match checkout.strip_prefix(workdir) {
+            Ok(rel) if !rel.as_os_str().is_empty() => format!("{root}/{}", rel.display()),
+            _ => root.to_string(),
+        };
+    }
+    seen_path_for(kind, workdir, checkout)
+}
+
 /// (#2294) The per-checkout remedy sentence. Three shapes, three remedies
 /// (this is why the message isn't one string): a WORKTREE's gitdir is a
 /// sibling tree, so the fix is to dispatch against a plain clone; a
@@ -390,7 +405,7 @@ pub(crate) fn with_workspace_notes(
         Some(workdir) if !found.is_empty() => {
             let paths: Vec<String> = found
                 .iter()
-                .map(|f| seen_path_for(Some(kind), workdir, &f.checkout))
+                .map(|f| model_path_for(Some(kind), workdir, &f.checkout))
                 .collect();
             format!(
                 "{}\n\n{}",
@@ -553,6 +568,14 @@ pub(crate) fn mod_attachment_mounts(mounts: &[(PathBuf, String)]) -> Vec<Mount> 
         .iter()
         .map(|(host, container)| Mount { host: host.clone(), at: container.clone(), access: Access::ReadOnly })
         .collect()
+}
+
+/// (#3654) A sandbox on the host's [`crate::mods::MODS_ENV`]: the mod store
+/// the briefed mods' attachments sit in (each mount is
+/// `<store>/<key>/attachments`), or nothing when no mod is attached.
+fn mod_store_env(mounts: &[(PathBuf, String)]) -> Option<(String, String)> {
+    let store = mounts.first()?.0.parent()?.parent()?;
+    Some((crate::mods::MODS_ENV.to_string(), store.display().to_string()))
 }
 
 /// (#386) Filename the host writes the user message into (under `host_out`), and
@@ -2710,6 +2733,9 @@ pub(crate) fn dispatch_policy_for(config: &DockerRunConfig, backend: &dyn darkmu
     // (#3112 step 2) A runtime that cannot assume its container paths is told them.
     if ws_at != mounts[0].at {
         env.push(("DARKMUX_RUNTIME_WORKSPACE".to_string(), ws_at));
+        // (#3654) And where the mod store is, which its brief names a mod's
+        // attachments under (`brief_refs::attachments_seen`), never by path.
+        env.extend(mod_store_env(&config.mod_attachment_mounts));
     }
     if out_at != mounts[1].at {
         env.push(("DARKMUX_RUNTIME_OUT_DIR".to_string(), out_at.clone()));
@@ -7335,14 +7361,15 @@ fn prepare_container_run(
 }
 
 /// (contract 6) The system prompt as a `kind` sandbox's runtime sends it:
-/// `/workspace` named where that sandbox sees `workspace` (a container:
-/// unchanged; a sandbox on the host: the workspace's host path), by the
-/// runtime's path-boundary rule. The dispatch records the hash of this text
-/// and passes it as `--system`, which the runtime sends byte for byte, so
-/// `system_sha256` is the hash of the bytes sent on every backend.
+/// `/workspace` named as that sandbox's model sees `workspace` (a container:
+/// unchanged; a sandbox on the host: the current directory, #3654, never the
+/// workspace's host path), by the runtime's path-boundary rule. The dispatch
+/// records the hash of this text and passes it as `--system`, which the
+/// runtime sends byte for byte, so `system_sha256` is the hash of the bytes
+/// sent on every backend.
 pub(crate) fn system_prompt_as_sent(prompt: String, kind: Option<darkmux_sandbox::BackendKind>, workspace: &Path) -> String {
-    let root = darkmux_sandbox::seen_at(kind, workspace, "/workspace");
-    crate::mission_config::workspace_paths::named_as(&prompt, &root)
+    use crate::mission_config::workspace_paths::{model_root, named_as};
+    named_as(&prompt, model_root(kind, workspace))
 }
 
 /// (contract 6) [`system_prompt_as_sent`] for the backend `image` was

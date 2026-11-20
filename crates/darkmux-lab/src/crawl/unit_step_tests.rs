@@ -3399,10 +3399,12 @@ fn a_unit_naming_a_rule_no_longer_declared_is_refused() {
     }
 }
 
-/// (#3112 review) The production wiring, through the unit's one read: under
-/// `DARKMUX_SANDBOX=seatbelt` (on a Mac) a unit's dispatch is briefed with
-/// the tree's own path and stamps it as `context.root`; under Docker (a test
-/// build's default) it says `/workspace` and stamps nothing.
+/// (#3112 review, #3654) The production wiring, through the unit's one
+/// read: under `DARKMUX_SANDBOX=seatbelt` (on a Mac) a unit's dispatch is
+/// briefed with the tree as the current directory, never its host path, and
+/// stamps that path as `context.root` (for mapping, never for a model);
+/// under Docker (a test build's default) it says `/workspace` and stamps
+/// nothing.
 #[test]
 #[serial_test::serial] // scopes DARKMUX_HOME and DARKMUX_SANDBOX, process-globals
 fn a_units_dispatch_is_briefed_with_the_tree_where_the_selected_sandbox_sees_it() {
@@ -3439,7 +3441,8 @@ fn a_units_dispatch_is_briefed_with_the_tree_where_the_selected_sandbox_sees_it(
         return;
     }
     let (seatbelt, tree, _ws) = dispatched(Some("seatbelt"));
-    assert!(seatbelt.message.contains(&format!("- {tree}/app/src/a.ts")) && !seatbelt.message.contains("/workspace"), "{}", seatbelt.message);
+    assert!(seatbelt.message.contains("- ./app/src/a.ts") && !seatbelt.message.contains("/workspace"), "{}", seatbelt.message);
+    assert!(!seatbelt.message.contains(&tree), "{}", seatbelt.message);
     assert_eq!(seatbelt.record_context.as_ref().unwrap().root.as_deref(), Some(tree.as_str()));
 }
 
@@ -3469,11 +3472,26 @@ fn a_unit_brief_names_the_tree_where_the_sandbox_sees_it() {
     for unit in [&site, &read] {
         let docker = build_message_at("/workspace", &rules_by_id, unit, None).unwrap();
         assert_eq!(docker, build_message(&rules_by_id, unit, None).unwrap(), "Docker is the frozen message");
-        let host = build_message_at("/Users/op/tree", &rules_by_id, unit, None).unwrap();
+        let host = build_message_at(".", &rules_by_id, unit, None).unwrap();
         assert!(!host.contains("/workspace"), "{host}");
-        assert!(host.contains("`/Users/op/tree/app`") && host.contains("- /Users/op/tree/app/src/"), "{host}");
-        assert!(host.contains("starting with `/Users/op/tree/`"), "{host}");
+        assert!(host.contains("`./app`") && host.contains("- ./app/src/"), "{host}");
+        assert!(host.contains("starting with `./`"), "{host}");
     }
+}
+
+/// (#3654) A unit's brief names its tree as its model sees it: `/workspace`
+/// in a container, the current directory in a sandbox on the host (whose
+/// tool calls run there), never the tree's host path, which names the user.
+#[test]
+fn a_units_brief_names_its_tree_as_its_model_sees_it() {
+    use darkmux_sandbox::BackendKind;
+    let tree = TempDir::new().unwrap();
+    assert_eq!(tree_named(Some(BackendKind::Docker), tree.path()), "/workspace");
+    for kind in [BackendKind::Seatbelt, BackendKind::Landlock] {
+        assert_eq!(tree_named(Some(kind), tree.path()), ".", "{kind:?}");
+    }
+    let src = include_str!("unit_step.rs");
+    assert!(src.contains("let message = build_message_at(&ctx.tree_named, &rules_by_id, unit, intent_text.as_deref())?;"));
 }
 
 /// (#3112 review) The unit's dispatch stamps where its sandbox saw the tree
@@ -3514,6 +3532,7 @@ fn a_units_readback_maps_a_host_seen_finding_like_a_workspace_one() {
             session_id: SessionId::adhoc(run, "crawler", "u-1"),
             tree_root: tmp.path().join("tree"),
             tree_seen: tree_seen.to_string(),
+            tree_named: if tree_seen == "/workspace" { "/workspace" } else { "." }.to_string(),
             sandbox: Err("not read in this test".into()),
         };
         let into = tmp.path().join("findings.jsonl");
@@ -3524,6 +3543,12 @@ fn a_units_readback_maps_a_host_seen_finding_like_a_workspace_one() {
     };
     assert_eq!(stored("/workspace", "/workspace/app/src/x.ts"), json!("src/x.ts"));
     assert_eq!(stored("/Users/op/tree", "/Users/op/tree/app/src/x.ts"), json!("src/x.ts"));
+    // (#3654) A host sandbox's brief names the tree as `.`: the path it
+    // lists, and the one without `./`, map the same way.
+    assert_eq!(stored("/Users/op/tree", "./app/src/x.ts"), json!("src/x.ts"));
+    assert_eq!(stored("/Users/op/tree", "app/src/x.ts"), json!("src/x.ts"));
+    // The store's one mapping reads `./<source>/` under any root.
+    assert_eq!(stored("/workspace", "./app/src/x.ts"), json!("src/x.ts"));
 }
 
 // ── (#2310 fix-loop E2) `draws`: a named ceiling, and dedup that only

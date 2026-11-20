@@ -6635,6 +6635,32 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(prompt(&docker).as_deref(), Some("/darkmux-out/.prompt.txt"));
     }
 
+    /// (#3654) A sandbox on the host is told where the mod store is in its
+    /// environment, so a brief can name a mod's attachments under
+    /// `$DARKMUX_MODS` (the sandbox's shell expands it) and never by the
+    /// store's host path. A container mounts them at `/darkmux-mods` and gets
+    /// no such variable.
+    #[test]
+    fn a_host_sandbox_is_told_where_the_mod_store_is_and_a_container_is_not() {
+        use darkmux_sandbox::{DockerBackend, SeatbeltBackend};
+        let root = tempfile::TempDir::new().unwrap();
+        let attachments = root.path().join("mods/mod-1/attachments");
+        for d in ["ws", "out"] {
+            std::fs::create_dir(root.path().join(d)).unwrap();
+        }
+        std::fs::create_dir_all(&attachments).unwrap();
+        let mut cfg = argv_config_with_base_url(None);
+        cfg.workspace = root.path().join("ws");
+        cfg.host_out = root.path().join("out");
+        cfg.mod_attachment_mounts = vec![(attachments.canonicalize().unwrap(), crate::mods::attachments_container_dir("mod-1"))];
+        let env = |p: &darkmux_sandbox::SandboxPolicy| p.env.iter().find(|(k, _)| k == crate::mods::MODS_ENV).map(|(_, v)| v.clone());
+        let store = root.path().join("mods").canonicalize().unwrap().display().to_string();
+        assert_eq!(env(&dispatch_policy_for(&cfg, &SeatbeltBackend)), Some(store));
+        assert_eq!(env(&dispatch_policy_for(&cfg, &DockerBackend)), None);
+        cfg.mod_attachment_mounts.clear();
+        assert_eq!(env(&dispatch_policy_for(&cfg, &SeatbeltBackend)), None, "no attachments, no variable");
+    }
+
     /// (#3112) `sandbox.memory` reaches a dispatch under either backend:
     /// the default `4g`, else what the operator set, which Docker passes as
     /// `--memory` and Seatbelt hands its watch in bytes.
@@ -6839,10 +6865,10 @@ S(("127.0.0.1", port), H).serve_forever()
         cfg.workspace = root.path().join("ws");
         cfg.host_out = root.path().join("out");
         cfg.system_prompt = system_prompt_as_sent(role.clone(), Some(BackendKind::Seatbelt), &cfg.workspace);
-        let real = cfg.workspace.canonicalize().unwrap().display().to_string();
-        assert_eq!(cfg.system_prompt, format!("Work in {real} and read {real}/a.rs."));
+        assert_eq!(cfg.system_prompt, "Work in . and read ./a.rs.");
         let policy = dispatch_policy_for(&cfg, &SeatbeltBackend);
         let passed = policy.command.iter().skip_while(|a| *a != "--system").nth(1).unwrap();
+        assert!(!passed.contains(&cfg.workspace.canonicalize().unwrap().display().to_string()), "{passed}");
         let mut payload = DispatchStartPayload::default();
         crate::role_inputs::stamp_prompt_inputs(&mut payload, &cfg.system_prompt, &Default::default());
         assert_eq!(payload.system_sha256, Some(darkmux_flow::sha256_hex(passed.as_bytes())));
@@ -6864,7 +6890,6 @@ S(("127.0.0.1", port), H).serve_forever()
     fn the_prompt_names_the_workspace_for_the_backend_that_runs() {
         use darkmux_sandbox::BackendKind;
         let ws = TempDir::new().unwrap();
-        let real = ws.path().canonicalize().unwrap().display().to_string();
         let image = |kind| RuntimeImage {
             inject: false,
             darkmux_image: crate::runtime_image::ResolvedImage { reference: "r".into(), id: "r".into() },
@@ -6883,7 +6908,7 @@ S(("127.0.0.1", port), H).serve_forever()
         unsafe {
             match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
         }
-        assert_eq!(seen, [("in /workspace".to_string(), BackendKind::Docker), (format!("in {real}"), BackendKind::Seatbelt)]);
+        assert_eq!(seen, [("in /workspace".to_string(), BackendKind::Docker), ("in .".to_string(), BackendKind::Seatbelt)]);
         let src = include_str!("dispatch_internal.rs");
         assert!(src.contains("let system_prompt = run_system_prompt(system_prompt, &image, &workspace);"));
         assert!(src.contains("spawn_container(&argv_config, run_backend(&run.image), opts.max_turns_override)?"));
@@ -8430,11 +8455,12 @@ S(("127.0.0.1", port), H).serve_forever()
         );
     }
 
-    /// (#3112 review) A `${WORKSPACE_ROOT}` still in the message when the
-    /// dispatch writes its prompt file (a step with no workdir, whose
+    /// (#3112 review, #3654) A `${WORKSPACE_ROOT}` still in the message when
+    /// the dispatch writes its prompt file (a step with no workdir, whose
     /// workspace is a fresh tempdir; a CLI `dispatch` message) names that
-    /// workspace where the dispatch's sandbox sees it: `/workspace` in a
-    /// container, the tempdir's own path on the host.
+    /// workspace as the dispatch's model sees it: `/workspace` in a
+    /// container, the current directory on the host, never the tempdir's
+    /// path.
     #[test]
     fn the_prompt_file_names_the_actual_workspace_for_the_placeholder() {
         use darkmux_sandbox::BackendKind;
@@ -8444,10 +8470,7 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(prompt_file_text("no placeholder", ws.path(), BackendKind::Seatbelt), "no placeholder");
         let src = include_str!("dispatch_internal.rs");
         assert!(src.contains("fs::write(host_out.join(PROMPT_FILE_NAME), prompt_file_text(&opts.message, workspace, kind))"));
-        assert_eq!(
-            prompt_file_text(msg, ws.path(), BackendKind::Seatbelt),
-            format!("look in `{}/src`", ws.path().canonicalize().unwrap().display())
-        );
+        assert_eq!(prompt_file_text(msg, ws.path(), BackendKind::Seatbelt), "look in `./src`");
     }
 
     /// (#3112 review) A split-gitdir checkout is named where the sandbox
@@ -8464,6 +8487,35 @@ S(("127.0.0.1", port), H).serve_forever()
         let real = root.path().canonicalize().unwrap();
         assert_eq!(seen_path_for(Some(BackendKind::Seatbelt), root.path(), &child), real.join("src-a").display().to_string());
         assert_eq!(seen_path_for(Some(BackendKind::Seatbelt), root.path(), root.path()), real.display().to_string());
+    }
+
+    /// (#3654) The model-facing note names a split-gitdir checkout as its
+    /// model sees it: `/workspace/<child>` in a container, unchanged; under
+    /// the current directory in a sandbox on the host, never its host path.
+    #[test]
+    fn the_no_git_note_names_a_checkout_as_its_model_sees_it() {
+        use darkmux_sandbox::BackendKind;
+        let root = TempDir::new().unwrap();
+        let child = root.path().join("src-a");
+        std::fs::create_dir_all(&child).unwrap();
+        let found = |checkout: &Path| darkmux_types::workdir::SplitGitdir {
+            checkout: checkout.to_path_buf(),
+            target: PathBuf::from("/elsewhere/.git/worktrees/x"),
+            kind: darkmux_types::workdir::GitdirPointerKind::Worktree,
+            superproject: None,
+        };
+        let note = |kind, at: &Path| with_workspace_notes("ROLE".into(), Some(root.path()), &[found(at)], kind);
+        assert!(note(BackendKind::Docker, &child).contains("Git is not available in /workspace/src-a."));
+        assert!(note(BackendKind::Docker, root.path()).contains("Git is not available in /workspace."));
+        let real = root.path().canonicalize().unwrap().display().to_string();
+        for kind in [BackendKind::Seatbelt, BackendKind::Landlock] {
+            let (child_note, root_note) = (note(kind, &child), note(kind, root.path()));
+            assert!(child_note.contains("Git is not available in ./src-a."), "{child_note}");
+            assert!(root_note.contains("Git is not available in ."), "{root_note}");
+            for n in [&child_note, &root_note] {
+                assert!(!n.contains(&real) && !n.contains(&root.path().display().to_string()), "{n}");
+            }
+        }
     }
 
     /// (#3112 review) The origin records the sandbox it ran in, and a resume

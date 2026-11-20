@@ -208,27 +208,38 @@ pub fn mod_attachment_mounts(
     Ok(out)
 }
 
-/// (#3112 review) Where the model reads a mod's attachments: their mount
-/// as the sandbox sees it (`/darkmux-mods/<key>/attachments` in a
-/// container, unchanged; the store's own path in a sandbox on the host).
+/// (#3112 review, #3654) Where the model reads a mod's attachments: their
+/// mount in a container (`/darkmux-mods/<key>/attachments`, unchanged); in a
+/// sandbox on the host, which sees them at the store's own path under the
+/// user's home, the same place under [`crate::mods::MODS_ENV`], which the
+/// dispatch sets to the store and the sandbox's shell expands.
 fn attachments_seen(kind: Option<darkmux_sandbox::BackendKind>, mods_root: &Path, key: &str) -> String {
-    darkmux_sandbox::seen_at(kind, &crate::mods::attachments_dir_at(mods_root, key), &crate::mods::attachments_container_dir(key))
+    let container = crate::mods::attachments_container_dir(key);
+    let seen = darkmux_sandbox::seen_at(kind, &crate::mods::attachments_dir_at(mods_root, key), &container);
+    if seen == container {
+        return container;
+    }
+    format!("${}/{key}/attachments", crate::mods::MODS_ENV)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// (#3112 review) The brief names a mod's attachments where the sandbox
-    /// mounts them: unchanged in a container, the store's path on the host.
+    /// (#3112 review, #3654) The brief names a mod's attachments where the
+    /// model reads them: their mount in a container, unchanged; under a
+    /// sandbox on the host, under the store's environment variable, which
+    /// the sandbox's shell expands (`dispatch_policy_for` sets it), never
+    /// the store's host path, which is under the user's home.
     #[test]
-    fn a_mods_attachments_are_named_where_the_sandbox_sees_them() {
+    fn a_mods_attachments_are_named_where_the_model_reads_them() {
         use darkmux_sandbox::BackendKind;
         let m = TempDir::new().unwrap();
         write_mod(m.path(), "mod-9-zzz", Some("kit"), &["one.patch"]);
         assert_eq!(attachments_seen(Some(BackendKind::Docker), m.path(), "mod-9-zzz"), "/darkmux-mods/mod-9-zzz/attachments");
-        let real = crate::mods::attachments_dir_at(m.path(), "mod-9-zzz").canonicalize().unwrap();
-        assert_eq!(attachments_seen(Some(BackendKind::Seatbelt), m.path(), "mod-9-zzz"), real.display().to_string());
+        for kind in [BackendKind::Seatbelt, BackendKind::Landlock] {
+            assert_eq!(attachments_seen(Some(kind), m.path(), "mod-9-zzz"), "$DARKMUX_MODS/mod-9-zzz/attachments", "{kind:?}");
+        }
     }
     /// The brief names a mod's attachments for the backend it is rendered
     /// for (the one its dispatch runs in), never for `runtime.sandbox` read
@@ -259,6 +270,8 @@ mod tests {
         assert!(!brief.contains("/darkmux-mods/"), "named for a container: {brief}");
         let on_host = attachments_seen(Some(darkmux_sandbox::BackendKind::Seatbelt), m.path(), "mod-9-zzz");
         assert!(brief.contains(&on_host), "{brief}");
+        let real = m.path().canonicalize().unwrap().display().to_string();
+        assert!(!brief.contains(&real) && !brief.contains(&m.path().display().to_string()), "{brief}");
     }
 
     use std::fs;
