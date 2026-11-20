@@ -511,3 +511,14 @@ async fn a_round_reads_the_sandbox_launchers_once_and_a_hung_read_is_no_answer()
         begun.elapsed()
     );
 }
+
+/// Only work darkmux contains is kept out of the judged slots: what could
+/// not be told is not contained, so a failed lookup never shuts the
+/// operator, or a peer this user cannot see, out.
+#[test]
+fn only_contained_work_is_kept_out_of_the_judged_slots() {
+    assert!(PeerProcess::SandboxedWork.is_contained());
+    assert!(PeerProcess::ContainerForwarder("com.docker.backend".into()).is_contained());
+    assert!(!PeerProcess::Operator.is_contained());
+    assert!(!PeerProcess::Unknown("no process this user can see").is_contained());
+}

@@ -67,6 +67,7 @@ fn limits(max_conns: usize, per_ip: usize, header_read_timeout: Duration) -> Kep
         label: "test listener",
         max_conns,
         per_ip,
+        judged_share: 0,
         header_read_timeout,
     }
 }
@@ -259,6 +260,10 @@ fn the_production_limits_fit_their_processes() {
     const { assert!(VIEWER.per_ip < VIEWER.max_conns) };
     for l in [VIEWER, CLIENT] {
         assert!(l.header_read_timeout <= Duration::from_secs(10), "{l:?}");
+        assert!(
+            l.judged_share > 0 && l.judged_share < l.per_ip,
+            "a share kept for judged connections, and an open one: {l:?}"
+        );
     }
 }
 
@@ -391,4 +396,334 @@ fn an_upgraded_connection_holds_its_slot_until_its_stream_closes() {
         done.recv_timeout(Duration::from_secs(3)).is_ok(),
         "did not return once the upgraded stream closed"
     );
+}
+
+/// A connection is judged before it is served only when it comes from this
+/// machine (a loopback address, however spelled, or the listener's own
+/// address) and its address already holds the open share; a remote peer
+/// never is, and a listener with no judged share (the fleet listener's)
+/// judges nothing.
+#[test]
+fn a_connection_from_this_machine_past_the_open_share_is_judged_first() {
+    let at = |s: &str| -> SocketAddr { s.parse().unwrap() };
+    let unread = || -> Option<SocketAddr> { None };
+    for peer in ["127.0.0.1:50000", "[::ffff:127.0.0.1]:50000", "[::1]:50000"] {
+        assert!(
+            !judged_first(at(peer), 3, 4, unread),
+            "{peer}: inside the open share"
+        );
+        assert!(judged_first(at(peer), 4, 4, unread), "{peer}: past it");
+    }
+    let lan = || Some(at("192.168.1.5:8799"));
+    assert!(
+        judged_first(at("192.168.1.5:50000"), 4, 4, lan),
+        "this machine reaching its own address"
+    );
+    assert!(
+        !judged_first(at("192.168.1.5:50000"), 3, 4, || panic!(
+            "read inside the open share"
+        )),
+        "the listener's address is read only past the open share"
+    );
+    assert!(
+        !judged_first(at("192.168.1.9:50000"), 100, 4, lan),
+        "another machine, at any count"
+    );
+    assert!(!judged_first(at("100.64.0.7:50000"), 100, 4, unread));
+    assert_eq!(
+        Admission::new("fleet", 8, 4).open_share,
+        4,
+        "judges nothing"
+    );
+    assert_eq!(
+        Admission::new("viewer", 8, 4)
+            .with_judged_share(1)
+            .open_share,
+        3
+    );
+}
+
+/// Not a test: a stand-in for a container engine's forwarder, run from a
+/// copy of this test binary named `com.docker.backend` ([`forwarder`]).
+/// Without `DARKMUX_TEST_FORWARDER` it does nothing. Given `<addr> <n>
+/// <closing>`, it opens `n` connections to `addr`, prints `closed <k>` once
+/// the other end has closed `closing` of them (or 8 s pass: within the
+/// production listeners' 10 s header deadline, so a connection that
+/// deadline closes is never counted as refused), and holds the rest until
+/// its stdin closes.
+#[test]
+#[ignore]
+fn container_forwarder_stand_in() {
+    let Ok(spec) = std::env::var("DARKMUX_TEST_FORWARDER") else {
+        return;
+    };
+    let parts: Vec<&str> = spec.split(' ').collect();
+    let addr: SocketAddr = parts[0].parse().unwrap();
+    let (n, closing): (usize, usize) = (parts[1].parse().unwrap(), parts[2].parse().unwrap());
+    let held: Vec<_> = (0..n)
+        .map(|_| std::net::TcpStream::connect(addr).unwrap())
+        .collect();
+    let closed = closed_count(&held, closing, Duration::from_secs(8));
+    println!("closed {closed}");
+    let _ = std::io::stdin().read_to_end(&mut Vec::new());
+}
+
+/// How many of `conns` the other end has closed, once `want` have been or
+/// `within` has passed.
+fn closed_count(conns: &[std::net::TcpStream], want: usize, within: Duration) -> usize {
+    for c in conns {
+        c.set_nonblocking(true).unwrap();
+    }
+    let until = std::time::Instant::now() + within;
+    loop {
+        let closed = conns.iter().filter(|c| is_closed(c)).count();
+        if closed >= want || std::time::Instant::now() >= until {
+            return closed;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether the other end of nonblocking `c` has closed it.
+fn is_closed(mut c: &std::net::TcpStream) -> bool {
+    match c.read(&mut [0u8; 1]) {
+        Ok(n) => n == 0,
+        Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+    }
+}
+
+/// A running [`container_forwarder_stand_in`], stopped when dropped.
+struct Forwarder {
+    child: std::process::Child,
+    _exe_dir: tempfile::TempDir,
+}
+
+impl Drop for Forwarder {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A container engine's forwarder opening `n` connections to `addr`: this
+/// test binary copied as `com.docker.backend` (the name is what tells a
+/// forwarder) and running [`container_forwarder_stand_in`]. Returns once
+/// `closing` of them have been closed (or 8 s passed), with how many were.
+fn forwarder(addr: SocketAddr, n: usize, closing: usize) -> (Forwarder, usize) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let exe = dir.path().join("com.docker.backend");
+    std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+    let mut child = spawn_copied(&exe, &format!("{addr} {n} {closing}"));
+    let out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let closed = std::io::BufRead::lines(out)
+        .map_while(Result::ok)
+        // libtest prints the test's name on the same line first.
+        .find_map(|l| {
+            l.rsplit_once("closed ")
+                .map(|(_, k)| k.trim().parse().unwrap())
+        })
+        .expect("the stand-in reports what it holds");
+    let held = Forwarder {
+        child,
+        _exe_dir: dir,
+    };
+    (held, closed)
+}
+
+/// Starts the stand-in at `exe`. A copy just written can be busy for a
+/// moment (ETXTBSY: a process another test forked meanwhile still holds
+/// it open for writing), so that one error is waited out.
+fn spawn_copied(exe: &std::path::Path, spec: &str) -> std::process::Child {
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let started = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "bounded_serve::tests::container_forwarder_stand_in",
+                "--ignored",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env("DARKMUX_TEST_FORWARDER", spec)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match started {
+            Err(e) if e.raw_os_error() == Some(26) && std::time::Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => return other.unwrap(),
+        }
+    }
+}
+
+/// Rounds that read this machine's socket table but cannot see a holder
+/// named `hidden` (as a listener's socket table cannot show tailscaled,
+/// which runs as root and forwards `tailscale serve`), with no host
+/// sandbox running.
+fn not_seeing(hidden: &'static str) -> Arc<crate::local_peer::Rounds> {
+    crate::local_peer::Rounds::new(
+        Arc::new(move |local| {
+            let platform = darkmux_platform::current();
+            platform.tcp_peers_of(local).map(|peers| {
+                peers
+                    .into_iter()
+                    .filter(|(_, pid)| platform.process_name(*pid).as_deref() != Some(hidden))
+                    .collect()
+            })
+        }),
+        Arc::new(|| Some(Vec::new())),
+        Duration::from_secs(5),
+    )
+}
+
+/// [`serve_kept_alive_reading`] within `limits`, its connections judged
+/// from `rounds`, as [`serving_with`] starts it.
+fn serving_judged(
+    app: Router,
+    limits: KeptAliveLimits,
+    rounds: Arc<crate::local_peer::Rounds>,
+) -> (
+    SocketAddr,
+    tokio::sync::watch::Sender<bool>,
+    std::sync::mpsc::Receiver<()>,
+) {
+    serving_with(
+        Box::new(move |l, app, rx| Box::pin(serve_kept_alive_reading(l, app, limits, rounds, rx))),
+        app,
+    )
+}
+
+/// `/ok`'s status as `curl` gets it, sent the way `tailscale serve`
+/// forwards a request (with `X-Forwarded-For`); `000` when refused.
+fn status_from_curl(addr: SocketAddr) -> String {
+    let out = std::process::Command::new("curl")
+        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "10"])
+        .args(["-H", "X-Forwarded-For: 100.64.0.7"])
+        .arg(format!("http://{addr}/ok"))
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The judged share of 127.0.0.1's slots is out of a container's reach: its
+/// forwarder, opening twice the address's cap, holds only the open share
+/// (every connection past it is judged and closed), while the operator's
+/// own process holds connections in the judged share and a peer this user
+/// cannot see (tailscaled, forwarding `tailscale serve`) is served there.
+#[test]
+fn a_container_holds_only_the_open_share_and_the_operator_and_tailscale_are_served() {
+    let lim = KeptAliveLimits {
+        label: "test listener",
+        max_conns: 64,
+        per_ip: 8,
+        judged_share: 4,
+        header_read_timeout: Duration::from_secs(30),
+    };
+    let open = lim.per_ip - lim.judged_share;
+    let (addr, _stop, _done) = serving_judged(ok_app(), lim, not_seeing("curl"));
+    let (_container, closed) = forwarder(addr, 2 * lim.per_ip, 2 * lim.per_ip - open);
+    assert_eq!(
+        closed,
+        2 * lim.per_ip - open,
+        "the container holds only the open share ({open})"
+    );
+    let mut mine: Vec<_> = (1..lim.judged_share)
+        .map(|_| std::net::TcpStream::connect(addr).unwrap())
+        .collect();
+    for (i, s) in mine.iter_mut().enumerate() {
+        let got = get_on(s, "/ok");
+        assert!(
+            got.starts_with("HTTP/1.1 200"),
+            "the operator's #{i}: {got:?}"
+        );
+    }
+    assert_eq!(
+        status_from_curl(addr),
+        "200",
+        "tailscale serve's connection, in the last judged slot"
+    );
+}
+
+/// The operator's own connections are never counted as a container's: past
+/// the open share each is judged the operator's and served, up to the
+/// address's cap, and so is one whose lookup gives no answer (a failure to
+/// tell never refuses). The cap still closes the next connection.
+#[test]
+fn the_operators_own_connections_fill_the_judged_share_and_the_cap_still_holds() {
+    let no_answer = crate::local_peer::Rounds::new(
+        Arc::new(|_| None),
+        Arc::new(|| Some(Vec::new())),
+        Duration::from_secs(5),
+    );
+    for (what, rounds, operators) in [
+        ("judged", not_seeing(""), true),
+        ("no answer", no_answer, false),
+    ] {
+        let lim = KeptAliveLimits {
+            label: "test listener",
+            max_conns: 64,
+            per_ip: 8,
+            judged_share: 4,
+            header_read_timeout: Duration::from_secs(30),
+        };
+        let (addr, _stop, _done) = serving_judged(ok_app(), lim, rounds);
+        let mut mine: Vec<_> = (0..lim.per_ip)
+            .map(|_| std::net::TcpStream::connect(addr).unwrap())
+            .collect();
+        for (i, s) in mine.iter_mut().enumerate() {
+            let got = get_on(s, "/ok");
+            assert!(got.starts_with("HTTP/1.1 200"), "{what}: #{i}: {got:?}");
+            assert_eq!(
+                crate::local_peer::is_operator(s.local_addr().unwrap()),
+                operators,
+                "{what}: #{i} was judged from these rounds"
+            );
+        }
+        let mut extra = std::net::TcpStream::connect(addr).unwrap();
+        assert!(
+            closed_within(&mut extra, Duration::from_secs(1)),
+            "{what}: one past the address's cap is closed"
+        );
+    }
+}
+
+/// The viewer and the client listener keep their judged share from a
+/// container: with a container's forwarder holding all it can from
+/// 127.0.0.1, this process's request is still served.
+#[test]
+fn the_viewer_and_the_client_listener_keep_a_share_no_container_can_take() {
+    let _ = crate::raise_open_file_limit(4096);
+    let starts: [(&str, KeptAliveLimits, Start); 2] = [
+        (
+            "viewer",
+            VIEWER,
+            Box::new(|l, app, rx| Box::pin(crate::serve_viewer(l, app, rx))),
+        ),
+        (
+            "client",
+            CLIENT,
+            Box::new(|l, app, rx| {
+                Box::pin(crate::client_pairing::serve_client_listener(l, app, rx))
+            }),
+        ),
+    ];
+    for (name, lim, start) in starts {
+        let (addr, _stop, _done) = serving_with(start, ok_app());
+        let (_container, closed) = forwarder(addr, lim.per_ip, lim.judged_share);
+        assert_eq!(
+            closed, lim.judged_share,
+            "{name}: the container's judged connections are closed"
+        );
+        let body = ureq::get(&format!("http://{addr}/ok"))
+            .call()
+            .map(|r| r.into_string().unwrap());
+        assert_eq!(
+            body.ok().as_deref(),
+            Some("ok"),
+            "{name}: the operator is served"
+        );
+    }
 }

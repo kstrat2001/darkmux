@@ -28,6 +28,14 @@
 //! read auth is on), and the client listener refuses it. Failing toward
 //! showing less is the doctrine every other local check here follows.
 //!
+//! The same verdict decides who may take the connection slots a listener
+//! keeps for this machine's own ([`may_take_a_judged_slot`], the judged
+//! share in `bounded_serve`): contained work (sandboxed work, a container's)
+//! may not, everything else may. That is the opposite question (may this
+//! connection be served at all, not may it be trusted), so what could not
+//! be told is let in: a failed lookup never shuts the operator out, and a
+//! peer this user cannot see (tailscaled, which runs as root) gets in.
+//!
 //! **A second line, not the barrier.** This check catches sandboxed work
 //! that stays where darkmux put it. It does not stop code trying to get
 //! past it: the barrier is the sandbox's own network profile, which keeps
@@ -44,7 +52,9 @@
 //! that times out reads as remote. Then one process-table read and one
 //! `ps` per Seatbelt sandbox recorded, both skipped when no host sandbox
 //! runs. A request a proxy forwarded costs no lookup. A connection is
-//! judged once, on its first request; its later requests read the verdict.
+//! judged once, on its first request, or as it is accepted when its
+//! address already holds a listener's open share; its later requests read
+//! that verdict.
 //! A peer address is the operator's only while its connection lasts
 //! ([`Verdict`]'s drop), so a port another process reuses later inherits
 //! nothing.
@@ -86,6 +96,20 @@ pub(crate) enum PeerProcess {
     ContainerForwarder(String),
     /// It could not be told, and why.
     Unknown(&'static str),
+}
+
+impl PeerProcess {
+    /// Whether this is work darkmux contains (a host sandbox's process, or a
+    /// container's through its forwarder): what never takes a connection
+    /// slot kept for this machine's own ([`may_take_a_judged_slot`]). What
+    /// could not be told is not, so a failed lookup never shuts the
+    /// operator out.
+    pub(crate) fn is_contained(&self) -> bool {
+        matches!(
+            self,
+            PeerProcess::SandboxedWork | PeerProcess::ContainerForwarder(_)
+        )
+    }
 }
 
 /// The verdict for a connection whose holders are `holders` (every process
@@ -218,21 +242,24 @@ impl Drop for Verdict {
 }
 
 /// What a listener knows of a connection ([`PeerConn::new`], once per
-/// connection): both its ends, when it was accepted, and its verdict.
+/// connection): both its ends, when it was accepted, the rounds that read
+/// it, and its verdict.
 #[derive(Clone)]
 pub(crate) struct PeerConn {
     remote: SocketAddr,
     local: Option<SocketAddr>,
     accepted: Instant,
+    rounds: Arc<Rounds>,
     verdict: Arc<Verdict>,
 }
 
 impl PeerConn {
     /// A connection just accepted from `remote`, on the listener's own
     /// address `local` (`None`: it could not be read, and a loopback peer
-    /// then reads as unknown), not judged yet. Made once per connection
-    /// and put on each of its requests as `ConnectInfo<PeerConn>`.
-    pub(crate) fn new(remote: SocketAddr, local: Option<SocketAddr>) -> Self {
+    /// then reads as unknown), not judged yet, to be judged from `rounds`
+    /// ([`this_machine`] in production). Made once per connection and put
+    /// on each of its requests as `ConnectInfo<PeerConn>`.
+    pub(crate) fn new(remote: SocketAddr, local: Option<SocketAddr>, rounds: Arc<Rounds>) -> Self {
         let verdict = Arc::new(Verdict {
             remote,
             judged: tokio::sync::OnceCell::new(),
@@ -241,9 +268,25 @@ impl PeerConn {
             remote,
             local,
             accepted: Instant::now(),
+            rounds,
             verdict,
         }
     }
+}
+
+/// `conn`'s verdict, reached once for the connection however many ask.
+async fn verdict(conn: &PeerConn) -> &PeerProcess {
+    conn.verdict.judged.get_or_init(|| verdict_of(conn)).await
+}
+
+/// Whether `conn` may take a connection slot kept for this machine's own
+/// (`bounded_serve::KeptAliveLimits::judged_share`): judged now, unless it
+/// already was, within [`JUDGE_BOUND`]. Contained work may not; the
+/// operator's process may, and so may a peer that could not be told (one
+/// this user cannot see, as `tailscale serve`'s root daemon is). The
+/// verdict is the one the connection's requests read later.
+pub(crate) async fn may_take_a_judged_slot(conn: &PeerConn) -> bool {
+    !verdict(conn).await.is_contained()
 }
 
 /// `app` as every listener that trusts this machine serves it: given a
@@ -268,7 +311,7 @@ async fn judge_peer(mut req: Request, next: Next) -> Response {
         if conn.remote.ip().to_canonical().is_loopback()
             && !crate::carries_proxy_header(req.headers())
         {
-            conn.verdict.judged.get_or_init(|| verdict_of(&conn)).await;
+            verdict(&conn).await;
         }
     }
     next.run(req).await
@@ -292,7 +335,7 @@ async fn looked_up(conn: &PeerConn) -> PeerProcess {
     let Some(local) = conn.local else {
         return PeerProcess::Unknown("the connection's own address could not be read");
     };
-    match ROUNDS.look(local, conn.remote, conn.accepted).await {
+    match conn.rounds.look(local, conn.remote, conn.accepted).await {
         None => PeerProcess::Unknown("this machine's connections could not be read"),
         Some(looked) => judged_now(looked).await,
     }
@@ -483,6 +526,12 @@ impl Rounds {
             .get(&canonical(local))
             .is_some_and(|at| at.running.is_some() || at.latest.borrow().is_some())
     }
+}
+
+/// This process's rounds, read from this machine's socket table: what every
+/// listener here judges its connections from.
+pub(crate) fn this_machine() -> Arc<Rounds> {
+    ROUNDS.clone()
 }
 
 /// This process's rounds, read from this machine's socket table.

@@ -217,7 +217,14 @@ darkmux release.
   accepted, and a connection that sends no complete request within 10 seconds (an idle kept-alive one
   included) closed. A peer that opened connections and sent nothing could otherwise hold them all open
   and use up the file descriptors the process needs. Keep-alive, streamed answers (the viewer's live
-  feeds) and WebSocket upgrades work as before.
+  feeds) and WebSocket upgrades work as before. Half of the connections from 127.0.0.1 (64 for the
+  viewer, 32 for the client listener) are kept out of a container's or a sandbox's reach (#3660): your browser,
+  `tailscale serve`'s traffic and the CLI all arrive from 127.0.0.1, and so do a Docker container
+  reaching `host.docker.internal` and a sandboxed process. Once the other half is in use, each further
+  connection from this machine is checked first (the same look at who holds it that decides what a
+  local caller may read, about 70 ms on a Mac), and one held by a container's forwarder or a host
+  sandbox is closed. So a container holding connections open takes at most half, and the browser and
+  the tailnet keep the rest. Nothing is checked while the first half has room.
 - **A preview's streaming answer ends with its session.** An answer a preview was still streaming
   through the tailnet entry (a long download, a dev server's event stream) kept streaming after its
   session ended; it is now cut within a second of the session ending (previews turned off, the device
