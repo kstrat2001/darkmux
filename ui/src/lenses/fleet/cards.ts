@@ -603,6 +603,15 @@ export function withPresenceUnread(base: FleetCardBase): FleetCardBase {
   return { ...base, availability: underUnreadPresence(base.availability, base.liveInputs.self) };
 }
 
+/** (#3662 review 3) `withPresenceUnread` over a page's card bases: every view
+ *  row (each says whether it is this machine), and a flow-only card only once
+ *  the page knows which machine is its own (`selfKnown`). Until then a
+ *  flow-only card may be this machine, which is up by definition and whose
+ *  records are its own. */
+export function presenceUnreadBases(bases: readonly FleetCardBase[], viewUids: ReadonlySet<string>, selfKnown: boolean): FleetCardBase[] {
+  return bases.map((b) => (selfKnown || viewUids.has(b.uid) ? withPresenceUnread(b) : b));
+}
+
 /** (#2958) Which of a fleet card's sources have answered at least once on
  *  this mount (success or failure; a source this mount never reads counts
  *  as answered). A failed read counts: `/runs` has its own notice

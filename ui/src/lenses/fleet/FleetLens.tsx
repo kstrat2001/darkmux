@@ -29,7 +29,7 @@ import { fmtN, fmtC } from "../../lib/format";
 import { Shimmer } from "../../components/Placeholder";
 import { usePlaybackClock } from "../../lib/pageClockRate";
 import { tokensOffMeter } from "./savings";
-import { buildFleetCardBase, withLiveReadings, withPresenceUnread, shownExecution, cardFace, notStreamedNames, type CardSourcesAnswered } from "./cards";
+import { buildFleetCardBase, withLiveReadings, presenceUnreadBases, shownExecution, cardFace, notStreamedNames, type CardSourcesAnswered } from "./cards";
 import { MachineCard } from "./MachineCard";
 import { useLatch } from "../../hooks/useLatch";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
@@ -45,7 +45,9 @@ import { HUB_UNREAD } from "../../lib/machineAvailability";
  *  uid), so with none it reads `null`: standing unknown, never online. Every
  *  other machine keeps reading absent only on positive evidence.
  *  `presenceUnread` (#3662): this page's presence read is stale or
- *  unreadable, so no evidence is not "up" either: every machine reads `null`. */
+ *  unreadable, so no evidence is not "up" either: every machine reads `null`.
+ *  The caller passes it only once it knows which machine is this one (a
+ *  flow-only card that may be this machine is up by definition). */
 export const absentOrUnknown = (present: boolean | null, m: string, presenceUnread = false): boolean | null =>
   (m === NO_UID_KEY || presenceUnread) && present === null ? null : present === false;
 
@@ -862,7 +864,7 @@ export function FleetLens({
         liveMachines,
         specs,
         presence,
-        absentOrUnknown(machPresent(flowWindow.data, liveMachines, playheadT, m), m, presenceDegraded),
+        absentOrUnknown(machPresent(flowWindow.data, liveMachines, playheadT, m), m, presenceDegraded && specs !== null),
         m,
         playheadT,
         null,
@@ -875,7 +877,7 @@ export function FleetLens({
     // view's order nor the flow window's, so which source answered first
     // never moves a card.
     const bases = orderCards([...viewBases, ...flowBases], (b) => b.order).map((b) => b.base);
-    return presenceDegraded ? bases.map(withPresenceUnread) : bases;
+    return presenceDegraded ? presenceUnreadBases(bases, new Set(viewBases.map((b) => b.base.uid)), specs !== null) : bases;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `playheadT` is read through `liveEdgeClock` on purpose (#2928, above).
   }, [viewCards, flowOnlyUids, flowWindow.data, liveEdgeClock, liveMachines, specs, presence, runs, roster, policy, presenceDegraded]);
   const cards = useMemo(

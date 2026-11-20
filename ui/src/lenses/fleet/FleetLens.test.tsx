@@ -2107,6 +2107,31 @@ describe("FleetLens — rostered-but-silent machine (#1855)", () => {
     await waitFor(() => expect(peer.querySelector(".stat")!.textContent).toBe("not streaming"));
   });
 
+  // (#3662 review 3) With nothing naming this machine (no view, no specs),
+  // a flow-only card may be this machine itself, which is up by definition:
+  // the page cannot say "nothing says whether it is up" about it. It waits
+  // ("checking…") like any card whose sources have not all answered. Only a
+  // card positively not this machine reads standing unknown.
+  it("with presence unreadable and nothing naming this machine, a flow-only card is not called a stranger", async () => {
+    const day = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${day}T09:30:00.000Z`, action: "dispatch.start", session_id: "s1", machine_uid: "u1", machine_id: "MacBook-Pro", handle: "coder" },
+        { ts: `${day}T09:31:00.000Z`, action: "dispatch.complete", session_id: "s1", machine_uid: "u1", machine_id: "MacBook-Pro", handle: "coder" },
+      ],
+      hold: { "/runs": new Promise<void>(() => {}) },
+      runs: [],
+      presence: { state: "unavailable", detail: "could not read presence beats from Redis" },
+    });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderFleetLens({}, qc);
+    await waitFor(() => expect(qc.getQueryState(queryKeys.fleetMachinesLive())?.status).toBe("success"));
+    await waitFor(() => expect(document.querySelector(".mach .stat")).not.toBeNull());
+    await new Promise((r) => setTimeout(r, 50));
+    expect(document.querySelector(".mach .stat")!.textContent).toBe("checking…");
+    expect(document.body.textContent).not.toContain("nothing says whether it is up");
+  });
+
   // (#3662 review) A peer nobody rostered, known only from records in the
   // window: with presence unreadable nothing read says it is up, so it reads
   // plain "not streaming" with the hub reason, never "online".
