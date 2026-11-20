@@ -410,7 +410,6 @@ pub(crate) fn tree_named(kind: Option<darkmux_sandbox::BackendKind>, tree_root: 
     darkmux_crew::mission_config::workspace_paths::model_root(kind, tree_root).to_string()
 }
 
-
 /// (#3112 review) [`build_message`] naming the tree at `root`, as the unit's
 /// model sees it ([`tree_named`]): `/workspace` in a container (the frozen
 /// message, byte for byte), the current directory in a sandbox on the host,

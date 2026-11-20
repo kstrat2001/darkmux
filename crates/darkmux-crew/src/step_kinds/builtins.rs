@@ -4665,22 +4665,29 @@ mod tests {
         assert!(plain.message.contains("tree_root"), "{}", plain.message);
     }
 
-    /// (#3654) Every shipped mission config's model-facing dispatch, grown
-    /// as the launcher grows it, is handed no dependency output but its own
-    /// item: the create-mod seat (the hosted one included) never receives
-    /// the summary's host paths. A shipped dispatch that read any other
-    /// dependency would be a new way for a host artifact to reach a model.
+    /// (#3654) Every shipped mission config (the embedded set) whose task
+    /// composes a model message (`dispatch.internal`, `dispatch.single_shot`,
+    /// and `dispatch.map`, which renders a dependency's items into its user
+    /// message) reads no dependency but its own grow source; grown as the
+    /// launcher grows it, from an output that names host paths, its message
+    /// carries none. The create-mod seat (the hosted one included) never
+    /// receives the summary's host paths, and a shipped dispatch that read
+    /// any other dependency would be a new way for a host artifact to reach a
+    /// model.
     #[test]
     fn no_shipped_dispatch_is_fed_a_host_artifact() {
         use crate::mission_config::{grow::grow_task, MissionConfig};
-        for (name, text) in [
-            ("crawl.json", include_str!("../../../../templates/builtin/mission-configs/crawl.json")),
-            ("review.json", include_str!("../../../../templates/builtin/mission-configs/review.json")),
-        ] {
+        const COMPOSING: [&str; 3] = ["dispatch.internal", "dispatch.single_shot", "dispatch.map"];
+        let shipped = crate::mission_config::load::embedded_all();
+        let on_disk = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/mission-configs"))
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "json"))
+            .count();
+        assert_eq!(shipped.len(), on_disk, "every shipped mission config is embedded, so none is skipped here");
+        for (name, text) in shipped {
             let config: MissionConfig = serde_json::from_str(text).unwrap();
             for task in config.phases.iter().flat_map(|p| &p.tasks) {
-                let composes = task.steps.iter().any(|s| s.kind == "dispatch.internal" || s.kind == "dispatch.single_shot");
-                if !composes {
+                if !task.steps.iter().any(|s| COMPOSING.contains(&s.kind.as_str())) {
                     continue;
                 }
                 let from = task.grow.as_ref().map(|g| g.from.clone());
@@ -4689,7 +4696,7 @@ mod tests {
                 }
                 let Some(spec) = task.grow.as_ref() else { continue };
                 let item = json!({ "id": "f1", "key": "exec-1/1", "rule": "r", "tree_root": "/Users/op/.darkmux/runs/m/tree" });
-                let growth = grow_task(task, spec, &[item], "summary").unwrap();
+                let growth = grow_task(task, spec, &[item], SUMMARY_WITH_HOST_PATHS).unwrap();
                 let mut input = BTreeMap::new();
                 input.insert(spec.from.clone(), SUMMARY_WITH_HOST_PATHS.to_string());
                 let copy = &growth.tasks[0];
