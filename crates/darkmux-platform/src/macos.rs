@@ -203,6 +203,12 @@ impl Platform for MacPlatform {
         lsof_established(local.port()).map(|out| crate::peers_from_lsof_fpn(&out, local))
     }
 
+    /// (#3660) `pid`'s socket descriptors, each read with `proc_pidfdinfo`,
+    /// as #3559's listener read does: no `lsof`, no walk over processes.
+    fn holds_tcp_peer(&self, pid: u32, peer: std::net::SocketAddr, local: std::net::SocketAddr) -> Option<bool> {
+        connection_held_by_pid(pid, peer, local)
+    }
+
     /// (#3112) One `netstat -anv -p tcp` (the kernel's `pcblist`, no walk
     /// over processes), bounded to 5 s: about 5 ms measured on an M5 Max.
     fn tcp_port_listeners(&self, port: u16) -> Option<Vec<crate::PortListener>> {
@@ -725,14 +731,69 @@ pub(crate) mod libproc {
         Some((port, crate::PortListener { addr: Some(addr), text: addr.to_string(), scope, pid: Some(pid) }))
     }
 
+    /// (#3660) One socket's `struct socket_fdinfo` as a TCP connection's two
+    /// ends, `(own, other)`: `None` for any other socket (a listener, UDP,
+    /// a local socket). The foreign port and address sit just before their
+    /// local forms (`insi_fport`, `insi_faddr`).
+    pub(crate) fn connection_in_fdinfo(info: &[u8]) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
+        let int = |at: usize| info.get(at..at + 4).map(|b| i32::from_ne_bytes([b[0], b[1], b[2], b[3]]));
+        if info.len() < SOCKET_FDINFO_SIZE || int(SOI_KIND)? != SOCKINFO_TCP || int(TCPSI_STATE)? == TSI_S_LISTEN {
+            return None;
+        }
+        let port = |at: usize| u16::from_be_bytes([info[at], info[at + 1]]);
+        let addr = |v6: usize, v4: usize| -> Option<std::net::IpAddr> {
+            let vflag = info[INSI_VFLAG];
+            if vflag & INI_IPV6 != 0 {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&info[v6..v6 + 16]);
+                Some(std::net::Ipv6Addr::from(octets).into())
+            } else {
+                (vflag & INI_IPV4 != 0).then(|| std::net::IpAddr::from([info[v4], info[v4 + 1], info[v4 + 2], info[v4 + 3]]))
+            }
+        };
+        let own = std::net::SocketAddr::new(addr(INSI_LADDR6, INSI_LADDR4)?, port(INSI_LPORT));
+        let other = std::net::SocketAddr::new(addr(INSI_FADDR6, INSI_FADDR4)?, port(INSI_FPORT));
+        Some((own, other))
+    }
+
+    /// (#3660) Whether one of the socket descriptors `fds`, each read by
+    /// `read` (as [`listeners_in_records`] reads them), is the `peer` end of
+    /// a connection to `local`, however either address is spelled (an
+    /// IPv4-mapped IPv6 address is its IPv4 one). A match found is the
+    /// answer whatever else could not be read (a process churning sockets
+    /// has some torn down mid-read); with no match, any refused read makes
+    /// it no answer. A descriptor gone since it was listed is skipped.
+    pub(crate) fn holds_connection_in_records(
+        fds: &[i32],
+        mut read: impl FnMut(i32, &mut [u8]) -> (i32, i32),
+        peer: std::net::SocketAddr,
+        local: std::net::SocketAddr,
+    ) -> Option<bool> {
+        let same = |a: std::net::SocketAddr, b: std::net::SocketAddr| a.port() == b.port() && a.ip().to_canonical() == b.ip().to_canonical();
+        let mut unread = false;
+        for &fd in fds {
+            let mut info = vec![0u8; SOCKET_FDINFO_SIZE];
+            let (got, errno) = read(fd, &mut info);
+            match libproc_read(got, Some(SOCKET_FDINFO_SIZE as i32), errno) {
+                LibprocRead::Read if connection_in_fdinfo(&info).is_some_and(|(own, other)| same(own, peer) && same(other, local)) => return Some(true),
+                LibprocRead::Read | LibprocRead::Gone => {}
+                LibprocRead::Unreadable => unread = true,
+            }
+        }
+        (!unread).then_some(false)
+    }
+
     /// Offsets in `struct socket_fdinfo`, measured with clang's `offsetof` on
     /// macOS 26.6: `psi.soi_kind`, then in `psi.soi_proto.pri_tcp`:
     /// `tcpsi_ini.insi_lport` (the port in network order, in an `int`),
     /// `.insi_vflag`, `.insi_laddr` (an `in6_addr`, its IPv4 form 12 bytes in),
     /// `.insi_v6.in6_ifindex`, and `tcpsi_state`.
     const SOI_KIND: usize = 256;
+    const INSI_FPORT: usize = 264;
     const INSI_LPORT: usize = 268;
     const INSI_VFLAG: usize = 288;
+    const INSI_FADDR6: usize = 296;
+    const INSI_FADDR4: usize = 308;
     const INSI_LADDR6: usize = 312;
     const INSI_LADDR4: usize = 324;
     const IN6_IFINDEX: usize = 340;
@@ -833,7 +894,7 @@ pub(crate) mod libproc {
 }
 
 #[cfg(target_os = "macos")]
-use libproc::{listeners_in_records, socket_fds_in, PROC_PIDFDSOCKETINFO, PROC_PIDLISTFDS};
+use libproc::{holds_connection_in_records, listeners_in_records, socket_fds_in, PROC_PIDFDSOCKETINFO, PROC_PIDLISTFDS};
 
 /// `(pid, ppid, pgid, sid)` of every process this user's libproc reads
 /// answer for; `None` when the pid list cannot be read.
@@ -875,6 +936,26 @@ pub(crate) fn listeners_held_by_pid(pid: u32) -> Option<Vec<(u16, crate::PortLis
         (got, errno())
     };
     listeners_in_records(pid, &socket_fds(p)?, read, interface_name)
+}
+
+/// (#3660) Whether `pid` holds the `peer` end of a connection to `local`
+/// ([`holds_connection_in_records`]); `None` when its sockets cannot be
+/// read. A process that exited since it was named holds none.
+#[cfg(target_os = "macos")]
+pub(crate) fn connection_held_by_pid(pid: u32, peer: std::net::SocketAddr, local: std::net::SocketAddr) -> Option<bool> {
+    let p = libc::pid_t::try_from(pid).ok()?;
+    let read = |fd: i32, info: &mut [u8]| {
+        clear_errno();
+        // SAFETY: `info` holds as many bytes as the size given.
+        let got = unsafe { libc::proc_pidfdinfo(p, fd, PROC_PIDFDSOCKETINFO, info.as_mut_ptr().cast(), info.len() as libc::c_int) };
+        (got, errno())
+    };
+    holds_connection_in_records(&socket_fds(p)?, read, peer, local)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn connection_held_by_pid(_pid: u32, _peer: std::net::SocketAddr, _local: std::net::SocketAddr) -> Option<bool> {
+    None
 }
 
 /// `pid`'s socket file descriptors (`PROC_PIDLISTFDS`); empty when it has

@@ -34,7 +34,10 @@
 //! may not, everything else may. That is the opposite question (may this
 //! connection be served at all, not may it be trusted), so what could not
 //! be told is let in: a failed lookup never shuts the operator out, and a
-//! peer this user cannot see (tailscaled, which runs as root) gets in.
+//! peer this user cannot see (tailscaled, which runs as root) gets in. A
+//! verdict that names a container's forwarder also names its pid, which
+//! the rounds remember ([`Rounds::known_forwarder_holding`]) so a later
+//! connection it holds is refused from one read of that process alone.
 //!
 //! **A second line, not the barrier.** This check catches sandboxed work
 //! that stays where darkmux put it. It does not stop code trying to get
@@ -323,10 +326,26 @@ async fn verdict_of(conn: &PeerConn) -> PeerProcess {
     let kind = tokio::time::timeout(JUDGE_BOUND, looked_up(conn))
         .await
         .unwrap_or(PeerProcess::Unknown("the lookup did not finish in time"));
+    let kind = settled(kind, || {
+        let local = conn.local?;
+        conn.rounds
+            .known_forwarder_holding(darkmux_platform::current(), conn.remote, local)
+    });
     if kind == PeerProcess::Operator {
         hold(conn.remote);
     }
     kind
+}
+
+/// `kind`, unless it could not be told and a forwarder already named holds
+/// the connection (`known`, asked only then): a judgment that ran out of
+/// time, or whose round read nothing, still never lets a known container
+/// in as unknown.
+pub(crate) fn settled(kind: PeerProcess, known: impl FnOnce() -> Option<String>) -> PeerProcess {
+    match kind {
+        PeerProcess::Unknown(_) => known().map_or(kind, PeerProcess::ContainerForwarder),
+        kind => kind,
+    }
 }
 
 /// `conn`'s verdict from its round ([`Rounds::look`]) and this host's
@@ -354,6 +373,30 @@ async fn judged_now(looked: Looked) -> PeerProcess {
     .await
     .unwrap_or(PeerProcess::Unknown("the lookup did not finish"))
 }
+
+/// The distinct processes in a round's `(peer, pid)` pairs.
+fn pids_in(peers: &[(SocketAddr, u32)]) -> Vec<u32> {
+    let mut pids: Vec<u32> = peers.iter().map(|(_, pid)| *pid).collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// The container forwarders among `holders`, each with its name.
+pub(crate) fn forwarders_among(
+    platform: &dyn darkmux_platform::Platform,
+    holders: &[u32],
+) -> Vec<(u32, String)> {
+    holders
+        .iter()
+        .filter_map(|&pid| Some((pid, platform.process_name(pid)?)))
+        .filter(|(_, name)| darkmux_platform::is_container_forwarder(name))
+        .collect()
+}
+
+/// The most forwarders one listener's rounds remember: an engine runs one
+/// or two, so this only bounds what a peer could make each check cost.
+const KNOWN_FORWARDERS: usize = 8;
 
 /// What reads every connection to the listener at an address, `(peer,
 /// pid)` ([`darkmux_platform::Platform::tcp_peers_of`]); `None`: no answer.
@@ -402,6 +445,9 @@ pub(crate) struct Rounds {
     launchers: LaunchersReader,
     bound: std::time::Duration,
     listeners: Mutex<HashMap<SocketAddr, ListenerRounds>>,
+    /// The container forwarders a verdict named, each with its name then,
+    /// newest last ([`Self::known_forwarder_holding`]).
+    forwarders: Mutex<Vec<(u32, String)>>,
 }
 
 /// What a connection does next: read a round's answer, or wait for the
@@ -422,7 +468,40 @@ impl Rounds {
             launchers,
             bound,
             listeners: Mutex::new(HashMap::new()),
+            forwarders: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Remembers `found` forwarders, each once, keeping the newest
+    /// [`KNOWN_FORWARDERS`].
+    pub(crate) fn remember(&self, found: Vec<(u32, String)>) {
+        let mut known = self.forwarders.lock().unwrap_or_else(|p| p.into_inner());
+        for f in found {
+            known.retain(|k| k.0 != f.0);
+            known.push(f);
+        }
+        let over = known.len().saturating_sub(KNOWN_FORWARDERS);
+        known.drain(..over);
+    }
+
+    /// The name of a forwarder a round already named that holds the `peer`
+    /// end of a connection to `local`: one process's descriptors read per
+    /// forwarder ([`darkmux_platform::Platform::holds_tcp_peer`]), no round,
+    /// so a listener can refuse a container's connection as it accepts it.
+    /// A pid whose process is no longer that forwarder (it exited, its pid
+    /// was reused) is forgotten, so it never refuses anyone else's.
+    pub(crate) fn known_forwarder_holding(
+        &self,
+        platform: &dyn darkmux_platform::Platform,
+        peer: SocketAddr,
+        local: SocketAddr,
+    ) -> Option<String> {
+        let mut known = self.forwarders.lock().unwrap_or_else(|p| p.into_inner());
+        known.retain(|(pid, name)| platform.process_name(*pid).as_deref() == Some(name.as_str()));
+        known
+            .iter()
+            .find(|(pid, _)| platform.holds_tcp_peer(*pid, peer, local) == Some(true))
+            .map(|(_, name)| name.clone())
     }
 
     /// Every process holding the other end of `remote`'s connection to the
@@ -486,9 +565,13 @@ impl Rounds {
             let tables = tokio::task::spawn_blocking(move || {
                 let peers = read(local);
                 let launchers = peers.as_ref().and_then(|_| launchers());
-                (peers, launchers)
+                let forwarders = peers.as_deref().map_or(Vec::new(), |p| {
+                    forwarders_among(darkmux_platform::current(), &pids_in(p))
+                });
+                (peers, launchers, forwarders)
             });
-            let (peers, launchers) = tables.await.unwrap_or((None, None));
+            let (peers, launchers, forwarders) = tables.await.unwrap_or((None, None, Vec::new()));
+            rounds.remember(forwarders);
             let mut listeners = rounds.listeners.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(at) = listeners.get_mut(&local) {
                 at.running = None;

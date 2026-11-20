@@ -230,6 +230,12 @@ impl Platform for FakePlatform {
         Some(self.tcp_peers.clone())
     }
 
+    /// Whether [`Self::tcp_peers`] pairs `peer` with `pid`, whatever the
+    /// listener.
+    fn holds_tcp_peer(&self, pid: u32, peer: std::net::SocketAddr, _local: std::net::SocketAddr) -> Option<bool> {
+        Some(self.tcp_peers.contains(&(peer, pid)))
+    }
+
     /// The ports [`Self::port_listeners`] names.
     fn tcp_listening_ports(&self) -> Option<Vec<u16>> {
         let mut ports: Vec<u16> = self.port_listeners.iter().map(|(p, _)| *p).collect();

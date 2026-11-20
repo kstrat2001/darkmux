@@ -398,43 +398,46 @@ fn an_upgraded_connection_holds_its_slot_until_its_stream_closes() {
     );
 }
 
-/// A connection is judged before it is served only when it comes from this
-/// machine (a loopback address, however spelled, or the listener's own
-/// address) and its address already holds the open share; a remote peer
-/// never is, and a listener with no judged share (the fleet listener's)
-/// judges nothing.
+/// This machine is a loopback peer however spelled, any peer of a listener
+/// bound to loopback (whatever source address it chose), and a peer at the
+/// listener's own address; another machine is not. All of this machine
+/// counts as one address, so binding another source address adds no open
+/// share; a listener with no judged share (the fleet listener's) judges
+/// nothing.
 #[test]
-fn a_connection_from_this_machine_past_the_open_share_is_judged_first() {
+fn this_machine_is_every_peer_of_a_loopback_listener_and_counts_as_one() {
     let at = |s: &str| -> SocketAddr { s.parse().unwrap() };
-    let unread = || -> Option<SocketAddr> { None };
+    let lo = Some(at("127.0.0.1:8799"));
     for peer in ["127.0.0.1:50000", "[::ffff:127.0.0.1]:50000", "[::1]:50000"] {
-        assert!(
-            !judged_first(at(peer), 3, 4, unread),
-            "{peer}: inside the open share"
-        );
-        assert!(judged_first(at(peer), 4, 4, unread), "{peer}: past it");
+        assert!(from_this_machine(at(peer), None), "{peer}");
     }
-    let lan = || Some(at("192.168.1.5:8799"));
     assert!(
-        judged_first(at("192.168.1.5:50000"), 4, 4, lan),
+        from_this_machine(at("192.168.1.5:50000"), lo),
+        "this Mac's LAN address, to a loopback listener"
+    );
+    assert!(from_this_machine(at("127.0.0.2:50000"), lo));
+    let lan = Some(at("192.168.1.5:8799"));
+    assert!(
+        from_this_machine(at("192.168.1.5:50000"), lan),
         "this machine reaching its own address"
     );
     assert!(
-        !judged_first(at("192.168.1.5:50000"), 3, 4, || panic!(
-            "read inside the open share"
-        )),
-        "the listener's address is read only past the open share"
+        !from_this_machine(at("192.168.1.9:50000"), lan),
+        "another machine"
     );
-    assert!(
-        !judged_first(at("192.168.1.9:50000"), 100, 4, lan),
-        "another machine, at any count"
-    );
-    assert!(!judged_first(at("100.64.0.7:50000"), 100, 4, unread));
+    assert!(!from_this_machine(at("100.64.0.7:50000"), None));
+    let one: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    assert_eq!(counted_as(at("192.168.1.5:50000"), true), one);
+    assert_eq!(counted_as(at("[::1]:50000"), true), one);
     assert_eq!(
-        Admission::new("fleet", 8, 4).open_share,
-        4,
-        "judges nothing"
+        counted_as(at("100.64.0.7:50000"), false),
+        "100.64.0.7".parse::<std::net::IpAddr>().unwrap()
     );
+    let fleet = Admission::new("fleet", 8, 4);
+    assert_eq!(fleet.open_share, 4, "judges nothing");
+    assert!(!fleet.judging, "and counts this machine's addresses apart");
+    assert!(!Admission::new("x", 8, 4).with_judged_share(0).judging);
+    assert!(Admission::new("x", 8, 4).with_judged_share(1).judging);
     assert_eq!(
         Admission::new("viewer", 8, 4)
             .with_judged_share(1)
@@ -444,13 +447,20 @@ fn a_connection_from_this_machine_past_the_open_share_is_judged_first() {
 }
 
 /// Not a test: a stand-in for a container engine's forwarder, run from a
-/// copy of this test binary named `com.docker.backend` ([`forwarder`]).
-/// Without `DARKMUX_TEST_FORWARDER` it does nothing. Given `<addr> <n>
-/// <closing>`, it opens `n` connections to `addr`, prints `closed <k>` once
-/// the other end has closed `closing` of them (or 8 s pass: within the
-/// production listeners' 10 s header deadline, so a connection that
-/// deadline closes is never counted as refused), and holds the rest until
-/// its stdin closes.
+/// copy of this test binary named `com.docker.backend` ([`forwarder`],
+/// [`churning_forwarder`]). Without `DARKMUX_TEST_FORWARDER` it does
+/// nothing. Its modes:
+///
+/// - `hold <addr> <n> <closing> <source>`: opens `n` connections to `addr`
+///   (from this machine's address `source`, or `-` for the default), prints
+///   `closed <k>` once the other end has closed `closing` of them (or 8 s
+///   pass: within the production listeners' 10 s header deadline, so a
+///   connection that deadline closes is never counted as refused), and
+///   holds the rest until its stdin closes.
+/// - `churn <addr> <hold> <threads> <secs>`: holds `hold` connections, prints
+///   `churning`, and for `secs` has each of `threads` threads connect, wait
+///   for the other end to close, and connect again (a container reopening
+///   every connection it loses), then holds until its stdin closes.
 #[test]
 #[ignore]
 fn container_forwarder_stand_in() {
@@ -458,14 +468,64 @@ fn container_forwarder_stand_in() {
         return;
     };
     let parts: Vec<&str> = spec.split(' ').collect();
-    let addr: SocketAddr = parts[0].parse().unwrap();
-    let (n, closing): (usize, usize) = (parts[1].parse().unwrap(), parts[2].parse().unwrap());
-    let held: Vec<_> = (0..n)
+    let addr: SocketAddr = parts[1].parse().unwrap();
+    let num = |i: usize| -> usize { parts[i].parse().unwrap() };
+    let _held = match parts[0] {
+        "hold" => {
+            let source = parts[4].parse().ok();
+            let held: Vec<_> = (0..num(2)).map(|_| connect_from(addr, source)).collect();
+            let closed = closed_count(&held, num(3), Duration::from_secs(8));
+            println!("closed {closed}");
+            held
+        }
+        _ => churn(addr, num(2), num(3), Duration::from_secs(num(4) as u64)),
+    };
+    let _ = std::io::stdin().read_to_end(&mut Vec::new());
+}
+
+/// A connection to `addr` from this machine's address `source` (the
+/// default one when `None`).
+fn connect_from(addr: SocketAddr, source: Option<std::net::IpAddr>) -> std::net::TcpStream {
+    let Some(source) = source else {
+        return std::net::TcpStream::connect(addr).unwrap();
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap();
+    let s = rt.block_on(async {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(SocketAddr::new(source, 0)).unwrap();
+        socket.connect(addr).await.unwrap()
+    });
+    let s = s.into_std().unwrap();
+    s.set_nonblocking(false).unwrap();
+    s
+}
+
+/// [`container_forwarder_stand_in`]'s `churn` mode: the held connections.
+fn churn(
+    addr: SocketAddr,
+    hold: usize,
+    threads: usize,
+    for_: Duration,
+) -> Vec<std::net::TcpStream> {
+    let held: Vec<_> = (0..hold)
         .map(|_| std::net::TcpStream::connect(addr).unwrap())
         .collect();
-    let closed = closed_count(&held, closing, Duration::from_secs(8));
-    println!("closed {closed}");
-    let _ = std::io::stdin().read_to_end(&mut Vec::new());
+    let until = std::time::Instant::now() + for_;
+    for _ in 0..threads {
+        std::thread::spawn(move || {
+            while std::time::Instant::now() < until {
+                if let Ok(mut s) = std::net::TcpStream::connect(addr) {
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(9)));
+                    let _ = s.read(&mut [0u8; 1]);
+                }
+            }
+        });
+    }
+    println!("churning");
+    held
 }
 
 /// How many of `conns` the other end has closed, once `want` have been or
@@ -510,24 +570,54 @@ impl Drop for Forwarder {
 /// forwarder) and running [`container_forwarder_stand_in`]. Returns once
 /// `closing` of them have been closed (or 8 s passed), with how many were.
 fn forwarder(addr: SocketAddr, n: usize, closing: usize) -> (Forwarder, usize) {
-    let dir = tempfile::TempDir::new().unwrap();
-    let exe = dir.path().join("com.docker.backend");
-    std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
-    let mut child = spawn_copied(&exe, &format!("{addr} {n} {closing}"));
-    let out = std::io::BufReader::new(child.stdout.take().unwrap());
-    let closed = std::io::BufRead::lines(out)
-        .map_while(Result::ok)
-        // libtest prints the test's name on the same line first.
+    forwarder_from(addr, n, closing, None)
+}
+
+/// [`forwarder`], its connections from this machine's address `source`.
+fn forwarder_from(
+    addr: SocketAddr,
+    n: usize,
+    closing: usize,
+    source: Option<std::net::IpAddr>,
+) -> (Forwarder, usize) {
+    let source = source.map_or("-".to_string(), |s| s.to_string());
+    let (held, mut lines) = stand_in(&format!("hold {addr} {n} {closing} {source}"));
+    // libtest prints the test's name on the same line first.
+    let closed = lines
         .find_map(|l| {
             l.rsplit_once("closed ")
                 .map(|(_, k)| k.trim().parse().unwrap())
         })
         .expect("the stand-in reports what it holds");
+    (held, closed)
+}
+
+/// A container engine's forwarder holding `hold` connections to `addr` and
+/// reopening every other one it loses on `threads` threads for `for_secs`
+/// ([`container_forwarder_stand_in`]'s `churn` mode), once it has begun.
+fn churning_forwarder(addr: SocketAddr, hold: usize, threads: usize, for_secs: u64) -> Forwarder {
+    let (held, mut lines) = stand_in(&format!("churn {addr} {hold} {threads} {for_secs}"));
+    assert!(
+        lines.any(|l| l.contains("churning")),
+        "the stand-in began churning"
+    );
+    held
+}
+
+/// [`container_forwarder_stand_in`] started with `spec`, from a copy of this
+/// test binary named `com.docker.backend`, and the lines it prints.
+fn stand_in(spec: &str) -> (Forwarder, impl Iterator<Item = String>) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let exe = dir.path().join("com.docker.backend");
+    std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+    let mut child = spawn_copied(&exe, spec);
+    let out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let lines = std::io::BufRead::lines(out).map_while(Result::ok);
     let held = Forwarder {
         child,
         _exe_dir: dir,
     };
-    (held, closed)
+    (held, lines)
 }
 
 /// Starts the stand-in at `exe`. A copy just written can be busy for a
@@ -726,4 +816,164 @@ fn the_viewer_and_the_client_listener_keep_a_share_no_container_can_take() {
             "{name}: the operator is served"
         );
     }
+}
+
+/// How many of `n` requests, each on a connection of its own (a browser's
+/// new connection), `/ok` answers, `gap` apart.
+fn served_of(addr: SocketAddr, n: usize, gap: Duration) -> usize {
+    let mut served = 0;
+    for _ in 0..n {
+        if let Ok(mut s) = std::net::TcpStream::connect(addr) {
+            s.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+            if s.write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n").is_ok()
+                && get_answer(&mut s).starts_with("HTTP/1.1 200")
+            {
+                served += 1;
+            }
+        }
+        std::thread::sleep(gap);
+    }
+    served
+}
+
+/// The answer read from `s` up to its `ok` body, or what came before it
+/// closed.
+fn get_answer(s: &mut std::net::TcpStream) -> String {
+    let mut got = Vec::new();
+    let mut b = [0u8; 512];
+    while !String::from_utf8_lossy(&got).ends_with("ok") {
+        match s.read(&mut b) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&b[..n]),
+        }
+    }
+    String::from_utf8_lossy(&got).into_owned()
+}
+
+/// A container that reopens every connection it loses cannot crowd the
+/// operator out of the viewer: with its forwarder holding the open share
+/// and 64, then 128, threads reconnecting as fast as they are closed,
+/// every one of this process's new connections is served. Once a round
+/// has named the forwarder, its connections past the open share are refused
+/// as they are accepted, without waiting for a round while holding a slot.
+#[test]
+fn a_reconnecting_container_never_crowds_the_operator_out_of_the_viewer() {
+    let _ = crate::raise_open_file_limit(8192);
+    for threads in [64, 128] {
+        let (addr, _stop, _done) = serving_with(
+            Box::new(|l, app, rx| Box::pin(crate::serve_viewer(l, app, rx))),
+            ok_app(),
+        );
+        let open = VIEWER.per_ip - VIEWER.judged_share;
+        let _container = churning_forwarder(addr, open, threads, 8);
+        std::thread::sleep(Duration::from_millis(300));
+        let served = served_of(addr, 20, Duration::from_millis(100));
+        assert_eq!(
+            served, 20,
+            "{threads} reconnecting threads: the operator served {served} of 20"
+        );
+    }
+}
+
+/// This machine is every peer of a listener bound to loopback, whatever
+/// source address it connects from, and all of them share one count: a
+/// container's forwarder connecting from this Mac's LAN address as well as
+/// from 127.0.0.1 holds only the open share between them, and the operator
+/// is served. The listener has the client listener's shape (its per-address
+/// cap is its whole cap, so a second source address with an open share of
+/// its own would fill it) and a header deadline far past the test, so a
+/// held connection never closes on its own while it runs.
+#[test]
+fn a_container_connecting_from_another_address_of_this_machine_shares_the_open_share() {
+    let lan = {
+        let u = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        u.connect("192.0.2.1:9")
+            .expect("a route off this machine, to name its LAN address");
+        u.local_addr().unwrap().ip()
+    };
+    let lim = KeptAliveLimits {
+        label: "test listener",
+        max_conns: 8,
+        per_ip: 8,
+        judged_share: 4,
+        header_read_timeout: Duration::from_secs(60),
+    };
+    let open = lim.per_ip - lim.judged_share;
+    let (addr, _stop, _done) = serving_judged(ok_app(), lim, crate::local_peer::this_machine());
+    let (_from_lan, closed) = forwarder_from(addr, lim.per_ip, lim.judged_share, Some(lan));
+    assert_eq!(
+        closed, lim.judged_share,
+        "from {lan}: the open share ({open}) is held"
+    );
+    let (_from_loopback, closed) = forwarder(addr, open, open);
+    assert_eq!(
+        closed, open,
+        "from 127.0.0.1 too: the open share is already held"
+    );
+    assert_eq!(
+        served_of(addr, 4, Duration::from_millis(50)),
+        4,
+        "the operator is served"
+    );
+}
+
+/// A stop ends a connection still waiting for its judgment at once, never
+/// after the lookup's bound.
+#[test]
+fn a_stop_ends_a_connection_waiting_for_its_judgment() {
+    let hung = crate::local_peer::Rounds::new(
+        Arc::new(|_| {
+            std::thread::sleep(Duration::from_secs(4));
+            None
+        }),
+        Arc::new(|| Some(Vec::new())),
+        Duration::from_secs(5),
+    );
+    let lim = KeptAliveLimits {
+        label: "test listener",
+        max_conns: 8,
+        per_ip: 4,
+        judged_share: 4,
+        header_read_timeout: Duration::from_secs(30),
+    };
+    let (addr, stop, done) = serving_judged(ok_app(), lim, hung);
+    let _waiting = std::net::TcpStream::connect(addr).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    stop.send(true).unwrap();
+    assert!(
+        done.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "the server returned while the judgment was still running"
+    );
+}
+
+/// A listener that keeps no judged share still judges its loopback peers'
+/// trust on their first request: the operator's connection reads as the
+/// operator's, which needs the listener's own end of it.
+#[test]
+fn a_listener_with_no_judged_share_still_knows_the_operators_connection() {
+    let app = Router::new().route(
+        "/me",
+        axum::routing::get(
+            |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>| async move {
+                crate::local_peer::is_operator(peer).to_string()
+            },
+        ),
+    );
+    let (addr, _stop, _done) =
+        serving_judged(app, limits(4, 4, Duration::from_secs(30)), not_seeing(""));
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.write_all(b"GET /me HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+    let mut got = Vec::new();
+    let mut b = [0u8; 512];
+    while !String::from_utf8_lossy(&got).contains("true")
+        && !String::from_utf8_lossy(&got).contains("false")
+    {
+        match s.read(&mut b) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&b[..n]),
+        }
+    }
+    let got = String::from_utf8_lossy(&got);
+    assert!(got.ends_with("true"), "judged the operator's: {got:?}");
 }

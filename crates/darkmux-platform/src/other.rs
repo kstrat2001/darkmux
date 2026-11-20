@@ -121,6 +121,10 @@ impl Platform for OtherPlatform {
         None
     }
 
+    fn holds_tcp_peer(&self, _pid: u32, _peer: std::net::SocketAddr, _local: std::net::SocketAddr) -> Option<bool> {
+        None
+    }
+
     fn tcp_port_listeners(&self, _port: u16) -> Option<Vec<crate::PortListener>> {
         None
     }

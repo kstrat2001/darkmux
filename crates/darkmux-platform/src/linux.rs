@@ -251,6 +251,14 @@ impl Platform for LinuxPlatform {
     /// end is `local`, matched in one pass over every process's fds to the
     /// process holding each. A process this user cannot read is left out (a
     /// host-network container run as root, say).
+    /// (#3660) The inode of the `peer` end of the connection to `local` in
+    /// `/proc/net/tcp{,6}`, then whether `pid`'s descriptors hold it.
+    fn holds_tcp_peer(&self, pid: u32, peer: std::net::SocketAddr, local: std::net::SocketAddr) -> Option<bool> {
+        let mut ends = connected_to(&read_to_string("/proc/net/tcp")?, local);
+        ends.extend(connected_to(&read_to_string("/proc/net/tcp6").unwrap_or_default(), local));
+        Some(holds_one_of(&inodes_of(&ends, peer), &socket_inodes_held_by(pid)?))
+    }
+
     fn tcp_peers_of(&self, local: std::net::SocketAddr) -> Option<Vec<(std::net::SocketAddr, u32)>> {
         let mut ends = connected_to(&read_to_string("/proc/net/tcp")?, local);
         ends.extend(connected_to(&read_to_string("/proc/net/tcp6").unwrap_or_default(), local));
@@ -524,6 +532,18 @@ pub(crate) fn socket_inodes_held_by(pid: u32) -> Option<Vec<u64>> {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn socket_inodes_held_by(_pid: u32) -> Option<Vec<u64>> {
     None
+}
+
+/// (#3660) The inodes among `ends` (`(own end, inode)`) whose own end is
+/// `peer`, however it is spelled (an IPv4-mapped address is its IPv4 one).
+pub(crate) fn inodes_of(ends: &[(std::net::SocketAddr, u64)], peer: std::net::SocketAddr) -> Vec<u64> {
+    let same = |a: std::net::SocketAddr| a.port() == peer.port() && a.ip().to_canonical() == peer.ip().to_canonical();
+    ends.iter().filter(|(own, _)| same(*own)).map(|(_, inode)| *inode).collect()
+}
+
+/// (#3660) Whether `held` (a process's socket inodes) has any of `wanted`.
+pub(crate) fn holds_one_of(wanted: &[u64], held: &[u64]) -> bool {
+    wanted.iter().any(|i| held.contains(i))
 }
 
 /// (#3453 review) The inodes of `/proc/net/tcp{,6}`'s sockets in LISTEN

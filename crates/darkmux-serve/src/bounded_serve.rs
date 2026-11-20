@@ -16,13 +16,29 @@
 //! browser and every request `tailscale serve` forwards arrive from
 //! 127.0.0.1, and so does a container's (its engine's forwarder connects
 //! for `host.docker.internal`) and any other local process's. So a
-//! listener that serves this machine keeps part of each address's slots
-//! for connections judged first ([`KeptAliveLimits::judged_share`]): once
-//! a loopback address holds the rest (the open share), its next connection
-//! is served only after [`crate::local_peer`] has judged its process not
-//! to be contained work (a host sandbox's, or a container forwarder's);
-//! contained work is closed. Below that point nothing is judged here, so a
-//! listener under no pressure pays nothing for it.
+//! listener that serves this machine keeps part of its slots for
+//! connections judged first ([`KeptAliveLimits::judged_share`]). Every
+//! connection from this machine counts against one per-address count,
+//! whatever source address it binds ([`from_this_machine`],
+//! [`counted_as`]). Once this machine holds the rest (the open share), its
+//! next connection is served only after [`crate::local_peer`] has judged
+//! its process not to be contained work (a host sandbox's, or a container
+//! forwarder's); contained work is closed. A forwarder a verdict has named
+//! is remembered, and a later connection whose peer end it holds is closed
+//! as it is accepted, from one read of that process's descriptors, before
+//! it holds a slot: a container reopening every connection it loses never
+//! occupies the judged share while a round runs. Below the open share
+//! nothing is judged here and no other process is read, so a listener
+//! under no pressure pays one `getsockname` per connection for it.
+//!
+//! **What it does not cover.** A sandboxed process is judged by a round
+//! each time (it is not remembered: its pid could be reused by the
+//! operator's next process of the same name), so sandboxed work reopening
+//! connections could keep judged slots busy while each waits for its
+//! round; the sandbox's network profile keeps it off darkmux's ports
+//! (#3640). A peer this user cannot see (tailscaled, another account's
+//! process) and an engine whose forwarder is not in
+//! `darkmux_platform::CONTAINER_FORWARDERS` read as unknown and are served.
 
 use crate::fleet_listener::{KeySlot, KeySlots};
 use axum::extract::ConnectInfo;
@@ -38,9 +54,13 @@ pub(crate) struct Admission {
     max_conns: usize,
     permits: Arc<tokio::sync::Semaphore>,
     per_ip: Arc<KeySlots<IpAddr>>,
-    /// How many connections one address of this machine holds before its
-    /// next is judged first ([`judged_first`]); `per_ip` judges nothing.
+    /// How many connections this machine holds before its next is judged
+    /// first; `per_ip` judges nothing.
     open_share: usize,
+    /// Whether it keeps a judged share at all ([`Self::with_judged_share`]).
+    /// One that does not (the fleet listener) counts every peer address
+    /// apart, this machine's included, and reads nothing more on accept.
+    judging: bool,
 }
 
 /// A connection's places in its listener's caps, given back when dropped.
@@ -54,7 +74,11 @@ pub(crate) struct Admitted {
     pub(crate) stream: tokio::net::TcpStream,
     pub(crate) peer: SocketAddr,
     pub(crate) slots: Slots,
-    /// Whether it must be judged before it is served ([`judged_first`]).
+    /// The listener's own end of it, when it could be read; read on
+    /// accept only by a listener that judges.
+    pub(crate) local: Option<SocketAddr>,
+    /// Whether it must be judged before it is served: it comes from this
+    /// machine ([`from_this_machine`]) and the open share is in use.
     pub(crate) judge_first: bool,
 }
 
@@ -73,6 +97,7 @@ impl Admission {
             permits: Arc::new(tokio::sync::Semaphore::new(max_conns)),
             per_ip: Arc::new(KeySlots::new(per_ip)),
             open_share: per_ip,
+            judging: false,
         }
     }
 
@@ -80,6 +105,7 @@ impl Admission {
     /// for connections from this machine that are judged first.
     pub(crate) fn with_judged_share(mut self, judged_share: usize) -> Self {
         self.open_share = self.open_share.saturating_sub(judged_share);
+        self.judging = judged_share > 0;
         self
     }
 
@@ -113,9 +139,10 @@ impl Admission {
     /// `stream` with its slots, or `None` (and the stream dropped, which
     /// closes it) when its address or the listener is at its cap.
     fn admit(&self, stream: tokio::net::TcpStream, peer: SocketAddr) -> Option<Admitted> {
-        let (ip, held) = self.per_ip.try_take_counted(peer.ip().to_canonical())?;
+        let local = self.judging.then(|| stream.local_addr().ok()).flatten();
+        let here = self.judging && from_this_machine(peer, local);
+        let (ip, held) = self.per_ip.try_take_counted(counted_as(peer, here))?;
         let conn = self.permits.clone().try_acquire_owned().ok()?;
-        let judge_first = judged_first(peer, held, self.open_share, || stream.local_addr().ok());
         Some(Admitted {
             stream,
             peer,
@@ -123,7 +150,8 @@ impl Admission {
                 _conn: conn,
                 _ip: ip,
             },
-            judge_first,
+            local,
+            judge_first: here && held >= self.open_share,
         })
     }
 
@@ -135,19 +163,29 @@ impl Admission {
     }
 }
 
-/// Whether a connection from `peer`, accepted while `peer`'s address
-/// already held `held` connections, is judged before it is served: one from
-/// this machine (a loopback address, or the listener's own address, which
-/// `local` reads only past the open share) once that address holds its
-/// open share.
-pub(crate) fn judged_first(
-    peer: SocketAddr,
-    held: usize,
-    open_share: usize,
-    local: impl FnOnce() -> Option<SocketAddr>,
-) -> bool {
+/// Whether a connection from `peer` to the listener's own end `local`
+/// (`None`: unread) comes from this machine: every peer of a listener
+/// bound to loopback, whatever source address it chose (this Mac's LAN
+/// address, Linux's 127.0.0.2), a loopback peer, and a peer at the
+/// listener's own address.
+pub(crate) fn from_this_machine(peer: SocketAddr, local: Option<SocketAddr>) -> bool {
     let ip = peer.ip().to_canonical();
-    held >= open_share && (ip.is_loopback() || local().is_some_and(|l| l.ip().to_canonical() == ip))
+    ip.is_loopback()
+        || local.is_some_and(|l| {
+            let l = l.ip().to_canonical();
+            l.is_loopback() || l == ip
+        })
+}
+
+/// The address a connection from `peer` counts against for `per_ip`: one
+/// for all of this machine (`here`), so a process cannot add an open share
+/// for each source address it binds.
+pub(crate) fn counted_as(peer: SocketAddr, here: bool) -> IpAddr {
+    if here {
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    } else {
+        peer.ip().to_canonical()
+    }
 }
 
 /// The bounds of a listener served by [`serve_kept_alive`].
@@ -162,9 +200,10 @@ pub(crate) struct KeptAliveLimits {
     /// Of `per_ip`, the slots a connection from this machine takes only
     /// once judged not to be contained work (a host sandbox's process or a
     /// container forwarder): the rest, the open share, is served unjudged.
-    /// Contained work therefore holds at most the open share of an address,
-    /// and this share stays for the operator's processes and for peers this
-    /// user cannot see (tailscaled, which runs as root).
+    /// Contained work therefore holds at most the open share of this
+    /// machine's connections, and this share stays for the operator's
+    /// processes and for peers this user cannot see (tailscaled, which runs
+    /// as root).
     pub judged_share: usize,
     /// Time allowed for each request's head: from the connection's start
     /// for its first request, and from the end of the last answer for each
@@ -179,8 +218,9 @@ pub(crate) struct KeptAliveLimits {
 /// binds the viewer to its tailnet address directly leaves room for the
 /// rest. A browser holds at most six connections to one host, and an idle
 /// one is closed within the header deadline and opened again on its next
-/// request. Half of 127.0.0.1's slots are judged, so a container or a
-/// sandbox reaching this machine's loopback holds at most 64.
+/// request. Half of this machine's slots are judged, so a container or a
+/// sandbox holds at most 64, and a known forwarder's connections past those
+/// are closed as they are accepted.
 pub(crate) const VIEWER: KeptAliveLimits = KeptAliveLimits {
     label: "darkmux serve",
     max_conns: 256,
@@ -245,6 +285,9 @@ pub(crate) async fn serve_kept_alive_reading(
     let admission = Admission::new(limits.label, limits.max_conns, limits.per_ip)
         .with_judged_share(limits.judged_share);
     while let Some(conn) = admission.next(&listener, &mut shutdown).await {
+        if conn.judge_first && from_a_known_forwarder(&rounds, &conn) {
+            continue;
+        }
         tokio::spawn(kept_alive(
             conn,
             app.clone(),
@@ -255,6 +298,19 @@ pub(crate) async fn serve_kept_alive_reading(
     }
     drop(listener);
     admission.drained().await;
+}
+
+/// Whether `conn` is a container's, by a forwarder `rounds` already named
+/// ([`crate::local_peer::Rounds::known_forwarder_holding`]): read here,
+/// as it is accepted, so it is closed before it holds a slot while a round
+/// runs. A container reopening every connection it loses therefore gets
+/// none of the judged share, whose slots stay free for the rest.
+fn from_a_known_forwarder(rounds: &crate::local_peer::Rounds, conn: &Admitted) -> bool {
+    conn.local.is_some_and(|local| {
+        rounds
+            .known_forwarder_holding(darkmux_platform::current(), conn.peer, local)
+            .is_some()
+    })
 }
 
 /// Serves one admitted connection until it closes, or, once `shutdown`
@@ -272,10 +328,12 @@ async fn kept_alive(
         stream,
         peer,
         slots,
+        local,
         judge_first,
     } = conn;
-    let this_conn = crate::local_peer::PeerConn::new(peer, stream.local_addr().ok(), rounds);
-    if judge_first && !crate::local_peer::may_take_a_judged_slot(&this_conn).await {
+    let local = local.or_else(|| stream.local_addr().ok());
+    let this_conn = crate::local_peer::PeerConn::new(peer, local, rounds);
+    if judge_first && !judged_in_time(&this_conn, &mut shutdown).await {
         return;
     }
     let served = hyper::server::conn::http1::Builder::new()
@@ -295,6 +353,19 @@ async fn kept_alive(
         () = stopped(&mut shutdown) => served.as_mut().graceful_shutdown(),
     }
     let _ = served.await;
+}
+
+/// Whether `conn` may take a judged slot
+/// ([`crate::local_peer::may_take_a_judged_slot`]); not once `shutdown`
+/// says stop while it waits, so a stop never waits on a lookup.
+async fn judged_in_time(
+    conn: &crate::local_peer::PeerConn,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        may = crate::local_peer::may_take_a_judged_slot(conn) => may,
+        () = stopped(shutdown) => false,
+    }
 }
 
 /// A connection's socket together with its slots, so they are given back

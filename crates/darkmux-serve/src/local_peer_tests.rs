@@ -189,9 +189,15 @@ async fn the_client_listener_judges_a_loopback_peer_as_the_viewer_does() {
     let here = health_from_here("127.0.0.1", addr.port()).await;
     assert_eq!(here["operator"], true, "this process: {here}");
     let child = health_from_child("127.0.0.1", addr.port(), None).await;
-    assert_eq!(child["operator"], true, "a process outside any sandbox: {child}");
+    assert_eq!(
+        child["operator"], true,
+        "a process outside any sandbox: {child}"
+    );
     let sandboxed = health_from_child("127.0.0.1", addr.port(), Some(&dir)).await;
-    assert_eq!(sandboxed["operator"], false, "sandboxed work is not the operator: {sandboxed}");
+    assert_eq!(
+        sandboxed["operator"], false,
+        "sandboxed work is not the operator: {sandboxed}"
+    );
 }
 
 /// A fake machine: the operator's CLI (pid 51), a host sandbox led by 100
@@ -521,4 +527,98 @@ fn only_contained_work_is_kept_out_of_the_judged_slots() {
     assert!(PeerProcess::ContainerForwarder("com.docker.backend".into()).is_contained());
     assert!(!PeerProcess::Operator.is_contained());
     assert!(!PeerProcess::Unknown("no process this user can see").is_contained());
+}
+
+/// A forwarder a verdict named is remembered, and a connection whose peer
+/// end it holds is known as a container's without a round; one it does not
+/// hold is not. A pid that no longer runs that forwarder is forgotten, so
+/// it never refuses another process's connection.
+#[test]
+fn a_named_forwarder_is_known_until_its_pid_runs_something_else() {
+    let at = |s: &str| -> SocketAddr { s.parse().unwrap() };
+    let (theirs, mine, local) = (
+        at("127.0.0.1:50001"),
+        at("127.0.0.1:50002"),
+        at("127.0.0.1:8799"),
+    );
+    let mut m = darkmux_platform::FakePlatform {
+        tcp_peers: vec![(theirs, 68948), (mine, 51)],
+        ..machine()
+    };
+    assert_eq!(
+        forwarders_among(&m, &[51, 68948]),
+        vec![(68948, "com.docker.backend".to_string())]
+    );
+    let rounds = Rounds::new_for_test(Arc::new(|_| None), std::time::Duration::from_secs(1));
+    assert_eq!(
+        rounds.known_forwarder_holding(&m, theirs, local),
+        None,
+        "none named yet"
+    );
+    rounds.remember(forwarders_among(&m, &[68948]));
+    assert_eq!(
+        rounds.known_forwarder_holding(&m, theirs, local).as_deref(),
+        Some("com.docker.backend")
+    );
+    assert_eq!(
+        rounds.known_forwarder_holding(&m, mine, local),
+        None,
+        "the operator's"
+    );
+    m.process_names.retain(|(pid, _)| *pid != 68948);
+    m.process_names.push((68948, "zsh".into()));
+    m.tcp_peers.push((mine, 68948));
+    assert_eq!(
+        rounds.known_forwarder_holding(&m, mine, local),
+        None,
+        "a reused pid is no forwarder"
+    );
+}
+
+/// The rounds remember at most a handful of forwarders, newest kept, each
+/// once.
+#[test]
+fn the_known_forwarders_are_bounded() {
+    let rounds = Rounds::new_for_test(Arc::new(|_| None), std::time::Duration::from_secs(1));
+    rounds.remember((0..20).map(|pid| (pid, "vpnkit".to_string())).collect());
+    rounds.remember(vec![(19, "vpnkit".to_string())]);
+    let known = rounds.forwarders.lock().unwrap().clone();
+    assert_eq!(known.len(), KNOWN_FORWARDERS);
+    assert_eq!(known.last(), Some(&(19, "vpnkit".to_string())));
+    assert_eq!(known.iter().filter(|(p, _)| *p == 19).count(), 1);
+}
+
+/// A verdict that could not be told becomes a container's when a forwarder
+/// already named holds the connection (a judgment that ran out of time
+/// never lets a known container in); a verdict that was told stands, and
+/// the forwarders are asked only for an unknown one.
+#[test]
+fn an_unknown_verdict_held_by_a_known_forwarder_is_a_containers() {
+    let fwd = || Some("com.docker.backend".to_string());
+    assert_eq!(
+        settled(
+            PeerProcess::Unknown("the lookup did not finish in time"),
+            fwd
+        ),
+        PeerProcess::ContainerForwarder("com.docker.backend".into())
+    );
+    let unknown = PeerProcess::Unknown("no process this user can see holds the connection");
+    assert_eq!(settled(unknown.clone(), || None), unknown);
+    assert_eq!(
+        settled(PeerProcess::Operator, || panic!("asked for a told verdict")),
+        PeerProcess::Operator
+    );
+}
+
+/// A round names the forwarders among every process in its table, each
+/// process looked at once.
+#[test]
+fn a_round_looks_at_each_process_once() {
+    let at = |s: &str| -> SocketAddr { s.parse().unwrap() };
+    let peers = [
+        (at("127.0.0.1:1"), 9),
+        (at("127.0.0.1:2"), 3),
+        (at("127.0.0.1:3"), 9),
+    ];
+    assert_eq!(pids_in(&peers), vec![3, 9]);
 }

@@ -191,6 +191,15 @@ pub trait Platform: Send + Sync {
     /// connection.
     fn tcp_peers_of(&self, local: std::net::SocketAddr) -> Option<Vec<(std::net::SocketAddr, u32)>>;
 
+    /// (#3660) Whether process `pid` holds the `peer` end of a TCP
+    /// connection to this process's listener at `local`: `Some(false)` when
+    /// it holds no such socket (or has exited), `None` when its sockets
+    /// cannot be read (another user's process). It reads that one process's
+    /// descriptors, not the whole machine's as [`Self::tcp_peers_of`] does,
+    /// so it is cheap enough to ask of every connection about a process
+    /// already named (a container engine's forwarder).
+    fn holds_tcp_peer(&self, pid: u32, peer: std::net::SocketAddr, local: std::net::SocketAddr) -> Option<bool>;
+
     /// (#3112) Every TCP socket listening on `port`, whatever the process,
     /// with the address it is bound to and its owner when known, read from
     /// the kernel's socket table (no walk over processes, which one that
