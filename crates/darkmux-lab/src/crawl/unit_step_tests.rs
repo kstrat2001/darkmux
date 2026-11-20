@@ -3547,8 +3547,8 @@ fn a_units_readback_maps_a_host_seen_finding_like_a_workspace_one() {
     // lists, and the one without `./`, map the same way.
     assert_eq!(stored("/Users/op/tree", "./app/src/x.ts"), json!("src/x.ts"));
     assert_eq!(stored("/Users/op/tree", "app/src/x.ts"), json!("src/x.ts"));
-    // A container's brief never says `./`: its spelling is kept as it came.
-    assert_eq!(stored("/workspace", "./app/src/x.ts"), json!("./app/src/x.ts"));
+    // The store's one mapping reads `./<source>/` under any root.
+    assert_eq!(stored("/workspace", "./app/src/x.ts"), json!("src/x.ts"));
 }
 
 // ── (#2310 fix-loop E2) `draws`: a named ceiling, and dedup that only

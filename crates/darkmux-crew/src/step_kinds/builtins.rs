@@ -66,6 +66,17 @@ pub(crate) fn expand_workspace_root(
     }
 }
 
+/// (#3654) The dependency outputs a model-facing step composes into its
+/// message: every one but its grow source's. A grown step already carries
+/// its own item (its config's `{{item.*}}`); the source's whole output is a
+/// host artifact (a crawl's summary names the tree each finding was seen in
+/// and each unit's out-dir by host path, under the user's home) that the
+/// host reads and a model must never be sent.
+fn model_inputs(step: &Step, input: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let source = step.config.get(crate::mission_config::grow::GROWN_FROM_KEY).and_then(|g| g.get("task")).and_then(|t| t.as_str());
+    input.iter().filter(|(dep, _)| Some(dep.as_str()) != source).map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
 fn compose_message(base: &str, input: &BTreeMap<String, String>) -> String {
     if input.is_empty() {
         return base.to_string();
@@ -581,7 +592,7 @@ pub(crate) fn dispatch_opts_for(
     let sandbox = darkmux_sandbox::selection();
     let kind = sandbox.as_ref().ok().map(|s| s.kind);
     let base = expand_workspace_root(cfg.message.as_deref().unwrap_or_default(), kind, workdir.as_deref());
-    let message = compose_message(&base, input);
+    let message = compose_message(&base, &model_inputs(step, input));
     // The owning Task names the phase for every step minted from a mission
     // config; the step config's own `phase_id` (the crew-of-one's way of
     // passing the CLI's `--phase`) wins when present. Without the task
@@ -1176,7 +1187,7 @@ impl DispatchSingleShotStepKind {
         let is_hosted = endpoint.is_some();
         let wire_model = step_wire_model(call, is_hosted);
         let system = call.system.as_deref().unwrap_or("");
-        let user = compose_message(cfg.user.as_deref().unwrap_or_default(), input);
+        let user = compose_message(cfg.user.as_deref().unwrap_or_default(), &model_inputs(step, input));
         let max_tokens = call.max_tokens.map_or(4096, |c| c.saturating_u32());
         let timeout_seconds = call.timeout_seconds.map_or(120, |c| c.saturating_u32());
 
@@ -4627,6 +4638,71 @@ mod tests {
             let text = std::fs::read_to_string(&path).unwrap();
             assert!(text.contains("${WORKSPACE_ROOT}/<source>"), "{name}");
             assert!(!text.contains("`/workspace/<source>"), "{name} still names the container path");
+        }
+    }
+
+    /// A grow source's whole output, as `dispatch.summary` writes it: host
+    /// paths (the tree a finding was seen in, each unit's out-dir) that the
+    /// host reads and a model must never be sent (#3654).
+    const SUMMARY_WITH_HOST_PATHS: &str = r#"{"finding_refs":[{"key":"exec-1/1","id":"exec-1-1","rule":"r","tree_root":"/Users/op/.darkmux/runs/m/tree"}],"units":[{"out_dir":"/Users/op/.darkmux/runs/m/out"}]}"#;
+
+    /// (#3654) A step grown from a task is handed its item (its config's
+    /// `{{item.*}}`), never that task's whole output: the grow source is a
+    /// host artifact, and its paths name the user's home. Any other
+    /// dependency's output is still composed, as before.
+    #[test]
+    fn a_grown_steps_message_never_carries_its_grow_sources_output() {
+        let cfg = json!({"role_id": "coder", "message": "propose the mod",
+            "grown_from": {"task": "summary", "item": "exec-1-1", "index": 0}});
+        let mut input = BTreeMap::new();
+        input.insert("summary".to_string(), SUMMARY_WITH_HOST_PATHS.to_string());
+        input.insert("notes".to_string(), "keep me".to_string());
+        let opts = dispatch_opts_for(&step("s1", "dispatch.internal", cfg), &empty_task(), &input, &StepRunCtx::for_test()).unwrap();
+        assert!(!opts.message.contains("/Users/op") && !opts.message.contains("tree_root"), "{}", opts.message);
+        assert!(opts.message.contains("keep me") && opts.message.ends_with("propose the mod"), "{}", opts.message);
+        // A step not grown from it still reads it, as any dependency.
+        let plain = dispatch_opts_for(&step("s1", "dispatch.internal", json!({"role_id": "coder", "message": "m"})), &empty_task(), &input, &StepRunCtx::for_test()).unwrap();
+        assert!(plain.message.contains("tree_root"), "{}", plain.message);
+    }
+
+    /// (#3654) Every shipped mission config's model-facing dispatch, grown
+    /// as the launcher grows it, is handed no dependency output but its own
+    /// item: the create-mod seat (the hosted one included) never receives
+    /// the summary's host paths. A shipped dispatch that read any other
+    /// dependency would be a new way for a host artifact to reach a model.
+    #[test]
+    fn no_shipped_dispatch_is_fed_a_host_artifact() {
+        use crate::mission_config::{grow::grow_task, MissionConfig};
+        for (name, text) in [
+            ("crawl.json", include_str!("../../../../templates/builtin/mission-configs/crawl.json")),
+            ("review.json", include_str!("../../../../templates/builtin/mission-configs/review.json")),
+        ] {
+            let config: MissionConfig = serde_json::from_str(text).unwrap();
+            for task in config.phases.iter().flat_map(|p| &p.tasks) {
+                let composes = task.steps.iter().any(|s| s.kind == "dispatch.internal" || s.kind == "dispatch.single_shot");
+                if !composes {
+                    continue;
+                }
+                let from = task.grow.as_ref().map(|g| g.from.clone());
+                for dep in task.depends_on.iter().chain(task.reads.iter()) {
+                    assert_eq!(Some(dep), from.as_ref(), "{name}: `{}` composes `{dep}`'s output into a model message", task.id);
+                }
+                let Some(spec) = task.grow.as_ref() else { continue };
+                let item = json!({ "id": "f1", "key": "exec-1/1", "rule": "r", "tree_root": "/Users/op/.darkmux/runs/m/tree" });
+                let growth = grow_task(task, spec, &[item], "summary").unwrap();
+                let mut input = BTreeMap::new();
+                input.insert(spec.from.clone(), SUMMARY_WITH_HOST_PATHS.to_string());
+                let copy = &growth.tasks[0];
+                for s in copy.steps.iter().filter(|s| s.kind == "dispatch.internal") {
+                    let mut config = s.config.clone();
+                    config.as_object_mut().unwrap().remove("brief_refs");
+                    let mut t = empty_task();
+                    t.role_id = copy.role_id.clone();
+                    let opts = dispatch_opts_for(&step(&s.id, &s.kind, config), &t, &input, &StepRunCtx::for_test()).unwrap();
+                    assert!(!opts.message.contains("/Users/op"), "{name}: `{}`: {}", copy.id, opts.message);
+                    assert!(opts.message.contains("A finding recorded earlier"), "{name}: the copy's own message: {}", opts.message);
+                }
+            }
         }
     }
 

@@ -260,9 +260,15 @@ darkmux release.
   refusal the runtime writes (`Wrote 5 bytes to new.txt`, an escape refused as "a path outside the
   workspace"), a lab or crawl brief, the no-git note, a briefed finding (its recorded `root` is no
   longer shown) and a briefed mod's attachments (named under `$DARKMUX_MODS`, which the sandbox's
-  shell expands) carry no host path, so neither do compaction requests. Nothing a model wrote or a
-  command printed is rewritten: a command that prints `$HOME`, `$TMPDIR` or `pwd` still shows those
-  paths. A container run is byte for byte unchanged.
+  shell expands) carry no host path, so neither do compaction requests. A finding or a kit cited as
+  `./<source>/<path>`, as that brief lists the scope, is stored as the repo path like any other. A
+  step grown from a task (a crawl's or review's `create-mod`) is no longer sent that task's whole
+  output: the summary named each finding's tree and each unit's out-dir by host path, under every
+  sandbox, Docker included, and reached the create-mod seat, hosted or local. Nothing a model wrote or
+  a command printed is rewritten: a command that prints `$HOME`, `$TMPDIR` or `pwd` still shows those
+  paths, and a mission config of your own that feeds a step's output (a shell command's, or an
+  errored step's reason) into a dispatch passes on whatever that text holds. Otherwise a container
+  run's requests are unchanged.
 - **Flow records: lab runs stay off hooks, a failed write is said, and the audit trail's gaps stay
   visible.** Found by the 2026-11-17 layer review. A hook rule that matched everything delivered a lab
   run's records off the machine; hooks now drop them by the same rule that keeps them off the fleet hub

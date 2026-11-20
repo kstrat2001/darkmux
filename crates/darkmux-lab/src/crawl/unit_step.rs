@@ -410,14 +410,6 @@ pub(crate) fn tree_named(kind: Option<darkmux_sandbox::BackendKind>, tree_root: 
     darkmux_crew::mission_config::workspace_paths::model_root(kind, tree_root).to_string()
 }
 
-/// A finding's `file` as the source names it: mapped from where the unit's
-/// sandbox saw the tree (`tree_seen`), after the `./` a brief that named
-/// the tree as the current directory taught the model to write (#3654).
-fn source_file(ctx: &UnitContext, raw: &str) -> String {
-    let named_here = ctx.tree_named == darkmux_crew::mission_config::workspace_paths::CURRENT_DIR;
-    let raw = if named_here { raw.strip_prefix("./").unwrap_or(raw) } else { raw };
-    strip_source_prefix_under(Some(&ctx.tree_seen), &ctx.source, raw)
-}
 
 /// (#3112 review) [`build_message`] naming the tree at `root`, as the unit's
 /// model sees it ([`tree_named`]): `/workspace` in a container (the frozen
@@ -761,7 +753,7 @@ fn readback_findings(
         if let Some(obj) = rec.as_object_mut() {
             let raw_file = obj.get(FINDING_FILE_KEY).and_then(Value::as_str).unwrap_or("").to_string();
             obj.insert("file_raw".to_string(), json!(raw_file));
-            obj.insert(FINDING_FILE_KEY.to_string(), json!(source_file(ctx, &raw_file)));
+            obj.insert(FINDING_FILE_KEY.to_string(), json!(strip_source_prefix_under(Some(&ctx.tree_seen), &ctx.source, &raw_file)));
             obj.insert("workspace".to_string(), json!(ctx.workspace));
             obj.insert("unit".to_string(), json!(ctx.unit_id));
             obj.insert("source".to_string(), json!(ctx.source));
