@@ -483,7 +483,9 @@ fn config_timeout_seconds_zero_is_refused_in_its_string_form_too() {
 
 /// A garbage (non-numeric, non-parseable) `timeout_seconds` must error
 /// loudly by name, matching `draws`'s and `no_progress_turns`'s own
-/// convention — never silently read as absent.
+/// convention — never silently read as absent. The key is named; the value
+/// is named by its type only, as every user-file refusal does (a value may
+/// be a pasted credential).
 #[test]
 fn config_timeout_seconds_garbage_value_is_refused_by_name() {
     let step = unit_step(serde_json::json!({
@@ -493,7 +495,8 @@ fn config_timeout_seconds_garbage_value_is_refused_by_name() {
     let msg = format!("{err:#}");
     assert!(msg.contains("`config.timeout_seconds` must be"), "{msg}");
     assert!(msg.contains("non-negative integer"), "{msg}");
-    assert!(msg.contains("soon"), "the offending value is named: {msg}");
+    assert!(msg.contains("got a string that does not fit"), "the offending value's type is named: {msg}");
+    assert!(!msg.contains("soon"), "the value itself is never quoted: {msg}");
 }
 
 /// (#2595 review round 2, CONSIDER 6) An unresolved `{{template}}` in a
@@ -986,6 +989,44 @@ fn draws_dispatches_the_unit_n_times_and_dedups_matching_finding_refs() {
     )
     .expect("draw 1's readback file must be rule-namespaced");
     assert!(draw2_findings.contains("unnamed-predicate"), "{draw2_findings}");
+}
+
+/// A stop that lands during a unit's first draw, which then comes back clean,
+/// keeps every later draw from starting: zero further dispatches. The unit
+/// ends stopped, an `Err` carrying the interrupt marker and its outcome
+/// labeled interrupted with the findings of the draw that ran, so the
+/// scheduler abandons it naming the stop and the summary counts it
+/// interrupted, as it does a unit whose draw the stop cut off.
+#[test]
+#[serial_test::serial] // scopes DARKMUX_HOME; raises the process-wide interrupt flag
+fn a_stop_during_a_clean_draw_starts_no_further_draw() {
+    // (#3100) It raises the process-wide interrupt flag.
+    darkmux_types::run_in_own_process!();
+    darkmux_types::interrupt::reset_for_test();
+    let home = TempDir::new().unwrap();
+    let _g = HomeGuard::set(home.path());
+    save_phase(PHASE, MISSION);
+    let ws = TempDir::new().unwrap();
+    let plan = write_plan(ws.path(), "unnamed-predicate", "u-0001", &"a".repeat(40));
+    let out = seeded_out_dir(ws.path(), 1);
+    let calls = Arc::new(std::sync::Mutex::new(0usize));
+    let captured = calls.clone();
+    let kind = DispatchUnitStepKind::with_dispatch(Arc::new(move |_opts: DispatchOpts| {
+        *captured.lock().unwrap() += 1;
+        darkmux_types::interrupt::raise_for_test();
+        ok_result(envelope("stop", 50, 10, 1_000), out.clone())
+    }));
+    let step = unit_step(serde_json::json!({
+        "plan": plan.to_string_lossy(), "unit": "u-0001", "rule": "unnamed-predicate", "draws": 3
+    }));
+    let ctx = darkmux_crew::step_kinds::StepRunCtx::solo(darkmux_types::session_id::RunId::mission(MISSION).unwrap());
+    let result = kind.run(&step, &unit_task(), &BTreeMap::new(), &ctx);
+    darkmux_types::interrupt::reset_for_test();
+    assert_eq!(*calls.lock().unwrap(), 1, "no draw may start after the stop");
+    let err = format!("{:#}", result.expect_err("a unit the stop cut short ends stopped, never complete"));
+    assert!(err.contains(darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL), "{err}");
+    assert!(err.contains(INTERRUPTED_MARKER), "the summary reads it interrupted: {err}");
+    assert!(err.contains("1 of 3 draw(s)") && err.contains("\"findings\":1"), "{err}");
 }
 
 /// (#2310 P4c-2b) `draws` absent (the default) must dispatch exactly ONCE

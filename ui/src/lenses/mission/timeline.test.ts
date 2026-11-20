@@ -206,15 +206,17 @@ describe("taskAggMetrics task-level duration (#2269)", () => {
     expect(agg.sumMs).toBe(60_000 + 29_000);
   });
 
-  it("prefers the metrics stream's own start/end over the node's timestamps, like the per-step meter does", () => {
+  it("takes each step's true start, the later of the metrics stream's and the node's, like the per-step meter does", () => {
+    // (#3195) s1's records start at its admission (T0); the node says its
+    // dispatch began 5 s later, which is when its work started.
     const now = T0 + 100_000;
     const task = seq({ startedTs: T0 + 5_000 }, { startedTs: T0 + 70_000 });
     const metrics: MetricsMap = {
       s1: { tokRun: 0, tokFinal: 0, tokUtilityRun: 0, tokUtilityFinal: 0, turnRun: 0, turnFinal: 0, turnsEnded: 0, toolRun: 0, toolFinal: 0, startTs: T0, endTs: T0 + 50_000, lastTs: T0 + 50_000 },
     };
     const agg = taskAggMetrics(task, metrics, now);
-    expect(agg.spanMs).toBe(100_000);
-    expect(agg.sumMs).toBe(50_000 + 30_000);
+    expect(agg.spanMs).toBe(95_000);
+    expect(agg.sumMs).toBe(45_000 + 30_000);
   });
 
   it("a task whose steps never started has no duration", () => {
@@ -255,5 +257,58 @@ describe("taskAggMetrics task-level duration (#2269)", () => {
     const task = seq({ startedTs: T0, completedTs: T0 + 60_000 }, { startedTs: T0 + 61_000 });
     expect(taskAggMetrics(task, {}, T0 + 100_000, new Map([["s2", "open"]])).generating).toBe(true);
     expect(taskAggMetrics(task, {}, T0 + 100_000, new Map([["s2", "stale"]])).generating).toBe(false);
+  });
+});
+
+// (#3195, operator 2026-10-10) Steps show their own work time; each phase
+// heading shows how long the phase has run: its first step's start until
+// now while any of its steps is running or waiting, else until its last
+// step ended. A step still waiting for its slot has no start of its own.
+describe("a phase's running total (#3195)", () => {
+  const T0 = 1_756_900_000_000;
+  const m = (startTs: number, endTs = 0) => ({ tokRun: 0, tokFinal: 0, tokUtilityRun: 0, tokUtilityFinal: 0, turnRun: 0, turnFinal: 0, turnsEnded: 0, toolRun: 0, toolFinal: 0, startTs, endTs, lastTs: endTs || startTs });
+  const unit = (id: string, status: "complete" | "running" | "waiting"): GraphNode => ({
+    id,
+    label: id,
+    kind: "task",
+    status,
+    parentId: "p1",
+    depth: 0,
+    steps: [{ id: `${id}-step`, label: "Dispatch", kind: "dispatch.internal", status }],
+  });
+  const phaseOf = (tasks: GraphNode[], metrics: MetricsMap, now: number) => groupTimeline([{ ...PHASE, status: "running" }, ...tasks], [], metrics, now)[0];
+
+  it("runs from its first step's start until now while a step waits", () => {
+    const metrics: MetricsMap = { "u1-step": m(T0, T0 + 30_000), "u2-step": m(T0 + 30_000) };
+    const ph = phaseOf([unit("u1", "complete"), unit("u2", "running"), unit("u3", "waiting")], metrics, T0 + 90_000);
+    expect(ph.elapsed).toEqual({ ms: 90_000, running: true });
+    // The waiting unit's own row shows no time; the running one counts its own work.
+    expect(ph.tasks[2].steps[0].meter.elapsedMs).toBe(0);
+    expect(ph.tasks[1].steps[0].meter.wallMs).toBe(60_000);
+  });
+
+  it("keeps counting while its only open step waits for its slot", () => {
+    const metrics: MetricsMap = { "u1-step": m(T0, T0 + 30_000) };
+    expect(phaseOf([unit("u1", "complete"), unit("u2", "waiting")], metrics, T0 + 90_000).elapsed).toEqual({ ms: 90_000, running: true });
+  });
+
+  it("a task whose step waits for its slot says so on its own row", () => {
+    const ph = phaseOf([unit("u1", "complete"), unit("u2", "waiting")], { "u1-step": m(T0, T0 + 30_000) }, T0 + 90_000);
+    expect(ph.tasks[1].agg.waiting).toBe(true);
+    expect(ph.tasks[0].agg.waiting).toBe(false);
+  });
+
+  it("counts a step's wait for its slot as the phase's time, as the mission's clock does", () => {
+    const metrics: MetricsMap = { "u1-step": { ...m(T0 + 35_000), waitFromTs: T0 } };
+    expect(phaseOf([unit("u1", "running")], metrics, T0 + 90_000).elapsed).toEqual({ ms: 90_000, running: true });
+  });
+
+  it("ends at its last step's end once nothing runs or waits", () => {
+    const metrics: MetricsMap = { "u1-step": m(T0, T0 + 30_000), "u2-step": m(T0 + 30_000, T0 + 75_000) };
+    expect(phaseOf([unit("u1", "complete"), unit("u2", "complete")], metrics, T0 + 900_000).elapsed).toEqual({ ms: 75_000, running: false });
+  });
+
+  it("has no total before any of its steps started", () => {
+    expect(phaseOf([unit("u1", "waiting")], {}, T0).elapsed).toBeNull();
   });
 });

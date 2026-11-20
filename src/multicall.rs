@@ -66,7 +66,8 @@ pub(crate) fn hand_over() -> Option<ExitCode> {
 
 /// How the process ends: a helper's own exit code, returned from `main`
 /// exactly as the helper returns it, or a darkmux command's result, reported
-/// by std's own `Result` reporting (`Error: …`, exit 1), unchanged.
+/// the way std reports a `Result` (`Error: …` on stderr, exit 1) except that
+/// the error is escaped ([`error_report`]).
 pub(crate) enum Exit {
     Helper(ExitCode),
     Darkmux(anyhow::Result<()>),
@@ -76,9 +77,22 @@ impl Termination for Exit {
     fn report(self) -> ExitCode {
         match self {
             Exit::Helper(code) => code,
-            Exit::Darkmux(result) => result.report(),
+            Exit::Darkmux(Ok(())) => ExitCode::SUCCESS,
+            Exit::Darkmux(Err(e)) => {
+                eprintln!("{}", error_report(&e));
+                ExitCode::FAILURE
+            }
         }
     }
+}
+
+/// The line a failed darkmux command ends with: std's `Error: {e:?}`, with
+/// the error's text escaped (`escape_text_keeping_lines`). An error chain
+/// can quote what another system sent (an endpoint's error body, a peer's
+/// refusal, a model's reply), so an escape sequence in it is shown as text
+/// rather than acted on, while its lines still read as lines.
+pub(crate) fn error_report(e: &anyhow::Error) -> String {
+    format!("Error: {}", darkmux_types::user_files::escape_text_keeping_lines(&format!("{e:?}")))
 }
 
 #[cfg(test)]
@@ -124,5 +138,17 @@ mod tests {
         for name in names {
             assert!(cli.find_subcommand(name).is_none(), "`{name}` would hide the darkmux command of that name");
         }
+    }
+
+    /// An error quoting an endpoint's body that holds an OSC 0 title, a screen
+    /// clear and an OSC 52 clipboard write ends the process inert.
+    #[test]
+    fn a_hostile_error_is_reported_inert_and_a_plain_one_as_std_reports_it() {
+        let e = anyhow::anyhow!("body: \x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}")
+            .context("the endpoint refused");
+        let line = error_report(&e);
+        assert!(!line.chars().any(|c| (c.is_control() && c != '\n') || c == '\u{202e}'), "{line:?}");
+        let plain = anyhow::anyhow!("café 日本語 🇺🇸\n\tdetail").context("outer");
+        assert_eq!(error_report(&plain), format!("Error: {plain:?}"));
     }
 }

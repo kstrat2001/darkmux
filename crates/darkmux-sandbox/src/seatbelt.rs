@@ -11,8 +11,31 @@
 //!   runs this host's programs, read-only, and `policy.image` is unused. It
 //!   needs an `entrypoint` (a host program), since there is no image to
 //!   supply one.
-//! - **Limit memory or processes, or switch user.** `limits` and `user` are
-//!   unused; the process runs as the caller's user.
+//! - **Switch user.** `user` is unused; the process runs as the caller's
+//!   user.
+//! - **Hold processes and memory the way a container does (#3112).**
+//!   `limits.pids` is the kernel's `RLIMIT_NPROC`, which macOS counts per
+//!   USER, not per sandbox: a fork in the sandbox fails once the user's
+//!   processes number what they did at launch plus `pids`. So the sandbox
+//!   may start about `pids` processes (threads are not counted). The room is
+//!   SHARED with every other process of the user's: another sandbox, a
+//!   parallel build or an app that starts while it runs takes from it (one
+//!   that ends gives back), and a fork that finds no room fails with a bare
+//!   `EAGAIN` ("Resource temporarily unavailable") that says nothing of
+//!   why. The limit is set on the sandboxed program alone, so nothing
+//!   else of the user's is held by it, and a fork bomb stops at `pids` more
+//!   rather than at the system's per-user cap, where nothing of the user's
+//!   could start. `limits.memory` is a watch, not a boundary ([`WATCH`]):
+//!   macOS gives a process no memory ceiling it can set on itself
+//!   (`RLIMIT_AS` and `RLIMIT_DATA` are refused below the address space
+//!   every process already maps, and `RLIMIT_RSS` is not enforced), so the
+//!   resident memory of the sandbox's session is summed every second and
+//!   the sandbox is stopped (exit 137) once the sum is over the limit, its
+//!   reason the last line of its stderr (what a dispatch error's stderr
+//!   tail shows), naming the limit, what it used and `sandbox.memory`. It can be over for up to a second; a process that
+//!   started a session of its own is neither counted nor stopped. Docker
+//!   holds both inside the container's cgroup: tasks (threads included) and
+//!   the memory the kernel charges it, page cache included.
 //! - **Publish one port, or hold a bind to the loopback (#3559).** The
 //!   default network may bind any port on ANY local address: `0.0.0.0` and
 //!   this host's LAN address included, so a server that binds every address
@@ -31,6 +54,24 @@
 //!   (`darkmux-crew`'s `sandbox_listeners`), a client preview watches its
 //!   two ports. Both are detection with a window, not a boundary.
 //!   [`Network::None`] allows no network at all, the loopback included.
+//! - **Tell a server the sandbox started from the host's.** The default
+//!   network reaches the rest of the network as before, but of this
+//!   machine's own services (at any of its addresses: SBPL's `remote ip4
+//!   "localhost:<port>"` matches the loopback and every IPv4 address of this
+//!   host) only its `host_services` and its own `ports`. No SBPL filter
+//!   matches an IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) as this
+//!   machine's, so IPv6 is held by port at every address. A policy naming
+//!   ports binds only those, so every other port of this machine is
+//!   refused, and so is all of IPv6, the internet's included (an install
+//!   goes over IPv4). One naming none (a dispatch's) may bind any port and
+//!   must reach its own servers there (a test suite's HTTP server), which
+//!   SBPL cannot tell from the host's, and SBPL takes no port range: the
+//!   ports this host listens on when the sandbox is planned are refused
+//!   instead (IPv4 to this machine, IPv6 to any address), and so are its
+//!   `refused_ports` (darkmux's own services) whether or not they listen
+//!   yet, the given ones excepted. Another service that first listens
+//!   after that is reachable. When
+//!   this host's listeners cannot be read, it is held as one naming ports.
 //! - **Reach every descendant.** A sandbox is the session its launcher leads
 //!   (#3559): its process group is killed over and over until it is empty (a
 //!   process that keeps forking is caught), then every other process in the
@@ -48,7 +89,7 @@
 //! `TMPDIR`), and, for one created but not started, its start script. The
 //! launcher removes the directory when the sandbox exits.
 
-use crate::{Access, BackendKind, Having, Listed, Mount, Network, Query, SandboxBackend, SandboxHandle, SandboxPolicy};
+use crate::{Access, BackendKind, Having, Limits, Listed, Mount, Network, Query, SandboxBackend, SandboxHandle, SandboxPolicy};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -128,17 +169,60 @@ mkdir -m 700 "$d/tmp" && printf '%s' "$2" > "$d/profile.sb" && printf '%s' "$3" 
 /// ([`sweep!`]), so one that moved to a group of its own (`setpgid`, as a
 /// runtime's tool command does) ends too. Only one that started a session of
 /// its own (`setsid`) is not reached: unlike a container's, this sandbox
-/// does not end everything in it.
-const LAUNCH: &str = r#"wd=$1; shift
-echo $$ > "$d/pid" && ps -o lstart= -p $$ > "$d/started" || exit 125
+/// does not end everything in it. What the shell itself says about how its
+/// program ended ("Segmentation fault: 11", "Abort trap: 6", "Killed: 9")
+/// is kept in `$d/notice` and passed on, except when the memory watch
+/// stopped the program ([`WATCH`]): then its reason, written to `$d/limit`,
+/// is the last line instead of the shell's "Killed: 9".
+const LAUNCH: &str = r#"wd=$1; pids=$2; mem=$3; memtext=$4; shift 4
+echo $$ > "$d/pid" && st=$(/usr/bin/env -i TZ=UTC0 /bin/ps -o lstart= -p $$) && [ -n "$st" ] && printf 'utc:%s\n' "$st" > "$d/started" || exit 125
 {GUARD} "$$" </dev/null >/dev/null 2>&1 &
+guard=$!
+if [ -n "$mem" ]; then {WATCH} "$$" "$mem" "$guard" "$d/limit" "$memtext" </dev/null >/dev/null 2>&1 & fi
 trap : TERM INT HUP
 [ -z "$wd" ] || cd "$wd" || { rm -rf "$d"; exit 125; }
 [ -n "$1" ] || { echo "seatbelt: no program to run (a policy needs an entrypoint)" >&2; rm -rf "$d"; exit 125; }
-/usr/bin/sandbox-exec -f "$d/profile.sb" "$@"
+nproc=
+if [ -n "$pids" ]; then
+  n=$(/bin/ps -A -o uid= | /usr/bin/awk -v u="$(/usr/bin/id -u)" '$1 == u { n++ } END { print n + 0 }')
+  [ "$n" -gt 0 ] 2>/dev/null || { echo "seatbelt: could not count this user's processes" >&2; rm -rf "$d"; exit 125; }
+  nproc=$((n + pids)); h=$(ulimit -Hu)
+  [ "$h" = unlimited ] || [ "$nproc" -le "$h" ] || nproc=$h
+fi
+{ ( exec 2>&3 3>&-
+  [ -z "$nproc" ] || ulimit -u "$nproc" || { echo "seatbelt: could not limit the sandbox to $nproc processes" >&2; exit 125; }
+  exec /usr/bin/perl -e '{CARRY}' /usr/bin/sandbox-exec -f "$d/profile.sb" "$@" ); } 3>&2 2>"$d/notice"
 rc=$?
+if [ -f "$d/limit" ]; then cat "$d/limit" >&2; else cat "$d/notice" >&2 2>/dev/null; fi
 g=$$
 "#;
+
+/// (#3112) The memory ceiling's watch, beside the guard ([`LAUNCH`]): its
+/// arguments the launcher's pid, the limit in bytes, the guard's pid, the
+/// file it writes its reason to and the limit as a person reads it. Every second, while the launcher is
+/// its parent, it sums the resident memory of every live process in the
+/// launcher's session (the sandbox, the launcher, the guard and itself; a
+/// process that started a session of its own is not counted, nor reached),
+/// and once the sum is over the limit, writes why and kills every one of
+/// them but the launcher, the guard and itself, listing them again until
+/// none is left (at most 200 times). The launcher then sees its program
+/// end, says why, and ends as it always does. macOS has no memory ceiling a
+/// process can set on itself and its children: `RLIMIT_AS` and
+/// `RLIMIT_DATA` are refused below the address space every process already
+/// maps (about 400 GiB), and `RLIMIT_RSS` is not enforced. So this is
+/// detection with a window, not a boundary: a program can hold more than
+/// the limit for up to a second, as much more as it can allocate in that
+/// time. Each look lists every process on the host (measured: 0.24 CPU
+/// seconds over 10 s with 1,000 running), about 2.5% of one core per
+/// running sandbox. No single quote: it runs inside one.
+const WATCH: &str = concat!(
+    r#"/usr/bin/perl -e 'my ($l, $cap, $g, $f, $limit) = @ARGV; my %keep = ($$ => 1, $l => 1, $g => 1); "#,
+    r#"sub human { my $b = shift; my $t = $b >= 2 ** 30 ? sprintf("%.1f GiB", $b / 2 ** 30) : sprintf("%.1f MiB", $b / 2 ** 20); $t =~ s/\.0 / /; $t } "#,
+    r#"sub mine { map { $_->[0] } grep { $_->[0] > 1 && $_->[2] !~ /^Z/ && syscall(310, $_->[0] + 0) == $l } map { [split] } `/bin/ps -A -o pid=,rss=,stat=` } "#,
+    r#"sub held { my $sum = 0; for (`/bin/ps -A -o pid=,rss=,stat=`) { my ($p, $r, $s) = split; $sum += $r * 1024 if $p > 1 && $s !~ /^Z/ && syscall(310, $p + 0) == $l; } $sum } "#,
+    r#"while (getppid() == $l) { my $sum = held(); if ($sum > $cap) { open(F, ">", $f); printf F "seatbelt: the job was stopped: its processes used %s of memory, over the %s sandbox memory limit (sandbox.memory). To give it more: darkmux config set sandbox.memory <size>, e.g. 16g\n", human($sum), $limit; close(F); "#,
+    r#"for (1 .. 200) { my @p = grep { !$keep{$_} } mine(); last unless @p; kill("KILL", @p); select(undef, undef, undef, 0.01); } exit 0; } select(undef, undef, undef, 1); }'"#
+);
 
 /// (#3559) Perl that kills every process in session `$ARGV[0]` but itself,
 /// zombies and pids 0 and 1, listing them again until none is left (at most
@@ -186,8 +270,26 @@ exit $rc
 
 /// The whole launcher script.
 fn launcher() -> String {
-    format!("{}{LAUNCHED}", LAUNCH.replacen("{GUARD}", GUARD, 1))
+    format!("{}{LAUNCHED}", LAUNCH.replacen("{GUARD}", GUARD, 1).replacen("{WATCH}", WATCH, 1).replacen("{CARRY}", CARRY, 1))
 }
+
+/// The prefix of the variables that carry a policy's environment through
+/// the launcher ([`SeatbeltBackend::launcher_environment`]): each holds one
+/// `key=value`. The launcher's shell, its guard and its bookkeeping run with
+/// nothing else, so no policy variable reaches them under its own name
+/// (`BASH_FUNC_*`, `SHELLOPTS` and `PS4`, `PERL5OPT`, `IFS` ...); only the
+/// program gets them ([`CARRY`]).
+pub(crate) const CARRIED: &str = "DARKMUX_SANDBOX_ENV_";
+
+/// Perl that sets the program's environment to exactly the carried
+/// variables ([`CARRIED`]), each under its own name, in the order carried
+/// (so were a name carried twice, the later would win, as it does in
+/// [`SeatbeltBackend::launcher_environment`], which carries each once), plus the launcher's
+/// `PWD` when the policy names none, then runs its arguments as the
+/// program (`sandbox-exec` and what it runs), never through a shell. It
+/// starts with the launcher's own environment, so no policy variable
+/// reaches perl itself. No single quote: it runs inside one.
+const CARRY: &str = "my %e; for my $k (sort { substr($a, 20) <=> substr($b, 20) } grep { /^DARKMUX_SANDBOX_ENV_[0-9]+$/ } keys %ENV) { my ($n, $v) = split(/=/, $ENV{$k}, 2); $e{$n} = $v if defined $v && length $n; } $e{PWD} = $ENV{PWD} if defined $ENV{PWD} && !exists $e{PWD}; %ENV = %e; exec { $ARGV[0] } @ARGV; exit 127;";
 
 /// The launcher's guard ([`LAUNCH`]), its launcher's pid its argument: the
 /// group drained, then the session swept ([`sweep!`]).
@@ -203,8 +305,42 @@ const OURS: &str = r#"[ -f "$d/profile.sb" ]"#;
 
 /// Whether `$d`'s sandbox is running: its launcher's pid is alive and is
 /// still that launcher, started when the launcher recorded (a reused pid,
-/// or another sandbox's launcher, is not), leaving `$pid` set.
-const ALIVE: &str = r#"pid=$(cat "$d/pid" 2>/dev/null) && kill -0 "$pid" 2>/dev/null && started=$(cat "$d/started" 2>/dev/null) && [ -n "$started" ] && [ "$(ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ]"#;
+/// or another sandbox's launcher, is not), leaving `$pid` set. A start is
+/// recorded and read as [`STARTED_PREFIX`] and `ps -o lstart=` run by
+/// [`STARTED_READER`], never in the sandbox's own environment: `lstart`'s
+/// text follows `TZ` and the locale, which a policy may set.
+///
+/// A record without the prefix was written by a launcher from before it,
+/// in its policy's environment: it is compared the way that launcher's own
+/// check compared it (`ps -o lstart=` with only `PATH` set), and when that
+/// does not match while the pid lives, the sandbox is [`UNDECIDED`], never
+/// gone.
+const ALIVE: &str = r#"pid=$(cat "$d/pid" 2>/dev/null) && kill -0 "$pid" 2>/dev/null && started=$(cat "$d/started" 2>/dev/null) && [ -n "$started" ] && { [ "utc:$(/usr/bin/env -i TZ=UTC0 /bin/ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ] || { case $started in utc:*) false ;; *) [ "$(/bin/ps -o lstart= -p "$pid" 2>/dev/null)" = "$started" ] ;; esac; }; }"#;
+
+/// Waits, at most 2.5 s, while `$d`'s launcher has recorded its pid but not
+/// yet its start (it writes them one after the other), so a stop, kill or
+/// remove landing between the two decides on both, never on the pid alone
+/// ([`UNDECIDED`], which would leave the sandbox to start and run).
+const SETTLE: &str = r#"i=0; while [ -f "$d/pid" ] && [ ! -s "$d/started" ] && [ "$i" -lt 50 ]; do sleep 0.05; i=$((i + 1)); done"#;
+
+/// Whether `$d`'s sandbox, which [`ALIVE`] did not find running, may still
+/// run: its pid lives and no record in the [`STARTED_PREFIX`] form says it
+/// is another process (the record is from an older launcher, or not written
+/// yet). Such a sandbox is never removed, stopped or listed as exited:
+/// what decides it is gone is a dead pid or a comparable record that
+/// differs.
+const UNDECIDED: &str = r#"pid=$(cat "$d/pid" 2>/dev/null) && kill -0 "$pid" 2>/dev/null && case $(cat "$d/started" 2>/dev/null) in utc:*) false ;; *) true ;; esac"#;
+
+/// How a launcher's start is recorded in `$d/started` and read back ([`LAUNCH`],
+/// [`ALIVE`], and `host_leaders`): this prefix, then `ps -o lstart=` with no
+/// environment but UTC, so its text is the same whatever `TZ`, locale or
+/// system time zone the recorder and the reader have. A record without the
+/// prefix was written some other way and cannot be compared.
+pub(crate) const STARTED_PREFIX: &str = "utc:";
+
+/// The command, then the pid, that reads a process's start as
+/// [`STARTED_PREFIX`] records it.
+pub(crate) const STARTED_READER: [&str; 6] = ["/usr/bin/env", "-i", "TZ=UTC0", "/bin/ps", "-o", "lstart="];
 
 /// The directory sandboxes live under: [`STATE_DIR_ENV`], else
 /// `~/.darkmux/seatbelt` (not `~/.darkmux/sandboxes`, which holds the lab's
@@ -236,6 +372,12 @@ impl SeatbeltBackend {
     /// over an earlier read-write one denies writes beneath it; Seatbelt's
     /// later rule wins), and its network.
     pub fn profile(policy: &SandboxPolicy, dir: &Path) -> String {
+        Self::profile_with(policy, dir, || darkmux_platform::current().tcp_listening_ports())
+    }
+
+    /// [`Self::profile`], this host's listening ports read by `listening`
+    /// (only for a policy that needs them).
+    fn profile_with(policy: &SandboxPolicy, dir: &Path, listening: impl FnOnce() -> Option<Vec<u16>>) -> String {
         let mut p = String::from("(version 1)\n(deny default)\n");
         p.push_str("(allow process-fork)\n(allow process-exec)\n");
         p.push_str("(allow signal (target same-sandbox))\n(allow process-info* (target same-sandbox))\n");
@@ -283,6 +425,7 @@ impl SeatbeltBackend {
                     "(deny network-outbound (remote unix-socket))\n",
                     "(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n",
                 ));
+                p.push_str(&Self::host_services_rule(policy, listening));
             }
             // Nothing: a sandbox has no loopback of its own, and the host's
             // runs its databases and model servers (#3553 review).
@@ -306,6 +449,72 @@ impl SeatbeltBackend {
         }
         let named = join(ports.iter().map(|p| format!("(local ip \"localhost:{p}\")")));
         format!("(allow network-bind {named})\n(deny network-inbound)\n(allow network-inbound {named})\n")
+    }
+
+    /// Which of this host's own services the default network reaches: its
+    /// `host_services` and its own `ports`, no other. SBPL's `remote ip4
+    /// "localhost:<port>"` matches every IPv4 address of this machine (the
+    /// loopback, its LAN and tailnet addresses; measured on macOS 26.6) and
+    /// nothing beyond it. No `localhost` filter matches an IPv4-mapped IPv6
+    /// address (`::ffff:127.0.0.1` reaches a server on 127.0.0.1), so IPv6 is
+    /// refused by port (`remote ip6 "*:<port>"`), whatever the address. A
+    /// rule spelled `remote ip` is never used: next to an `ip6` one it stops
+    /// matching IPv4 (measured).
+    ///
+    /// With ports named (a preview's shape) the sandbox binds only those, so
+    /// every other port on this machine is another's: IPv4 to this machine
+    /// is refused, and all of IPv6 (the internet's too: an IPv4-mapped
+    /// address cannot be told from any other), but the named and given
+    /// ports, on this machine. With none named (a dispatch's shape) it may
+    /// bind any port and must reach its own servers there, which SBPL cannot
+    /// tell from the host's: the ports something on this host listens on as
+    /// the sandbox starts (`listening`) are refused instead, IPv4 to this
+    /// machine and IPv6 to any address, and so are its `refused_ports`
+    /// whether or not they listen yet (darkmux's own services), the given
+    /// ones excepted. Another service that first listens after the sandbox
+    /// started is not refused. When
+    /// this host's listeners cannot be read, it is held as one naming ports.
+    fn host_services_rule(policy: &SandboxPolicy, listening: impl FnOnce() -> Option<Vec<u16>>) -> String {
+        let given: Vec<u16> = policy.ports.iter().chain(&policy.host_services).copied().collect();
+        let held = if policy.ports.is_empty() { listening() } else { None };
+        match held {
+            Some(held) => Self::refuse_ports(Self::refused_of(held, &policy.refused_ports, &given)),
+            None => Self::refuse_all_ports_but(given),
+        }
+    }
+
+    /// The ports a policy naming none is refused: those `held` (listening
+    /// as it is planned) and those it is told to refuse whether or not they
+    /// listen yet, each once, sorted, but never a `given` one.
+    fn refused_of(held: Vec<u16>, always: &[u16], given: &[u16]) -> Vec<u16> {
+        let mut refused: Vec<u16> = held.into_iter().chain(always.iter().copied()).filter(|p| !given.contains(p)).collect();
+        refused.sort_unstable();
+        refused.dedup();
+        refused
+    }
+
+    /// Outbound to these ports refused: on this machine over IPv4, at any
+    /// address over IPv6. None, no rule.
+    fn refuse_ports(ports: Vec<u16>) -> String {
+        if ports.is_empty() {
+            return String::new();
+        }
+        let v4 = ports.iter().map(|p| format!("(remote ip4 \"localhost:{p}\")"));
+        let v6 = ports.iter().map(|p| format!("(remote ip6 \"*:{p}\")"));
+        format!("(deny network-outbound {})\n", join(v4.chain(v6)))
+    }
+
+    /// Outbound to this machine over IPv4, and all of IPv6, refused but
+    /// `allowed` on this machine.
+    fn refuse_all_ports_but(mut allowed: Vec<u16>) -> String {
+        allowed.sort_unstable();
+        allowed.dedup();
+        let mut rule = "(deny network-outbound (remote ip4 \"localhost:*\") (remote ip6 \"*:*\"))\n".to_string();
+        if !allowed.is_empty() {
+            let at = allowed.iter().flat_map(|p| [format!("(remote ip4 \"localhost:{p}\")"), format!("(remote ip6 \"localhost:{p}\")")]);
+            rule.push_str(&format!("(allow network-outbound {})\n", join(at)));
+        }
+        rule
     }
 
     /// The directories above every path the sandbox may reach, and the
@@ -363,6 +572,35 @@ impl SeatbeltBackend {
         env
     }
 
+    /// The environment a launcher runs in: `PATH`, and the policy's
+    /// environment ([`Self::environment`]) carried under [`CARRIED`] names
+    /// for the program alone ([`CARRY`]). A variable whose name is empty or
+    /// holds `=` is not one a program could be given, and is dropped.
+    fn launcher_environment(policy: &SandboxPolicy, dir: &Path) -> Vec<(String, String)> {
+        let valid = Self::environment(policy, dir).into_iter().filter(|(k, _)| !k.is_empty() && !k.contains('='));
+        std::iter::once(("PATH".to_string(), DEFAULT_PATH.to_string()))
+            .chain(last_of_each(valid).into_iter().enumerate().map(|(i, (k, v))| (format!("{CARRIED}{i}"), format!("{k}={v}"))))
+            .collect()
+    }
+
+    /// The environment the program `cmd` plans is given ([`CARRY`]): each
+    /// variable [`Self::launcher_environment`] carried, under its own name,
+    /// in the order carried. What a caller that checks a planned sandbox's
+    /// environment reads, since the launcher's own holds only `PATH` and
+    /// the carried variables.
+    pub fn program_environment(cmd: &Command) -> Vec<(String, String)> {
+        let mut carried: Vec<(usize, String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                let n = k.to_str()?.strip_prefix(CARRIED)?.parse().ok()?;
+                let (key, value) = v?.to_str()?.split_once('=')?;
+                Some((n, key.to_string(), value.to_string()))
+            })
+            .collect();
+        carried.sort_by_key(|(n, ..)| *n);
+        carried.into_iter().map(|(_, k, v)| (k, v)).collect()
+    }
+
     /// The program and its arguments: the entrypoint, then the command.
     fn program(policy: &SandboxPolicy) -> Vec<String> {
         policy.entrypoint.iter().cloned().chain(policy.command.iter().cloned()).collect()
@@ -415,25 +653,92 @@ impl SeatbeltBackend {
     }
 }
 
+/// `env` with each name once: its last value, in the place of its last
+/// naming, as a process given the same name twice (`Command::env`, a
+/// shell's `export`) keeps the later one.
+fn last_of_each(env: impl IntoIterator<Item = (String, String)>) -> Vec<(String, String)> {
+    let all: Vec<(String, String)> = env.into_iter().collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: Vec<(String, String)> = all.into_iter().rev().filter(|(k, _)| seen.insert(k.clone())).collect();
+    kept.reverse();
+    kept
+}
+
 /// Removes `$d`'s sandbox, killing it first if it runs; leaves alone a
-/// directory this backend did not write ([`OURS`]).
+/// directory this backend did not write ([`OURS`]), and one whose sandbox
+/// may still run ([`UNDECIDED`]).
 fn remove_script() -> String {
-    format!("{OURS} || exit 0\nif {ALIVE}; then kill -KILL -- \"-$pid\" 2>/dev/null; g=$pid\n{DRAIN}fi\nrm -rf \"$d\"; exit 0")
+    format!("{OURS} || exit 0\n{SETTLE}\nif {ALIVE}; then kill -KILL -- \"-$pid\" 2>/dev/null; g=$pid\n{DRAIN}elif {UNDECIDED}; then exit 0\nfi\nrm -rf \"$d\"; exit 0")
 }
 
 /// Lists the sandboxes under `$1`, skipping any directory this backend did
-/// not write ([`OURS`]).
+/// not write ([`OURS`]). A sandbox that may still run but cannot be shown
+/// to ([`UNDECIDED`]) is `undecided`: neither running (nothing may stop or
+/// kill it) nor exited ([`undecided_sandboxes`] names it with its remedy).
 fn list_script() -> String {
     format!(
         r#"r=$1; [ -d "$r" ] || exit 0
 for d in "$r"/*; do
   {OURS} || continue
-  if {ALIVE}; then s=running; elif [ -f "$d/pid" ]; then s=exited; else s=created; fi
+  if {ALIVE}; then s=running; elif {UNDECIDED}; then s=undecided; elif [ -f "$d/pid" ]; then s=exited; else s=created; fi
   printf 'N\t%s\t%s\n' "${{d##*/}}" "$s"
   sed 's/^/L	/' "$d/labels" 2>/dev/null
 done
 exit 0"#
     )
+}
+
+/// A sandbox that may still run but whose launcher cannot be shown to be
+/// the one it recorded ([`UNDECIDED`]: a live pid beside a start record from
+/// an older darkmux): darkmux neither stops nor removes it, since the pid
+/// may not be its own. Its remedy is the operator's ([`Undecided::remedy`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Undecided {
+    pub name: String,
+    pub dir: PathBuf,
+    /// The pid it recorded, when it reads.
+    pub pid: Option<u32>,
+}
+
+impl Undecided {
+    /// What the operator can do: look at the recorded pid, and when no
+    /// sandbox of it runs, remove the record darkmux keeps for it. darkmux
+    /// never kills a pid it cannot show is its own.
+    pub fn remedy(&self) -> String {
+        let pid = self.pid.map_or_else(|| "its recorded pid".to_string(), |p| format!("pid {p}"));
+        let look = self.pid.map_or_else(String::new, |p| format!(" (`ps -o pid,lstart,command -p {p}`)"));
+        format!(
+            "Seatbelt sandbox `{}` may still run a program an older darkmux started: its start record cannot be compared, so darkmux cannot show {pid} is its launcher and will neither stop nor remove it. If no sandbox of it runs{look}, remove its record: rm -rf {}",
+            self.name,
+            sh_quote(&self.dir.to_string_lossy())
+        )
+    }
+}
+
+/// The names the listing ([`list_script`]) marks `undecided`.
+pub(crate) fn undecided_in(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|l| l.strip_prefix("N\t")?.split_once('\t'))
+        .filter(|(_, state)| *state == "undecided")
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
+/// Every Seatbelt sandbox on this host that is [`Undecided`], from one
+/// listing bounded at 10 s; none when the listing gives no answer.
+pub fn undecided_sandboxes() -> Vec<Undecided> {
+    let root = canonical(&state_root());
+    let list = SeatbeltBackend::script(&list_script(), &[root.to_string_lossy().into_owned()], &[("PATH".into(), DEFAULT_PATH.into())]);
+    let Some(out) = darkmux_platform::output_within(list, std::time::Duration::from_secs(10)) else { return Vec::new() };
+    undecided_in(&String::from_utf8_lossy(&out.stdout))
+        .into_iter()
+        .map(|name| {
+            let dir = root.join(&name);
+            let pid = std::fs::read_to_string(dir.join("pid")).ok().and_then(|p| p.trim().parse().ok());
+            Undecided { name, dir, pid }
+        })
+        .collect()
 }
 
 /// `name`'s directory, or `None` when `name` could leave [`state_root`] (a
@@ -483,6 +788,62 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// The launcher's `$2` to `$4`: the processes the sandbox may add to its
+/// user's, and its memory limit in bytes and as a person reads it, each
+/// empty for none. `Err` names a memory limit that is not one
+/// ([`darkmux_types::size::sandbox_memory_bytes`]).
+fn limit_args(limits: &Limits) -> Result<[String; 3], String> {
+    let pids = limits.pids.map(|n| n.to_string()).unwrap_or_default();
+    let Some(text) = &limits.memory else { return Ok([pids, String::new(), String::new()]) };
+    let bytes = crate::memory_bytes(text)?;
+    Ok([pids, bytes.to_string(), darkmux_types::size::human_bytes(bytes)])
+}
+
+impl SeatbeltBackend {
+    /// What `run` and `create` need before they plan anything: the
+    /// sandbox's directory and the launcher's limit arguments, or the
+    /// command that refuses the policy (a name that could leave the state
+    /// root, a memory limit that is not one).
+    fn planned(policy: &SandboxPolicy) -> Result<(PathBuf, [String; 3]), Box<Command>> {
+        let dir = dir_of(&policy.name).ok_or_else(|| Box::new(refused(&policy.name)))?;
+        let limits = limit_args(&policy.limits).map_err(|why| Box::new(crate::failing(&why)))?;
+        Ok((dir, limits))
+    }
+
+    /// `create`'s command, built and never run: the one that writes the
+    /// sandbox's directory and its start script, or the refusal
+    /// ([`Self::planned`]).
+    fn create_command(policy: &SandboxPolicy) -> (Command, SandboxHandle) {
+        let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: policy.name.clone() };
+        let (dir, limits) = match Self::planned(policy) {
+            Ok(planned) => planned,
+            Err(refusal) => return (*refusal, handle),
+        };
+        let start = Self::start_script(policy, &dir, limits);
+        let args = vec![dir.to_string_lossy().into_owned(), Self::profile(policy, &dir), Self::labels(policy), start];
+        let cmd = Self::script(&format!("{PREPARE}printf '%s' \"$4\" > \"$d/start.sh\" || exit 125\n"), &args, &[("PATH".into(), DEFAULT_PATH.into())]);
+        (cmd, handle)
+    }
+
+    /// The start script a created sandbox runs: the launcher, with nothing
+    /// of the starting process's environment but the sandbox's own, its
+    /// directory, working directory, limits and program, each quoted.
+    fn start_script(policy: &SandboxPolicy, dir: &Path, limits: [String; 3]) -> String {
+        let env = Self::launcher_environment(policy, dir);
+        let launch_args: Vec<String> = [dir.to_string_lossy().into_owned(), policy.workdir.clone().unwrap_or_default()]
+            .into_iter()
+            .chain(limits)
+            .chain(Self::program(policy))
+            .collect();
+        format!(
+            "exec /usr/bin/env -i {} {SH} -c {} sh {}\n",
+            join(env.iter().map(|(k, v)| sh_quote(&format!("{k}={v}")))),
+            sh_quote(&format!("d=$1; shift\n{}", launcher())),
+            join(launch_args.iter().map(|a| sh_quote(a))),
+        )
+    }
+}
+
 impl SandboxBackend for SeatbeltBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Seatbelt
@@ -506,7 +867,10 @@ impl SandboxBackend for SeatbeltBackend {
 
     fn run(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle) {
         let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: policy.name.clone() };
-        let Some(dir) = dir_of(&policy.name) else { return (refused(&policy.name), handle) };
+        let (dir, limits) = match Self::planned(policy) {
+            Ok(planned) => planned,
+            Err(refusal) => return (*refusal, handle),
+        };
         let _ = std::fs::create_dir_all(state_root());
         let mut args = vec![
             dir.to_string_lossy().into_owned(),
@@ -514,8 +878,9 @@ impl SandboxBackend for SeatbeltBackend {
             Self::labels(policy),
             policy.workdir.clone().unwrap_or_default(),
         ];
+        args.extend(limits);
         args.extend(Self::program(policy));
-        let mut cmd = Self::launcher_script(&format!("{PREPARE}shift 3\n{}", launcher()), &args, &Self::environment(policy, &dir));
+        let mut cmd = Self::launcher_script(&format!("{PREPARE}shift 3\n{}", launcher()), &args, &Self::launcher_environment(policy, &dir));
         if !policy.stdin {
             cmd.stdin(Stdio::null());
         }
@@ -523,23 +888,8 @@ impl SandboxBackend for SeatbeltBackend {
     }
 
     fn create(&self, policy: &SandboxPolicy) -> (Command, SandboxHandle) {
-        let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: policy.name.clone() };
-        let Some(dir) = dir_of(&policy.name) else { return (refused(&policy.name), handle) };
         let _ = std::fs::create_dir_all(state_root());
-        let env = Self::environment(policy, &dir);
-        let launch_args: Vec<String> = [dir.to_string_lossy().into_owned(), policy.workdir.clone().unwrap_or_default()]
-            .into_iter()
-            .chain(Self::program(policy))
-            .collect();
-        let start = format!(
-            "exec /usr/bin/env -i {} {SH} -c {} sh {}\n",
-            join(env.iter().map(|(k, v)| sh_quote(&format!("{k}={v}")))),
-            sh_quote(&format!("d=$1; shift\n{}", launcher())),
-            join(launch_args.iter().map(|a| sh_quote(a))),
-        );
-        let args = vec![dir.to_string_lossy().into_owned(), Self::profile(policy, &dir), Self::labels(policy), start];
-        let cmd = Self::script(&format!("{PREPARE}printf '%s' \"$4\" > \"$d/start.sh\" || exit 125\n"), &args, &[("PATH".into(), DEFAULT_PATH.into())]);
-        (cmd, handle)
+        Self::create_command(policy)
     }
 
     fn start(&self, handle: &SandboxHandle) -> Command {
@@ -552,19 +902,21 @@ exec /bin/sh "$d/start.sh""#, &[], Self::launcher_script);
     fn stop(&self, handle: &SandboxHandle, grace: std::time::Duration) -> Command {
         let script = format!(
             r#"{OURS} && [ -f "$d/pid" ] || exit 0
+{SETTLE}
 if {ALIVE}; then
   kill -TERM -- "-$pid" 2>/dev/null
   i=0; while kill -0 "$pid" 2>/dev/null && [ "$i" -lt "$(($2 * 10))" ]; do sleep 0.1; i=$((i + 1)); done
   kill -KILL -- "-$pid" 2>/dev/null
   g=$pid
-{DRAIN}fi
+{DRAIN}elif {UNDECIDED}; then exit 0
+fi
 rm -rf "$d"; exit 0"#
         );
         Self::on_dir(handle, &script, &[grace.as_secs().to_string()])
     }
 
     fn kill(&self, handle: &SandboxHandle) -> Command {
-        Self::on_dir(handle, &format!("{OURS} && {ALIVE} || exit 1\nkill -KILL -- \"-$pid\" || exit 1\ng=$pid\n{DRAIN}rm -rf \"$d\""), &[])
+        Self::on_dir(handle, &format!("{OURS} || exit 1\n{SETTLE}\n{ALIVE} || exit 1\nkill -KILL -- \"-$pid\" || exit 1\ng=$pid\n{DRAIN}rm -rf \"$d\""), &[])
     }
 
     fn remove(&self, handle: &SandboxHandle) -> Command {
@@ -616,6 +968,10 @@ pub(crate) fn parse_listing(kind: BackendKind, query: &Query, listing: &str) -> 
 }
 
 #[cfg(test)]
+#[path = "seatbelt_limits_tests.rs"]
+mod limits_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -630,6 +986,8 @@ mod tests {
             mounts,
             ports: Vec::new(),
             stdin: false,
+            host_services: Vec::new(),
+            refused_ports: Vec::new(),
             host_alias: None,
             user: None,
             env: vec![("A".into(), "1".into())],
@@ -677,10 +1035,54 @@ mod tests {
         // (#3112 review) A listen with no bind gets an ephemeral port the
         // bind rule never sees: inbound is held to the named ports too.
         assert!(named.contains("(deny network-inbound)\n(allow network-inbound (local ip \"localhost:4100\") (local ip \"localhost:4200\"))\n"), "{named}");
-        assert!(!named.contains("localhost:*"), "{named}");
+        assert!(!named.contains("(local ip \"localhost:*\")"), "{named}");
         let any = SeatbeltBackend::profile(&policy(Vec::new(), Network::Default), Path::new("/s"));
         assert!(any.contains("(allow network-bind (local ip \"localhost:*\"))"), "{any}");
         assert!(!any.contains("network-inbound"), "no ports named, inbound as it was: {any}");
+    }
+
+    /// Which of this host's services the default network reaches: with
+    /// ports named, IPv4 to this machine and all of IPv6 are refused but
+    /// those and the given ones; with none named, the ports this host
+    /// listens on are (IPv4 to this machine, IPv6 to any address), but the
+    /// given ones, and when its listeners cannot be read, it is held as one
+    /// naming ports. No rule says `remote ip` (it stops matching IPv4 next
+    /// to an `ip6` one). No network has no such rule (it has no network).
+    #[test]
+    fn the_default_network_refuses_this_hosts_services_it_was_not_given() {
+        let deny_all = "(deny network-outbound (remote ip4 \"localhost:*\") (remote ip6 \"*:*\"))\n";
+        let mut preview = policy(Vec::new(), Network::Default);
+        (preview.ports, preview.host_services) = (vec![4200, 4100], vec![1234]);
+        let read = std::cell::Cell::new(false);
+        let named = SeatbeltBackend::profile_with(&preview, Path::new("/s"), || {
+            read.set(true);
+            Some(vec![8799])
+        });
+        assert!(!read.get(), "a policy naming ports needs no listing");
+        let allow = "(allow network-outbound (remote ip4 \"localhost:1234\") (remote ip6 \"localhost:1234\") (remote ip4 \"localhost:4100\") (remote ip6 \"localhost:4100\") (remote ip4 \"localhost:4200\") (remote ip6 \"localhost:4200\"))\n";
+        assert!(named.ends_with(&format!("{deny_all}{allow}")), "{named}");
+        let mut dispatch = policy(Vec::new(), Network::Default);
+        dispatch.host_services = vec![1234];
+        let held = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || Some(vec![1234, 6379, 8799]));
+        let refused = "(deny network-outbound (remote ip4 \"localhost:6379\") (remote ip4 \"localhost:8799\") (remote ip6 \"*:6379\") (remote ip6 \"*:8799\"))\n";
+        assert!(held.ends_with(refused), "{held}");
+        assert!(!held.contains("localhost:*\") (remote ip6"), "its own servers on any other port stay reachable: {held}");
+        dispatch.refused_ports = vec![8765, 1234, 6379];
+        let always = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || Some(vec![6379]));
+        assert!(always.ends_with("(deny network-outbound (remote ip4 \"localhost:6379\") (remote ip4 \"localhost:8765\") (remote ip6 \"*:6379\") (remote ip6 \"*:8765\"))\n"), "refused before it listens, never a given one: {always}");
+        dispatch.refused_ports.clear();
+        let only_given = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || Some(vec![1234]));
+        assert!(!only_given.contains("(remote ip"), "{only_given}");
+        let unread = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || None);
+        assert!(unread.ends_with(&format!("{deny_all}(allow network-outbound (remote ip4 \"localhost:1234\") (remote ip6 \"localhost:1234\"))\n")), "{unread}");
+        dispatch.host_services.clear();
+        let nothing_given = SeatbeltBackend::profile_with(&dispatch, Path::new("/s"), || None);
+        assert!(nothing_given.ends_with(deny_all), "{nothing_given}");
+        for p in [&named, &held, &unread] {
+            assert!(!p.contains("(remote ip \""), "`remote ip` stops matching IPv4 next to `ip6`: {p}");
+        }
+        let none = SeatbeltBackend::profile_with(&policy(Vec::new(), Network::None), Path::new("/s"), || Some(vec![8799]));
+        assert!(!none.contains("network"), "{none}");
     }
 
     /// No network allows no network rule at all, the host's loopback
@@ -742,6 +1144,312 @@ mod tests {
         assert!(!crate::DockerBackend.host_reads(Path::new("/usr/bin")), "a container reads only its image and mounts");
     }
 
+    /// The launcher records a start, and `ALIVE` reads one, with the same
+    /// reader and prefix `host_leaders` compares against.
+    #[test]
+    fn a_start_is_recorded_and_read_by_the_one_reader() {
+        let reader = STARTED_READER.join(" ");
+        assert!(LAUNCH.contains(&format!("st=$({reader} -p $$)")) && LAUNCH.contains(&format!("'{STARTED_PREFIX}%s\\n'")), "{LAUNCH}");
+        assert!(ALIVE.contains(&format!("\"{STARTED_PREFIX}$({reader} -p \"$pid\" 2>/dev/null)\"")), "{ALIVE}");
+    }
+
+    /// Runs `p` under a state root of its own until its launcher has
+    /// recorded its start; the launcher, its directory and the root (kept
+    /// alive by the caller), with [`STATE_DIR_ENV`] pointing at it until
+    /// [`StateRoot`] drops.
+    fn running(mut p: SandboxPolicy, name: &str) -> (std::process::Child, PathBuf, StateRoot) {
+        let root = StateRoot::new();
+        p.name = name.into();
+        let (mut cmd, _) = SeatbeltBackend.run(&p);
+        let child = cmd.spawn().unwrap();
+        let d = canonical(root.0.path()).join(name);
+        for _ in 0..300 {
+            if std::fs::read_to_string(d.join("started")).is_ok_and(|s| !s.trim().is_empty()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (child, d, root)
+    }
+
+    /// A temporary [`STATE_DIR_ENV`], restored on drop.
+    struct StateRoot(tempfile::TempDir, Option<std::ffi::OsString>);
+
+    impl StateRoot {
+        fn new() -> Self {
+            let root = tempfile::TempDir::new().unwrap();
+            let prev = std::env::var_os(STATE_DIR_ENV);
+            unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
+            StateRoot(root, prev)
+        }
+    }
+
+    impl Drop for StateRoot {
+        fn drop(&mut self) {
+            unsafe {
+                match self.1.take() {
+                    Some(v) => std::env::set_var(STATE_DIR_ENV, v),
+                    None => std::env::remove_var(STATE_DIR_ENV),
+                }
+            }
+        }
+    }
+
+    /// A process's start as `ps -o lstart=` prints it under `env`, the way
+    /// a launcher before the `utc:` form recorded it in its policy's
+    /// environment.
+    fn lstart_under(pid: u32, env: &[(&str, &str)]) -> String {
+        let out = Command::new("/bin/ps").args(["-o", "lstart=", "-p", &pid.to_string()]).env_clear().envs(env.iter().copied()).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim_end_matches('\n').to_string()
+    }
+
+    /// A sandbox left running by a launcher that recorded its start the
+    /// older way (no `utc:` prefix, in its policy's time zone) is never
+    /// taken for gone: when its record cannot be compared, remove and stop
+    /// leave its directory and its processes alone, and the listing says
+    /// running. When its record does compare (written with no time zone),
+    /// remove ends it as before.
+    #[test]
+    #[serial_test::serial]
+    fn a_sandbox_with_an_older_start_record_is_never_taken_for_gone() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let mut p = policy(Vec::new(), Network::None);
+        p.entrypoint = Some("/bin/sleep".into());
+        p.command = vec!["20".into()];
+        let (mut child, d, root) = running(p.clone(), "darkmux-older-record");
+        let pid: u32 = std::fs::read_to_string(d.join("pid")).unwrap().trim().parse().unwrap();
+        std::fs::write(d.join("started"), format!("{}\n", lstart_under(pid, &[("TZ", "Pacific/Kiritimati"), ("PATH", DEFAULT_PATH)]))).unwrap();
+        let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: "darkmux-older-record".into() };
+        let removed = SeatbeltBackend.remove(&handle).status().unwrap();
+        let stopped = SeatbeltBackend.stop(&handle, Duration::from_secs(1)).status().unwrap();
+        let listing = String::from_utf8_lossy(&SeatbeltBackend.list(&Query::labeled("darkmux.host.pid")).output().unwrap().stdout).into_owned();
+        let launchers = crate::host_leaders::host_sandbox_launchers();
+        let undecided = undecided_sandboxes();
+        let (kept, alive) = (d.is_dir(), child.try_wait().unwrap().is_none());
+        let _ = std::fs::write(d.join("started"), format!("{}\n", lstart_under(pid, &[("PATH", DEFAULT_PATH)])));
+        let ended = SeatbeltBackend.remove(&handle).status().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let gone = child.try_wait().unwrap().is_some();
+        let _ = Command::new("/bin/kill").args(["-KILL", &format!("-{pid}")]).status();
+        let _ = child.wait();
+        drop(root);
+        assert!(removed.success() && stopped.success());
+        assert!(kept && alive, "remove or stop took a live sandbox for gone (dir kept {kept}, alive {alive})");
+        assert!(listing.contains("N\tdarkmux-older-record\tundecided"), "{listing}");
+        assert_eq!(undecided.iter().map(|u| (u.name.as_str(), u.pid)).collect::<Vec<_>>(), [("darkmux-older-record", Some(pid))]);
+        assert!(!parse_listing(BackendKind::Seatbelt, &Query { stopped_too: false, ..Query::labeled("darkmux.host.pid") }, &listing).iter().any(|l| l.handle.id == "darkmux-older-record"), "never listed as running: nothing tries to kill it");
+        assert_eq!(launchers, Some(vec![pid]));
+        assert!(ended.success() && gone && !d.exists(), "a record that compares is still ended by remove");
+    }
+
+    /// A planned sandbox's launcher runs with only `PATH` and the carried
+    /// variables, and [`SeatbeltBackend::program_environment`] reads back
+    /// exactly the policy's environment the program is given, in order.
+    #[test]
+    fn the_program_environment_is_the_policys_carried_through_the_launcher() {
+        let mut p = policy(Vec::new(), Network::None);
+        p.env = vec![("A".into(), "1=2".into()), ("PATH".into(), "/p".into()), ("BASH_FUNC_x%%".into(), "() { :; }".into()), ("".into(), "dropped".into())];
+        let (cmd, _) = SeatbeltBackend.run(&p);
+        let launcher: Vec<String> = cmd.get_envs().map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+        assert!(launcher.iter().all(|k| k == "PATH" || k.starts_with(CARRIED)), "{launcher:?}");
+        let tmp = canonical(&state_root().join("darkmux-dispatch-1/tmp")).to_string_lossy().into_owned();
+        assert_eq!(
+            SeatbeltBackend::program_environment(&cmd),
+            [("A", "1=2"), ("PATH", "/p"), ("BASH_FUNC_x%%", "() { :; }"), ("HOME", tmp.as_str()), ("TMPDIR", tmp.as_str())]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+    }
+
+    /// A variable the policy names twice is carried once, its last value
+    /// (a preview's recipe naming `PATH` after the toolchain's), in the
+    /// place of its last naming.
+    #[test]
+    fn a_variable_named_twice_is_carried_once_with_its_last_value() {
+        let mut p = policy(Vec::new(), Network::None);
+        p.env = vec![("PATH".into(), "/toolchain".into()), ("A".into(), "1".into()), ("PATH".into(), "/recipe".into())];
+        let (cmd, _) = SeatbeltBackend.run(&p);
+        let tmp = canonical(&state_root().join("darkmux-dispatch-1/tmp")).to_string_lossy().into_owned();
+        assert_eq!(
+            SeatbeltBackend::program_environment(&cmd),
+            [("A", "1"), ("PATH", "/recipe"), ("HOME", tmp.as_str()), ("TMPDIR", tmp.as_str())].map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+    }
+
+    /// Run after run, the program gets the last value of a variable the
+    /// policy names twice, never one picked by chance.
+    #[test]
+    #[serial_test::serial]
+    fn a_program_always_gets_the_last_value_of_a_variable_named_twice() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let mut seen = Vec::new();
+        for n in 0..8 {
+            let mut p = policy(Vec::new(), Network::None);
+            p.env = vec![("PATH".into(), "/toolchain/bin:/usr/bin:/bin".into()), ("PATH".into(), "/recipe/bin:/usr/bin:/bin".into())];
+            p.entrypoint = Some("/bin/sh".into());
+            p.command = vec!["-c".into(), "printf %s \"$PATH\" > \"$TMPDIR/path\"; exec /bin/sleep 3".into()];
+            let (mut child, d, root) = running(p, &format!("darkmux-twice-{n}"));
+            let mut path = String::new();
+            for _ in 0..200 {
+                path = std::fs::read_to_string(d.join("tmp/path")).unwrap_or_default();
+                if !path.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = SeatbeltBackend.remove(&SandboxHandle { backend: BackendKind::Seatbelt, id: format!("darkmux-twice-{n}") }).status();
+            let _ = child.wait();
+            drop(root);
+            seen.push(path);
+        }
+        assert!(seen.iter().all(|p| p == "/recipe/bin:/usr/bin:/bin"), "{seen:?}");
+    }
+
+    /// A listing's `undecided` rows are named, and nothing else; the remedy
+    /// names the sandbox, the pid to look at and the one command that
+    /// removes its record, never a kill.
+    #[test]
+    fn an_undecided_sandbox_is_named_with_a_remedy_that_kills_nothing() {
+        let listing = "N\tdarkmux-a\trunning\nL\tk=v\nN\tdarkmux-b\tundecided\nN\tdarkmux-c\texited\nN\tdarkmux-d\tundecided\n";
+        assert_eq!(undecided_in(listing), ["darkmux-b", "darkmux-d"]);
+        let u = Undecided { name: "darkmux-b".into(), dir: PathBuf::from("/s/darkmux b"), pid: Some(4242) };
+        let remedy = u.remedy();
+        assert!(remedy.contains("`darkmux-b`") && remedy.contains("ps -o pid,lstart,command -p 4242"), "{remedy}");
+        assert!(remedy.ends_with("rm -rf '/s/darkmux b'"), "{remedy}");
+        assert!(!remedy.contains("kill"), "{remedy}");
+        let unread = Undecided { pid: None, ..u };
+        assert!(unread.remedy().contains("its recorded pid") && !unread.remedy().contains("ps -o"), "{}", unread.remedy());
+    }
+
+    /// The carry sets the carried variables in the order carried, by
+    /// number (the tenth after the ninth), so a later one always wins.
+    #[cfg(unix)]
+    #[test]
+    fn the_carry_sets_variables_in_the_order_carried() {
+        let mut cmd = Command::new("/usr/bin/perl");
+        cmd.args(["-e", CARRY, "/usr/bin/env"]).env_clear();
+        for n in 0..12 {
+            cmd.env(format!("{CARRIED}{n}"), format!("P={n}"));
+        }
+        let out = String::from_utf8_lossy(&cmd.output().unwrap().stdout).into_owned();
+        assert_eq!(out.lines().collect::<Vec<_>>(), ["P=11"], "{out}");
+    }
+
+    /// A stop that lands while a launcher has recorded its pid but not yet
+    /// its start waits for the start and stops it, never leaving it to run.
+    #[test]
+    #[serial_test::serial]
+    fn a_stop_between_the_pid_and_the_start_record_still_stops_the_sandbox() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let root = StateRoot::new();
+        let d = canonical(root.0.path()).join("darkmux-starting");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("profile.sb"), "(version 1)").unwrap();
+        let mut launcher = Command::new("/bin/sleep");
+        launcher.arg("30");
+        std::os::unix::process::CommandExt::process_group(&mut launcher, 0);
+        let mut launcher = launcher.spawn().unwrap();
+        let pid = launcher.id().to_string();
+        std::fs::write(d.join("pid"), format!("{pid}\n")).unwrap();
+        let record = Command::new(STARTED_READER[0]).args(&STARTED_READER[1..]).args(["-p", &pid]).output().unwrap();
+        let record = format!("{STARTED_PREFIX}{}\n", String::from_utf8_lossy(&record.stdout).trim_end_matches('\n'));
+        let late = d.join("started");
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::write(late, record).unwrap();
+        });
+        let stopped = SeatbeltBackend.stop(&SandboxHandle { backend: BackendKind::Seatbelt, id: "darkmux-starting".into() }, Duration::from_secs(1)).status().unwrap();
+        writer.join().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let ended = launcher.try_wait().unwrap().is_some();
+        let _ = launcher.kill();
+        let _ = launcher.wait();
+        assert!(stopped.success());
+        assert!(ended && !d.exists(), "the stop left the starting sandbox to run (ended {ended}, dir left {})", d.exists());
+    }
+
+    /// A policy's environment reaches the program and nothing the launcher
+    /// does: functions exported to the shell (`BASH_FUNC_*`) cannot forge
+    /// its pid or its start record.
+    #[test]
+    #[serial_test::serial]
+    fn a_policys_environment_cannot_forge_the_launchers_record() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let mut p = policy(Vec::new(), Network::None);
+        p.env = vec![
+            ("A".into(), "seen".into()),
+            ("BASH_FUNC_echo%%".into(), "() { builtin echo 4242; }".into()),
+            ("BASH_FUNC_printf%%".into(), "() { builtin printf 'utc:forged\\n'; }".into()),
+            ("SHELLOPTS".into(), "xtrace".into()),
+            ("PS4".into(), "$(builtin echo 4242 > \"$d/pid\")".into()),
+        ];
+        p.entrypoint = Some("/bin/sh".into());
+        p.command = vec!["-c".into(), "/usr/bin/printenv A > \"$TMPDIR/a\"; exec /bin/sleep 3".into()];
+        let (mut child, d, root) = running(p, "darkmux-env-forge");
+        std::thread::sleep(Duration::from_millis(300));
+        let pid = std::fs::read_to_string(d.join("pid")).unwrap_or_default();
+        let started = std::fs::read_to_string(d.join("started")).unwrap_or_default();
+        let seen = std::fs::read_to_string(d.join("tmp/a")).unwrap_or_default();
+        let real = Command::new(STARTED_READER[0]).args(&STARTED_READER[1..]).args(["-p", &child.id().to_string()]).output().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(root);
+        assert_eq!(pid.trim(), child.id().to_string(), "the launcher's own pid");
+        assert_eq!(started.trim(), format!("{STARTED_PREFIX}{}", String::from_utf8_lossy(&real.stdout).trim()), "the launcher's own start");
+        assert_eq!(seen.trim(), "seen", "the program still gets the policy's environment");
+    }
+
+    /// A running sandbox whose policy sets `TZ` and a locale is still the
+    /// running sandbox its directory records: its listing says running, and
+    /// its launcher is among the host's sandbox launchers. Its start is
+    /// recorded and read in one fixed environment, whatever the policy's.
+    #[test]
+    #[serial_test::serial]
+    fn a_policys_time_zone_and_locale_never_make_a_running_sandbox_look_gone() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let root = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var_os(STATE_DIR_ENV);
+        unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
+        let mut p = policy(Vec::new(), Network::None);
+        p.name = "darkmux-tz-test".into();
+        p.env = vec![("TZ".into(), "Pacific/Kiritimati".into()), ("LANG".into(), "fr_FR.UTF-8".into()), ("LC_ALL".into(), "fr_FR.UTF-8".into())];
+        p.entrypoint = Some("/bin/sleep".into());
+        p.command = vec!["5".into()];
+        let (mut cmd, _) = SeatbeltBackend.run(&p);
+        let mut child = cmd.spawn().unwrap();
+        let d = canonical(root.path()).join("darkmux-tz-test");
+        for _ in 0..200 {
+            if std::fs::read_to_string(d.join("started")).is_ok_and(|s| !s.trim().is_empty()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let listing = SeatbeltBackend.list(&Query::labeled("darkmux.host.pid")).output().unwrap();
+        let launchers = crate::host_leaders::host_sandbox_launchers();
+        let pid: Option<u32> = std::fs::read_to_string(d.join("pid")).ok().and_then(|s| s.trim().parse().ok());
+        let _ = SeatbeltBackend.remove(&SandboxHandle { backend: BackendKind::Seatbelt, id: "darkmux-tz-test".into() }).status();
+        let _ = child.kill();
+        let _ = child.wait();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(STATE_DIR_ENV, v),
+                None => std::env::remove_var(STATE_DIR_ENV),
+            }
+        }
+        let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
+        assert!(listing.contains("N\tdarkmux-tz-test\trunning"), "{listing}");
+        assert_eq!(launchers, Some(vec![pid.expect("the launcher recorded its pid")]));
+    }
+
     /// (#3112 review, MAJOR D) A launcher that ends at once (its working
     /// folder missing) leaves no guard behind: twenty such launches, then no
     /// process naming their sandboxes is left.
@@ -754,12 +1462,18 @@ mod tests {
         let root = tempfile::TempDir::new().unwrap();
         let prev = std::env::var_os(STATE_DIR_ENV);
         unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
+        // Only this test's own guards count: another test's sandbox may be
+        // ending at the same moment, its guard still draining it. A guard's
+        // last argument is its launcher's pid.
+        let mut launchers = std::collections::HashSet::new();
         for n in 0..20 {
             let mut p = policy(Vec::new(), Network::None);
             p.name = format!("darkmux-guard-test-{n}");
             p.workdir = Some("/nonexistent-darkmux-workdir".into());
             let (mut cmd, _) = SeatbeltBackend.run(&p);
-            let out = cmd.output().unwrap();
+            let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            launchers.insert(child.id().to_string());
+            let out = child.wait_with_output().unwrap();
             assert_eq!(out.status.code(), Some(125), "{}", String::from_utf8_lossy(&out.stderr));
         }
         unsafe {
@@ -771,7 +1485,9 @@ mod tests {
         // And the guard alone, under a parent that is gone before it starts:
         // it must not mistake launchd (its new parent) for its launcher.
         for _ in 0..5 {
-            Command::new(SH).arg("-c").arg(format!("{GUARD} \"$$\" </dev/null >/dev/null 2>&1 & exit 0")).status().unwrap();
+            let child = Command::new(SH).arg("-c").arg(format!("{GUARD} \"$$\" </dev/null >/dev/null 2>&1 & exit 0")).spawn().unwrap();
+            launchers.insert(child.id().to_string());
+            child.wait_with_output().unwrap();
         }
         std::thread::sleep(Duration::from_millis(500));
         // A guard is a perl that moved itself to a group of its own; once its
@@ -780,6 +1496,7 @@ mod tests {
         let pids: Vec<String> = String::from_utf8_lossy(&ps.stdout)
             .lines()
             .filter(|l| l.contains("/usr/bin/perl -e setpgrp(0, 0); my $l = "))
+            .filter(|l| l.split_whitespace().last().is_some_and(|pid| launchers.contains(pid)))
             .filter_map(|l| {
                 let mut f = l.split_whitespace();
                 let (pid, ppid) = (f.next()?, f.next()?);
@@ -833,25 +1550,34 @@ mod tests {
         let prev = std::env::var_os(STATE_DIR_ENV);
         unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
         let handle = SandboxHandle { backend: BackendKind::Seatbelt, id: "darkmux-stale-b3559".into() };
-        let stale = |lead: u32| {
-            let d = canonical(root.path()).join(&handle.id);
+        let d = canonical(root.path()).join(&handle.id);
+        let stale = |lead: u32, record: &str| {
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(d.join("profile.sb"), "(version 1)").unwrap();
             std::fs::write(d.join("pid"), lead.to_string()).unwrap();
-            std::fs::write(d.join("started"), "Thu Jan  1 00:00:00 1970\n").unwrap();
+            std::fs::write(d.join("started"), format!("{record}\n")).unwrap();
         };
         let lifecycle: [(&str, &dyn Fn() -> Command); 3] = [
             ("remove", &|| SeatbeltBackend.remove(&handle)),
             ("stop", &|| SeatbeltBackend.stop(&handle, Duration::from_secs(1))),
             ("kill", &|| SeatbeltBackend.kill(&handle)),
         ];
-        let mut ended = Vec::new();
-        for (what, command) in lifecycle {
-            let s = session();
-            stale(s.leader.id());
-            let _ = command().output().unwrap();
-            if !alive(&s.leader.id().to_string()) || !alive(&s.child) {
-                ended.push(what);
+        let (mut ended, mut kept) = (Vec::new(), Vec::new());
+        // A record in today's form that is not the leader's start says the
+        // pid was reused: remove and stop clear the directory. An older
+        // launcher's record cannot say so, and leaves it.
+        for record in ["utc:Thu Jan  1 00:00:00 1970", "Thu Jan  1 00:00:00 1970"] {
+            for (what, command) in &lifecycle {
+                let s = session();
+                stale(s.leader.id(), record);
+                let _ = command().output().unwrap();
+                if !alive(&s.leader.id().to_string()) || !alive(&s.child) {
+                    ended.push(*what);
+                }
+                if d.exists() && *what != "kill" && record.starts_with("utc:") {
+                    kept.push(*what);
+                }
+                let _ = std::fs::remove_dir_all(&d);
             }
         }
         unsafe {
@@ -861,6 +1587,7 @@ mod tests {
             }
         }
         assert_eq!(ended, Vec::<&str>::new(), "an unrelated session was ended");
+        assert_eq!(kept, Vec::<&str>::new(), "a reused pid's stale directory was kept");
     }
 
     /// A lifecycle command runs its script with `$d` the sandbox's
@@ -951,5 +1678,178 @@ mod tests {
     fn sh_quoting_keeps_an_argument_whole() {
         let out = Command::new(SH).arg("-c").arg(format!("printf '%s|' {}", sh_quote("a 'b' $HOME"))).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "a 'b' $HOME|");
+    }
+
+    /// What a sandbox on the host under the default network reaches of this
+    /// host's own services: `host_services` and its own servers, never
+    /// another listener on this machine. Lines the probe script printed, one
+    /// per probe that connected, run in the sandbox and (the control, which
+    /// shows each probe can connect at all) outside it.
+    fn reached(ports: Vec<u16>, host_services: Vec<u16>, own: u16, probes: &[Probe]) -> (Vec<String>, Vec<String>) {
+        let root = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var_os(STATE_DIR_ENV);
+        unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
+        // Its own server on `own`, up before any probe runs, then each probe.
+        let mut script = format!("/usr/bin/nc -lk 127.0.0.1 {own} >/dev/null 2>&1 &\ni=0; until /usr/bin/nc -z -G 1 127.0.0.1 {own} 2>/dev/null || [ $i -ge 50 ]; do sleep 0.1; i=$((i + 1)); done\n");
+        script.push_str(&format!("/usr/bin/nc -z -G 2 127.0.0.1 {own} 2>/dev/null && echo own\n"));
+        for (said, at, port) in probes {
+            script.push_str(&format!("/usr/bin/nc -z -G 1 '{at}' {port} 2>/dev/null && echo '{said}'\n"));
+        }
+        script.push_str("kill %1 2>/dev/null; true\n");
+        let mut p = policy(Vec::new(), Network::Default);
+        p.name = format!("darkmux-loopback-test-{}-{own}", std::process::id());
+        p.ports = ports;
+        p.host_services = host_services;
+        p.entrypoint = Some(SH.into());
+        p.command = vec!["-c".into(), script.clone()];
+        let (mut cmd, _) = SeatbeltBackend.run(&p);
+        let out = cmd.output().unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(STATE_DIR_ENV, v),
+                None => std::env::remove_var(STATE_DIR_ENV),
+            }
+        }
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let control = Command::new(SH).arg("-c").arg(&script).output().unwrap();
+        let lines = |o: &[u8]| String::from_utf8_lossy(o).lines().map(str::to_string).collect();
+        (lines(&out.stdout), lines(&control.stdout))
+    }
+
+    /// A port nothing on this host holds yet.
+    fn a_free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// A probe: what the script prints when it connects, and where.
+    type Probe = (String, String, u16);
+
+    /// This host's own addresses beyond the loopback (its LAN and tailnet
+    /// ones, each IPv6 one with its scope), from `ifconfig`.
+    fn this_hosts_addresses() -> (Vec<String>, Vec<String>) {
+        let out = Command::new("/sbin/ifconfig").output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let of = |family: &str| -> Vec<String> {
+            text.lines().filter_map(|l| l.split_whitespace().collect::<Vec<_>>().get(..2).filter(|f| f[0] == family).map(|f| f[1].to_string())).filter(|a| a != "127.0.0.1" && a != "::1" && a != "fe80::1%lo0").collect()
+        };
+        (of("inet"), of("inet6"))
+    }
+
+    /// This host's listeners the sandbox must not reach, at every address
+    /// form that reaches each (127.0.0.1, `::1`, the IPv4-mapped forms of the
+    /// loopback and of every IPv4 address of this host, `0.0.0.0`, `::`,
+    /// `fe80::1%lo0`, every other address of this host and its name), and
+    /// the one it is given: probes, with the listeners held open.
+    fn host_listeners() -> (Vec<std::net::TcpListener>, u16, Vec<Probe>) {
+        let bind = |at: &str| std::net::TcpListener::bind(at).unwrap();
+        let port = |l: &std::net::TcpListener| l.local_addr().unwrap().port();
+        let (given, v4, v6, any4) = (bind("127.0.0.1:0"), bind("127.0.0.1:0"), bind("[::1]:0"), bind("0.0.0.0:0"));
+        let (given6, any6) = (bind(&format!("[::1]:{}", port(&given))), bind("[::]:0"));
+        let probe = |said: &str, at: &str, l: &std::net::TcpListener| (said.to_string(), at.to_string(), port(l));
+        let mut probes = vec![
+            probe("given", "127.0.0.1", &given),
+            probe("given6", "::1", &given6),
+            probe("v4", "127.0.0.1", &v4),
+            probe("mapped", "::ffff:127.0.0.1", &v4),
+            probe("mapped-hex", "::ffff:7f00:1", &v4),
+            probe("v6", "::1", &v6),
+            probe("zero4", "0.0.0.0", &any4),
+            probe("zero6", "::", &any6),
+            probe("lo0-link-local", "fe80::1%lo0", &any6),
+        ];
+        let hostname = String::from_utf8_lossy(&Command::new("/bin/hostname").output().unwrap().stdout).trim().to_string();
+        probes.push(probe("hostname", &hostname, &any4));
+        let (inet, inet6) = this_hosts_addresses();
+        for a in &inet {
+            probes.push(probe(&format!("own4 {a}"), a, &any4));
+            probes.push(probe(&format!("mapped-own4 {a}"), &format!("::ffff:{a}"), &any4));
+        }
+        probes.extend(inet6.iter().map(|a| probe(&format!("own6 {a}"), a, &any6)));
+        let given_port = port(&given);
+        (vec![given, given6, v4, v6, any4, any6], given_port, probes)
+    }
+
+    /// The probes the control reached that the sandbox must not: every one
+    /// but `own` and `given` (on 127.0.0.1 and `::1`). The control reaching each fixed form (and at
+    /// least one other IPv4 address of this host) shows the probes can
+    /// connect at all.
+    fn assert_only_own_and_given(sandboxed: &[String], control: &[String]) {
+        for must in ["own", "given", "given6", "v4", "mapped", "mapped-hex", "v6", "zero4", "zero6", "lo0-link-local", "hostname"] {
+            assert!(control.iter().any(|l| l == must), "the control never reached {must}: {control:?}");
+        }
+        assert!(control.iter().any(|l| l.starts_with("mapped-own4 ")), "no other IPv4 address of this host was probed: {control:?}");
+        assert_eq!(sandboxed, ["own", "given", "given6"], "control reached {control:?}");
+    }
+
+    /// A dispatch's shape (no ports named, any bind): it reaches the host
+    /// service it is given and its own server on a port it picked, never
+    /// another service listening on this host's loopback.
+    #[test]
+    #[serial_test::serial]
+    fn a_dispatch_reaches_only_the_host_services_it_is_given_and_its_own() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let (_held, given, probes) = host_listeners();
+        let (sandboxed, control) = reached(Vec::new(), vec![given], a_free_port(), &probes);
+        assert_only_own_and_given(&sandboxed, &control);
+    }
+
+    /// A preview's shape (its ports named): it reaches its own ports and the
+    /// host service it is given, never another service on this host.
+    #[test]
+    #[serial_test::serial]
+    fn a_preview_reaches_only_its_ports_and_the_host_services_it_is_given() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let (_held, given, probes) = host_listeners();
+        let own = a_free_port();
+        let (sandboxed, control) = reached(vec![own], vec![given], own, &probes);
+        assert_only_own_and_given(&sandboxed, &control);
+    }
+
+    /// A dispatch's shape: a port it is told to refuse is refused even when
+    /// nothing listens on it as the sandbox is planned (a darkmux daemon
+    /// started after the dispatch), at 127.0.0.1, `::1` and the IPv4-mapped
+    /// loopback, unless it is given; a listener that also starts late on a
+    /// port it is not told to refuse is reached (the probes ran after both
+    /// were up).
+    #[test]
+    #[serial_test::serial]
+    fn a_dispatch_never_reaches_a_refused_port_that_starts_listening_after_it_is_planned() {
+        if !SeatbeltBackend::available() {
+            return;
+        }
+        let (refused, given, late) = (a_free_port(), a_free_port(), a_free_port());
+        let root = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var_os(STATE_DIR_ENV);
+        unsafe { std::env::set_var(STATE_DIR_ENV, root.path()) };
+        let mut script = String::from("sleep 2\n");
+        for (said, at, port) in [("refused", "127.0.0.1", refused), ("refused6", "::1", refused), ("refused-mapped", "::ffff:127.0.0.1", refused), ("given", "127.0.0.1", given), ("late", "127.0.0.1", late)] {
+            script.push_str(&format!("/usr/bin/nc -z -G 1 '{at}' {port} 2>/dev/null && echo '{said}'\n"));
+        }
+        let mut p = policy(Vec::new(), Network::Default);
+        p.name = format!("darkmux-late-listener-test-{}", std::process::id());
+        (p.host_services, p.refused_ports) = (vec![given], vec![refused, given]);
+        p.entrypoint = Some(SH.into());
+        p.command = vec!["-c".into(), script.clone()];
+        let (mut cmd, _) = SeatbeltBackend.run(&p);
+        let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        // Every listener starts after the profile was built (at `run`).
+        let bind = |at: String| std::net::TcpListener::bind(at).unwrap();
+        let _up = [bind(format!("127.0.0.1:{refused}")), bind(format!("[::1]:{refused}")), bind(format!("127.0.0.1:{given}")), bind(format!("127.0.0.1:{late}"))];
+        let out = child.wait_with_output().unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(STATE_DIR_ENV, v),
+                None => std::env::remove_var(STATE_DIR_ENV),
+            }
+        }
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let control = Command::new(SH).arg("-c").arg(&script).output().unwrap();
+        let lines = |o: &[u8]| String::from_utf8_lossy(o).lines().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(lines(&control.stdout), ["refused", "refused6", "refused-mapped", "given", "late"], "the control reaches every listener");
+        assert_eq!(lines(&out.stdout), ["given", "late"]);
     }
 }

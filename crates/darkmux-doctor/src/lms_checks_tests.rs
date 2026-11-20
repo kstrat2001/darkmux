@@ -33,12 +33,23 @@ fn exe(path: &Path, body: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// (#2976, #3444) Runs a no-op at `path` once, so the fake written there
+/// next pays macOS's first-exec scan here, outside every bounded call under
+/// test. Writing over it keeps the file (and its scanned state). It leaves
+/// `<path>.warm` behind as the trace that it ran.
+fn warm(path: &Path) {
+    exe(path, "#!/bin/sh\n: > \"$0.warm\"\n");
+    let ran = std::process::Command::new(path).status().expect("warming the fake lms");
+    assert!(ran.success(), "the warm-up no-op exits 0");
+}
+
 impl Fakes {
     fn new(profiles: Option<&str>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().display();
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
+        warm(&bin.join("lms"));
         exe(
             &bin.join("lms"),
             &format!(
@@ -102,7 +113,11 @@ impl Drop for Fakes {
 }
 
 fn row(identifier: &str, model: &str) -> String {
-    format!(r#"{{"identifier":"{identifier}","modelKey":"{model}","status":"idle","contextLength":8192}}"#)
+    row_at(identifier, model, 8192)
+}
+
+fn row_at(identifier: &str, model: &str, context: u64) -> String {
+    format!(r#"{{"identifier":"{identifier}","modelKey":"{model}","status":"idle","contextLength":{context}}}"#)
 }
 
 fn ps(rows: &[(&str, &str)]) -> String {
@@ -141,12 +156,36 @@ fn profile_match_warns_when_nothing_is_loaded() {
 #[serial_test::serial]
 #[test]
 fn profile_match_passes_naming_every_profile_whose_default_model_is_loaded() {
-    // `big` under its namespaced identifier, `other` under its plain one.
-    let _f = Fakes::new(Some(PROFILES)).loaded(&ps(&[("darkmux:big", "big"), ("other", "other")]));
+    let _f = Fakes::new(Some(PROFILES)).loaded(&ps(&[("darkmux:big", "big"), ("darkmux:other", "other")]));
     let c = check_profile_loaded_match();
     assert_eq!(c.status, Status::Pass, "{}", c.message);
     assert_eq!(c.message, "loaded state matches profile(s): p, q");
     assert!(c.hint.is_none());
+}
+
+/// (Contract 4) A profile matches only on the instance a dispatch would
+/// use: darkmux's own at the profile's window or more. A copy darkmux did
+/// not load never matches, and neither does darkmux's own below the window;
+/// each is named with the window it is loaded at.
+#[serial_test::serial]
+#[test]
+fn profile_match_never_counts_a_user_copy_or_an_undersized_instance() {
+    let user = Fakes::new(Some(PROFILES)).loaded(&format!("[{}]", row_at("big", "big", 8192)));
+    let c = check_profile_loaded_match();
+    assert_eq!(c.status, Status::Warn, "a user copy is never dispatched to: {}", c.message);
+    assert!(c.message.contains("`big`") && c.message.contains("never uses"), "{}", c.message);
+    assert!(c.hint.as_deref().is_some_and(|h| h.contains("--identifier darkmux:big")), "{:?}", c.hint);
+    drop(user);
+    let small = Fakes::new(Some(PROFILES)).loaded(&format!("[{}]", row_at("darkmux:big", "big", 4096)));
+    let c = check_profile_loaded_match();
+    assert_eq!(c.status, Status::Warn, "an undersized instance is reloaded: {}", c.message);
+    assert!(c.message.contains("4096") && c.message.contains("8192"), "{}", c.message);
+    let hint = c.hint.unwrap_or_default();
+    assert!(hint.contains("`lms unload darkmux:big`, then `lms load big --context-length 8192 --identifier darkmux:big`"), "{hint}");
+    drop(small);
+    let _big = Fakes::new(Some(PROFILES)).loaded(&format!("[{}]", row_at("darkmux:big", "big", 16384)));
+    let c = check_profile_loaded_match();
+    assert_eq!((c.status, c.message.as_str()), (Status::Pass, "loaded state matches profile(s): p"));
 }
 
 #[serial_test::serial]
@@ -199,16 +238,30 @@ fn projection_skips_when_no_profile_matches() {
 
 #[serial_test::serial]
 #[test]
-fn projection_passes_when_the_active_profile_is_fully_resident_whichever_way_each_model_is_named() {
-    // `big` by its plain identifier (under another model key), `helper` by its
-    // model key under a custom identifier, `extra` by its namespaced
-    // identifier: each counts as loaded.
+fn projection_passes_when_the_active_profile_is_fully_resident_as_darkmuxs_own_instances() {
     let f = Fakes::new(Some(PROFILES))
-        .loaded(&ps(&[("big", "vendor/big-gguf"), ("my-helper", "helper"), ("darkmux:extra", "x-key")]))
+        .loaded(&ps(&[("darkmux:big", "big"), ("darkmux:helper", "helper"), ("darkmux:extra", "extra")]))
         .free_gb(64);
     let c = f.projection();
     assert_eq!(c.status, Status::Pass, "{}", c.message);
     assert_eq!(c.message, "active profile `p` fully resident");
+}
+
+/// (Contract 4) A copy darkmux did not load is not resident for the
+/// projection: a dispatch loads darkmux's own beside it, so it is counted
+/// as still to load, and a profile whose default model is resident only so
+/// is not the active one.
+#[serial_test::serial]
+#[test]
+fn projection_counts_a_user_copy_as_still_to_load() {
+    let f = Fakes::new(Some(PROFILES))
+        .loaded(&ps(&[("darkmux:big", "big"), ("helper", "helper"), ("my-extra", "extra")]))
+        .free_gb(64);
+    let c = f.projection();
+    assert!(c.message.contains("(helper (size unknown), extra (size unknown))"), "{}", c.message);
+    drop(f);
+    let f = Fakes::new(Some(PROFILES)).loaded(&ps(&[("big", "big")])).free_gb(64);
+    assert_eq!(skipped(&f.projection()), "no profile matches loaded state");
 }
 
 #[serial_test::serial]
@@ -244,6 +297,40 @@ fn projection_fails_when_the_rest_of_the_profile_would_not_fit() {
     assert!(c.message.ends_with("— load would swap or OOM"), "{}", c.message);
 }
 
+/// An `lms ps --json` row with the memory the instance holds.
+fn row_holding(identifier: &str, model: &str, context: u64, size_bytes: u64) -> String {
+    format!(
+        r#"{{"identifier":"{identifier}","modelKey":"{model}","status":"idle","contextLength":{context},"sizeBytes":{size_bytes}}}"#
+    )
+}
+
+/// An undersized darkmux instance is reloaded, and a dispatch unloads it
+/// first: the memory it holds comes back before the new load, so it is
+/// credited to what is reclaimable. A reload that does not fit even then
+/// still fails.
+#[serial_test::serial]
+#[test]
+fn projection_credits_an_undersized_instance_with_the_memory_its_reload_frees() {
+    let tight = |held: u64| {
+        Fakes::new(Some(PROFILES))
+            .loaded(&format!(
+                "[{},{}]",
+                row_holding("darkmux:big", "big", 8192, 1_000_000_000),
+                row_holding("darkmux:helper", "helper", 2048, held)
+            ))
+            .catalog(r#"[{"modelKey":"helper","type":"llm","sizeBytes":40000000000}]"#)
+            .free_gb(16)
+    };
+    let f = tight(40_000_000_000);
+    let c = f.projection();
+    assert_ne!(c.status, Status::Fail, "the reload frees what the instance holds: {}", c.message);
+    assert!(c.message.contains("reloads `darkmux:helper`, freeing ~40.0 GB"), "{}", c.message);
+    drop(f);
+    let f = tight(4_000_000_000);
+    let c = f.projection();
+    assert_eq!(c.status, Status::Fail, "a reload that is too big still fails: {}", c.message);
+}
+
 #[serial_test::serial]
 #[test]
 fn projection_skips_when_free_memory_cannot_be_read() {
@@ -252,6 +339,18 @@ fn projection_skips_when_free_memory_cannot_be_read() {
 }
 
 // ─── check_unpriceable_residents ────────────────────────────────────
+
+/// (#3444) The fake `lms` has run once before any test reads through it.
+/// macOS scans a freshly written executable on its first exec, which took
+/// 2.4 s to 32 s on a loaded host (#2976); the ledger gives `lms ps` 5 s,
+/// and a first exec inside that bound read as "residents unknown", so a row
+/// that should warn passed.
+#[serial_test::serial]
+#[test]
+fn the_fake_lms_has_run_once_before_a_test_reads_through_it() {
+    let f = Fakes::new(None);
+    assert!(f.dir.path().join("bin").join("lms.warm").exists(), "the first exec is left to the bounded call under test");
+}
 
 /// (#316 stage 3.6) The row reads the local engine's ledger: a resident with
 /// no catalog size and no readable weights is named as unpriceable.

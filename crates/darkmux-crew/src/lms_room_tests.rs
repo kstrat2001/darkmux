@@ -268,6 +268,9 @@ impl ModelHost for ArchHost {
     fn unload(&mut self, t: &darkmux_gestalt::OwnedTarget, d: darkmux_gestalt::Deadline) -> Result<(), darkmux_gestalt::HostError> {
         self.inner.unload(t, d)
     }
+    fn context_limit(&mut self, model_key: &str) -> Option<u64> {
+        self.inner.context_limit(model_key)
+    }
     fn on_this_machine(&self) -> bool {
         self.on_machine
     }
@@ -556,7 +559,7 @@ fn a_refused_wave_runs_none_of_its_jobs_and_each_ends_in_an_error() {
         let free = || Some(GIB);
         let machine = FakeMachine { capacity: Some(capacity), ..FakeMachine::new(&free) };
         let est = FixedEstimator(std::collections::BTreeMap::from([("map-model".to_string(), 5_000_000_000)]));
-        let results = run_bounded(jobs, &Facts::default(), &est, 4, &factory, Some(&rig.room(&machine))).expect("planned");
+        let results = run_bounded(jobs, &Facts::default(), &est, 4, &factory, Some(&rig.room(&machine)), &|_| {}).expect("planned");
         assert_eq!(ran.load(Ordering::SeqCst), 0, "no job of the refused wave ran");
         assert_eq!(results.len(), 2, "every job has its terminal result");
         for (_, r) in &results {
@@ -1003,6 +1006,8 @@ struct FakePreflight<'a> {
     calls: Mutex<Vec<String>>,
     /// What other dispatches hold is read from the leases on disk.
     real_leases: bool,
+    /// Each model's maximum context, as LM Studio's catalog states it.
+    context_limits: std::collections::BTreeMap<String, u64>,
 }
 
 impl FakePreflight<'static> {
@@ -1026,7 +1031,12 @@ impl<'a> FakePreflight<'a> {
             locks: Default::default(),
             calls: Default::default(),
             real_leases: false,
+            context_limits: Default::default(),
         }
+    }
+    fn context_limited(mut self, model_key: &str, limit: u64) -> Self {
+        self.context_limits.insert(model_key.into(), limit);
+        self
     }
     /// The caller prices `model_key` at `bytes`, both ways.
     fn priced(mut self, model_key: &str, bytes: u64) -> Self {
@@ -1090,7 +1100,12 @@ impl Preflight for FakePreflight<'_> {
         Ok(())
     }
     fn host(&self) -> Option<Box<dyn ModelHost>> {
-        let inner = MockHost { residents: self.residents.clone(), catalog: self.catalog.clone(), ..Default::default() };
+        let inner = MockHost {
+            residents: self.residents.clone(),
+            catalog: self.catalog.clone(),
+            context_limits: self.context_limits.clone(),
+            ..Default::default()
+        };
         Some(Box::new(ArchHost::new(inner, self.format)))
     }
     fn estimator(&self) -> &dyn FootprintEstimator {
@@ -1237,6 +1252,30 @@ fn a_preflight_load_short_of_memory_a_running_dispatch_holds_is_busy() {
     assert!(format!("{err:#}").contains("running dispatches hold TensorFold/q (tf)"), "{err:#}");
     assert!(tf.running(), "the held server was not stopped");
     assert!(gate.calls().is_empty(), "nothing loaded: {:?}", gate.calls());
+}
+
+/// (#1135 class) A profile asking more context than the model takes, as LM
+/// Studio's catalog states it, is refused before anything is unloaded or
+/// loaded: fresh, and as a reload of an instance resident below it. The
+/// error names the model, its maximum and the profile's `n_ctx`.
+#[test]
+#[serial_test::serial]
+fn a_preflight_asking_more_context_than_the_model_takes_is_refused_before_anything_changes() {
+    let _rig = Rig::new();
+    for gate in [
+        FakePreflight::without_machine().context_limited("m", 4_096),
+        FakePreflight::without_machine().context_limited("m", 4_096).resident("darkmux:m", "m", 4_096, GIB),
+    ] {
+        let err = format!("{:#}", preflight(&gate, "m").expect_err("8000 is beyond the model's 4096"));
+        for part in ["`m` takes at most 4096", "n_ctx=8000", "`n_ctx` to 4096 or less"] {
+            assert!(err.contains(part), "{part}: {err}");
+        }
+        assert!(gate.calls().is_empty(), "nothing unloaded or loaded: {:?}", gate.calls());
+        assert_eq!(gate.locks.get(), 0, "refused before the memory decision");
+    }
+    let roomy = FakePreflight::without_machine().context_limited("m", 8_000);
+    preflight(&roomy, "m").expect("a model that takes 8000 loads at 8000");
+    assert_eq!(roomy.calls(), ["load darkmux:m 8000"]);
 }
 
 /// A load priced only by the size-based estimate (its architecture

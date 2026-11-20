@@ -49,6 +49,16 @@ After pairing, call `GET /client/whoami` and gate every feature on its `capabili
 
 Every refusal carries a `code` and an `error`. Branch on the `code`; show the `error` to a person; never parse it. `unavailable` means not now (the Mac's settings could not be read, or `darkmux client serve` is stopping): send the request again later. `too_many_requests` means slow down. A code your app does not know comes from a newer darkmux: handle it by the HTTP status class.
 
+## Find an engine, or add one
+
+Gate this on `engines` in `capabilities`.
+
+1. Call `GET /client/engines`. It lists each engine darkmux found installed on the Mac in `detected`, and `usable` says whether any of them can run work. darkmux recommends none: when `usable` is false, which engine to suggest is your app's choice.
+2. Each entry says which `engine` it is, its `version`, its `state` (`usable`, `unusable`, or `unknown` when a probe failed or ran out of time), a `reason` for the last two, whether it is `configured`, and the `models` it holds. A model's `max_context` is the largest context the engine states for it, when it states one.
+3. An entry with `can_add` can be added, by an app on the Mac or by a device paired over the tailnet, through `url`. Ask your user first, then send `POST /client/engines` with its `engine`. Name a `model` when it holds more than one, and an `n_ctx` when the model states no `max_context` (that one is used otherwise). The request is the user's confirmation: darkmux writes the Mac's profile registry at once, and records the add in the `darkmux client serve` log, naming your client and whether it came from the Mac or over the tailnet (with the tailnet user and device). The reply names the new `profile`, which `POST /client/work` can run on.
+4. A refusal says why: `engine_unavailable` (not installed, or not usable as it is), `conflict` (configured already, including by another add that landed first, or the registry changed meanwhile: list again), `bad_request` (a `model` or `n_ctx` it cannot take, or an engine that needs nothing added), `unprocessable` (the registry cannot be edited safely; the operator fixes it on the Mac).
+5. When the Mac's operator has set which profiles apps may use, the new profile is listed by `GET /client/profiles` only once they add it there.
+
 ## Run work
 
 1. Optionally list what may run with `GET /client/profiles`.

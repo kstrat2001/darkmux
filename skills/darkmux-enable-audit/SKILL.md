@@ -129,7 +129,7 @@ Should now show `✓ audit integrity   1 file(s), 1 record(s), all chains pass t
 
 ## Step 7 — Optional: wire integrity-check into cron / CI
 
-`darkmux flow integrity-check` exits with **status 2** when any chain is broken. This is the contract that lets cron / CI / monitoring detect tampering without parsing output.
+`darkmux flow integrity-check` exits with **status 2** when any chain is broken, and with **status 3** when every chain verifies but the trail is incomplete: a day file's chain restarted (the file was emptied, cut to whitespace, or its first line set aside) or the local flow files record dropped audit writes (`audit.write_failed`) over the days the audit trail covers. `0` means neither. This is the contract that lets cron / CI / monitoring detect tampering and gaps without parsing output; any non-zero exit is worth a look.
 
 Propose a sample cron entry that alerts on broken chain (operator decides whether to add it):
 
@@ -139,7 +139,7 @@ Propose a sample cron entry that alerts on broken chain (operator decides whethe
 # Replace the darkmux path with what `which darkmux` shows on your machine
 # (cargo install puts it at ~/.cargo/bin/darkmux, NOT /usr/local/bin).
 0 6 * * * /usr/local/bin/darkmux flow integrity-check >/dev/null 2>&1 || \
-    echo "darkmux audit chain broken on $(hostname) at $(date)" | mail -s "darkmux audit alert" you@example.com
+    echo "darkmux audit chain broken or incomplete on $(hostname) at $(date) (exit 2: break, 3: restart or dropped write)" | mail -s "darkmux audit alert" you@example.com
 ```
 
 Tell the operator: this is **optional**, and it runs as the user who owns the crontab — make sure that user has `DARKMUX_AUDIT_DIR` set in their environment (cron doesn't read `.zshrc` by default; either inline the env var into the crontab or source the rc explicitly). Also: cron runs can miss alerts if mail delivery fails — for higher-stakes monitoring use a CI-side check or a monitoring agent that retries on failure.

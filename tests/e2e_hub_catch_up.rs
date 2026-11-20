@@ -6,7 +6,8 @@
 //! directly, so deleting the daemon's one call to `spawn_hub_catch_up_thread`
 //! left every one of them green. This boots the real release daemon (a binary
 //! with no test-support cfg, which is what honors `DARKMUX_REDIS_URL`) on a
-//! throwaway Redis. The outage watermark and the day file holding the missed
+//! throwaway Redis; the harness refuses a binary that ignores that URL
+//! (#3155). The outage watermark and the day file holding the missed
 //! record are written AFTER the daemon has finished starting (its first write
 //! is the only other thing that reads the watermark), so the record can reach
 //! the hub only through the tick.

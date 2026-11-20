@@ -12,6 +12,8 @@
 //! the reaper writes no dispatch terminal of its own.
 
 use darkmux_crew::orphan_reaper::{host_liveness, reap_tick, HostLiveness, LocalHost, ReapTick};
+use darkmux_sandbox::seatbelt::Undecided;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,13 +81,37 @@ pub(crate) fn this_host_tick_lines(docker_warned: &mut bool) -> Vec<String> {
     )
 }
 
+/// The lines for Seatbelt sandboxes darkmux cannot decide on (`found`,
+/// [`Undecided`]): one naming each and its remedy the first tick it is
+/// found, none while it stays undecided. `said` carries the names between
+/// ticks; one no longer found is forgotten, so it is named again if it
+/// comes back. darkmux never kills one (the pid may not be its own), so
+/// this is all a tick does about it.
+pub(crate) fn undecided_lines(found: &[Undecided], said: &mut BTreeSet<String>) -> Vec<String> {
+    said.retain(|name| found.iter().any(|u| &u.name == name));
+    found.iter().filter(|u| said.insert(u.name.clone())).map(|u| format!("darkmux serve: {}", u.remedy())).collect()
+}
+
+/// [`undecided_lines`] for this host's Seatbelt sandboxes, where it runs
+/// Seatbelt.
+fn this_host_undecided_lines(said: &mut BTreeSet<String>) -> Vec<String> {
+    if !darkmux_sandbox::SeatbeltBackend::available() {
+        return Vec::new();
+    }
+    undecided_lines(&darkmux_sandbox::seatbelt::undecided_sandboxes(), said)
+}
+
 /// Start the reaper thread: a tick at once, then every `interval` until
 /// `stop_flag` is set.
 pub(crate) fn spawn(interval: Duration, stop_flag: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut docker_warned = false;
+        let mut undecided_said = BTreeSet::new();
         loop {
             for line in this_host_tick_lines(&mut docker_warned) {
+                eprintln!("{line}");
+            }
+            for line in this_host_undecided_lines(&mut undecided_said) {
                 eprintln!("{line}");
             }
             let mut slept = Duration::ZERO;
@@ -142,6 +168,7 @@ mod tests {
     #[test]
     #[serial]
     fn the_production_tick_keeps_a_live_hosts_container_and_kills_a_dead_ones() {
+        darkmux_types::run_in_own_process!();
         let me = darkmux_crew::orphan_reaper::HostIdentity::this_process()
             .expect("this host reads its own pid, start time, machine uid and pid namespace");
         let mut child = std::process::Command::new("true").spawn().unwrap();
@@ -167,7 +194,8 @@ mod tests {
 
     fn with_path<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
         let prev = std::env::var("PATH").ok();
-        // SAFETY: every caller is `#[serial]`.
+        // SAFETY: every caller runs in its own process (`run_in_own_process!`),
+        // since every child of the process reads `PATH`.
         unsafe {
             std::env::set_var(
                 "PATH",
@@ -190,6 +218,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_serve_tick_kills_the_orphan_and_names_it_and_its_host() {
+        darkmux_types::run_in_own_process!();
         let dir = TempDir::new().unwrap();
         let record = dir.path().join("calls.txt");
         let docker = dir.path().join("docker");
@@ -272,6 +301,22 @@ mod tests {
         let tick = &src[src.find("pub(crate) fn this_host_tick_lines").unwrap()..];
         let tick = &tick[..tick.find("\n}\n").unwrap()];
         assert!(tick.contains("darkmux_crew::contained_command::reap_orphaned_containers();"), "{tick}");
+    }
+
+    /// An undecided sandbox is named once with its remedy, not every tick;
+    /// one that is no longer undecided is forgotten and named again if it
+    /// comes back.
+    #[test]
+    fn an_undecided_sandbox_is_named_once_not_every_tick() {
+        let u = |name: &str| Undecided { name: name.into(), dir: std::path::PathBuf::from(format!("/s/{name}")), pid: Some(7) };
+        let mut said = BTreeSet::new();
+        let first = undecided_lines(&[u("a")], &mut said);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].starts_with("darkmux serve: Seatbelt sandbox `a`") && first[0].contains("rm -rf '/s/a'"), "{first:?}");
+        assert!(undecided_lines(&[u("a")], &mut said).is_empty(), "not again");
+        assert_eq!(undecided_lines(&[u("a"), u("b")], &mut said).len(), 1, "only the new one");
+        assert!(undecided_lines(&[u("b")], &mut said).is_empty());
+        assert_eq!(undecided_lines(&[u("a"), u("b")], &mut said).len(), 1, "a came back");
     }
 
     /// (#3112) The idle line names every backend the tick asked, or says

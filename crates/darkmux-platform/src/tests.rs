@@ -727,17 +727,43 @@ fn a_label_two_chips_share_is_keyed_by_chip() {
     assert!(crate::linux::board_sensors_from_hwmon(&[hwmon("tas2764", "temp1", None, 31_000)]).is_none());
 }
 
+/// (#3621) One host sample reads hwmon once: power and sensors come from
+/// the same read.
+#[test]
+fn one_board_reading_reads_hwmon_once_for_power_and_sensors() {
+    let reads = std::cell::Cell::new(0);
+    let r = crate::linux::board_readings_from(|| {
+        reads.set(reads.get() + 1);
+        darkbook_hwmon()
+    });
+    assert_eq!(reads.get(), 1, "hwmon is read once per board reading");
+    assert_eq!(r.package_power_mw, Some(5001.028));
+    assert_eq!(r.sensors, crate::linux::board_sensors_from_hwmon(&darkbook_hwmon()));
+}
+
+/// (#3621) The kinds left unread are kinds no answer uses: the same inputs
+/// with every voltage and current dropped give the same board reading.
+#[test]
+fn the_hwmon_kinds_left_unread_change_no_board_reading() {
+    let mut all = darkbook_hwmon();
+    all.extend([hwmon("macsmc_hwmon", "in0", Some("Heatpipe Power"), 12_000), hwmon("macsmc_hwmon", "curr1", Some("Die"), 900)]);
+    let kept: Vec<_> = all.iter().filter(|i| crate::linux::hwmon_kind_is_read(&i.sensor)).cloned().collect();
+    assert_eq!(kept.len(), darkbook_hwmon().len(), "only the voltage and the current are left unread");
+    assert_eq!(crate::linux::board_readings_from(|| kept), crate::linux::board_readings_from(|| all));
+}
+
 #[test]
 fn this_linux_machine_reads_its_smc_power_and_sensors_if_it_has_them() {
     if std::env::consts::OS == "linux" && std::fs::read_dir("/sys/class/hwmon").is_ok_and(|d| {
         d.flatten().any(|c| std::fs::read_to_string(c.path().join("name")).is_ok_and(|n| n.trim() == "macsmc_hwmon"))
     }) {
-        let mw = LinuxPlatform.package_power_mw().expect("the SMC's heatpipe power");
+        let board = LinuxPlatform.board_readings();
+        let mw = board.package_power_mw.expect("the SMC's heatpipe power");
         assert!(mw > 0.0 && mw < 200_000.0, "{mw} mW");
-        assert!(!LinuxPlatform.board_sensors().expect("SMC sensors").temps_c.is_empty());
+        assert!(!board.sensors.expect("SMC sensors").temps_c.is_empty());
     }
-    assert!(MacPlatform.package_power_mw().is_none() && MacPlatform.board_sensors().is_none());
-    assert!(OtherPlatform.package_power_mw().is_none() && OtherPlatform.board_sensors().is_none());
+    assert_eq!(MacPlatform.board_readings(), BoardReadings::default());
+    assert_eq!(OtherPlatform.board_readings(), BoardReadings::default());
 }
 
 #[test]
@@ -1745,6 +1771,50 @@ fn netstat_listen_rows_on_a_port_parse_to_addresses_and_owners() {
     assert_eq!(crate::port_listeners_from_netstat(&unparsed, 47996), None);
 }
 
+/// Every port a netstat LISTEN row holds, at any address and in either
+/// family, sorted and once each; an ESTABLISHED row is not one. A header
+/// that is not netstat's, or a LISTEN row whose port does not read, is no
+/// answer at all, never "nothing listens".
+#[test]
+fn netstat_listen_rows_parse_to_every_listening_port() {
+    let head = "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat          process:pid    state  options           gencnt    flags   flags1 usecnt rtncnt fltrs\n";
+    let row = |proto: &str, local: &str, state: &str| {
+        format!("{proto}       0      0  {local}                *.*                    {state}                 0            0  131072  131072           Python:2900   00000 00000002 0000000000ff626a 00000000 00000800      1      0 000000\n")
+    };
+    let table = [
+        head.to_string(),
+        row("tcp4", "127.0.0.1.8799", "LISTEN"),
+        row("tcp6", "::1.1234", "LISTEN"),
+        row("tcp46", "*.8799", "LISTEN"),
+        row("tcp6", "fe80::1823:f45e:.6379", "LISTEN"),
+        "tcp4       0      0  127.0.0.1.4000         127.0.0.1.50000        ESTABLISHED         1 2 3 4 x:9 00 0 0 0 0 0 0 0\n".to_string(),
+    ]
+    .concat();
+    assert_eq!(crate::listening_ports_from_netstat(&table), Some(vec![1234, 6379, 8799]));
+    assert_eq!(crate::listening_ports_from_netstat(head), Some(vec![]), "nothing listens");
+    assert_eq!(crate::listening_ports_from_netstat("not netstat\n"), None, "a header that is not netstat's");
+    let broken = format!("{head}{}", row("tcp4", "127.0.0.1.80x", "LISTEN"));
+    assert_eq!(crate::listening_ports_from_netstat(&broken), None, "a LISTEN row whose port does not read");
+}
+
+/// This host's listening ports, asked of its strategy, hold a port this
+/// process listens on, on the loopback in either family. An OS with no
+/// strategy cannot say.
+#[test]
+fn the_host_lists_every_port_something_listens_on() {
+    if current().id() == "other" {
+        assert_eq!(current().tcp_listening_ports(), None, "no strategy reads sockets here");
+        return;
+    }
+    let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let v6 = std::net::TcpListener::bind("[::1]:0").ok();
+    let ports = current().tcp_listening_ports().unwrap();
+    assert!(ports.contains(&v4.local_addr().unwrap().port()), "{ports:?}");
+    if let Some(v6) = v6 {
+        assert!(ports.contains(&v6.local_addr().unwrap().port()), "{ports:?}");
+    }
+}
+
 /// (#3112 review) Only a netstat that exited 0 answers; any other exit,
 /// or none (killed at the bound), is no answer.
 #[test]
@@ -2514,4 +2584,253 @@ fn the_overlay_tool_is_looked_for_where_each_platform_installs_it() {
     let fake = crate::fake::FakePlatform { overlay_tool_locations: vec!["/x/t".into()], ..Default::default() };
     assert_eq!(fake.overlay_tool_locations(), ["/x/t"]);
     assert!(crate::fake::FakePlatform::default().overlay_tool_locations().is_empty());
+}
+
+// ── whose process a loopback peer is ────────────────────────────────────
+
+/// A process is in a sandbox on the host when it is one of a leader's
+/// members (`sandbox_members`): the leader, its group or session, or a
+/// descendant. A process outside every leader's is not; neither is anything
+/// when no sandbox runs.
+#[test]
+fn a_process_is_in_a_host_sandbox_when_it_is_one_of_a_leaders_members() {
+    let table = [
+        (1, 0, 1, 1),         // launchd / init
+        (50, 1, 50, 50),      // the operator's shell
+        (51, 50, 51, 50),     // the operator's CLI
+        (100, 50, 100, 100),  // a sandbox's launcher
+        (101, 100, 100, 100), // its program
+        (102, 101, 102, 102), // a descendant in a session of its own
+    ];
+    for pid in [100, 101, 102] {
+        assert!(crate::in_sandbox_of_table(pid, &[300, 100], &table), "{pid} is the sandbox's");
+    }
+    assert!(!crate::in_sandbox_of_table(51, &[100], &table), "the operator's CLI is not");
+    assert!(!crate::in_sandbox_of_table(50, &[100], &table), "the leader's parent is not");
+    assert!(!crate::in_sandbox_of_table(101, &[], &table), "no sandbox runs");
+    let fake = FakePlatform { process_table: Some(table.to_vec()), ..Default::default() };
+    assert_eq!(fake.in_sandbox_of(101, &[100]), Some(true));
+    assert_eq!(FakePlatform::default().in_sandbox_of(101, &[100]), None, "no table, no answer");
+    assert_eq!(OtherPlatform.in_sandbox_of(101, &[100]), None);
+}
+
+/// This host's strategy reads its own process table: a child started as
+/// the leader of a session of its own (as a Seatbelt launcher is) is in
+/// that leader's sandbox, and this test's own process is not.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_host_tells_a_sandbox_leaders_session_from_this_process() {
+    let mut cmd = std::process::Command::new("/bin/sleep");
+    cmd.arg("5");
+    crate::in_a_session_of_its_own(&mut cmd);
+    let mut child = cmd.spawn().unwrap();
+    let leader = child.id();
+    let here = std::process::id();
+    let answers = (current().in_sandbox_of(leader, &[leader]), current().in_sandbox_of(here, &[leader]));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(answers, (Some(true), Some(false)));
+}
+
+/// The container engines' forwarders are named; an ordinary program, or a
+/// name that only contains one, is not.
+#[test]
+fn a_container_forwarder_is_known_by_its_executable_name() {
+    for name in ["com.docker.backend", "vpnkit", "docker-proxy", "gvproxy", "limactl"] {
+        assert!(crate::is_container_forwarder(name), "{name}");
+    }
+    for name in ["curl", "Google Chrome Helper", "darkmux", "com.docker.backend.evil", ""] {
+        assert!(!crate::is_container_forwarder(name), "{name}");
+    }
+}
+
+/// A process's name is its executable link's file name, a deleted binary's
+/// mark dropped; with no link to read (another user's process), its `comm`.
+#[test]
+fn a_linux_process_is_named_by_its_executable_else_its_command_name() {
+    use crate::linux::name_from_exe_or_comm as name;
+    assert_eq!(name(Some("/usr/bin/docker-proxy".into()), || None), Some("docker-proxy".into()));
+    assert_eq!(name(Some("/tmp/x/curl (deleted)".into()), || None), Some("curl".into()));
+    assert_eq!(name(None, || Some("docker-proxy\n".into())), Some("docker-proxy".into()));
+    assert_eq!(name(None, || Some("\n".into())), None);
+    assert_eq!(name(None, || None), None);
+}
+
+/// This host's strategy names this test's own executable.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_host_names_a_processs_executable() {
+    let exe = std::env::current_exe().unwrap();
+    let want = exe.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(current().process_name(std::process::id()), Some(want));
+    assert_eq!(OtherPlatform.process_name(1), None);
+}
+
+/// A look at a port's connections that hangs is no answer within its
+/// bound, never a wait without end; one that answers is read.
+#[cfg(unix)]
+#[test]
+fn a_hung_connection_listing_is_no_answer_within_its_bound() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::TempDir::new().unwrap();
+    let stub = |name: &str, body: &str| {
+        let p = dir.path().join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        p
+    };
+    // Both written before either runs: a file still open for writing in a
+    // process forked meanwhile cannot be run (ETXTBSY).
+    let hung = stub("hung", "exec /bin/sleep 30");
+    let answers = stub("answers", "printf 'p7\\nn127.0.0.1:5000->127.0.0.1:8767\\n'");
+    let started = std::time::Instant::now();
+    let answer = crate::macos::lsof_established_with(&hung, 8767, std::time::Duration::from_millis(300));
+    assert_eq!(answer, None, "a hung lsof is no answer");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "within its bound, not the stub's 30 s: {:?}", started.elapsed());
+    let out = crate::macos::lsof_established_with(&answers, 8767, std::time::Duration::from_secs(60)).expect("the stub answers");
+    assert_eq!(crate::peers_from_lsof_fpn(&out, "127.0.0.1:8767".parse().unwrap()), vec![("127.0.0.1:5000".parse().unwrap(), 7)]);
+}
+
+/// What each strategy says a spawned process may be handed: macOS bounds
+/// only the total (`ARG_MAX`), Linux also each string (`MAX_ARG_STRLEN`,
+/// 32 pages: 128 KiB with 4 KiB pages, 512 KiB with Asahi's 16 KiB), an
+/// unknown OS nothing, and a fake what the test set.
+#[test]
+fn each_strategy_answers_what_a_spawned_process_may_be_handed() {
+    assert_eq!(linux_max_arg_strlen(4096), 128 * 1024);
+    assert_eq!(linux_max_arg_strlen(16384), 512 * 1024);
+    let mac = MacPlatform.exec_env_limits();
+    assert_eq!(mac.per_string, None);
+    let linux = LinuxPlatform.exec_env_limits();
+    assert_eq!(linux.per_string, page_size().map(linux_max_arg_strlen));
+    #[cfg(unix)]
+    {
+        let total = arg_max().expect("a unix system answers ARG_MAX");
+        assert!(total >= 64 * 1024, "{total}");
+        assert_eq!((mac.total, linux.total), (Some(total), Some(total)));
+        assert!(linux.per_string.unwrap() >= 128 * 1024);
+    }
+    assert_eq!(OtherPlatform.exec_env_limits(), ExecEnvLimits::default());
+    let set = ExecEnvLimits { per_string: Some(1), total: Some(2) };
+    assert_eq!(FakePlatform { exec_env_limits: set, ..Default::default() }.exec_env_limits(), set);
+}
+
+/// The port-free decision over what the binds came to and the listeners
+/// this user can see. A bind the host refuses is a held port even when no
+/// listener is visible: another user's or root's, which `lsof` and
+/// `/proc/<pid>/fd` leave out.
+#[test]
+fn a_port_is_free_only_when_darkmux_could_bind_it_and_sees_no_listener() {
+    use BindOutcome::{Absent, Bound, Failed, InUse};
+    let none: &[u32] = &[];
+    assert!(port_free_from(&[Bound, Bound, Bound, Bound], Some(none)));
+    assert!(!port_free_from(&[Bound, InUse, Bound, Bound], Some(none)), "a listener this user cannot see");
+    assert!(!port_free_from(&[Bound, Bound, Bound, InUse], Some(none)), "an IPv6-only listener this user cannot see");
+    assert!(!port_free_from(&[Bound, Bound, Bound, Bound], Some(&[7])), "a listener this user can see");
+    assert!(port_free_from(&[Bound, Bound, Absent, Absent], None), "no IPv6, and no listing: the binds decide");
+    assert!(!port_free_from(&[Failed, Bound, Bound, Bound], Some(none)), "a bind that says nothing is no answer");
+    assert!(!port_free_from(&[Absent, Absent, Absent, Absent], Some(none)), "nothing bound");
+    assert!(!port_free_from(&[], Some(none)), "nothing tried");
+}
+
+/// A bind's result as an outcome: in use when the host says so; any other
+/// failure is an absent address for IPv6 and no answer for IPv4.
+#[test]
+fn a_binds_result_reads_as_bound_in_use_absent_or_failed() {
+    use std::io::{Error, ErrorKind};
+    let v4 = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let v6 = std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+    let in_use = || Err(Error::from(ErrorKind::AddrInUse));
+    let other = || Err(Error::from(ErrorKind::AddrNotAvailable));
+    assert_eq!(bind_outcome(v4, &Ok(())), BindOutcome::Bound);
+    assert_eq!((bind_outcome(v4, &in_use()), bind_outcome(v6, &in_use())), (BindOutcome::InUse, BindOutcome::InUse));
+    assert_eq!((bind_outcome(v4, &other()), bind_outcome(v6, &other())), (BindOutcome::Failed, BindOutcome::Absent));
+}
+
+/// A real socket held on the wildcard: the probe's bind of the wildcard is
+/// refused (macOS lets the loopback bind beside it under `SO_REUSEADDR`), and
+/// the port is not free. Released, it is free again.
+#[test]
+fn a_port_held_on_the_wildcard_is_not_free() {
+    let held = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    let wildcard = PROBED.iter().position(|ip| *ip == std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)).unwrap();
+    assert_eq!(bind_probe(port)[wildcard], BindOutcome::InUse);
+    assert!(!tcp_port_free(port));
+    drop(held);
+    assert!(tcp_port_free(port), "released, nothing holds it");
+}
+
+/// A real socket held on the IPv6 loopback only: the IPv4 binds go through,
+/// and the probe's IPv6 bind is what refuses it. A host without an IPv6
+/// loopback has nothing to hold.
+#[test]
+fn a_port_held_on_the_ipv6_loopback_is_not_free() {
+    let Ok(held) = std::net::TcpListener::bind("[::1]:0") else {
+        eprintln!("this host has no IPv6 loopback");
+        return;
+    };
+    let port = held.local_addr().unwrap().port();
+    let loopback = PROBED.iter().position(|ip| *ip == std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)).unwrap();
+    assert_eq!(bind_probe(port)[loopback], BindOutcome::InUse);
+    assert!(!tcp_port_free(port));
+}
+
+/// The probe binds and never listens: while it holds each address, a
+/// connection to that address (the loopback of its family, for a wildcard)
+/// is not accepted (macOS lets it time out rather than refusing it; a
+/// listener on the loopback accepts within microseconds). A listening probe
+/// would accept one, and on a Mac whose
+/// application firewall is on, listening on the wildcard can prompt.
+#[test]
+fn the_port_probe_binds_without_listening() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (held, accepted) = (std::sync::Mutex::new(Vec::new()), std::sync::Mutex::new(Vec::new()));
+    let outcomes = crate::port_free::bind_probe_holding(port, &|at, _| {
+        held.lock().unwrap().push(at);
+        let ip = match at.ip() {
+            std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        };
+        let to = std::net::SocketAddr::new(ip, port);
+        if std::net::TcpStream::connect_timeout(&to, std::time::Duration::from_millis(250)).is_ok() {
+            accepted.lock().unwrap().push(at);
+        }
+    });
+    let bound = outcomes.iter().filter(|o| **o == BindOutcome::Bound).count();
+    assert_eq!((outcomes[0], held.into_inner().unwrap().len()), (BindOutcome::Bound, bound), "the probe held each address it bound");
+    assert_eq!(accepted.into_inner().unwrap(), Vec::<std::net::SocketAddr>::new(), "a connection reached the probe");
+}
+
+/// A port whose last connection closed on this side first is left in
+/// `TIME_WAIT`, holding no listener: the probe sets `SO_REUSEADDR` as a
+/// server does, so the port reads free, as it would bind for one.
+#[test]
+fn a_port_left_in_time_wait_is_free() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let (served, _) = listener.accept().unwrap();
+    drop(served);
+    drop(listener);
+    drop(client);
+    assert!(tcp_port_free(port));
+}
+
+/// The probe's socket is close-on-exec while it holds each address, as
+/// std's listener was: a child spawned on another thread during the probe
+/// (the daemon spawns them) must not inherit it and hold the port.
+#[test]
+fn the_port_probes_socket_is_not_inherited_by_a_child() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let inherited = std::sync::Mutex::new(Vec::new());
+    let held = std::sync::Mutex::new(0);
+    crate::port_free::bind_probe_holding(port, &|at, fd| {
+        *held.lock().unwrap() += 1;
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC == 0 {
+            inherited.lock().unwrap().push(at);
+        }
+    });
+    assert!(held.into_inner().unwrap() > 0, "the probe held an address");
+    assert_eq!(inherited.into_inner().unwrap(), Vec::<std::net::SocketAddr>::new(), "a probe socket a child would inherit");
 }

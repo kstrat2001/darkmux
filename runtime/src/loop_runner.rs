@@ -640,28 +640,15 @@ fn saturating_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// (#3013) Announce the re-read loop escalation: the operator-visible line
-/// and the `EscalationTriggered` trajectory record. The caller returns the
-/// `LoopOutcome`, carrying every banked turn out as the other compaction
-/// bounds do.
-fn announce_reread_loop(
-    trajectory: &mut Trajectory,
-    turns: u32,
-    repeats: u32,
-    model: &str,
-    latest_prompt_tokens: u32,
-) {
+/// (#3013) The operator-visible line for the re-read loop escalation. The
+/// caller escalates, which records it and carries the turn's pending answer
+/// out as every other escalation does.
+fn announce_reread_loop(repeats: u32) {
     eprintln!(
         "darkmux-runtime: {repeats} compactions in a row were followed by a turn that \
          re-read exactly what the turn before the compaction read. Each compaction \
          succeeds and each re-read refills the context, so the run cannot converge. \
          ESCALATING to the frontier rather than repeating the loop. (#3013)"
-    );
-    trajectory.append_escalation_triggered(
-        turns,
-        escalation_reason_str(EscalationReason::CompactionRereadLoop),
-        model,
-        latest_prompt_tokens,
     );
 }
 
@@ -953,6 +940,9 @@ struct TurnAccum {
     carries_own_opener: bool,
     /// Where this turn's prefill sits in `messages`, while one is live.
     prefill_at: Option<usize>,
+    /// A salvage removed the prefill and kept the regions (`supersede`): the
+    /// turn's banked work is in no message until the turn ends.
+    superseded: bool,
 }
 
 impl TurnAccum {
@@ -1222,10 +1212,15 @@ impl TurnAccum {
     /// invalid conversation shape — measured: the next request returned HTTP
     /// 500. Folding instead ends the turn early and restores content that
     /// salvage deliberately cleared. Neither is right; the prefill simply needs
-    /// to go while the regions stay, so the accumulation returns at the next
-    /// checkpoint.
+    /// to go while the regions stay.
+    ///
+    /// The regions are then the turn's banked work and are in no message: the
+    /// salvaged message's content was cleared. They stay until the next call
+    /// opens a new turn (`begin`), so a run that ends before that call, on any
+    /// escalation of this tool turn, hands them over through `pending_answer`.
     fn supersede(&mut self, messages: &mut Vec<Message>) {
         self.remove_prefill(messages);
+        self.superseded = true;
     }
 
     /// Give up on this turn: the message and the state go together. Used by the
@@ -1235,11 +1230,14 @@ impl TurnAccum {
         self.clear();
     }
 
-    /// The answer this turn would hand over if the run ended right now, and
-    /// only while a prefill is still live — once folded, the deliverable is
-    /// already the last message and there is nothing to override.
+    /// The answer this turn would hand over if the run ended right now, while
+    /// the turn's banked work is in no final message: a prefill is still live,
+    /// or a salvage superseded it (`supersede`). Once folded, the deliverable
+    /// is already the last message and there is nothing to override.
     fn pending_answer(&self) -> Option<String> {
-        self.prefill_at?;
+        if self.prefill_at.is_none() && !self.superseded {
+            return None;
+        }
         let d = self.deliverable("");
         if d.trim().is_empty() {
             None
@@ -1295,6 +1293,7 @@ impl TurnAccum {
         self.is_reasoning = false;
         self.carries_own_opener = false;
         self.prefill_at = None;
+        self.superseded = false;
     }
 }
 
@@ -2796,11 +2795,9 @@ fn detector_code_hash(canonical_args: &str) -> Option<String> {
         .get("path")?
         .as_str()?
         .to_owned();
-    let meta = std::fs::metadata(&path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_HASH_BYTES {
-        return None;
-    }
-    let bytes = std::fs::read(&path).ok()?;
+    // One open, never a named pipe or device (a swap after a separate check
+    // could block the loop for ever), refused unread over the cap.
+    let bytes = crate::tools::workspace::read_whole_regular_bytes(std::path::Path::new(&path), MAX_HASH_BYTES).ok()?;
     Some(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -6999,6 +6996,24 @@ mod tests {
             "the actual answer text",
             "the answer region wins whenever it has content"
         );
+    }
+
+    /// A salvage's banked work is pending until its turn ends, and not after:
+    /// the next turn's first slice, absorbed before any prefill exists, is not
+    /// an answer the loop has banked.
+    #[test]
+    fn a_superseded_turns_banked_work_is_pending_only_until_the_turn_ends() {
+        let mut messages = vec![Message::system("s"), Message::user("u")];
+        let mut turn = TurnAccum::default();
+        turn.absorb("", "banked answer");
+        turn.hand_back(&mut messages);
+        turn.supersede(&mut messages);
+        assert_eq!(messages.len(), 2, "the prefill message is gone");
+        assert_eq!(turn.pending_answer().as_deref(), Some("banked answer"), "the regions are the turn's banked work");
+
+        turn.begin(&mut messages);
+        turn.absorb("", "a new turn's first slice");
+        assert_eq!(turn.pending_answer(), None, "a new turn starts with nothing banked");
     }
 
     #[test]
@@ -15094,6 +15109,37 @@ mod tests {
         assert!(detector_code_hash("not json").is_none());
         // A `path` that doesn't exist → None (best-effort, never a fake hash).
         assert!(detector_code_hash(r#"{"path":"/no/such/file.rs"}"#).is_none());
+    }
+
+    /// A named pipe is refused at its open, never waited on: the hash runs
+    /// on the loop's own thread, with no deadline.
+    #[test]
+    fn detector_code_hash_never_waits_on_a_named_pipe() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pipe = dir.path().join("p");
+        let c = std::ffi::CString::new(pipe.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let args = serde_json::json!({ "path": pipe.to_str().unwrap() }).to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(detector_code_hash(&args)).unwrap());
+        let hashed = rx.recv_timeout(std::time::Duration::from_secs(5));
+        if hashed.is_err() {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new().read(true).write(true).custom_flags(libc::O_NONBLOCK).open(&pipe);
+        }
+        assert_eq!(hashed.expect("still blocked on a named pipe after 5 s"), None);
+    }
+
+    /// Over the cap is no hash; at the cap is one.
+    #[test]
+    fn detector_code_hash_skips_a_file_over_its_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let big = dir.path().join("big.rs");
+        std::fs::File::create(&big).unwrap().set_len(10 * 1024 * 1024 + 1).unwrap();
+        let args = |p: &std::path::Path| serde_json::json!({ "path": p.to_str().unwrap() }).to_string();
+        assert!(detector_code_hash(&args(&big)).is_none());
+        std::fs::OpenOptions::new().write(true).open(&big).unwrap().set_len(10 * 1024 * 1024).unwrap();
+        assert!(detector_code_hash(&args(&big)).is_some());
     }
 
     // ─── (#465/#472) cadence_drift_step state machine ────────────────

@@ -24,9 +24,10 @@ pub enum ConfigCmd {
     /// `darkmux config set redis.host 100.64.0.2`,
     /// `darkmux config set fleet.mode hub`, or
     /// `darkmux config set role_profiles.code-reviewer qwen35b` (bind a role to
-    /// a profile). The role id must be a real one (`darkmux role
-    /// list`): a typo'd or invented role id is settable but resolves nothing
-    /// (`darkmux doctor` flags it).
+    /// a profile). The role must be one `darkmux role list` shows and the
+    /// profile one the registry defines: either refused names the closest,
+    /// and nothing is written. An empty value clears a binding, whatever its
+    /// role.
     ///
     /// With no VALUE, prints what the key accepts: for an enum-valued key,
     /// every valid value with its meaning.
@@ -169,6 +170,9 @@ const KEYS: &[(&str, Ty)] = &[
     // (#3275) A string: a bare uid stays `"1000"`, the field is a string.
     ("runtime.container_user", Ty::Str),
     ("runtime.tests_on_host", Ty::Bool),
+    // (#3112) A string in Docker's size syntax (`4g`), checked before it
+    // is written (`check_sandbox_memory`).
+    ("sandbox.memory", Ty::Str),
     // (#2110/#2109) The thermal governor + breaker's tuning block —
     // see `ThermalConfig`'s own doc. (#2947) The enum-valued keys
     // (`runtime.detection.degeneracy.policy`, `runtime.thermal.pause_at` /
@@ -295,13 +299,13 @@ pub fn run(cmd: ConfigCmd) -> Result<i32> {
             return Ok(2);
         }
         ConfigCmd::Get { key } => {
-            println!("{}", get_at(&path, &key)?);
+            println!("{}", get_warned(&path, &key)?);
         }
         ConfigCmd::List => {
             // (5.0) The console's config-list panel, for a viewer that is not
             // this machine: values that name an address, a path, a URL, a
             // credential pointer or the execution surface are withheld.
-            let listed = list_for(&path, darkmux_types::panel_audience::remote())?;
+            let listed = list_warned(&path, darkmux_types::panel_audience::remote())?;
             println!("{listed}");
             // (#2947) stderr, so `darkmux config list | jq` still parses,
             // and only for a person at a terminal: the serve daemon's
@@ -318,12 +322,31 @@ pub fn run(cmd: ConfigCmd) -> Result<i32> {
     Ok(0)
 }
 
+fn warn_about_duplicates(path: &Path) {
+    if let Some(warning) = duplicate_warning_at(path) {
+        eprintln!("warning: {warning}");
+    }
+}
+
+/// `config get`: [`get_at`], after the duplicate-key warning.
+fn get_warned(path: &Path, key: &str) -> Result<String> {
+    warn_about_duplicates(path);
+    get_at(path, key)
+}
+
+/// `config list`: [`list_for`], after the duplicate-key warning.
+fn list_warned(path: &Path, remote: bool) -> Result<String> {
+    warn_about_duplicates(path);
+    list_for(path, remote)
+}
+
 /// Look up a key's type, or `None` if it isn't a known settable key. Static
 /// keys come from `KEYS`; the `role_profiles.<role-id>` map (#1475 packet 1) is
 /// DYNAMIC — any single `role_profiles.<role-id>` segment is a settable string
 /// (the bound profile name). Only the SHAPE is validated here (one level:
-/// `role_profiles.<role> -> <profile>`); that the named profile EXISTS is a
-/// resolution-time / `darkmux doctor` concern (config-leniency contract 7).
+/// `role_profiles.<role> -> <profile>`); that the role and the profile exist
+/// is checked by `set_at` before it writes ([`check_role_binding`]), and by
+/// `darkmux doctor` for a file edited by hand.
 fn key_type(key: &str) -> Option<Ty> {
     if let Some(role) = key.strip_prefix("role_profiles.") {
         // Exactly one more segment — reject a blank role (`role_profiles.`) or a
@@ -403,9 +426,11 @@ fn describe_key_at(path: &Path, key: &str) -> Result<String> {
     })
 }
 
-/// Set `key` to `value` in the config.json at `path`, returning the operator
-/// confirmation line. Pure-ish (file IO only) so tests drive it with a temp path.
-pub(crate) fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
+/// The keys `config set` refuses by name, each with its own remedy: a
+/// secret (the Keychain form), a retired key (what replaced it), the one
+/// role the dynamic map does not take, and `fleet.accept_work.*` (the
+/// command that writes it).
+fn refuse_unsettable_key(key: &str) -> Result<()> {
     if let Some((_, item)) = SECRET_KEYS.iter().find(|(k, _)| *k == key) {
         bail!(
             "`{key}` is a secret and never lives in config.json — store it in the macOS Keychain:\n  \
@@ -429,6 +454,16 @@ pub(crate) fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
              still a profile binding: `role_profiles.radio-host`. (#2914)"
         );
     }
+    if let Some(remedy) = accept_work_remedy(key) {
+        bail!("{remedy}");
+    }
+    Ok(())
+}
+
+/// Set `key` to `value` in the config.json at `path`, returning the operator
+/// confirmation line. Pure-ish (file IO only) so tests drive it with a temp path.
+pub(crate) fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
+    refuse_unsettable_key(key)?;
     let Some(ty) = key_type(key) else {
         bail!("unknown config key `{key}`{}", suggestion(key));
     };
@@ -482,8 +517,112 @@ fn names_the_answering_seat(key: &str) -> bool {
 /// address or an engine is checked before it is written.
 fn check_value(key: &str, value: &str) -> Result<()> {
     check_answering_seat(key, value)?;
+    check_role_binding(key, value)?;
     check_default_engine(key, value)?;
-    check_container_user(key, value)
+    check_container_user(key, value)?;
+    check_sandbox_memory(key, value)
+}
+
+/// (#3112) `sandbox.memory` is a size every sandbox backend takes; anything
+/// else is refused here, before it is written, as every entry point would
+/// refuse it after.
+fn check_sandbox_memory(key: &str, value: &str) -> Result<()> {
+    if key != "sandbox.memory" {
+        return Ok(());
+    }
+    darkmux_types::size::sandbox_memory_bytes(value)
+        .map(|_| ())
+        .map_err(|why| anyhow!("invalid value for `{key}`: {why}; the form is {}", darkmux_types::size::SANDBOX_MEMORY_FORM))
+}
+
+/// `role_profiles.<role> <profile>`: the role must be one darkmux can
+/// dispatch and the profile one the registry defines, refused before it is
+/// written (contract 9), naming the closest of each. Doctor fails the same
+/// pair (`role_profiles_status`); refusing it here means it is never written
+/// in the first place. radio's answering seat may name a profile on a fleet
+/// peer (`<profile>@<machine>`), whose registry defines it, so that form
+/// skips the registry check, as doctor's does. A blank value binds nothing
+/// (the map drops it, `config_access::role_profiles`), so it is always
+/// accepted, whatever the role: it is how a binding is cleared (no `config`
+/// verb removes one), including a binding whose role no longer exists.
+fn check_role_binding(key: &str, value: &str) -> Result<()> {
+    let Some(role) = key.strip_prefix("role_profiles.") else { return Ok(()) };
+    if value.trim().is_empty() {
+        return Ok(());
+    }
+    let roles: Vec<String> = crate::crew::loader::load_roles()
+        .map_err(|e| anyhow!("cannot check `{key}`: the role library did not load ({e:#}); `darkmux doctor` names the file"))?
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    refuse_unknown_binding_role(key, role, &roles)?;
+    if is_peer_seat(role, value) {
+        return Ok(());
+    }
+    let loaded = darkmux_profiles::profiles::load_registry_quiet(None).map_err(|e| {
+        anyhow!("cannot check `{key}`: the profile registry did not load ({e:#}); `darkmux doctor` names the problem")
+    })?;
+    let defined: Vec<&str> = loaded.registry.profiles.keys().map(String::as_str).collect();
+    refuse_undefined_binding_profile(key, value.trim(), &defined)
+}
+
+/// The refusal for a `role_profiles.<role>` key whose role does not exist.
+/// A role of the operator's own exists once its manifest is in the user
+/// roles directory, so the refusal names that path for one not added yet.
+fn refuse_unknown_binding_role(key: &str, role: &str, roles: &[String]) -> Result<()> {
+    if roles.iter().any(|r| r == role) {
+        return Ok(());
+    }
+    let hint = closest_hint(role, roles.iter().map(String::as_str));
+    let manifest = crate::crew::loader::user_roles_dir().join(format!("{role}.json"));
+    bail!(
+        "`{key}`: `{role}` names no role{hint}. `darkmux role list` shows the roles; a role of your own exists once \
+         its manifest is at {}, so add that first. Nothing was written",
+        manifest.display()
+    )
+}
+
+/// The refusal for a binding whose profile the registry does not define.
+fn refuse_undefined_binding_profile(key: &str, profile: &str, defined: &[&str]) -> Result<()> {
+    if defined.contains(&profile) {
+        return Ok(());
+    }
+    let hint = closest_hint(profile, defined.iter().copied());
+    bail!(
+        "invalid value for `{key}`: `{profile}` names no profile in the registry{hint}. `darkmux profile list` \
+         shows them; nothing was written"
+    )
+}
+
+/// `; the closest is `<c>`` by the one suggester, or nothing when there are
+/// no candidates.
+fn closest_hint<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -> String {
+    darkmux_types::user_files::closest(name, candidates).map(|c| format!("; the closest is `{c}`")).unwrap_or_default()
+}
+
+/// A `radio-host` binding written as `<profile>@<machine>`: the seat runs on
+/// that fleet peer, whose registry defines the profile.
+fn is_peer_seat(role: &str, value: &str) -> bool {
+    role == "radio-host"
+        && darkmux_types::profile_address::ProfileAddress::parse(value).is_ok_and(|a| a.machine.is_some())
+}
+
+/// `fleet.accept_work.<name>` is a config key with no `config set` form:
+/// `darkmux machine trust` resolves the peer's node id through the identity
+/// provider and writes the entry. The remedy names that command, never a
+/// near-miss key.
+fn accept_work_remedy(key: &str) -> Option<String> {
+    let rest = key.strip_prefix("fleet.accept_work")?;
+    let name = match rest.strip_prefix('.') {
+        Some(n) if !n.is_empty() => n,
+        _ if rest.is_empty() || rest == "." => "<name>",
+        _ => return None,
+    };
+    Some(format!(
+        "`{key}` is written only by `darkmux machine trust {name}`, which looks the machine's node up through the \
+         identity provider and stores its id (`darkmux machine untrust {name}` removes it); `config set` cannot \
+         write it"
+    ))
 }
 
 /// (#3275) `runtime.container_user` is `image`, `<uid>` or `<uid>:<gid>`;
@@ -681,6 +820,29 @@ pub(crate) fn load_object(path: &Path) -> Result<Value> {
     }
 }
 
+/// Every key the config.json at `path` writes twice, as the gate words
+/// each, `None` when there is none (or the file is clean otherwise judged:
+/// other problems are doctor's and the preflights').
+fn duplicate_lines_at(path: &Path) -> Option<String> {
+    use darkmux_types::user_files::{Issue, Problem};
+    let refusal = darkmux_types::user_files::config_check_at(path).refusal?;
+    let Problem::Keys(keys) = &refusal.problem else { return None };
+    let lines: Vec<String> = keys.iter().filter(|k| matches!(k.issue, Issue::Duplicate(_))).map(ToString::to_string).collect();
+    (!lines.is_empty()).then(|| lines.join("; "))
+}
+
+/// What `config get` and `config list` print on stderr before they show a
+/// config.json with a key written twice: they read a `Value`, which holds
+/// only the last copy, while the runtime may be on defaults.
+fn duplicate_warning_at(path: &Path) -> Option<String> {
+    duplicate_lines_at(path).map(|lines| {
+        format!(
+            "{}: {lines}\n  `config get` and `config list` show the last copy of each; fix the file by hand (`darkmux doctor` names the fix)",
+            path.display()
+        )
+    })
+}
+
 /// [`load_object`] for a writer: a file written by a newer darkmux is refused
 /// ("upgrade darkmux") instead of being rewritten by a binary that cannot place
 /// its keys (the same refusal every reader gives it, `data_version::newer_refusal`).
@@ -689,6 +851,20 @@ pub(crate) fn load_object_for_write(path: &Path) -> Result<Value> {
     let known = darkmux_types::config::CONFIG_SCHEMA_VERSION;
     if let Some(found) = darkmux_types::data_version::newer(&root, known) {
         bail!("{}: {}", path.display(), darkmux_types::data_version::newer_refusal("config", &found, known));
+    }
+    // A rewrite from `root` would keep only the last copy of a key written
+    // twice and delete the rest, silently: the operator chooses which stays.
+    // Every repeat counts here, a `_comment` note included, which the gate
+    // lets a load through with but a rewrite would still lose.
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let repeated: Vec<String> = darkmux_types::user_files::duplicate_paths(&raw).iter().map(|p| format!("`{p}`")).collect();
+    if !repeated.is_empty() {
+        bail!(
+            "{}: {} written more than once in the same object. Refusing to rewrite it: a rewrite would keep only the \
+             last copy of each and delete the rest. Fix it by hand first",
+            path.display(),
+            repeated.join(", ")
+        );
     }
     Ok(root)
 }
@@ -783,6 +959,9 @@ fn get_path<'a>(root: &'a Value, key: &str) -> Option<&'a Value> {
 /// the one suggester every unknown-key message uses
 /// (`darkmux_types::user_files::closest`).
 fn suggestion(key: &str) -> String {
+    if let Some(remedy) = accept_work_remedy(key) {
+        return format!(": {remedy}");
+    }
     let keys = all_keys();
     match darkmux_types::user_files::closest(key, keys.iter().map(|(k, _)| *k)) {
         Some(near) => format!(": did you mean `{near}`? (`darkmux config list` shows every settable key)"),
@@ -809,6 +988,52 @@ mod tests {
         let err = set_at(f.path(), "serve.port", "8799").unwrap_err().to_string();
         assert!(err.contains("written by a newer darkmux") && err.contains("Upgrade darkmux"), "{err}");
         assert_eq!(std::fs::read_to_string(f.path()).unwrap(), original);
+    }
+
+    /// A key written twice: `config set` would rewrite the file from a
+    /// `Value` holding only the last copy, silently deleting the others, so
+    /// it refuses, naming each, and leaves the file byte-for-byte as it was.
+    #[test]
+    fn config_set_refuses_a_config_with_a_key_written_twice() {
+        let f = tmp();
+        let original = r#"{"machine_id": "a", "role_profiles": {"coder": "p", "coder": "q"}, "machine_id": "b"}"#;
+        std::fs::write(f.path(), original).unwrap();
+        let err = set_at(f.path(), "serve.port", "8799").unwrap_err().to_string();
+        assert!(err.contains("`machine_id`") && err.contains("`role_profiles.coder`") && err.contains("written more than once"), "{err}");
+        assert!(err.contains("by hand"), "{err}");
+        assert_eq!(std::fs::read_to_string(f.path()).unwrap(), original);
+    }
+
+    /// A repeated `_comment` note loads (the gate lets it through), but a
+    /// rewrite would keep only its last copy: the writer refuses it too,
+    /// naming it, and leaves the file as it was.
+    #[test]
+    fn config_set_refuses_a_config_with_a_repeated_comment_note() {
+        let f = tmp();
+        let original = r#"{"runtime": {"_comment": "note one", "max_turns": 5, "_comment": "note two"}}"#;
+        std::fs::write(f.path(), original).unwrap();
+        let err = set_at(f.path(), "serve.port", "8799").unwrap_err().to_string();
+        assert!(err.contains("`runtime._comment`") && err.contains("by hand"), "{err}");
+        assert_eq!(std::fs::read_to_string(f.path()).unwrap(), original);
+    }
+
+    /// `config get` and `config list` read a `Value`, so they show the last
+    /// copy of a key written twice while the runtime may be on defaults:
+    /// they warn, naming each duplicate. A clean file gets no warning.
+    #[test]
+    fn config_get_and_list_warn_about_a_key_written_twice() {
+        let f = tmp();
+        std::fs::write(f.path(), r#"{"machine_id": "a", "machine_id": "b"}"#).unwrap();
+        let warning = duplicate_warning_at(f.path()).expect("a warning");
+        assert!(warning.contains("duplicate key `machine_id`") && warning.contains("so the file fails to load"), "{warning}");
+        assert!(warning.contains("last copy"), "says what get and list show: {warning}");
+        // What `get` and `list` print after the warning is the last copy.
+        assert_eq!(get_warned(f.path(), "machine_id").unwrap(), "\"b\"");
+        assert!(list_warned(f.path(), false).unwrap().contains("\"machine_id\": \"b\""));
+        std::fs::write(f.path(), r#"{"machine_id": "a"}"#).unwrap();
+        assert_eq!(duplicate_warning_at(f.path()), None);
+        std::fs::write(f.path(), r#"{"machine_idd": "a"}"#).unwrap();
+        assert_eq!(duplicate_warning_at(f.path()), None, "only duplicates: other problems are doctor's and preflight's");
     }
 
     /// (#2765) The knob the operator could not reach. `darkmux config list`
@@ -866,14 +1091,16 @@ mod tests {
     /// families, so re-narrowing this to one key's special case fails here
     /// rather than in review.
     #[test]
+    #[serial_test::serial]
     fn every_set_confirmation_carries_the_restart_clause() {
+        let _home = BindingHome::new();
         let f = tmp();
         let p = f.path();
         for (key, value) in [
             ("serve.port", "8799"),
             ("redis.host", "192.0.2.10"),
             ("fleet.mode", "hub"),
-            ("role_profiles.example-coder", "qwen35b"),
+            ("role_profiles.coder", "qwen35b"),
         ] {
             let msg = set_at(p, key, value).unwrap();
             assert!(
@@ -925,6 +1152,22 @@ mod tests {
         let err = set_at(f.path(), "runtime.container_user", "garbage").unwrap_err().to_string();
         assert!(err.contains("runtime.container_user") && err.contains("`garbage`"), "{err}");
         assert!(!std::fs::read_to_string(f.path()).unwrap_or_default().contains("garbage"), "nothing written");
+    }
+
+    /// (#3112) `config set sandbox.memory 16g` writes it; a value no sandbox
+    /// takes (`lots`, `0`, a negative) is refused naming the form, and
+    /// nothing is written.
+    #[test]
+    fn sandbox_memory_is_settable_and_a_bad_size_is_refused() {
+        let f = tmp();
+        set_at(f.path(), "sandbox.memory", "16g").unwrap();
+        let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(f.path()).unwrap()).unwrap();
+        assert_eq!(cfg.sandbox.unwrap().memory.as_deref(), Some("16g"));
+        for bad in ["lots", "0", "-1g", "262145g"] {
+            let err = set_at(f.path(), "sandbox.memory", bad).unwrap_err().to_string();
+            assert!(err.contains("sandbox.memory") && err.contains(&format!("`{bad}`")) && err.contains("a whole number followed by k, m or g"), "{err}");
+            assert!(std::fs::read_to_string(f.path()).unwrap().contains("\"16g\""), "{bad} was written");
+        }
     }
 
     /// (#3276 review F1) `runtime.container_user` is settable, and kept a
@@ -1016,7 +1259,9 @@ mod tests {
     /// `role_profiles.radio-router` is refused (the one role id the dynamic
     /// map does not accept), each with the fix named.
     #[test]
+    #[serial_test::serial]
     fn radio_router_staffing_keys_are_refused_with_the_fix() {
+        let _home = BindingHome::new();
         let f = tmp();
         let p = f.path();
         // flow-action-guard:allow — a retired config key, refused by name
@@ -1052,7 +1297,9 @@ mod tests {
     /// The answering seat may run on a fleet peer: its two keys take a valid
     /// `<profile>@<machine>` address and refuse a malformed one, naming it.
     #[test]
+    #[serial_test::serial]
     fn the_answering_seat_keys_take_a_valid_profile_address_and_refuse_a_malformed_one() {
+        let _home = BindingHome::new();
         let f = tmp();
         let p = f.path();
         for key in ["radio.answerer_profile", "role_profiles.radio-host"] {
@@ -1102,17 +1349,43 @@ mod tests {
         assert!(get_at(p, "default_engine").unwrap().contains("mlx"), "a refused write leaves the old value");
     }
 
+    /// An isolated darkmux home whose registry defines `deep`, `qwen35b` and
+    /// `qwen27b`, so a `role_profiles` write is checked against it and never
+    /// against the machine's own registry or role library.
+    struct BindingHome {
+        _state: darkmux_types::test_isolation::IsolatedState,
+    }
+
+    impl BindingHome {
+        fn new() -> Self {
+            let state = darkmux_types::test_isolation::IsolatedState::new();
+            let reg = state.join("profiles.json");
+            std::fs::write(
+                &reg,
+                r#"{"profiles": {"deep": {"models": [{"id": "m", "n_ctx": 1}]},
+                    "qwen35b": {"models": [{"id": "m", "n_ctx": 1}]},
+                    "qwen27b": {"models": [{"id": "m", "n_ctx": 1}]}}}"#,
+            )
+            .unwrap();
+            // SAFETY: every caller is #[serial]; `IsolatedState` restores it.
+            unsafe { std::env::set_var("DARKMUX_PROFILES", &reg) };
+            Self { _state: state }
+        }
+    }
+
     #[test]
+    #[serial_test::serial]
     fn role_profiles_dynamic_key_round_trips() {
+        let _home = BindingHome::new();
         let f = tmp();
         let p = f.path();
-        set_at(p, "role_profiles.example-judge", "qwen35b").unwrap();
-        set_at(p, "role_profiles.example-verify", "qwen35b").unwrap();
-        set_at(p, "role_profiles.example-probe-high", "qwen27b").unwrap();
+        set_at(p, "role_profiles.code-reviewer", "qwen35b").unwrap();
+        set_at(p, "role_profiles.test-designer", "qwen35b").unwrap();
+        set_at(p, "role_profiles.reviewer", "qwen27b").unwrap();
 
         // get reads the stored value back.
-        assert!(get_at(p, "role_profiles.example-judge").unwrap().contains("qwen35b"));
-        assert!(get_at(p, "role_profiles.example-probe-high").unwrap().contains("qwen27b"));
+        assert!(get_at(p, "role_profiles.code-reviewer").unwrap().contains("qwen35b"));
+        assert!(get_at(p, "role_profiles.reviewer").unwrap().contains("qwen27b"));
         // An unbound role reports unset (falls through to default_profile).
         assert!(get_at(p, "role_profiles.analyst").unwrap().contains("unset"));
 
@@ -1124,8 +1397,68 @@ mod tests {
         let cfg: DarkmuxConfig =
             serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
         let map = cfg.role_profiles.unwrap();
-        assert_eq!(map.get("example-judge").map(String::as_str), Some("qwen35b"));
-        assert_eq!(map.get("example-verify").map(String::as_str), Some("qwen35b"), "many roles -> one profile");
+        assert_eq!(map.get("code-reviewer").map(String::as_str), Some("qwen35b"));
+        assert_eq!(map.get("test-designer").map(String::as_str), Some("qwen35b"), "many roles -> one profile");
+    }
+
+    /// A binding names a role darkmux can dispatch and a profile the registry
+    /// defines, or it is refused before it is written, naming the closest of
+    /// each (contract 9, the same pair doctor fails).
+    #[test]
+    #[serial_test::serial]
+    fn role_profiles_refuses_an_unknown_role_or_profile_naming_the_closest() {
+        let _home = BindingHome::new();
+        let f = tmp();
+        let p = f.path();
+        let err = set_at(p, "role_profiles.code-reviwer", "qwen35b").unwrap_err().to_string();
+        assert!(err.contains("`code-reviwer` names no role; the closest is `code-reviewer`"), "{err}");
+        assert!(err.contains("darkmux role list"), "{err}");
+        let err = set_at(p, "role_profiles.code-reviewer", "nosuchprofile").unwrap_err().to_string();
+        assert!(err.contains("`nosuchprofile` names no profile in the registry"), "{err}");
+        assert!(err.contains("darkmux profile list"), "{err}");
+        let err = set_at(p, "role_profiles.code-reviewer", "qwen35").unwrap_err().to_string();
+        assert!(err.contains("the closest is `qwen35b`"), "{err}");
+        assert!(!p.exists() || std::fs::read_to_string(p).unwrap().trim().is_empty(), "nothing was written");
+        // radio's answering seat may name a profile on a fleet peer, whose
+        // registry (not this one) defines it.
+        set_at(p, "role_profiles.radio-host", "elsewhere@studio").unwrap();
+        let err = set_at(p, "role_profiles.radio-host", "elsewhere").unwrap_err().to_string();
+        assert!(err.contains("names no profile"), "a bare name is this machine's: {err}");
+        set_at(p, "role_profiles.code-reviewer", "").expect("a blank value binds nothing, so there is no profile to check");
+    }
+
+    /// A binding whose role is gone (its manifest removed) can still be
+    /// cleared: a blank value binds nothing, and no `config unset` exists. A
+    /// non-blank value for that role is still refused, naming where a role of
+    /// the operator's own is defined.
+    #[test]
+    #[serial_test::serial]
+    fn a_binding_on_a_role_that_is_gone_can_still_be_cleared() {
+        let _home = BindingHome::new();
+        let f = tmp();
+        let p = f.path();
+        std::fs::write(p, "{\"role_profiles\": {\"oldrole\": \"deep\"}}\n").unwrap();
+        set_at(p, "role_profiles.oldrole", "").expect("clearing a binding is always accepted");
+        set_at(p, "role_profiles.oldrole", "  ").expect("whitespace is blank too");
+        let err = set_at(p, "role_profiles.oldrole", "deep").unwrap_err().to_string();
+        assert!(err.contains("`oldrole` names no role"), "{err}");
+        let manifest = crate::crew::loader::user_roles_dir().join("oldrole.json");
+        assert!(err.contains(&manifest.display().to_string()), "names where its manifest goes: {err}");
+    }
+
+    /// `fleet.accept_work.<name>` has no `config set` form: the remedy is the
+    /// command that writes it, not a near-miss key.
+    #[test]
+    fn fleet_accept_work_names_machine_trust_as_the_way_to_write_it() {
+        let f = tmp();
+        let err = set_at(f.path(), "fleet.accept_work.studio", "x").unwrap_err().to_string();
+        assert!(err.contains("darkmux machine trust studio"), "{err}");
+        assert!(!err.contains("fleet.identity.bin"), "no near-miss guess: {err}");
+        assert!(!err.contains("unknown config key"), "it is a key, written by another command: {err}");
+        let err = get_at(f.path(), "fleet.accept_work.studio").unwrap_err().to_string();
+        assert!(err.contains("darkmux machine trust studio"), "{err}");
+        let err = set_at(f.path(), "fleet.accept_work", "x").unwrap_err().to_string();
+        assert!(err.contains("darkmux machine trust <name>"), "{err}");
     }
 
     /// The `role_profiles` map is one level deep: a blank role or a deeper path

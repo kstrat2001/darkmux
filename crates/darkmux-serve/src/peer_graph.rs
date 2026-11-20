@@ -262,7 +262,7 @@ fn settled_peer_target(
 /// never assumed, and every caller here already falls back to `None` safely
 /// when the set is empty.
 fn live_machine_names() -> HashSet<String> {
-    let Some(url) = darkmux_flow::redis_url() else {
+    let Some(url) = crate::presence_hub_url() else {
         return HashSet::new();
     };
     // (#3432) The daemon's shared read: a failed one is empty, as before.

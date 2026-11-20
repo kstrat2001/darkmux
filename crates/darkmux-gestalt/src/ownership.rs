@@ -57,6 +57,33 @@ pub fn is_darkmux_owned(identifier: &str) -> bool {
     identifier.starts_with(DARKMUX_NAMESPACE)
 }
 
+/// Is the resident listed as `resident_identifier` serving `resident_key` the
+/// instance a placement loads under `identifier` for `wanted_key`?
+///
+/// The identifier decides first. The DEFAULT identifier, `darkmux:<id>`
+/// minted from the wanted key itself, is exact and namespaced, so it alone
+/// names darkmux's instance, whatever key LM Studio lists it under: a variant
+/// (`qwen/qwen3.8-27b@4bit`) or path id loads under `darkmux:<id>`, and its
+/// listed `modelKey` need not equal that id. An explicit identifier, inside
+/// the namespace or not, is not derived from the id: one left in place after
+/// the operator changed the model's `id` still names the old model's load.
+/// So the listed key must also be exactly the wanted key; otherwise the
+/// dispatch would be answered by another model (the #1135 ghost). A variant's
+/// base key is never enough: if LM Studio lists a variant's load under it,
+/// it cannot tell one quantization from another, so an explicit identifier
+/// on a variant id is refused at preflight (`ProfileModel::identifier_problem`)
+/// and a variant is found through its default identifier.
+///
+/// A resident whose identifier equals its own listed key is never ours: that
+/// is the name LM Studio gives a load made without one (its app, a bare `lms
+/// load`), which darkmux cannot tell from an opt-out identifier spelled the
+/// same (contract 4).
+pub fn is_own_instance(resident_identifier: &str, resident_key: &str, wanted_key: &str, identifier: &str) -> bool {
+    resident_identifier == identifier
+        && resident_identifier != resident_key
+        && (identifier == namespaced_identifier(wanted_key, None) || resident_key == bare_model_key(wanted_key))
+}
+
 /// Does a model already loaded at `loaded_ctx` satisfy a placement that
 /// wants `wanted_n_ctx`? `n_ctx` is a **minimum**, not an exact size (#600):
 /// a model loaded with *at least* the wanted context satisfies the request,

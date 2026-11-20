@@ -1452,6 +1452,28 @@ pub struct MapItemResult {
     /// different from one that never needed to retry at all.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub retried: u32,
+    /// (#3445) The item's last attempt replied but stopped at the cap with no
+    /// answer, so the item failed though its call was made and its tokens
+    /// spent. Read by the item's terminal, which keeps that call's turn and
+    /// counts as a single-shot dispatch's cap failure does; never part of the
+    /// step's output.
+    #[serde(skip)]
+    pub stopped_at_cap: bool,
+    /// The item failed while the run was being stopped: its call was cut off
+    /// mid-flight, or its next attempt was never sent. Decided the moment the
+    /// item ended ([`MapItemResult::ended`]). Counted as stopped, never as a
+    /// failure of its own; never part of the step's output.
+    #[serde(skip)]
+    pub cut_by_stop: bool,
+}
+
+impl MapItemResult {
+    /// The item as it ended: marked [`Self::cut_by_stop`] when it failed
+    /// while the run was being stopped. Read here, as the item ends, so an
+    /// item that failed on its own before any stop keeps reading as failed.
+    fn ended(self) -> Self {
+        Self { cut_by_stop: !self.ok && darkmux_types::interrupt::is_set(), ..self }
+    }
 }
 
 fn u32_is_zero(n: &u32) -> bool {
@@ -1649,7 +1671,9 @@ fn resolve_map_collection(
 ///
 /// **`retry_on_empty` (#1442, the generic port of the probe stage's
 /// retry-on-empty loop).** Default `0` (off) — a call whose trimmed content
-/// comes back empty is accepted as-is (`ok: true`, empty `content`). When set
+/// comes back empty is accepted as-is (`ok: true`, empty `content`), unless
+/// (#3445) it stopped at `max_tokens` with no answer, which fails the item
+/// (`ok: false`, an error naming the cap and `max_tokens`). When set
 /// to `N > 0`, an empty-content reply is RE-DISPATCHED up to `N` additional
 /// times (so `N = 1` matches the review probe's historical single retry: up
 /// to 2 attempts total), stopping early the moment a non-empty reply lands.
@@ -1697,6 +1721,17 @@ fn resolve_map_collection(
 /// [`DispatchInternalStepKind`], where a non-zero agentic dispatch exit is a
 /// step-level `Err` — that's a single-dispatch step with downstream
 /// `depends_on` to protect; a map's whole point is surviving partial failure.)
+///
+/// **A stop ends the map.** Once the run is stopped (an operator's signal,
+/// a host's shutdown, the run's wall-clock bound) no item starts and no
+/// attempt is sent, a retry included; a retry's backoff wakes on the stop.
+/// An item whose call was in flight ends the way a single dispatch does: the
+/// call is killed and the item's `dispatch.error` names the stop. Every item
+/// that started gets exactly one terminal (contract 2); an item the stop
+/// kept from starting opens none and is counted neither ok nor failed. The
+/// step then ends with an error carrying the interrupt marker, saying how
+/// many items did not run, which the scheduler reads as stopped (abandoned,
+/// naming the stop), never as a success.
 ///
 /// **Empty-collection short-circuit.** An empty collection is a completed
 /// no-op: [`Self::residency`] returns `None` (so the wave loader never loads
@@ -1752,8 +1787,9 @@ impl DispatchMapStepKind {
     }
 
     /// The terminal of one item's execution (see [`ExecutionBookends`]):
-    /// `dispatch.complete` for an item that produced a reply, `dispatch.error`
-    /// for one that did not.
+    /// `dispatch.complete` for an ok item, `dispatch.error` for a failed one
+    /// (no reply, or #3445 a last reply that stopped at the cap with no
+    /// answer).
     fn item_terminal(records: &ExecutionBookends<'_>, res: &MapItemResult) -> darkmux_flow::FlowRecord {
         let tokens = crate::dispatch_envelope::DirectTokens {
             prompt_tokens: res.prompt_tokens,
@@ -1762,9 +1798,15 @@ impl DispatchMapStepKind {
             reasoning_tokens: res.reasoning_tokens,
             cached_tokens: res.cached_tokens,
         };
-        // A reply is one turn with its own counts; an item that produced none took none.
+        // A reply is one turn with its own counts; an item that produced none
+        // took none. (#3445) A reply that stopped at the cap with no answer
+        // is a failed execution that still took its turn and spent its
+        // counts, with no exit code, as `close_answered_call`'s is.
+        let replied = crate::dispatch_internal::single_call_complete(&tokens, res.wall_ms, res.content.chars().count() as u64);
         let base = if res.ok {
-            crate::dispatch_internal::single_call_complete(&tokens, res.wall_ms, res.content.chars().count() as u64)
+            replied
+        } else if res.stopped_at_cap {
+            DispatchEndPayload { exit_code: None, ..replied }
         } else {
             DispatchEndPayload { wall_ms: Some(res.wall_ms), ..DispatchEndPayload::new(0) }
         };
@@ -1786,15 +1828,21 @@ impl DispatchMapStepKind {
     /// total_tokens across every item. See the emission site in `run` for
     /// why the sum (not the per-item values) is what the mission graph's
     /// max-fold token meter must see.
+    ///
+    /// `items_in` is the whole collection; `ok_count` and `failed_count`
+    /// count only the items that ran to their own end, so an item a stop cut
+    /// off or kept from starting is neither (the step's own error says how
+    /// many, naming the stop).
     fn aggregate_record(
         session: &SessionId,
         step: &Step,
         model: &str,
         unmanaged: bool,
         results: &[MapItemResult],
+        items_in: usize,
     ) -> darkmux_flow::FlowRecord {
         let ok_count = results.iter().filter(|r| r.ok).count();
-        let failed_count = results.len() - ok_count;
+        let failed_count = results.iter().filter(|r| !r.ok && !r.cut_by_stop).count();
         let total_tokens: u64 = results.iter().filter_map(|r| r.total_tokens).sum();
         // (#1442) Summed per-item dispatch wall-clock — trivially additive
         // beside the summed tokens, so the aggregate stays self-describing for
@@ -1810,7 +1858,7 @@ impl DispatchMapStepKind {
                 darkmux_flow::Category::Work,
                 darkmux_flow::Stage::Dispatch,
                 darkmux_flow::Payload::StepResult(StepResultPayload {
-                    items_in: Some(results.len() as u64),
+                    items_in: Some(items_in as u64),
                     ok_count: Some(ok_count as u64),
                     failed_count: Some(failed_count as u64),
                     unmanaged: Some(unmanaged),
@@ -1982,7 +2030,12 @@ impl DispatchMapStepKind {
 
         let temperature = call.temperature();
         let mut results: Vec<MapItemResult> = Vec::with_capacity(items.len());
-        for (index, item) in items.iter().enumerate() {
+        // A stop ends the map: no item starts after it, so none opens a
+        // `dispatch.start` or sends a request the stop would kill (and the
+        // endpoint bill) a moment later. The items it kept from starting are
+        // not run, never failed ([`MapVerdict::of`]).
+        let not_stopped = |_: &(usize, &serde_json::Value)| !darkmux_types::interrupt::is_set();
+        for (index, item) in items.iter().enumerate().take_while(not_stopped) {
             // One item, one execution: its bookends, its usage records and
             // the budget records of its gate all name it.
             let execution = &ExecutionId::mint();
@@ -2037,7 +2090,8 @@ impl DispatchMapStepKind {
                         timeout_seconds, retry_on_empty, retry_on_error, ovr, &mut calls, limits.as_ref(),
                     )
                 }
-            };
+            }
+            .ended();
             // (#1442 gate C3) LIVE per-item emission when streaming.
             push(Self::item_record(session, execution, step, wire_model.as_ref(), endpoint.is_some(), &res), &mut batched);
             // (#1442 ship-2b, #1361 continuity) `telemetry.tokens` records
@@ -2110,12 +2164,12 @@ impl DispatchMapStepKind {
         // would render as the LARGEST single item, not the step's spend. The
         // aggregate's SUMMED total_tokens is >= every per-item value, so the
         // existing max-fold reads the true spend with zero viewer changes.
-        push(Self::aggregate_record(session, step, wire_model.as_ref(), endpoint.is_some(), &results), &mut batched);
+        push(Self::aggregate_record(session, step, wire_model.as_ref(), endpoint.is_some(), &results, items.len()), &mut batched);
 
         let output = serde_json::to_string(&results).context("serializing dispatch.map results")?;
         Ok(MapRun {
             outcome: StepOutcome { output, flow_records: batched, degraded: None },
-            verdict: MapVerdict::of(&results),
+            verdict: MapVerdict::of(&results, items.len()),
         })
     }
 }
@@ -2126,6 +2180,9 @@ impl DispatchMapStepKind {
 /// failing is a clean step.
 #[derive(Debug, PartialEq, Eq)]
 enum MapVerdict {
+    /// The run's stop ended the map before every item ran to its own end:
+    /// `cut` items were cut off, `not_run` never started.
+    Stopped { total: usize, cut: usize, not_run: usize },
     AllFailed { total: usize, first_error: String },
     Partial { failed: usize, total: usize },
     Clean,
@@ -2143,6 +2200,12 @@ impl MapRun {
     /// marked degraded when some did, unchanged when none did.
     fn into_outcome(self, step_id: &str) -> Result<StepOutcome> {
         match self.verdict {
+            // The interrupt marker is how the scheduler and the launcher tell
+            // a step the stop ended from one that failed on its own.
+            MapVerdict::Stopped { total, cut, not_run } => Err(anyhow!(
+                "{}: step `{step_id}` dispatch.map stopped with {not_run} of {total} item(s) not run and {cut} cut off",
+                darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL
+            )),
             MapVerdict::AllFailed { total, first_error } => Err(anyhow!(
                 "step `{step_id}` dispatch.map: all {total} item(s) failed; first error: {first_error}"
             )),
@@ -2156,9 +2219,14 @@ impl MapRun {
 }
 
 impl MapVerdict {
-    fn of(results: &[MapItemResult]) -> Self {
+    /// `results` are the items that started, of `total` in the collection.
+    fn of(results: &[MapItemResult], total: usize) -> Self {
+        let cut = results.iter().filter(|r| r.cut_by_stop).count();
+        let not_run = total - results.len();
+        if cut + not_run > 0 {
+            return MapVerdict::Stopped { total, cut, not_run };
+        }
         let failed = results.iter().filter(|r| !r.ok).count();
-        let total = results.len();
         match failed {
             0 => MapVerdict::Clean,
             n if n == total => MapVerdict::AllFailed {
@@ -2465,6 +2533,26 @@ fn map_item_token_payload(
 /// dispatch) never pay it.
 const RETRY_ON_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// The first check before every attempt of a map item, ahead of its budget
+/// gate: once the run was stopped no attempt is sent, a retry included. The
+/// error carries the interrupt marker.
+fn map_attempt_not_stopped() -> Result<()> {
+    darkmux_types::interrupt::bail_if_set("the dispatch.map item's next attempt was not sent")
+}
+
+/// (#3445) The failure of a map attempt that stopped at the item's
+/// `max_tokens` with no answer
+/// ([`SingleShotReply::hit_cap_with_no_answer`](crate::single_shot::SingleShotReply::hit_cap_with_no_answer)),
+/// naming the cap and the step's knob, as a single-shot dispatch names its
+/// own; `None` for any other reply. An item whose last attempt is this failed:
+/// it is not the "dispatched, said nothing" empty success.
+fn cap_hit_failure(reply: &crate::single_shot::SingleShotReply, max_tokens: u32) -> Option<String> {
+    reply.hit_cap_with_no_answer().then(|| {
+        let raise = "set `max_tokens` in the `dispatch.map` step's config";
+        format!("{:#}", crate::dispatch_internal::cap_hit_error(max_tokens, reply.counts.completion, raise))
+    })
+}
+
 /// (#1442) One LOCAL map item — dispatch, with the generic `retry_on_empty`
 /// loop (default 0/off) and the `retry_on_error` loop (#1605, default
 /// 0/off). Tokens accumulate across every attempt; the loop stops early on
@@ -2496,23 +2584,25 @@ fn map_local_item(
     let mut error_budget = retry_on_error;
     let mut error_retries_used = 0u32;
     let mut last_error: Option<String> = None;
-    loop {
+    // (#3445) The loop ends with the last attempt's cap failure, if it was one.
+    let capped = loop {
         // (#3035) A managed endpoint's window gate, then this item's dispatch
-        // cap reservation, before every attempt. Only a run stopped during a
-        // wait (or limits that cannot be used) ends the item, with nothing sent.
-        if let Some(l) = limits {
-            if let Err(e) = crate::budget::admit_endpoint(l.endpoint, l.caller) {
-                return MapItemResult {
-                    index,
-                    ok: false,
-                    content: String::new(),
-                    error: Some(format!("{e:#}")),
-                    served_model: None,
-                    wall_ms,
-                    retried: error_retries_used,
-                    ..MapItemResult::tokens_of(calls)
-                };
-            }
+        // cap reservation, before every attempt. A stopped run (before the
+        // attempt, or during a budget wait) or limits that cannot be used end
+        // the item, with nothing sent.
+        let admitted = map_attempt_not_stopped()
+            .and_then(|()| limits.map_or(Ok(()), |l| crate::budget::admit_endpoint(l.endpoint, l.caller)));
+        if let Err(e) = admitted {
+            return MapItemResult {
+                index,
+                ok: false,
+                content: String::new(),
+                error: Some(format!("{e:#}")),
+                served_model: None,
+                wall_ms,
+                retried: error_retries_used,
+                ..MapItemResult::tokens_of(calls)
+            };
         }
         let req = SingleShotRequest {
             base_url: None,
@@ -2563,7 +2653,7 @@ fn map_local_item(
                 }
                 // Empty content — retry (until the budget is spent).
                 if empty_budget == 0 {
-                    break;
+                    break cap_hit_failure(&reply, max_tokens);
                 }
                 empty_budget -= 1;
             }
@@ -2597,22 +2687,27 @@ fn map_local_item(
                 error_budget -= 1;
                 error_retries_used += 1;
                 last_error = Some(format!("{e:#}"));
-                std::thread::sleep(RETRY_ON_ERROR_BACKOFF);
+                // A stop wakes it; the next attempt's gate then sends nothing.
+                darkmux_types::interrupt::sleep(RETRY_ON_ERROR_BACKOFF);
             }
         }
-    }
+    };
     // (#3074) Reaching here means no attempt produced content. When no
     // attempt errored, every one came back empty: the item DISPATCHED (ok),
-    // produced no usable content, and its whole spend is billed (the
-    // reasoning-guillotine case the probe stage's retry loop already
-    // handled). When an earlier attempt errored and the retry came back
+    // produced no usable content, and its whole spend is billed. (#3445)
+    // Unless the last attempt stopped at the cap with no answer (the
+    // reasoning model that spent the cap thinking): that item failed, naming
+    // the cap. When an earlier attempt errored and the retry came back
     // empty, `ok` is a claim about what happened, so the item reports that
     // error instead of an empty success (the hosted sibling's rule, #1605).
+    let stopped_at_cap = capped.is_some();
+    let error = capped.or(last_error);
     MapItemResult {
         index,
-        ok: last_error.is_none(),
+        ok: error.is_none(),
+        stopped_at_cap,
         content: String::new(),
-        error: last_error,
+        error,
         served_model: None,
         wall_ms,
         retried: error_retries_used,
@@ -2626,8 +2721,9 @@ fn map_local_item(
 /// own token cap bucket (#3035: `crate::budget`), then settles its real cost
 /// against the cap after the call. No attempt is ever skipped or clamped for
 /// budget: a breach warns, and an endpoint `wait` holds the attempt until
-/// there is room. Only a run stopped during a wait (Ctrl-C, `mission abort`)
-/// ends the item early, reported as its error, with nothing sent.
+/// there is room. Only a stopped run (Ctrl-C before an attempt, or Ctrl-C or
+/// `mission abort` during a wait) ends the item early, reported as its
+/// error, with nothing sent.
 #[allow(clippy::too_many_arguments)]
 fn map_hosted_item(
     index: usize,
@@ -2691,11 +2787,13 @@ fn map_hosted_item(
             };
         }
     };
-    loop {
+    // (#3445) The loop ends with the last attempt's cap failure, if it was one.
+    let capped = loop {
         // (#2902 step 5, #3035) The endpoint's window gate. It may warn or,
-        // under `wait`, hold; only a run stopped during a wait (or limits
-        // that cannot be used) returns here, and then nothing is sent.
-        if let Err(e) = crate::budget::admit_endpoint(endpoint, caller) {
+        // under `wait`, hold; only a stopped run (before the attempt, or
+        // during a wait) or limits that cannot be used return here, and then
+        // nothing is sent.
+        if let Err(e) = map_attempt_not_stopped().and_then(|()| crate::budget::admit_endpoint(endpoint, caller)) {
             return MapItemResult {
                 index,
                 ok: false,
@@ -2749,7 +2847,7 @@ fn map_hosted_item(
                 }
                 // Empty content: retry, when `retry_on_empty` allows.
                 if empty_budget == 0 {
-                    break;
+                    break cap_hit_failure(&reply, clamped);
                 }
                 empty_budget -= 1;
             }
@@ -2785,18 +2883,24 @@ fn map_hosted_item(
                 error_budget -= 1;
                 error_retries_used += 1;
                 last_error = Some(format!("{e:#}"));
-                std::thread::sleep(RETRY_ON_ERROR_BACKOFF);
+                // A stop wakes it; the next attempt's gate then sends nothing.
+                darkmux_types::interrupt::sleep(RETRY_ON_ERROR_BACKOFF);
             }
         }
-    }
+    };
     // (#1605 QA finding) `ok` is a claim about what actually happened. An
     // item that reaches here after an errored attempt (an error retry that
-    // came back empty) must report that error, not an empty success.
+    // came back empty) must report that error, not an empty success, and
+    // (#3445) one whose last attempt stopped at the cap with no answer
+    // reports that.
+    let stopped_at_cap = capped.is_some();
+    let error = capped.or(last_error);
     MapItemResult {
         index,
-        ok: last_error.is_none(),
+        ok: error.is_none(),
+        stopped_at_cap,
         content: String::new(),
-        error: last_error,
+        error,
         served_model,
         wall_ms,
         retried: error_retries_used,
@@ -2907,7 +3011,12 @@ impl StepKind for DispatchMapStepKind {
 /// `DARKMUX_STEP_INPUT_<SANITIZED-DEP-ID>` (non-alphanumeric bytes in
 /// the dependency id become `_`) so a shell step can consume prior
 /// output without darkmux having to parse the command's own
-/// substitution syntax. `DARKMUX_BIN` is exported too — the absolute path
+/// substitution syntax. Every output is also written whole to
+/// `$DARKMUX_STEP_INPUTS_DIR/<SANITIZED-DEP-ID>`, and one the environment
+/// cannot carry ([`input_env_budget`]) has its variable UNSET, so a command
+/// reads it from that file, and a command that names it makes the step
+/// degraded; see [`export_step_inputs`].
+/// `DARKMUX_BIN` is exported too — the absolute path
 /// of the darkmux running the mission, for a command that has to call
 /// darkmux back. A non-zero exit is a loud `Err` carrying stdout
 /// + stderr, never a silently-`Ok` failed command.
@@ -3098,109 +3207,296 @@ impl StepKind for ProceduralShellStepKind {
     fn run(&self, step: &Step, task: &Task, input: &BTreeMap<String, String>, _ctx: &StepRunCtx) -> Result<StepOutcome> {
         let cfg: ShellConfig = load(step, ConfigKind::ProceduralShell)?;
         let cwd = resolve_shell_cwd(step, task, &cfg)?;
-
-        let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(&cfg.command);
-        if let Some(cwd) = &cwd {
-            cmd.current_dir(cwd);
-        }
-        // (#3074) Declared values first, so the darkmux-set variables below
-        // (`DARKMUX_STEP_INPUT_*`, `DARKMUX_BIN`) win over a clashing name.
-        for (name, value) in cfg.env.iter().flatten() {
-            match value {
-                serde_json::Value::String(text) => cmd.env(name, text),
-                other => cmd.env(name, other.to_string()),
-            };
-        }
-        for (dep_id, output) in input {
-            let env_key = sanitize_env_key(dep_id);
-            cmd.env(format!("DARKMUX_STEP_INPUT_{env_key}"), output);
-        }
-        // (#2310 P4e) `DARKMUX_BIN` — THIS darkmux, by absolute path, so a
-        // step command that has to ask darkmux something (`review`'s
-        // wait step polls `mod list --for`) calls the binary running the
-        // mission rather than whatever `darkmux` on `PATH` resolves to. A
-        // step spawned from `cargo run`, from a worktree's `target/`, or
-        // from a launcher whose `PATH` carries no darkmux at all would
-        // otherwise fail on a name lookup that has nothing to do with the
-        // step's own work. Set only when `current_exe` resolves; a command
-        // written as `"${DARKMUX_BIN:-darkmux}"` still works when it does
-        // not.
-        //
-        // (#2310 P4e review, item 8) Two cases where this is set but not
-        // the darkmux an operator means, both of which the fallback CANNOT
-        // rescue because the variable is present, just wrong:
-        //
-        //  - **Under `cargo test`** it is the TEST HARNESS binary, not
-        //    darkmux. A step command that shells out to it gets a test
-        //    runner. Harmless for the in-process kind tests (which only
-        //    read the variable), and the integration tests that exercise a
-        //    real command set `DARKMUX_BIN` themselves to
-        //    `assert_cmd::cargo::cargo_bin("darkmux")` — but a future test
-        //    that lets this default through would be testing the harness.
-        //  - **After an in-place reinstall** (`cargo install` renames, but
-        //    a `cp` over a running binary does not) `current_exe` can name
-        //    a path that no longer exists. The command then fails on a
-        //    missing file rather than falling back to `PATH`.
-        //
-        // Both are narrower than the failure this closes (a `PATH` with no
-        // darkmux on it at all, which is the ordinary case for a worktree
-        // build), so it stays — named here rather than silently inherited.
-        if let Ok(exe) = std::env::current_exe() {
-            cmd.env("DARKMUX_BIN", exe);
-        }
-
+        let mut cmd = shell_command(&cfg, cwd.as_deref());
+        // Held until the command has finished: it owns the files the inputs
+        // were written to.
+        let budget = input_env_budget(darkmux_platform::current().exec_env_limits());
+        let inputs = export_step_inputs(step, &mut cmd, input, budget)?;
+        let unset = unset_inputs_reason(step, &cfg.command, &inputs.unset);
+        export_darkmux_bin(&mut cmd);
         // (#2361, swarm S4-4) BOUNDED, in its own process group, and
         // registered with the child registry — see
         // `crate::bounded_command`'s module doc. An unbounded `.output()`
         // here pinned the mission Active with no way for a caught
         // SIGTERM/SIGINT to reach the child.
         let timeout = crate::bounded_command::configured_timeout();
-        match crate::bounded_command::run_bounded(cmd, timeout) {
-            crate::bounded_command::Bounded::Finished { success, code, stdout, stderr } => {
-                if !success {
-                    anyhow::bail!(
-                        "step `{}`: command exited with {:?}\nstdout: {}\nstderr: {}",
-                        step.id,
-                        code,
-                        String::from_utf8_lossy(&stdout),
-                        String::from_utf8_lossy(&stderr),
-                    );
-                }
-                Ok(StepOutcome {
-                    output: String::from_utf8_lossy(&stdout).to_string(),
-                    flow_records: Vec::new(),
-                    degraded: None,
-                })
-            }
-            // A killed command produced no output this step could hand on,
-            // so — unlike `mods.gate`, where a hung `test_command` is
-            // recorded as gate DATA — this is a step error naming the bound.
-            crate::bounded_command::Bounded::TimedOut { seconds } => anyhow::bail!(
-                "step `{}`: command exceeded {seconds}s and was killed \
-                 (`runtime.step_command_timeout_seconds`)",
-                step.id
-            ),
-            crate::bounded_command::Bounded::Interrupted => anyhow::bail!(
-                "step `{}`: interrupted before the command finished; the child was killed",
-                step.id
-            ),
-            // (#2532) The resolved working directory is NAMED here. A spawn
-            // that fails because the directory vanished between resolution
-            // and `fork` renders `No such file or directory` — byte-identical
-            // to `sh` itself being missing, which is exactly the confusion
-            // this change exists to end. `<inherited>` when nothing was set
-            // (the ambient tier), so the message never implies a `cwd` the
-            // step did not have.
-            crate::bounded_command::Bounded::SpawnFailed(e) => {
-                let where_ = cwd
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "<inherited from the process>".to_string());
-                Err(anyhow::Error::new(e))
-                    .with_context(|| format!("step `{}`: spawning shell command in {where_}", step.id))
-            }
+        let (ran, cut) = crate::bounded_command::run_bounded_with_cuts(cmd, timeout);
+        shell_outcome(step, cwd.as_deref(), ran, cut, unset)
+    }
+}
+
+/// The `sh -c` command a `procedural.shell` step runs, in `cwd` when one
+/// was resolved, with the step's declared `env`.
+fn shell_command(cfg: &ShellConfig, cwd: Option<&std::path::Path>) -> std::process::Command {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(&cfg.command);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    // (#3074) Declared values first, so the darkmux-set variables
+    // (`DARKMUX_STEP_INPUT_*`, `DARKMUX_BIN`) set after this win over a
+    // clashing name.
+    for (name, value) in cfg.env.iter().flatten() {
+        match value {
+            serde_json::Value::String(text) => cmd.env(name, text),
+            other => cmd.env(name, other.to_string()),
+        };
+    }
+    cmd
+}
+
+/// (#2310 P4e) `DARKMUX_BIN` — THIS darkmux, by absolute path, so a
+/// step command that has to ask darkmux something (`review`'s
+/// wait step polls `mod list --for`) calls the binary running the
+/// mission rather than whatever `darkmux` on `PATH` resolves to. A
+/// step spawned from `cargo run`, from a worktree's `target/`, or
+/// from a launcher whose `PATH` carries no darkmux at all would
+/// otherwise fail on a name lookup that has nothing to do with the
+/// step's own work. Set only when `current_exe` resolves; a command
+/// written as `"${DARKMUX_BIN:-darkmux}"` still works when it does
+/// not.
+///
+/// (#2310 P4e review, item 8) Two cases where this is set but not
+/// the darkmux an operator means, both of which the fallback CANNOT
+/// rescue because the variable is present, just wrong:
+///
+///  - **Under `cargo test`** it is the TEST HARNESS binary, not
+///    darkmux. A step command that shells out to it gets a test
+///    runner. Harmless for the in-process kind tests (which only
+///    read the variable), and the integration tests that exercise a
+///    real command set `DARKMUX_BIN` themselves to
+///    `assert_cmd::cargo::cargo_bin("darkmux")` — but a future test
+///    that lets this default through would be testing the harness.
+///  - **After an in-place reinstall** (`cargo install` renames, but
+///    a `cp` over a running binary does not) `current_exe` can name
+///    a path that no longer exists. The command then fails on a
+///    missing file rather than falling back to `PATH`.
+///
+/// Both are narrower than the failure this closes (a `PATH` with no
+/// darkmux on it at all, which is the ordinary case for a worktree
+/// build), so it stays — named here rather than silently inherited.
+fn export_darkmux_bin(cmd: &mut std::process::Command) {
+    if let Ok(exe) = std::env::current_exe() {
+        cmd.env("DARKMUX_BIN", exe);
+    }
+}
+
+/// What a `procedural.shell` step's bounded run means for the step. A
+/// non-zero exit, a timeout, an interrupt and a failed spawn are step
+/// errors; a finished command's stdout is the step's output, marked
+/// degraded when the output cap cut it or `unset` says the command read a
+/// variable darkmux left unset.
+fn shell_outcome(
+    step: &Step,
+    cwd: Option<&std::path::Path>,
+    ran: crate::bounded_command::Bounded,
+    cut: crate::bounded_command::OutputCut,
+    unset: Option<String>,
+) -> Result<StepOutcome> {
+    use crate::bounded_command::Bounded;
+    match ran {
+        Bounded::Finished { success: false, code, stdout, stderr } => bail!(
+            "step `{}`: command exited with {:?}\nstdout: {}\nstderr: {}",
+            step.id,
+            code,
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr),
+        ),
+        Bounded::Finished { stdout, .. } => Ok(StepOutcome {
+            output: String::from_utf8_lossy(&stdout).to_string(),
+            flow_records: Vec::new(),
+            degraded: either_reason(cut_output_reason(step, cut.stdout), unset),
+        }),
+        // A killed command produced no output this step could hand on,
+        // so — unlike `mods.gate`, where a hung `test_command` is
+        // recorded as gate DATA — this is a step error naming the bound.
+        Bounded::TimedOut { seconds } => bail!(
+            "step `{}`: command exceeded {seconds}s and was killed \
+             (`runtime.step_command_timeout_seconds`)",
+            step.id
+        ),
+        Bounded::Interrupted => bail!(
+            "step `{}`: interrupted before the command finished; the child was killed",
+            step.id
+        ),
+        // (#2532) The resolved working directory is NAMED here. A spawn
+        // that fails because the directory vanished between resolution
+        // and `fork` renders `No such file or directory` — byte-identical
+        // to `sh` itself being missing, which is exactly the confusion
+        // this change exists to end. `<inherited>` when nothing was set
+        // (the ambient tier), so the message never implies a `cwd` the
+        // step did not have.
+        Bounded::SpawnFailed(e) => {
+            let where_ = cwd.map_or_else(|| "<inherited from the process>".to_string(), |p| p.display().to_string());
+            Err(anyhow::Error::new(e)).with_context(|| format!("step `{}`: spawning shell command in {where_}", step.id))
         }
+    }
+}
+
+/// The degraded reason for a step whose stdout lost `cut` bytes to the
+/// output cap: its output is incomplete, so the run must not read Clean.
+fn cut_output_reason(step: &Step, cut: u64) -> Option<String> {
+    (cut > 0).then(|| {
+        format!(
+            "step `{}`: the command wrote more than the {}-byte output cap; {cut} bytes were cut from the \
+             middle of its stdout, so the step's output is incomplete",
+            step.id,
+            crate::bounded_command::OUTPUT_CAP_BYTES
+        )
+    })
+}
+
+/// Room kept under a per-string limit for a variable's name, its `=` and
+/// its terminating NUL, so the value itself never reaches the limit.
+const STEP_INPUT_NAME_ROOM: usize = 8 * 1024;
+
+/// How much of a step command's environment its inputs may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputEnvBudget {
+    /// The most bytes one input's value may be.
+    per: usize,
+    /// The most bytes all inputs' values may be together.
+    total: usize,
+}
+
+/// The budget under what this platform lets a spawned process be handed:
+/// each input under the per-string limit (Linux's `MAX_ARG_STRLEN`, about
+/// 120 KiB with 4 KiB pages) less [`STEP_INPUT_NAME_ROOM`], and all of them
+/// within three quarters of `ARG_MAX` (768 KiB on macOS), the last quarter
+/// left for the inherited environment and the command's own text. A limit
+/// the platform cannot name is no limit, as before.
+fn input_env_budget(limits: darkmux_platform::ExecEnvLimits) -> InputEnvBudget {
+    InputEnvBudget {
+        per: limits.per_string.map_or(usize::MAX, |n| n.saturating_sub(STEP_INPUT_NAME_ROOM)),
+        total: limits.total.map_or(usize::MAX, |n| n / 4 * 3),
+    }
+}
+
+/// The dependencies whose output is too large for the environment: any over
+/// the budget's per-input bytes, and, in dependency order, any that would
+/// take the values kept in the environment past its total.
+fn inputs_too_large_for_env(input: &BTreeMap<String, String>, budget: InputEnvBudget) -> std::collections::BTreeSet<&str> {
+    let mut used = 0;
+    let mut too_large = std::collections::BTreeSet::new();
+    for (dep_id, output) in input {
+        if output.len() > budget.per || used + output.len() > budget.total {
+            too_large.insert(dep_id.as_str());
+        } else {
+            used += output.len();
+        }
+    }
+    too_large
+}
+
+/// A directory darkmux created, owner-only, for one shell step's inputs;
+/// removed with everything in it when dropped.
+struct StepInputsDir(std::path::PathBuf);
+
+impl Drop for StepInputsDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// What [`export_step_inputs`] handed a command: the directory holding every
+/// input (which must outlive the command), and the `(variable, key)` of each
+/// input whose variable it left unset.
+#[derive(Default)]
+struct StepInputs {
+    /// Held for its `Drop`: the files are removed once the command is done.
+    _dir: Option<StepInputsDir>,
+    unset: Vec<(String, String)>,
+}
+
+/// Hand each dependency's output to `cmd`. Every one, whatever its size, is
+/// written to `$DARKMUX_STEP_INPUTS_DIR/<KEY>` (a fresh 0700 directory,
+/// each file 0600). Each that fits `budget` ([`inputs_too_large_for_env`])
+/// is also `DARKMUX_STEP_INPUT_<KEY>`; one that does not has that variable
+/// UNSET, never filled with something else, so a spawn never fails on an
+/// input's size and `${VAR:?}` fails loudly. A command that names an unset
+/// variable makes the step degraded ([`unset_inputs_reason`]).
+fn export_step_inputs(
+    step: &Step,
+    cmd: &mut std::process::Command,
+    input: &BTreeMap<String, String>,
+    budget: InputEnvBudget,
+) -> Result<StepInputs> {
+    if input.is_empty() {
+        return Ok(StepInputs::default());
+    }
+    let base = std::env::temp_dir().join(format!("darkmux-step-inputs-{}-{}", std::process::id(), unix_nanos()));
+    let dir = StepInputsDir(
+        crate::exclusive_fs::create_dir_exclusive_unique_0700(&base)
+            .with_context(|| format!("step `{}`: creating a directory for its inputs", step.id))?,
+    );
+    let too_large = inputs_too_large_for_env(input, budget);
+    let mut unset = Vec::new();
+    for (dep_id, output) in input {
+        let key = sanitize_env_key(dep_id);
+        crate::exclusive_fs::write_file_refusing_symlinks_0600(&dir.0.join(&key), output.as_bytes())
+            .map_err(|e| anyhow!("step `{}`: writing the output of `{dep_id}` for its command: {e}", step.id))?;
+        let name = format!("DARKMUX_STEP_INPUT_{key}");
+        if too_large.contains(dep_id.as_str()) {
+            cmd.env_remove(&name);
+            eprintln!("{}", unset_input_warning(step, dep_id, output.len(), &name, &key));
+            unset.push((name, key));
+        } else {
+            cmd.env(&name, output);
+        }
+    }
+    cmd.env("DARKMUX_STEP_INPUTS_DIR", &dir.0);
+    Ok(StepInputs { _dir: Some(dir), unset })
+}
+
+/// Nanoseconds since the epoch, for a directory name; `0` on a clock set
+/// before 1970 (the exclusive create steps past a taken name either way).
+fn unix_nanos() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+}
+
+/// What darkmux says on stderr when an input's variable is left unset.
+fn unset_input_warning(step: &Step, dep_id: &str, len: usize, name: &str, key: &str) -> String {
+    format!(
+        "darkmux: step `{}`: the output of `{dep_id}` is {len} bytes, more than this step command's \
+         environment carries, so `{name}` is unset; the command reads it from \"$DARKMUX_STEP_INPUTS_DIR/{key}\"",
+        step.id
+    )
+}
+
+/// Whether `command` names the variable `name`: the name with no further
+/// identifier byte after it, so `X_2` is not `X`. No shell parsing: a
+/// mention in a comment counts too, which errs toward saying so.
+fn names_variable(command: &str, name: &str) -> bool {
+    command
+        .match_indices(name)
+        .any(|(at, _)| !command[at + name.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// The degraded reason for a command that names a variable darkmux left
+/// unset: it read an empty value where an input was, which can pass for a
+/// clean result (a `grep` for a failure finding nothing), so the run must
+/// not read Clean over it.
+fn unset_inputs_reason(step: &Step, command: &str, unset: &[(String, String)]) -> Option<String> {
+    let named: Vec<String> = unset
+        .iter()
+        .filter(|(name, _)| names_variable(command, name))
+        .map(|(name, key)| format!("`{name}` (read \"$DARKMUX_STEP_INPUTS_DIR/{key}\" instead)"))
+        .collect();
+    (!named.is_empty()).then(|| {
+        format!(
+            "step `{}`: the command reads {}, unset because the input is too large for the environment, \
+             so it saw no value there",
+            step.id,
+            named.join(", ")
+        )
+    })
+}
+
+/// Both degraded reasons, when a step has both.
+fn either_reason(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
     }
 }
 
@@ -4488,6 +4784,231 @@ mod tests {
         assert!(out.output.contains("value-from-upstream"), "got: {}", out.output);
     }
 
+    /// A dependency's output larger than the environment can carry (2 MiB,
+    /// past macOS's 1 MiB argument-plus-environment limit and Linux's
+    /// 128 KiB per variable) reaches the command whole in its file, its
+    /// variable is unset rather than filled with anything else, and the
+    /// step's spawn does not fail.
+    #[test]
+    // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
+    #[serial_test::serial]
+    fn procedural_shell_hands_an_input_too_large_for_the_environment_over_in_a_file() {
+        let big = format!("first-line\n{}\nlast-line", "z".repeat(2 * 1024 * 1024));
+        let input = BTreeMap::from([("upstream-step".to_string(), big.clone())]);
+        let command = r#"f="$DARKMUX_STEP_INPUTS_DIR/UPSTREAM_STEP"; printf 'bytes=%s\n' "$(wc -c < "$f" | tr -d ' ')"; tail -n 1 "$f"; echo; printf 'var=%s' "${DARKMUX_STEP_INPUT_UPSTREAM_STEP-unset}""#;
+        let s = step("s1", "procedural.shell", json!({"command": command}));
+        let out = ProceduralShellStepKind
+            .run(&s, &empty_task(), &input, &crate::step_kinds::StepRunCtx::for_test())
+            .expect("a large input must not fail the step's spawn");
+        assert!(out.output.contains(&format!("bytes={}", big.len())), "the file holds the whole input: {}", out.output);
+        assert!(out.output.contains("last-line"), "{}", out.output);
+        assert!(out.output.ends_with("var=unset"), "the variable is unset, not a stand-in: {}", out.output);
+    }
+
+    /// A failing log too large for the environment (2 MiB) reaches the next
+    /// step. Its variable is unset, so `${VAR:?}` fails the step loudly
+    /// instead of a stand-in value passing a `grep` for the failure; the
+    /// file has it.
+    #[test]
+    // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
+    #[serial_test::serial]
+    fn procedural_shell_an_unset_large_input_fails_a_required_reference_and_its_file_has_it() {
+        let log = format!("{}\ntest result: FAILED\n", "ok line\n".repeat(2 * 1024 * 1024 / 8));
+        let input = BTreeMap::from([("tests".to_string(), log)]);
+        let ctx = crate::step_kinds::StepRunCtx::for_test();
+        let required = step("s1", "procedural.shell", json!({"command": r#"printf %s "${DARKMUX_STEP_INPUT_TESTS:?}" | grep -c FAILED"#}));
+        let err = ProceduralShellStepKind.run(&required, &empty_task(), &input, &ctx).unwrap_err();
+        assert!(err.to_string().contains("DARKMUX_STEP_INPUT_TESTS"), "the shell names the unset variable: {err}");
+        let from_file = step("s2", "procedural.shell", json!({"command": r#"grep -c FAILED "$DARKMUX_STEP_INPUTS_DIR/TESTS""#}));
+        let out = ProceduralShellStepKind.run(&from_file, &empty_task(), &input, &ctx).unwrap();
+        assert_eq!(out.output.trim(), "1");
+    }
+
+    /// An input that fits is both its variable and its file, byte for byte.
+    #[test]
+    // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
+    #[serial_test::serial]
+    fn procedural_shell_writes_every_input_to_its_file_as_well_as_the_environment() {
+        let input = BTreeMap::from([("upstream-step".to_string(), "value-from-upstream\nsecond line".to_string())]);
+        let command = r#"[ "$(cat "$DARKMUX_STEP_INPUTS_DIR/UPSTREAM_STEP")" = "$DARKMUX_STEP_INPUT_UPSTREAM_STEP" ] && printf same"#;
+        let s = step("s1", "procedural.shell", json!({"command": command}));
+        let out = ProceduralShellStepKind.run(&s, &empty_task(), &input, &crate::step_kinds::StepRunCtx::for_test()).unwrap();
+        assert_eq!(out.output, "same");
+    }
+
+    /// The inputs directory is owner-only (0700) and each file in it 0600,
+    /// whatever the umask: another local user on a shared `/tmp` reads
+    /// nothing. Dropping the handle removes the directory.
+    #[test]
+    #[cfg(unix)]
+    fn step_inputs_are_owner_only_and_removed_after_the_command() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let input = BTreeMap::from([("dep".to_string(), "secret".to_string())]);
+        let mut cmd = std::process::Command::new("true");
+        let budget = InputEnvBudget { per: usize::MAX, total: usize::MAX };
+        let dir = export_step_inputs(&step("s1", "procedural.shell", json!({})), &mut cmd, &input, budget).unwrap()._dir.expect("a directory");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir.0), 0o700, "the directory");
+        assert_eq!(mode(&dir.0.join("DEP")), 0o600, "the file");
+        let path = dir.0.clone();
+        drop(dir);
+        assert!(!path.exists(), "removed after the command");
+        assert!(export_step_inputs(&step("s1", "procedural.shell", json!({})), &mut cmd, &BTreeMap::new(), budget).unwrap()._dir.is_none(), "no inputs, no directory");
+    }
+
+    /// A shell step whose command writes past the output cap (2 MB against
+    /// 1 MiB) records the head and tail of it as the step's output, with the
+    /// note naming the cut and the cap, instead of holding all of it.
+    #[test]
+    // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
+    #[serial_test::serial]
+    fn procedural_shell_output_past_the_cap_is_recorded_with_a_cut_note() {
+        let command = r#"printf 'start\n'; head -c 2000000 /dev/zero | tr '\0' x; printf '\nverdict: ok'"#;
+        let s = step("s1", "procedural.shell", json!({"command": command}));
+        let out = ProceduralShellStepKind.run(&s, &empty_task(), &BTreeMap::new(), &crate::step_kinds::StepRunCtx::for_test()).unwrap();
+        let cap = crate::bounded_command::OUTPUT_CAP_BYTES;
+        assert!(out.output.len() <= cap + 512, "kept {} bytes", out.output.len());
+        assert!(out.output.starts_with("start\n") && out.output.ends_with("verdict: ok"), "head and tail survive");
+        assert!(out.output.contains(&format!("cut {} bytes from the middle of stdout", "start\n".len() + 2_000_000 + "\nverdict: ok".len() - cap)), "no cut note");
+        assert!(out.degraded.is_some(), "an incomplete output is recorded as degraded");
+    }
+
+    /// An input over the per-input limit is too large for the environment;
+    /// so is, in dependency order, one that would take the environment's
+    /// values past the total; an input at either limit exactly fits.
+    #[test]
+    fn inputs_too_large_for_the_environment_are_picked() {
+        let input = BTreeMap::from([
+            ("a".to_string(), "x".repeat(4)),
+            ("b".to_string(), "x".repeat(5)),
+            ("c".to_string(), "x".repeat(4)),
+            ("d".to_string(), "x".repeat(2)),
+            ("e".to_string(), "x".to_string()),
+        ]);
+        let budget = |per, total| InputEnvBudget { per, total };
+        let too_large: Vec<_> = inputs_too_large_for_env(&input, budget(4, 7)).into_iter().collect();
+        assert_eq!(too_large, ["b", "c"], "b is over 4; c would make 8 of 7; d makes 6, e makes 7 exactly");
+        assert!(inputs_too_large_for_env(&input, budget(5, 16)).is_empty(), "everything fits: 16 of 16");
+        let per_only: Vec<_> = inputs_too_large_for_env(&input, budget(4, 100)).into_iter().collect();
+        assert_eq!(per_only, ["b"], "the per-input limit applies with room left in the total");
+    }
+
+    /// Many inputs that each fit, but not all together (forty of 100 KiB,
+    /// 4 MB, past `ARG_MAX` on macOS and Linux alike), do not fail the step's
+    /// spawn: all forty are files, the first is a variable, the last unset.
+    #[test]
+    // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
+    #[serial_test::serial]
+    fn procedural_shell_unsets_inputs_past_the_environments_total() {
+        let input: BTreeMap<String, String> = (0..40).map(|i| (format!("dep-{i:02}"), "y".repeat(100 * 1024))).collect();
+        let command = r#"printf '%s %s ' "${#DARKMUX_STEP_INPUT_DEP_00}" "${DARKMUX_STEP_INPUT_DEP_39-unset}"; ls "$DARKMUX_STEP_INPUTS_DIR" | wc -l | tr -d ' '"#;
+        let s = step("s1", "procedural.shell", json!({"command": command}));
+        let out = ProceduralShellStepKind
+            .run(&s, &empty_task(), &input, &crate::step_kinds::StepRunCtx::for_test())
+            .expect("many inputs must not fail the step's spawn");
+        assert_eq!(out.output.trim(), format!("{} unset 40", 100 * 1024));
+    }
+
+    /// The budget sits under what the platform allows: each input 8 KiB
+    /// under the per-string limit (120 KiB of Linux's 128 KiB), all of them
+    /// within three quarters of `ARG_MAX` (768 KiB of macOS's 1 MiB), and no
+    /// limit where the platform names none.
+    #[test]
+    fn the_input_budget_sits_under_the_platforms_limits() {
+        use darkmux_platform::ExecEnvLimits;
+        let linux = input_env_budget(ExecEnvLimits { per_string: Some(128 * 1024), total: Some(2 * 1024 * 1024) });
+        assert_eq!(linux, InputEnvBudget { per: 120 * 1024, total: 1536 * 1024 });
+        let mac = input_env_budget(ExecEnvLimits { per_string: None, total: Some(1024 * 1024) });
+        assert_eq!(mac, InputEnvBudget { per: usize::MAX, total: 768 * 1024 });
+        assert_eq!(input_env_budget(ExecEnvLimits::default()), InputEnvBudget { per: usize::MAX, total: usize::MAX });
+    }
+
+    /// A 100 KiB input, which fit the environment before inputs had files,
+    /// still does: the reviewer's probe, reading the variable bare, sees the
+    /// failure in it and fails the step, as it did then.
+    #[test]
+    // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
+    #[serial_test::serial]
+    fn procedural_shell_a_100_kib_input_still_reaches_a_bare_variable() {
+        let log = format!("{}\ntest result: FAILED\n", "ok line\n".repeat(100 * 1024 / 8));
+        let input = BTreeMap::from([("tests".to_string(), log)]);
+        let s = step("s1", "procedural.shell", json!({"command": REVIEWER_PROBE}));
+        let err = ProceduralShellStepKind.run(&s, &empty_task(), &input, &crate::step_kinds::StepRunCtx::for_test()).unwrap_err();
+        assert!(err.to_string().contains("exited with Some(1)"), "{err}");
+    }
+
+    /// The reviewer's probe, which reads the variable bare and reports green
+    /// unless it finds `FAILED`.
+    const REVIEWER_PROBE: &str = r#"if printf %s "$DARKMUX_STEP_INPUT_TESTS" | grep -q FAILED; then exit 1; fi; echo tests-green"#;
+
+    /// The reviewer's probe against an input too large for the environment
+    /// (2 MiB): the variable is unset, so the probe reports green, but the
+    /// step is DEGRADED, naming the variable and the file to read instead,
+    /// so the run's verdict does not read Clean. A command that reads only
+    /// the file sees the failure and is not degraded.
+    #[test]
+    // (#2532) Reads the process cwd through `resolve_shell_cwd`'s ambient tier.
+    #[serial_test::serial]
+    fn procedural_shell_naming_an_unset_input_is_degraded_and_reading_the_file_is_not() {
+        let log = format!("{}\ntest result: FAILED\n", "ok line\n".repeat(2 * 1024 * 1024 / 8));
+        let input = BTreeMap::from([("tests".to_string(), log)]);
+        let ctx = crate::step_kinds::StepRunCtx::for_test();
+        let probe = ProceduralShellStepKind.run(&step("s1", "procedural.shell", json!({"command": REVIEWER_PROBE})), &empty_task(), &input, &ctx).unwrap();
+        assert_eq!(probe.output.trim(), "tests-green");
+        let reason = probe.degraded.expect("naming an unset input degrades the step");
+        assert!(reason.contains("DARKMUX_STEP_INPUT_TESTS") && reason.contains("$DARKMUX_STEP_INPUTS_DIR/TESTS"), "{reason}");
+        let file_only = r#"if grep -q FAILED "$DARKMUX_STEP_INPUTS_DIR/TESTS"; then echo saw-failure; fi"#;
+        let read = ProceduralShellStepKind.run(&step("s2", "procedural.shell", json!({"command": file_only})), &empty_task(), &input, &ctx).unwrap();
+        assert_eq!((read.output.trim(), read.degraded), ("saw-failure", None));
+    }
+
+    /// A variable is named when nothing identifier-like follows it, so a
+    /// longer name sharing the prefix is not a mention; the reason lists
+    /// only the unset variables the command names; both reasons combine.
+    #[test]
+    fn an_unset_input_counts_only_when_the_command_names_it() {
+        assert!(names_variable("echo ${X_A:?}", "X_A") && names_variable("echo $X_A", "X_A"));
+        assert!(!names_variable("echo $X_AB $X_A_2", "X_A"));
+        let s = step("s1", "procedural.shell", json!({}));
+        let unset = [("X_A".to_string(), "A".to_string()), ("X_B".to_string(), "B".to_string())];
+        let reason = unset_inputs_reason(&s, "cat \"$X_B\"", &unset).unwrap();
+        assert!(reason.contains("`X_B`") && reason.contains("/B") && !reason.contains("X_A"), "{reason}");
+        assert_eq!(unset_inputs_reason(&s, "cat \"$DARKMUX_STEP_INPUTS_DIR/A\"", &unset), None);
+        assert_eq!(either_reason(Some("a".into()), Some("b".into())).as_deref(), Some("a; b"));
+        assert_eq!(either_reason(None, Some("b".into())).as_deref(), Some("b"));
+        assert_eq!(either_reason(None, None), None);
+    }
+
+    /// Each way a bounded run ends, as the step sees it: the output, marked
+    /// degraded only when the cap cut stdout; and an error naming what
+    /// happened for a failed exit, a timeout, an interrupt and a spawn.
+    #[test]
+    fn shell_outcome_maps_every_bounded_result() {
+        use crate::bounded_command::{Bounded, OutputCut};
+        let s = step("s1", "procedural.shell", json!({}));
+        let finished = |success| Bounded::Finished { success, code: Some(if success { 0 } else { 3 }), stdout: b"out".to_vec(), stderr: b"err".to_vec() };
+        let ok = shell_outcome(&s, None, finished(true), OutputCut::default(), None).unwrap();
+        assert_eq!((ok.output.as_str(), ok.degraded), ("out", None));
+        let named = shell_outcome(&s, None, finished(true), OutputCut::default(), Some("reads `X`".into())).unwrap();
+        assert_eq!(named.degraded.as_deref(), Some("reads `X`"), "an unset input the command names degrades it");
+        let only_stderr_cut = shell_outcome(&s, None, finished(true), OutputCut { stdout: 0, stderr: 9 }, None).unwrap();
+        assert_eq!(only_stderr_cut.degraded, None, "stderr is not the step's output");
+        let cut = shell_outcome(&s, None, finished(true), OutputCut { stdout: 42, stderr: 0 }, None).unwrap();
+        let reason = cut.degraded.expect("a cut output is degraded");
+        assert!(reason.contains("42 bytes") && reason.contains(&crate::bounded_command::OUTPUT_CAP_BYTES.to_string()), "{reason}");
+        let failed = shell_outcome(&s, None, finished(false), OutputCut::default(), None).unwrap_err().to_string();
+        assert!(failed.contains("exited with Some(3)") && failed.contains("stdout: out") && failed.contains("stderr: err"), "{failed}");
+        let timed_out = shell_outcome(&s, None, Bounded::TimedOut { seconds: 7 }, OutputCut::default(), None).unwrap_err().to_string();
+        assert!(timed_out.contains("exceeded 7s") && timed_out.contains("step_command_timeout_seconds"), "{timed_out}");
+        let interrupted = shell_outcome(&s, None, Bounded::Interrupted, OutputCut::default(), None).unwrap_err().to_string();
+        assert!(interrupted.contains("interrupted"), "{interrupted}");
+        let gone = || Bounded::SpawnFailed(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let inherited = format!("{:#}", shell_outcome(&s, None, gone(), OutputCut::default(), None).unwrap_err());
+        assert!(inherited.contains("<inherited from the process>"), "{inherited}");
+        let named = format!("{:#}", shell_outcome(&s, Some(std::path::Path::new("/gone/dir")), gone(), OutputCut::default(), None).unwrap_err());
+        assert!(named.contains("/gone/dir"), "{named}");
+    }
+
     /// (#2310 P4e) A step command that has to call darkmux back gets the
     /// RUNNING binary's absolute path, not a `PATH` lookup. Red-proved by
     /// deleting the `cmd.env("DARKMUX_BIN", …)` line: the command then
@@ -5331,6 +5852,166 @@ mod tests {
         assert_eq!(out.index, 3, "{out:?}");
     }
 
+    /// A reply that stopped at the item's cap: `finish_reason: "length"`,
+    /// `content` as given, `completion` tokens spent.
+    fn capped_reply(content: &str, completion: u64) -> crate::single_shot::SingleShotReply {
+        crate::single_shot::SingleShotReply {
+            content: content.to_string(),
+            model: None,
+            counts: darkmux_trajectory::UsageCounts { completion: Some(completion), ..Default::default() },
+            finish_reason: Some("length".to_string()),
+        }
+    }
+
+    /// (#3445) A LOCAL map item whose every attempt stopped at its
+    /// `max_tokens` with no answer failed: it is not the "dispatched, said
+    /// nothing" empty success, and its error names the cap and the step's
+    /// knob. `retry_on_empty` still retries it first.
+    #[test]
+    fn a_local_item_that_stops_at_its_cap_with_no_answer_fails_naming_max_tokens() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            *seen.lock().unwrap() += 1;
+            Ok(capped_reply("", 100))
+        });
+        let out = map_local_item(3, "m", "sys", "user", 0.0, 100, 5, 1, 0, Some(&ovr), &mut Vec::new(), None);
+        assert!(!out.ok && out.content.is_empty(), "{out:?}");
+        let error = out.error.as_deref().unwrap_or_default();
+        assert!(error.contains("output cap of 100") && error.contains("`max_tokens`"), "{error}");
+        assert_eq!(*calls.lock().unwrap(), 2, "retry_on_empty retried it once first");
+        assert_eq!(out.completion_tokens, Some(200), "both attempts' spend is kept");
+        assert!(out.stopped_at_cap, "its terminal keeps the spent call's turn and counts: {out:?}");
+    }
+
+    /// (#3445) The HOSTED sibling: the same failure, the same remedy.
+    #[test]
+    fn a_hosted_item_that_stops_at_its_cap_with_no_answer_fails_naming_max_tokens() {
+        let bucket = Arc::new(Mutex::new(DispatchBudget::new(None, darkmux_types::BudgetPolicy::Warn)));
+        // Not the 4096 default: the error names the cap this item was given.
+        let ovr: MapDispatchOverride = Arc::new(|_call: &OverrideDispatchCall<'_>| Ok(capped_reply(" \n", 2_048)));
+        let out = map_hosted_item(
+            0, &bucket, &map_ep(), "gpt-5.1", "sys", "user", 2_048, 1, 0, 0, Some(&ovr),
+            &mut Vec::new(), "s1", &crate::budget::tests::solo_caller(),
+        );
+        assert!(!out.ok, "{out:?}");
+        let error = out.error.as_deref().unwrap_or_default();
+        assert!(error.contains("output cap of 2048") && error.contains("`max_tokens`"), "{error}");
+        assert!(out.stopped_at_cap, "its terminal keeps the spent call's turn and counts: {out:?}");
+    }
+
+    /// An override whose first call errors and whose retry stops at the cap
+    /// of 300 with no answer.
+    fn errored_then_capped() -> MapDispatchOverride {
+        let calls = Arc::new(Mutex::new(0usize));
+        Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            let mut n = calls.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                anyhow::bail!("transport refused the draw")
+            }
+            Ok(capped_reply("", 300))
+        })
+    }
+
+    /// (#3445) An item whose first attempt errored and whose `retry_on_error`
+    /// retry stopped at the cap with no answer reports the cap, not the
+    /// earlier transport error: the cap is how its last attempt failed, and
+    /// raising `max_tokens` is what fixes it. Local and hosted alike.
+    #[test]
+    fn an_errored_then_capped_item_names_the_cap_not_the_earlier_error() {
+        let assert_names_the_cap = |out: &MapItemResult| {
+            assert!(!out.ok, "{out:?}");
+            let error = out.error.as_deref().unwrap_or_default();
+            assert!(error.contains("output cap of 300") && error.contains("`max_tokens`"), "{error}");
+            assert!(!error.contains("transport refused"), "{error}");
+        };
+        let ovr = errored_then_capped();
+        assert_names_the_cap(&map_local_item(0, "m", "sys", "user", 0.0, 300, 5, 0, 1, Some(&ovr), &mut Vec::new(), None));
+        let bucket = Arc::new(Mutex::new(DispatchBudget::new(None, darkmux_types::BudgetPolicy::Warn)));
+        let ovr = errored_then_capped();
+        assert_names_the_cap(&map_hosted_item(
+            0, &bucket, &map_ep(), "gpt-5.1", "sys", "user", 300, 1, 0, 1, Some(&ovr),
+            &mut Vec::new(), "s1", &crate::budget::tests::solo_caller(),
+        ));
+    }
+
+    /// (#3445) The inverted cases: a capped attempt whose retry answered is
+    /// an ok item, a reply cut off at the cap WITH an answer in it is ok, and
+    /// an empty reply the model ended itself (`stop`) stays the ok empty item.
+    #[test]
+    fn a_capped_item_that_answered_on_retry_or_partly_stays_ok() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            let mut n = seen.lock().unwrap();
+            *n += 1;
+            Ok(capped_reply(if *n == 1 { "" } else { "partial answer" }, 100))
+        });
+        let out = map_local_item(0, "m", "sys", "user", 0.0, 100, 5, 1, 0, Some(&ovr), &mut Vec::new(), None);
+        assert!(out.ok && out.error.is_none() && out.content == "partial answer", "{out:?}");
+
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+            let mut n = seen.lock().unwrap();
+            *n += 1;
+            let mut reply = capped_reply("", 100);
+            if *n == 2 {
+                reply.finish_reason = Some("stop".to_string());
+            }
+            Ok(reply)
+        });
+        let out = map_local_item(0, "m", "sys", "user", 0.0, 100, 5, 1, 0, Some(&ovr), &mut Vec::new(), None);
+        assert!(out.ok && out.error.is_none() && out.content.is_empty(), "the last attempt decides: {out:?}");
+    }
+
+    /// (#3445) A map whose every item stopped at the cap with no answer is an
+    /// errored step, never a clean one: each item's terminal is
+    /// `dispatch.error` naming the cap, and no `dispatch.complete` is written.
+    #[test]
+    fn dispatch_map_whose_items_all_hit_the_cap_with_no_answer_errors_the_step() {
+        let ovr: MapDispatchOverride = Arc::new(|_call: &OverrideDispatchCall<'_>| Ok(capped_reply("", 64)));
+        let s = map_step(json!({
+            "model": "qwen3-4b",
+            "user_template": "check {item}",
+            "collection": ["a", "b"],
+            "max_tokens": 64,
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = StepRunCtx::new(crate::test_run(), Some(tx), Some(ovr), std::sync::Arc::new(crate::step_kinds::ArtifactBus::new()));
+        let result = DispatchMapStepKind.run(&s, &empty_task(), &BTreeMap::new(), &ctx);
+        drop(ctx);
+        let msg = format!("{:#}", result.expect_err("no item answered, so the step errors"));
+        assert!(msg.contains("all 2 item(s) failed") && msg.contains("output cap of 64"), "{msg}");
+        let emitted: Vec<darkmux_flow::FlowRecord> = rx
+            .into_iter()
+            .filter_map(|sig| match sig {
+                crate::step_kinds::WaveSignal::Record(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        let count = |a: darkmux_flow::FlowAction| emitted.iter().filter(|r| r.action == a).count();
+        assert_eq!(count(darkmux_flow::FlowAction::DispatchComplete), 0, "{emitted:?}");
+        let errors: Vec<_> = emitted.iter().filter(|r| r.action == darkmux_flow::FlowAction::DispatchError).collect();
+        assert_eq!(errors.len(), 2, "{emitted:?}");
+        assert!(
+            errors.iter().all(|r| r.payload_json()["error"].as_str().is_some_and(|e| e.contains("output cap of 64"))),
+            "each terminal names the cap: {errors:?}"
+        );
+        // The call was made and its tokens spent: like a single-shot cap
+        // failure, the terminal keeps its one turn and its counts, and no
+        // exit code (a failed execution has none).
+        for r in &errors {
+            let p = r.payload_json();
+            assert_eq!(p["total_turns"], 1, "{p}");
+            assert_eq!(p["completion_tokens"], 64, "{p}");
+            assert_eq!(p["result_class"], "error", "{p}");
+            assert!(p.get("exit_code").is_none_or(|c| c.is_null()), "{p}");
+        }
+        assert_eq!(count(darkmux_flow::FlowAction::TelemetryTokens), 2, "each spent call keeps its usage record: {emitted:?}");
+    }
+
     /// A named endpoint with a 1-token daily budget under `policy`.
     fn budgeted_ep(policy: &str) -> darkmux_types::ModelEndpoint {
         let mut ep: darkmux_types::ModelEndpoint = serde_json::from_value(json!({
@@ -5896,8 +6577,10 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
+            cut_by_stop: false,
         }];
-        let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", false, &results);
+        let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", false, &results, results.len());
         assert_eq!(
             rec.session_id.as_deref(),
             Some(expected.as_str()),
@@ -5965,6 +6648,8 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("a reply with usage emits a record")).unwrap();
         assert_eq!(payload["total_tokens"], 4547);
@@ -5992,6 +6677,8 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&local, "m", "ep").expect("emits")).unwrap();
         assert_eq!(payload["index"], 3, "which item of the fan-out this was");
@@ -6017,6 +6704,8 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let execution = ExecutionId::mint();
         let rec = DispatchMapStepKind::item_record(&task_session(), &execution, &step, "m", false, &res);
@@ -6043,6 +6732,8 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let tok = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("emits")).unwrap();
         let item = DispatchMapStepKind::item_record(&task_session(), &ExecutionId::mint(), &step, "m", false, &res);
@@ -6072,6 +6763,8 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("a reply with usage emits a record")).unwrap();
         assert_eq!(payload["reasoning_tokens"], 1024);
@@ -6101,6 +6794,8 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("emits")).unwrap();
         assert_eq!(payload["reasoning_tokens"], 300);
@@ -6180,6 +6875,8 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("a total alone still emits")).unwrap();
         assert_eq!(payload["total_tokens"], 1521);
@@ -6207,6 +6904,8 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
+            cut_by_stop: false,
         };
         let payload = serde_json::to_value(map_item_token_payload(&res, "m", "ep").expect("a split alone still emits")).unwrap();
         assert_eq!(payload["total_tokens"], 42, "arithmetic on reported parts, not fabrication");
@@ -6239,12 +6938,12 @@ mod tests {
         // mission graph's max-fold token meter reads as the step's true
         // spend (any per-item value is <= the sum).
         let results = vec![
-            MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(100), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
-            MapItemResult { index: 1, ok: false, content: String::new(), error: Some("boom".to_string()), total_tokens: None, prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
-            MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 },
+            MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(100), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false, cut_by_stop: false },
+            MapItemResult { index: 1, ok: false, content: String::new(), error: Some("boom".to_string()), total_tokens: None, prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false, cut_by_stop: false },
+            MapItemResult { index: 2, ok: true, content: "c".to_string(), error: None, total_tokens: Some(250), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false, cut_by_stop: false },
         ];
         let s = map_step(json!({}));
-        let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", true, &results);
+        let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", true, &results, results.len());
         let p = rec.payload_json();
         assert_eq!(p["kind"], "dispatch.map");
         assert_eq!(p["items_in"], 3);
@@ -6257,8 +6956,8 @@ mod tests {
             "any failed item raises the level"
         );
 
-        let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0 }];
-        let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", false, &clean);
+        let clean = vec![MapItemResult { index: 0, ok: true, content: "a".to_string(), error: None, total_tokens: Some(5), prompt_tokens: None, completion_tokens: None, reasoning_tokens: None, cached_tokens: None, served_model: None, wall_ms: 0, retried: 0, stopped_at_cap: false, cut_by_stop: false }];
+        let rec = DispatchMapStepKind::aggregate_record(&task_session(), &s, "m", false, &clean, clean.len());
         assert!(matches!(rec.level, darkmux_flow::Level::Info));
         assert_eq!(rec.payload_json()["unmanaged"], false);
     }
@@ -6277,13 +6976,15 @@ mod tests {
             served_model: None,
             wall_ms: 0,
             retried: 0,
+            stopped_at_cap: false,
+            cut_by_stop: false,
         }
     }
 
     fn run_of(results: &[MapItemResult]) -> MapRun {
         MapRun {
             outcome: StepOutcome { output: serde_json::to_string(results).unwrap(), flow_records: Vec::new(), degraded: None },
-            verdict: MapVerdict::of(results),
+            verdict: MapVerdict::of(results, results.len()),
         }
     }
 
@@ -6732,6 +7433,91 @@ mod tests {
         assert!(!results[0].ok);
         assert_eq!(results[0].retried, 0, "no retry budget — never retried");
         assert_eq!(calls.get(), 1, "exactly one call — the historical no-retry-on-error behavior");
+    }
+
+    /// An operator's stop that lands during a map's first model call ends
+    /// the map there. The item's retries are never sent, and no later item
+    /// opens a `dispatch.start` or calls the model: each would be a request
+    /// sent after the stop, killed about 100 ms later and billed. The item
+    /// that started gets exactly one terminal (contract 2): a `dispatch.error`
+    /// naming the stop when its call was cut off, its own `dispatch.complete`
+    /// when the call came back whole. The items never started are not
+    /// counted as failures, and the step ends stopped (its error carries the
+    /// interrupt marker and says how many items did not run), never as a
+    /// success. Local and hosted items alike.
+    #[test]
+    #[serial_test::serial]
+    fn a_stop_during_the_first_call_of_a_map_sends_nothing_more() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        let _state = darkmux_types::test_isolation::IsolatedState::new(); // budget records stay off the real flow sink
+        let marker = darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL;
+        for (arm, endpoint) in [("local", None), ("hosted", Some(json!({ "url": "https://example.com" })))] {
+            for call_cut in [true, false] {
+                let case = format!("{arm} item, call cut off: {call_cut}");
+                darkmux_types::interrupt::reset_for_test();
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let seen = Arc::clone(&calls);
+                let ovr: MapDispatchOverride = Arc::new(move |_call: &OverrideDispatchCall<'_>| {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    darkmux_types::interrupt::raise_for_test();
+                    if call_cut {
+                        // What the reap watchdog's kill of the in-flight request returns.
+                        return Err(anyhow!("hosted dispatch {marker}: the request was killed mid-flight"));
+                    }
+                    Ok(crate::single_shot::SingleShotReply {
+                        content: "answer".into(),
+                        model: None,
+                        counts: darkmux_trajectory::UsageCounts { total: Some(10), ..Default::default() },
+                        finish_reason: None,
+                    })
+                });
+                let mut config = json!({
+                    "model": "m",
+                    "user_template": "check {item}",
+                    "collection": ["a", "b", "c", "d", "e"],
+                    "retry_on_error": 2,
+                    "retry_on_empty": 2,
+                });
+                if let Some(ep) = &endpoint {
+                    config["endpoint"] = ep.clone();
+                }
+                let (tx, rx) = std::sync::mpsc::channel();
+                let ctx = StepRunCtx::new(crate::test_run(), Some(tx), Some(ovr), Arc::new(crate::step_kinds::ArtifactBus::new()));
+                let result = DispatchMapStepKind.run(&map_step(config), &empty_task(), &BTreeMap::new(), &ctx);
+                drop(ctx);
+                darkmux_types::interrupt::reset_for_test();
+                let records: Vec<darkmux_flow::FlowRecord> = rx
+                    .into_iter()
+                    .filter_map(|sig| match sig {
+                        crate::step_kinds::WaveSignal::Record(r) => Some(r),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "{case}: no model call after the stop");
+                let bookends: Vec<&darkmux_flow::FlowRecord> =
+                    records.iter().filter(|r| r.action.bookend().is_some()).collect();
+                let actions: Vec<&str> = bookends.iter().map(|r| r.action.as_str()).collect();
+                let terminal = if call_cut { "dispatch.error" } else { "dispatch.complete" };
+                assert_eq!(actions, ["dispatch.start", terminal], "{case}: one execution, opened and closed once");
+                if call_cut {
+                    assert_eq!(bookends[1].payload_json()["stop_reason"], "interrupted", "{case}: the terminal names the stop");
+                }
+                let aggregate = records
+                    .iter()
+                    .map(|r| r.payload_json())
+                    .find(|p| p["items_in"].is_u64())
+                    .unwrap_or_else(|| panic!("{case}: the map's aggregate record"));
+                let ok = u64::from(!call_cut);
+                assert_eq!(
+                    (aggregate["items_in"].as_u64(), aggregate["ok_count"].as_u64(), aggregate["failed_count"].as_u64()),
+                    (Some(5), Some(ok), Some(0)),
+                    "{case}: the items the stop kept from running are not failures"
+                );
+                let err = result.expect_err("a stopped map never ends as a success").to_string();
+                assert!(err.contains(marker) && err.contains("4 of 5 item(s) not run"), "{case}: {err}");
+            }
+        }
     }
 
     #[test]

@@ -140,6 +140,7 @@ mod tests {
             ("estimator.rs", include_str!("estimator.rs")),
             ("facts.rs", include_str!("facts.rs")),
             ("lib.rs", include_str!("lib.rs")),
+            ("load_check.rs", include_str!("load_check.rs")),
             ("ownership.rs", include_str!("ownership.rs")),
             ("plan.rs", include_str!("plan.rs")),
             ("planner.rs", include_str!("planner.rs")),

@@ -638,6 +638,71 @@ pub fn invalid_engine_args(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> 
     out
 }
 
+/// Every profile model whose explicit `identifier` collides with the name LM
+/// Studio gives a load made without one, or is set on a variant id, where it
+/// cannot tell one quantization's load from another's
+/// (`ProfileModel::identifier_problem`).
+/// Refused at every dispatching preflight and Fail in doctor, naming
+/// `profiles.<p>.models[<i>].identifier`.
+pub fn colliding_identifiers(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
+    let mut out = Vec::new();
+    for (pname, profile) in &reg.profiles {
+        for (i, m) in profile.models.iter().enumerate() {
+            if let Some(why) = m.identifier_problem() {
+                out.push(InvalidSetting {
+                    set_in: SetIn::Profiles(format!("profiles.{pname}.models[{i}].identifier")),
+                    problem: why,
+                    valid: "no `identifier` on a variant id; elsewhere a `darkmux:`-prefixed identifier, one \
+                            distinct from the model key, or no `identifier`"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Every profile model whose `darkmux:` identifier (explicit, or its default
+/// `darkmux:<id>`) a model with a different id already loads under
+/// (`ProfileModel::darkmux_load_name`). Either model's dispatch would read the
+/// other's load as its own, the #1135 ghost. The same id in several profiles
+/// shares its identifier by design. Refused at every dispatching preflight and
+/// Fail in doctor, naming `profiles.<p>.models[<i>].identifier` and the model
+/// that has the identifier first.
+pub fn shared_darkmux_identifiers(reg: &crate::ProfileRegistry) -> Vec<InvalidSetting> {
+    let mut first: std::collections::BTreeMap<String, (String, &str)> = std::collections::BTreeMap::new();
+    let mut out = Vec::new();
+    for (pname, profile) in &reg.profiles {
+        for (i, m) in profile.models.iter().enumerate() {
+            let Some((identifier, key)) = m.darkmux_load_name() else { continue };
+            let at = format!("profiles.{pname}.models[{i}]");
+            match first.get(&identifier) {
+                Some((other_at, other_key)) if *other_key != key => {
+                    out.push(shared_identifier(&at, &identifier, other_at, other_key));
+                }
+                Some(_) => {}
+                None => {
+                    first.insert(identifier, (at, key));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn shared_identifier(at: &str, identifier: &str, other_at: &str, other_key: &str) -> InvalidSetting {
+    InvalidSetting {
+        set_in: SetIn::Profiles(format!("{at}.identifier")),
+        problem: format!(
+            "this model loads under `{identifier}`, which `{other_at}` (model `{other_key}`) also loads under, so \
+             each would read the other's load as its own and a dispatch could be answered by the wrong model"
+        ),
+        valid: "one `darkmux:` identifier per model id: give this model its own `identifier`, or none (darkmux then \
+                loads under `darkmux:<id>`)"
+            .to_string(),
+    }
+}
+
 /// (#3448, #3453) The utility binding (`internal.utility`) on a server
 /// darkmux starts (Tensorfold, Flint): the utility jobs (compaction, radio
 /// routing) send to LM Studio or to an endpoint darkmux only sends to, and do
@@ -698,7 +763,7 @@ pub fn machine_port_owners() -> Vec<PortOwner> {
     let mut owners = Vec::new();
     let lms = crate::config_access::lmstudio_url();
     if crate::endpoint::url_names_this_machine(&lms) {
-        if let Some(port) = url_port(&lms) {
+        if let Some(port) = crate::endpoint::url_port(&lms) {
             owners.push(PortOwner { port, owner: "LM Studio's (`lmstudio_url`)".to_string() });
         }
     }
@@ -710,28 +775,21 @@ pub fn machine_port_owners() -> Vec<PortOwner> {
     owners
 }
 
-/// The port `url` is dialed on: the one it names, else its scheme's.
-fn url_port(url: &str) -> Option<u16> {
-    let (scheme, _) = url.split_once("://")?;
-    // A host `url_host` accepts closes any `[` it opens.
-    let hostport = crate::endpoint::url_host(url)?;
-    let after_host = match hostport.strip_prefix('[') {
-        Some(v6) => v6.split_once(']').map_or("", |(_, tail)| tail),
-        None => hostport.find(':').map_or("", |i| &hostport[i..]),
-    };
-    match after_host.strip_prefix(':').filter(|p| !p.is_empty()) {
-        Some(port) => port.parse().ok(),
-        None => scheme_port(scheme),
-    }
-}
-
-/// The port a URL scheme dials when the URL names none.
-fn scheme_port(scheme: &str) -> Option<u16> {
-    match scheme.to_ascii_lowercase().as_str() {
-        "http" => Some(80),
-        "https" => Some(443),
-        _ => None,
-    }
+/// The ports darkmux's own services and LM Studio listen on here, as
+/// resolved now, whether or not they run: [`machine_port_owners`]' (LM
+/// Studio's when `lmstudio_url` names this machine, the daemon's
+/// `serve.port`, a running daemon's own), the fleet listener's
+/// (`fleet.listener.port`, bound to the overlay address) and `darkmux client
+/// serve`'s default ([`crate::config_access::CLIENT_SERVE_PORT`], on the
+/// loopback and published on the overlay). Sorted, once each. What a
+/// sandbox on the host is refused even before they listen.
+pub fn darkmux_service_ports() -> Vec<u16> {
+    let owned = machine_port_owners().into_iter().map(|o| o.port);
+    let started = [crate::config_access::fleet_listener_port(), crate::config_access::CLIENT_SERVE_PORT];
+    let mut ports: Vec<u16> = owned.chain(started).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 /// Every engine endpoint (a server darkmux starts) whose `port` something
@@ -819,7 +877,7 @@ pub struct PreflightRefusal {
     pub bad: Vec<BadEnumValue>,
     /// (#2902 step 5) Settings that are not a bad ENUM value but cannot be
     /// used as written (an endpoint's unreadable `limits`, a window period
-    /// that does not parse). Empty for a config.json-only preflight.
+    /// that does not parse, a numeric env var that does not read).
     pub invalid: Vec<InvalidSetting>,
     /// User files the scope consumes that carry a key their schema does not
     /// know, or are not JSON (`crate::user_files`).
@@ -884,7 +942,9 @@ impl std::error::Error for PreflightRefusal {}
 /// Docker probe, and bad config is not a probe result that can be stale.
 ///
 /// Every scope consumes `config.json`, so every scope also refuses one that
-/// carries a key its schema does not know (`crate::user_files`).
+/// carries a key its schema does not know (`crate::user_files`), and a
+/// numeric env var set to a value that does not read
+/// (`crate::numeric_env`).
 pub fn preflight(scope: Scope) -> Result<(), PreflightRefusal> {
     let bad: Vec<BadEnumValue> = ENUM_SETTINGS
         .iter()
@@ -892,7 +952,12 @@ pub fn preflight(scope: Scope) -> Result<(), PreflightRefusal> {
         .flat_map(crate::config_access::enum_bad_values)
         .collect();
     let files = crate::user_files::config_json_problems();
-    PreflightRefusal { scope, bad, invalid: Vec::new(), files }.into_result()
+    // (#3112) Every scope can start a sandbox (`runtime.sandbox`'s scopes).
+    let mut invalid: Vec<InvalidSetting> = crate::config_access::sandbox_memory_problem().into_iter().collect();
+    // A numeric env var that does not read is refused by every scope, as a
+    // wrong-typed `config.json` value is.
+    invalid.extend(crate::numeric_env::bad_values());
+    PreflightRefusal { scope, bad, invalid, files }.into_result()
 }
 
 /// Look up a registered setting by its dotted key.
@@ -1089,6 +1154,25 @@ pub fn config_path_of(setting: &EnumSetting) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// darkmux's own service ports are refused before they listen: the
+    /// daemon's resolved `serve.port`, the fleet listener's, `client serve`'s
+    /// default, and LM Studio's when it is on this machine; once each, sorted.
+    #[test]
+    fn darkmux_service_ports_name_every_listener_darkmux_starts() {
+        let ports = super::darkmux_service_ports();
+        for want in [crate::config_access::serve_port(), crate::config_access::fleet_listener_port(), crate::config_access::CLIENT_SERVE_PORT] {
+            assert!(ports.contains(&want), "{want} missing from {ports:?}");
+        }
+        let lms = crate::config_access::lmstudio_url();
+        if crate::endpoint::url_names_this_machine(&lms) {
+            assert!(ports.contains(&crate::endpoint::url_port(&lms).unwrap()), "{ports:?}");
+        }
+        let mut sorted = ports.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(ports, sorted);
+    }
+
 
     /// (#3504) A busy dispatch reads `fleet.busy_policy`, so every entry
     /// point that dispatches refuses a value it does not know, as the fleet
@@ -1100,6 +1184,58 @@ mod tests {
             assert!(busy.scopes.contains(&scope), "{scope:?}");
         }
     }
+    /// Runs `body` with `var` set to `value`, restoring what it was.
+    fn with_env_var(var: &str, value: &str, body: impl FnOnce()) {
+        let prev = std::env::var(var).ok();
+        unsafe { std::env::set_var(var, value) };
+        body();
+        match prev {
+            Some(p) => unsafe { std::env::set_var(var, p) },
+            None => unsafe { std::env::remove_var(var) },
+        }
+    }
+
+    /// A numeric env var that is set but does not parse was read as unset:
+    /// `DARKMUX_RUNTIME_MAX_TOKENS=50k` meant no cap at all, while the same
+    /// value in `config.json` is refused as a wrong type. Every entry point
+    /// refuses it, naming the variable, what its value is (never the value:
+    /// an env var can hold a secret) and the accepted form.
+    #[test]
+    #[serial_test::serial]
+    fn a_set_but_unreadable_numeric_env_var_is_refused_by_every_preflight() {
+        with_env_var("DARKMUX_RUNTIME_MAX_TOKENS", "50k", || {
+            for scope in Scope::ALL {
+                let refusal = preflight(scope).expect_err("an unreadable number is refused").to_string();
+                assert!(refusal.contains("env var DARKMUX_RUNTIME_MAX_TOKENS"), "{scope:?}: {refusal}");
+                assert!(refusal.contains("set to text"), "names what the value is: {refusal}");
+                assert!(refusal.contains("an integer from 0 to 4294967295"), "names the accepted form: {refusal}");
+                assert!(!refusal.contains("50k"), "never echoes the value: {refusal}");
+            }
+        });
+        with_env_var("DARKMUX_SERVE_PORT", "70000", || {
+            let refusal = preflight(Scope::Serve).expect_err("a port out of range is refused").to_string();
+            assert!(refusal.contains("env var DARKMUX_SERVE_PORT: set to a number that is not an integer from 0 to 65535"), "{refusal}");
+            assert!(!refusal.contains("70000"), "{refusal}");
+        });
+        with_env_var("DARKMUX_RUNTIME_MAX_TOKENS", " 50000 ", || {
+            assert_eq!(preflight(Scope::Dispatch), Ok(()), "a readable value, padded, passes");
+        });
+        assert_eq!(preflight(Scope::Dispatch), Ok(()), "unset passes");
+    }
+
+    /// `runtime.memory.pressure_gate` is registered, so a bad value never
+    /// reaches the gate through an entry point that loads a model.
+    #[test]
+    #[serial_test::serial]
+    fn a_bad_pressure_gate_is_refused_by_every_dispatching_preflight() {
+        with_env_var("DARKMUX_MEMORY_PRESSURE_GATE", "sometimes", || {
+            for scope in DISPATCHING {
+                let refusal = preflight(*scope).expect_err("refused").to_string();
+                assert!(refusal.contains("runtime.memory.pressure_gate"), "{scope:?}: {refusal}");
+            }
+        });
+    }
+
     /// The port a URL is dialed on: the one it names, else its scheme's.
     #[test]
     fn a_urls_port_is_the_one_it_names_else_its_schemes() {
@@ -1114,7 +1250,7 @@ mod tests {
             ("http://bad host:1234", None),
             ("http://localhost:99999", None),
         ] {
-            assert_eq!(super::url_port(url), port, "{url}");
+            assert_eq!(crate::endpoint::url_port(url), port, "{url}");
         }
     }
 
@@ -1454,12 +1590,14 @@ mod tests {
             ("Source", "provenance of a resolved value, not a setting"),
             ("Read", "how the registry reads a value, not a setting"),
             ("SetIn", "where a bad value was set, not a setting"),
+            ("Number", "the number type a numeric env var parses as (`numeric_env`), never a setting"),
             ("UserFileKind", "which kind of user file the unknown-key gate checked, not a setting"),
             ("Issue", "what the user-file key gate found at one key, not a setting"),
             ("Problem", "what the unknown-key gate found wrong with a file, not a setting"),
             ("Others", "how a schema treats keys it does not name, internal to the gate"),
             ("Depth", "how strictly the user-file gate judges a value, internal to the gate"),
             ("Reach", "which files a user-file check reaches (doctor vs preflight), not a setting"),
+            ("Repeat", "what a key written twice in a user file costs its load, not a setting"),
             ("LeftoverPolicy", "whether a retired env var still set is refused or only warned about, fixed per retired setting, not a setting"),
             ("LeftoverValue", "how a retired config key's leftover value is judged, fixed per retired setting, not a setting"),
             ("OldDefault", "a value a retired config key held by default, matched by the leftover check, not a setting"),

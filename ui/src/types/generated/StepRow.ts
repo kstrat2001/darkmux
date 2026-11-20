@@ -23,7 +23,13 @@ label: string,
  * step with no config-snapshot recovery — see `build_mission_graph`);
  * the page then falls back to showing a meter only if metrics arrive.
  */
-kind: string, status: NodeStatus, startedTs?: number, completedTs?: number, 
+kind: string, status: NodeStatus, 
+/**
+ * (#3195) The step waits for its turn ([`step_waiting`]): `running` by
+ * the scheduler's word, but admitted and not yet dispatching, queued
+ * for its call slot or its wave's model. Absent when it does not wait.
+ */
+waiting?: boolean, startedTs?: number, completedTs?: number, 
 /**
  * (#1432 item 4) The step's token/turn totals folded from this
  * mission's flow records at page-load time, so a completed step whose

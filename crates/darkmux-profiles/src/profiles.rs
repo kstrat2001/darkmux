@@ -35,15 +35,34 @@ pub fn default_locations() -> Vec<PathBuf> {
 /// ([`parse_registry_lenient`], #1282); a broken registry shell fails the
 /// load outright. Neither is silent.
 pub fn user_file_problem(path: &Path) -> Option<darkmux_types::user_files::FileProblem> {
-    use darkmux_types::user_files::{check_path_and, Issue, KeyIssue, Problem, UserFileKind};
-    let inline_endpoints = |doc: &serde_json::Value| -> Vec<KeyIssue> {
-        ProfileRegistry::inline_endpoint_rewrites(doc)
-            .into_iter()
-            .map(|r| KeyIssue { issue: Issue::Removed(r.line()), path: r.path })
-            .chain(darkmux_types::bare_utility_in(doc).map(|(path, line)| KeyIssue { issue: Issue::Removed(line), path: path.to_string() }))
-            .collect()
-    };
-    let mut found = check_path_and::<ProfileRegistry>(UserFileKind::Profiles, path, &|_| None, &inline_endpoints)?;
+    use darkmux_types::user_files::{check_path_and, UserFileKind};
+    let found = check_path_and::<ProfileRegistry>(UserFileKind::Profiles, path, &|_| None, &registry_shape_issues)?;
+    keys_only(found)
+}
+
+/// (#3569) [`user_file_problem`] of a registry's `text`, as if it were the
+/// file at `path`: the check a write runs on what it is about to write.
+pub fn user_file_problem_text(path: &Path, text: &str) -> Option<darkmux_types::user_files::FileProblem> {
+    use darkmux_types::user_files::{check_text_and, UserFileKind};
+    let found = check_text_and::<ProfileRegistry>(UserFileKind::Profiles, path, text, &|_| None, &registry_shape_issues)?;
+    keys_only(found)
+}
+
+/// What the registry's schema cannot say: an inline endpoint, a bare
+/// utility binding.
+fn registry_shape_issues(doc: &serde_json::Value) -> Vec<darkmux_types::user_files::KeyIssue> {
+    use darkmux_types::user_files::{Issue, KeyIssue};
+    ProfileRegistry::inline_endpoint_rewrites(doc)
+        .into_iter()
+        .map(|r| KeyIssue { issue: Issue::Removed(r.line()), path: r.path })
+        .chain(darkmux_types::bare_utility_in(doc).map(|(path, line)| KeyIssue { issue: Issue::Removed(line), path: path.to_string() }))
+        .collect()
+}
+
+/// A problem without the wrong-type and missing-key issues the registry
+/// quarantines instead; `None` when nothing else is left.
+fn keys_only(mut found: darkmux_types::user_files::FileProblem) -> Option<darkmux_types::user_files::FileProblem> {
+    use darkmux_types::user_files::{Issue, Problem};
     if let Problem::Keys(keys) = &mut found.problem {
         keys.retain(|k| !matches!(k.issue, Issue::WrongType { .. } | Issue::Missing { .. }));
         if keys.is_empty() {
@@ -182,7 +201,7 @@ pub fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
                 quarantined.push(QuarantinedEntry {
                     kind,
                     name: name.clone(),
-                    error: e.to_string(),
+                    error: darkmux_types::user_files::load_error(&e),
                 });
             }
         }
@@ -210,7 +229,8 @@ pub fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
                 name: "endpoints".to_string(),
                 error: format!(
                     "`endpoints` must be an object mapping each endpoint id to its definition \
-                     (got {raw}); no endpoint from it is defined"
+                     (got {}); no endpoint from it is defined",
+                    darkmux_types::user_files::json_type(&raw)
                 ),
             });
         }
@@ -222,7 +242,7 @@ pub fn parse_registry_lenient(raw: &str) -> Result<ProfileRegistry> {
                 serde_json::from_value::<darkmux_types::ModelEndpoint>(entry.clone()).err().map(|e| QuarantinedEntry {
                     kind: QuarantinedEntryKind::Endpoint,
                     name: name.clone(),
-                    error: e.to_string(),
+                    error: darkmux_types::user_files::load_error(&e),
                 })
             })
             .collect();
@@ -325,9 +345,11 @@ pub fn get_profile<'a>(reg: &'a ProfileRegistry, name: &str) -> Result<&'a Profi
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RoleProfileSource {
-    /// (#1475 packet 3) The role was bound by a per-run launch override
-    /// (`mission launch review --param <role>=<profile>`) — highest precedence,
-    /// above the `role_profiles` map and `default_profile`.
+    /// (#1475 packet 3) The role was bound by a profile the run itself names:
+    /// a task's or step's `profile_name` (`review`'s `mod_seat_profile` input
+    /// reaches its seat this way). Highest precedence, above the
+    /// `role_profiles` map and `default_profile`. `mission launch` takes no
+    /// `--param <role>=<profile>` override (an undeclared input is refused).
     Overridden,
     /// The role was bound to this profile by the `role_profiles` map.
     Mapped,
@@ -339,7 +361,7 @@ impl RoleProfileSource {
     /// The words `mission config show` prints for the tier.
     pub fn label(self) -> &'static str {
         match self {
-            RoleProfileSource::Overridden => "launch override (--param)",
+            RoleProfileSource::Overridden => "named by the task or step",
             RoleProfileSource::Mapped => "role_profiles map",
             RoleProfileSource::DefaultFallback => "default_profile fallback",
         }
@@ -348,14 +370,15 @@ impl RoleProfileSource {
 
 /// (#1475 packet 3) The origin of a role→profile binding, supplied to
 /// [`resolve_role_profile_with`] so it can stamp the right [`RoleProfileSource`]
-/// without collapsing a per-run launch override into a plain map binding.
+/// without collapsing a profile the run names into a plain map binding.
 /// Precedence (override > map > unmapped) is decided by the CALLER building this
 /// value; the resolver only reads which tier won. Owns its profile name so a
 /// caller can build it from `config_access`'s owned `Option<String>` return
 /// without lifetime gymnastics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoleBinding {
-    /// A per-run launch override (`--param <role>=<profile>`). Highest precedence.
+    /// A profile the run itself names (a task's or step's `profile_name`).
+    /// Highest precedence.
     Overridden(String),
     /// The machine-local `role_profiles` map binding in `config.json`.
     Mapped(String),
@@ -390,10 +413,11 @@ pub fn resolve_role_profile<'a>(
     role_id: &str,
     registry: &'a ProfileRegistry,
 ) -> Result<ResolvedRoleProfile<'a>> {
-    // The config-only production entry knows nothing of launch overrides — it
-    // reads the `role_profiles` map (→ `Mapped`) or resolves unmapped
-    // (→ `Unmapped`). Override bindings enter only via `resolve_role_profile_with`
-    // from a launcher that has the `--param <role>=<profile>` values (#1475 packet 3).
+    // The config-only production entry knows nothing of a profile the run
+    // names: it reads the `role_profiles` map (→ `Mapped`) or resolves
+    // unmapped (→ `Unmapped`). `Overridden` enters only via
+    // `resolve_role_profile_with`, from a caller holding a task's or step's
+    // `profile_name` (the mission launch staffing gate).
     let binding = match darkmux_types::config_access::role_profile(role_id) {
         Some(p) => RoleBinding::Mapped(p),
         None => RoleBinding::Unmapped,
@@ -454,12 +478,14 @@ pub fn resolve_role_profile_with<'a>(
             }
             let available: Vec<&str> = registry.profiles.keys().map(String::as_str).collect();
             let listed = if available.is_empty() { "(none)".to_string() } else { available.join(", ") };
-            // The fix suggestion tracks the binding tier: an override is fixed
-            // on the launch line, a map binding via `config set`.
+            // The fix suggestion tracks the binding tier: a profile the run
+            // names is fixed where it is named, a map binding via `config set`.
             let (how, fix) = match source {
                 RoleProfileSource::Overridden => (
-                    "is overridden to",
-                    format!("check the `--param {role_id}=<profile>` launch value"),
+                    "is staffed by the run with",
+                    "check the profile the task or step names (its `profile_name`; `review`'s \
+                     `mod_seat_profile` input sets one)"
+                        .to_string(),
                 ),
                 _ => (
                     "is mapped to",
@@ -896,6 +922,30 @@ mod tests {
         );
     }
 
+    /// A quarantine reason reaches load warnings, `validate` and doctor, so
+    /// it never quotes the entry: an endpoint written as its URL carries the
+    /// URL's credentials, and serde's own message quotes a wrong value.
+    #[test]
+    fn a_quarantine_reason_never_quotes_the_entry() {
+        let secret = "https://user:hunter2@h.example/v1";
+        for doc in [
+            format!(r#"{{"profiles":{{"l":{{"models":[{{"id":"m","n_ctx":1}}]}}}},"endpoints":{{"azure":"{secret}"}}}}"#),
+            format!(r#"{{"profiles":{{"l":{{"models":[{{"id":"m","n_ctx":1}}]}}}},"endpoints":"{secret}"}}"#),
+            format!(r#"{{"profiles":{{"l":{{"models":[{{"id":"m","n_ctx":"{secret}"}}]}}}}}}"#),
+            format!(r#"{{"profiles":{{"l":{{"models":[{{"id":"m","n_ctx":1}}]}}}},"endpoints":{{"e":{{"managed":"{secret}"}}}}}}"#),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let p = tmp.path().join("profiles.json");
+            write(&p, &doc);
+            let loaded = load_registry(Some(p.to_str().unwrap())).unwrap();
+            let reasons: Vec<&str> = loaded.registry.quarantined.iter().map(|q| q.error.as_str()).collect();
+            assert!(!reasons.is_empty() || doc.contains("managed"), "{doc}: quarantined");
+            for r in reasons {
+                assert!(!r.contains("hunter2") && !r.contains("h.example"), "the value leaked: {r}");
+            }
+        }
+    }
+
     #[test]
     fn a_bad_default_model_is_quarantined_not_fatal() {
         let tmp = TempDir::new().unwrap();
@@ -1022,7 +1072,7 @@ mod tests {
 
     #[test]
     fn resolve_overridden_role_binds_and_records_overridden_source() {
-        // (#1475 packet 3) A per-run launch override binds identically to a map
+        // (#1475 packet 3) A profile the run names binds identically to a map
         // binding, but the recorded source is `Overridden` (highest precedence)
         // so the envelope names the winning tier.
         let reg = two_profile_reg();
@@ -1032,16 +1082,23 @@ mod tests {
     }
 
     #[test]
-    fn resolve_overridden_to_nonexistent_profile_names_the_launch_value() {
-        // (#1475 packet 3) A bad override profile is a loud error whose fix
-        // suggestion points at the launch line, not `config set`.
+    fn resolve_overridden_to_nonexistent_profile_names_where_the_profile_was_named() {
+        // A bad profile named by the run (a task's or step's `profile_name`)
+        // is a loud error whose fix points at that name, not `config set`
+        // and not a `--param <role>=<profile>` no launch accepts.
         let reg = two_profile_reg();
         let err = resolve_role_profile_with("judge", &RoleBinding::Overridden("ghost35b".into()), &reg)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("overridden to"), "names the tier: {err}");
-        assert!(err.contains("ghost35b"), "names the bad profile: {err}");
-        assert!(err.contains("--param judge=<profile>"), "points at the launch value: {err}");
+        assert!(err.contains("is staffed by the run with profile \"ghost35b\""), "names the tier: {err}");
+        assert!(err.contains("`profile_name`"), "points at where it was named: {err}");
+        assert!(!err.contains("--param"), "no launch takes a role override: {err}");
+    }
+
+    #[test]
+    fn the_overridden_label_says_where_the_profile_was_named() {
+        assert_eq!(RoleProfileSource::Overridden.label(), "named by the task or step");
+        assert!(!RoleProfileSource::Overridden.label().contains("--param"));
     }
 
     #[test]

@@ -43,7 +43,9 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
 3. **Lab/fleet sink boundary** — lab runs write per-run-local artifacts; the fleet flow
    stream carries engagement work only. No crossings in either direction. Conformance:
    `RedisSink::persist` and the outage backfill drop any record whose `session_id` is a
-   lab run, through the one `is_lab_session` predicate (#3074).
+   lab run, through the one `is_lab_session` predicate (#3074), and so does every hook
+   rule (`hooks::hook_match`, which `HookSink::persist` decides by), since a hook delivers
+   off the machine too (`a_lab_runs_records_never_reach_a_hook`).
 4. **Namespace convention** — darkmux-owned state in shared systems carries the darkmux
    namespace; operations manage only the namespaced subset (see the namespace section).
    Formalized as ABSOLUTE for model lifecycle (operator, 2026-07-10, #1274): every darkmux
@@ -161,7 +163,11 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    Both name the file, the key's dotted path and the closest valid key (the same shape as
    contract 9's enum refusal); a retired key names what replaced it instead of a guess.
    **A value of the wrong type, or a missing required key, is refused the same way**, naming the path, the expected
-   type and what it got: one such value fails the whole typed load, which for `config.json`
+   type and the JSON type it got (never the value, which may be a pasted credential); **so is a key written twice in
+   one object**, at any depth, which a `serde_json::Value` hides (the gate reads the text for it, and asks serde what the
+   repeat costs: a repeated struct field fails the typed load, a repeated map entry or unknown key loads with only its
+   last copy, silently; a repeated `_comment` note is not refused): one such value or field fails the whole typed load,
+   which for `config.json`
    means every setting falls back to its default (Redis and audit silently off) and for a
    user role, skill or rule means the builtin of the same id silently stands in. The
    registry is the one exception: it already quarantines a mistyped profile or endpoint
@@ -179,7 +185,10 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    against the schema's type, integer range, enum tokens and variant tags. The `extras` overflow is
    `#[schemars(skip)]` (it catches keys, it does not validate them); a flattened map that IS
    the schema (a hook rule's `match`) stays open, and each kind's `open_objects` test pins
-   that set. `_comment` is valid in any struct-shaped object, as a note for the reader; inside
+   that set; what such a schema cannot say is checked beside it (an extra `match` key must be a
+   `payload.<path>` predicate, `HookMatch::is_match_key`, so a typo there is refused rather
+   than dropped, which would widen the rule; a hooks sink built where no preflight ran disables
+   that rule through the same predicate). `_comment` is valid in any struct-shaped object, as a note for the reader; inside
    a map it is an entry and is checked as one. A missing required key is refused too. The
    structural guard is `whatever_the_gate_passes_the_typed_load_accepts`: for every shipped
    template and example, and variants inserting `_comment`, an unknown key, or a value of
@@ -398,6 +407,15 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    refusal: today `fleet.mode` (a bad value only makes viewer links use the direct address, with
    a warning) and a hook rule's `match.level` / `match.category` (a bad value turns the hooks sink
    off, loudly, while the run continues without it).
+
+   A numeric setting's env tier follows the same rule (`darkmux-types/src/numeric_env.rs`): a
+   `DARKMUX_*` var a numeric accessor reads, set to a value that does not read as its number
+   (`DARKMUX_RUNTIME_MAX_TOKENS=50k`), is refused by every preflight and failed by doctor, as the
+   same value in `config.json` is refused by the user-file gate; a command with no preflight reads
+   it as unset and says so on stderr (`numeric_env::notices`, printed beside the config notice). The refusal names the variable,
+   the value's kind (text, a number out of range) and the accepted form, never the value: an env
+   var can hold a secret. `NUMERIC_ENV_VARS` is the list; a test fails on a var a numeric accessor
+   reads that it lacks.
 
    Retired spellings are refused too, naming the replacement ("`enforce` was renamed to `conclude`
    in 5.0"): a rename never reads the old word as the new one. Policy values name the action

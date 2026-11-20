@@ -796,16 +796,14 @@ impl FleetSources for ProcessSources {
     }
 
     fn presence(&self) -> (Vec<PresenceBeat>, SourceState) {
-        match darkmux_flow::redis_url() {
+        match crate::presence_hub_url() {
             Some(url) => crate::machine_beats(&url, crate::PresenceRead::ROUTE),
             None => (Vec::new(), SourceState::Off),
         }
     }
 
     fn hub_time_ms(&self) -> Option<u64> {
-        let url = darkmux_flow::redis_url()?;
-        let client = redis::Client::open(url.expose_for_probe()).ok()?;
-        darkmux_flow::presence::read_hub_time_ms(&client).ok()
+        crate::hub_time_ms(&crate::presence_hub_url()?)
     }
 
     fn local_card(&self) -> MachineCard {
@@ -2422,7 +2420,7 @@ pub(crate) mod tests {
             req = req.header(*k, *v);
         }
         let mut req = req.body(Body::empty()).unwrap();
-        req.extensions_mut().insert(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
+        req.extensions_mut().insert(ConnectInfo(crate::local_peer::operator(peer.parse::<std::net::SocketAddr>().unwrap())));
         let res = app.oneshot(req).await.unwrap();
         (res.status().as_u16(), axum::body::to_bytes(res.into_body(), 1 << 22).await.unwrap().to_vec())
     }

@@ -6,7 +6,9 @@
 //! ([`bind_addr`]): never `0.0.0.0`, never the tailnet address. Every route
 //! sits behind one gate ([`admitted`]): the request must be from this
 //! machine as the viewer daemon decides it (`is_local_request`: a loopback
-//! peer, no reverse-proxy header, a `Host` naming this listener), must carry
+//! peer whose process is the operator's, never sandboxed work or a container
+//! engine's forwarder (`local_peer`), no reverse-proxy header, a `Host`
+//! naming this listener), must carry
 //! no `Origin` (a web page sends one; a native app does not), and a POST with
 //! a body must be `Content-Type: application/json`. A browser page on any
 //! site therefore cannot drive it, whatever DNS it rebinds. (#3560) With
@@ -153,7 +155,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
 
 /// The listener's default port (the viewer is 8765, the fleet listener 8766).
-pub const DEFAULT_PORT: u16 = 8767;
+pub const DEFAULT_PORT: u16 = darkmux_types::config_access::CLIENT_SERVE_PORT;
 /// A pairing request lives this long from when it was made, approved or not.
 pub const PENDING_TTL_SECS: u64 = 600;
 /// Expired and denied requests are kept this long past their TTL, so the app
@@ -497,6 +499,10 @@ fn parse_clients(path: &Path, text: &str) -> Result<(ClientsFile, bool)> {
     }
     let mut doc: Value = serde_json::from_str(text)
         .with_context(|| format!("{} is not valid JSON", path.display()))?;
+    // `doc` holds only the last copy of a key written twice.
+    if let Some(lines) = darkmux_types::user_files::duplicate_refusal(text) {
+        bail!("client store {}: {lines}", path.display());
+    }
     if let Some(v) = darkmux_types::data_version::newer(&doc, CLIENTS_SCHEMA_VERSION) {
         bail!("{} was written by a newer darkmux (schema_version {v}; this one reads {CLIENTS_SCHEMA_VERSION}). Upgrade darkmux.", path.display());
     }
@@ -1090,6 +1096,12 @@ pub struct ClientServerState {
     pub profile_is_local: RoleProfileCheck,
     /// Every profile name in this machine's registry.
     pub registry_profiles: Lister,
+    /// (#3569) The engines installed on this machine (`GET /client/engines`).
+    pub detect_engines: crate::client_engines::DetectEngines,
+    /// (#3569) Add one to `profiles.json` (`POST /client/engines`).
+    pub add_engine: crate::client_engines::AddEngine,
+    /// (#3569) Where an add's record goes: the `client serve` log (stderr).
+    pub log_add: crate::client_engines::LogAdd,
     /// This machine, as a paired app keys its per-machine settings: a stable
     /// id (the same from the Mac app and the phone) and a display name.
     pub machine: ClientMachine,
@@ -1232,6 +1244,9 @@ impl ClientServerState {
             profile_info: Arc::new(crate::client_profiles::describe_profiles),
             profile_is_local: Arc::new(crate::client_profiles::work_stays_here),
             registry_profiles: Arc::new(registry_profiles_here),
+            detect_engines: Arc::new(crate::client_engines::detect_here),
+            add_engine: Arc::new(crate::client_engines::add_here),
+            log_add: Arc::new(|line| eprintln!("{line}")),
             machine: ClientMachine::this_one(),
             check_workdir: Arc::new(check_workdir_here),
             execute: Arc::new(move |spec, cancel| {
@@ -1459,8 +1474,9 @@ fn read_config_at(path: &Path) -> Result<darkmux_types::config::DarkmuxConfig, S
             }
             serde_json::from_str::<darkmux_types::config::DarkmuxConfig>(&text).map_err(|e| {
                 format!(
-                    "{} does not parse ({e}); refusing client work",
-                    path.display()
+                    "{} does not parse ({}); refusing client work",
+                    path.display(),
+                    darkmux_types::user_files::load_error(&e)
                 )
             })?
         }
@@ -1533,6 +1549,7 @@ pub fn run(port: u16) -> Result<()> {
         state.remote = started.wire;
         state.tailnet_entry = started.serving.clone();
         log_lines(swept_partials(&state));
+        log_lines(reaped_cleanings(&state));
         // (#3456) Preview containers a `client serve` that died left behind.
         let reaper = state.previews.clone();
         std::thread::spawn(move || {
@@ -1619,6 +1636,24 @@ pub(crate) fn swept_partials(state: &ClientServerState) -> Vec<String> {
         .collect()
 }
 
+/// (#3585) Deletes, in the background, the trees clean preview starts moved
+/// aside that the last `client serve` did not finish deleting
+/// ([`crate::client_preview::Previews::reap_cleanings`]); one serve-log
+/// line when there were any.
+pub(crate) fn reaped_cleanings(state: &ClientServerState) -> Vec<String> {
+    let Ok(base) = (state.worktrees_base)() else {
+        return Vec::new();
+    };
+    let left = state.previews.reap_cleanings(&base);
+    if left.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "darkmux client serve: deleting {} tree(s) a clean preview start moved aside and a stop left",
+        left.len()
+    )]
+}
+
 /// How long a stopping `client serve` waits, from its stop signal, for the
 /// work it canceled to end, and for docker to remove its previews'
 /// containers: the executor's own [`CANCEL_GRACE`] (after
@@ -1648,15 +1683,27 @@ fn begin_stop(previews: &crate::client_preview::Previews, works: &Mutex<HashMap<
 /// container is removed (#3456) while the canceled work is waited for,
 /// each until `work_until` at the latest ([`end_running_work`]); a docker
 /// that answers no `stop` or `rm` by then is no longer waited for, and its
-/// containers stop themselves once the heartbeat goes stale. Returns the
-/// work still running then.
+/// containers stop themselves once the heartbeat goes stale. The
+/// background deletes of clean starts (#3585), told to give up as the stop
+/// began, are waited for too; what they leave is deleted at the next start.
+/// Returns the work still running then.
 async fn finish_stop(
     previews: Arc<crate::client_preview::Previews>,
     works: Arc<Mutex<HashMap<String, WorkEntry>>>,
     work_until: std::time::Instant,
 ) -> Vec<String> {
     let ending = tokio::task::spawn_blocking(move || end_running_work(&works, work_until));
-    let stopping = tokio::task::spawn_blocking(move || previews.stop_all());
+    let stopping = tokio::task::spawn_blocking(move || {
+        let removed = previews.stop_all();
+        let deleting = previews.wait_cleanings(work_until);
+        if deleting > 0 {
+            eprintln!(
+                "darkmux client serve: {deleting} background delete(s) of a clean preview start still running; \
+                 no longer waiting (what they leave is deleted when client serve next starts)"
+            );
+        }
+        removed
+    });
     match tokio::time::timeout_at(work_until.into(), stopping).await {
         Ok(removed) => {
             let removed = removed.unwrap_or_default();
@@ -1791,7 +1838,7 @@ async fn serve_until_stopped(
 ) -> Result<()> {
     let stop = Arc::new(tokio::sync::Notify::new());
     let graceful = stop.clone();
-    let server = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+    let server = axum::serve(listener, crate::local_peer::make_service(app))
         .with_graceful_shutdown(async move { graceful.notified().await });
     let mut serving = tokio::spawn(std::future::IntoFuture::into_future(server));
     let ended = tokio::select! {
@@ -1909,7 +1956,8 @@ pub(crate) async fn method_not_allowed() -> Response {
 
 /// The gate in front of every route. The request must come from this
 /// machine the way the viewer daemon decides it ([`crate::is_local_at`]: a
-/// loopback peer, no reverse-proxy header, a `Host` naming this listener),
+/// loopback peer whose process is the operator's, no reverse-proxy header, a
+/// `Host` naming this listener),
 /// or (#3560) from a paired device through the tailnet entry this process
 /// published ([`remote_admitted`]). Either way it must not come from a web
 /// page (it carries no `Origin`; a native app sends none, and every browser
@@ -2270,7 +2318,7 @@ pub(crate) fn internal(e: anyhow::Error) -> Response {
 }
 
 /// Read and parse a capped JSON body; every refusal is JSON.
-async fn json_body<T: serde::de::DeserializeOwned>(body: Body) -> Result<T, Response> {
+pub(crate) async fn json_body<T: serde::de::DeserializeOwned>(body: Body) -> Result<T, Response> {
     let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES).await.map_err(|_| body_too_large())?;
     serde_json::from_slice(&bytes)
         .map_err(|e| err(StatusCode::BAD_REQUEST, ClientCode::BadRequest, format!("bad JSON body: {e}")))

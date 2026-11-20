@@ -25,6 +25,8 @@ pub use seatbelt::SeatbeltBackend;
 pub mod landlock;
 pub use landlock::LandlockBackend;
 pub mod toolchain;
+pub mod host_leaders;
+pub use host_leaders::host_sandbox_launchers;
 
 #[cfg(test)]
 mod docker_calls;
@@ -61,10 +63,15 @@ pub enum Network {
     Default,
 }
 
-/// Resource limits. `None` leaves the backend's own.
+/// Resource limits. `None` leaves the backend's own. Docker holds both in
+/// the container's cgroup; Seatbelt holds `pids` with the user's
+/// `RLIMIT_NPROC` and watches `memory` ([`seatbelt`]'s doc says how far
+/// each reaches); Landlock holds neither ([`landlock`]'s doc).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Limits {
-    /// Memory, in the backend's size syntax (`4g`).
+    /// Memory, in Docker's size syntax (`4g`: a whole number, then `b`,
+    /// `k`, `m` or `g`). A backend that holds memory refuses a value that
+    /// is not one.
     pub memory: Option<String>,
     /// Processes the sandbox may hold at once.
     pub pids: Option<u64>,
@@ -91,6 +98,21 @@ pub struct SandboxPolicy {
     /// Whether the sandbox reads the caller's stdin (a secret piped in);
     /// otherwise it gets none.
     pub stdin: bool,
+    /// The ports of this host's own services the sandbox may connect to (a
+    /// dispatch's model server). Under Seatbelt it reaches no other service
+    /// listening on this machine, at any of its addresses, beyond its own
+    /// `ports` (with no ports named: none listening when it is planned, so
+    /// its own servers on any other port stay reachable). Landlock does not
+    /// hold it. A container reaches the host by the engine's name for it
+    /// (`host.docker.internal`), which Docker Desktop forwards to this
+    /// host's loopback whatever this says.
+    pub host_services: Vec<u16>,
+    /// Ports of this host that a sandbox on the host naming no `ports` is
+    /// refused whether or not anything listens on them when it is planned
+    /// (darkmux's own services, which may start after it), unless given in
+    /// `host_services`. A policy naming ports is refused every port of this
+    /// machine but its own and the given ones already.
+    pub refused_ports: Vec<u16>,
     /// A name inside the sandbox that reaches this host's own services (a
     /// model server on the host), where the backend does not provide one.
     pub host_alias: Option<String>,
@@ -105,6 +127,23 @@ pub struct SandboxPolicy {
     pub entrypoint: Option<String>,
     /// Its arguments.
     pub command: Vec<String>,
+}
+
+/// (#3112) `text` as a sandbox memory limit in bytes, or the refusal
+/// naming it: the grammar `sandbox.memory`'s preflight reads
+/// ([`darkmux_types::size::sandbox_memory_bytes`]), so a value one backend
+/// takes, every backend takes, and none reads `0` as no limit.
+pub fn memory_bytes(text: &str) -> Result<u64, String> {
+    darkmux_types::size::sandbox_memory_bytes(text)
+        .map_err(|why| format!("sandbox: memory limit refused: {why}; the form is {}", darkmux_types::size::SANDBOX_MEMORY_FORM))
+}
+
+/// A command that fails (125, Docker's "could not make it"), saying
+/// `message`: what a backend hands back for a policy it refuses.
+pub(crate) fn failing(message: &str) -> Command {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(r#"echo "$1" >&2; exit 125"#).arg("sh").arg(message);
+    cmd
 }
 
 /// Which backend a handle belongs to.

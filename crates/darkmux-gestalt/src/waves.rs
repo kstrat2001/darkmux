@@ -1100,12 +1100,14 @@ mod tests {
         // shortfall). The 4B lands in wave 2, after the wave-1 free has
         // genuinely happened — never against phantom headroom.
         let f = Facts {
-            residents: vec![resident("devstral", "devstral", 4_096, Some(DEVSTRAL_32K))],
+            // An opt-out alias distinct from the key: one equal to it is LM
+            // Studio's name for a load made without one, never darkmux's.
+            residents: vec![resident("devstral-alias", "devstral", 4_096, Some(DEVSTRAL_32K))],
             pools: single_pool(5 * GB),
             ..Default::default()
         };
         let placements = vec![
-            aliased("devstral", 262_144, "devstral"),
+            aliased("devstral", 262_144, "devstral-alias"),
             placement("qwen-4b", 32_768),
         ];
         let est = est_map(&[("devstral", 27 * GB), ("qwen-4b", QWEN_4B_32K)]);

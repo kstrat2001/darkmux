@@ -19,6 +19,7 @@ use serde::Serialize;
 use darkmux_serve::usage_sum::{UsageBreakdown, UsageGroup, UsageSplit};
 use darkmux_serve::{AbandonReason, Run, RunKind, RunStatus};
 use darkmux_types::style;
+use darkmux_types::user_files::escape_text as shown;
 
 use crate::cli::RunKindArg;
 
@@ -409,6 +410,23 @@ fn ellipsize(s: &str, max: usize) -> String {
     format!("{front}…{back}")
 }
 
+/// A column cell of text a peer or an endpoint chose (a machine name, an
+/// endpoint, a model id): escaped (`escape_text`, so an escape sequence is
+/// shown and never acted on), cut to `cols` display columns at a middle `…`
+/// (`bounded_for_display`, the one width answer in this workspace), and
+/// padded to exactly `cols` columns, so a wide character cannot push the
+/// columns after it out of line.
+pub(crate) fn cell(s: &str, cols: usize) -> String {
+    let fitted = darkmux_flow::hooks::bounded_for_display(&shown(s), cols);
+    let pad = cols.saturating_sub(darkmux_flow::hooks::display_columns(&fitted));
+    format!("{fitted}{}", " ".repeat(pad))
+}
+
+/// Display columns of `s` as [`cell`] shows it, before any cut.
+pub(crate) fn cell_width(s: &str) -> usize {
+    darkmux_flow::hooks::display_columns(&shown(s))
+}
+
 /// Strip the `darkmux:` residency namespace off a model id for display —
 /// the Rust twin of `ui/src/lib/format.ts::shortModel`, which
 /// `runSubtitle` applies before pushing the model.
@@ -428,7 +446,7 @@ fn short_model(model: &str) -> &str {
 /// machine, for when the MACHINE column has been shed (#1929).
 fn subtitle_with_machine(r: &Run) -> String {
     let mut bits = subtitle_bits(r);
-    bits.extend(r.machine.clone());
+    bits.extend(r.machine.as_deref().map(shown));
     bits.extend(relay_text(r));
     bits.join(" · ")
 }
@@ -436,7 +454,7 @@ fn subtitle_with_machine(r: &Run) -> String {
 /// A relayed run says where it was asked: "from <machine>", the same words as
 /// `ui/src/lib/relayWords.ts` (`tests/fixtures/run-status-words.json`).
 fn relay_text(r: &Run) -> Option<String> {
-    r.relay.as_ref().map(|relay| format!("from {}", relay.asked_on_machine))
+    r.relay.as_ref().map(|relay| format!("from {}", shown(&relay.asked_on_machine)))
 }
 
 /// `[workload ·] [verify ·] role · model · via route · [from machine]` — the
@@ -457,22 +475,24 @@ fn subtitle_for(r: &Run) -> String {
     bits.join(" · ")
 }
 
+/// Every bit is escaped (`escape_text`): a run row can come from a peer
+/// through the hub, so none of its text is this machine's own.
 fn subtitle_bits(r: &Run) -> Vec<String> {
     let mut bits: Vec<String> = Vec::new();
     if let Some(workload) = &r.workload {
-        bits.push(workload.clone());
+        bits.push(shown(workload));
     }
     if let Some(verify) = verify_label(r) {
         bits.push(verify.to_string());
     }
     if let Some(role) = &r.role {
-        bits.push(role.clone());
+        bits.push(shown(role));
     }
     if let Some(model) = &r.model {
-        bits.push(short_model(model).to_string());
+        bits.push(shown(short_model(model)));
     }
     if let Some(route) = &r.route {
-        bits.push(format!("via {route}"));
+        bits.push(format!("via {}", shown(route)));
     }
     bits
 }
@@ -600,7 +620,7 @@ fn id_width(rows: &[Run], width: Option<usize>) -> usize {
     // next field, which is what the operator noticed. Ellipsizing one
     // outlier costs less than spacing out the whole table for it, and
     // `ellipsize` keeps the discriminating tail.
-    let mut lens: Vec<usize> = rows.iter().map(|r| r.id.chars().count()).collect();
+    let mut lens: Vec<usize> = rows.iter().map(|r| shown(&r.id).chars().count()).collect();
     lens.sort_unstable();
     let max_id = if lens.is_empty() {
         0
@@ -651,7 +671,7 @@ fn header_line(id_w: usize, machine_col: bool) -> String {
 /// this returns — see [`FIXED_COLS`] for why measuring beats recomputing
 /// the budget.
 fn format_row(now: u64, r: &Run, id_w: usize, width: Option<usize>, machine_col: bool) -> String {
-    let id_cell = format!("{:<id_w$}", ellipsize(&r.id, id_w));
+    let id_cell = format!("{:<id_w$}", ellipsize(&shown(&r.id), id_w));
     let base = format!(
         "{:i$}{:<k$} {:<s$} {:<t$} {:<d$} {:>n$}{:g$}{}{}",
         "",
@@ -663,7 +683,7 @@ fn format_row(now: u64, r: &Run, id_w: usize, width: Option<usize>, machine_col:
         "",
         id_cell,
         if machine_col {
-            format!(" {:<w$}", ellipsize(r.machine.as_deref().unwrap_or("-"), MACHINE_COLS), w = MACHINE_COLS)
+            format!(" {}", cell(r.machine.as_deref().unwrap_or("-"), MACHINE_COLS))
         } else {
             String::new()
         },
@@ -902,15 +922,15 @@ fn usage_lines(report: &UsageReport, width: Option<usize>) -> Vec<String> {
     let machine_w = b
         .groups
         .iter()
-        .map(|g| none_or(g.machine.as_deref()).chars().count())
+        .map(|g| cell_width(none_or(g.machine.as_deref())))
         .max()
         .unwrap_or(0)
         .max("MACHINE".len());
-    let ep_w = b.groups.iter().map(|g| endpoint_cell(g).chars().count()).max().unwrap_or(0).max("ENDPOINT".len());
+    let ep_w = b.groups.iter().map(|g| cell_width(endpoint_cell(g))).max().unwrap_or(0).max("ENDPOINT".len());
     let model_w = b
         .groups
         .iter()
-        .map(|g| none_or(g.requested_model.as_deref()).chars().count())
+        .map(|g| cell_width(none_or(g.requested_model.as_deref())))
         .max()
         .unwrap_or(0)
         .max("MODEL".len());
@@ -920,15 +940,12 @@ fn usage_lines(report: &UsageReport, width: Option<usize>) -> Vec<String> {
     };
     let label = |machine: &str, ep: &str, model: &str| {
         format!(
-            "{:i$}{:<a$} {:<e$} {:<m$} ",
+            "{:i$}{} {} {} ",
             "",
-            ellipsize(machine, machine_w),
-            ellipsize(ep, ep_w),
-            ellipsize(model, model_w),
+            cell(machine, machine_w),
+            cell(ep, ep_w),
+            cell(model, model_w),
             i = USAGE_INDENT,
-            a = machine_w,
-            e = ep_w,
-            m = model_w
         )
     };
     lines.push(format!(
@@ -959,7 +976,7 @@ fn usage_lines(report: &UsageReport, width: Option<usize>) -> Vec<String> {
             ));
         }
         if let Some(served) = &g.reported_model {
-            lines.push(style::dim(&format!("{sub_indent}reported model: {served}")));
+            lines.push(style::dim(&format!("{sub_indent}reported model: {}", shown(served))));
         }
     }
     let (mut work, mut utility) = (UsageSplit::default(), UsageSplit::default());
@@ -1966,5 +1983,76 @@ mod tests {
              RUN_LIST_KIND_OPT table (crates/darkmux-serve/src/panel.rs): the panel would \
              spawn a flag the CLI no longer accepts, or hide one it does (#1911)"
         );
+    }
+
+    /// An OSC 0 title, a screen clear and an OSC 52 clipboard write, plus a
+    /// C1 CSI and a bidi override: what a peer's record (through the hub) or
+    /// an endpoint's reply can carry into a run row.
+    const HOSTILE: &str = "\x1b]0;owned\x07\x1b[2J\x1b]52;c;aGk=\x07\u{9b}2J\u{202e}";
+
+    fn inert(text: &str) -> bool {
+        !text.chars().any(|c| (c.is_control() && c != '\n') || c == '\u{202e}')
+    }
+
+    fn hostile_run() -> Run {
+        let mut r = mk_run(&format!("run-{HOSTILE}"), RunKind::Dispatch, RunStatus::Complete, 1);
+        r.machine = Some(format!("peer{HOSTILE}"));
+        r.role = Some(HOSTILE.into());
+        r.model = Some(HOSTILE.into());
+        r.route = Some(HOSTILE.into());
+        r.workload = Some(HOSTILE.into());
+        r.relay = Some(darkmux_serve::RunRelay { asked_on_machine: HOSTILE.into(), sender_run: None });
+        r
+    }
+
+    #[test]
+    fn a_hostile_peer_row_prints_inert_in_every_layout() {
+        let r = hostile_run();
+        for (width, machine_col) in [(None, true), (None, false), (Some(400), true), (Some(400), false)] {
+            let row = format_row(2, &r, id_width(std::slice::from_ref(&r), width), width, machine_col);
+            assert!(inert(&row), "{row:?}");
+        }
+    }
+
+    // Colors forced off (a process-global override, hence serial), so the
+    // only control bytes the output could hold are the hostile text's.
+    #[test]
+    #[serial_test::serial]
+    fn a_hostile_usage_group_prints_inert_and_its_columns_hold_their_width() {
+        darkmux_types::style::set_colorize_override(Some(false));
+        let _restore = RestoreColor;
+        let mut report = sample_report();
+        let g = &mut report.breakdown.groups[1];
+        g.machine = Some(HOSTILE.into());
+        g.endpoint_id = Some(HOSTILE.into());
+        g.requested_model = Some(format!("日本語{HOSTILE}"));
+        g.reported_model = Some(HOSTILE.into());
+        for width in [None, Some(200)] {
+            let text = usage_lines(&report, width).join("\n");
+            assert!(inert(&text), "{text:?}");
+        }
+        // Every group line is exactly as wide as the header, the wide one too.
+        let lines = usage_lines(&report, Some(200));
+        let header = darkmux_flow::hooks::display_columns(&lines[1]);
+        let wide = lines.iter().find(|l| l.contains("日本語")).expect("the wide-model row");
+        assert_eq!(darkmux_flow::hooks::display_columns(wide), header, "{lines:#?}");
+    }
+
+    #[test]
+    fn plain_run_text_and_unicode_print_unchanged() {
+        let mut r = mk_run("run-1", RunKind::Dispatch, RunStatus::Complete, 1);
+        r.role = Some("café".into());
+        r.model = Some("日本語-model".into());
+        assert!(format_row(2, &r, 20, None, true).ends_with("  café · 日本語-model"), "{}", format_row(2, &r, 20, None, true));
+        let text = usage_lines(&sample_report(), None).join("\n");
+        assert!(text.contains("reported model: gpt-x-2026-01"), "{text}");
+    }
+
+    /// Puts the colorize override back on drop, even when an assertion fails.
+    struct RestoreColor;
+    impl Drop for RestoreColor {
+        fn drop(&mut self) {
+            darkmux_types::style::set_colorize_override(None);
+        }
     }
 }

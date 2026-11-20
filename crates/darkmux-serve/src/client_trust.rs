@@ -170,7 +170,7 @@ pub fn tailnet_dialog_message(code: &str, identity: &crate::client_tailnet::Tail
          computer can send a request naming any device, so Allow only if {} shows code {}. If you are not pairing a \
          device now, Deny.\nAllow pairs it now; the next device asks again.",
         crate::client_tailnet::described(identity),
-        safe(&identity.device.name),
+        crate::client_tailnet::shown_name(&identity.device.name),
         safe(code)
     )
 }

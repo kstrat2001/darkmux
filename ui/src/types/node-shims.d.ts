@@ -40,4 +40,10 @@ declare module "node:path" {
   export default path;
 }
 
-declare const process: { env: Record<string, string | undefined> };
+/** `on`/`off`: `mountApp.test.tsx`'s teardown check listens for errors
+ * thrown after it removes the DOM globals (#2501). */
+declare const process: {
+  env: Record<string, string | undefined>;
+  on(event: "uncaughtException" | "unhandledRejection", listener: (error: unknown) => void): unknown;
+  off(event: "uncaughtException" | "unhandledRejection", listener: (error: unknown) => void): unknown;
+};

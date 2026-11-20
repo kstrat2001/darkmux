@@ -95,6 +95,8 @@ pub(crate) struct FleetListenerState {
     pub queue_heartbeat: std::time::Duration,
     /// How long a queued job may wait for its seat ([`queue_deadline`]).
     pub queue_limits: QueueLimits,
+    /// How long a submission's body may take to arrive ([`BODY_READ_TIMEOUT`]).
+    pub body_read_timeout: std::time::Duration,
     /// Per-peer throttle on refusal log lines.
     pub refusal_log: Arc<RefusalLog>,
     /// (#2916 round 3 C5) Requests in flight per admitted NODE, so a node
@@ -162,6 +164,7 @@ impl FleetListenerState {
             queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
             queue_heartbeat: QUEUE_HEARTBEAT,
             queue_limits: QueueLimits::PRODUCTION,
+            body_read_timeout: BODY_READ_TIMEOUT,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
@@ -595,24 +598,19 @@ fn queued_reply(base: &SubmissionReply, receiver: &str, what: &str) -> Submissio
 
 /// (#2916 stage 2 review C1) How long a job may wait for its seat, or
 /// `None` when it cannot wait at all. A job the sender waits on must finish
-/// inside its connection's lifetime, so its queue time is that lifetime
-/// less the job's own timeout and [`QUEUE_SLACK`]; a job queued without
-/// `--wait` may wait [`QueueLimits::no_wait_max_age`].
+/// inside its connection's lifetime, so its queue time is what the
+/// connection has left after the job's run needs (its timeout, the
+/// sandbox's first-use setup, the answer's slack: the same bound the
+/// sender's read deadline is, `darkmux_fleet::WaitBudget::run_needs`); a
+/// job queued without `--wait` may wait [`QueueLimits::no_wait_max_age`].
 ///
 /// The job's `timeout_seconds` bounds a tool-less (hosted single-shot)
 /// call; a container-agentic dispatch runs on its inactivity budget
 /// instead and can outlast it. Such a run can outlive the connection: the
 /// job keeps running here, and the sender reports that the answer was lost
 /// and the job may still be running, naming the session to follow.
-fn queue_deadline(limits: &QueueLimits, wait: bool, job_timeout_seconds: u32) -> Option<std::time::Instant> {
-    let window = if wait {
-        limits
-            .connection_lifetime
-            .saturating_sub(std::time::Duration::from_secs(u64::from(job_timeout_seconds)))
-            .saturating_sub(QUEUE_SLACK)
-    } else {
-        limits.no_wait_max_age
-    };
+fn queue_deadline(limits: &QueueLimits, wait: bool, job: &WorkJob) -> Option<std::time::Instant> {
+    let window = if wait { limits.budget.queue_room(job) } else { limits.no_wait_max_age };
     (!window.is_zero()).then(|| std::time::Instant::now() + window)
 }
 
@@ -626,7 +624,7 @@ fn wait_or_refuse(
 ) -> Result<std::time::Instant, Refusal> {
     match state.busy_policy {
         BusyPolicy::Refuse => Err(Refusal::Busy { what: occupied.what.clone() }),
-        BusyPolicy::Queue => queue_deadline(&state.queue_limits, sub.wait, sub.job.timeout_seconds).ok_or_else(|| {
+        BusyPolicy::Queue => queue_deadline(&state.queue_limits, sub.wait, &sub.job).ok_or_else(|| {
             Refusal::Busy {
                 what: format!(
                     "{}; a job with a {}s timeout has no time left to wait inside one connection",
@@ -637,8 +635,17 @@ fn wait_or_refuse(
     }
 }
 
+/// A waited-on job whose run does not fit one connection here is refused
+/// before it starts: the connection would end before its answer is sent.
+fn fits_its_connection(limits: &QueueLimits, sub: &WorkSubmission) -> Result<(), Refusal> {
+    if !sub.wait {
+        return Ok(());
+    }
+    limits.budget.fits(&sub.job).map_err(|detail| Refusal::TooLongToWait { detail })
+}
+
 /// Decide how a scoped job starts: its seat now, a place in the queue, or a
-/// busy refusal.
+/// refusal (busy, or too long for one connection).
 fn start_or_refuse(
     state: &FleetListenerState,
     admitted: &Admitted,
@@ -646,6 +653,7 @@ fn start_or_refuse(
     session_id: &darkmux_types::session_id::SessionId,
     sub: &WorkSubmission,
 ) -> Result<Start, Refusal> {
+    fits_its_connection(&state.queue_limits, sub)?;
     let occupied = match state.seats.try_claim(&scoped.seat, &session_id.wire()) {
         Ok(guard) => return Ok(Start::Now(guard)),
         Err(occupied) => occupied,
@@ -946,6 +954,34 @@ fn scope_job(state: &FleetListenerState, admitted: &Admitted, job: &WorkJob) -> 
     darkmux_fleet::check_scope(&state.receiver, state.receiver_uid.as_deref(), admitted, job, resolution)
 }
 
+/// The longest a submission's body may take to arrive once its headers
+/// have: the sender's write timeout ([`darkmux_fleet::SUBMISSION_WRITE_TIMEOUT`])
+/// and as long again for a slow link. A peer that drips its body in is
+/// answered and cut off then, never held to its connection's lifetime.
+pub(crate) const BODY_READ_TIMEOUT: std::time::Duration = darkmux_fleet::SUBMISSION_WRITE_TIMEOUT.saturating_mul(2);
+
+/// A submission's body, read within `deadline` by axum's own `Bytes`
+/// extractor, so its size limit (axum's default) and the 413 for a body
+/// over it are what they always were.
+async fn read_body(deadline: std::time::Duration, request: Request) -> Result<Bytes, Refusal> {
+    use axum::extract::FromRequest;
+    match tokio::time::timeout(deadline, Bytes::from_request(request, &())).await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(rejection)) => Err(body_refusal(rejection.status(), rejection.body_text())),
+        Err(_) => Err(Refusal::BadRequest(format!("the body did not arrive within {deadline:?}"))),
+    }
+}
+
+/// The refusal for a body axum could not read: too large (413), or
+/// anything else (400).
+fn body_refusal(status: StatusCode, detail: String) -> Refusal {
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        Refusal::BodyTooLarge { detail }
+    } else {
+        Refusal::BadRequest(format!("the body could not be read: {detail}"))
+    }
+}
+
 /// `POST` a job or a check: refuses a caller the allow-list does not list,
 /// with the remedy for the job it posted, else hands the admitted job on.
 async fn submit_route(
@@ -953,8 +989,12 @@ async fn submit_route(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     authorization: Authorization,
     Extension(token): Extension<TokenFingerprint>,
-    body: Bytes,
+    request: Request,
 ) -> Response {
+    let body = match read_body(state.body_read_timeout, request).await {
+        Ok(bytes) => bytes,
+        Err(r) => return refuse(&state, Some(peer_addr.ip()), &r),
+    };
     match authorization.admitted(&body) {
         Ok(admitted) => submit_handler(state, peer_addr, admitted, token, body).await,
         Err(refusal) => refuse(&state, Some(peer_addr.ip()), &refusal),
@@ -1166,7 +1206,9 @@ pub(crate) struct ConnLimits {
     /// Time allowed to send the request headers.
     pub header_read_timeout: std::time::Duration,
     /// Longest a connection may live: a waiting submission holds its
-    /// connection for the whole job, so this is the job cap plus slack.
+    /// connection while its job queues and runs, so this is
+    /// `darkmux_fleet::WaitBudget`'s connection lifetime, the one bound the
+    /// queue window and the sender's read deadline are cut from.
     pub conn_deadline: std::time::Duration,
     /// (#3190) After the answer, how long the listener reads what the sender
     /// still sends before closing: time for it to read the answer and hang
@@ -1184,7 +1226,7 @@ impl ConnLimits {
         max_conns: 32,
         per_ip: PER_IP_CONNECTIONS,
         header_read_timeout: std::time::Duration::from_secs(3),
-        conn_deadline: std::time::Duration::from_secs(60 * 60 + 300),
+        conn_deadline: darkmux_fleet::WaitBudget::PRODUCTION.connection_lifetime,
         linger: std::time::Duration::from_secs(2),
         linger_bytes: 1024 * 1024,
     };
@@ -1212,17 +1254,13 @@ pub(crate) const CARD_NODE_CAP: usize = 2;
 /// (60 s), so the connection never looks dead while the job waits.
 pub(crate) const QUEUE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// (#2916 stage 2 review C1) Time a waited-on queued job leaves between its
-/// own timeout and the end of its connection: its answer must still reach a
-/// sender that is listening.
-pub(crate) const QUEUE_SLACK: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// (#2916 stage 2 review C1) How long queued jobs may wait for a seat.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QueueLimits {
-    /// How long one connection may live ([`ConnLimits::conn_deadline`]): a
-    /// waited-on job waits and runs inside it.
-    pub connection_lifetime: std::time::Duration,
+    /// How long one connection lives ([`ConnLimits::conn_deadline`]) and
+    /// what a waited-on job's run needs of it: the job waits for its seat
+    /// only as long as the rest allows.
+    pub budget: darkmux_fleet::WaitBudget,
     /// How long a job queued without `--wait` may wait before it is
     /// dropped as stale: 30 minutes. Nobody is listening for it, and work
     /// sent half an hour ago is rarely still wanted.
@@ -1231,7 +1269,7 @@ pub(crate) struct QueueLimits {
 
 impl QueueLimits {
     pub(crate) const PRODUCTION: QueueLimits = QueueLimits {
-        connection_lifetime: ConnLimits::PRODUCTION.conn_deadline,
+        budget: darkmux_fleet::WaitBudget::PRODUCTION,
         no_wait_max_age: std::time::Duration::from_secs(30 * 60),
     };
 }
@@ -1601,9 +1639,13 @@ mod tests {
         }
     }
 
+    /// The test receiver's body-read deadline: a local test's body arrives
+    /// in moments, and a dripping one is cut off well inside a test.
+    const TEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
     /// Wide queue limits: nothing in a test waits long enough to hit them.
     const WIDE: QueueLimits = QueueLimits {
-        connection_lifetime: Duration::from_secs(3600),
+        budget: darkmux_fleet::WaitBudget { connection_lifetime: Duration::from_secs(3600), ..darkmux_fleet::WaitBudget::PRODUCTION },
         no_wait_max_age: Duration::from_secs(3600),
     };
 
@@ -1690,6 +1732,9 @@ mod tests {
         let origins_c = origins.clone();
         let seats = Arc::new(SeatBook::new());
         let refusal_log = Arc::new(RefusalLog::new());
+        // The test receiver ends its connections at its own budget's
+        // lifetime, as production does at its own.
+        let conn_limits = ConnLimits { conn_deadline: queue_limits.budget.connection_lifetime, ..ConnLimits::PRODUCTION };
         let state = FleetListenerState {
             receiver: "studio".into(),
             receiver_uid: receiver_uid.map(str::to_string),
@@ -1723,8 +1768,13 @@ mod tests {
             execute: Arc::new(move |job: WorkJob, profile: String, origin: String| {
                 origins_c.lock().unwrap().push(origin);
                 // A job whose message is "slow" runs ten times as long, so a test
-                // can end one job while another still runs.
-                let ms = if job.message == "slow" { job_ms * 10 } else { job_ms };
+                // can end one job while another still runs; one whose message is
+                // "ms:<n>" runs n milliseconds.
+                let ms = match job.message.strip_prefix("ms:") {
+                    Some(n) => n.parse().expect("a test's ms:<n> message"),
+                    None if job.message == "slow" => job_ms * 10,
+                    None => job_ms,
+                };
                 std::thread::sleep(Duration::from_millis(ms));
                 ran_c.lock().unwrap().push((job.session_id.wire(), profile.clone()));
                 Ok(DispatchResult {
@@ -1742,6 +1792,7 @@ mod tests {
             queue_slots: queue_slots.clone(),
             queue_heartbeat: Duration::from_millis(100),
             queue_limits,
+            body_read_timeout: TEST_BODY_READ_TIMEOUT,
             refusal_log: refusal_log.clone(),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
@@ -1757,7 +1808,7 @@ mod tests {
             rt.block_on(async move {
                 let l = tokio::net::TcpListener::from_std(std_listener).unwrap();
                 let (_tx, rx) = tokio::sync::watch::channel(false);
-                serve_bounded(l, router(state), ConnLimits::PRODUCTION, rx).await;
+                serve_bounded(l, router(state), conn_limits, rx).await;
             });
         });
         Harness { refusal_log, url: format!("http://127.0.0.1:{port}{}", darkmux_fleet::SUBMISSION_PATH), ran, seats, allow: allow_now, queue_slots, model_moved, went_hosted, token: token_now, network, origins }
@@ -2785,14 +2836,243 @@ mod tests {
         assert_eq!(h.ran.lock().unwrap().len(), 1, "the abandoned job ran");
     }
 
+    /// A waited-on job's connection holds the longest it may queue and then
+    /// the whole wait its sender reads the answer with (its run, the
+    /// sandbox's first-use setup, the answer's slack), for every timeout up
+    /// to the cap: otherwise the receiver ends the connection mid-run and
+    /// the sender reports the answer lost.
+    #[test]
+    fn a_waited_jobs_connection_outlasts_its_queue_and_its_senders_wait() {
+        for timeout_seconds in [1, 60, 300, 600, 1800, 3600] {
+            let j = WorkJob { timeout_seconds, ..job("s-fit", None) };
+            // Measured from after the call, so the clock moving during it
+            // never counts as queue time.
+            let deadline = queue_deadline(&QueueLimits::PRODUCTION, true, &j);
+            let queued_for = deadline.map_or(Duration::ZERO, |d| d.saturating_duration_since(std::time::Instant::now()));
+            let sender_waits = darkmux_fleet::reply_wait(&j, true);
+            let held = ConnLimits::PRODUCTION.conn_deadline;
+            assert!(
+                queued_for + sender_waits <= held,
+                "--timeout {timeout_seconds}: queued up to {queued_for:?}, then the sender waits {sender_waits:?}, \
+                 but the connection lives {held:?}"
+            );
+        }
+    }
+
+    /// A shortened [`darkmux_fleet::WaitBudget`]: a 1 s job needs 3 s of a
+    /// 5 s connection (1.5 s of first-use setup, 0.5 s for the answer), so it
+    /// may queue 2 s.
+    const SHORT_BUDGET: darkmux_fleet::WaitBudget = darkmux_fleet::WaitBudget {
+        first_use: Duration::from_millis(1_500),
+        answer_slack: Duration::from_millis(500),
+        connection_lifetime: Duration::from_secs(5),
+    };
+
+    /// A 1 s job whose run takes `ms` (its first-use setup and its work).
+    fn short_job(session: &str, ms: u64) -> WorkJob {
+        WorkJob { timeout_seconds: 1, message: format!("ms:{ms}"), ..job(session, None) }
+    }
+
+    /// A receiver that queues, with [`SHORT_BUDGET`].
+    fn short_receiver() -> Harness {
+        let limits = QueueLimits { budget: SHORT_BUDGET, no_wait_max_age: Duration::from_secs(60) };
+        start_full(Some(laptop()), false, 0, Arc::new(|| Ok(())), BusyPolicy::Queue, None, limits)
+    }
+
+    /// Post `j`, waiting, with the read deadline a sender holding
+    /// [`SHORT_BUDGET`] uses: what the job's run needs.
+    fn post_waiting_short(h: &Harness, j: WorkJob) -> anyhow::Result<(u16, SubmissionReply)> {
+        let wait = SHORT_BUDGET.run_needs(&j);
+        darkmux_fleet::post_submission_with_progress(&h.url, TOKEN, &WorkSubmission::new(j, true), wait, &mut |_| {})
+    }
+
+    /// A waited-on job that queues, then spends its whole first-use setup
+    /// before its work, still gets its answer inside its connection.
+    #[test]
+    fn a_queued_job_that_then_sets_up_its_sandbox_returns_its_answer() {
+        let h = short_receiver();
+        assert_eq!(post(&h, TOKEN, short_job("s-first", 1_000), false).0, 202);
+        // Queued about 1 s, then 1.5 s of setup and 0.8 s of work.
+        let (code, reply) = post_waiting_short(&h, short_job("s-wait", 2_300)).expect("the answer reached the sender");
+        assert_eq!((code, reply.status), (200, ReplyStatus::Completed), "{reply:?}");
+        wait_idle(&h);
+    }
+
+    /// A waited-on job never queues into the time its run needs: one whose
+    /// seat stays busy past its queue room is answered busy while its
+    /// connection is open, never cut off mid-setup with its answer lost.
+    #[test]
+    fn a_waited_job_never_queues_into_its_first_use_setup() {
+        let h = short_receiver();
+        assert_eq!(post(&h, TOKEN, short_job("s-first", 3_200), false).0, 202);
+        // Queued 3.2 s and then 2.3 s of setup and work would end at 5.5 s,
+        // past the 5 s connection; its 2 s of queue room end first.
+        let (_, reply) = post_waiting_short(&h, short_job("s-wait", 2_300)).expect("the answer reached the sender");
+        assert_eq!(reply.status, ReplyStatus::Refused, "{reply:?}");
+        assert!(reply.reason.as_deref().unwrap_or_default().contains("waited as long as it may"), "{reply:?}");
+        wait_ran(&h, 1);
+        wait_idle(&h);
+        assert_eq!(h.ran.lock().unwrap().len(), 1, "the waited job ran after it was refused");
+    }
+
+    /// The receiver ends a connection at its own budget's lifetime: a
+    /// waited-on job that fits its budget but runs past it (an agentic run
+    /// outlasting its timeout) loses its connection at 5 s, before its
+    /// answer at 7 s, and the job still runs to its end.
+    #[test]
+    fn the_receiver_ends_a_connection_at_its_budgets_lifetime() {
+        let h = short_receiver();
+        let j = short_job("s-overrun", 7_000);
+        let sent = std::time::Instant::now();
+        let got = darkmux_fleet::post_submission_with_progress(
+            &h.url,
+            TOKEN,
+            &WorkSubmission::new(j, true),
+            Duration::from_secs(20),
+            &mut |_| {},
+        );
+        let after = sent.elapsed();
+        assert!(got.is_err(), "the answer outlived the connection's lifetime: {got:?}");
+        let lifetime = SHORT_BUDGET.connection_lifetime;
+        assert!(after >= lifetime - Duration::from_millis(500) && after < Duration::from_millis(6_500), "closed after {after:?}");
+        wait_ran(&h, 1);
+    }
+
+    /// A peer that drips its request body in is answered and cut off at the
+    /// body-read deadline, not held to its connection's lifetime.
+    #[test]
+    fn a_body_that_drips_in_is_refused_at_the_body_read_deadline() {
+        use std::io::{Read, Write};
+        let h = start(Some(laptop()), false, 0);
+        let addr = h.url.trim_start_matches("http://").split('/').next().unwrap().to_string();
+        let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+        write!(
+            sock,
+            "POST {} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n",
+            darkmux_fleet::SUBMISSION_PATH,
+        )
+        .unwrap();
+        let sent = std::time::Instant::now();
+        // One byte every 200 ms, for longer than the deadline and the
+        // reader's own wait, until the listener stops reading.
+        let mut drip = sock.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..50 {
+                if drip.write_all(b" ").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        sock.set_read_timeout(Some(TEST_BODY_READ_TIMEOUT * 3)).unwrap();
+        let mut got = Vec::new();
+        let mut b = [0u8; 4096];
+        while let Ok(n @ 1..) = sock.read(&mut b) {
+            got.extend_from_slice(&b[..n]);
+        }
+        let answer = String::from_utf8_lossy(&got);
+        assert!(answer.starts_with("HTTP/1.1 400"), "no refusal within {:?}: {answer:?}", TEST_BODY_READ_TIMEOUT * 3);
+        assert!(answer.contains("did not arrive within 2s"), "{answer}");
+        assert!(sent.elapsed() < TEST_BODY_READ_TIMEOUT * 2, "answered after {:?}", sent.elapsed());
+        assert!(h.ran.lock().unwrap().is_empty());
+    }
+
+    /// A body over the listener's size limit (axum's default for a body,
+    /// 2 MiB) is refused 413, as it always was, with the JSON refusal and
+    /// the `bad_request` code; nothing runs.
+    #[test]
+    fn a_body_over_the_size_limit_is_refused_413() {
+        use std::io::{Read, Write};
+        let h = start(Some(laptop()), false, 0);
+        let addr = h.url.trim_start_matches("http://").split('/').next().unwrap().to_string();
+        let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+        let len = 2 * 1024 * 1024 + 1;
+        write!(
+            sock,
+            "POST {} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\n\r\n",
+            darkmux_fleet::SUBMISSION_PATH,
+        )
+        .unwrap();
+        // The listener may answer before the body is all sent, and stop
+        // reading: the writer stops at its first failed write.
+        let mut writer = sock.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let chunk = vec![b' '; 64 * 1024];
+            let mut left = len;
+            while left > 0 {
+                let n = left.min(chunk.len());
+                if writer.write_all(&chunk[..n]).is_err() {
+                    return;
+                }
+                left -= n;
+            }
+        });
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut got = Vec::new();
+        let mut b = [0u8; 4096];
+        while let Ok(n @ 1..) = sock.read(&mut b) {
+            got.extend_from_slice(&b[..n]);
+        }
+        let answer = String::from_utf8_lossy(&got);
+        assert!(answer.starts_with("HTTP/1.1 413"), "{answer:?}");
+        assert!(answer.contains("\"refusal\":\"bad_request\""), "{answer}");
+        assert!(h.ran.lock().unwrap().is_empty());
+    }
+
+    /// Only a body over the size limit is a 413; any other failure to read
+    /// one is a 400.
+    #[test]
+    fn only_an_oversized_body_is_refused_413() {
+        let too_large = body_refusal(StatusCode::PAYLOAD_TOO_LARGE, "length limit exceeded".into());
+        assert_eq!((too_large.http_status(), too_large.code()), (413, darkmux_fleet::RefusalCode::BadRequest));
+        let broken = body_refusal(StatusCode::BAD_REQUEST, "the connection broke off".into());
+        assert_eq!((broken.http_status(), broken.code()), (400, darkmux_fleet::RefusalCode::BadRequest));
+        assert!(broken.reason("studio").contains("the body could not be read: the connection broke off"));
+    }
+
+    /// The production body-read deadline: the sender's write timeout and
+    /// as long again, far inside the connection's lifetime.
+    #[test]
+    fn the_body_read_deadline_is_twice_the_senders_write_timeout() {
+        assert_eq!(BODY_READ_TIMEOUT, darkmux_fleet::SUBMISSION_WRITE_TIMEOUT * 2);
+        assert!(BODY_READ_TIMEOUT < ConnLimits::PRODUCTION.conn_deadline / 10);
+    }
+
+    /// A waited-on job whose run cannot fit one connection is refused when
+    /// it is submitted, naming the bound, and nothing runs. Sent without
+    /// waiting it holds no connection, and is taken.
+    #[test]
+    fn a_waited_job_too_long_for_its_connection_is_refused_at_submit() {
+        let h = short_receiver();
+        let too_long = || WorkJob { timeout_seconds: 4, ..short_job("s-long", 0) };
+        let (code, reply) = post_waiting_short(&h, too_long()).unwrap();
+        assert_eq!(
+            (code, reply.status, reply.refusal),
+            (400, ReplyStatus::Refused, Some(darkmux_fleet::RefusalCode::BadRequest)),
+            "{reply:?}"
+        );
+        let why = reply.reason.unwrap_or_default();
+        assert!(why.contains("cannot hold the answer's connection that long"), "{why}");
+        assert!(why.contains("lives at most 5s") && why.contains("a timeout of at most 3s"), "{why}");
+        assert!(h.ran.lock().unwrap().is_empty(), "a job too long to answer ran");
+        assert_eq!(post(&h, TOKEN, too_long(), false).0, 202, "an unwaited job holds no connection");
+        wait_ran(&h, 1);
+    }
+
     /// (#2916 stage 2 review C1) A waited-on job whose timeout leaves no time
     /// to wait inside one connection is answered busy at once, not queued.
     #[test]
     fn a_waited_job_with_no_room_in_its_connection_is_busy_not_queued() {
-        let tight = QueueLimits { connection_lifetime: Duration::from_secs(120), no_wait_max_age: Duration::from_secs(60) };
+        let budget = darkmux_fleet::WaitBudget {
+            first_use: Duration::from_secs(30),
+            answer_slack: Duration::from_secs(30),
+            connection_lifetime: Duration::from_secs(120),
+        };
+        let tight = QueueLimits { budget, no_wait_max_age: Duration::from_secs(60) };
         let h = start_full(Some(laptop()), false, 600, Arc::new(|| Ok(())), BusyPolicy::Queue, None, tight);
         assert_eq!(post(&h, TOKEN, job("s-first", None), false).0, 202);
-        // A 60 s job in a 120 s connection, less 60 s of slack: no time left.
+        // A 60 s job, 30 s of first-use setup and 30 s for the answer fill a
+        // 120 s connection: it fits, with no time left to wait.
         let (code, reply) = post(&h, TOKEN, job("s-second", None), true);
         assert_eq!((code, reply.status), (503, ReplyStatus::Refused), "{reply:?}");
         assert!(reply.reason.unwrap().contains("no time left to wait"));
@@ -2804,7 +3084,11 @@ mod tests {
     #[test]
     fn a_queued_job_past_its_limit_is_dropped_and_never_runs() {
         let short = QueueLimits {
-            connection_lifetime: Duration::from_secs(60) + QUEUE_SLACK + Duration::from_millis(300),
+            budget: darkmux_fleet::WaitBudget {
+                connection_lifetime: Duration::from_secs(60) + Duration::from_millis(300),
+                first_use: Duration::ZERO,
+                answer_slack: Duration::ZERO,
+            },
             no_wait_max_age: Duration::from_millis(300),
         };
         let h = start_full(Some(laptop()), false, 1_500, Arc::new(|| Ok(())), BusyPolicy::Queue, None, short);
@@ -2857,6 +3141,7 @@ mod tests {
             queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
             queue_heartbeat: QUEUE_HEARTBEAT,
             queue_limits: QueueLimits::PRODUCTION,
+            body_read_timeout: BODY_READ_TIMEOUT,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
@@ -2934,6 +3219,7 @@ mod tests {
             queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
             queue_heartbeat: QUEUE_HEARTBEAT,
             queue_limits: QueueLimits::PRODUCTION,
+            body_read_timeout: BODY_READ_TIMEOUT,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
@@ -3239,6 +3525,7 @@ mod tests {
             queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
             queue_heartbeat: QUEUE_HEARTBEAT,
             queue_limits: QueueLimits::PRODUCTION,
+            body_read_timeout: BODY_READ_TIMEOUT,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(NODE_CAP)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),
@@ -3300,6 +3587,7 @@ mod tests {
             queue_slots: Arc::new(KeySlots::new(NODE_CAP)),
             queue_heartbeat: QUEUE_HEARTBEAT,
             queue_limits: QueueLimits::PRODUCTION,
+            body_read_timeout: BODY_READ_TIMEOUT,
             refusal_log: Arc::new(RefusalLog::new()),
             node_slots: Arc::new(KeySlots::new(1)),
             card_slots: Arc::new(KeySlots::new(CARD_NODE_CAP)),

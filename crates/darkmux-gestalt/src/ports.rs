@@ -52,6 +52,15 @@ pub enum HostError {
     /// typed instead of an opaque stderr bail.
     NotResident { identifier: String },
     CommandFailed { detail: String },
+    /// Refused before loading (#1135 class): the model's own maximum
+    /// context, as the host's catalog states it, is below what was asked.
+    /// Nothing was unloaded or loaded.
+    ContextBeyondModel { model_key: String, asked: u32, limit: u64 },
+    /// The load finished, but the host holds the instance at less context
+    /// than was asked (#1135 class): a dispatch on it would run truncated.
+    /// `limit` is the model's maximum when the catalog states one. The
+    /// instance is left loaded.
+    ContextShort { model_key: String, identifier: String, asked: u32, got: u64, limit: Option<u64> },
 }
 
 impl HostError {
@@ -76,7 +85,31 @@ impl std::fmt::Display for HostError {
                 write!(f, "\"{identifier}\" is not resident: nothing to unload")
             }
             HostError::CommandFailed { detail } => write!(f, "host command failed: {detail}"),
+            HostError::ContextBeyondModel { model_key, asked, limit } => write!(
+                f,
+                "`{model_key}` takes at most {limit} tokens of context, as the engine's catalog states, \
+                 and n_ctx={asked} was asked, so it was not loaded: set the profile's `n_ctx` to {limit} or less"
+            ),
+            HostError::ContextShort { model_key, identifier, asked, got, limit } => write!(
+                f,
+                "`{identifier}` loaded at context {got}, below the n_ctx={asked} asked{}. It is left loaded \
+                 (`darkmux machine eject` unloads it); set the profile's `n_ctx` to {got} or less to run on it",
+                short_cause(model_key, *asked, *limit)
+            ),
         }
+    }
+}
+
+/// Why a load lands below the context asked, as far as the catalog says.
+fn short_cause(model_key: &str, asked: u32, limit: Option<u64>) -> String {
+    match limit {
+        Some(limit) if limit < u64::from(asked) => format!(": `{model_key}` takes at most {limit}"),
+        Some(limit) => format!(
+            ", though `{model_key}` states a maximum of {limit}: the engine capped the load (check its settings for this model)"
+        ),
+        None => format!(
+            ": the engine caps a load at the model's own maximum, and `{model_key}` may take less than was asked"
+        ),
     }
 }
 
@@ -108,6 +141,14 @@ pub trait ModelHost {
         deadline: Deadline,
     ) -> Result<LoadReport, HostError>;
     fn unload(&mut self, target: &OwnedTarget, deadline: Deadline) -> Result<(), HostError>;
+    /// The largest context `model_key` takes, as the host's catalog states
+    /// it, or `None` when it states none (#1135 class). Read before a load
+    /// is decided, so a profile asking more is refused before anything is
+    /// unloaded or loaded ([`crate::refuse_beyond_limit`]).
+    fn context_limit(&mut self, model_key: &str) -> Option<u64> {
+        let _ = model_key;
+        None
+    }
     /// (#3508) Architecture facts for each of `model_keys` the host can
     /// read (layers, KV heads, head size), the KV-cache term of a load's
     /// estimate, and which of them pay that cache at load. A host that

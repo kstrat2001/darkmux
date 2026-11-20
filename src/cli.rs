@@ -522,6 +522,21 @@ pub(crate) enum Cmd {
         /// finds answering in a config it creates, and keeps an existing one.
         #[arg(long, value_name = "URL")]
         engine_url: Option<String>,
+        /// Add an installed engine darkmux starts servers for (`tensorfold`
+        /// or `flint`) to profiles.json: an endpoint and a profile running
+        /// its model. Shows what it adds and writes only after you confirm
+        /// on the terminal. `init` lists the engines it finds on every run.
+        #[arg(long, value_name = "ENGINE")]
+        add_engine: Option<String>,
+        /// With --add-engine: which of the engine's models to add, when it
+        /// holds more than one.
+        #[arg(long, value_name = "ID", requires = "add_engine")]
+        engine_model: Option<String>,
+        /// With --add-engine: the context to run the model at, in tokens.
+        /// Without it, the largest the engine states for the model; an
+        /// engine that states none (Tensorfold) needs it.
+        #[arg(long, value_name = "TOKENS", requires = "add_engine")]
+        n_ctx: Option<u32>,
     },
 }
 
@@ -583,10 +598,11 @@ pub(crate) enum ModCmd {
         #[command(flatten)]
         json: JsonFlag,
     },
-    /// Show one mod, whole, by its minted key. The kit is printed as its own
-    /// bytes, with nothing added: but this rendering is for reading. To get
-    /// the kit back byte for byte in a script, use the JSON channel:
-    /// `darkmux mod show <key> --json | jq -j .kit`.
+    /// Show one mod, whole, by its minted key. The kit is printed as written,
+    /// with nothing added, except that an escape sequence or other control
+    /// character in it is shown as text (`\u{1b}`): this rendering is for
+    /// reading. To get the kit back byte for byte in a script, use the JSON
+    /// channel: `darkmux mod show <key> --json | jq -j .kit`.
     Show {
         /// The mod key, e.g. `mod-1788000000-a1b2c3`.
         key: String,

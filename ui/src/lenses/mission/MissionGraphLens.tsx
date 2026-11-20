@@ -61,7 +61,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient, skipToken } from "@tanstack/react-query";
 import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { missionRowOf } from "../../lib/lifecycle";
-import { runChip } from "../runs/format";
+import { lastKnownChip, runChip } from "../runs/format";
 import type { Run } from "../../types/generated/Run";
 import type { RunsResponse } from "../../types/generated/RunsResponse";
 import { queryKeys, PRESENCE_POLL_MS, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
@@ -86,6 +86,8 @@ import {
   type GraphStep,
   type MetricsMap,
   type StepHeaderField,
+  missionSpan,
+  shownGraph,
 } from "./graph";
 import { initMinimap, isNarrowViewport, persistMinimap, timelineActive } from "./timeline";
 import { byReceiveOrder, byTime, ingest, stepIdOf, type NormRecord } from "../../lib/ingest";
@@ -321,13 +323,6 @@ function useKeptMissionRow(data: FetchResult<RunsResponse> | undefined, missionI
   return { row, stale: !rows && row !== null };
 }
 
-/** A kept row's chip while `/runs` is failing: its word and color stand, but
- *  a running row loses the live treatment (no pulse, no clock, no process
- *  readout), since nothing says it is still running. */
-function lastKnownChip(chip: MissionHeaderChip): MissionHeaderChip {
-  return { ...chip, live: "stale", title: LAST_KNOWN_TITLE };
-}
-
 /** Whether the header's chip is a run in flight right now: running, and not a
  *  kept row read while `/runs` is failing. It gates the clock and the host
  *  readout. */
@@ -335,7 +330,6 @@ function chipIsLive(chip: MissionHeaderChip): boolean {
   return workStatusKind(chip.status, chip.abandonReason) === "running" && chip.live !== "stale";
 }
 
-const LAST_KNOWN_TITLE = "last known status; the daemon's run list isn't answering";
 
 /** The chip the header renders: a row's (`runChip`), a kept row's
  *  (`lastKnownChip`), the lifecycle word, or the neutral one while `/runs`
@@ -346,16 +340,6 @@ const PENDING_CHIP: MissionHeaderChip = { status: undefined, label: "\u2026", ti
 
 /** Mission-wide span from the per-step metrics the fold already keeps:
  * earliest step start, latest step end (0 when unknown). */
-function missionSpan(metrics: MetricsMap): { start: number; end: number } {
-  let start = 0;
-  let end = 0;
-  for (const k of Object.keys(metrics)) {
-    const m = metrics[k];
-    if (m.startTs) start = start ? Math.min(start, m.startTs) : m.startTs;
-    if (m.endTs) end = Math.max(end, m.endTs);
-  }
-  return { start, end };
-}
 function HelpGlyph() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true">
@@ -566,7 +550,9 @@ export function MissionGraphLens({
   // resolve one from), and a static build never reads `graphQuery` (it's
   // `enabled: false`, so `graphQuery.data` stays `undefined` forever).
   const staticGraph = staticGraphsQuery.data?.ok ? (staticGraphsQuery.data.data[missionId] ?? null) : null;
-  const baseGraph = daemonBacked ? (graphQuery.data?.ok ? graphQuery.data.data : null) : staticGraph;
+  const wireGraph = daemonBacked ? (graphQuery.data?.ok ? graphQuery.data.data : null) : staticGraph;
+  // (#3195) A step the server marks `waiting` reads waiting.
+  const baseGraph = useMemo(() => (wireGraph ? shownGraph(wireGraph) : null), [wireGraph]);
 
   // All three record sources, deduped — see this module's own doc.
   const allRecords = useMemo(() => {
@@ -684,7 +670,8 @@ export function MissionGraphLens({
 
   const anyRunning = !!(
     graph &&
-    graph.nodes.some((n) => n.status === "running" || (n.steps || []).some((s) => s.status === "running"))
+    // (#3195) A step waiting for its slot keeps its phase's total counting.
+    graph.nodes.some((n) => n.status === "running" || (n.steps || []).some((s) => s.status === "running" || s.status === "waiting"))
   );
   const headerState = useMissionHeaderState(missionId, graph, daemonBacked);
   // (#2332 review) `active` is a mission's status from mint to finalize —

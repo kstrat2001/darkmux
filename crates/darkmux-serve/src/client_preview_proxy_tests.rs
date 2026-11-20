@@ -531,10 +531,7 @@ async fn sent(h: &Harness, mut req: Request<Body>) -> (u16, HeaderMap, String) {
         .is_none()
     {
         req.extensions_mut()
-            .insert(axum::extract::ConnectInfo(SocketAddr::from((
-                [127, 0, 0, 1],
-                5555,
-            ))));
+            .insert(axum::extract::ConnectInfo(crate::local_peer::operator(SocketAddr::from(([127, 0, 0, 1], 5555)))));
     }
     let resp = router(h.state.clone()).oneshot(req).await.unwrap();
     let (status, headers) = (resp.status().as_u16(), resp.headers().clone());
@@ -966,7 +963,7 @@ async fn off_the_tailnet_nothing_reaches_a_preview() {
 async fn listening(h: &Harness) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = router(h.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
+    let app = crate::local_peer::make_service(router(h.state.clone()));
     tokio::spawn(async move { axum::serve(listener, app).await });
     addr
 }
@@ -1401,10 +1398,7 @@ async fn a_session_has_six_requests_at_the_preview_at_once_and_the_rest_wait() {
         from.push(("cookie", cookie.as_str()));
         let mut req = get("/hold", &from);
         req.extensions_mut()
-            .insert(axum::extract::ConnectInfo(SocketAddr::from((
-                [127, 0, 0, 1],
-                5555,
-            ))));
+            .insert(axum::extract::ConnectInfo(crate::local_peer::operator(SocketAddr::from(([127, 0, 0, 1], 5555)))));
         asked.push(tokio::spawn(router(h.state.clone()).oneshot(req)));
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1491,10 +1485,7 @@ async fn a_preview_that_never_answers_times_out_and_frees_its_turn() {
         from.push(("cookie", cookie.as_str()));
         let mut req = get("/hang", &from);
         req.extensions_mut()
-            .insert(axum::extract::ConnectInfo(SocketAddr::from((
-                [127, 0, 0, 1],
-                5555,
-            ))));
+            .insert(axum::extract::ConnectInfo(crate::local_peer::operator(SocketAddr::from(([127, 0, 0, 1], 5555)))));
         asked.push(tokio::spawn(router(h.state.clone()).oneshot(req)));
     }
     for a in asked {
@@ -1546,10 +1537,7 @@ async fn a_turn_is_held_until_the_answers_body_is_done() {
         from.push(("cookie", cookie.as_str()));
         let mut req = get(path, &from);
         req.extensions_mut()
-            .insert(axum::extract::ConnectInfo(SocketAddr::from((
-                [127, 0, 0, 1],
-                5555,
-            ))));
+            .insert(axum::extract::ConnectInfo(crate::local_peer::operator(SocketAddr::from(([127, 0, 0, 1], 5555)))));
         router(h.state.clone()).oneshot(req)
     };
     let mut slow = Vec::new();

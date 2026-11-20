@@ -11,7 +11,7 @@
     },
     {
       "name": "rules",
-      "description": "Comma-separated rule ids to crawl with, selecting which of this document's plan tasks are minted. A task whose `config.rule` is not named is pruned at mint with reason `not_selected` and reported in `graph-report.json`, so the run's graph is exactly the rules that will run. Absent means every enabled plan task the document declares.",
+      "description": "Comma-separated rule ids to crawl with, selecting which of this document's plan tasks are minted. A task whose `config.rule` is not named is pruned at mint with reason `not_selected` and reported in `graph-report.json`, so the run's graph is exactly the rules that will run. Absent means every enabled plan task the document declares. A name no plan task declares is refused before anything mints, naming the closest declared rule.",
       "required": false
     },
     {

@@ -472,13 +472,28 @@ fn same_identity(asked: &TailnetIdentity, polling: &TailnetIdentity) -> Option<P
     })
 }
 
+/// (#3626) The most display columns one tailnet name takes where darkmux
+/// shows it: room for an ordinary login or MagicDNS name whole, while a
+/// device that names itself at length cannot push the rest of a line off
+/// screen.
+pub const NAME_COLUMNS: usize = 40;
+
+/// (#3626) One name a device chose for itself (its tailnet user, device
+/// or host name, or the device name its app sent with a pairing request) as
+/// darkmux shows it: display-safe, on one line, and at most
+/// [`NAME_COLUMNS`] display columns, cut in the middle at a `…` so its
+/// start and end both show (see `darkmux_flow::hooks::bounded_for_display`
+/// for the cut).
+pub fn shown_name(name: &str) -> String {
+    darkmux_flow::hooks::bounded_for_display(&darkmux_platform::display_safe(name), NAME_COLUMNS)
+}
+
 /// A remote identity as the operator is shown it: Tailscale's user and
-/// device, each display-safe.
+/// device, each a [`shown_name`].
 pub fn described(identity: &TailnetIdentity) -> String {
-    let safe = darkmux_platform::display_safe;
     let device = &identity.device;
-    let host = device.host_name.as_deref().map(|h| format!(" ({})", safe(h))).unwrap_or_default();
-    format!("tailnet user {}, device {}{host}", safe(&identity.login), safe(&device.name))
+    let host = device.host_name.as_deref().map(|h| format!(" ({})", shown_name(h))).unwrap_or_default();
+    format!("tailnet user {}, device {}{host}", shown_name(&identity.login), shown_name(&device.name))
 }
 
 /// The device at `ip`, from a recent answer in `cache` or from `lookup`

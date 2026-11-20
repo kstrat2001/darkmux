@@ -36,6 +36,13 @@ pub struct InitOptions {
     /// (#316) `--engine-url`: the OpenAI-compatible server to record as this
     /// machine's engine, probed alone and chosen when it answers.
     pub engine_url: Option<String>,
+    /// (#3569) `--add-engine`: the detected engine to add to profiles.json,
+    /// after the operator confirms.
+    pub add_engine: Option<String>,
+    /// (#3569) `--engine-model`: which of its models to add.
+    pub engine_model: Option<String>,
+    /// (#3569) `--n-ctx`: the context to add it at.
+    pub n_ctx: Option<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -67,9 +74,18 @@ pub struct InitReport {
     pub engine: Option<Outcome>,
     /// (#316) Why the chosen engine could not be recorded, when it could not.
     pub engine_unrecorded: Option<String>,
+    /// (#3569) The engines darkmux starts servers for that are installed here.
+    pub detected: Option<darkmux_profiles::engine::detect::Detected>,
+    /// (#3569) What `--add-engine` did, and the registry it planned against.
+    pub engine_add: Option<(crate::init_detect::AddOutcome, PathBuf)>,
     pub config_path: Option<PathBuf>,
     pub config_created: bool,
     pub config_already_present: bool,
+    /// The dotted keys `init` added to a config that already existed but
+    /// lacked them (a `config set` before the first `init` leaves a one-key
+    /// file), each with its default; the operator's own keys are kept. Empty
+    /// when nothing was missing or the file is not a JSON object.
+    pub config_completed: Vec<String>,
     pub skills_targets: Vec<PathBuf>,
     pub skills_installed: Vec<String>,
     pub skills_overwritten: Vec<String>,
@@ -116,10 +132,11 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
 
     // 1b) Bootstrap the config file (#661). Same never-overwrite discipline as
     //     the profile registry — the operator's config edits outrank a re-run.
-    let (config_path, config_created) = bootstrap_config(opts.dry_run)?;
+    let (config_path, config_created, config_completed) = bootstrap_config(opts.dry_run)?;
     report.config_already_present = !config_created;
     report.config_path = Some(config_path.clone());
     report.config_created = config_created;
+    report.config_completed = config_completed;
 
     // 1c) (#316, ENGINES.md 9.2) Which engine answers on this machine, recorded
     //     as `default_engine` while none was chosen yet (`may_detect`), or
@@ -136,6 +153,9 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
         fill_models(&registry_path, &engine, &mut report);
     }
 
+    // 1f) (#3569) The engines installed here, and `--add-engine`.
+    detect_and_add(opts, &registry_path, &mut report);
+
     // 3)-6) Skills, and the optional hook and doc merges.
     install_integrations(opts, &mut report)?;
 
@@ -147,9 +167,7 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
 /// CLAUDE.md or AGENTS.md block under `--force`. The merges run as dry runs,
 /// so the check is the same code that refuses later.
 fn preflight(opts: &InitOptions) -> Result<()> {
-    if let Some(url) = opts.engine_url.as_deref() {
-        init_engine::engine_url(url).map_err(|e| anyhow!("--engine-url: {e}"))?;
-    }
+    preflight_engine_flags(opts)?;
     if opts.with_hook {
         ensure_session_start_hook(&claude_settings_path()?, true, opts.force)?;
     }
@@ -158,6 +176,17 @@ fn preflight(opts: &InitOptions) -> Result<()> {
     }
     if let Some(target) = opts.with_agents_md.as_ref() {
         ensure_agents_md_section(target, true, opts.force)?;
+    }
+    Ok(())
+}
+
+/// `--engine-url` and `--add-engine`, refused before anything is written.
+fn preflight_engine_flags(opts: &InitOptions) -> Result<()> {
+    if let Some(url) = opts.engine_url.as_deref() {
+        init_engine::engine_url(url).map_err(|e| anyhow!("--engine-url: {e}"))?;
+    }
+    if let Some(word) = opts.add_engine.as_deref() {
+        crate::init_detect::parse_engine(word)?;
     }
     Ok(())
 }
@@ -175,8 +204,7 @@ fn bootstrap_registry(dry_run: bool, report: &mut InitReport) -> Result<PathBuf>
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        fs::write(&registry_path, EXAMPLE_PROFILES_JSON)
-            .with_context(|| format!("writing {}", registry_path.display()))?;
+        write_registry(&registry_path, None, EXAMPLE_PROFILES_JSON).map_err(|e| anyhow!(e))?;
         report.profile_registry_created = true;
     } else {
         // dry-run: report what would happen without writing
@@ -291,21 +319,57 @@ fn record_engine(
     }
     let previous = fs::read_to_string(registry_path).ok();
     if let Some(t) = new_text.as_deref() {
-        fs::write(registry_path, t).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
+        write_registry(registry_path, previous.as_deref(), t)?;
     }
     let set = crate::config_cmd::set_at(config_path, darkmux_types::default_engine::KEY, id);
-    if let (Err(e), Some(_)) = (&set, new_text.as_deref()) {
-        return Err(format!("{e:#} ({})", put_back(registry_path, previous.as_deref())));
+    if let (Err(e), Some(written)) = (&set, new_text.as_deref()) {
+        return Err(format!("{e:#} ({})", put_back(registry_path, previous.as_deref(), written)));
     }
     set.map(|_| ()).map_err(|e| format!("{e:#}"))
 }
 
-/// Put the registry back as it was before `record_engine` wrote it (removed,
-/// when there was none), and say whether that worked.
-fn put_back(registry_path: &Path, previous: Option<&str>) -> &'static str {
+/// (#3569) Step 1f: detect the engines darkmux starts servers for that are
+/// installed here (LM Studio and a server are step 1c's), and add the one
+/// `--add-engine` names once the operator confirms. The add plans against
+/// the registry dispatch reads (`DARKMUX_PROFILES`, else the one `init`
+/// manages); a dry run on a machine with none yet plans against the one
+/// `init` would create.
+fn detect_and_add(opts: &InitOptions, registry_path: &Path, report: &mut InitReport) {
+    let target = darkmux_profiles::profiles::registry_path(None).unwrap_or_else(|| registry_path.to_path_buf());
+    let text = fs::read_to_string(&target).ok().or_else(|| opts.dry_run.then(|| EXAMPLE_PROFILES_JSON.to_string()));
+    let registry = text.as_deref().and_then(|t| darkmux_profiles::profiles::parse_registry_lenient(t).ok());
+    let found = engine::detect::Detected::of(engine::detect::detect_servers(registry.as_ref()));
+    if let Some(word) = opts.add_engine.as_deref() {
+        let outcome = match (crate::init_detect::parse_engine(word), text) {
+            (Err(e), _) => crate::init_detect::AddOutcome::Refused(format!("{e:#}")),
+            (Ok(_), None) => crate::init_detect::AddOutcome::Refused(format!(
+                "there is no profile registry at {} to add it to; run `darkmux init` first",
+                target.display()
+            )),
+            (Ok(kind), Some(text)) => {
+                let req = engine::add::AddRequest { engine: kind, model: opts.engine_model.clone(), n_ctx: opts.n_ctx };
+                crate::init_detect::add_engine(&req, &found, &target, &text, opts.dry_run, &mut crate::init_detect::TerminalConfirm)
+            }
+        };
+        report.engine_add = Some((outcome, target));
+    }
+    report.detected = Some(found);
+}
+
+/// (#3569) Write `text` to the registry through the one write path every
+/// `profiles.json` writer shares (`darkmux_profiles::registry_write`: its
+/// lock, a compare with `expected`, what this run read, and an atomic
+/// replace that keeps a symlink a symlink).
+fn write_registry(path: &Path, expected: Option<&str>, text: &str) -> std::result::Result<(), String> {
+    darkmux_profiles::registry_write::replace(path, expected, text).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// Put the registry back as it was before `record_engine` wrote `written`
+/// (removed, when there was none), and say whether that worked.
+fn put_back(registry_path: &Path, previous: Option<&str>, written: &str) -> &'static str {
     let restored = match previous {
-        Some(p) => fs::write(registry_path, p).is_ok(),
-        None => fs::remove_file(registry_path).is_ok(),
+        Some(p) => write_registry(registry_path, Some(written), p).is_ok(),
+        None => darkmux_profiles::registry_write::remove(registry_path, written).is_ok(),
     };
     if restored { "profiles.json was put back" } else { "profiles.json could NOT be put back" }
 }
@@ -443,13 +507,7 @@ fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Opt
     }
     let available = match engine::lmstudio().catalog() {
         Ok(v) => v,
-        Err(e) => {
-            return Err(format!(
-                "could not ask LM Studio what is downloaded ({e:#}). Install LM Studio and enable its \
-                 command-line tool (`~/.lmstudio/bin/lms bootstrap`), download a model, then re-run \
-                 `darkmux init`."
-            ))
-        }
+        Err(e) => return Err(catalog_failure_reason(&format!("{e:#}"))),
     };
     let loaded: Vec<String> = engine::lmstudio().loaded()
         .map(|v| v.into_iter().map(|m| m.model).collect())
@@ -459,8 +517,22 @@ fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Opt
         return Err(no_worker_model_reason(ram_gb));
     };
     let filled = fill_placeholder_models(&text, &id).expect("placeholder was present");
-    fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
+    write_registry(registry_path, Some(&text), &filled)?;
     Ok(Some(id))
+}
+
+/// Why the worker fill could not ask LM Studio, in operator words. A spawn
+/// error for a missing `lms` already names the fix
+/// (`gestalt_host::lms_host::spawn_capped`), so the install line is added
+/// only when the error does not carry it: said once, never twice.
+fn catalog_failure_reason(error: &str) -> String {
+    let fix = if error.contains("lms bootstrap") {
+        ""
+    } else {
+        " Install LM Studio and enable its command-line tool (`~/.lmstudio/bin/lms bootstrap`), or point darkmux \
+         at it: `darkmux config set lms_bin <path>`."
+    };
+    format!("could not ask LM Studio what is downloaded ({error}).{fix} Then download a model and re-run `darkmux init`.")
 }
 
 /// (#316, ENGINES.md 9.2 step 5) The worker model on an OpenAI-compatible
@@ -528,8 +600,8 @@ fn fill_models_on_server(
     if text == read {
         return;
     }
-    if let Err(e) = fs::write(registry_path, &text) {
-        report.worker_model_unfilled_reason = Some(format!("writing {}: {e}", registry_path.display()));
+    if let Err(e) = write_registry(registry_path, Some(&read), &text) {
+        report.worker_model_unfilled_reason = Some(e);
         report.worker_model_filled = None;
         report.utility_model_filled = None;
         report.utility_model_unregistered_reason = None;
@@ -939,7 +1011,7 @@ fn fill_utility_model(registry_path: &std::path::Path) -> std::result::Result<Op
     let headroom = if window.is_some() { ai_headroom_bytes() } else { None };
     let plan = plan_utility_binding(&current, window, &available, headroom, worker_bytes, floor);
     if let Some(filled) = apply_utility_plan(&text, &current, &plan) {
-        fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
+        write_registry(registry_path, Some(&text), &filled)?;
     } else if !matches!(plan, UtilityPlan::Missing(_)) {
         return Ok(None);
     }
@@ -978,27 +1050,47 @@ fn user_profile_registry_path() -> Result<PathBuf> {
 /// operator tunes the file rather than hunting hidden code-defaults. The
 /// integration features (`redis`, `audit`) are written as `enabled: false`
 /// blocks with their sub-defaults populated (the full surface is discoverable
-/// and one flip from on). Skip-if-exists (never overwrites, even under
-/// `--force`: the operator's config edits outrank a re-run). Returns
-/// `(path, created)`; `created` is `true` in dry-run to report the intent.
+/// and one flip from on). Returns `(path, created, completed)`; `created` is
+/// `true` in dry-run to report the intent.
+///
+/// An existing file is never overwritten, even under `--force`: the
+/// operator's values outrank a re-run. It is **completed** instead
+/// ([`complete_config`]): a `config set` before the first `init` leaves a
+/// one-key file, and `init` used to stop at "already present" there, so the
+/// full default was never written. Completing adds only the keys the file
+/// lacks, except the ones whose absence darkmux reads differently from the
+/// default ([`NEVER_COMPLETED`], `machine_id` among them: an existing file
+/// keeps the machine's name), so the visible defaults are the same whichever
+/// command ran first.
 ///
 /// The write target routes through `paths::resolve(ForceUser).config`, so it
 /// honors the `DARKMUX_HOME` bootstrap pointer and lands where the runtime
 /// reads.
-fn bootstrap_config(dry_run: bool) -> Result<(PathBuf, bool)> {
-    use darkmux_types::config::DarkmuxConfig;
+fn bootstrap_config(dry_run: bool) -> Result<(PathBuf, bool, Vec<String>)> {
     use darkmux_types::paths::{ResolveScope, resolve};
 
     let config_path = resolve(ResolveScope::ForceUser).config;
     if config_path.exists() {
-        return Ok((config_path, false));
+        let completed = complete_config(&config_path, dry_run)?;
+        return Ok((config_path, false, completed));
     }
     if dry_run {
-        return Ok((config_path, true));
+        return Ok((config_path, true, Vec::new()));
     }
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
+    write_config(&config_path, &default_config()?)?;
+    Ok((config_path, true, Vec::new()))
+}
+
+/// The config `init` writes on this machine: the defaults, `machine_id`
+/// seeded from the computer name, and the hooks and audit directories under
+/// a non-default `DARKMUX_HOME`.
+fn default_config() -> Result<Value> {
+    use darkmux_types::config::DarkmuxConfig;
+    use darkmux_types::paths::{ResolveScope, resolve};
+
     let mut cfg = DarkmuxConfig::with_defaults();
     if let Some(name) = computer_name() {
         cfg.machine_id = Some(name);
@@ -1013,10 +1105,93 @@ fn bootstrap_config(dry_run: bool) -> Result<(PathBuf, bool)> {
             audit.dir = Some(resolved_paths.root.join("audit").display().to_string());
         }
     }
-    let mut json = serde_json::to_string_pretty(&cfg).context("serializing config.json")?;
+    serde_json::to_value(&cfg).context("serializing config.json")
+}
+
+fn write_config(path: &Path, value: &Value) -> Result<()> {
+    let mut json = serde_json::to_string_pretty(value).context("serializing config.json")?;
     json.push('\n');
-    fs::write(&config_path, json).with_context(|| format!("writing {}", config_path.display()))?;
-    Ok((config_path, true))
+    fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+}
+
+/// The `config:` line for a config `init` completed: how many defaults it
+/// added (or would add, on a dry run), and that the operator's own values
+/// were kept.
+pub fn config_completed_line(path: &Path, added: &[String], dry_run: bool) -> String {
+    let verb = if dry_run { "would add" } else { "added" };
+    format!(
+        "config: completed at {}: {verb} {} default setting(s) it was missing; your own values were kept",
+        path.display(),
+        added.len()
+    )
+}
+
+/// Add every default the existing config at `path` lacks, keeping each of
+/// the operator's own values (a key already present is never replaced, at
+/// any depth), and return the dotted keys added. A file `config set` would
+/// also refuse to rewrite (not a JSON object, written by a newer darkmux, a
+/// key written twice) is left as it is: doctor names its problem. A dry run
+/// returns what it would add and writes nothing.
+fn complete_config(path: &Path, dry_run: bool) -> Result<Vec<String>> {
+    let Ok(mut existing) = crate::config_cmd::load_object_for_write(path) else {
+        return Ok(Vec::new());
+    };
+    let mut defaults = default_config()?;
+    for key in NEVER_COMPLETED {
+        remove_dotted(&mut defaults, key);
+    }
+    let added = add_missing_keys(&mut existing, &defaults, "");
+    if !added.is_empty() && !dry_run {
+        write_config(path, &existing)?;
+    }
+    Ok(added)
+}
+
+/// The keys completion never adds, because darkmux reads their absence
+/// differently from the value `init` writes on a fresh machine. Every other
+/// key resolves the same absent or present: `init_completion_tests` reads
+/// every `config_access` accessor and enum setting with each key removed and
+/// fails on a new one that differs, and on an entry here that no longer does.
+/// - `machine_id`: absent, the machine is named by `hostname(1)`
+///   (`resolve_machine_id`); the seeded computer name differs from it, so
+///   adding one would rename an established machine on the fleet (roster
+///   entries, `<profile>@<machine>` addresses, flow records).
+/// - `redis.host`: absent, nothing assembles a Redis URL, even with
+///   `redis.enabled` true; adding `127.0.0.1` would point it at localhost.
+/// - `audit.dir`, `hooks.outbox_dir`: absent, each is derived from the
+///   darkmux root at run time; a literal freezes today's root.
+const NEVER_COMPLETED: &[&str] = &["machine_id", "redis.host", "audit.dir", "hooks.outbox_dir"];
+
+/// Remove the dotted `key` from a JSON object, when present.
+fn remove_dotted(root: &mut Value, key: &str) {
+    let (parent, leaf) = match key.rsplit_once('.') {
+        Some((parent, leaf)) => (parent.split('.').try_fold(&mut *root, |v, seg| v.get_mut(seg)), leaf),
+        None => (Some(root), key),
+    };
+    if let Some(obj) = parent.and_then(Value::as_object_mut) {
+        obj.remove(leaf);
+    }
+}
+
+/// Copy each key of `defaults` that `target` lacks into it, descending into
+/// objects both sides hold, and return the dotted paths copied. A key
+/// `target` holds with any other value is the operator's and is left alone.
+fn add_missing_keys(target: &mut Value, defaults: &Value, prefix: &str) -> Vec<String> {
+    let (Some(target), Some(defaults)) = (target.as_object_mut(), defaults.as_object()) else {
+        return Vec::new();
+    };
+    let mut added = Vec::new();
+    for (key, default) in defaults {
+        let path = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+        match target.get_mut(key) {
+            None => {
+                target.insert(key.clone(), default.clone());
+                added.push(path);
+            }
+            Some(own) => added.extend(add_missing_keys(own, default, &path)),
+        }
+    }
+    added
 }
 
 /// The friendly machine name to seed `machine_id` with, so the operator gets a
@@ -1357,13 +1532,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("profiles.json");
         fs::write(&path, "changed").unwrap();
-        assert_eq!(put_back(&path, Some("before")), "profiles.json was put back");
+        // (#3569) A registry someone else changed since is not ours to put back.
+        assert_eq!(put_back(&path, Some("before"), "what this run wrote"), "profiles.json could NOT be put back");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "changed");
+        assert_eq!(put_back(&path, Some("before"), "changed"), "profiles.json was put back");
         assert_eq!(fs::read_to_string(&path).unwrap(), "before");
-        assert_eq!(put_back(&path, None), "profiles.json was put back");
+        // (#3569) With no registry before, it is removed only while it holds
+        // what this run wrote: one another writer changed is kept.
+        assert_eq!(put_back(&path, None, "what this run wrote"), "profiles.json could NOT be put back");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before");
+        assert_eq!(put_back(&path, None, "before"), "profiles.json was put back");
         assert!(!path.exists(), "no registry before, none after");
-        assert_eq!(put_back(&path, None), "profiles.json could NOT be put back");
+        assert_eq!(put_back(&path, None, "before"), "profiles.json could NOT be put back");
         let unwritable = dir.path().join("no-such-dir").join("profiles.json");
-        assert_eq!(put_back(&unwritable, Some("before")), "profiles.json could NOT be put back");
+        assert_eq!(put_back(&unwritable, Some("before"), "x"), "profiles.json could NOT be put back");
     }
 
     #[test]
@@ -1394,6 +1576,20 @@ mod tests {
         assert!(cfg.extras.is_empty(), "example must use only documented keys");
     }
 
+    #[test]
+    fn add_missing_keys_adds_only_what_is_absent_and_names_each() {
+        let mut own = serde_json::json!({ "a": 1, "b": { "x": "mine" }, "c": "not-an-object" });
+        let defaults = serde_json::json!({ "a": 9, "b": { "x": "d", "y": 2 }, "c": { "z": 3 }, "d": false });
+        let added = add_missing_keys(&mut own, &defaults, "");
+        assert_eq!(added, ["b.y", "d"]);
+        assert_eq!(own, serde_json::json!({ "a": 1, "b": { "x": "mine", "y": 2 }, "c": "not-an-object", "d": false }));
+        let line = config_completed_line(Path::new("/c.json"), &["redis".to_string(), "d".to_string()], true);
+        assert_eq!(
+            line,
+            "config: completed at /c.json: would add 2 default setting(s) it was missing; your own values were kept"
+        );
+    }
+
     #[serial_test::serial]
     #[test]
     fn bootstrap_config_writes_full_personalized_and_skips_if_exists() {
@@ -1403,7 +1599,7 @@ mod tests {
         unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()); }
 
         // First run writes the full self-documenting default config.
-        let (path, created) = bootstrap_config(false).unwrap();
+        let (path, created, _) = bootstrap_config(false).unwrap();
         assert!(created, "fresh config is created");
         assert_eq!(path, tmp.path().join("config.json"));
         let cfg: DarkmuxConfig = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -1454,9 +1650,10 @@ mod tests {
         assert!(cfg.dirs.is_none(), "derived dirs are surfaced by doctor, not frozen");
 
         // Second run never overwrites — returns (same path, false).
-        let (path2, created2) = bootstrap_config(false).unwrap();
+        let (path2, created2, completed2) = bootstrap_config(false).unwrap();
         assert_eq!(path2, path);
         assert!(!created2, "existing config is left untouched");
+        assert!(completed2.is_empty(), "a full config has nothing to complete: {completed2:?}");
 
         unsafe {
             match prev {
@@ -1473,7 +1670,7 @@ mod tests {
         let prev = std::env::var("DARKMUX_HOME").ok();
         unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()); }
 
-        let (path, created) = bootstrap_config(true).unwrap();
+        let (path, created, _) = bootstrap_config(true).unwrap();
         assert!(created, "dry-run reports the intent to create");
         assert!(!path.exists(), "dry-run writes nothing");
 
@@ -1962,3 +2159,7 @@ mod tests {
 #[cfg(test)]
 #[path = "init_tests.rs"]
 mod init_tests;
+
+#[cfg(test)]
+#[path = "init_completion_tests.rs"]
+mod init_completion_tests;

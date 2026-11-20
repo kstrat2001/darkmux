@@ -388,6 +388,16 @@
         assert!(src.contains("pacer.on_tick(thermal_elapsed_ms, &self.host_out, &others, &caller, env)"), "the pacer tick");
         assert!(src.contains("let others = self.governors.other_pacing();"), "derived from the pair");
         assert!(!src.contains("OtherPacing {"), "no second derivation of what the governors hold");
+        // And the other direction: the pair is told whether the pacer holds a
+        // pause, so neither governor writes a release over it (`pace_file`'s
+        // rule). Passing a constant here compiles and leaves every scenario
+        // green, because no scenario reaches the sampler.
+        let tick = &src[src.find("self.governors.tick(").expect("the governor tick")..];
+        let tick = &tick[..tick.find(");").expect("call end")];
+        assert!(
+            tick.contains("self.budget_pacer.as_ref().is_some_and(crate::budget::BudgetPacer::is_pausing)"),
+            "the governor tick must carry the pacer's live pause: {tick}"
+        );
     }
 
     /// (3rd review #4) The container pre-start gate (hosted brain or a
@@ -4856,6 +4866,68 @@ S(("127.0.0.1", port), H).serve_forever()
         format!("http://127.0.0.1:{port}/v1/chat/completions")
     }
 
+    /// A loopback endpoint that answers every request with a 429, counting
+    /// the requests it took.
+    fn rate_limited_http_mock() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write as IoWrite};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let taken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&taken);
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut chunk = [0u8; 8192];
+                let _ = stream.read(&mut chunk);
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = r#"{"error":{"code":429,"message":"slow down"}}"#;
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1/chat/completions"), taken)
+    }
+
+    /// An operator's stop during the rate-limit backoff (30 s after a 429,
+    /// then 60, then 120) ends the call at once, and nothing more is sent:
+    /// before, the backoff slept its whole length and then sent one more
+    /// request, holding a stopped run for minutes.
+    #[test]
+    #[serial]
+    fn a_stop_during_the_rate_limit_backoff_returns_at_once_and_sends_nothing_more() {
+        // (#3100) It raises the process-wide interrupt flag.
+        darkmux_types::run_in_own_process!();
+        darkmux_types::interrupt::reset_for_test();
+        let (url, taken) = rate_limited_http_mock();
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(remote_chat_completion(&url, None, &serde_json::json!({"model": "m", "messages": []}), 30, None));
+        });
+        let first = Instant::now();
+        while taken.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(first.elapsed() < Duration::from_secs(20), "the first request never arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The 429 is answered; the call is now in its 30 s backoff.
+        std::thread::sleep(Duration::from_millis(200));
+        let stopped = Instant::now();
+        darkmux_types::interrupt::raise_for_test();
+        let outcome = result.recv_timeout(Duration::from_secs(3));
+        let waited = stopped.elapsed();
+        // Room for a request the call would wrongly send after waking.
+        std::thread::sleep(Duration::from_millis(300));
+        darkmux_types::interrupt::reset_for_test();
+        let err = outcome.expect("the call must return within seconds of the stop, not after its backoff").unwrap_err();
+        assert!(waited < Duration::from_millis(1500), "returned {waited:?} after the stop");
+        assert!(err.to_string().contains(darkmux_types::interrupt::INTERRUPTED_BY_SIGNAL), "{err:#}");
+        assert!(!call_may_have_spent(&err), "a request never sent is never charged: {err:#}");
+        assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 1, "no request after the stop");
+    }
+
     /// The cutoff arms at the first body byte: a prefill that sends nothing
     /// for longer than the cutoff, then streams its reply, is not cut. Before
     /// the first byte, the call's total timeout is the bound.
@@ -6336,7 +6408,7 @@ S(("127.0.0.1", port), H).serve_forever()
             "must include --pids-limit 512"
         );
         assert!(
-            argv.contains(&format!("--memory={}", DOCKER_MEMORY)),
+            argv.contains(&format!("--memory={}", darkmux_types::config_access::SANDBOX_MEMORY_DEFAULT)),
             "must include --memory 4g"
         );
         assert!(
@@ -6548,6 +6620,260 @@ S(("127.0.0.1", port), H).serve_forever()
         assert_eq!(env(&docker, "CARGO_HOME"), Some("/darkmux-cache/cargo".to_string()));
         assert_eq!(docker.entrypoint.as_deref(), Some("/darkmux-runtime"));
         assert_eq!(prompt(&docker).as_deref(), Some("/darkmux-out/.prompt.txt"));
+    }
+
+    /// (#3112) `sandbox.memory` reaches a dispatch under either backend:
+    /// the default `4g`, else what the operator set, which Docker passes as
+    /// `--memory` and Seatbelt hands its watch in bytes.
+    #[test]
+    #[serial]
+    fn the_sandbox_memory_setting_reaches_both_backends() {
+        use darkmux_sandbox::{DockerBackend, SandboxBackend, SeatbeltBackend};
+        let k = darkmux_types::config_access::SANDBOX_MEMORY_ENV;
+        let prev = std::env::var_os(k);
+        unsafe { std::env::remove_var(k) };
+        let cfg = argv_config_with_base_url(None);
+        let default = dispatch_policy_for(&cfg, &DockerBackend);
+        unsafe { std::env::set_var(k, "16g") };
+        let docker = dispatch_policy_for(&cfg, &DockerBackend);
+        let seatbelt = dispatch_policy_for(&cfg, &SeatbeltBackend);
+        let docker_argv: Vec<String> = DockerBackend.run(&docker).0.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let seatbelt_argv: Vec<String> = SeatbeltBackend.run(&seatbelt).0.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        assert_eq!(default.limits.memory.as_deref(), Some("4g"));
+        assert_eq!(docker.limits.memory.as_deref(), Some("16g"));
+        assert_eq!(seatbelt.limits.memory.as_deref(), Some("16g"));
+        assert!(docker_argv.contains(&"--memory=16g".to_string()), "{docker_argv:?}");
+        assert!(seatbelt_argv.contains(&(16u64 << 30).to_string()) && seatbelt_argv.contains(&"16 GiB".to_string()), "{seatbelt_argv:?}");
+    }
+
+    /// A dispatch is given the port of each endpoint its runtime dials on
+    /// this machine: its model server (`--base-url`, or the runtime's own
+    /// default when none is passed), a brain's `--chat-url` and an unmanaged
+    /// compactor's, each at the port it names or its scheme's. An endpoint
+    /// on another host opens no port of this one (an `https` brain is not
+    /// this machine's :443).
+    #[test]
+    fn a_dispatch_is_given_the_ports_of_the_endpoints_its_runtime_dials_here() {
+        use darkmux_sandbox::SeatbeltBackend;
+        let mut cfg = argv_config_with_base_url(Some("http://localhost:1234/v1".to_string()));
+        assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [1234]);
+        cfg.base_url_override = Some("http://127.0.0.1:41999/v1".to_string());
+        cfg.remote_chat_url = Some("https://api.example.com/v1/chat/completions".to_string());
+        cfg.compaction.compactor_chat_url = Some("http://[::1]:8088/v1/chat/completions".to_string());
+        assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [8088, 41999], "a hosted brain opens no port here");
+        cfg.remote_chat_url = Some("http://192.0.2.7/v1/chat/completions".to_string());
+        cfg.compaction.compactor_chat_url = Some("http://[::ffff:127.0.0.1]:8090/v1".to_string());
+        assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [8090, 41999], "another host's address opens no :80");
+        cfg.base_url_override = None;
+        cfg.remote_chat_url = None;
+        cfg.compaction.compactor_chat_url = None;
+        assert_eq!(dispatch_policy_for(&cfg, &SeatbeltBackend).host_services, [1234], "the runtime's own default");
+        assert!(dispatch_policy_for(&cfg, &SeatbeltBackend).ports.is_empty(), "a dispatch binds any port");
+        let refused = dispatch_policy_for(&cfg, &SeatbeltBackend).refused_ports;
+        assert_eq!(refused, darkmux_types::config_enum::darkmux_service_ports(), "darkmux's own services, refused before they listen");
+        assert!(refused.contains(&darkmux_types::config_access::serve_port()), "{refused:?}");
+    }
+
+    /// What names this machine in an endpoint's URL, read as the runtime's
+    /// WHATWG URL parser reads the host: `localhost` (any case, a trailing
+    /// dot), an IPv4 literal in any spelling it accepts (one
+    /// to four parts, hex, octal, a single 32-bit number, a trailing dot)
+    /// that is a loopback or unspecified address, an IPv6 loopback,
+    /// unspecified or IPv4-mapped one, an address of this host's own, and its
+    /// own name, with or without `.local`. Never a multicast or the limited
+    /// broadcast address, whatever `own` says (a subnet's broadcast is
+    /// `is_own_address`'s to refuse); nothing the parser refuses, and no name
+    /// is looked up.
+    #[test]
+    fn an_endpoint_is_on_this_machine_only_when_its_host_names_it() {
+        let own = |ip: std::net::IpAddr| {
+            // What a bind test says: multicast and the limited broadcast bind too.
+            ["192.168.1.5", "2001:db8::5", "224.0.0.1", "239.1.2.3", "ff02::1", "ff0e::1", "255.255.255.255"]
+                .iter()
+                .any(|a| ip == a.parse::<std::net::IpAddr>().unwrap())
+        };
+        let here = |url: &str| host_is_this_machine(url, Some("Mac-Studio.local"), own);
+        for yes in [
+            "http://localhost:1234/v1",
+            "http://LOCALHOST:1",
+            "http://localhost.:1234/v1",
+            "http://127.0.0.1:1234",
+            "http://127.0.0.1.:1",
+            "http://127.9.9.9:1",
+            "http://127.1:1",
+            "http://127.0.1:1",
+            "http://0x7f000001:1",
+            "http://0X7F.1:1",
+            "http://2130706433:1",
+            "http://0177.0.0.1:1",
+            "http://0x7f.0.0.0x1:1",
+            "http://0:1",
+            "http://0.0.0.0:1",
+            "http://[::1]:1",
+            "http://[::]:1",
+            "http://[::ffff:127.0.0.1]:1",
+            "http://[::ffff:7f00:1]:1",
+            "http://192.168.1.5:1234",
+            "http://3232235781:1",
+            "http://[::ffff:192.168.1.5]:1",
+            "http://[2001:db8::5]:1",
+            "http://mac-studio.local:1234",
+            "http://Mac-Studio.:1234",
+            "http://Mac-Studio:1234",
+        ] {
+            assert!(here(yes), "{yes}");
+        }
+        for no in [
+            "https://api.example.com/v1",
+            "http://192.0.2.7/v1",
+            "http://[2001:db8::9]:1",
+            "http://mac-studio.example.com:1",
+            "http://studio:1",
+            "not a url",
+            "http://224.0.0.1:6379",
+            "http://239.1.2.3:1",
+            "http://[ff02::1]:1",
+            "http://[ff0e::1]:1",
+            "http://[::ffff:224.0.0.1]:1",
+            "http://255.255.255.255:1",
+            "http://0xffffffff:1",
+            "http://4294967296:1",
+            "http://256.0.0.1:1",
+            "http://126.256.0.1:1",
+            "http://127.0.0.256:1",
+            "http://127.0.0.1.1.1:1",
+            "http://127..0.1:1",
+            "http://0x7g.0.0.1:1",
+            "http://08.0.0.1:1",
+            "http://evil.example\\@127.0.0.1:1",
+            "http://localhost..:1",
+            // Percent-encoded: the runtime decodes it, this check does not (fails closed).
+            "http://%6Cocalhost:1",
+        ] {
+            assert!(!here(no), "{no}");
+        }
+        assert!(!host_is_this_machine("http://mac-studio:1", None, own), "no name of its own, no name matches");
+    }
+
+    /// Each way a URL's host reads, as the runtime reads it: an IPv6 literal
+    /// (none without its `]`, none with a zone), a name lowercased without
+    /// one trailing dot, an IPv4 address in a spelling WHATWG accepts (none
+    /// in one it refuses), nothing for an empty host, a backslash, a
+    /// character that is not printable ASCII, or no `scheme://`.
+    #[test]
+    fn a_urls_host_reads_as_the_runtime_reads_it() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let ip = |a: IpAddr| Some(RuntimeHost::Ip(a));
+        assert_eq!(runtime_host("http://[::1]:1/v1"), ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert_eq!(bracketed_host("::1"), None, "no closing bracket");
+        assert_eq!(bracketed_host("fe80::1%25lo0]:1"), None, "a zone");
+        assert_eq!(bracketed_host("not-an-address]"), None);
+        assert_eq!(runtime_host("http://Studio.Local.:1"), Some(RuntimeHost::Name("studio.local".into())));
+        assert_eq!(runtime_host("http://0x7f.1:1"), ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert_eq!(runtime_host("http://256.0.0.1:1"), None, "an IPv4 address WHATWG refuses");
+        assert_eq!(plain_host(":1"), None, "an empty host");
+        assert_eq!(plain_host("Host"), Some(RuntimeHost::Name("host".into())), "no port");
+        for refused in ["http://a\\b@127.0.0.1:1", "http://local host:1", "http://h\tx:1", "127.0.0.1:1"] {
+            assert_eq!(runtime_host(refused), None, "{refused}");
+        }
+    }
+
+    /// This host's own addresses are its interfaces' unicast ones: the
+    /// loopback, and never a multicast address, the limited broadcast, or
+    /// the broadcast address of a subnet this host is on (which a socket can
+    /// bind, so a bind test would take it for this host).
+    #[test]
+    fn this_hosts_own_addresses_are_its_interfaces_unicast_ones() {
+        use std::net::{IpAddr, Ipv4Addr};
+        assert!(is_own_address(IpAddr::from(Ipv4Addr::LOCALHOST)));
+        for not in ["224.0.0.1", "239.1.2.3", "255.255.255.255", "ff02::1", "ff0e::1", "192.0.2.7"] {
+            assert!(!is_own_address(not.parse().unwrap()), "{not}");
+        }
+        let v4: Vec<Ipv4Addr> = own_addresses().into_iter().filter_map(|a| match a {
+            IpAddr::V4(a) if !a.is_loopback() => Some(a),
+            _ => None,
+        }).collect();
+        for a in &v4 {
+            assert!(is_own_address(IpAddr::V4(*a)), "{a}");
+            let [x, y, z, _] = a.octets();
+            let edge = Ipv4Addr::new(x, y, z, 255);
+            if !v4.contains(&edge) {
+                assert!(!is_own_address(IpAddr::V4(edge)), "{edge}, the broadcast of a /24 this host is on");
+            }
+        }
+    }
+
+    /// (contract 6) The system prompt a dispatch records the hash of is the
+    /// one it passes to the runtime as `--system`, named for where the
+    /// sandbox sees the workspace (the runtime sends `--system` byte for
+    /// byte): under Seatbelt the hash recorded is the hash of the host-path
+    /// text the runtime sends, not of the `/workspace` text the role wrote.
+    #[test]
+    fn the_recorded_system_hash_is_of_the_system_prompt_the_runtime_is_passed() {
+        use darkmux_sandbox::{BackendKind, SeatbeltBackend};
+        let root = tempfile::TempDir::new().unwrap();
+        for d in ["ws", "out"] {
+            std::fs::create_dir(root.path().join(d)).unwrap();
+        }
+        let role = "Work in /workspace and read /workspace/a.rs.".to_string();
+        let mut cfg = argv_config_with_base_url(None);
+        cfg.workspace = root.path().join("ws");
+        cfg.host_out = root.path().join("out");
+        cfg.system_prompt = system_prompt_as_sent(role.clone(), Some(BackendKind::Seatbelt), &cfg.workspace);
+        let real = cfg.workspace.canonicalize().unwrap().display().to_string();
+        assert_eq!(cfg.system_prompt, format!("Work in {real} and read {real}/a.rs."));
+        let policy = dispatch_policy_for(&cfg, &SeatbeltBackend);
+        let passed = policy.command.iter().skip_while(|a| *a != "--system").nth(1).unwrap();
+        let mut payload = DispatchStartPayload::default();
+        crate::role_inputs::stamp_prompt_inputs(&mut payload, &cfg.system_prompt, &Default::default());
+        assert_eq!(payload.system_sha256, Some(darkmux_flow::sha256_hex(passed.as_bytes())));
+        // The container run names its prompt so before it is recorded or passed.
+        let src = include_str!("dispatch_internal.rs");
+        assert!(
+            src.contains("let system_prompt = run_system_prompt(system_prompt, &image, &workspace);"),
+            "prepare_container_run must name the prompt before ContainerRun holds it"
+        );
+    }
+
+    /// (contract 6) The system prompt names the workspace for the backend
+    /// that runs the dispatch: the one its runtime image was resolved for,
+    /// never the selection read again later. A setting switched while a
+    /// model loads (Docker to Seatbelt, or back) changes neither the path the
+    /// prompt names nor the backend that launches.
+    #[test]
+    #[serial]
+    fn the_prompt_names_the_workspace_for_the_backend_that_runs() {
+        use darkmux_sandbox::BackendKind;
+        let ws = TempDir::new().unwrap();
+        let real = ws.path().canonicalize().unwrap().display().to_string();
+        let image = |kind| RuntimeImage {
+            inject: false,
+            darkmux_image: crate::runtime_image::ResolvedImage { reference: "r".into(), id: "r".into() },
+            image: "i".into(),
+            run_image: "i".into(),
+            host_runtime: None,
+            kind,
+        };
+        let prev = std::env::var_os("DARKMUX_SANDBOX");
+        let mut seen = Vec::new();
+        for (selected, resolved) in [("seatbelt", BackendKind::Docker), ("docker", BackendKind::Seatbelt)] {
+            unsafe { std::env::set_var("DARKMUX_SANDBOX", selected) };
+            let img = image(resolved);
+            seen.push((run_system_prompt("in /workspace".into(), &img, ws.path()), run_backend(&img).kind()));
+        }
+        unsafe {
+            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
+        }
+        assert_eq!(seen, [("in /workspace".to_string(), BackendKind::Docker), (format!("in {real}"), BackendKind::Seatbelt)]);
+        let src = include_str!("dispatch_internal.rs");
+        assert!(src.contains("let system_prompt = run_system_prompt(system_prompt, &image, &workspace);"));
+        assert!(src.contains("spawn_container(&argv_config, run_backend(&run.image), opts.max_turns_override)?"));
     }
 
     /// (#3561) A dispatch on the host runs with its managed Node: the
@@ -6853,6 +7179,7 @@ S(("127.0.0.1", port), H).serve_forever()
             image: "i".into(),
             run_image: "host".into(),
             host_runtime: Some(host),
+            kind: darkmux_sandbox::BackendKind::Seatbelt,
         };
         assert!(runtime_program(&image).is_ok(), "unchanged, the command is built");
         let staged = root.path().join("bin/.darkmux.new");
@@ -6912,6 +7239,7 @@ S(("127.0.0.1", port), H).serve_forever()
             darkmux_image: crate::runtime_image::ResolvedImage { reference: "r".into(), id: "r".into() },
             image: "i".into(),
             run_image: "i".into(),
+            kind: if host_runtime.is_some() { darkmux_sandbox::BackendKind::Seatbelt } else { darkmux_sandbox::BackendKind::Docker },
             host_runtime,
         };
         let host = HostRuntime { program: PathBuf::from("/real/darkmux"), leading_args: vec!["runtime".to_string()], started_as: None };
@@ -6963,12 +7291,9 @@ S(("127.0.0.1", port), H).serve_forever()
         cfg.workspace = root.path().join("ws");
         cfg.host_out = root.path().join("out");
         let (cmd, _) = container_command(&cfg, &darkmux_sandbox::SeatbeltBackend);
-        let envs: Vec<(String, Option<String>)> = cmd
-            .get_envs()
-            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned())))
-            .collect();
+        let envs = darkmux_sandbox::SeatbeltBackend::program_environment(&cmd);
         let ws = root.path().join("ws").canonicalize().unwrap().display().to_string();
-        assert!(envs.contains(&("DARKMUX_RUNTIME_WORKSPACE".to_string(), Some(ws))), "{envs:?}");
+        assert!(envs.contains(&("DARKMUX_RUNTIME_WORKSPACE".to_string(), ws)), "{envs:?}");
         assert!(!envs.iter().any(|(k, _)| k == "CARGO_PKG_NAME"), "the host's environment rode along: {envs:?}");
     }
 
@@ -7335,7 +7660,7 @@ S(("127.0.0.1", port), H).serve_forever()
         assert!(argv.contains(&format!("--cap-drop={}", DOCKER_CAP_DROP)));
         assert!(argv.contains(&format!("--security-opt={}", DOCKER_SECURITY_OPT)));
         assert!(argv.contains(&format!("--pids-limit={}", DOCKER_PIDS_LIMIT)));
-        assert!(argv.contains(&format!("--memory={}", DOCKER_MEMORY)));
+        assert!(argv.contains(&format!("--memory={}", darkmux_types::config_access::SANDBOX_MEMORY_DEFAULT)));
         // (#2481) --init is unconditional — a minimal dispatch still needs
         // its orphaned grandchildren reaped.
         assert!(argv.contains(&"--init".to_string()));
@@ -17245,6 +17570,69 @@ S(("127.0.0.1", port), H).serve_forever()
         assert!(err.contains("lms ls"), "{err}");
     }
 
+    /// Run the preflight's production load ([`super::load_at_ctx_bounded`])
+    /// against a fake `lms` whose `case "$1"` arms are `arms`.
+    #[cfg(unix)]
+    fn load_with_fake_lms(arms: &str, n_ctx: u32) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("lms");
+        std::fs::write(&bin, format!("#!/bin/sh\ncase \"$1\" in\n{arms}\nesac\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A fresh executable's first exec can be slow on macOS; pay it here,
+        // not inside the load's deadline.
+        assert!(std::process::Command::new(&bin).status().unwrap().success());
+        let prev = std::env::var_os("DARKMUX_LMS_BIN");
+        // SAFETY: #[serial] on every caller; restored below.
+        unsafe { std::env::set_var("DARKMUX_LMS_BIN", &bin) };
+        let out = super::load_at_ctx_bounded("m", "darkmux:m", n_ctx);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+        out
+    }
+
+    /// (#1135 class) A load LM Studio finishes at less context than asked
+    /// is an error naming the instance, what was asked and what it got,
+    /// never a dispatch that runs truncated.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_load_that_lands_below_the_asked_context_is_an_error() {
+        let err = load_with_fake_lms(
+            r#"  load) exit 0 ;;
+  ps) echo '[{"identifier":"darkmux:m","modelKey":"m","contextLength":4096}]' ;;
+  ls) echo '[{"modelKey":"m","type":"llm","maxContextLength":131072}]' ;;"#,
+            32768,
+        )
+        .expect_err("LM Studio holds it at 4096, not the 32768 asked");
+        let err = format!("{err:#}");
+        for part in ["darkmux:m", "4096", "32768", "n_ctx"] {
+            assert!(err.contains(part), "names {part}: {err}");
+        }
+    }
+
+    /// The same load at (or above) the asked context is a success: LM
+    /// Studio reporting more context than asked is no shortfall.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_load_that_lands_at_or_above_the_asked_context_is_ok() {
+        for resolved in [32768, 40960] {
+            load_with_fake_lms(
+                &format!(
+                    r#"  load) exit 0 ;;
+  ps) echo '[{{"identifier":"darkmux:m","modelKey":"m","contextLength":{resolved}}}]' ;;"#
+                ),
+                32768,
+            )
+            .unwrap_or_else(|e| panic!("resolved {resolved}: {e:#}"));
+        }
+    }
+
 // ── (#1609) Namespace contract: darkmux never unloads user state ────────────
 
 /// The regression itself. A hand-loaded resident serves the same model key as
@@ -21551,6 +21939,80 @@ fn already_resident_refusal_at_a_smaller_ctx_still_errors() {
     assert!(err.contains("262144"), "message must name the declared n_ctx, got: {err}");
 }
 
+fn refuse_taken(identifier: &str) -> anyhow::Result<()> {
+    anyhow::bail!("`lms load` exited with exit status: 1: Error: A model with identifier {identifier} already exists.")
+}
+
+#[test]
+#[serial_test::serial]
+fn a_variant_id_second_dispatch_reuses_its_own_load() {
+    // The second dispatch of a variant id: darkmux's own load is resident,
+    // listed under the base key. Reuse it; never issue a load the host
+    // refuses as identifier-taken.
+    let pm = darkmux_types::ProfileModel {
+        id: "qwen/qwen3.8-27b@4bit".to_string(),
+        n_ctx: Some(262144),
+        ..Default::default()
+    };
+    let row = resident("darkmux:qwen/qwen3.8-27b@4bit", "qwen/qwen3.8-27b", 262144);
+    let loads = std::sync::atomic::AtomicUsize::new(0);
+    let out = crate::dispatch_internal::ensure_model_resident(&pm, &|| vec![row.clone()], &|_| Ok(()), &|_, id, _| {
+        loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        refuse_taken(id)
+    });
+    assert!(out.is_ok(), "expected reuse, got {:?}", out.err().map(|e| format!("{e:#}")));
+    assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 0, "no load for a resident darkmux instance");
+}
+
+/// The identifier-taken message for a profile whose opt-out identifier
+/// `my-qwen` is held by `held`, as the re-probe after the refused load sees it.
+fn taken_opt_out_error(held: darkmux_types::LoadedModel) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let pm = darkmux_types::ProfileModel {
+        id: "qwen".to_string(),
+        n_ctx: Some(32768),
+        identifier: Some("my-qwen".to_string()),
+        ..Default::default()
+    };
+    let reads = AtomicUsize::new(0);
+    let out = crate::dispatch_internal::ensure_model_resident(
+        &pm,
+        &|| if reads.fetch_add(1, Ordering::SeqCst) == 0 { Vec::new() } else { vec![held.clone()] },
+        &|_| Ok(()),
+        &|_, id, _| refuse_taken(id),
+    );
+    format!("{:#}", out.expect_err("a refused load with no usable resident must error"))
+}
+
+#[test]
+#[serial_test::serial]
+fn an_identifier_taken_remedy_never_points_eject_at_a_bare_identifier() {
+    // `darkmux machine eject` unloads only the `darkmux:` namespace, so for
+    // an opt-out identifier it would do nothing: the remedy names the
+    // instance and `lms unload`, in both the undersized and the
+    // other-model arms.
+    for held in [resident("my-qwen", "qwen", 4096), resident("my-qwen", "phi-4", 262144)] {
+        let err = taken_opt_out_error(held);
+        assert!(!err.contains("machine eject"), "eject cannot reach `my-qwen`: {err}");
+        assert!(err.contains("lms unload my-qwen"), "names the command that frees it: {err}");
+        assert!(err.contains("darkmux:"), "offers a namespaced identifier: {err}");
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn an_identifier_taken_remedy_names_the_other_model_holding_it() {
+    let err = taken_opt_out_error(resident("my-qwen", "phi-4", 262144));
+    assert!(err.contains("phi-4"), "names the model holding the identifier: {err}");
+    assert!(!err.contains("listed no resident"), "the probe did list it: {err}");
+}
+
+#[test]
+fn an_identifier_taken_remedy_keeps_eject_for_a_darkmux_identifier() {
+    let hint = crate::dispatch_internal::free_identifier_hint("darkmux:qwen");
+    assert!(hint.contains("darkmux machine eject"), "{hint}");
+}
+
     /// (#2794) A compaction record must name the model that did the
     /// compaction, not the specialist the dispatch is for.
     ///
@@ -23776,6 +24238,75 @@ fn decide_preflight_a_different_darkmux_instance_cannot_answer() {
         decide_preflight("qwen", None, 32768, &l),
         PreflightDecision::LoadFresh { foreign_identifier: Some(_) }
     ));
+}
+
+/// A variant (`@4bit`) or path id loads under `darkmux:<id>`, while LM Studio
+/// may report the instance's `modelKey` as the base key (inferred: no recorded
+/// `lms ps` row for such a load). The namespaced identifier alone names it.
+#[test]
+fn decide_preflight_a_variant_id_reuses_its_own_load() {
+    let l = [resident("darkmux:qwen/qwen3.8-27b@4bit", "qwen/qwen3.8-27b", 262144)];
+    assert_eq!(
+        decide_preflight("qwen/qwen3.8-27b@4bit", None, 262144, &l),
+        PreflightDecision::Reuse { identifier: "darkmux:qwen/qwen3.8-27b@4bit".into(), resident_ctx: 262144 }
+    );
+}
+
+#[test]
+fn decide_preflight_a_path_id_reloads_its_own_undersized_load() {
+    let id = "lmstudio-community/Qwen3-Coder-30B-MLX-4bit";
+    let l = [resident(&format!("darkmux:{id}"), "qwen3-coder-30b", 4096)];
+    assert_eq!(
+        decide_preflight(id, None, 32768, &l),
+        PreflightDecision::Reload { stale_identifier: format!("darkmux:{id}"), stale_ctx: 4096 }
+    );
+}
+
+#[test]
+fn decide_preflight_an_opt_out_identifier_on_another_model_is_not_ours() {
+    let l = [resident("my-qwen", "phi-4", 262144)];
+    assert_eq!(
+        decide_preflight("qwen", Some("my-qwen"), 32768, &l),
+        PreflightDecision::LoadFresh { foreign_identifier: None }
+    );
+}
+
+/// LM Studio names a load made without an identifier (its app, a bare `lms
+/// load`) by the model key, so an opt-out identifier equal to the key cannot
+/// tell darkmux's instance from the operator's: never reused or unloaded.
+#[test]
+fn decide_preflight_a_load_named_by_its_own_key_is_never_ours() {
+    let l = [resident("qwen", "qwen", 1000)];
+    assert_eq!(
+        decide_preflight("qwen", Some("qwen"), 32768, &l),
+        PreflightDecision::LoadFresh { foreign_identifier: Some("qwen".into()) }
+    );
+}
+
+/// The operator changed the model's `id` and kept `identifier:
+/// "darkmux:coder"` while the old model's load is resident: an explicit
+/// identifier also needs the resident's key, so the dispatch loads (and the
+/// taken identifier is refused loudly) rather than being answered by the old
+/// model.
+#[test]
+fn decide_preflight_an_explicit_darkmux_identifier_on_another_model_is_not_reused() {
+    let l = [resident("darkmux:coder", "qwen3.6-27b", 262144)];
+    assert_eq!(
+        decide_preflight("qwen/qwen3.8-27b", Some("darkmux:coder"), 32768, &l),
+        PreflightDecision::LoadFresh { foreign_identifier: None }
+    );
+}
+
+/// An explicit identifier on `q@4bit` never reuses another quantization's
+/// load listed under the base key `q` (the 8bit one the profile ran before
+/// its id changed).
+#[test]
+fn decide_preflight_an_explicit_identifier_never_reuses_another_quantization() {
+    let l = [resident("darkmux:coder", "q", 262144)];
+    assert_eq!(
+        decide_preflight("q@4bit", Some("darkmux:coder"), 32768, &l),
+        PreflightDecision::LoadFresh { foreign_identifier: None }
+    );
 }
 
 #[test]

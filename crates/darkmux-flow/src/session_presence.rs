@@ -143,7 +143,12 @@ pub fn read_live_sessions(client: &redis::Client) -> Result<Vec<SessionBeat>> {
     // `/fleet/dispatches/live` endpoint, so an unbounded stall here holds an
     // HTTP worker as well as the caller.
     bound_redis_response(&conn);
-    let values = crate::presence::scan_and_mget(&mut conn, &format!("{SESSION_KEY_PREFIX}*"), "session-presence")?;
+    read_live_sessions_on(&mut conn)
+}
+
+/// [`read_live_sessions`] on a connection the caller holds (#3432).
+pub fn read_live_sessions_on(conn: &mut redis::Connection) -> Result<Vec<SessionBeat>> {
+    let values = crate::presence::scan_and_mget(conn, &format!("{SESSION_KEY_PREFIX}*"), "session-presence")?;
     Ok(values.iter().flatten().filter_map(|json| serde_json::from_str::<SessionBeat>(json).ok()).collect())
 }
 

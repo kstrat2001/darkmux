@@ -85,15 +85,11 @@ impl Platform for MacPlatform {
         Vec::new()
     }
 
-    /// IOReport reads a Mac's power, by rail, in darkmux-crew's probe.
-    fn package_power_mw(&self) -> Option<f64> {
-        None
-    }
-
-    /// A Mac's thermal reading is its pressure state (darkmux-crew's
-    /// `thermal` probe); its board sensors are not read.
-    fn board_sensors(&self) -> Option<crate::BoardSensors> {
-        None
+    /// IOReport reads a Mac's power, by rail, in darkmux-crew's probe. A
+    /// Mac's thermal reading is its pressure state (darkmux-crew's `thermal`
+    /// probe); its board sensors are not read.
+    fn board_readings(&self) -> crate::BoardReadings {
+        crate::BoardReadings::default()
     }
 
     /// `vm_stat`'s free plus inactive pages, times the page size (`pagesize`,
@@ -162,6 +158,12 @@ impl Platform for MacPlatform {
         None
     }
 
+    /// `ARG_MAX` (1 MiB) bounds everything together; macOS has no limit on
+    /// one string of its own.
+    fn exec_env_limits(&self) -> crate::ExecEnvLimits {
+        crate::ExecEnvLimits { per_string: None, total: crate::arg_max() }
+    }
+
     fn node_release_platform(&self) -> Option<&'static str> {
         crate::node_release_platform_for(crate::NodeOs::Darwin, std::env::consts::ARCH)
     }
@@ -207,6 +209,11 @@ impl Platform for MacPlatform {
         netstat_tcp().and_then(|out| crate::port_listeners_from_netstat(&out, port))
     }
 
+    /// One `netstat -anv -p tcp`, as [`Self::tcp_port_listeners`] reads.
+    fn tcp_listening_ports(&self) -> Option<Vec<u16>> {
+        netstat_tcp().and_then(|out| crate::listening_ports_from_netstat(&out))
+    }
+
     /// (#3559) In-process, no command spawned: the process table from
     /// libproc (`proc_listallpids`, then each process's `PROC_PIDTBSDINFO`,
     /// which answers for this user's processes), then each member's own open
@@ -217,6 +224,16 @@ impl Platform for MacPlatform {
 
     fn process_group(&self, pid: u32) -> Option<u32> {
         crate::unix_process_group(pid)
+    }
+
+    /// The process table from libproc ([`Platform::tcp_listeners_held_by`]'s).
+    fn in_sandbox_of(&self, pid: u32, leaders: &[u32]) -> Option<bool> {
+        process_table().map(|table| crate::in_sandbox_of_table(pid, leaders, &table))
+    }
+
+    /// `proc_pidpath`, which answers for another user's process too.
+    fn process_name(&self, pid: u32) -> Option<String> {
+        process_path(pid).ok()?.file_name().map(|n| n.to_string_lossy().into_owned())
     }
 
     /// (#3453) The XDG layout, read from this process's environment.
@@ -937,16 +954,28 @@ pub(crate) fn netstat_answer(code: Option<i32>, stdout: &str) -> Option<String> 
 /// (exit 1 with no output is "none").
 #[cfg(target_os = "macos")]
 fn lsof_established(port: u16) -> Option<String> {
-    let out = std::process::Command::new("/usr/sbin/lsof")
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:ESTABLISHED", "-Fpn"])
-        .current_dir("/")
-        .output()
-        .ok()?;
+    lsof_established_with(std::path::Path::new("/usr/sbin/lsof"), port, LSOF_BOUND)
+}
+
+/// [`lsof_established`] run as `program` (a stub in a test), within
+/// `bound` ([`LSOF_BOUND`]). (Compiled on every OS for its test; only macOS
+/// runs lsof.)
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn lsof_established_with(program: &std::path::Path, port: u16, bound: std::time::Duration) -> Option<String> {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(["-nP", &format!("-iTCP:{port}"), "-sTCP:ESTABLISHED", "-Fpn"]).current_dir("/");
+    let out = crate::output_within(cmd, bound)?;
     match out.status.code() {
         Some(0 | 1) => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
         _ => None,
     }
 }
+
+/// How long one look at a port's connections may take, as
+/// [`NETSTAT_BOUND`] bounds netstat's: one that hangs (a stuck mount it
+/// waits on) is no answer, never a wait without end.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const LSOF_BOUND: std::time::Duration = NETSTAT_BOUND;
 
 #[cfg(not(target_os = "macos"))]
 fn lsof_established(_port: u16) -> Option<String> {
