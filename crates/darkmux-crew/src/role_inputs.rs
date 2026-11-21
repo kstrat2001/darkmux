@@ -409,14 +409,15 @@ impl ResolvedRole {
         &self,
         prompt: String,
         workdir: Option<&Path>,
-        found: &[darkmux_types::workdir::SplitGitdir],
+        found: (&[darkmux_types::workdir::SplitGitdir], darkmux_sandbox::BackendKind),
         prov: &mut PromptProvenance,
     ) -> String {
         if self.is_lab() {
             return prompt;
         }
         let before = prompt.len();
-        let out = crate::dispatch_internal::with_workspace_notes(prompt, workdir, found);
+        let (found, kind) = found;
+        let out = crate::dispatch_internal::with_workspace_notes(prompt, workdir, found, kind);
         prov.additions.workspace_notes = out.len() != before;
         out
     }

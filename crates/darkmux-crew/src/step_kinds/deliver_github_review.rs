@@ -2277,6 +2277,29 @@ mod tests {
         assert!(!review.body.contains("s/3"), "the record key never renders: {}", review.body);
     }
 
+    /// (#3654) A finding a host sandbox's model cited from its current
+    /// directory (`./<source>/<rel>`, as its brief lists the scope) is
+    /// stored through the store's own boundary and reaches the review as the
+    /// diff's path: an inline comment on the line, not a body fallback.
+    #[test]
+    fn a_finding_cited_from_the_current_directory_reaches_the_review_as_the_diff_path() {
+        let stored = crate::findings::build_record(
+            "s",
+            4,
+            "2026-09-04T00:00:00Z".into(),
+            "create_finding",
+            crate::findings::Proposer { handle: "reviewer".into(), model: "test".into(), machine_id: None },
+            crate::findings::Scope::default(),
+            Some(crate::ctx(json!({"source": "app", "root": "/Users/op/tree"}))),
+            json!({"file": "./app/src/a.ts", "line": 2, "pattern": "test", "evidence": "the cited line", "why": "a dot-cited claim"}),
+        );
+        let out = render(&[stored], &[], DIFF, &DeliverScope::default(), None);
+        let review = out.review.unwrap();
+        assert_eq!(review.comments.len(), 1, "{review:?}");
+        assert_eq!(review.comments[0].path, "src/a.ts");
+        assert_eq!(review.comments[0].line, 2);
+    }
+
     #[test]
     fn a_finding_anchored_outside_the_diff_falls_back_to_a_body_count_not_a_comment() {
         // (#2431 round 2, MF-A) `has_anchor` used to mean only "the

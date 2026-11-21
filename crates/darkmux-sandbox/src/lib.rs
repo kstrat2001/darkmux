@@ -4,7 +4,7 @@
 //!
 //! Three backends: Docker ([`DockerBackend`]), macOS Seatbelt
 //! ([`SeatbeltBackend`]) and Linux Landlock ([`LandlockBackend`]), picked by
-//! the `runtime.sandbox` setting ([`selected`]). Callers build a policy and spawn the command a backend
+//! the `runtime.sandbox` setting ([`selection`]). Callers build a policy and spawn the command a backend
 //! gives them; they never spell a container engine's command line. Bounding
 //! a run (deadline, interrupt, process-group kill) stays with the caller's
 //! runner, so a backend only plans processes.
@@ -225,20 +225,57 @@ pub const SANDBOX_ENV: &str = "DARKMUX_SANDBOX";
 /// The `config.json` key that picks the backend.
 pub const SANDBOX_KEY: &str = "runtime.sandbox";
 
-/// The backend `runtime.sandbox` names, or why it names none this host can
-/// use: an unregistered value (refused, never defaulted, contract 9),
-/// `seatbelt` where `sandbox-exec` is missing, or `landlock` where the
-/// kernel lacks what it needs (saying what).
-pub fn selected() -> Result<BackendKind, String> {
-    let resolved = darkmux_types::config_access::sandbox_with_source().map_err(|bad| bad.to_string());
-    selected_from(resolved, SeatbeltBackend::available(), LandlockBackend::available())
+/// One read of `runtime.sandbox`: the backend it names and the tier that set
+/// it. A caller that reads the setting once per unit of work and carries
+/// this value gives every later message (why Docker, the way back) from that
+/// same read, so the unit's parts agree by construction. No method of it
+/// reads the setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub kind: BackendKind,
+    pub source: darkmux_types::config_access::Source,
 }
 
-/// [`selected`] against `cfg`, a `config.json` read fresh (the env tier
+/// The one read of `runtime.sandbox` this crate offers: the backend it
+/// names and the tier that set it, or why it names none this host can use
+/// (an unregistered value, refused, never defaulted, contract 9; `seatbelt`
+/// where `sandbox-exec` is missing; `landlock` where the kernel lacks what
+/// it needs, saying what). Every other function here takes the value.
+pub fn selection() -> Result<Selection, String> {
+    let resolved = darkmux_types::config_access::sandbox_with_source().map_err(|bad| bad.to_string());
+    let source = resolved.as_ref().map_or(darkmux_types::config_access::Source::BuiltIn, |(_, s)| *s);
+    selected_from(resolved, SeatbeltBackend::available(), LandlockBackend::available()).map(|kind| Selection { kind, source })
+}
+
+impl Selection {
+    /// (#3112) For a message saying Docker could not run something: why
+    /// Docker was needed (the setting that chose it) and, where a sandbox on
+    /// the host can run (Seatbelt, Landlock), how to need no Docker. `None`
+    /// unless this selection is Docker: a Docker remedy never appears under
+    /// another.
+    pub fn docker_remedy(&self) -> Option<String> {
+        docker_remedy_given(self.kind, self.source, host_alternative())
+    }
+
+    /// [`Selection::docker_remedy`] without naming the setting, for a
+    /// message whose [`placed_in`] already does.
+    pub fn docker_needs(&self) -> Option<String> {
+        docker_needs_given(self.kind, self.source, host_alternative())
+    }
+
+    /// The way back from this selection to Docker
+    /// ([`way_back_to_docker_given`]).
+    pub fn way_back_to_docker(&self) -> String {
+        way_back_to_docker_given(setting_value(self.kind), self.source)
+    }
+}
+
+/// [`selection`] against `cfg`, a `config.json` read fresh (the env tier
 /// still live), for a process that reads its config per request.
-pub fn selected_in(cfg: &darkmux_types::config::DarkmuxConfig) -> Result<BackendKind, String> {
+pub fn selection_in(cfg: &darkmux_types::config::DarkmuxConfig) -> Result<Selection, String> {
     let resolved = darkmux_types::config_access::sandbox_with_source_in(cfg).map_err(|bad| bad.to_string());
-    selected_from(resolved, SeatbeltBackend::available(), LandlockBackend::available())
+    let source = resolved.as_ref().map_or(darkmux_types::config_access::Source::BuiltIn, |(_, s)| *s);
+    selected_from(resolved, SeatbeltBackend::available(), LandlockBackend::available()).map(|kind| Selection { kind, source })
 }
 
 fn selected_from(
@@ -305,25 +342,10 @@ pub fn placed_in(kind: BackendKind) -> String {
     }
 }
 
-/// (#3112) Where isolated work runs under the configured sandbox (Docker's
-/// wording when the setting is refused: the entry point already refused it).
-pub fn placed_in_configured() -> String {
-    match selected() {
-        Ok(kind) => placed_in(kind),
-        Err(_) => format!("the sandbox (`{SANDBOX_KEY}` is refused)"),
-    }
-}
-
-/// (#3112 review) The way back from `kind`, a sandbox on the host, to
-/// Docker, naming what decided the sandbox: the env var when it did (a
-/// `config set` under it changes nothing), else `config set`.
-pub fn way_back_to_docker(kind: BackendKind) -> String {
-    let source = darkmux_types::config_access::sandbox_with_source().map_or(darkmux_types::config_access::Source::BuiltIn, |(_, s)| s);
-    way_back_to_docker_given(setting_value(kind), source)
-}
-
-/// [`way_back_to_docker`] from the sandbox `current` (its setting value),
-/// chosen by the tier `source`.
+/// (#3112 review) The way back from `current` (a sandbox on the host, by its
+/// setting value) to Docker, naming what decided the sandbox (`source`):
+/// the env var when it did (a `config set` under it changes nothing), else
+/// `config set`.
 pub fn way_back_to_docker_given(current: &str, source: darkmux_types::config_access::Source) -> String {
     let docker = setting_value(BackendKind::Docker);
     match source {
@@ -335,22 +357,6 @@ pub fn way_back_to_docker_given(current: &str, source: darkmux_types::config_acc
     }
 }
 
-/// (#3112) For a message saying Docker could not run something: why Docker
-/// was needed (the setting that chose it) and, where a sandbox on the host
-/// can run (Seatbelt, Landlock), how to need no Docker. `None` unless the configured sandbox is Docker (a
-/// refused setting included): a Docker remedy never appears under another.
-pub fn docker_remedy() -> Option<String> {
-    let (kind, source) = configured_kind()?;
-    docker_remedy_given(kind, source, host_alternative())
-}
-
-/// [`docker_remedy`] without naming the setting, for a message whose
-/// [`placed_in`] already does.
-pub fn docker_needs() -> Option<String> {
-    let (kind, source) = configured_kind()?;
-    docker_needs_given(kind, source, host_alternative())
-}
-
 /// The sandbox on the host this host can run, if any: Seatbelt on a Mac,
 /// Landlock on a Linux whose kernel has what it needs.
 fn host_alternative() -> Option<BackendKind> {
@@ -359,12 +365,6 @@ fn host_alternative() -> Option<BackendKind> {
     } else {
         LandlockBackend::available().ok().map(|()| BackendKind::Landlock)
     }
-}
-
-fn configured_kind() -> Option<(BackendKind, darkmux_types::config_access::Source)> {
-    let kind = selected().ok()?;
-    let source = darkmux_types::config_access::sandbox_with_source().map_or(darkmux_types::config_access::Source::BuiltIn, |(_, s)| s);
-    Some((kind, source))
 }
 
 fn docker_remedy_given(kind: BackendKind, source: darkmux_types::config_access::Source, on_host: Option<BackendKind>) -> Option<String> {
@@ -386,16 +386,8 @@ fn docker_needs_given(kind: BackendKind, source: darkmux_types::config_access::S
     Some(out)
 }
 
-/// The backend a NEW sandbox starts through: the one [`selected`] names, or
-/// why there is none (an unregistered value, Seatbelt without
-/// `sandbox-exec`, or Landlock on a kernel without what it needs). A refused selection is an error here, never Docker, so
-/// no caller can start a sandbox in a backend nobody chose. A sandbox that
-/// already exists is reached through its handle ([`for_handle`]).
-pub fn backend() -> Result<&'static dyn SandboxBackend, String> {
-    selected().map(backend_of)
-}
-
-/// The backend of `kind`, for a sandbox already made in it.
+/// The backend of `kind`: the one a caller's [`selection`] names, for a new
+/// sandbox, or the one a sandbox was already made in.
 pub fn backend_of(kind: BackendKind) -> &'static dyn SandboxBackend {
     match kind {
         BackendKind::Docker => &DockerBackend,
@@ -421,11 +413,6 @@ pub fn seen_at(kind: Option<BackendKind>, host: &std::path::Path, at: &str) -> S
         Some(kind) => backend_of(kind).place(&Mount { host: host.to_path_buf(), at: at.to_string(), access: Access::ReadOnly }),
         None => at.to_string(),
     }
-}
-
-/// [`seen_at`] under the configured sandbox.
-pub fn seen_at_configured(host: &std::path::Path, at: &str) -> String {
-    seen_at(selected().ok(), host, at)
 }
 
 /// Every backend this host can run (Docker when `docker` is on `PATH`,
@@ -529,6 +516,9 @@ pub trait SandboxBackend: Send + Sync {
 }
 
 #[cfg(test)]
+mod setting_reads;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -603,8 +593,8 @@ mod tests {
         assert!(env.contains("unset DARKMUX_SANDBOX"), "{env}");
     }
 
-    /// (#3112 review) Starting a sandbox goes through `backend()`, which
-    /// carries a refused selection as an error: no caller can get Docker by
+    /// (#3112 review) Starting a sandbox goes through `selection()`, which
+    /// carries a refused setting as an error: no caller can get Docker by
     /// accident. An existing sandbox is reached through its own handle's
     /// backend, whatever is configured now.
     #[test]
@@ -612,7 +602,7 @@ mod tests {
     fn a_refused_selection_gives_no_backend_and_a_handle_keeps_its_own() {
         let prev = std::env::var_os(SANDBOX_ENV);
         unsafe { std::env::set_var(SANDBOX_ENV, "podman") };
-        let refused = backend().err();
+        let refused = selection().err();
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(SANDBOX_ENV, v),
@@ -628,27 +618,6 @@ mod tests {
         assert_eq!(for_handle(&handle).kind(), BackendKind::Seatbelt);
     }
 
-    /// (#3112) A message names the sandbox the setting resolves to now, and
-    /// a refused setting as refused (its entry point already said why),
-    /// never as Docker.
-    #[test]
-    #[serial_test::serial]
-    fn a_message_names_the_configured_sandbox_or_that_it_is_refused() {
-        let prev = std::env::var_os(SANDBOX_ENV);
-        let under = |value: &str| {
-            unsafe { std::env::set_var(SANDBOX_ENV, value) };
-            placed_in_configured()
-        };
-        let (docker, refused) = (under("docker"), under("podman"));
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(SANDBOX_ENV, v),
-                None => std::env::remove_var(SANDBOX_ENV),
-            }
-        }
-        assert_eq!(docker, placed_in(BackendKind::Docker));
-        assert_eq!(refused, "the sandbox (`runtime.sandbox` is refused)");
-    }
 
     /// (#3112 review) A reaper lists every backend this host can run, so a
     /// sandbox left from before the default changed is still found.

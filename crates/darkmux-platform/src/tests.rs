@@ -2834,3 +2834,111 @@ fn the_port_probes_socket_is_not_inherited_by_a_child() {
     assert!(held.into_inner().unwrap() > 0, "the probe held an address");
     assert_eq!(inherited.into_inner().unwrap(), Vec::<std::net::SocketAddr>::new(), "a probe socket a child would inherit");
 }
+
+/// (#3660) A socket's `struct socket_fdinfo` reads as a connection's two
+/// ends, own and other, IPv4 and IPv6 alike (the foreign port and address
+/// just before their local forms); a listener, a socket that is not TCP and
+/// one with no address family flag are no connection. A run of descriptors
+/// holds a connection's peer end when one of them is it, however its
+/// address is spelled; a refused read is no answer, a gone one is skipped.
+#[test]
+fn a_socket_fdinfo_record_reads_as_a_connections_two_ends() {
+    use crate::macos::libproc::{connection_ends_in_records, connection_in_fdinfo, SOCKET_FDINFO_SIZE};
+    let record = |state: i32, vflag: u8, own: std::net::SocketAddr, other: std::net::SocketAddr| {
+        let mut b = vec![0u8; SOCKET_FDINFO_SIZE];
+        b[256..260].copy_from_slice(&2i32.to_ne_bytes());
+        b[344..348].copy_from_slice(&state.to_ne_bytes());
+        b[288] = vflag;
+        b[268..270].copy_from_slice(&own.port().to_be_bytes());
+        b[264..266].copy_from_slice(&other.port().to_be_bytes());
+        let mut put = |ip: std::net::IpAddr, v6: usize, v4: usize| match ip {
+            std::net::IpAddr::V4(a) => b[v4..v4 + 4].copy_from_slice(&a.octets()),
+            std::net::IpAddr::V6(a) => b[v6..v6 + 16].copy_from_slice(&a.octets()),
+        };
+        put(own.ip(), 312, 324);
+        put(other.ip(), 296, 308);
+        b
+    };
+    let at = |s: &str| -> std::net::SocketAddr { s.parse().unwrap() };
+    let (own, other) = (at("127.0.0.1:50123"), at("127.0.0.1:8799"));
+    assert_eq!(connection_in_fdinfo(&record(4, 1, own, other)), Some((own, other)));
+    let (own6, other6) = (at("[::1]:50123"), at("[::1]:8799"));
+    assert_eq!(connection_in_fdinfo(&record(4, 2, own6, other6)), Some((own6, other6)));
+    assert_eq!(connection_in_fdinfo(&record(1, 1, own, other)), None, "a listener");
+    assert_eq!(connection_in_fdinfo(&record(2, 1, own, other)), None, "still connecting (SYN_SENT)");
+    assert_eq!(connection_in_fdinfo(&record(8, 1, own, other)), None, "closing (CLOSE_WAIT)");
+    assert_eq!(connection_in_fdinfo(&record(4, 0, own, other)), None, "no family");
+    let mut udp = record(4, 1, own, other);
+    udp[256..260].copy_from_slice(&1i32.to_ne_bytes());
+    assert_eq!(connection_in_fdinfo(&udp), None, "not TCP");
+    assert_eq!(connection_in_fdinfo(&[0u8; 100]), None, "short");
+
+    let full = SOCKET_FDINFO_SIZE as i32;
+    let reads = |answers: Vec<(i32, i32, Vec<u8>)>| {
+        let mut answers = answers.into_iter();
+        move |_fd: i32, info: &mut [u8]| {
+            let (got, errno, b) = answers.next().unwrap();
+            info.copy_from_slice(&b);
+            (got, errno)
+        }
+    };
+    let elsewhere = record(4, 1, at("127.0.0.1:50999"), at("127.0.0.1:9"));
+    let mapped = record(4, 2, at("[::ffff:127.0.0.1]:50124"), at("[::ffff:127.0.0.1]:8799"));
+    let ends = |answers| connection_ends_in_records(&[3, 4, 5, 6], reads(answers), other);
+    let mut got = ends(vec![(full, 0, record(4, 1, own, other)), (full, 0, elsewhere.clone()), (full, 0, mapped.clone()), (0, 9, elsewhere.clone())]);
+    got.sort();
+    assert_eq!(got, vec![own, at("127.0.0.1:50124")], "its ends to the listener, a mapped one as IPv4; another listener's and a gone one left out");
+    let refused = ends(vec![(0, 1, elsewhere.clone()), (full, 0, record(4, 1, own, other)), (0, 12, elsewhere.clone()), (full, 0, elsewhere)]);
+    assert_eq!(refused, vec![own], "a descriptor that cannot be read is skipped, never the whole answer");
+    let dual = connection_ends_in_records(&[3], reads(vec![(full, 0, record(4, 1, own, other))]), at("[::ffff:127.0.0.1]:8799"));
+    assert_eq!(dual, vec![own], "a dual-stack listener's own address");
+}
+
+/// (#3660) Linux's `/proc` answer: the ESTABLISHED rows whose other end is
+/// the listener, both ends read the same however they are spelled (a
+/// dual-stack listener's `[::ffff:127.0.0.1]` matches `tcp`'s IPv4 rows and
+/// `tcp6`'s mapped ones), kept when the process's descriptors hold the
+/// inode.
+#[test]
+fn a_listeners_connection_ends_are_read_from_proc_and_matched_to_a_processs_descriptors() {
+    use crate::linux::{ends_held, ends_to};
+    let at = |s: &str| -> std::net::SocketAddr { s.parse().unwrap() };
+    let row = |own: &str, other: &str, st: &str, inode: u32| format!("   1: {own} {other} {st} 00000000:00000000 00:00000000 00000000  1000        0 {inode} 1\n");
+    // 127.0.0.1:54321 -> 127.0.0.1:8767, a listener's own row, another port's, and tcp6's mapped form.
+    let mut table = String::from("  sl  local_address rem_address   st\n");
+    table += &row("0100007F:D431", "0100007F:223F", "01", 11);
+    table += &row("0100007F:223F", "0100007F:D431", "01", 12);
+    table += &row("0100007F:D432", "0100007F:0050", "01", 13);
+    table += &row("0100007F:D433", "0100007F:223F", "0A", 14);
+    table += &row("0000000000000000FFFF00000100007F:D434", "0000000000000000FFFF00000100007F:223F", "01", 15);
+    let want = vec![(at("127.0.0.1:54321"), 11), (at("127.0.0.1:54324"), 15)];
+    assert_eq!(ends_to(&table, at("127.0.0.1:8767")), want);
+    assert_eq!(ends_to(&table, at("[::ffff:127.0.0.1]:8767")), want, "a dual-stack listener");
+    assert_eq!(ends_held(&want, &[5, 15]), vec![at("127.0.0.1:54324")]);
+    assert_eq!(ends_held(&want, &[5]), Vec::<std::net::SocketAddr>::new());
+}
+
+/// (#3660) This host's strategy names the own ends of one process's
+/// connections to a listener: this test's own process holds its two
+/// clients', a process with no socket holds none. An OS with no strategy
+/// cannot say; the fake answers what the test set.
+#[test]
+fn the_host_names_the_ends_one_process_holds_to_a_listener() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = listener.local_addr().unwrap();
+    let clients = [std::net::TcpStream::connect(local).unwrap(), std::net::TcpStream::connect(local).unwrap()];
+    let _accepted = [listener.accept().unwrap(), listener.accept().unwrap()];
+    let mut want: Vec<_> = clients.iter().map(|c| c.local_addr().unwrap()).collect();
+    want.sort();
+    let me = std::process::id();
+    let mut got = current().tcp_ends_held_by(me, local).unwrap();
+    got.sort();
+    assert_eq!(got, want);
+    let mut sleeper = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+    assert_eq!(current().tcp_ends_held_by(sleeper.id(), local), Some(vec![]), "a process with no socket");
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+    assert_eq!(OtherPlatform.tcp_ends_held_by(me, local), None);
+    let fake = FakePlatform { tcp_peers: vec![(want[0], 7), (want[1], 8)], ..Default::default() };
+    assert_eq!(fake.tcp_ends_held_by(7, local), Some(vec![want[0]]));
+}

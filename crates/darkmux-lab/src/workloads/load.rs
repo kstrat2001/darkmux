@@ -606,15 +606,17 @@ mod tests {
         write(&user.join("workloads/zebra.json"), &manifest_json("zebra"));
         write(&user.join("workloads/alpha.json"), &manifest_json("alpha"));
         write(&user.join("workloads/beta/workload.json"), &manifest_json("beta"));
+        // The eval tier lists every workload a fixture registered in the
+        // darkmux root's lab registry, so an unpinned root reads this
+        // machine's installed evals. Pin it to an empty root.
+        let empty_root = TempDir::new().unwrap();
+        let _darkmux_home_guard = EnvVarGuard::set("DARKMUX_HOME", empty_root.path());
         // Point templates dir at an empty path so builtins don't pollute the test.
-        let empty = tmp.path().join("no-builtins-here");
-        unsafe { env::set_var("DARKMUX_TEMPLATES_DIR", empty.to_str().unwrap()) };
+        let _templates_guard =
+            EnvVarGuard::set("DARKMUX_TEMPLATES_DIR", tmp.path().join("no-builtins-here"));
         // Also chdir to a dir without templates/ so the cwd lookup misses.
-        let prev = env::current_dir().unwrap();
-        env::set_current_dir(tmp.path()).unwrap();
+        let _cwd_guard = CwdGuard::new(tmp.path());
         let avail = list_available(Some(user));
-        env::set_current_dir(prev).unwrap();
-        unsafe { env::remove_var("DARKMUX_TEMPLATES_DIR") };
         // Embedded workloads (compiled into the binary) are always present in
         // addition to whatever's on disk. Filter them out for this test, which
         // asserts on-disk discovery + sorting only.

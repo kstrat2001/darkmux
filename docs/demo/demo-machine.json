@@ -208,6 +208,7 @@
       }
     ],
     "machine_id": "Workstation",
+    "machine_uid": "DEMO-M5ULTRA-2F4A-11F0-9C3D-A2B1C0D4E5F6",
     "os": "macos aarch64",
     "ram_free_for_ai_bytes": 98725027315,
     "ram_total_bytes": 274877906944,

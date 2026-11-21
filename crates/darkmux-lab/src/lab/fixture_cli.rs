@@ -94,7 +94,10 @@ pub fn cmd_register(
             .map(|c| !c.trim().is_empty())
             .unwrap_or(false)
         {
-            msg.push_str(&verify_command_note(darkmux_types::config_access::tests_on_host(), darkmux_sandbox::selected().ok()));
+            msg.push_str(&verify_command_note(
+                darkmux_types::config_access::tests_on_host_with_source().0,
+                darkmux_sandbox::selection().ok().map(|s| s.kind),
+            ));
         }
     }
 

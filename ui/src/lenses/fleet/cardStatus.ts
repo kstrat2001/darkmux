@@ -10,6 +10,7 @@
  */
 
 import { LampForm } from "../../lib/lamp";
+import { HUB_UNREAD, type MachineAvailability } from "../../lib/machineAvailability";
 
 export enum CardStatus {
   Idle = "idle",
@@ -60,15 +61,25 @@ export function lampOf(status: CardStatus): LampForm {
   }
 }
 
+/** Why an online machine is not streaming: its stream does not reach this hub,
+ *  or (#3662) this viewer cannot read the hub at all. */
+function onlineNotStreamingReason(availability: MachineAvailability | undefined): string {
+  return availability === "hub_unread"
+    ? `online · not streaming: ${HUB_UNREAD}, so its live state is unknown; its recorded activity still shows.`
+    : "online · not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here.";
+}
+
 /** The status line's tooltip: the word's reason. `note` is the view's typed
  *  reason for a card it could not read ("not listening"); `null` means the
- *  card was read. `undefined` when the word needs none. */
-export function statusReason(note: string | null, status: CardStatus): string | undefined {
+ *  card was read. `undefined` when the word needs none. `availability`
+ *  (#3662): a `hub_unread` machine is not streaming because THIS viewer
+ *  cannot read the hub, which the reason says instead of blaming its stream. */
+export function statusReason(note: string | null, status: CardStatus, availability?: MachineAvailability): string | undefined {
   switch (status) {
     case CardStatus.Offline:
       return `offline: ${note ?? "its presence beat stopped"}`;
     case CardStatus.OnlineNotStreaming:
-      return "online · not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here.";
+      return onlineNotStreamingReason(availability);
     case CardStatus.NotStreaming:
       return `not streaming: ${note ?? "its card couldn't be read"}`;
     case CardStatus.Disconnected:

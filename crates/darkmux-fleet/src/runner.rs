@@ -223,6 +223,7 @@ impl WorkJob {
             // on the WorkJob); the runner injects darkmux's binary into it.
             // `None` → the runner's default slim image.
             image: self.image,
+            sandbox: None,
             // Mock-model harness (v1): not carried on a WorkJob today —
             // fleet-published dispatches always target real LMStudio.
             // `None` preserves that.

@@ -2,6 +2,8 @@ import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../lib/queryKeys";
+import { getSource } from "../lib/source";
+import { degradedFleetSource, type DegradedFleetSource } from "../lib/fleetCoverage";
 import type { CoverageMeta } from "../types/generated/CoverageMeta";
 import type { FleetMachinesLiveResponse } from "../types/generated/FleetMachinesLiveResponse";
 import type { FleetRosterResponse } from "../types/generated/FleetRosterResponse";
@@ -105,7 +107,7 @@ export function useFleetRoster(
 /** `useFleetCoverage`'s return shape — the server's own coverage report,
  * PLUS whether the read that should have produced it even got an answer.
  * See that hook's doc. */
-export interface FleetCoverageResult {
+interface FleetCoverageResult {
   /** The daemon's `meta`, or `null` when there isn't one to report — still
    * pending, or the read failed (`unreadable` below is what says which). */
   meta: CoverageMeta | null;
@@ -140,8 +142,8 @@ export interface FleetCoverageResult {
  * failure is REPORTED (`unreadable`), not interpreted.
  */
 /** `enabled` (#1800 P2) — same reason as `useLiveMachines`: on a replay this
- * banner would report the CURRENT fleet's coverage over a past day's records. */
-export function useFleetCoverage(enabled = true): FleetCoverageResult {
+ * would report the CURRENT fleet's coverage over a past day's records. */
+function useFleetCoverage(enabled = true): FleetCoverageResult {
   const query = useQuery({
     enabled,
     queryKey: queryKeys.fleetMachinesLive(),
@@ -154,4 +156,16 @@ export function useFleetCoverage(enabled = true): FleetCoverageResult {
     meta: query.data?.ok ? (query.data.data.meta ?? null) : null,
     unreadable: query.data !== undefined && !query.data.ok,
   };
+}
+
+/** (#3662) The degraded fleet source this page's presence read reports, or
+ * `null` (`degradedFleetSource`): the one reading every surface that derives
+ * a claim from presence takes its caveat from. `enabled` is the caller's
+ * live-vs-replay gate; a daemon-less build has no presence to read. Shares
+ * `queryKeys.fleetMachinesLive` with `useLiveMachines`, so it costs no extra
+ * request, and equally a stray enabled observer would re-open a poll a
+ * replay had just gated off. */
+export function useDegradedFleetSource(enabled: boolean): DegradedFleetSource | null {
+  const { meta, unreadable } = useFleetCoverage(enabled && getSource().kind === "daemon");
+  return degradedFleetSource(meta, unreadable);
 }

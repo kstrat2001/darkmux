@@ -439,14 +439,15 @@
     }
 
 
-/// (#3112 review, contract 6) A shipped role whose frozen prompt says the
-/// working directory is mounted at `/workspace` (`tool-bench`) reaches a host
-/// sandbox's model naming where that sandbox sees the workspace: the host
-/// names it (`system_prompt_as_sent`) before it hashes and passes the
-/// prompt, so the frozen text never changes and the recorded hash is of the
-/// bytes sent. Byte-identical in a container.
+/// (#3654, contract 6) A shipped role whose frozen prompt says the working
+/// directory is mounted at `/workspace` (`tool-bench`) reaches a host
+/// sandbox's model naming it as the current directory, never its host path
+/// (which is under the user's home): the host names it
+/// (`system_prompt_as_sent`) before it hashes and passes the prompt, so the
+/// frozen text never changes and the recorded hash is of the bytes sent.
+/// Byte-identical in a container.
 #[test]
-fn the_tool_bench_role_names_the_workspace_where_a_host_sandbox_sees_it() {
+fn the_tool_bench_role_names_the_workspace_as_the_current_directory_under_a_host_sandbox() {
     use darkmux_sandbox::BackendKind;
     let role = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/tool-bench.md")).to_string();
     assert!(role.contains("mounted at `/workspace`"), "tool-bench.md no longer names `/workspace`");
@@ -454,6 +455,9 @@ fn the_tool_bench_role_names_the_workspace_where_a_host_sandbox_sees_it() {
     let real = ws.path().canonicalize().unwrap().display().to_string();
     let docker = crate::dispatch_internal::system_prompt_as_sent(role.clone(), Some(BackendKind::Docker), ws.path());
     assert_eq!(docker, role);
-    let seatbelt = crate::dispatch_internal::system_prompt_as_sent(role.clone(), Some(BackendKind::Seatbelt), ws.path());
-    assert!(seatbelt.contains(&format!("mounted at `{real}`")) && !seatbelt.contains("`/workspace`"), "{seatbelt}");
+    for kind in [BackendKind::Seatbelt, BackendKind::Landlock] {
+        let host = crate::dispatch_internal::system_prompt_as_sent(role.clone(), Some(kind), ws.path());
+        assert!(host.contains("mounted at `.`") && !host.contains("/workspace"), "{kind:?}: {host}");
+        assert!(!host.contains(&real) && !host.contains(&ws.path().display().to_string()), "{kind:?}: {host}");
+    }
 }

@@ -65,6 +65,8 @@ pub mod client_trust;
 pub mod client_wire;
 pub mod client_workspace;
 mod fleet_listener;
+/// Bounded serving every listener shares (connection caps, header deadline).
+mod bounded_serve;
 /// The fleet view: one row per roster machine, each with its own card.
 pub mod fleet_view;
 /// (#3200) Reaps dispatch containers whose darkmux host died unhandled.
@@ -431,7 +433,7 @@ pub(crate) fn build_router_full(
 /// way to carry.
 ///
 /// A real request always arrives on a connection, so `run()`'s
-/// `into_make_service_with_connect_info` always supplies a peer address. A
+/// `serve_viewer` always supplies a peer address. A
 /// `oneshot` call has no connection and therefore no `ConnectInfo`, which used
 /// to be papered over inside `auth_mw` itself (absent ⇒ loopback ⇒ exempt) —
 /// the fail-open default this issue removed.
@@ -1570,7 +1572,7 @@ pub fn listen_socket_addr(bind: &str, port: u16) -> Result<std::net::SocketAddr>
 /// both, and doctor says when they differ).
 fn sandbox_configured_now() -> Option<darkmux_sandbox::BackendKind> {
     let path = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::ForceUser).config;
-    darkmux_sandbox::selected_in(&darkmux_types::config::DarkmuxConfig::load_from(&path)).ok()
+    darkmux_sandbox::selection_in(&darkmux_types::config::DarkmuxConfig::load_from(&path)).ok().map(|s| s.kind)
 }
 
 /// The ASCII-art wordmark and tagline the startup banner opens with, each
@@ -1751,10 +1753,10 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             dispatch_reaper::spawn(dispatch_reaper::REAP_INTERVAL, Arc::clone(&host_sampler_stop));
 
         // Shutdown plumbing: multiplex one signal to two consumers
-        // (axum's graceful shutdown future and the force-exit timer).
+        // (the viewer listener's graceful shutdown and the force-exit timer).
         // `watch::channel` is the right shape — both consumers wait_for
         // the same latch flip.
-        let (shutdown_tx, mut shutdown_rx_axum) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx_axum) = tokio::sync::watch::channel(false);
 
         // (#2916) The work-submission listener, when `fleet.listener.enabled`:
         // its own socket on this machine's overlay address, gated by the
@@ -1811,11 +1813,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
             });
         });
 
-        let axum_shutdown = async move {
-            let _ = shutdown_rx_axum.wait_for(|&v| v).await;
-        };
-
-        // (#881) `local_peer::make_service` populates each request's
+        // (#881) `serve_viewer` populates each request's
         // `ConnectInfo<SocketAddr>` from the real TCP peer — that's how
         // `auth_mw` tells a remote peer (token required) from a loopback one
         // (exempt). It also judges whose process a loopback peer is, so
@@ -1825,17 +1823,29 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         // absent `ConnectInfo` as loopback, so downgrading to a plain
         // `into_make_service()` made every peer look exempt and turned the
         // remote gate into a SILENT no-op. It fails closed now, so the same
-        // downgrade is loud instead — every peerless request 401s, including
+        // downgrade is loud instead: every peerless request 401s, including
         // the operator's own loopback viewer once a token is configured.
         // Still don't change it without re-reading `auth_mw`; the failure just
         // announces itself now rather than hiding.
-        axum::serve(listener, local_peer::make_service(app))
-        .with_graceful_shutdown(axum_shutdown)
-        .await?;
+        serve_viewer(listener, app, shutdown_rx_axum).await;
 
         println!("darkmux serve: clean shutdown");
         Ok::<_, anyhow::Error>(())
     })
+}
+
+/// Serves the viewer's `app` on `listener` until `shutdown` says stop, then
+/// lets open connections finish their answers
+/// ([`bounded_serve::serve_kept_alive`] within [`bounded_serve::VIEWER`]):
+/// connections are capped and an idle one is closed, so no peer can hold
+/// enough of them open to take this process's file descriptors (#2916's
+/// fleet listener is bounded the same way).
+pub(crate) async fn serve_viewer(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    bounded_serve::serve_kept_alive(listener, app, bounded_serve::VIEWER, shutdown).await;
 }
 
 /// (#1461) The mtime of the binary this daemon was launched from, captured at
@@ -1889,7 +1899,7 @@ async fn health(
     let loopback_caller = is_local_request(peer.map(|c| c.0), &headers);
     // (#3112) The sandbox this daemon runs isolated work in; `None` when the
     // setting is refused (every launch through the daemon refuses it too).
-    let daemon_sandbox = darkmux_sandbox::selected().ok();
+    let daemon_sandbox = darkmux_sandbox::selection().ok().map(|s| s.kind);
     let configured = if loopback_caller { sandbox_configured_now() } else { None };
     axum::Json(wire::HealthResponse {
         darkmux_version: env!("CARGO_PKG_VERSION").to_string(),

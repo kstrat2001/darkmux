@@ -8,7 +8,7 @@ import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLatch } from "../../hooks/useLatch";
-import { useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
+import { useDegradedFleetSource, useFleetRoster, useLiveMachines } from "../../hooks/useLiveMachines";
 import { localMachineUid, displayNameOf, sameUid } from "../../lib/machineIdentity";
 import { windowAvailability, remoteIdleLine } from "../../lib/machineAvailability";
 import { relAgoFrom } from "../../lib/format";
@@ -309,7 +309,15 @@ export function MachineLens({
   const identityKnown = specsAnswered && (machineIsLocal || flowAnswered);
   // (5.0 R3) What this viewer can see of the page's machine. Judged only once
   // the window has answered and the page knows whose machine it is.
-  const availability = windowAvailability(flowWindow.data, liveMachines, targetUid, { self: isLocalMach, answered: identityKnown && flowAnswered });
+  // (#3662) A stale or unreadable presence read: a peer's records in the
+  // window are history, so its page reads "not reported", never "idle".
+  // Same query key as `liveMachines` (one request), gated identically.
+  const presenceDegraded = useDegradedFleetSource(daemonBacked) !== null;
+  const availability = windowAvailability(flowWindow.data, liveMachines, targetUid, {
+    self: isLocalMach,
+    answered: identityKnown && flowAnswered,
+    presenceDegraded,
+  });
 
   // (#2108, operator design rule — "the lens must be a strict SUPERSET of
   // the sheet") The SAME shared hook `MachineDrawer.tsx`'s desktop dialog

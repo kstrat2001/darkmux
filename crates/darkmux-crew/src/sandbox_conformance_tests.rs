@@ -568,7 +568,7 @@ fn a_listener_beyond_the_loopback_is_refused_or_stopped(backend: &dyn SandboxBac
     let stopped = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let watch = {
         let (stopped, handle) = (std::sync::Arc::clone(&stopped), handle.clone());
-        crate::sandbox_listeners::watch(&handle.clone(), client.id(), "a conformance sandbox", move |why| {
+        crate::sandbox_listeners::watch(&handle.clone(), client.id(), "a conformance sandbox", String::new(), move |why| {
             *stopped.lock().unwrap() = Some(why);
             let backend = darkmux_sandbox::backend_of(handle.backend);
             let _ = run_bounded(backend.kill(&handle), Duration::from_secs(30));
@@ -662,7 +662,7 @@ fn a_loopback_listener_is_never_stopped(backend: &dyn SandboxBackend, host: &Hos
     let stopped = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let watch = {
         let stopped = std::sync::Arc::clone(&stopped);
-        crate::sandbox_listeners::watch(&handle, client.id(), "a conformance sandbox", move |why| *stopped.lock().unwrap() = Some(why))
+        crate::sandbox_listeners::watch(&handle, client.id(), "a conformance sandbox", String::new(), move |why| *stopped.lock().unwrap() = Some(why))
     };
     assert_eq!(watch.is_some(), backend.kind().on_host());
     std::thread::sleep(crate::sandbox_listeners::CHECK_EVERY * 3);
@@ -705,7 +705,7 @@ fn a_loopback_server_on_an_unnamed_port_works_and_is_never_stopped(backend: &dyn
         let stopped = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
         let watch = {
             let stopped = std::sync::Arc::clone(&stopped);
-            crate::sandbox_listeners::watch(&handle, client.id(), "a conformance sandbox", move |why| *stopped.lock().unwrap() = Some(why))
+            crate::sandbox_listeners::watch(&handle, client.id(), "a conformance sandbox", String::new(), move |why| *stopped.lock().unwrap() = Some(why))
         };
         let said_at = tree.path().join("said");
         let deadline = Instant::now() + Duration::from_secs(30);

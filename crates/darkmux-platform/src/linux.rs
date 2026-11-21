@@ -251,6 +251,14 @@ impl Platform for LinuxPlatform {
     /// end is `local`, matched in one pass over every process's fds to the
     /// process holding each. A process this user cannot read is left out (a
     /// host-network container run as root, say).
+    /// (#3660) The ends connected to `local` in `/proc/net/tcp{,6}`, kept
+    /// when `pid`'s descriptors hold their inode.
+    fn tcp_ends_held_by(&self, pid: u32, local: std::net::SocketAddr) -> Option<Vec<std::net::SocketAddr>> {
+        let mut table = read_to_string("/proc/net/tcp")?;
+        table.push_str(&read_to_string("/proc/net/tcp6").unwrap_or_default());
+        Some(ends_held(&ends_to(&table, local), &socket_inodes_held_by(pid)?))
+    }
+
     fn tcp_peers_of(&self, local: std::net::SocketAddr) -> Option<Vec<(std::net::SocketAddr, u32)>> {
         let mut ends = connected_to(&read_to_string("/proc/net/tcp")?, local);
         ends.extend(connected_to(&read_to_string("/proc/net/tcp6").unwrap_or_default(), local));
@@ -524,6 +532,26 @@ pub(crate) fn socket_inodes_held_by(pid: u32) -> Option<Vec<u64>> {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn socket_inodes_held_by(_pid: u32) -> Option<Vec<u64>> {
     None
+}
+
+/// (#3660) Every ESTABLISHED row of `/proc/net/tcp{,6}` text `table` whose
+/// other end is `local`: `(own end, inode)`, both ends read the same however
+/// they are spelled (a dual-stack listener's `[::ffff:127.0.0.1]` is
+/// `127.0.0.1`).
+pub(crate) fn ends_to(table: &str, local: std::net::SocketAddr) -> Vec<(std::net::SocketAddr, u64)> {
+    let canonical = |a: std::net::SocketAddr| std::net::SocketAddr::new(a.ip().to_canonical(), a.port());
+    table
+        .lines()
+        .filter_map(established)
+        .filter(|(_, other, _)| canonical(*other) == canonical(local))
+        .map(|(own, _, inode)| (canonical(own), inode))
+        .collect()
+}
+
+/// (#3660) The own ends among `ends` whose inode is in `held` (a process's
+/// socket inodes).
+pub(crate) fn ends_held(ends: &[(std::net::SocketAddr, u64)], held: &[u64]) -> Vec<std::net::SocketAddr> {
+    ends.iter().filter(|(_, inode)| held.contains(inode)).map(|(own, _)| *own).collect()
 }
 
 /// (#3453 review) The inodes of `/proc/net/tcp{,6}`'s sockets in LISTEN

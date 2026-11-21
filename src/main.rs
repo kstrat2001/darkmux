@@ -1293,6 +1293,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         // (#703) operator-selected dispatch image; darkmux injects its runtime
         // binary into it when it's not the default.
         image,
+        sandbox: None,
         // Mock-model harness (v1): no CLI surface yet (deliberately — see
         // darkmux's CLAUDE.md doctrine on shipping the underlying mechanism
         // before the CLI verb). `None` on every operator-facing dispatch.
@@ -2190,7 +2191,12 @@ fn cmd_init(opts: init::InitOptions) -> Result<i32> {
                 .unwrap_or_else(|| "the profile registry".to_string());
             step(&format!("Edit {path} to point at a downloaded model (`lms ls` lists them)"));
         }
-        first_steps(darkmux_types::config_access::sandbox().ok(), darkmux_sandbox::selected().is_ok()).into_iter().for_each(&mut step);
+        first_steps(
+            darkmux_types::config_access::sandbox_with_source().ok().map(|(v, _)| v),
+            darkmux_sandbox::selection().is_ok(),
+        )
+        .into_iter()
+        .for_each(&mut step);
     }
     Ok(i32::from(add_refused))
 }

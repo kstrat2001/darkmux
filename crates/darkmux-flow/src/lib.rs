@@ -1426,10 +1426,32 @@ pub fn spawn_acking_redis_peer() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<St
 /// (#3125) Test support: a loopback port nothing listens on, so every Redis
 /// connection to it is refused: the dead-hub case, where a session emitter's
 /// first beat never lands and its start must promise nothing.
+///
+/// A fixture port, not a dropped `bind(0)`: an ephemeral port is the kind the
+/// OS gives the next `bind(0)`, so a fake hub another test starts alongside
+/// can land on it and answer, and the "refused" hub then acks the beat. A
+/// fixture port is below every ephemeral range and reserved for this
+/// process's life (`darkmux_types::test_ports`).
 #[cfg(any(test, feature = "test-support"))]
 pub fn refused_redis_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().unwrap().port()
+    darkmux_types::test_ports::fixture_port()
+}
+
+#[cfg(test)]
+mod refused_redis_port_tests {
+    use darkmux_types::test_ports::{reserve, FIXTURE_PORT_RANGE};
+
+    /// (#3125) The dead-hub port stays dead for the whole test: it is never a
+    /// port the OS hands another `bind(0)` (so no fake hub started by a test
+    /// running alongside can land on it), and no other test process is given
+    /// it while this one runs.
+    #[test]
+    fn the_refused_port_cannot_be_handed_to_another_listener() {
+        let port = super::refused_redis_port();
+        assert!(FIXTURE_PORT_RANGE.contains(&port), "{port} is an ephemeral port another bind(0) can be given");
+        assert!(reserve(port).is_none(), "{port} is not reserved, so another test process can be handed it");
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "something answers on {port}");
+    }
 }
 
 /// (#2227) Spawn a fake Redis peer that COMPLETES redis-rs's connection-setup

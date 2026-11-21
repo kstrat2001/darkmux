@@ -380,8 +380,26 @@ impl ClientStore {
     /// only; an absent one reads as empty and is not created): for a reader
     /// that must change nothing, `darkmux doctor`.
     pub fn peek(&self) -> Result<ClientsFile> {
+        Ok(self.peek_parsed()?.0)
+    }
+
+    /// The store for a check that changes nothing (a request's bearer
+    /// token): read as [`ClientStore::peek`] reads it, under the shared
+    /// lock and never written, so checks go ahead together and none
+    /// rewrites the file or its mode. One that still needs a migration is
+    /// read with [`ClientStore::read`] instead, which writes the migration
+    /// once: it mints ids, which must be the same at the next read.
+    pub fn read_for_check(&self) -> Result<ClientsFile> {
+        match self.peek_parsed()? {
+            (_, true) => self.read(),
+            (file, false) => Ok(file),
+        }
+    }
+
+    /// [`ClientStore::peek`], with whether the store needed a migration.
+    fn peek_parsed(&self) -> Result<(ClientsFile, bool)> {
         let Some(mut guard) = self.lock_shared_current()? else {
-            return Ok(ClientsFile::default());
+            return Ok((ClientsFile::default(), false));
         };
         let mut text = String::new();
         guard
@@ -389,7 +407,7 @@ impl ClientStore {
             .take(darkmux_types::user_files::MAX_USER_FILE_BYTES + 1)
             .read_to_string(&mut text)
             .with_context(|| format!("reading {}", self.path.display()))?;
-        Ok(parse_clients(&self.path, &text)?.0)
+        parse_clients(&self.path, &text)
     }
 
     /// Load, change, save, all under the file's exclusive lock. `f`'s error
@@ -1440,7 +1458,7 @@ fn read_preview_sandbox() -> Result<darkmux_sandbox::BackendKind, String> {
 
 /// [`read_preview_sandbox`] against the config at `path`.
 pub(crate) fn read_preview_sandbox_at(path: &Path) -> Result<darkmux_sandbox::BackendKind, String> {
-    darkmux_sandbox::selected_in(&read_config_at(path)?)
+    darkmux_sandbox::selection_in(&read_config_at(path)?).map(|s| s.kind)
 }
 
 /// [`read_preview_enabled`] against the config at `path`.
@@ -1836,11 +1854,8 @@ async fn serve_until_stopped(
     signals: &mut ShutdownSignals,
     on_stop: impl FnOnce(),
 ) -> Result<()> {
-    let stop = Arc::new(tokio::sync::Notify::new());
-    let graceful = stop.clone();
-    let server = axum::serve(listener, crate::local_peer::make_service(app))
-        .with_graceful_shutdown(async move { graceful.notified().await });
-    let mut serving = tokio::spawn(std::future::IntoFuture::into_future(server));
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let mut serving = tokio::spawn(serve_client_listener(listener, app, stopped));
     let ended = tokio::select! {
         ended = &mut serving => Some(ended),
         signal = signals.next() => {
@@ -1854,7 +1869,7 @@ async fn serve_until_stopped(
     let ended = match ended {
         Some(ended) => ended,
         None => {
-            stop.notify_one();
+            let _ = stop.send(true);
             tokio::select! {
                 ended = &mut serving => ended,
                 _ = tokio::time::sleep(SHUTDOWN_DRAIN) => {
@@ -1863,17 +1878,32 @@ async fn serve_until_stopped(
                         SHUTDOWN_DRAIN.as_secs()
                     );
                     serving.abort();
-                    Ok(Ok(()))
+                    Ok(())
                 }
                 signal = signals.next() => {
                     eprintln!("darkmux client serve: {signal} again; no longer waiting for open connections");
                     serving.abort();
-                    Ok(Ok(()))
+                    Ok(())
                 }
             }
         }
     };
-    ended.context("the server task")?.context("serving")
+    ended.context("the server task")
+}
+
+/// Serves the client listener's `app` on `listener` until `stop` says stop,
+/// then lets open connections finish their answers
+/// ([`crate::bounded_serve::serve_kept_alive`] within
+/// [`crate::bounded_serve::CLIENT`]): connections are capped and an idle
+/// one is closed, so a device reaching the listener through the tailnet
+/// entry cannot hold enough of them open to take this process's file
+/// descriptors.
+pub(crate) async fn serve_client_listener(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    stop: tokio::sync::watch::Receiver<bool>,
+) {
+    crate::bounded_serve::serve_kept_alive(listener, app, crate::bounded_serve::CLIENT, stop).await;
 }
 
 /// SIGINT (Ctrl-C), SIGTERM (launchd stopping the job, a plain `kill`) and
@@ -2335,6 +2365,37 @@ fn clean_text(s: &str, field: &str, min: usize, max: usize) -> Result<(), Refuse
     Ok(())
 }
 
+/// [`clean_text`] for a name the operator is shown when deciding whether to
+/// pair (`device_name`): also nothing the approval surface would hide
+/// ([`darkmux_platform::display_safe`]: bidirectional controls and marks,
+/// zero-width characters, word joiners), so it is stored as it is shown.
+fn shown_text(s: &str, field: &str, min: usize, max: usize) -> Result<(), Refused> {
+    clean_text(s, field, min, max)?;
+    refused_unless(
+        darkmux_platform::display_safe(s) == s,
+        format!("`{field}` must have no invisible formatting characters (bidirectional controls or marks, zero-width characters)"),
+    )
+}
+
+/// [`clean_text`] for text the operator compares character for character
+/// (the pairing `code`): also nothing [`escape_text_strict`] would escape,
+/// so it is laid out left to right in the order it is stored, with nothing
+/// that takes no space.
+///
+/// [`escape_text_strict`]: darkmux_types::user_files::escape_text_strict
+fn exact_text(s: &str, field: &str, min: usize, max: usize) -> Result<(), Refused> {
+    clean_text(s, field, min, max)?;
+    refused_unless(
+        darkmux_types::user_files::escape_text_strict(s) == s,
+        format!("`{field}` must have no invisible, formatting or right-to-left characters: it is compared character for character"),
+    )
+}
+
+/// A 400 `bad_request` saying `why`, unless `ok`.
+fn refused_unless(ok: bool, why: String) -> Result<(), Refused> {
+    ok.then_some(()).ok_or_else(|| refuse(StatusCode::BAD_REQUEST, ClientCode::BadRequest, why))
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PairBody {
@@ -2360,8 +2421,8 @@ pub(crate) async fn pair_handler(
         Err(r) => return r,
     };
     let checks = [
-        clean_text(&req.device_name, "device_name", 1, 64),
-        clean_text(&req.code, "code", 1, 16),
+        shown_text(&req.device_name, "device_name", 1, 64),
+        exact_text(&req.code, "code", 1, 16),
         clean_text(&req.pair_secret, "pair_secret", 16, 256),
     ];
     if let Some(Err(r)) = checks.into_iter().find(Result::is_err) {
@@ -2726,7 +2787,9 @@ async fn polled_identity(
 }
 
 /// The client the bearer token names. Every stored hash is compared (no early
-/// exit), each in constant time.
+/// exit), each in constant time. The store is read again for every request
+/// ([`ClientStore::read_for_check`], a shared lock), so a token revoked is
+/// refused on its next request.
 pub(crate) fn authenticate(
     state: &ClientServerState,
     headers: &HeaderMap,
@@ -2739,7 +2802,7 @@ pub(crate) fn authenticate(
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .ok_or_else(unauthorized)?;
-    let clients = state.store.read().map_err(internal)?.clients;
+    let clients = state.store.read_for_check().map_err(internal)?.clients;
     let found = clients.into_iter().fold(None, |hit, c| {
         let ok = secret_matches(&c.token_hash, token);
         if ok && hit.is_none() {

@@ -29,6 +29,8 @@ pub struct FakePlatform {
     /// How many [`Platform::tcp_listeners`] reads cannot say (`None`) before
     /// the reads answer; each read counts one down.
     pub tcp_listeners_unreadable_reads: std::sync::atomic::AtomicU32,
+    /// How many times [`Platform::tcp_ends_held_by`] was asked.
+    pub tcp_ends_reads: std::sync::atomic::AtomicU32,
     /// The `(peer, pid)` pairs [`Platform::tcp_peers_of`] answers, whatever
     /// the listener.
     pub tcp_peers: Vec<(std::net::SocketAddr, u32)>,
@@ -89,6 +91,7 @@ impl Default for FakePlatform {
             tcp_listeners: Vec::new(),
             tcp_listeners_unreadable: false,
             tcp_listeners_unreadable_reads: std::sync::atomic::AtomicU32::new(0),
+            tcp_ends_reads: std::sync::atomic::AtomicU32::new(0),
             tcp_peers: Vec::new(),
             port_listeners: Vec::new(),
             port_listeners_unreadable_reads: std::sync::atomic::AtomicU32::new(0),
@@ -228,6 +231,13 @@ impl Platform for FakePlatform {
 
     fn tcp_peers_of(&self, _local: std::net::SocketAddr) -> Option<Vec<(std::net::SocketAddr, u32)>> {
         Some(self.tcp_peers.clone())
+    }
+
+    /// The peers [`Self::tcp_peers`] pairs with `pid`, whatever the
+    /// listener; each call is counted in [`Self::tcp_ends_reads`].
+    fn tcp_ends_held_by(&self, pid: u32, _local: std::net::SocketAddr) -> Option<Vec<std::net::SocketAddr>> {
+        self.tcp_ends_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(self.tcp_peers.iter().filter(|(_, p)| *p == pid).map(|(peer, _)| *peer).collect())
     }
 
     /// The ports [`Self::port_listeners`] names.

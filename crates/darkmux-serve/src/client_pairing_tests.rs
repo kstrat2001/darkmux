@@ -592,6 +592,51 @@ fn pair_body() -> Value {
     })
 }
 
+/// A pairing request's device name and code reach the operator, who
+/// approves on the code (the dialog, `client approve`). So neither may hold
+/// what would show other than as sent: the device name nothing the
+/// approval surface would hide (`darkmux_platform::display_safe`: bidi
+/// controls and marks, zero-width characters, word joiners), and the code,
+/// compared character for character, also nothing that reorders the
+/// characters around it or takes no space (`escape_text_strict`). Each is
+/// refused, and nothing is stored; ordinary names and codes pair.
+#[tokio::test]
+async fn a_pairing_with_hidden_or_reordering_characters_is_refused() {
+    let refused: [(&str, &str); 10] = [
+        ("device_name", "Sam\u{202e}enohPi"),
+        ("device_name", "Sam\u{200b}'s iPhone"),
+        ("device_name", "\u{2066}Sam's iPhone\u{2069}"),
+        ("device_name", "Sam\u{200f}'s iPhone"),
+        ("device_name", "\u{feff}Sam's iPhone"),
+        ("code", "4F7\u{200d}K2Q"),
+        ("code", "4F7-\u{202e}K2Q"),
+        ("code", "\u{5d0}4F7-K2Q\u{5d0}"),
+        ("code", "\u{661}\u{662}\u{663}"),
+        ("code", "4F7\u{34f}K2Q"),
+    ];
+    let h = harness();
+    for (field, text) in refused {
+        let mut body = pair_body();
+        body[field] = text.into();
+        let (status, v) = call(&h, post("/client/pair", None, body)).await;
+        assert_eq!((status, v["code"].as_str()), (400, Some("bad_request")), "{field} {text:?}: {v}");
+        assert!(v["error"].as_str().unwrap().contains(field), "{v}");
+    }
+    assert_eq!(pending_count(&h), 0, "a refused request is never stored");
+    let accepted: [(&str, &str); 4] = [
+        ("device_name", "長い名前のiPad"),
+        ("device_name", "האייפון של דני"),
+        ("device_name", "Sam's iPhone ❤️"),
+        ("code", "4F7-K2Q"),
+    ];
+    for (field, text) in accepted {
+        let mut body = pair_body();
+        body[field] = text.into();
+        let (status, v) = call(&h, post("/client/pair", None, body)).await;
+        assert_eq!(status, 202, "{field} {text:?}: {v}");
+    }
+}
+
 async fn request_pairing(h: &Harness) -> String {
     let (code, v) = call(h, post("/client/pair", None, pair_body())).await;
     assert_eq!(code, 202, "{v}");
@@ -2034,6 +2079,41 @@ async fn openapi_is_the_route_tables_document_behind_the_token() {
     assert_eq!(doc["info"]["version"], env!("CARGO_PKG_VERSION"));
 }
 
+/// Checking a bearer token reads the store under its shared lock and
+/// writes nothing: it goes ahead while another reader holds the store,
+/// where an exclusive lock would wait for it.
+#[tokio::test]
+async fn a_token_check_shares_the_store_with_other_readers() {
+    let h = harness();
+    let token = paired(&h).await;
+    let reader = darkmux_types::flock::lock_shared_existing(h.store.path()).unwrap().expect("the store exists");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let state = h.state.clone();
+    let headers = HeaderMap::from_iter([(
+        axum::http::header::AUTHORIZATION,
+        bearer(&token).parse().unwrap(),
+    )]);
+    std::thread::spawn(move || {
+        let _ = tx.send(authenticate(&state, &headers).map(|c| c.name).map_err(|r| r.status()));
+    });
+    let checked = rx.recv_timeout(std::time::Duration::from_secs(2));
+    drop(reader);
+    assert!(matches!(checked, Ok(Ok(_))), "the token check waited on a reader: {checked:?}");
+}
+
+/// A token revoked while its app keeps a connection open is refused on
+/// that app's very next request: the check reads the store each time.
+#[tokio::test]
+async fn a_revoked_token_is_refused_on_its_next_request() {
+    let h = harness();
+    let token = paired(&h).await;
+    let ask = || call(&h, get("/client/whoami", &[("authorization", &bearer(&token))]));
+    assert_eq!(ask().await.0, 200);
+    let name = list_clients(&h.store).unwrap()[0].name.clone();
+    assert!(revoke(&h.store, &name).unwrap());
+    assert_eq!(ask().await.0, 401);
+}
+
 #[tokio::test]
 async fn a_revoked_client_is_401_everywhere() {
     let h = harness();
@@ -2260,6 +2340,26 @@ fn a_1_0_store_is_read_with_its_scopes_dropped() {
     assert_eq!(f.schema_version, CLIENTS_SCHEMA_VERSION);
     assert_eq!(f.pending.len(), 1);
     assert_eq!(f.clients[0].name, "a");
+}
+
+/// A token check on a store that still needs its migration writes it once,
+/// as a full read does: the ids it mints are the ones every later check
+/// and read sees.
+#[test]
+fn a_token_check_on_an_older_store_writes_its_migration_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("clients.json");
+    std::fs::write(
+        &path,
+        r#"{"schema_version":"1.1","pending":[],"clients":[{"name":"a","created":1,"token_hash":"00"}]}"#,
+    )
+    .unwrap();
+    let store = ClientStore::at(path.clone());
+    let first = store.read_for_check().unwrap().clients[0].id.clone();
+    assert_eq!(store.read_for_check().unwrap().clients[0].id, first, "a second check minted another id");
+    assert_eq!(store.peek().unwrap().clients[0].id, first);
+    let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(on_disk["schema_version"], CLIENTS_SCHEMA_VERSION);
 }
 
 /// A 1.1 store's clients get an id each when it is read, written at once,
@@ -8976,8 +9076,10 @@ async fn a_disconnect_during_admission_never_leaves_a_run_with_no_runner() {
     let addr = listener.local_addr().unwrap();
     h.state.bound = Some(addr);
     let app = router(h.state.clone());
+    let (stop, stopped) = tokio::sync::watch::channel(false);
     let server = tokio::spawn(async move {
-        axum::serve(listener, crate::local_peer::make_service(app)).await
+        let _running = stop;
+        crate::client_pairing::serve_client_listener(listener, app, stopped).await
     });
     let body = work_for("coder").to_string();
     let request = format!(
@@ -11328,15 +11430,18 @@ async fn allow_never_remembers_a_container_engine() {
 }
 
 /// Bidirectional and invisible characters in the code the app sends never
-/// reach the dialog.
+/// reach the dialog: the request is refused before one opens, and the
+/// dialog's own text drops them as well (a request stored before that
+/// refusal, or the signer's name).
 #[tokio::test]
 async fn the_dialog_shows_no_bidi_or_invisible_characters() {
     let h = harness();
     let mut body = pair_body();
     body["code"] = "4F7\u{202E}-K2Q\u{200B}\u{2066}".into();
     let (code, _) = call(&h, post("/client/pair", None, body)).await;
-    assert_eq!(code, 202);
-    let message = dialog_shown(&h, 1).await;
+    assert_eq!(code, 400);
+    assert_eq!(pending_count(&h), 0, "no request, so no dialog");
+    let message = crate::client_trust::dialog_message("4F7\u{202E}-K2Q\u{200B}\u{2066}", None);
     assert!(message.contains("Code 4F7-K2Q."), "{message}");
     let app = darkmux_platform::SignedApp { signer: "Apple Development: \u{202E}evil".into(), ..fork() };
     let shown = crate::client_trust::dialog_message("X", Some(&app));

@@ -25,6 +25,7 @@ import { onIntentClick } from "../../lib/clickIntent";
 import type { ExecutionTokenReading, LiveState } from "../../lib/tokenRate";
 import { countLine, executionCountText, executionModelId, specDimLabel, type CardFace, type FleetCard } from "./cards";
 import { CardStatus, STATUS_WORD, lampOf, secondLineOf, statusReason } from "./cardStatus";
+import type { MachineAvailability } from "../../lib/machineAvailability";
 import { readingLabel, readingTitle } from "./readingLabel";
 import type { ReadingLabel } from "./readingLabel";
 
@@ -178,10 +179,12 @@ function CardSpec({ card }: { card: FleetCard }) {
 function StatusLine({
   status,
   note,
+  availability,
   reading,
 }: {
   status: CardStatus;
   note: string | null;
+  availability: MachineAvailability;
   reading: { exec: ExecutionTokenReading; state: LiveState } | null;
 }) {
   if (reading) {
@@ -201,7 +204,7 @@ function StatusLine({
     );
   }
   return (
-    <div className="stat" data-lamp={lampOf(status)} title={statusReason(note, status)}>
+    <div className="stat" data-lamp={lampOf(status)} title={statusReason(note, status, availability)}>
       <LampDot form={lampOf(status)} />
       {STATUS_WORD[status]}
     </div>
@@ -531,7 +534,7 @@ export function MachineCard({
       <CardSpec card={card} />
       <CardAsOf asOf={notCurrentAsOf} />
       <div className="mach-body mach-body--scope">
-        <StatusLine status={status} note={card.note} reading={reading} />
+        <StatusLine status={status} note={card.note} availability={card.availability} reading={reading} />
         <CountLine
           card={card}
           face={face}

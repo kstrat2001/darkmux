@@ -11,11 +11,8 @@ import { useLiveSessionIds } from "./useLiveSessionIds";
  * (`fleet_sessions_live_handler` emits it from the same
  * `source_state::coverage_meta` the machines endpoint uses).
  *
- * Nothing was silently wrong ON SCREEN, because `App` mounts
- * `FleetCoverageNotice` app-wide and that notice reads the MACHINES half of
- * the same substrate. But that cover is incidental — a different query, a
- * different mount — and a consumer of this hook had no way to tell "nothing
- * is running" from "we could not look". `useSessionLiveness` was making
+ * A consumer of this hook had no way to tell "nothing is running" from "we
+ * could not look", and (#3662) there is no app-wide notice to cover for it. `useSessionLiveness` was making
  * exactly that mistake (see its own tests).
  *
  * The inverted cases are the point of half this file: a healthy fleet, an

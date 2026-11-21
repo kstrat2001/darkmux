@@ -180,7 +180,7 @@ impl LandlockBackend {
     /// Whether this host can run one, or why not. The kernel is asked once
     /// per process (two short-lived children that try the namespaces and a
     /// root built in them, about a millisecond); every later call, and
-    /// [`backend`](crate::backend) calls it often, reads that answer.
+    /// [`selection`](crate::selection) calls it often, reads that answer.
     pub fn available() -> Result<(), String> {
         static REFUSAL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         match REFUSAL.get_or_init(|| darkmux_platform::current().confine_support().refusal()) {

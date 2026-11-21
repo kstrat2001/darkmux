@@ -1805,10 +1805,7 @@ pub fn turn_delay_ms_with_source() -> (u64, Source) {
 /// host instead of in a container. An **opt-in**: `env(DARKMUX_TESTS_ON_HOST)`
 /// truthy > `config.runtime.tests_on_host` > `false`; an unrecognized token
 /// reads as `false`, so a typo keeps model-written tests in the container.
-pub fn tests_on_host() -> bool {
-    tests_on_host_with_source().0
-}
-/// `tests_on_host` plus WHICH tier resolved it.
+/// The value, and WHICH tier resolved it.
 pub fn tests_on_host_with_source() -> (bool, Source) {
     if let Some(s) = env_str("DARKMUX_TESTS_ON_HOST") {
         return (parse_bool_token(&s).unwrap_or(false), Source::Env);
@@ -2032,11 +2029,9 @@ pub fn memory_pressure_gate() -> Result<crate::config::PressureGate, crate::conf
 /// mods gate): `env(DARKMUX_SANDBOX) > config.runtime.sandbox > this host's
 /// default` ([`sandbox_default`]). An unregistered value is an error naming
 /// the key, never a fallback: every entry point refuses it at preflight.
-pub fn sandbox() -> Result<crate::config::SandboxKind, crate::config_enum::BadEnumValue> {
-    sandbox_with_source().map(|(v, _)| v)
-}
-
-/// [`sandbox`] plus WHICH tier resolved it.
+/// Returned with WHICH tier resolved it. Outside this crate it is read
+/// through `darkmux_sandbox::selection`, at a named entry point (the
+/// workspace guard `tests/sandbox_setting_reads.rs`).
 pub fn sandbox_with_source(
 ) -> Result<(crate::config::SandboxKind, Source), crate::config_enum::BadEnumValue> {
     resolve_enum("runtime.sandbox")
@@ -2957,7 +2952,6 @@ mod location_guard {
         ("detection_degeneracy_policy", "an enum value"),
         ("thermal_pause_at", "an enum value"),
         ("memory_pressure_gate", "an enum value"),
-        ("sandbox", "an enum value"),
         ("sandbox_with_source", "an enum value and its tier"),
         ("sandbox_default", "an enum token"),
         ("sandbox_with_source_in", "an enum value and its tier"),
@@ -3113,7 +3107,8 @@ mod location_guard {
     /// The accessors in `found` that could name a location and are neither
     /// in `read` nor in `excused`. A `_with_source` returns its plain
     /// sibling's value and is covered by it, but only when that sibling
-    /// exists. One that takes arguments cannot be read without them, so it
+    /// exists; one with no sibling (`sandbox_with_source`, read outside this
+    /// crate only at named entry points) must be excused itself. One that takes arguments cannot be read without them, so it
     /// must be excused (its reason names what covers the value, if anything).
     fn unclassified(found: &[(String, String, bool)], read: &[&str], excused: &[&str]) -> Vec<String> {
         let mut out = Vec::new();
@@ -3122,7 +3117,7 @@ mod location_guard {
                 continue;
             }
             if let Some(base) = name.strip_suffix("_with_source") {
-                if !found.iter().any(|(f, _, _)| f == base) {
+                if !found.iter().any(|(f, _, _)| f == base) && !excused.contains(&name.as_str()) {
                     out.push(format!("{name} -> {ty} (a `_with_source` with no `{base}` beside it)"));
                 }
                 continue;
@@ -3260,7 +3255,7 @@ mod sandbox_setting {
             crate::config_enum::resolve_in(s, &crate::config::DarkmuxConfig::default(), none),
             Ok(("docker", Source::BuiltIn))
         );
-        assert_eq!(sandbox(), Ok(crate::config::SandboxKind::Docker));
+        assert_eq!(sandbox_with_source().map(|(v, _)| v), Ok(crate::config::SandboxKind::Docker));
     }
 }
 
@@ -5560,7 +5555,7 @@ mod tests {
             assert!(!cmd_enabled(), "cmd_enabled({token})");
             assert!(!hooks_enabled(), "hooks_enabled({token})");
             assert!(!strict_selection(), "strict_selection({token})");
-            assert!(!tests_on_host(), "tests_on_host({token})");
+            assert!(!tests_on_host_with_source().0, "tests_on_host({token})");
         }
         // Every TRUTHY spelling enables every knob in both families.
         for token in ["1", "true", "TRUE", "yes", "Yes", "on", "ON", " on "] {
@@ -5573,7 +5568,7 @@ mod tests {
             assert!(thermal_enabled(), "thermal_enabled({token})");
             assert!(cmd_enabled(), "cmd_enabled({token})");
             assert!(strict_selection(), "strict_selection({token})");
-            assert!(tests_on_host(), "tests_on_host({token})");
+            assert!(tests_on_host_with_source().0, "tests_on_host({token})");
         }
         // An UNRECOGNIZED token is where the two families legitimately
         // differ, and the difference is the POINT: an opt-out must not be
@@ -5588,7 +5583,7 @@ mod tests {
         assert!(!cmd_enabled(), "an opt-IN stays off for an unrecognized token");
         assert!(!hooks_enabled(), "…same");
         assert!(!strict_selection(), "…same");
-        assert!(!tests_on_host(), "…same: a typo keeps model-written tests in the container");
+        assert!(!tests_on_host_with_source().0, "…same: a typo keeps model-written tests in the container");
 
         unsafe {
             for (n, v) in prev {

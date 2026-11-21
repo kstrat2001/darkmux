@@ -121,6 +121,10 @@ impl Platform for OtherPlatform {
         None
     }
 
+    fn tcp_ends_held_by(&self, _pid: u32, _local: std::net::SocketAddr) -> Option<Vec<std::net::SocketAddr>> {
+        None
+    }
+
     fn tcp_port_listeners(&self, _port: u16) -> Option<Vec<crate::PortListener>> {
         None
     }
