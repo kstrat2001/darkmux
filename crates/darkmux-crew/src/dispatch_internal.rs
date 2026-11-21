@@ -16076,7 +16076,76 @@ fn switch_notice_for(engine_id: &str, loading: engine::Loading, could_hold: Opti
 /// servers and unloads its idle LM Studio loads to make room, or is refused
 /// `wont_fit`, `busy` or `memory_in_use`.
 pub(crate) fn ensure_model_loaded_at_ctx_from(pm: &darkmux_types::ProfileModel, source: WindowSource) -> Result<PreflightHold> {
-    preflight_load(pm, source, &crate::lms_room::ThisPreflight)
+    let hold = preflight_load(pm, source, &crate::lms_room::ThisPreflight)?;
+    // (#3578) A resident model is no use while LM Studio's local server is
+    // off: when LM Studio reports it off on this machine, start it, as
+    // darkmux starts the engine servers it manages. No report (a stand-in
+    // `lms`) starts nothing. One process starts it once (the check holds
+    // its own lock); a start that fails refuses the dispatch.
+    let port = darkmux_types::endpoint::url_port(&darkmux_types::config_access::lmstudio_url());
+    lmstudio_server_for_dispatch(engine::ensure_lmstudio_server(), port, &mut |r| {
+        let _ = darkmux_flow::record(r);
+    })?;
+    Ok(hold)
+}
+
+/// (#3578) What a dispatch does with the LM Studio server check's outcome:
+/// a start is said on stderr and recorded (`machine.engine_server.start`);
+/// a start that failed is recorded at error level
+/// (`machine.engine_server.error`) and refuses the dispatch
+/// `engine_unavailable`, naming the command to run, so it never goes on to
+/// a refused connection.
+pub(crate) fn lmstudio_server_for_dispatch(
+    outcome: std::result::Result<engine::ServerStart, engine::ServerStartFailed>,
+    port: Option<u16>,
+    sink: &mut dyn FnMut(darkmux_flow::FlowRecord),
+) -> Result<()> {
+    use darkmux_flow::{payload::EngineServerPayload, Level, Payload};
+    let payload = |command: String, elapsed_ms, error| EngineServerPayload {
+        engine: darkmux_types::default_engine::LMSTUDIO.to_string(),
+        port,
+        command,
+        elapsed_ms,
+        error,
+    };
+    match outcome {
+        Ok(engine::ServerStart::NotNeeded) => Ok(()),
+        Ok(engine::ServerStart::Started { command, elapsed_ms }) => {
+            eprintln!("darkmux dispatch: started LM Studio's local server (`{command}`). (#3578)");
+            sink(machine_record(Level::Info, Payload::MachineEngineServerStart(payload(command, Some(elapsed_ms), None))));
+            Ok(())
+        }
+        Err(failed) => {
+            let p = payload(failed.command.clone(), None, Some(failed.detail.clone()));
+            sink(machine_record(Level::Error, Payload::MachineEngineServerError(p)));
+            Err(crate::engine_dispatch::refuse(darkmux_types::client_code::ClientCode::EngineUnavailable, failed.to_string()).into())
+        }
+    }
+}
+
+/// A record of this machine's state: no session, no execution.
+fn machine_record(level: darkmux_flow::Level, payload: darkmux_flow::Payload) -> darkmux_flow::FlowRecord {
+    darkmux_flow::FlowRecord {
+        ts: darkmux_flow::ts_utc_now(),
+        level,
+        category: darkmux_flow::Category::Machinery,
+        tier: darkmux_flow::Tier::Darkmux,
+        stage: darkmux_flow::Stage::Dispatch,
+        action: payload.action(),
+        handle: "darkmux".to_string(),
+        phase_id: None,
+        session_id: None,
+        execution_id: None,
+        source: None,
+        model: None,
+        reasoning: None,
+        mission_id: None,
+        machine_id: None,
+        machine_uid: None,
+        prev_hash: None,
+        hash: None,
+        payload: Some(payload),
+    }
 }
 
 /// [`ensure_model_loaded_at_ctx_from`] against `gate`'s LM Studio and

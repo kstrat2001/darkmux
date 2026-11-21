@@ -1035,7 +1035,9 @@ fn profile_list_names_each_defined_endpoint() {
 /// `startable`, a model on LM Studio while LM Studio does not answer is
 /// `unknown`, and an unmanaged endpoint is `external`. The registry is still
 /// printed as before. Fakes stand in for `lms` and `tensorfold-native`, and
-/// each logs its calls: the listing loads and starts nothing. (#3574) A
+/// each logs its calls: the listing loads and starts nothing, and asks LM
+/// Studio's server only for its status (`lms server status --json`, #3578),
+/// never to start. (#3574) A
 /// model the engine does not list is `unavailable` with its dispatch code.
 #[test]
 fn profile_list_json_reports_each_models_availability() {
@@ -1102,7 +1104,7 @@ fn profile_list_json_reports_each_models_availability() {
     }
     let log = fs::read_to_string(&calls).unwrap();
     for line in log.lines() {
-        let read_only = ["lms ps", "lms ls", "lms --version", "tensorfold-native --version", "tensorfold-native capabilities", "tensorfold-native models"];
+        let read_only = ["lms ps", "lms ls", "lms --version", "lms server status --json", "tensorfold-native --version", "tensorfold-native capabilities", "tensorfold-native models"];
         // `serve --help` prints the usage and exits; `serve <model>` would start a server.
         let usage = line.trim_end() == "tensorfold-native serve --help";
         assert!(usage || read_only.iter().any(|r| line.starts_with(r)), "a listing asks only read-only questions: {line}");

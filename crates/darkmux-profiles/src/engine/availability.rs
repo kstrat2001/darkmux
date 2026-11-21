@@ -23,8 +23,8 @@
 //! where it matters). An engine with no answer within its bound and the
 //! reap grace reads `unknown`.
 //! It loads and starts nothing: the
-//! only questions are an engine's own read-only ones (LM Studio's residents
-//! and downloaded models, the Tensorfold binary's `--version`,
+//! only questions are an engine's own read-only ones (LM Studio's residents,
+//! downloaded models and whether its local server runs, the Tensorfold binary's `--version`,
 //! `capabilities --json`, `serve --help` and `models --json`), darkmux's
 //! server records, and whether a port answers.
 //!
@@ -366,10 +366,17 @@ pub struct LmStudioAnswer {
     pub loaded: Result<Vec<LoadedModel>, String>,
     /// The models it has downloaded, with every name it loads each by.
     pub catalog: Result<Vec<super::ModelMeta>, String>,
+    /// (#3578) Its local server (the one a dispatch sends to), as LM Studio
+    /// reports it. `lms` answers from the app while the server is off, so a
+    /// model can be loaded and still not answer a dispatch; a dispatch then
+    /// starts the server, so the model reads `startable`. Never learned by
+    /// connecting to the server.
+    pub server: super::LmStudioServer,
 }
 
 impl LmStudioAnswer {
-    /// Its residents and its downloaded models, asked at the same time.
+    /// Its residents, its downloaded models and its server, asked at the
+    /// same time.
     pub fn ask() -> Self {
         let msg = |e: anyhow::Error| format!("{e:#}");
         let cap = crate::gestalt_host::lms_host::deadline_cap();
@@ -384,7 +391,11 @@ impl LmStudioAnswer {
                     super::lmstudio().catalog().map_err(msg)
                 })
             });
+            let server = s.spawn(|| {
+                crate::gestalt_host::lms_host::with_deadline_cap(cap, super::lmstudio_server)
+            });
             LmStudioAnswer {
+                server: server.join().unwrap_or(super::LmStudioServer::Unknown),
                 loaded: loaded
                     .join()
                     .unwrap_or_else(|_| Err("listing its residents panicked".into())),
@@ -406,37 +417,32 @@ impl EngineAnswer for LmStudioAnswer {
             Ok(l) => l,
             Err(e) => return Availability::unknown(format!("LM Studio did not answer: {e}")),
         };
-        // The planner's own residency rule: darkmux's instance of the model,
-        // at the profile's context or more, is what a dispatch reuses. A
-        // copy someone else loaded is never one (contract 4).
         let key = darkmux_gestalt::bare_model_key(&model.id).to_string();
-        let placement = darkmux_gestalt::Placement {
-            model_key: key.clone(),
-            identifier: crate::ownership::namespaced_identifier(model),
-            min_ctx: n_ctx,
-            seat: "availability".into(),
-        };
-        let residents: Vec<darkmux_gestalt::ResidentFact> = loaded
-            .iter()
-            .map(|m| darkmux_gestalt::ResidentFact {
-                identifier: m.identifier.clone(),
-                model_key: m.model.clone(),
-                ctx: m.context,
-                est_bytes: None,
-                parallel: 0,
-            })
-            .collect();
-        if matches!(
-            darkmux_gestalt::decide_residency(&residents, &placement),
-            darkmux_gestalt::ResidencyDecision::Reuse { .. }
-        ) {
-            return Availability::resident();
+        if reuses_darkmuxs_instance(loaded, model, &key, n_ctx) {
+            // (#3578) Held, but LM Studio reports its server off: a dispatch
+            // starts the server first.
+            return if self.server == super::LmStudioServer::Off {
+                Availability::startable()
+            } else {
+                Availability::resident()
+            };
         }
+        self.by_catalog(&key)
+    }
+
+    fn residents(&self) -> Option<Vec<LoadedModel>> {
+        self.loaded.as_ref().ok().cloned()
+    }
+}
+
+impl LmStudioAnswer {
+    /// Not resident: `startable` when LM Studio has the model downloaded.
+    fn by_catalog(&self, key: &str) -> Availability {
         match &self.catalog {
             Err(e) => {
                 Availability::unknown(format!("LM Studio did not list its downloaded models: {e}"))
             }
-            Ok(models) if models.iter().any(|m| m.answers_to(&key)) => Availability::startable(),
+            Ok(models) if models.iter().any(|m| m.answers_to(key)) => Availability::startable(),
             // The wave planner's `UnknownModelKey`: `engine_unavailable`.
             Ok(_) => Availability::refused(
                 ClientCode::EngineUnavailable,
@@ -444,10 +450,32 @@ impl EngineAnswer for LmStudioAnswer {
             ),
         }
     }
+}
 
-    fn residents(&self) -> Option<Vec<LoadedModel>> {
-        self.loaded.as_ref().ok().cloned()
-    }
+/// The planner's own residency rule: darkmux's instance of the model, at
+/// the profile's context or more, is what a dispatch reuses. A copy
+/// someone else loaded is never one (contract 4).
+fn reuses_darkmuxs_instance(loaded: &[LoadedModel], model: &ProfileModel, key: &str, n_ctx: u32) -> bool {
+    let placement = darkmux_gestalt::Placement {
+        model_key: key.to_string(),
+        identifier: crate::ownership::namespaced_identifier(model),
+        min_ctx: n_ctx,
+        seat: "availability".into(),
+    };
+    let residents: Vec<darkmux_gestalt::ResidentFact> = loaded
+        .iter()
+        .map(|m| darkmux_gestalt::ResidentFact {
+            identifier: m.identifier.clone(),
+            model_key: m.model.clone(),
+            ctx: m.context,
+            est_bytes: None,
+            parallel: 0,
+        })
+        .collect();
+    matches!(
+        darkmux_gestalt::decide_residency(&residents, &placement),
+        darkmux_gestalt::ResidencyDecision::Reuse { .. }
+    )
 }
 
 // ─── Tensorfold ──────────────────────────────────────────────────────────

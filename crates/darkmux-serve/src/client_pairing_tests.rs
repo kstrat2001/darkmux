@@ -3216,6 +3216,71 @@ printf '{\"result\":\"refused\",\"code\":\"busy\",\"error\":\"held\"}'\necho 'he
     let e = run_dispatch_child(&no, &spec, &CancelFlag::default(), GRACE, &FakeTeardown::default()).unwrap_err();
     assert_eq!((e.reason.as_str(), e.code.as_deref()), ("exit 1", Some("busy")), "{e:?}");
     assert_eq!(e.error, "held");
+
+    // (#3578) A dispatch that never reached the model prints its error
+    // envelope and exits 1: a failed run with the envelope's error, never
+    // `done` (Mux Bot showed "Changed nothing").
+    let down = dir.path().join("down");
+    std::fs::write(
+        &down,
+        "#!/bin/sh\ncat >/dev/null\nprintf '{\"result\":\"error\",\"error\":\"Connection refused (os error 61)\"}'\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&down, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let e = run_dispatch_child(&down, &spec, &CancelFlag::default(), GRACE, &FakeTeardown::default()).unwrap_err();
+    assert_eq!(e.reason, "exit 1");
+    assert!(e.error.contains("Connection refused"), "{e:?}");
+}
+
+/// (#3578, operator decision) A run is judged by its envelope's `result`,
+/// not the exit code: only `error` and `refused` are failures. An escalated
+/// run (`escalation_*`, which exits 1) is done, with its answer and its
+/// result for the client to read. No envelope at all is a failure whatever
+/// the exit code: there is nothing to report as done.
+#[test]
+fn an_envelope_is_judged_by_its_result_not_the_exit_code() {
+    let error = r#"{"result":"error","error":"Connection refused (os error 61)"}"#;
+    let escalated = r#"{"result":"escalation_compaction_limit_reached","final_assistant":"partial"}"#;
+    let refused = r#"{"result":"refused","code":"busy","error":"held"}"#;
+    assert_eq!(read_envelope(error).unwrap_err(), (None, Some("Connection refused (os error 61)".into())));
+    assert_eq!(read_envelope(refused).unwrap_err(), (Some("busy".into()), Some("held".into())));
+    assert_eq!(read_envelope("not json").unwrap_err(), (None, None));
+    let done = read_envelope(escalated).unwrap();
+    assert_eq!((done["result"].as_str(), done["final_assistant"].as_str()), (Some("escalation_compaction_limit_reached"), Some("partial")));
+}
+
+/// The same through the child runner: an escalated dispatch exits 1 and its
+/// envelope is the run's result, never an error.
+#[test]
+fn an_escalated_dispatch_is_done_with_its_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = WorkSpec {
+        work_id: "w".into(),
+        role: "coder".into(),
+        profile: "p".into(),
+        workdir: None,
+        message: "go".into(),
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let esc = dir.path().join("esc");
+    std::fs::write(
+        &esc,
+        "#!/bin/sh\ncat >/dev/null\nprintf '{\"result\":\"escalation_compaction_limit_reached\",\"final_assistant\":\"partial\"}'\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&esc, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let v = run_dispatch_child(&esc, &spec, &CancelFlag::default(), GRACE, &FakeTeardown::default()).unwrap();
+    assert_eq!(v["result"], "escalation_compaction_limit_reached");
+}
+
+/// The envelope's error leads a failed run's text, unless stderr already
+/// carries it.
+#[test]
+fn a_failed_runs_text_leads_with_the_envelope_error_once() {
+    assert_eq!(failure_tail(Some("refused".into()), "boom\n".into()), "refused\nboom");
+    assert_eq!(failure_tail(Some("boom".into()), "boom".into()), "boom");
+    assert_eq!(failure_tail(Some(String::new()), "boom".into()), "boom");
+    assert_eq!(failure_tail(None, "boom".into()), "boom");
 }
 
 // ─── Cancel ──────────────────────────────────────────────────────────────

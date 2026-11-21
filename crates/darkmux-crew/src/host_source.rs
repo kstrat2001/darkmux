@@ -581,6 +581,11 @@ pub(crate) const NON_PRODUCER_SOURCE_PATHS: &[(&str, &str)] = &[
          it builds no record",
     ),
     (
+        "crates/darkmux-flow/src/payload/engine_server.rs",
+        "(#3578) declares `EngineServerPayload`; its `machine.engine_server.*` literals are its \
+         own tests' wire spellings, and nothing there builds a record",
+    ),
+    (
         "crates/darkmux-flow/src/action.rs",
         "the action vocabulary itself: every wire string is declared there, and nothing \
          there builds a record",
@@ -681,6 +686,18 @@ pub const HOST_READING_ACTIONS: &[(FlowAction, StampDuty)] = &[
     (
         FlowAction::MachineOffline,
         StampDuty::Exempt("presence edge, same shape as machine.online"),
+    ),
+    (
+        FlowAction::MachineEngineServerStart,
+        StampDuty::Exempt(
+            "(#3578) darkmux started LM Studio's own server for a dispatch: the payload is the \
+             engine, port, command and how long it took, no host reading, and the record exists \
+             because LM Studio reported its server off, never because of a host reading",
+        ),
+    ),
+    (
+        FlowAction::MachineEngineServerError,
+        StampDuty::Exempt("(#3578) that start failed: same shape as machine.engine_server.start"),
     ),
     // ── dispatch-scoped: session records, but the reading in them is this
     // machine's, and two of them are Warn.

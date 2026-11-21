@@ -16,6 +16,7 @@ import type { DispatchStartPayload } from "./DispatchStartPayload";
 import type { DispatchToolPayload } from "./DispatchToolPayload";
 import type { DispatchTurnPayload } from "./DispatchTurnPayload";
 import type { DispatchWorkdirGitUnavailablePayload } from "./DispatchWorkdirGitUnavailablePayload";
+import type { EngineServerPayload } from "./EngineServerPayload";
 import type { GhVerbExecutedPayload } from "./GhVerbExecutedPayload";
 import type { HookDeliveryPayload } from "./HookDeliveryPayload";
 import type { HookDryRunPayload } from "./HookDryRunPayload";
@@ -87,6 +88,8 @@ export type FlowPayloads = {
   "machine.thermal": MachineThermalPayload,
   "machine.battery": MachineBatteryPayload,
   "machine.battery_health": MachineBatteryHealthPayload,
+  "machine.engine_server.start": EngineServerPayload,
+  "machine.engine_server.error": EngineServerPayload,
   "mission.start": OpenPayload,
   "mission.close": OpenPayload,
   "mission.abort": OpenPayload,

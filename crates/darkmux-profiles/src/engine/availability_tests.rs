@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::engine::tensorfold::{parse_capabilities, parse_version, Version};
+use crate::engine::LmStudioServer;
 use darkmux_types::engine_record::{self, EngineRecord, ENGINE_RECORD_SCHEMA};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -329,6 +330,7 @@ fn lms_model() -> ProfileModel {
 #[test]
 fn lm_studio_judges_by_darkmuxs_own_instance_and_its_catalog() {
     let answer = |loaded: Vec<LoadedModel>, catalog: &[&str]| LmStudioAnswer {
+        server: LmStudioServer::Unknown,
         loaded: Ok(loaded),
         catalog: Ok(catalog.iter().map(|s| meta(s)).collect()),
     };
@@ -351,10 +353,143 @@ fn lm_studio_judges_by_darkmuxs_own_instance_and_its_catalog() {
     assert!(none.reason.unwrap().contains("`qwen`"));
 }
 
+/// (#3578) LM Studio holding darkmux's instance while it reports its local
+/// server off (a dispatch would be refused at connect): the model reads
+/// `startable`, since a dispatch starts the server first, never `resident`.
+/// A server it reports running, or no report, leaves it `resident`.
+#[test]
+fn lm_studio_with_its_server_off_is_startable_not_resident() {
+    let held = |server| LmStudioAnswer {
+        server,
+        loaded: Ok(vec![lm("darkmux:qwen", "qwen", 65536)]),
+        catalog: Ok(vec![meta("qwen")]),
+    };
+    assert_eq!(held(LmStudioServer::Off).judge(&lms_model()), Availability::startable());
+    assert_eq!(held(LmStudioServer::Running).judge(&lms_model()), Availability::resident());
+    assert_eq!(held(LmStudioServer::Unknown).judge(&lms_model()), Availability::resident());
+}
+
+/// (#3578) A listing asks LM Studio whether its server runs
+/// (`lms server status --json`) when `lmstudio_url` is this machine's, and
+/// not at all when it names another machine, which this `lms` knows nothing
+/// of.
+#[test]
+#[serial_test::serial]
+fn a_listing_takes_the_server_state_from_lm_studio_on_this_machine_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let argv = dir.path().join("argv");
+    let lms = dir.path().join("lms");
+    std::fs::write(
+        &lms,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$1\" in\n  ps|ls) echo '[]';;\n  server) echo '{{\"running\":false}}';;\nesac\nexit 0\n",
+            argv.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&lms, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ask = |url: &str| {
+        with_env(&[("DARKMUX_LMS_BIN", lms.to_str().unwrap()), ("DARKMUX_LMSTUDIO_URL", url)], LmStudioAnswer::ask)
+    };
+    assert_eq!(ask("http://localhost:1234").server, LmStudioServer::Off);
+    let asked = std::fs::read_to_string(&argv).unwrap();
+    assert!(asked.lines().any(|l| l == "server status --json"), "{asked}");
+    std::fs::remove_file(&argv).unwrap();
+    assert_eq!(ask("http://192.0.2.10:1234").server, LmStudioServer::Unknown);
+    let asked = std::fs::read_to_string(&argv).unwrap();
+    assert!(!asked.contains("server"), "another machine's server is not asked about: {asked}");
+}
+
+/// (#3578) A stand-in for LM Studio (a test's fake engine on `lmstudio_url`,
+/// a fake `lms` that says nothing about its server) is never connected to
+/// and never started: a listing and the dispatch preflight's server check
+/// take the server's state from LM Studio's own report, and do nothing when
+/// it gives none. A connection to the stand-in is one more request it
+/// counts; a start against a stand-in that never comes up stalls a dispatch.
+#[test]
+#[serial_test::serial]
+fn a_stand_in_lm_studio_is_never_connected_to_or_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let argv = dir.path().join("argv");
+    let lms = dir.path().join("lms");
+    std::fs::write(
+        &lms,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$1\" in\n  ps|ls) echo '[]';;\nesac\nexit 0\n",
+            argv.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&lms, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A stand-in that listens, and a loopback port nothing listens on.
+    let stand_in = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    stand_in.set_nonblocking(true).unwrap();
+    let listening = format!("http://127.0.0.1:{}", stand_in.local_addr().unwrap().port());
+    let closed = format!("http://127.0.0.1:{}", free_port());
+    for url in [&listening, &closed] {
+        let started = with_env(
+            &[("DARKMUX_LMS_BIN", lms.to_str().unwrap()), ("DARKMUX_LMSTUDIO_URL", url)],
+            || {
+                let _ = LmStudioAnswer::ask();
+                let at = std::time::Instant::now();
+                (crate::engine::ensure_lmstudio_server(), at.elapsed())
+            },
+        );
+        assert_eq!(started.0, Ok(crate::engine::ServerStart::NotNeeded), "{url}");
+        assert!(stand_in.accept().is_err(), "{url}: something connected to the stand-in LM Studio");
+        assert!(started.1 < Duration::from_secs(5), "{url}: the check waited {:?}", started.1);
+    }
+    let argv = std::fs::read_to_string(&argv).unwrap_or_default();
+    assert!(!argv.contains("server start"), "a server start ran against a stand-in:\n{argv}");
+}
+
+/// (#3578 review) A server LM Studio still reports off once `lms server
+/// start` has returned did not start: that is said at once, naming the
+/// command to run, after one more status check (the start command returns
+/// only when it is done, so there is nothing to wait for). A later check in
+/// the same process, while LM Studio still reports it off, fails the same
+/// way without running the start again.
+#[test]
+#[serial_test::serial]
+fn a_server_that_does_not_come_up_fails_at_once_and_is_not_started_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let argv = dir.path().join("argv");
+    let lms = dir.path().join("lms");
+    std::fs::write(
+        &lms,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$1\" in\n  server) [ \"$2\" = status ] && echo '{{\"running\":false}}';;\nesac\nexit 0\n",
+            argv.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&lms, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let port = free_port();
+    let url = format!("http://127.0.0.1:{port}");
+    let at = std::time::Instant::now();
+    let (first, second) = with_env(
+        &[("DARKMUX_LMS_BIN", lms.to_str().unwrap()), ("DARKMUX_LMSTUDIO_URL", &url)],
+        || (crate::engine::ensure_lmstudio_server(), crate::engine::ensure_lmstudio_server()),
+    );
+    eprintln!("two checks of a server that never comes up took {:?}", at.elapsed());
+    for (which, r) in [("first", &first), ("second", &second)] {
+        let e = r.as_ref().map(|_| ()).unwrap_err().to_string();
+        assert!(e.contains(&format!("lms server start --port {port}")), "{which}: {e}");
+    }
+    let argv = std::fs::read_to_string(&argv).unwrap();
+    let count = |verb: &str| argv.lines().filter(|l| l.starts_with(verb)).count();
+    assert_eq!(count("server start"), 1, "started once:\n{argv}");
+    assert_eq!(count("server status"), 3, "before and after the start, then once for the second check:\n{argv}");
+}
+
 /// LM Studio not answering is `unknown`, never `unavailable`.
 #[test]
 fn lm_studio_down_is_unknown() {
     let down = LmStudioAnswer {
+        server: LmStudioServer::Unknown,
         loaded: Err("running `lms ps --json`: exited 1".into()),
         catalog: Ok(vec![meta("qwen")]),
     };
@@ -362,6 +497,7 @@ fn lm_studio_down_is_unknown() {
     assert_eq!(state(&a), AvailabilityState::Unknown, "{a:?}");
     assert!(a.reason.unwrap().contains("LM Studio did not answer"));
     let no_catalog = LmStudioAnswer {
+        server: LmStudioServer::Unknown,
         loaded: Ok(vec![]),
         catalog: Err("`lms ls --json` exited with status 1".into()),
     };
@@ -543,6 +679,7 @@ fn a_model_with_no_context_or_port_is_unavailable() {
     let mut no_ctx = lms_model();
     no_ctx.n_ctx = None;
     let lms = LmStudioAnswer {
+        server: LmStudioServer::Unknown,
         loaded: Ok(vec![]),
         catalog: Ok(vec![meta("qwen")]),
     }
@@ -1064,7 +1201,7 @@ fn each_engines_unavailable_carries_the_code_its_dispatch_refusal_carries() {
     let dir = tempfile::tempdir().unwrap();
     // LM Studio: a model it has not downloaded is the planner's
     // `UnknownModelKey`, `engine_unavailable`.
-    let lms = LmStudioAnswer { loaded: Ok(vec![]), catalog: Ok(vec![meta("other")]) }.judge(&lms_model());
+    let lms = LmStudioAnswer { server: LmStudioServer::Unknown, loaded: Ok(vec![]), catalog: Ok(vec![meta("other")]) }.judge(&lms_model());
     assert_eq!((state(&lms), code(&lms)), (AvailabilityState::Unavailable, Some("engine_unavailable")), "{lms:?}");
 
     // Tensorfold: `plan`'s `verified_version` is `engine_unavailable`, its
@@ -1128,7 +1265,7 @@ fn no_code_where_no_dispatch_refusal_fits() {
     let dir = tempfile::tempdir().unwrap();
     let mut no_ctx = lms_model();
     no_ctx.n_ctx = None;
-    let lms = LmStudioAnswer { loaded: Ok(vec![]), catalog: Ok(vec![meta("qwen")]) }.judge(&no_ctx);
+    let lms = LmStudioAnswer { server: LmStudioServer::Unknown, loaded: Ok(vec![]), catalog: Ok(vec![meta("qwen")]) }.judge(&no_ctx);
     assert_eq!((state(&lms), code(&lms)), (AvailabilityState::Unavailable, None));
     let mut no_port = tf_model(free_port(), "[]");
     no_port.endpoint.as_mut().unwrap().port = None;
