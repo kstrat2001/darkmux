@@ -8011,7 +8011,7 @@ mod tests {
     /// contains "SET") and the final `DEL <presence key>` arrive in one read,
     /// and a match on the substring "SET" plus the key counted that as a
     /// second beat. Only a real `SET` command counts here.
-    fn recorded_sets<'a>(entries: &'a [String], key: impl Fn(&str) -> bool) -> Vec<&'a str> {
+    fn recorded_sets(entries: &[String], key: impl Fn(&str) -> bool) -> Vec<&str> {
         const SET: &str = "$3\r\nSET\r\n";
         let mut values = Vec::new();
         for entry in entries {
