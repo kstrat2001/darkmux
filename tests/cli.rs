@@ -15500,8 +15500,33 @@ fn console_run(args: &[&str], remote: bool, extra: &[(&str, &str)]) -> String {
 
 fn assert_no_console_secret(what: &str, text: &str) {
     for s in CONSOLE_SECRETS {
-        assert!(!text.contains(s), "{what} shows `{s}` to a remote viewer:\n{text}");
+        assert!(!shows_secret(text, s), "{what} shows `{s}` to a remote viewer:\n{text}");
     }
+}
+
+/// Whether `text` shows the fixture secret `s`. A number (the fixture's
+/// port) counts only as a whole number: doctor prints the daemon's pid, and
+/// a pid like 18766 is not the port 8766.
+fn shows_secret(text: &str, s: &str) -> bool {
+    if !s.bytes().all(|b| b.is_ascii_digit()) {
+        return text.contains(s);
+    }
+    let digit_at = |i: Option<usize>| {
+        i.and_then(|i| text.as_bytes().get(i))
+            .is_some_and(u8::is_ascii_digit)
+    };
+    text.match_indices(s)
+        .any(|(at, _)| !digit_at(at.checked_sub(1)) && !digit_at(Some(at + s.len())))
+}
+
+#[test]
+fn a_numeric_console_secret_is_matched_only_as_a_whole_number() {
+    assert!(!shows_secret("pid\n  18766", "8766"), "a pid that contains the port");
+    assert!(!shows_secret("87660 bytes", "8766"));
+    assert!(shows_secret("listening on 8766", "8766"));
+    assert!(shows_secret("http://127.0.0.1:8766/", "8766"));
+    assert!(shows_secret("8766", "8766"));
+    assert!(shows_secret("a tailnet-example b", "tailnet-example"));
 }
 
 /// `config list` for a remote viewer: every value that names an address, a
@@ -15636,7 +15661,7 @@ fn every_console_panel_serves_a_remote_viewer_redacted_and_this_machine_in_full(
             body["withheld"].as_str().unwrap_or_default()
         ));
         for s in CONSOLE_SECRETS.iter().chain(&[".ts.net", "/Users/", scratch.as_str()]) {
-            if shown.contains(s) {
+            if shows_secret(&shown, s) {
                 failures.push(format!("panel {id} shows `{s}` to a remote viewer:\n{shown}"));
             }
         }
