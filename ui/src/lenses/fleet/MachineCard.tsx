@@ -27,6 +27,7 @@ import { countLine, executionCountText, executionModelId, specDimLabel, type Car
 import { CardStatus, STATUS_WORD, lampOf, secondLineOf, statusReason } from "./cardStatus";
 import type { MachineAvailability } from "../../lib/machineAvailability";
 import { readingLabel, readingTitle } from "./readingLabel";
+import type { ReadingLabel } from "./readingLabel";
 
 /** Every machine card drills to the RUNS lens, pinned to that machine.
  *
@@ -191,21 +192,14 @@ function StatusLine({
     const label = readingLabel(exec, state);
     return (
       <div
-        className="stat mach-scope__rate"
+        className={label.kind === "toolGen" ? "stat mach-scope__rate mach-scope__rate--parts" : "stat mach-scope__rate"}
         data-tone={state}
         data-carried={exec.carried ? "true" : "false"}
         data-thinking={state === "generating" && exec.thinking === true ? "true" : undefined}
         title={readingTitle(exec, state)}
       >
         <LampDot form={LampForm.Filled} />
-        {label.kind === "text" ? (
-          label.text
-        ) : (
-          <>
-            <span className="mach-scope__why mach-scope__why--full">{label.full}</span>
-            <span className="mach-scope__why mach-scope__why--word">{label.word}</span>
-          </>
-        )}
+        <ReadingWords label={label} />
       </div>
     );
   }
@@ -214,6 +208,28 @@ function StatusLine({
       <LampDot form={lampOf(status)} />
       {STATUS_WORD[status]}
     </div>
+  );
+}
+
+/** The reading's words. A `byWidth` or `toolGen` label carries both forms;
+ *  the stylesheet shows one by the viewport's width. */
+function ReadingWords({ label }: { label: ReadingLabel }) {
+  if (label.kind === "text") return <>{label.text}</>;
+  if (label.kind === "byWidth") {
+    return (
+      <>
+        <span className="mach-scope__why mach-scope__why--full">{label.full}</span>
+        <span className="mach-scope__why mach-scope__why--word">{label.word}</span>
+      </>
+    );
+  }
+  // (#2971) The name's own box ellipsizes; the seconds never shrink.
+  return (
+    <>
+      <span className="mach-scope__why mach-scope__why--full">{"tool gen · "}</span>
+      <span className="mach-scope__tool">{label.tool}</span>
+      <span className="mach-scope__secs">{` · ${label.seconds}`}</span>
+    </>
   );
 }
 

@@ -4224,6 +4224,34 @@ body {
     display: inline;
   }
 }
+/* (#2971) TOOL GEN of a named tool ("tool gen · write · 18s") in parts: on
+   a phone "tool gen · " goes (the `--full` rule above; the tube already says
+   TOOL GEN), and a name too long for the line ellipsizes inside its own box,
+   so the seconds after it are always on screen. The line stays one line, the
+   same height as every other reading. Centered on a desktop, like the
+   status line's plain text. */
+.mach .stat.mach-scope__rate--parts {
+  display: flex;
+  align-items: baseline;
+}
+@media (min-width: 561px) {
+  .mach .stat.mach-scope__rate--parts {
+    justify-content: center;
+  }
+}
+/* The dot sits mid-line, as `vertical-align: middle` puts it on a plain line. */
+.mach-scope__rate--parts > .lamp-dot {
+  align-self: center;
+}
+.mach-scope__rate--parts > .mach-scope__why,
+.mach-scope__secs {
+  white-space: pre;
+}
+.mach-scope__tool {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .mach .runs {
   margin-top: 5px;
   font: calc(12px * var(--fs-scale)) var(--font-mono);

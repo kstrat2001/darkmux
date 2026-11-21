@@ -15,7 +15,7 @@
 // Each state first asserts the words it must show, so a fixture that slid
 // into another state fails here rather than measuring one state N times.
 const { test, expect } = require("@playwright/test");
-const { STATES, MULTI, PLAYBACK_NOW, VIEWPORTS, SELF_ROW, PEER_ROW, ONE_ICON_ROW, NO_ICON_ROW, OFFLINE_ROW, installLayoutRoutes, measure } = require("./lib/layout-fixture.js");
+const { STATES, MULTI, TOOLGEN_LONG, PLAYBACK_NOW, VIEWPORTS, SELF_ROW, PEER_ROW, ONE_ICON_ROW, NO_ICON_ROW, OFFLINE_ROW, installLayoutRoutes, measure } = require("./lib/layout-fixture.js");
 
 const RUN = {
   modelbox: ".session-run .modelbox",
@@ -35,11 +35,6 @@ const CARD = { card: ".mach", cardScope: ".mach-scope", rateLine: ".mach-scope__
 // runs, the live reading itself (`.stat.mach-scope__rate`). One line in
 // every state, so measured across all of them.
 const STAT = ".mach .stat";
-// (#2955 review) Status lines that overflow their one-line slot on a phone
-// and are ellipsized, already on origin/main before #2955 (measured there:
-// scrollWidth 203 > clientWidth 184). Owned by the fixme at the end of this
-// file; every other state with a reading must fit.
-const PHONE_OVERFLOW = new Set(["toolgen-named", "armed-toolgen"]);
 
 /** (#2955 review) How the status line LOOKS: its words' color and weight,
  *  and its dot's color. "disconnected" must look the same on every card. */
@@ -217,7 +212,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
         } else if (state.rateText) {
           await expect(page.locator(CARD.rateLine).first(), `${state.id}: the card must reach this state`).toHaveText(state.rateText instanceof RegExp ? state.rateText : new RegExp(state.rateText));
           // (#2955 review) Every reading fits its one line, not just REST's.
-          if (!(vpName === "phone" && PHONE_OVERFLOW.has(state.id))) await expectFits(page.locator(CARD.rateLine).first(), `${state.id}: fleet card status line (${vpName}, ${mode})`);
+          await expectFits(page.locator(CARD.rateLine).first(), `${state.id}: fleet card status line (${vpName}, ${mode})`);
         } else {
           await expect(page.locator(CARD.rateLine)).toHaveCount(0);
         }
@@ -467,7 +462,7 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
       expect(m.card, `${id}: exactly one card`).toHaveLength(1);
       rows.push({ state: id, card: m.card[0] });
     };
-    for (const state of [...STATES, MULTI]) {
+    for (const state of [...STATES, MULTI, ...TOOLGEN_LONG]) {
       const { ctx, page } = await openState(browser, viewport, state, { mode: "live", surface: "fleet" });
       await expect(page.locator(CARD.card)).toHaveCount(1);
       await measureCard(page, state.id);
@@ -505,22 +500,46 @@ for (const [vpName, viewport] of Object.entries(VIEWPORTS)) {
   });
 }
 
-// (#2955 review) On a phone, "tool gen · write · 18s" does not fit the fleet
-// card's status line and is ellipsized (scrollWidth 203 > clientWidth 184 at
-// 390px). The same on origin/main before #2955 (its own rate line, same
-// width, a size larger); not introduced by moving it onto the status line.
-// The fix (a phone form of the words, as REST's reason has) is a design
-// call, so it is recorded here, not decided here.
-test.fixme("fleet card: the tool gen status line fits on a phone (owner: the operator's call on its phone wording)", async ({ browser }) => {
-  for (const id of PHONE_OVERFLOW) {
-    const state = STATES.find((s) => s.id === id);
-    const { ctx, page } = await openState(browser, VIEWPORTS.phone, state, { mode: "live", surface: "fleet" });
-    await expect(page.locator(CARD.rateLine).first(), `${id}: the card must reach this state`).toHaveText(new RegExp(state.rateText));
-    await page.waitForTimeout(400);
-    await expectFits(page.locator(CARD.rateLine).first(), `${id}: fleet card status line (phone)`);
-    await ctx.close();
-  }
-});
+// (#2971) TOOL GEN's status line fits its one line on every card: a phone
+// card drops "tool gen ·" (the tube already says TOOL GEN) and a long tool
+// name gives up its own end, never the seconds. Measured on origin/main
+// before the fix: "tool gen · write · 18s" ellipsized on a 390px phone
+// (scrollWidth 203 > clientWidth 184). 375px is the narrowest phone the
+// viewer is checked at.
+const TOOLGEN_VIEWPORTS = { ...VIEWPORTS, "phone-375": { width: 375, height: 812 } };
+const TOOLGEN_CASES = [
+  { id: "toolgen-named", tool: "write", seconds: "18s" },
+  { id: "armed-toolgen", tool: "write", seconds: "18s" },
+  ...TOOLGEN_LONG.map((s) => ({ id: s.id, tool: s.tool, seconds: s.seconds })),
+];
+for (const [vpName, viewport] of Object.entries(TOOLGEN_VIEWPORTS)) {
+  test(`fleet card: the tool gen status line fits, seconds and all (${vpName})`, async ({ browser }) => {
+    const phone = viewport.width <= 560;
+    for (const { id, tool, seconds } of TOOLGEN_CASES) {
+      const state = [...STATES, ...TOOLGEN_LONG].find((s) => s.id === id);
+      const { ctx, page } = await openState(browser, viewport, state, { mode: "live", surface: "fleet" });
+      const line = page.locator(CARD.rateLine).first();
+      await expect(line, `${id}: the card must reach this state`).toHaveText(new RegExp(`tool gen.*${seconds}$`));
+      await page.waitForTimeout(400);
+      await expectFits(line, `${id}: fleet card status line (${vpName})`);
+      // The words the card SHOWS (`innerText` skips the hidden form).
+      const want = phone ? `${tool} · ${seconds}` : `tool gen · ${tool} · ${seconds}`;
+      await expect(line, `${id}: the card's visible words (${vpName})`).toHaveText(want, { useInnerText: true });
+      await expect(line, `${id}: the hover names it whole`).toHaveAttribute("title", `tool gen · ${tool} · ${seconds}`);
+      // The seconds are on screen, inside the line: a long name ellipsizes
+      // its own box, not the count after it.
+      const secs = await line.evaluate((e, want) => {
+        const box = e.getBoundingClientRect();
+        const el = [...e.querySelectorAll("*")].find((c) => c.textContent === want);
+        if (!el) return { found: false };
+        const r = el.getBoundingClientRect();
+        return { found: true, inside: r.width > 0 && r.left >= box.left - 0.5 && r.right <= box.right + 0.5 };
+      }, ` · ${seconds}`);
+      expect(secs, `${id}: the seconds have their own box, inside the line (${vpName})`).toEqual({ found: true, inside: true });
+      await ctx.close();
+    }
+  });
+}
 
 // (#2915 review, C7) The machine page's Utility section is ONE size whatever
 // the machine's utility jobs are doing: quiet, routing, compacting, a job
