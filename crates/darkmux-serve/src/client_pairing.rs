@@ -6380,10 +6380,14 @@ pub(crate) fn dispatch_args(spec: &WorkSpec) -> Vec<std::ffi::OsString> {
 pub const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Run `exe dispatch ...` with the message on stdin and return its `--json`
-/// envelope. Only a dispatch that exited 0 with an envelope that is neither
-/// `refused` nor `error` is returned (#3578); any other end is an error
-/// carrying the exit status, the envelope's error when it printed one, and
-/// the tail of stderr.
+/// envelope. The envelope's `result` decides, never the exit code (#3578,
+/// operator decision): one that is neither `refused` nor `error` is
+/// returned whatever the exit code (an escalated run exits 1 and is done,
+/// its `result` naming the escalation). A `refused` or `error` envelope, or
+/// none at all, is an error carrying the exit status, the envelope's error
+/// when it printed one, and the tail of stderr. A run its owner cancelled
+/// prints no envelope (the dispatch ends on the signal), so it reaches the
+/// cancel path as an error.
 ///
 /// **Cancel.** When `cancel` is raised the child gets SIGTERM; one still
 /// alive `grace` later gets SIGKILL, and since a killed child runs none of
@@ -6460,7 +6464,7 @@ pub(crate) fn run_dispatch_child(
     let stdout_bytes = out_reader.join().unwrap_or_default();
     let stderr_bytes = err_reader.join().unwrap_or_default();
     let stdout = String::from_utf8_lossy(&stdout_bytes);
-    let (refused_code, envelope_error) = match read_envelope(&stdout, status.success()) {
+    let (refused_code, envelope_error) = match read_envelope(&stdout) {
         Ok(v) => return Ok(v),
         Err(failed_with) => failed_with,
     };
@@ -6475,12 +6479,13 @@ pub(crate) fn run_dispatch_child(
 }
 
 /// What a dispatch's `--json` envelope says: `Ok` with it for a run that
-/// succeeded, else the refusal code (#3505: a refused dispatch prints its
-/// refusal envelope) and the envelope's error. (#3578) A dispatch that
-/// failed (exit non-zero, or its envelope says `error`: the model's server
-/// refused the connection, say) still prints an envelope; it is a failed
-/// run carrying the envelope's error, never `done`.
-fn read_envelope(stdout: &str, success: bool) -> Result<Value, (Option<String>, Option<String>)> {
+/// finished (any `result` but `refused` and `error`: `stop`, `max_turns`,
+/// an `escalation_*`), else the refusal code (#3505: a refused dispatch
+/// prints its refusal envelope) and the envelope's error. (#3578) A
+/// dispatch that failed (the model's server refused the connection, say)
+/// prints `result: error`: a failed run carrying the envelope's error,
+/// never `done`. No envelope is a failure with neither.
+fn read_envelope(stdout: &str) -> Result<Value, (Option<String>, Option<String>)> {
     let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(stdout.trim()) else {
         return Err((None, None));
     };
@@ -6488,7 +6493,6 @@ fn read_envelope(stdout: &str, success: bool) -> Result<Value, (Option<String>, 
     match v.get("result").and_then(Value::as_str) {
         Some("refused") => Err((field("code"), field("error"))),
         Some("error") => Err((None, field("error"))),
-        _ if !success => Err((None, field("error"))),
         _ => Ok(v),
     }
 }
