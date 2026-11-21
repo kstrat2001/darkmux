@@ -5,7 +5,7 @@
 #
 # Operator-facing install path:
 #   brew tap kstrat2001/tap
-#   brew install darkmux                # stable release (v5.11.0)
+#   brew install darkmux                # stable release (v5.12.0)
 #   brew install --HEAD darkmux         # build from main instead
 #
 # For local development / smoke testing:
@@ -17,7 +17,7 @@
 class Darkmux < Formula
   desc "Mission orchestrator and lab for local AI, running your models or a cloud endpoint"
   homepage "https://darkmux.com"
-  # Stable release: v5.11.0, the Docker-optional release.
+  # Stable release: v5.12.0, the phone-over-the-tailnet release.
   # See CHANGELOG.md.
   #
   # The tarball has no `.git`, so the full commit the lab needs for
@@ -30,8 +30,8 @@ class Darkmux < Formula
   # hash. A stale commit here means the lab submits an empty/mismatched
   # `darkmuxCommit` for the release that actually shipped. After bumping,
   # update the `sha256` on the url line too.
-  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.11.0.tar.gz"
-  sha256 "8c2c4f6374011637442940d15e68109964f91e472ecd48933ed97921867d90e2"
+  url "https://github.com/kstrat2001/darkmux/archive/refs/tags/v5.12.0.tar.gz"
+  sha256 "d48bd28de94bb9a52f206533e24c45d74704e96c1cddd727021d5254fcb310da"
   license "MIT"
   head "https://github.com/kstrat2001/darkmux.git", branch: "main"
 
@@ -53,7 +53,7 @@ class Darkmux < Formula
     # the run's `darkmuxCommit` carries the commit the lab actually ran against
     # instead of being empty (the tarball has no `.git` for build.rs to read).
     ENV["DARKMUX_RELEASE"] = "1" unless build.head?
-    ENV["DARKMUX_COMMIT"] = "6725c0815b27f53820003e775e99c9945579c50f" unless build.head?
+    ENV["DARKMUX_COMMIT"] = "063ce7f946bc07a57aa354ff6dccb8a974f45692" unless build.head?
 
     # Workspace-aware install. The root [[bin]] target in Cargo.toml is the
     # only thing that needs to land in bin/. The std_cargo_args helper sets
