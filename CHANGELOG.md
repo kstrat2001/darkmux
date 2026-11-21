@@ -14,7 +14,31 @@ darkmux release.
 
 ## [Unreleased]
 
+## [5.12.0] - 2026-11-21
+
+**A phone can drive darkmux over the tailnet.** `darkmux client serve` publishes its port on this
+machine's tailnet (`clients.remote`), a phone pairs with an Allow on the Mac and is pinned to its
+tailnet device, and a paired device starts runs, adds engines and opens previews from anywhere on the
+tailnet. Setup finds the engines installed on the machine and adds one on request; a Flint dispatch
+uses rec's own server when it already serves the model; Mux Bot reports a failed run as failed and
+darkmux starts LM Studio's local server when it is off. Seatbelt sandboxes are held to a process and
+a memory limit and reach only the host services they are given. Schema bumps: flow 2.9.0, config
+2.11, `clients.json` 1.3, machine card 1.5, run stats 2.5.0 (all additive).
+
 ### Added
+
+- **darkmux starts LM Studio's local server when it is off, and a failed Mux Bot run reads as failed
+  (#3578).** With darkmux's models loaded in LM Studio but its local server off, a dispatch used to
+  fail with "connection refused" while `/client/work` reported the run done and the app said "Changed
+  nothing". Now a dispatch asks LM Studio (`lms server status --json`, only when `lmstudio_url` names
+  this machine) and, when LM Studio reports the server off, runs `lms server start --port <port>`,
+  says so on stderr and records `machine.engine_server.start` (engine, port, the command, how long it
+  took). A start that fails is recorded as `machine.engine_server.error` and refuses the dispatch
+  `engine_unavailable`, naming the command to run; darkmux tries it once per process while LM Studio
+  still reports it off. `/client/profiles` no longer lists a model reachable while the server is off.
+  `/client/work` judges a run by its envelope's `result`: `error` or `refused`, or no envelope, is a
+  failed run carrying its error; a run that escalated (`escalation_*`) is done, with its work. Flow
+  2.9.0 gains the two `machine.engine_server.*` actions (additive).
 
 - **Seatbelt sandboxes are held to a process and a memory limit, and the memory limit is a setting
   (#3112).** New setting `sandbox.memory` (CONFIG 2.11, `DARKMUX_SANDBOX_MEMORY`; Docker's size syntax,
@@ -198,6 +222,16 @@ darkmux release.
   not. `None`, and listed in `host_unmeasured`, where no sample reads a GPU rail. Additive.
 
 ### Changed
+
+- **After a structured compaction, the model is told the answer cap as its per-call token cap (#3612).**
+  The budget block a structured-slot compaction installs said `Per-call token cap: N`, and a
+  non-streamed dispatch filled N with its check-in interval (1,000 or 4,000 tokens by default), which
+  does not end a turn. It is now `limits.answer_max_tokens` on every path, as the streamed path and a
+  resume already reported. This changes one number in model-facing text on non-streamed,
+  structured-slot dispatches; narrative compaction is unchanged.
+- **The fleet card's tool-generation line fits a phone (#3600).** On a phone the line drops "tool gen ·"
+  (the tube already says TOOL GEN), and a long tool name ellipsizes while the seconds stay on screen.
+  The hover keeps the whole line.
 
 - **The viewer no longer shows a warning box when fleet presence can't be read (#3662).** The cards say
   what is known instead. A peer reads "not streaming" (under "online" when its card was read), with static
@@ -434,6 +468,54 @@ darkmux release.
   says so. darkmux moves into and deletes from that folder only when it made it (a marker file
   inside), never through a link; a clean start that has to delete in place says why in the serve
   log.
+
+- **A port is free only when darkmux can bind it.** Choosing a port for an added engine (`darkmux
+  init`, the client engine add) asked only who listens (`lsof`, `/proc`), which cannot see a listener
+  owned by another user, such as Tailscale's root-owned ports. darkmux now also tries to bind it.
+- **Launch inputs and config keys darkmux cannot consume are refused, naming the closest.** `mission
+  launch` refuses an unknown `role=`, a non-string `rules` input and an undeclared `--param` key
+  instead of ignoring them; `mission launch` refuses a `rules=` name no plan task declares instead of
+  pruning every rule; `config set` refuses a `role_profiles.<role>` pair naming an unknown role or
+  profile and suggests the right family of keys; a `config set` before `init` no longer stops `init`
+  from writing the full default config.
+- **A key written twice in a user file is refused.** `config.json`, `profiles.json` and the other user
+  files used to keep only the last copy of a repeated key, or fail to load and fall back to defaults.
+  Every entry point now refuses the file naming the key's path and what the repeat costs, `config
+  get`/`list` warn, and `config set` refuses to rewrite such a file. A refused value is never quoted.
+- **Residency finds a variant or path id's own darkmux load, and refuses an identifier equal to the
+  model key.** Such a profile reloaded its model on every dispatch; and an opt-out `identifier` equal
+  to the model key took over a load the operator made in LM Studio. Only darkmux's own instance counts,
+  in the dispatch preflight, the planner and `profile list` alike.
+- **doctor's residency rows count only the instance a dispatch would use.** `utility model`, `profile
+  match` and `models loaded` no longer pass on a copy the operator loaded or a darkmux instance below
+  the profile's context, and the `flint engine` row checks rec's auth key as the dispatch does.
+- **A load that lands below the profile's context is an error.** A load LM Studio finished at less
+  context than asked used to run the dispatch truncated (the #1135 class). darkmux now checks the
+  loaded context after every load, and refuses before unloading anything when the catalog states a
+  maximum below the profile's `n_ctx`.
+- **A Seatbelt sandbox reaches only the host services it is given.** Under the default network a
+  sandboxed process could connect to any service on this machine, the viewer daemon included. Seatbelt
+  now allows only the host ports the sandbox needs, IPv4-mapped addresses included.
+- **The history catalog and runs board say a read failed instead of showing it as empty.** A failed
+  read reads `couldn't load <what> (HTTP <n>): <message>`, with a retry in the catalog, never "no
+  recorded days yet" or "no runs recorded yet".
+- **`dispatch.map` and the hosted rate-limit backoff stop when the run is stopped.** No map item or
+  retry starts after a stop, and the 30 to 120 second backoff on a 429 or 503 wakes on it.
+- **A `dispatch.map` item that hits its output cap with no answer fails (#3445)** instead of finishing
+  clean, as the single-shot paths already did.
+- **Every escalation hands over the turn's pending answer.** The unproductive-compaction and re-read-loop
+  escalations returned no final message; they, and an escalation after a salvage, now carry the
+  escalated turn's banked text, and the re-read loop records `dispatch.escalation.triggered`.
+- **A battery pause holds through every tick of a thermal duty cycle.** Below the battery floor at
+  `fair`, the duty cycle wrote a release over the battery's pause on every heartbeat. A release is
+  now written only when no other governor holds a live pause.
+- **A waited fleet job leaves room for the target's first-use sandbox setup.** The sender waits the
+  job's timeout plus the image pull or toolchain first-use bound (today 1,230 s) plus 120 s, and the
+  receiver keeps the connection open as long, so a long agentic job no longer reads "answer lost".
+- **The viewer's hub reads share kept connections**, reopened at once when the hub drops one and every
+  5 minutes so a rotated hub password stops working promptly.
+- **`lab submit` finds the weights of an LM Studio hub model** (`qwen/qwen3.8-27b`) through the selected
+  variant's folder instead of asking for `--weights-dir`.
 
 ## [5.11.0] - 2026-11-14
 
@@ -5404,6 +5486,7 @@ hand are in the one-time upgrade skill (`docs/upgrade/darkmux-upgrade/SKILL.md`)
   does. `FLOW_SCHEMA_VERSION` unchanged at 1.52.0; `RULES_SCHEMA_VERSION`
   unchanged at 3.0.0.
 
+[5.12.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.12.0
 [5.11.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.11.0
 [5.10.0]: https://github.com/kstrat2001/darkmux/releases/tag/v5.10.0
 [5.9.3]: https://github.com/kstrat2001/darkmux/releases/tag/v5.9.3
