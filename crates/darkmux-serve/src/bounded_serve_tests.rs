@@ -658,7 +658,11 @@ fn connect_from_port(addr: SocketAddr, port: u16) -> std::net::TcpStream {
 /// mode), once it has begun.
 fn flicking_forwarder(addr: SocketAddr, hold: usize, threads: usize, for_secs: u64) -> Forwarder {
     let (held, mut lines) = stand_in(&format!("flick {addr} {hold} {threads} {for_secs}"));
-    assert!(lines.any(|l| l.contains("churning")), "the stand-in began");
+    assert!(
+        lines.any(|l| l.contains("churning")),
+        "the stand-in began; its stderr: {}",
+        held.stderr()
+    );
     held
 }
 
@@ -724,7 +728,20 @@ fn close_seen(mut c: &std::net::TcpStream) -> Option<bool> {
 /// A running [`container_forwarder_stand_in`], stopped when dropped.
 struct Forwarder {
     child: std::process::Child,
-    _exe_dir: tempfile::TempDir,
+    exe_dir: tempfile::TempDir,
+}
+
+impl Forwarder {
+    /// What the stand-in wrote to stderr so far (its panic, when it died),
+    /// for a failure message: without it a stand-in that dies says nothing.
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(stand_in_stderr(self.exe_dir.path())).unwrap_or_default()
+    }
+}
+
+/// Where a stand-in copied into `dir` writes its stderr.
+fn stand_in_stderr(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("stderr.log")
 }
 
 impl Drop for Forwarder {
@@ -755,7 +772,12 @@ fn forwarder_from(
     // libtest prints the test's name on the same line first.
     let report = lines
         .find_map(|l| l.rsplit_once("closed ").map(|(_, r)| r.to_string()))
-        .expect("the stand-in reports what it holds");
+        .unwrap_or_else(|| {
+            panic!(
+                "the stand-in reports what it holds; its stderr: {}",
+                held.stderr()
+            )
+        });
     let (closed, reset) = report.split_once(" reset ").expect("closed k reset r");
     (
         held,
@@ -771,7 +793,8 @@ fn churning_forwarder(addr: SocketAddr, hold: usize, threads: usize, for_secs: u
     let (held, mut lines) = stand_in(&format!("churn {addr} {hold} {threads} {for_secs}"));
     assert!(
         lines.any(|l| l.contains("churning")),
-        "the stand-in began churning"
+        "the stand-in began churning; its stderr: {}",
+        held.stderr()
     );
     held
 }
@@ -787,7 +810,7 @@ fn stand_in(spec: &str) -> (Forwarder, impl Iterator<Item = String>) {
     let lines = std::io::BufRead::lines(out).map_while(Result::ok);
     let held = Forwarder {
         child,
-        _exe_dir: dir,
+        exe_dir: dir,
     };
     (held, lines)
 }
@@ -810,7 +833,7 @@ fn spawn_copied(exe: &std::path::Path, spec: &str) -> std::process::Child {
             .env("DARKMUX_TEST_FORWARDER", spec)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::fs::File::create(stand_in_stderr(exe.parent().unwrap())).unwrap())
             .spawn();
         match started {
             Err(e) if e.raw_os_error() == Some(26) && std::time::Instant::now() < until => {
@@ -1192,11 +1215,12 @@ fn a_known_forwarders_old_connection_never_refuses_a_later_one_from_its_port() {
     let port = darkmux_types::test_ports::fixture_port();
     let (container, lines) = stand_in(&format!("tag {addr} {open} {port}"));
     let said: Vec<String> = lines.collect();
+    let stderr = container.stderr();
     drop(container);
     assert!(
         said.iter().any(|l| l.contains("named true"))
             && said.iter().any(|l| l.contains("tagged true")),
-        "the forwarder was named and its connection from {port} closed: {said:?}"
+        "the forwarder was named and its connection from {port} closed: {said:?}; its stderr: {stderr}"
     );
     std::thread::sleep(Duration::from_millis(300));
     let _mine: Vec<_> = (0..open).map(|_| resetting(addr)).collect();
@@ -1420,12 +1444,13 @@ fn a_held_connections_end_is_never_cached_to_refuse_a_later_one() {
     );
     let open = VIEWER.per_ip - VIEWER.judged_share;
     let port = darkmux_types::test_ports::fixture_port();
-    let (_container, lines) = stand_in(&format!("drop-one {addr} {open} {port}"));
+    let (container, lines) = stand_in(&format!("drop-one {addr} {open} {port}"));
     let said: Vec<String> = lines.take_while(|l| !l.contains("ready")).collect();
     assert!(
         said.iter().any(|l| l.contains("named true"))
             && said.iter().any(|l| l.contains("read true")),
-        "the forwarder was named and read: {said:?}"
+        "the forwarder was named and read: {said:?}; its stderr: {}",
+        container.stderr()
     );
     std::thread::sleep(Duration::from_millis(200));
     let served = |s: &mut std::net::TcpStream| {
