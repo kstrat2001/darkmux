@@ -356,6 +356,9 @@ const ACTION_FACET: { readonly [K in keyof typeof ACTION]: ActivityFacet } = {
   MachineThermal: { section: "MACHINE", failure: false },
   MachineBattery: { section: "MACHINE", failure: false },
   MachineBatteryHealth: { section: "MACHINE", failure: false },
+  // (#3578) darkmux started an engine's own server (LM Studio's) for a dispatch.
+  MachineEngineServerStart: { section: "MACHINE", failure: false },
+  MachineEngineServerError: { section: "MACHINE", failure: true },
   MissionStart: { section: "MISSION", failure: false },
   MissionClose: { section: "MISSION", failure: false },
   MissionAbort: { section: "MISSION", failure: false },

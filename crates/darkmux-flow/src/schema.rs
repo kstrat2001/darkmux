@@ -31,6 +31,16 @@ pub const FLOW_SCHEMA_VERSION: &str = "2.9.0";
 //           closes the wait). ADDITIVE: a reader that does not know them
 //           keeps them as unknown records, and a step with neither reads as
 //           before.
+//           Also (#3578, unreleased with it) two machine actions,
+//           `machine.engine_server.start` and `.error` (payload
+//           `EngineServerPayload`: `engine`, `port`, `command`, and
+//           `elapsed_ms` on start, `error` on error), written when a
+//           dispatch's preflight starts an engine's own server darkmux does
+//           not run (LM Studio's local server, reported off by LM Studio):
+//           start once the engine reports it running, error (at error level)
+//           when it did not start and the dispatch was refused. No session
+//           and no execution: a machine's state. ADDITIVE: a reader that
+//           does not know them keeps them as unknown records.
 //   2.8.0 (#3112): `payload.context.root`, where a dispatch's sandbox saw the
 //           workspace, stamped only when it is not the container's
 //           `/workspace` (a sandbox on the host sees it at its own path); a

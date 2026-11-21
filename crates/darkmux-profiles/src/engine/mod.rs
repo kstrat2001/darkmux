@@ -297,7 +297,7 @@ pub(crate) fn assert_declaration_holds(engine: &dyn Engine, unload_probe: &str) 
 }
 
 
-pub use crate::lms::LmStudioServer;
+pub use crate::lms::{LmStudioServer, ServerStart, ServerStartFailed};
 
 /// (#3578) LM Studio's local server at `lmstudio_url`, as LM Studio reports
 /// it (`lms server status`), asked only when that URL is this machine's.
@@ -307,8 +307,8 @@ pub fn lmstudio_server() -> LmStudioServer {
 
 /// (#3578) Start LM Studio's local server when LM Studio reports it off and
 /// it is on this machine, so a model darkmux made resident there can answer
-/// a dispatch. `Ok(true)` when darkmux started it.
-pub fn ensure_lmstudio_server() -> anyhow::Result<bool> {
+/// a dispatch. A start that failed names the command to run.
+pub fn ensure_lmstudio_server() -> std::result::Result<ServerStart, ServerStartFailed> {
     crate::lms::ensure_server_running()
 }
 

@@ -31,6 +31,7 @@
 mod audit;
 mod context;
 mod dispatch;
+mod engine_server;
 mod hook;
 mod lifecycle;
 mod machine;
@@ -40,6 +41,7 @@ mod toolchain;
 mod usage;
 
 pub use audit::AuditWriteFailedPayload;
+pub use engine_server::EngineServerPayload;
 pub use context::{lenient, ContextSite, RecordContext, RuleRef};
 pub use hook::{HookDeliveryPayload, HookDryRunPayload, HookFailedPayload, HookNoticePayload};
 pub use dispatch::{
@@ -296,6 +298,8 @@ flow_payloads! {
     MachineThermal => MachineThermalPayload;
     MachineBattery => MachineBatteryPayload;
     MachineBatteryHealth => MachineBatteryHealthPayload;
+    MachineEngineServerStart => EngineServerPayload;
+    MachineEngineServerError => EngineServerPayload;
     MissionStart => OpenPayload;
     MissionClose => OpenPayload;
     MissionAbort => OpenPayload;

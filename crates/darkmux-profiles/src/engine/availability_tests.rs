@@ -437,12 +437,52 @@ fn a_stand_in_lm_studio_is_never_connected_to_or_started() {
                 (crate::engine::ensure_lmstudio_server(), at.elapsed())
             },
         );
-        assert!(matches!(started.0, Ok(false)), "{url}: {:?}", started.0);
+        assert_eq!(started.0, Ok(crate::engine::ServerStart::NotNeeded), "{url}");
         assert!(stand_in.accept().is_err(), "{url}: something connected to the stand-in LM Studio");
         assert!(started.1 < Duration::from_secs(5), "{url}: the check waited {:?}", started.1);
     }
     let argv = std::fs::read_to_string(&argv).unwrap_or_default();
     assert!(!argv.contains("server start"), "a server start ran against a stand-in:\n{argv}");
+}
+
+/// (#3578 review) A server LM Studio still reports off once `lms server
+/// start` has returned did not start: that is said at once, naming the
+/// command to run, after one more status check (the start command returns
+/// only when it is done, so there is nothing to wait for). A later check in
+/// the same process, while LM Studio still reports it off, fails the same
+/// way without running the start again.
+#[test]
+#[serial_test::serial]
+fn a_server_that_does_not_come_up_fails_at_once_and_is_not_started_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let argv = dir.path().join("argv");
+    let lms = dir.path().join("lms");
+    std::fs::write(
+        &lms,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$1\" in\n  server) [ \"$2\" = status ] && echo '{{\"running\":false}}';;\nesac\nexit 0\n",
+            argv.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&lms, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let port = free_port();
+    let url = format!("http://127.0.0.1:{port}");
+    let at = std::time::Instant::now();
+    let (first, second) = with_env(
+        &[("DARKMUX_LMS_BIN", lms.to_str().unwrap()), ("DARKMUX_LMSTUDIO_URL", &url)],
+        || (crate::engine::ensure_lmstudio_server(), crate::engine::ensure_lmstudio_server()),
+    );
+    eprintln!("two checks of a server that never comes up took {:?}", at.elapsed());
+    for (which, r) in [("first", &first), ("second", &second)] {
+        let e = r.as_ref().map(|_| ()).unwrap_err().to_string();
+        assert!(e.contains(&format!("lms server start --port {port}")), "{which}: {e}");
+    }
+    let argv = std::fs::read_to_string(&argv).unwrap();
+    let count = |verb: &str| argv.lines().filter(|l| l.starts_with(verb)).count();
+    assert_eq!(count("server start"), 1, "started once:\n{argv}");
+    assert_eq!(count("server status"), 3, "before and after the start, then once for the second check:\n{argv}");
 }
 
 /// LM Studio not answering is `unknown`, never `unavailable`.

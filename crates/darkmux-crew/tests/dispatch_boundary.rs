@@ -1097,8 +1097,41 @@ fn a_server_lm_studio_reports_off_is_started_before_the_dispatch() {
         if starts == 1 {
             assert_eq!(started[0], "server start --port 1234");
             assert!(stderr.contains("started LM Studio's local server"), "{stderr}");
+            // (#3578) The start is recorded: a machine's state, no execution.
+            let r = rig.record("machine.engine_server.start");
+            assert_eq!((r["session_id"].is_null(), r["execution_id"].is_null()), (true, true), "{r}");
+            let p = payload(&r);
+            assert_eq!((p["engine"].as_str(), p["port"].as_u64(), p["command"].as_str()), (Some("lmstudio"), Some(1234), Some("lms server start --port 1234")), "{p}");
+            assert!(p["elapsed_ms"].is_u64(), "{p}");
+        } else {
+            let none = ["machine.engine_server.start", "machine.engine_server.error"];
+            assert!(!rig.actions().iter().any(|a| none.contains(&a.as_str())), "{:?}", rig.actions());
         }
     }
+}
+
+/// (#3578, operator decision) A start that does not bring the server up
+/// (LM Studio still reports it off once `lms server start` returned) fails
+/// the dispatch before anything runs, `engine_unavailable`, naming the exact
+/// command to run, and is recorded at error level. It never goes on to a
+/// refused connection.
+#[test]
+#[serial]
+fn a_server_that_does_not_start_fails_the_dispatch_naming_the_command() {
+    own_process!();
+    let rig = Rig::new();
+    rig.fake("lms-server.json", r#"{"running":false}"#);
+    rig.container(ONE_TURN, ENVELOPE, "", 0);
+    let (res, _) = run(&rig, rig.opts());
+    let err = format!("{:#}", res.expect_err("the dispatch is refused"));
+    assert!(err.contains("Run `lms server start --port 1234`") && err.contains("[engine_unavailable]"), "{err}");
+    assert!(rig.docker_run().is_none(), "no container ran");
+    assert!(bookends(&rig).is_empty(), "refused before the execution started: {:?}", rig.actions());
+    let r = rig.record("machine.engine_server.error");
+    assert_eq!(r["level"], "error");
+    let p = payload(&r);
+    assert_eq!(p["command"], "lms server start --port 1234");
+    assert!(p["error"].as_str().unwrap().contains("still reports it off"), "{p}");
 }
 
 #[test]

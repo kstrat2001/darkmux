@@ -329,6 +329,14 @@ flow_actions! {
     MachineThermal => Machine, "machine.thermal";
     MachineBattery => Machine, "machine.battery";
     MachineBatteryHealth => Machine, "machine.battery_health";
+    /// (#3578) darkmux started an engine's own server, one it does not run,
+    /// because a dispatch needed it and the engine reported it off (LM
+    /// Studio's local server): written once the engine reports it running.
+    /// A machine's state, not a role's work: no execution.
+    MachineEngineServerStart => Machine, "machine.engine_server.start";
+    /// (#3578) That start failed, and the dispatch that needed it was
+    /// refused, naming the command to run.
+    MachineEngineServerError => Machine, "machine.engine_server.error";
     MissionStart => Mission, "mission.start";
     MissionClose => Mission, "mission.close";
     MissionAbort => Mission, "mission.abort";

@@ -194,6 +194,8 @@ const ACTION_WIRE = {
   MachineThermal: "machine.thermal",
   MachineBattery: "machine.battery",
   MachineBatteryHealth: "machine.battery_health",
+  MachineEngineServerStart: "machine.engine_server.start",
+  MachineEngineServerError: "machine.engine_server.error",
   MissionStart: "mission.start",
   MissionClose: "mission.close",
   MissionAbort: "mission.abort",
