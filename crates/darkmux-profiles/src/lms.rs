@@ -549,6 +549,55 @@ pub(crate) fn meta_from_json(v: &serde_json::Value) -> Option<ModelMeta> {
     })
 }
 
+/// (#3578) Start LM Studio's local server when it is off, so a dispatch to
+/// a model darkmux just made resident can reach it: `lms` loads models from
+/// the app while its server is off, and every request is then refused at
+/// connect. Only for a server on this machine (`lmstudio_url` on loopback);
+/// waits up to 15 s for it to accept. `Ok(true)` when it was off and now
+/// answers, `Ok(false)` when it was already on or isn't this machine's.
+pub fn ensure_server_running() -> Result<bool> {
+    let url = darkmux_types::config_access::lmstudio_url();
+    if crate::engine::availability::server_accepts(&url) || !is_loopback_url(&url) {
+        return Ok(false);
+    }
+    let port = url
+        .split("://")
+        .last()
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|authority| authority.rsplit_once(':'))
+        .and_then(|(_, p)| p.parse::<u16>().ok());
+    let mut cmd = Command::new(lms_bin());
+    cmd.args(["server", "start"]);
+    if let Some(port) = port {
+        cmd.args(["--port", &port.to_string()]);
+    }
+    let out = run_bounded(cmd, "server start", Deadline::from_secs(30), StdoutMode::Null)
+        .map_err(|e| anyhow::anyhow!("running `lms server start`: {e}"))?;
+    if !out.status.success() {
+        bail!("`lms server start` failed: {}", out.stderr.trim());
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < until {
+        if crate::engine::availability::server_accepts(&url) {
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    bail!("LM Studio's local server did not answer at {url} after `lms server start`")
+}
+
+/// Whether a base URL names this machine (localhost, 127.0.0.0/8, ::1).
+pub fn is_loopback_url(url: &str) -> bool {
+    let rest = url.split("://").last().unwrap_or(url);
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
+    host == "localhost"
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 pub fn unload(identifier: &str) -> Result<()> {
     let mut cmd = Command::new(lms_bin());
     cmd.args(["unload", identifier]);

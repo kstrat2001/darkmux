@@ -366,6 +366,14 @@ pub struct LmStudioAnswer {
     pub loaded: Result<Vec<LoadedModel>, String>,
     /// The models it has downloaded, with every name it loads each by.
     pub catalog: Result<Vec<super::ModelMeta>, String>,
+    /// Whether its local server (the base URL a dispatch sends to) accepts
+    /// a connection. `lms` answers from the app while the server is off, so
+    /// a model can be loaded and still not answer a dispatch (#3578).
+    pub server_up: bool,
+    /// Whether darkmux starts that server when a dispatch needs it (it is
+    /// on this machine): a model then reads `startable`, never `resident`,
+    /// while the server is off.
+    pub server_startable: bool,
 }
 
 impl LmStudioAnswer {
@@ -384,7 +392,12 @@ impl LmStudioAnswer {
                     super::lmstudio().catalog().map_err(msg)
                 })
             });
+            let url = darkmux_types::config_access::lmstudio_url();
+            let probe = url.clone();
+            let server_up = s.spawn(move || server_accepts(&probe));
             LmStudioAnswer {
+                server_startable: crate::lms::is_loopback_url(&url),
+                server_up: server_up.join().unwrap_or(false),
                 loaded: loaded
                     .join()
                     .unwrap_or_else(|_| Err("listing its residents panicked".into())),
@@ -396,6 +409,35 @@ impl LmStudioAnswer {
     }
 }
 
+/// Whether anything accepts a connection at a base URL's host and port
+/// (`http://localhost:1234`, or `localhost:1234` with no scheme; port 80 or
+/// 443 by scheme when none is given). Within about 300 ms per address.
+pub fn server_accepts(base_url: &str) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let (scheme, rest) = match base_url.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => ("http", base_url),
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let with_port = if authority.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
+        authority.to_string()
+    } else {
+        format!("{authority}:{}", if scheme == "https" { 443 } else { 80 })
+    };
+    let Ok(addrs) = with_port.to_socket_addrs() else {
+        return false;
+    };
+    addrs
+        .into_iter()
+        .any(|a| TcpStream::connect_timeout(&a, Duration::from_millis(300)).is_ok())
+}
+
+/// The reason a model on LM Studio reads `unavailable` while its local
+/// server is off. Clients match on its start (`LM Studio's local server is off`).
+pub const LMSTUDIO_SERVER_OFF: &str =
+    "LM Studio's local server is off, so a dispatch can't reach the model";
+
 impl EngineAnswer for LmStudioAnswer {
     fn judge(&self, model: &ProfileModel) -> Availability {
         let n_ctx = match model.require_n_ctx() {
@@ -406,37 +448,30 @@ impl EngineAnswer for LmStudioAnswer {
             Ok(l) => l,
             Err(e) => return Availability::unknown(format!("LM Studio did not answer: {e}")),
         };
-        // The planner's own residency rule: darkmux's instance of the model,
-        // at the profile's context or more, is what a dispatch reuses. A
-        // copy someone else loaded is never one (contract 4).
-        let key = darkmux_gestalt::bare_model_key(&model.id).to_string();
-        let placement = darkmux_gestalt::Placement {
-            model_key: key.clone(),
-            identifier: crate::ownership::namespaced_identifier(model),
-            min_ctx: n_ctx,
-            seat: "availability".into(),
-        };
-        let residents: Vec<darkmux_gestalt::ResidentFact> = loaded
-            .iter()
-            .map(|m| darkmux_gestalt::ResidentFact {
-                identifier: m.identifier.clone(),
-                model_key: m.model.clone(),
-                ctx: m.context,
-                est_bytes: None,
-                parallel: 0,
-            })
-            .collect();
-        if matches!(
-            darkmux_gestalt::decide_residency(&residents, &placement),
-            darkmux_gestalt::ResidencyDecision::Reuse { .. }
-        ) {
-            return Availability::resident();
+        if !self.server_up && !self.server_startable {
+            return Availability::unavailable(LMSTUDIO_SERVER_OFF);
         }
+        let key = darkmux_gestalt::bare_model_key(&model.id).to_string();
+        if reuses_darkmuxs_instance(loaded, model, &key, n_ctx) {
+            // Off but on this machine: a dispatch starts the server (#3578).
+            return if self.server_up { Availability::resident() } else { Availability::startable() };
+        }
+        self.by_catalog(&key)
+    }
+
+    fn residents(&self) -> Option<Vec<LoadedModel>> {
+        self.loaded.as_ref().ok().cloned()
+    }
+}
+
+impl LmStudioAnswer {
+    /// Not resident: `startable` when LM Studio has the model downloaded.
+    fn by_catalog(&self, key: &str) -> Availability {
         match &self.catalog {
             Err(e) => {
                 Availability::unknown(format!("LM Studio did not list its downloaded models: {e}"))
             }
-            Ok(models) if models.iter().any(|m| m.answers_to(&key)) => Availability::startable(),
+            Ok(models) if models.iter().any(|m| m.answers_to(key)) => Availability::startable(),
             // The wave planner's `UnknownModelKey`: `engine_unavailable`.
             Ok(_) => Availability::refused(
                 ClientCode::EngineUnavailable,
@@ -444,10 +479,32 @@ impl EngineAnswer for LmStudioAnswer {
             ),
         }
     }
+}
 
-    fn residents(&self) -> Option<Vec<LoadedModel>> {
-        self.loaded.as_ref().ok().cloned()
-    }
+/// The planner's own residency rule: darkmux's instance of the model, at
+/// the profile's context or more, is what a dispatch reuses. A copy
+/// someone else loaded is never one (contract 4).
+fn reuses_darkmuxs_instance(loaded: &[LoadedModel], model: &ProfileModel, key: &str, n_ctx: u32) -> bool {
+    let placement = darkmux_gestalt::Placement {
+        model_key: key.to_string(),
+        identifier: crate::ownership::namespaced_identifier(model),
+        min_ctx: n_ctx,
+        seat: "availability".into(),
+    };
+    let residents: Vec<darkmux_gestalt::ResidentFact> = loaded
+        .iter()
+        .map(|m| darkmux_gestalt::ResidentFact {
+            identifier: m.identifier.clone(),
+            model_key: m.model.clone(),
+            ctx: m.context,
+            est_bytes: None,
+            parallel: 0,
+        })
+        .collect();
+    matches!(
+        darkmux_gestalt::decide_residency(&residents, &placement),
+        darkmux_gestalt::ResidencyDecision::Reuse { .. }
+    )
 }
 
 // ─── Tensorfold ──────────────────────────────────────────────────────────

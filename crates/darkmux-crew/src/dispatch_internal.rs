@@ -16076,7 +16076,17 @@ fn switch_notice_for(engine_id: &str, loading: engine::Loading, could_hold: Opti
 /// servers and unloads its idle LM Studio loads to make room, or is refused
 /// `wont_fit`, `busy` or `memory_in_use`.
 pub(crate) fn ensure_model_loaded_at_ctx_from(pm: &darkmux_types::ProfileModel, source: WindowSource) -> Result<PreflightHold> {
-    preflight_load(pm, source, &crate::lms_room::ThisPreflight)
+    let hold = preflight_load(pm, source, &crate::lms_room::ThisPreflight)?;
+    // (#3578) A resident model is no use while LM Studio's local server is
+    // off: start it, as darkmux starts the engine servers it manages. A
+    // start that fails is said, and the dispatch goes on to report the
+    // refused connection itself.
+    match darkmux_profiles::engine::ensure_lmstudio_server() {
+        Ok(true) => eprintln!("darkmux dispatch: started LM Studio's local server. (#3578)"),
+        Ok(false) => {}
+        Err(e) => eprintln!("darkmux dispatch: LM Studio's local server is off and darkmux couldn't start it: {e:#} (#3578)"),
+    }
+    Ok(hold)
 }
 
 /// [`ensure_model_loaded_at_ctx_from`] against `gate`'s LM Studio and
