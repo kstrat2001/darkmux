@@ -72,6 +72,55 @@ fn limits(max_conns: usize, per_ip: usize, header_read_timeout: Duration) -> Kep
     }
 }
 
+/// A connection the other end has already reset reads as closed: on macOS
+/// the reset makes even setting a read timeout fail (ECONNRESET), which a
+/// stand-in under CI load hit and panicked on.
+#[test]
+fn closed_within_counts_a_connection_reset_before_it_looks() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+    let (s, _) = l.accept().unwrap();
+    reset(s);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(closed_within(&mut c, Duration::from_secs(2)));
+}
+
+/// The stand-in's count of its held connections the other end closed counts
+/// one reset before it looked as closed and reset, however macOS reports it.
+#[test]
+fn closed_count_counts_a_connection_reset_before_it_looks() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+    let (s, _) = l.accept().unwrap();
+    reset(s);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(closed_count(&[c], 1, Duration::from_secs(2)), (1, 1));
+}
+
+/// Whether `e` says the other end reset the connection. macOS reports a
+/// reset that arrived first as EINVAL from `connect` and from setting a
+/// socket option, and as ECONNRESET from a read or, sometimes, an option:
+/// a server that resets a refused connection at once, under load, gets
+/// there before the stand-in looks.
+fn reset_by_peer(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::ConnectionReset || e.raw_os_error() == Some(libc::EINVAL)
+}
+
+/// Whether a connection that may have been reset while it was opening
+/// (`connecting`) is closed within `d`: a reset at connect is a close.
+fn closed_or_reset_at_connect(
+    connecting: std::io::Result<std::net::TcpStream>,
+    d: Duration,
+) -> bool {
+    match connecting {
+        Ok(mut s) => closed_within(&mut s, d),
+        Err(e) => {
+            assert!(reset_by_peer(&e), "connecting: {e}");
+            true
+        }
+    }
+}
+
 /// Whether the other end closes `s` within `d` (whatever it sent first).
 fn closed_within(s: &mut std::net::TcpStream, d: Duration) -> bool {
     let until = std::time::Instant::now() + d;
@@ -81,7 +130,11 @@ fn closed_within(s: &mut std::net::TcpStream, d: Duration) -> bool {
         if left.is_zero() {
             return false;
         }
-        s.set_read_timeout(Some(left)).unwrap();
+        // A reset that arrived first fails even this (see `reset_by_peer`).
+        if let Err(e) = s.set_read_timeout(Some(left)) {
+            assert!(reset_by_peer(&e), "setting a read timeout: {e}");
+            return true;
+        }
         match s.read(&mut b) {
             Ok(0) => return true,
             Ok(_) => continue,
@@ -487,11 +540,20 @@ fn container_forwarder_stand_in() {
     let _held = match parts[0] {
         "hold" => {
             let source = parts[4].parse().ok();
-            let held: Vec<_> = (0..num(2))
-                .map(|_| abortive(connect_from(addr, source)))
-                .collect();
-            let (closed, reset) = closed_count(&held, num(3), Duration::from_secs(8));
-            println!("closed {closed} reset {reset}");
+            let opened: Vec<_> = (0..num(2)).map(|_| connect_from(addr, source)).collect();
+            // Reset while still opening: closed and reset already.
+            let at_connect = opened.iter().filter(|c| c.is_none()).count();
+            let held: Vec<_> = opened.into_iter().flatten().map(abortive).collect();
+            let (closed, reset) = closed_count(
+                &held,
+                num(3).saturating_sub(at_connect),
+                Duration::from_secs(8),
+            );
+            println!(
+                "closed {} reset {}",
+                closed + at_connect,
+                reset + at_connect
+            );
             held
         }
         "flick" => flick(addr, num(2), num(3), Duration::from_secs(num(4) as u64)),
@@ -507,9 +569,13 @@ fn container_forwarder_stand_in() {
 
 /// A connection to `addr` from this machine's address `source` (the
 /// default one when `None`).
-fn connect_from(addr: SocketAddr, source: Option<std::net::IpAddr>) -> std::net::TcpStream {
+fn connect_from(addr: SocketAddr, source: Option<std::net::IpAddr>) -> Option<std::net::TcpStream> {
     let Some(source) = source else {
-        return std::net::TcpStream::connect(addr).unwrap();
+        return match std::net::TcpStream::connect(addr) {
+            Ok(s) => Some(s),
+            Err(e) if reset_by_peer(&e) => None,
+            Err(e) => panic!("connecting: {e}"),
+        };
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -518,11 +584,15 @@ fn connect_from(addr: SocketAddr, source: Option<std::net::IpAddr>) -> std::net:
     let s = rt.block_on(async {
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.bind(SocketAddr::new(source, 0)).unwrap();
-        socket.connect(addr).await.unwrap()
+        socket.connect(addr).await
     });
-    let s = s.into_std().unwrap();
+    let s = match s {
+        Ok(s) => s.into_std().unwrap(),
+        Err(e) if reset_by_peer(&e) => return None,
+        Err(e) => panic!("connecting from {source}: {e}"),
+    };
     s.set_nonblocking(false).unwrap();
-    s
+    Some(s)
 }
 
 /// [`container_forwarder_stand_in`]'s `flick` mode: the held connections.
@@ -574,7 +644,13 @@ fn reset(s: std::net::TcpStream) {
 
 /// A connection to `addr` that resets when it is closed ([`abortive`]).
 fn resetting(addr: SocketAddr) -> std::net::TcpStream {
-    abortive(std::net::TcpStream::connect(addr).unwrap())
+    try_resetting(addr).unwrap()
+}
+
+/// [`resetting`], its connect's error returned (a stand-in's connection the
+/// server may reset while it opens).
+fn try_resetting(addr: SocketAddr) -> std::io::Result<std::net::TcpStream> {
+    std::net::TcpStream::connect(addr).map(abortive)
 }
 
 /// `s`, set to reset rather than close gracefully when it is dropped or its
@@ -605,13 +681,16 @@ fn drop_one(addr: SocketAddr, open: usize, port: u16) -> Vec<std::net::TcpStream
     let held: Vec<_> = (1..open).map(|_| resetting(addr)).collect();
     let tagged = connect_from_port(addr, port);
     std::thread::sleep(Duration::from_millis(200));
-    let mut named = resetting(addr);
+    let named = try_resetting(addr);
     println!(
         "named {}",
-        closed_within(&mut named, Duration::from_secs(6))
+        closed_or_reset_at_connect(named, Duration::from_secs(6))
     );
-    let mut read = resetting(addr);
-    println!("read {}", closed_within(&mut read, Duration::from_secs(6)));
+    let read = try_resetting(addr);
+    println!(
+        "read {}",
+        closed_or_reset_at_connect(read, Duration::from_secs(6))
+    );
     reset(tagged);
     println!("ready");
     held
@@ -620,21 +699,27 @@ fn drop_one(addr: SocketAddr, open: usize, port: u16) -> Vec<std::net::TcpStream
 fn tag(addr: SocketAddr, hold: usize, port: u16) {
     let _held: Vec<_> = (0..hold).map(|_| resetting(addr)).collect();
     std::thread::sleep(Duration::from_millis(200));
-    let mut extra = resetting(addr);
+    let extra = try_resetting(addr);
     println!(
         "named {}",
-        closed_within(&mut extra, Duration::from_secs(6))
+        closed_or_reset_at_connect(extra, Duration::from_secs(6))
     );
-    let mut tagged = connect_from_port(addr, port);
+    let tagged = try_connect_from_port(addr, port);
     println!(
         "tagged {}",
-        closed_within(&mut tagged, Duration::from_secs(6))
+        closed_or_reset_at_connect(tagged, Duration::from_secs(6))
     );
 }
 
 /// A connection to `addr` from 127.0.0.1's port `port`, which may still be
 /// in an earlier connection's close (`SO_REUSEADDR`).
 fn connect_from_port(addr: SocketAddr, port: u16) -> std::net::TcpStream {
+    try_connect_from_port(addr, port).unwrap()
+}
+
+/// [`connect_from_port`], its connect's error returned (a stand-in's
+/// connection the server may reset while it opens).
+fn try_connect_from_port(addr: SocketAddr, port: u16) -> std::io::Result<std::net::TcpStream> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
@@ -645,11 +730,11 @@ fn connect_from_port(addr: SocketAddr, port: u16) -> std::net::TcpStream {
         socket
             .bind(SocketAddr::new([127, 0, 0, 1].into(), port))
             .unwrap();
-        socket.connect(addr).await.unwrap()
-    });
-    let s = s.into_std().unwrap();
-    s.set_nonblocking(false).unwrap();
-    abortive(s)
+        socket.connect(addr).await
+    })?;
+    let s = s.into_std()?;
+    s.set_nonblocking(false)?;
+    Ok(abortive(s))
 }
 
 /// A container engine's forwarder holding `hold` connections to `addr` and,
