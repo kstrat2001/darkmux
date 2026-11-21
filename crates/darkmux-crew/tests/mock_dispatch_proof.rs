@@ -33,7 +33,6 @@
 
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -113,15 +112,14 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Bind an ephemeral port, read what the OS assigned, then drop the
-/// listener immediately so `darkmux-mock-model` can bind it next. Standard
-/// "find a free port" trick for spawning a child that needs an explicit
+/// A port for `darkmux-mock-model` to bind: the child needs an explicit
 /// `--port` (httpmock's standalone entry point doesn't report back an
-/// OS-assigned port itself — see `tools/darkmux-mock-model/src/main.rs`'s
-/// module doc). Small TOCTOU window; acceptable for local dev-tool tests.
+/// OS-assigned port itself; see `tools/darkmux-mock-model/src/main.rs`'s
+/// module doc).
 fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-    listener.local_addr().expect("local_addr").port()
+    // A fixture port (reserved, below every ephemeral range), not a dropped
+    // `bind(0)`, which the next `bind(0)` anywhere can be given.
+    darkmux_types::test_ports::fixture_port()
 }
 
 /// Build `tools/darkmux-mock-model` (debug profile — this is a test-time
@@ -291,6 +289,7 @@ fn run_mock_dispatch(
         force_container: false,
         max_completion_tokens: None,
         image: None,
+        sandbox: None,
         model_base_url_override: Some(format!("http://host.docker.internal:{port}/v1")),
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
@@ -548,6 +547,7 @@ fn real_container_dispatch_ends_alone_on_a_phase_stop_and_refuses_a_live_resume(
         force_container: false,
         max_completion_tokens: None,
         image: None,
+        sandbox: None,
         model_base_url_override: Some(format!("http://host.docker.internal:{port}/v1")),
         step_id: None,
         system_prompt_override: None,
@@ -995,6 +995,7 @@ fn run_mock_dispatch_with_timeout_override(
         force_container: false,
         max_completion_tokens: None,
         image: None,
+        sandbox: None,
         model_base_url_override: Some(format!("http://host.docker.internal:{port}/v1")),
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,

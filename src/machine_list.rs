@@ -494,6 +494,7 @@ pub(crate) fn render_text(view: &FleetView, roster_path: &str) -> String {
         "{}\n",
         style::dim(&format!("{:<14} {:<5} {:<11} {:<13} {:<12} LOADED", "MACHINE", "LIVE", "AI-HEADROOM", "OS", "VERSION"))
     ));
+    let presence_unread = crate::card_status::presence_unread(&view.presence);
     for m in &view.machines {
         let [ram, os, version, last] = cells(m);
         let row = format!(
@@ -512,7 +513,7 @@ pub(crate) fn render_text(view: &FleetView, roster_path: &str) -> String {
         if let Some(words) = m.clock_skew_ms.and_then(darkmux_flow::presence::clock_skew_words) {
             out.push_str(&format!("{}\n", style::warn(&format!("  {}: {words}", view.row_name(m)))));
         }
-        for line in crate::card_status::status_lines(m) {
+        for line in crate::card_status::status_lines(m, presence_unread) {
             out.push_str(&format!("{}\n", style::dim(&line)));
         }
         if let CardOutcome::Available { card, .. } = &m.card {
@@ -1034,5 +1035,25 @@ pub(crate) mod tests {
         assert!(text.contains("  why: not streaming: not listening"), "{text}");
         assert!(text.contains("  utility model: qwen3-4b, resident; job: not shown here"), "{text}");
         assert!(text.contains("  status: dispatch in flight"), "{text}");
+    }
+
+    /// (#3662) The reason comes from the view's own presence report, not from
+    /// the row's liveness: an unreadable presence read says this viewer cannot
+    /// read the hub; presence switched off (the same `unknown` liveness) keeps
+    /// the stream reason.
+    #[test]
+    fn a_read_peer_under_unreadable_presence_names_the_hub_not_its_stream() {
+        use darkmux_serve::source_state::SourceState;
+        let peer = || machine("studio", Liveness::Unknown, read(card("5.0.0")));
+        let mut v = view(vec![own_row(), peer()]);
+        v.presence = SourceState::Unavailable { detail: "x" };
+        let unread = text(&v);
+        assert!(unread.contains("  why: online · not streaming: this viewer can't read the fleet hub right now"), "{unread}");
+        assert!(!unread.contains("its flow stream doesn't reach this hub"), "{unread}");
+        v.presence = SourceState::Stale { age_ms: 41_200, detail: "x" };
+        assert!(text(&v).contains("this viewer can't read the fleet hub right now"));
+        v.presence = SourceState::Off;
+        let off = text(&v);
+        assert!(off.contains("  why: online · not streaming: its flow stream doesn't reach this hub"), "{off}");
     }
 }

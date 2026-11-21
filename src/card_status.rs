@@ -20,6 +20,7 @@
 //! running.
 
 use darkmux_serve::fleet_view::{CardOutcome, FleetMachine, Liveness, UnavailableWhy, UnreachableReason};
+use darkmux_serve::source_state::SourceState;
 use darkmux_serve::wire::UtilityModel;
 
 /// The status, as the card's status line has it. The page-only states
@@ -109,9 +110,24 @@ fn a_model_is_working(m: &FleetMachine) -> bool {
 
 const NOT_STREAMING_READ: &str = "online · not streaming: its flow stream doesn't reach this hub, so its activity can't be shown here.";
 
+/// (#3662) The same status when the view's presence read was stale or
+/// unreadable: the peer is not streaming here because this viewer cannot read
+/// the fleet hub, not because its stream is off. `onlineNotStreamingReason`
+/// in `cardStatus.ts` gives the same words.
+const NOT_STREAMING_HUB_UNREAD: &str =
+    "online · not streaming: this viewer can't read the fleet hub right now, so its live state is unknown; its recorded activity still shows.";
+
+/// Why a read card's machine is not streaming here (`presence_unread`: the
+/// view's own presence read was stale or unreadable).
+fn not_streaming_read_reason(presence_unread: bool) -> &'static str {
+    if presence_unread { NOT_STREAMING_HUB_UNREAD } else { NOT_STREAMING_READ }
+}
+
 /// The status of one machine row. Same precedence as `statusOf` in
 /// `cards.ts`: offline, then work, then the not-streaming forms, then idle.
-pub(crate) fn card_status(m: &FleetMachine) -> StatusReading {
+/// `presence_unread`: the view's presence read was stale or unreadable
+/// ([`presence_unread`]), which only changes the read card's reason.
+pub(crate) fn card_status(m: &FleetMachine, presence_unread: bool) -> StatusReading {
     let card_read = matches!(m.card, CardOutcome::Available { .. });
     // `rowStanding`: a card the view read proves the machine is up.
     let online = m.is_this_machine || card_read || m.liveness == Liveness::Live;
@@ -129,7 +145,7 @@ pub(crate) fn card_status(m: &FleetMachine) -> StatusReading {
     }
     if !streams_here {
         return if card_read {
-            StatusReading { status: CardStatus::OnlineNotStreaming, reason: Some(NOT_STREAMING_READ.to_string()) }
+            StatusReading { status: CardStatus::OnlineNotStreaming, reason: Some(not_streaming_read_reason(presence_unread).to_string()) }
         } else {
             // A card that was not read always has its reason (`outcome_line`).
             StatusReading { status: CardStatus::NotStreaming, reason: Some(format!("not streaming: {}", note.unwrap_or("its card couldn't be read"))) }
@@ -174,11 +190,19 @@ pub(crate) fn residents_unknown(specs: &darkmux_serve::wire::MachineSpecsRespons
     })
 }
 
+/// (#3662) Whether the view's presence read was stale or unreadable: the
+/// view's own report, never inferred from a row's liveness (`unknown` is also
+/// what presence switched off gives).
+pub(crate) fn presence_unread(presence: &SourceState) -> bool {
+    matches!(presence, SourceState::Stale { .. } | SourceState::Unavailable { .. })
+}
+
 /// The lines `machine list` prints under a machine's row: its status word, the
 /// count line's second line and the tooltip's reason when it has them, and, for
-/// a card that was read, its utility model.
-pub(crate) fn status_lines(m: &FleetMachine) -> Vec<String> {
-    let reading = card_status(m);
+/// a card that was read, its utility model. `presence_unread`: see
+/// [`presence_unread`].
+pub(crate) fn status_lines(m: &FleetMachine, presence_unread: bool) -> Vec<String> {
+    let reading = card_status(m, presence_unread);
     let mut lines = vec![format!("  status: {}", reading.status.word())];
     lines.extend(reading.status.second_line().map(|line| format!("  {line}")));
     lines.extend(reading.reason.map(|why| format!("  why: {why}")));
@@ -203,6 +227,9 @@ mod tests {
     struct Case {
         name: String,
         row: FleetMachine,
+        /// (#3662) The view's presence read was stale or unreadable.
+        #[serde(default)]
+        presence_unread: bool,
         expect: Expect,
     }
 
@@ -214,7 +241,7 @@ mod tests {
         let cases: Vec<Case> = serde_json::from_str(raw).expect("the shared rows parse as fleet rows");
         assert!(cases.len() >= 10, "the fixture must keep covering every status");
         for c in cases {
-            let got = card_status(&c.row);
+            let got = card_status(&c.row, c.presence_unread);
             assert_eq!(got.status, c.expect.status, "{}", c.name);
             assert_eq!(got.status.word(), c.expect.word, "{}", c.name);
             assert_eq!(got.status.second_line().map(str::to_string), c.expect.second_line, "{}", c.name);
@@ -237,11 +264,11 @@ mod tests {
         let raw = include_str!("../tests/fixtures/card-status-rows.json");
         let cases: Vec<Case> = serde_json::from_str(raw).unwrap();
         let by = |name: &str| cases.iter().find(|c| c.name == name).unwrap_or_else(|| panic!("{name}"));
-        let off = status_lines(&by("peer, no beat, listener off").row);
+        let off = status_lines(&by("peer, no beat, listener off").row, false);
         assert_eq!(off, vec!["  status: offline".to_string(), "  why: offline: not listening".to_string()]);
-        let online = status_lines(&by("peer, card read, no beat").row);
+        let online = status_lines(&by("peer, card read, no beat").row, false);
         assert_eq!(&online[..2], ["  status: online", "  not streaming"]);
-        let idle = status_lines(&by("peer, beating, idle").row);
+        let idle = status_lines(&by("peer, beating, idle").row, false);
         assert_eq!(idle[0], "  status: idle");
         assert_eq!(idle[1], "  utility model: qwen3-4b, resident; job: not shown here");
     }
@@ -268,7 +295,7 @@ mod tests {
         assert_eq!(residents_unknown(&card.specs).as_deref(), Some("LM Studio could not be asked"));
         card.specs.engine = engine("local-8080", true, true);
         assert_eq!(residents_unknown(&card.specs).as_deref(), Some("`local-8080` could not be asked"));
-        let lines = status_lines(&row);
+        let lines = status_lines(&row, false);
         assert_eq!(lines[1], "  utility model: qwen3-4b, residency not reported; job: not shown here");
     }
 }

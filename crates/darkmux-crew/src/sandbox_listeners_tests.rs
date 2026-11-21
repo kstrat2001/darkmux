@@ -20,7 +20,7 @@ fn watched(fake: FakePlatform, within: Duration) -> Vec<String> {
     let stops = Arc::new(Mutex::new(Vec::new()));
     let watch = {
         let (fake, stops) = (Arc::clone(&fake), Arc::clone(&stops));
-        ListenerWatch::start(FAST, move || look(&*fake, BackendKind::Seatbelt, "a dispatch", 100), move |why| stops.lock().unwrap().push(why))
+        ListenerWatch::start(FAST, move || look(&*fake, BackendKind::Seatbelt, "a dispatch", 100, &darkmux_sandbox::way_back_to_docker_given("seatbelt", darkmux_types::config_access::Source::Config)), move |why| stops.lock().unwrap().push(why))
     };
     let deadline = Instant::now() + within;
     while stops.lock().unwrap().is_empty() && Instant::now() < deadline {
@@ -114,9 +114,9 @@ fn a_dropped_watch_ends_at_once() {
 #[test]
 fn only_a_sandbox_on_the_host_is_watched() {
     let handle = |backend| darkmux_sandbox::SandboxHandle { backend, id: "darkmux-dispatch-x".into() };
-    assert!(watch(&handle(BackendKind::Docker), 1234, "a dispatch", |_| {}).is_none());
-    assert!(watch(&handle(BackendKind::Seatbelt), std::process::id(), "a dispatch", |_| {}).is_some());
-    assert!(watch(&handle(BackendKind::Landlock), std::process::id(), "a dispatch", |_| {}).is_some());
+    assert!(watch(&handle(BackendKind::Docker), 1234, "a dispatch", String::new(), |_| {}).is_none());
+    assert!(watch(&handle(BackendKind::Seatbelt), std::process::id(), "a dispatch", String::new(), |_| {}).is_some());
+    assert!(watch(&handle(BackendKind::Landlock), std::process::id(), "a dispatch", String::new(), |_| {}).is_some());
 }
 
 /// (#3559) One listener held by several of the sandbox's processes (a

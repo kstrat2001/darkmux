@@ -69,15 +69,17 @@ pub enum Look {
 }
 
 /// One look, through `platform`, at the sandbox of `kind` that `leader`
-/// leads, running `what` ("a dispatch").
-pub fn look(platform: &dyn Platform, kind: BackendKind, what: &str, leader: u32) -> Look {
+/// leads, running `what` ("a dispatch"). `way_back` is the run's own way
+/// back to Docker, from its one read of the setting: a look runs every
+/// second, and reads nothing.
+pub fn look(platform: &dyn Platform, kind: BackendKind, what: &str, leader: u32, way_back: &str) -> Look {
     match platform.tcp_listeners_held_by(leader) {
         Some(held) => exposure_reason(kind, what, &held).map_or(Look::Clear, Look::Exposed),
         None => Look::Unread(format!(
             "darkmux cannot read what it listens on, and {what} in {} must be watched: its sandbox cannot hold a \
              listener to the loopback (#3559). {}",
             darkmux_sandbox::placed_in(kind),
-            darkmux_sandbox::way_back_to_docker(kind),
+            way_back,
         )),
     }
 }
@@ -168,11 +170,18 @@ impl Drop for ListenerWatch {
 /// whose processes `leader` leads (the process its backend's command
 /// started: an on-host backend's launcher leads the sandbox's process
 /// group), every [`CHECK_EVERY`] for as long as the watch lives. `what`
-/// names what it runs ("a dispatch"). `None` for a container: nothing to
-/// watch.
-pub fn watch(handle: &SandboxHandle, leader: u32, what: &'static str, stop: impl FnOnce(String) + Send + 'static) -> Option<ListenerWatch> {
+/// names what it runs ("a dispatch"); `way_back` is the run's own way back
+/// to Docker, from its one read of the setting. `None` for a container:
+/// nothing to watch.
+pub fn watch(
+    handle: &SandboxHandle,
+    leader: u32,
+    what: &'static str,
+    way_back: String,
+    stop: impl FnOnce(String) + Send + 'static,
+) -> Option<ListenerWatch> {
     let kind = handle.backend;
-    kind.on_host().then(|| ListenerWatch::start(CHECK_EVERY, move || look(darkmux_platform::current(), kind, what, leader), stop))
+    kind.on_host().then(|| ListenerWatch::start(CHECK_EVERY, move || look(darkmux_platform::current(), kind, what, leader, &way_back), stop))
 }
 
 #[cfg(test)]

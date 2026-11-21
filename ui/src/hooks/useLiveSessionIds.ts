@@ -16,12 +16,9 @@ import type { FleetDispatchesLiveResponse } from "../types/generated/FleetDispat
  * consumer got an empty `Set` for "presence says nobody is running" and for
  * "presence could not be read", with nothing able to tell them apart.
  *
- * The app-wide `FleetCoverageNotice` (#2683) does caveat the page today, so
- * nothing was silently wrong on screen. But that cover is INCIDENTAL: it
- * comes from a different query, mounted by `App`, and it speaks about
- * machines. Returning the coverage here makes it structural — a consumer that
- * asserts something from this set has the caveat in hand at the point of the
- * claim, whether or not a notice happens to be mounted above it.
+ * Returning the coverage here makes it structural: a consumer that asserts
+ * something from this set has the caveat in hand at the point of the claim.
+ * (#3662: there is no app-wide notice above it to lean on.)
  * `useSessionLiveness` is the first consumer that actually needs it, and the
  * claim it was getting wrong is in that hook's own doc. */
 export interface LiveSessionsResult {

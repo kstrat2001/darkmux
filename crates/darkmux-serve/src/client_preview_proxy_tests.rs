@@ -958,13 +958,18 @@ async fn off_the_tailnet_nothing_reaches_a_preview() {
     assert_eq!(preview.count(), 0);
 }
 
-/// `router` serving on a real loopback listener (an upgrade needs a real
-/// connection); its address.
+/// `router` served as `client serve` serves it
+/// ([`crate::client_pairing::serve_client_listener`]) on a real loopback
+/// listener (an upgrade needs a real connection); its address.
 async fn listening(h: &Harness) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = crate::local_peer::make_service(router(h.state.clone()));
-    tokio::spawn(async move { axum::serve(listener, app).await });
+    let app = router(h.state.clone());
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let _running = stop;
+        crate::client_pairing::serve_client_listener(listener, app, stopped).await
+    });
     addr
 }
 
@@ -1094,6 +1099,55 @@ async fn an_open_websocket_ends_when_its_session_does() {
         assert!(
             !still_echoes(&mut s).await,
             "{why}: the socket outlived its session"
+        );
+    }
+}
+
+/// An answer the preview is still streaming (a long download, a dev
+/// server's event stream) ends with its session, as an open WebSocket
+/// does: when the device is revoked, its preview stops or restarts,
+/// previews are turned off, or `client serve` begins to stop, the body
+/// fails within [`RECHECK_EVERY`] instead of streaming on.
+#[tokio::test]
+async fn a_streaming_answer_ends_when_its_session_does() {
+    type End = fn(&mut Harness, u16);
+    let ends: [(&str, End); 5] = [
+        ("revoked", |h, _| {
+            assert!(revoke(&h.store, FIRST_CLIENT).unwrap())
+        }),
+        ("stopped", |h, _| assert!(h.state.previews.stop("wt1"))),
+        ("restarted", |h, port| {
+            h.state.previews.ready_for_test("wt1", port);
+        }),
+        ("previews off", |h, _| {
+            *h.preview_on.lock().unwrap() = false;
+            h.clock.fetch_add(1, Ordering::SeqCst);
+        }),
+        ("client serve stopping", |h, _| {
+            h.state.previews.begin_shutdown()
+        }),
+    ];
+    for (why, end) in ends {
+        let mut h = harness();
+        let (token, preview) = a_previewing_phone(&mut h).await;
+        let cookie = session_of(&h, &token).await;
+        let mut from = forwarded(Some(SAM));
+        from.push(("cookie", cookie.as_str()));
+        let mut req = get("/slowbody", &from);
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                [127, 0, 0, 1],
+                5555,
+            ))));
+        let res = router(h.state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), 200, "{why}: its head came at once");
+        end(&mut h, preview.port);
+        let body =
+            tokio::time::timeout(RECHECK_EVERY * 3, axum::body::to_bytes(res.into_body(), 64))
+                .await;
+        assert!(
+            matches!(body, Ok(Err(_))),
+            "{why}: the answer outlived its session: {body:?}"
         );
     }
 }

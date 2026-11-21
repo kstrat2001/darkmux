@@ -490,6 +490,56 @@ fn listened(port: u16) -> bool {
     darkmux_platform::current().tcp_port_listeners(port).is_some_and(|l| !l.is_empty())
 }
 
+/// The fork-hopping dev server: the first process stays (so the dev server
+/// has not exited) and hands the socket to a child that hops: forks, and the
+/// parent exits, over and over, so no one pid holds it for more than a few
+/// milliseconds. Every process ends by itself after `HOP_FOR` seconds (60
+/// unless set), so a test run that is killed before the preview watch stops
+/// it cannot leave hoppers forking for good.
+const HOPPER: &str = "import os, socket, time; d = time.time() + float(os.environ.get('HOP_FOR', '60')); s = socket.socket(); s.bind(('0.0.0.0', int(os.environ['PORT']))); s.listen()
+if os.fork():
+    s.close(); time.sleep(max(0, d - time.time())); os._exit(0)
+while time.time() < d:
+    if os.fork(): os._exit(0)
+    time.sleep(0.005)";
+
+/// A child leading its own process group: dropping it kills the whole group
+/// and reaps the child.
+struct GroupKill(std::process::Child);
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        // SAFETY: kill has no memory preconditions; a negative pid names a group.
+        unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+        let _ = self.0.wait();
+    }
+}
+
+/// The hopper fixture ends by itself: run outside any sandbox with a short
+/// life, its port is free again soon after, with no watch to stop it.
+#[test]
+fn the_fork_hopper_fixture_ends_by_itself() {
+    use std::os::unix::process::CommandExt;
+    let port = darkmux_types::test_ports::fixture_port();
+    let _group = GroupKill(std::process::Command::new("python3")
+        .args(["-c", HOPPER])
+        .env("PORT", port.to_string())
+        .env("HOP_FOR", "1")
+        .process_group(0)
+        .spawn()
+        .expect("python3 runs"));
+    let held = (0..40).any(|_| {
+        std::thread::sleep(Duration::from_millis(50));
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+    });
+    assert!(held, "the hopper never listened on {port}");
+    let freed = (0..60).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_err()
+    });
+    assert!(freed, "the hopper still holds {port} 6 s after its 1 s life");
+}
+
 /// (#3112 review, BLOCKER 1) A dev server that binds every address and then
 /// keeps forking a new pid (each child inheriting the socket, the parent
 /// exiting) is still stopped: the watch reads the port from the kernel's
@@ -505,15 +555,7 @@ fn a_fork_hopping_listener_on_every_address_is_stopped() {
     let _state = StateDir::set();
     let dir = tempfile::TempDir::new().unwrap();
     let previews = real_seatbelt(dir.path());
-    // The first process stays (so the dev server has not exited) and hands
-    // the socket to a child that hops: forks, and the parent exits, over and
-    // over, so no one pid holds it for more than a few milliseconds.
-    let hopper = r#"exec python3 -c "import os, socket, time; s = socket.socket(); s.bind(('0.0.0.0', int(os.environ['PORT']))); s.listen()
-if os.fork():
-    s.close(); time.sleep(600)
-while True:
-    if os.fork(): os._exit(0)
-    time.sleep(0.005)""#;
+    let hopper = format!("exec python3 -c \"{HOPPER}\"");
     let wt = a_workspace(dir.path(), serde_json::json!({"schema_version": "1.1", "command": hopper, "env": {"PORT": "{port}"}}));
     previews.start_in(BackendKind::Seatbelt, "w", &wt, &RecipeSource::Checkout(wt.clone())).unwrap();
     let v = until_status(&previews, "w", &["failed", "ready"], Duration::from_secs(30));

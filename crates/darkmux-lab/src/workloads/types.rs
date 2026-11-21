@@ -307,6 +307,10 @@ pub(crate) struct RunResult {
     /// on purpose to hand the work to a higher tier. `ok` is false then, but
     /// `error` stays `None`: an escalation is not an error.
     pub escalation: Option<String>,
+    /// The run's placement settings, when it read them (a coding-task run):
+    /// its grader, in the same run, places the suite where the run placed
+    /// its own tests, from that one read.
+    pub placement: Option<crate::providers::coding_task::RunPlacement>,
 }
 
 impl RunResult {

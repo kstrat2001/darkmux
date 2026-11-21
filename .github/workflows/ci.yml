@@ -48,7 +48,7 @@ on:
     # heavy Rust jobs, so this costs little and closes a real hole.
     branches: [main, ui/port]
     # (#2896) `labeled` so adding the `full-ci` label to an open PR runs the
-    # heavy checks it unlocks (the isolation leak check below) without a
+    # heavy checks it unlocks (the `leak-check` job below) without a
     # re-push.
     # The cost: ANY label added to an open PR restarts its run (the PR
     # concurrency group cancels the one in flight). Filtering the label per
@@ -97,10 +97,11 @@ jobs:
     # step having failed, which `gh pr checks` renders indistinguishably from a
     # real test failure. A timeout this tight stops being a runaway guard and
     # becomes a coin flip on job scheduling; 25 still bounds a genuine hang.
-    # Raised 25 -> 40 (2026-10-28): the push-to-main run adds the isolation
-    # leak check (~13 min) to the tests (~10 min) and clippy (~2 min), and
-    # the release commit d85aab9c6 was CANCELLED at 26m48s twice with every
-    # step green. 40 is ~1.5x that run and still bounds a genuine hang.
+    # Raised 25 -> 40 (2026-10-28), when the isolation leak check ran as a
+    # step here and the release commit d85aab9c6 was CANCELLED at 26m48s
+    # twice with every step green. The leak check is now its own job
+    # (`leak-check`), so this job is tests (~15-18 min) and clippy (~2 min);
+    # 40 still bounds a genuine hang.
     timeout-minutes: 40
 
     steps:
@@ -153,9 +154,10 @@ jobs:
       # hit the heavy steps skip and the summary names the run that is the
       # evidence. The job still reports success, so required checks are met.
       #
-      # Two records, because the PR light gate does not run the leak check: a
-      # main push after an unlabeled PR skips tests and clippy but still runs
-      # the leak check, and records it. The nightly schedule never skips.
+      # The leak check keeps its own record in the `leak-check` job: the PR
+      # light gate does not run it, so a main push after an unlabeled PR
+      # skips tests and clippy here but still runs the leak check there. The
+      # nightly schedule never skips.
       - name: Has this tree already passed tests + clippy?
         id: tree_tests
         if: steps.filter.outputs.rust == 'true' && github.event_name != 'schedule'
@@ -163,36 +165,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci-tree-pass.py lookup --kind build-test-lint --workflow .github/workflows/ci.yml
 
-      - name: Has this tree already passed the leak check?
-        id: tree_leak
-        if: steps.filter.outputs.rust == 'true' && github.event_name != 'schedule'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/ci-tree-pass.py lookup --kind leak-check --workflow .github/workflows/ci.yml
-
       - name: Which steps run
         id: gate
         env:
           RUST: ${{ steps.filter.outputs.rust }}
-          LEAK_WANTED: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci') }}
           TESTS_HIT: ${{ steps.tree_tests.outputs.hit }}
-          LEAK_HIT: ${{ steps.tree_leak.outputs.hit }}
         run: |
-          tests=false; leak=false
+          tests=false
           if [ "$RUST" = "true" ] && [ "$TESTS_HIT" != "true" ]; then tests=true; fi
-          if [ "$RUST" = "true" ] && [ "$LEAK_WANTED" = "true" ] && [ "$LEAK_HIT" != "true" ]; then leak=true; fi
           echo "tests=$tests" >> "$GITHUB_OUTPUT"
-          echo "leak=$leak" >> "$GITHUB_OUTPUT"
-          echo "tests+clippy: $tests, leak check: $leak"
+          echo "tests+clippy: $tests (the leak check is its own job, leak-check)"
 
       - name: Install Rust stable toolchain
-        if: steps.gate.outputs.tests == 'true' || steps.gate.outputs.leak == 'true'
+        if: steps.gate.outputs.tests == 'true'
         uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: clippy, rustfmt
 
       - name: Cache cargo registry + build artifacts
-        if: steps.gate.outputs.tests == 'true' || steps.gate.outputs.leak == 'true'
+        if: steps.gate.outputs.tests == 'true'
         uses: Swatinem/rust-cache@v2
 
       # Format check intentionally NOT enforced yet — the codebase has
@@ -209,8 +200,7 @@ jobs:
       # retries, so a flake fails the gate instead of passing on luck, and a
       # per-test `terminate-after`, so a hung test fails loudly instead of
       # running the job into its timeout. nextest does not run doctests; the
-      # step after this one does. The leak check below still drives `cargo
-      # test` children and reuses this step's build.
+      # step after this one does.
       - name: Install cargo-nextest
         if: steps.gate.outputs.tests == 'true'
         uses: taiki-e/install-action@v2
@@ -228,45 +218,6 @@ jobs:
       - name: Doc tests (nextest does not run them)
         if: steps.gate.outputs.tests == 'true'
         run: cargo test -q --workspace --doc
-
-      # (#2717) The execution-side isolation check. It re-runs each test
-      # unit as a child `cargo test` under a sentinel state tree and
-      # asserts the file census is EMPTY — so a test that writes into the
-      # operator's real `~/.darkmux` is caught by EFFECT rather than by
-      # a source scan over recognized spellings.
-      #
-      # Gated behind DARKMUX_LEAK_CHECK because it re-runs the suite, and
-      # deliberately placed AFTER the workspace test step — as a STEP in
-      # this job rather than a job of its own — so it reuses that step's
-      # warm `target/`. The reason is WALL CLOCK against this job's cap,
-      # not cost: the repository is public, so Actions minutes are not
-      # billed. A separate job would pay a cold build and blow the budget
-      # below.
-      #
-      # The cost, measured on this step's own first run (34977555381,
-      # macos-latest) rather than estimated: workspace tests 215s, this
-      # check 419s, clippy 24s — 690s of a 900s cap, leaving 210s of
-      # margin (23%). Re-measure before adding units here; widening the
-      # enumeration is a change to that number, not a free one. If the
-      # margin goes, the move is to the nightly workflow — the trade is
-      # that a leak then lands on main and is caught the next morning
-      # instead of at the gate.
-      #
-      # `continue-on-error` is NOT set: the whole point is that a green
-      # child proves nothing (measured — three of four leaking targets went
-      # red and one stayed green while leaking, so the verdict is the file
-      # count, never the status).
-      #
-      # (#2896) NOT on an ordinary PR any more: it runs on every push to main
-      # and on a PR labeled `full-ci`. A PR is the light gate (build, the
-      # full nextest suite, clippy); the trade is that a leak an unlabeled PR
-      # introduces is caught on main right after merge, not before it. Label
-      # a release candidate or a risky PR `full-ci` to get it at the gate.
-      - name: Isolation leak check (each test unit under a sentinel tree)
-        if: steps.gate.outputs.leak == 'true'
-        env:
-          DARKMUX_LEAK_CHECK: "1"
-        run: cargo test --test state_leak_execution_guard -- --nocapture
 
       - name: Clippy (whole workspace, all targets, no warnings allowed)
         if: steps.gate.outputs.tests == 'true'
@@ -297,6 +248,87 @@ jobs:
           path: ${{ runner.temp }}/tree-pass-tests/record.json
           if-no-files-found: error
           retention-days: 30
+      - name: No Rust-relevant changes — pipeline skipped
+        if: steps.filter.outputs.rust != 'true'
+        run: echo "No Rust / Cargo / template / workflow changes detected; test+lint skipped (reports green)."
+
+  # The execution-side isolation check (#2717), as its own job so it runs
+  # beside build-test-lint instead of after it. As a step it reused that job's
+  # warm target/, but tests (~15-18 min) plus this check (~16-18 min) ran into
+  # build-test-lint's 40 min cap on full-ci PRs (#3657, #3658, #3664, #3665
+  # were each cancelled there with every step green). Here it pays its own
+  # build, with its own rust-cache, in parallel.
+  #
+  # It re-runs each test unit as a child `cargo test` under a sentinel state
+  # tree and asserts the file census is EMPTY, so a test that writes into the
+  # operator's real `~/.darkmux` is caught by EFFECT rather than by a source
+  # scan over recognized spellings. `continue-on-error` is NOT set: a green
+  # child proves nothing (measured: three of four leaking targets went red and
+  # one stayed green while leaking, so the verdict is the file count, never
+  # the status).
+  #
+  # (#2896) Not on an ordinary PR: it runs on every push to main, nightly, and
+  # on a PR labeled `full-ci`. A leak an unlabeled PR introduces is caught on
+  # main right after merge. (#3137) Keyed by tree like build-test-lint: a main
+  # push whose tree already passed it skips the heavy steps.
+  leak-check:
+    name: isolation leak check (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The same filter as build-test-lint's; keep the two in step.
+      - name: Detect Rust-relevant changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            rust:
+              - '**'
+              - '!**/CLAUDE.md'
+              - '!docs/agents/**'
+              - '!{README.md,CONTRIBUTING.md,CHANGELOG.md,DISCLAIMER.md,SECURITY.md,LICENSE}'
+              - '!docs/{ENGAGEMENTS,OPERATIONS}.md'
+              - '!packaging/homebrew/{darkmux.rb,README.md}'
+              - '!packaging/homebrew/tap-bootstrap/**'
+
+      - name: Has this tree already passed the leak check?
+        id: tree_leak
+        if: steps.filter.outputs.rust == 'true' && github.event_name != 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-tree-pass.py lookup --kind leak-check --workflow .github/workflows/ci.yml
+
+      - name: Does the leak check run
+        id: gate
+        env:
+          RUST: ${{ steps.filter.outputs.rust }}
+          LEAK_WANTED: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+          LEAK_HIT: ${{ steps.tree_leak.outputs.hit }}
+        run: |
+          leak=false
+          if [ "$RUST" = "true" ] && [ "$LEAK_WANTED" = "true" ] && [ "$LEAK_HIT" != "true" ]; then leak=true; fi
+          echo "leak=$leak" >> "$GITHUB_OUTPUT"
+          echo "leak check: $leak"
+
+      - name: Install Rust stable toolchain
+        if: steps.gate.outputs.leak == 'true'
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      - name: Cache cargo registry + build artifacts
+        if: steps.gate.outputs.leak == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Isolation leak check (each test unit under a sentinel tree)
+        if: steps.gate.outputs.leak == 'true'
+        env:
+          DARKMUX_LEAK_CHECK: "1"
+        run: cargo test --test state_leak_execution_guard -- --nocapture
+
       - name: Record that this tree passed the leak check
         id: rec_leak
         if: steps.gate.outputs.leak == 'true'
@@ -309,10 +341,6 @@ jobs:
           path: ${{ runner.temp }}/tree-pass-leak/record.json
           if-no-files-found: error
           retention-days: 30
-
-      - name: No Rust-relevant changes — pipeline skipped
-        if: steps.filter.outputs.rust != 'true'
-        run: echo "No Rust / Cargo / template / workflow changes detected; test+lint skipped (reports green)."
 
   fleet-e2e:
     name: fleet e2e (ubuntu-latest, real redis)

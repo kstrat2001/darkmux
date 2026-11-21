@@ -829,9 +829,10 @@ fn the_runtime_subcommand_runs_inside_a_seatbelt_sandbox() {
         cmd.stdin(Stdio::null()).output().expect("running the sandbox")
     };
 
-    // The dispatch.
+    // The dispatch. (#3654) Its workspace sits under this build's target
+    // folder, itself under the user's home, as a real checkout would.
     let exe = darkmux_exe();
-    let ws = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let out = tempfile::tempdir().unwrap();
     std::fs::write(ws.path().join("x.txt"), "hello\nworld\n").unwrap();
     let mounts = vec![
@@ -861,6 +862,15 @@ fn the_runtime_subcommand_runs_inside_a_seatbelt_sandbox() {
     // host hashed exactly that text.
     let first: Value = serde_json::from_str(&mock.requests()[0].body).unwrap();
     assert_eq!(first["messages"][0]["content"], "You are a test. Work in /workspace.", "the system prompt as hashed");
+    // (#3654) No request the sandbox sent names the workspace's host path or
+    // the home it sits under.
+    let real = ws.path().canonicalize().unwrap().display().to_string();
+    let home = std::env::var("HOME").unwrap_or_default();
+    for (i, r) in mock.requests().iter().enumerate() {
+        for private in [real.as_str(), &ws.path().display().to_string(), home.as_str()].into_iter().filter(|p| p.len() > 1) {
+            assert!(!r.body.contains(private), "request {i} names {private:?}: {}", r.body);
+        }
+    }
     assert_eq!(std::fs::read_to_string(ws.path().join("x.txt")).unwrap(), "bye\nworld\n", "the edit landed");
     assert_eq!(std::fs::read_to_string(ws.path().join("new.txt")).unwrap(), "made\n", "the write landed");
     let trajectory = std::fs::read_to_string(out.path().join(".darkmux-runtime/trajectory.jsonl")).unwrap();

@@ -199,6 +199,18 @@ darkmux release.
 
 ### Changed
 
+- **The viewer no longer shows a warning box when fleet presence can't be read (#3662).** The cards say
+  what is known instead. A peer reads "not streaming" (under "online" when its card was read), with static
+  in its scope, never "idle" or "0 running", and its tooltip says this viewer can't read the fleet hub
+  right now, so its live state is unknown; any recorded activity still shows and still counts. A peer
+  nothing says is up reads plain "not streaming"; a peer known to be down still reads "offline". The token
+  total reads "tokens seen", since records written while the hub is unread can't be in it. This machine's
+  card keeps showing its own records, also when the fleet view can't be read, as long as the daemon names
+  this machine (`/machine/specs`, asked again until it answers); until then no card claims "idle". A
+  peer's machine page reads "not reported · this viewer can't read the fleet hub right now", and `darkmux
+  machine list` gives a read peer the same reason. The masthead's machine count keeps its small ⚠, and its
+  tooltip now says why in a few words.
+
 - **A `procedural.shell` step gets every dependency's output as a file, and a variable too large for the
   environment is unset.** Each input is written whole to `$DARKMUX_STEP_INPUTS_DIR/<DEP-ID>`, an
   owner-only directory removed when the command finishes, whatever its size. An input that fits the
@@ -211,6 +223,43 @@ darkmux release.
 
 ### Fixed
 
+- **The viewer and the client listener cap their connections and close an idle one.** `darkmux serve`
+  and `darkmux client serve` now serve as the fleet listener does: at most 256 connections at once for
+  the viewer (128 from one address) and 64 for the client listener, one past the cap closed as it is
+  accepted, and a connection that sends no complete request within 10 seconds (an idle kept-alive one
+  included) closed. A peer that opened connections and sent nothing could otherwise hold them all open
+  and use up the file descriptors the process needs. Keep-alive, streamed answers (the viewer's live
+  feeds) and WebSocket upgrades work as before. Half of the connections from this machine (64 for the
+  viewer, 32 for the client listener) are kept out of a container's or a sandbox's reach (#3660): your
+  browser, `tailscale serve`'s traffic and the CLI all arrive from this machine, and so do a Docker
+  container reaching `host.docker.internal` and a sandboxed process. Once the other half is in use, each
+  further connection from this machine is checked first (the look at who holds it that decides what a
+  local caller may read, about 70 ms on a Mac), and one held by a container's forwarder or a host sandbox
+  is closed. A forwarder found once is remembered and its later connections are closed as they arrive,
+  and a connection whose sender hangs up while it is checked is let go at once. So a container that
+  holds connections open, reopens every one it loses, or opens and drops them as fast as it can still
+  leaves the browser and the tailnet their half. Under such a flood a page's new connection waits longer:
+  a few hundred milliseconds measured on an M5 Max, and from one to several seconds (1.4 to 6 s
+  measured) when the container engine holds tens of thousands of open files. Every connection a listener
+  refuses is now closed with a reset rather than an ordinary close, so a flood leaves no closed
+  connections tying up the ports your browser needs to reach that listener. Nothing is
+  checked while the first half has room. Not covered: sandboxed work holding connections open past the
+  first half is checked each time (the sandbox's network rules keep it off darkmux's ports); a container
+  engine whose forwarder darkmux does not know by name (OrbStack, rootless Podman's slirp4netns or
+  pasta) is not told apart from your own processes; and a client that half-closes its connection after
+  sending a request is closed if it arrives while the first half is full.
+- **A preview's streaming answer ends with its session.** An answer a preview was still streaming
+  through the tailnet entry (a long download, a dev server's event stream) kept streaming after its
+  session ended; it is now cut within a second of the session ending (previews turned off, the device
+  revoked, the preview stopped or restarted, `client serve` stopping), as an open WebSocket is.
+- **Checking a client's token no longer locks the client store for writing.** Every request with a
+  bearer token took `clients.json`'s exclusive lock and set its mode; it now reads the store under its
+  shared lock and writes nothing, so requests no longer queue on each other. A revoked token is still
+  refused on its next request.
+- **A pairing request's code and device name refuse characters that would show other than as sent.** A
+  `device_name` with a bidirectional control or mark or a zero-width character, and a `code` with any
+  invisible, formatting or right-to-left character, are refused `bad_request`: the operator compares
+  the code character for character before approving.
 - **A typo in a hook rule's `match` is refused instead of widening the rule.** A `match` takes its
   named fields and `payload.<path>` predicates; any other key (`"levle": "error"`) was dropped on load,
   so a webhook meant for errors fired on every matching action. Every entry point now refuses it at
@@ -234,6 +283,22 @@ darkmux release.
   hashes it, and the runtime sends the prompt exactly as passed. A container run is unchanged. The
   model still sees the workspace's true host path under a sandbox on the host, so request bodies
   there still carry the path (under your home folder), including those sent to a hosted endpoint.
+- **Under a sandbox on the host, no request darkmux sends a model names your home or workspace path
+  (#3654).** Under `seatbelt` or `landlock` the model is now told the workspace is its current
+  directory, and works there with relative paths: the system prompt, the user's message
+  (`${WORKSPACE_ROOT}` and `/workspace` both read `.`), the tool descriptions, every tool result and
+  refusal the runtime writes (`Wrote 5 bytes to new.txt`, an escape refused as "a path outside the
+  workspace"), a lab or crawl brief, the no-git note, a briefed finding (its recorded `root` is no
+  longer shown) and a briefed mod's attachments (named under `$DARKMUX_MODS`, which the sandbox's
+  shell expands) carry no host path, so neither do compaction requests. A finding or a kit cited as
+  `./<source>/<path>`, as that brief lists the scope, is stored as the repo path like any other. A
+  step grown from a task (a crawl's or review's `create-mod`) is no longer sent that task's whole
+  output: the summary named each finding's tree and each unit's out-dir by host path, under every
+  sandbox, Docker included, and reached the create-mod seat, hosted or local. Nothing a model wrote or
+  a command printed is rewritten: a command that prints `$HOME`, `$TMPDIR` or `pwd` still shows those
+  paths, and a mission config of your own that feeds a step's output (a shell command's, or an
+  errored step's reason) into a dispatch passes on whatever that text holds. Otherwise a container
+  run's requests are unchanged.
 - **Flow records: lab runs stay off hooks, a failed write is said, and the audit trail's gaps stay
   visible.** Found by the 2026-11-17 layer review. A hook rule that matched everything delivered a lab
   run's records off the machine; hooks now drop them by the same rule that keeps them off the fleet hub

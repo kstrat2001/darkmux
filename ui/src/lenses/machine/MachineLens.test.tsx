@@ -96,6 +96,8 @@ function mockMachineFetch(opts: {
   hold?: Record<string, Promise<void>>;
   /** (#2965) Both `/flow/<day>` reads answer with this HTTP error status. */
   failFlow?: number;
+  /** (#3662) The fleet source state both presence routes report. */
+  presence?: Record<string, unknown>;
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -130,7 +132,7 @@ function mockMachineFetch(opts: {
     if (path === "/fleet/machines/live") {
       return Promise.resolve(
         new Response(
-          JSON.stringify({ machines: opts.liveMachines ?? [], meta: { sources: { fleet: { state: "off" } }, complete: true } }),
+          JSON.stringify({ machines: opts.liveMachines ?? [], meta: { sources: { fleet: opts.presence ?? { state: "off" } }, complete: opts.presence === undefined } }),
           { status: 200 },
         ),
       );
@@ -142,7 +144,9 @@ function mockMachineFetch(opts: {
     }
     if (path === "./demo-flow.jsonl") return Promise.resolve(new Response("", { status: 200 }));
     if (path === "/fleet/dispatches/live") {
-      return Promise.resolve(new Response(JSON.stringify({ dispatches: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+      return Promise.resolve(
+        new Response(JSON.stringify({ dispatches: [], meta: { sources: { fleet: opts.presence ?? { state: "off" } }, complete: opts.presence === undefined } }), { status: 200 }),
+      );
     }
     if (path === "/fleet/view" && opts.fleetView) {
       return Promise.resolve(new Response(JSON.stringify({ machines: opts.fleetView }), { status: 200 }));
@@ -660,6 +664,47 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     expect(section.querySelector(".mm-utility__live")?.textContent).toBe("not reported");
     expect([...section.querySelectorAll(".mm-utility__job")].map((r) => r.textContent)).toEqual(["compacting——", "radio routing——", "other——"]);
     expect(container.textContent).not.toMatch(/0 calls|idle/);
+  });
+
+  // (#3662) With presence unreadable, a peer's records in the window came
+  // through the hub presence could not be read from: history, not a stream.
+  // Its page says not reported, never "idle" or "0 calls". The fleet cards
+  // say the same ("not streaming"), off the same predicate.
+  it("(#3662) with presence unreadable, a peer with records in the window reads not reported, never idle", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self" },
+      roster: [{ id: "studio", address: "100.64.0.9:8765", added_unix_ms: 1, machine_uid: "u-studio" }],
+      flowToday: [
+        { ts: new Date(Date.now() - 3_600_000).toISOString(), machine_uid: "u-studio", machine_id: "studio", action: "dispatch.start", session_id: "p1" },
+        { ts: new Date(Date.now() - 3_540_000).toISOString(), machine_uid: "u-studio", machine_id: "studio", action: "dispatch.complete", session_id: "p1" },
+      ],
+      presence: { state: "unavailable", detail: "could not read presence beats from Redis" },
+    });
+    const { container } = renderMachine("u-studio");
+    // What is true: this viewer cannot read the hub. Not "no records reach
+    // this viewer": the window holds them.
+    await waitFor(() =>
+      expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("not reported · this viewer can't read the fleet hub right now"),
+    );
+    const section = container.querySelector('[data-testid="machine-utility"]')!;
+    expect(section.querySelector(".mm-utility__live")?.textContent).toBe("not reported");
+    expect(container.textContent).not.toMatch(/0 calls|idle|no records from this machine/);
+  });
+
+  // The inverted case: the same page with presence healthy is a peer whose
+  // records do reach this viewer, so its quiet reads idle.
+  it("(#3662) with presence healthy, the same peer reads idle", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", machine_uid: "u-self" },
+      roster: [{ id: "studio", address: "100.64.0.9:8765", added_unix_ms: 1, machine_uid: "u-studio" }],
+      flowToday: [
+        { ts: new Date(Date.now() - 3_600_000).toISOString(), machine_uid: "u-studio", machine_id: "studio", action: "dispatch.start", session_id: "p1" },
+        { ts: new Date(Date.now() - 3_540_000).toISOString(), machine_uid: "u-studio", machine_id: "studio", action: "dispatch.complete", session_id: "p1" },
+      ],
+      presence: { state: "ok" },
+    });
+    const { container } = renderMachine("u-studio");
+    await waitFor(() => expect(container.querySelector(".machine-drawer__idle-line")!.textContent).toBe("idle · no samples in the last 10 min"));
   });
 
   // (#2965) A failed flow read settles the window, but it is not an answer

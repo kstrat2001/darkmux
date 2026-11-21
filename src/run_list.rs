@@ -66,8 +66,8 @@ pub(crate) fn run(
         return Ok(0);
     }
 
-    let selection = select_rows(filtered, limit, all);
-    render_text(&selection, kind, &fleet.state, since_label);
+    let rows = select_rows(filtered, limit, all);
+    render_text(&rows, kind, &fleet.state, since_label);
     if let Some(report) = &report {
         println!();
         for line in usage_lines(report, style::terminal_width()) {

@@ -10,7 +10,7 @@
 
 ## Pair on the Mac
 
-1. Make a random pair secret and keep it in memory. Send `POST /client/pair` with a code your app shows its user and that secret. The reply names a request.
+1. Make a random pair secret and keep it in memory. Send `POST /client/pair` with a code your app shows its user, a `device_name`, and that secret. The reply names a request. The operator compares the code character for character, so it is refused (`bad_request`) when it holds an invisible, formatting or right-to-left character; use letters, digits and dashes. A `device_name` with an invisible formatting character (a bidirectional control or mark, a zero-width character) is refused too.
 2. Show the code. A Mux Bot signed by a verified team is approved at once. Any other app waits for the operator, who approves it in a dialog on the Mac or with `darkmux client approve --code <CODE>`.
 3. Poll `GET /client/pair/{request_id}` with the secret in `X-Pair-Secret`:
    - `pending`: keep polling.
@@ -86,7 +86,7 @@ Gate this on `remote_preview` in `capabilities`, with `remote` `available`. A de
 2. Send `POST /client/workspaces/{name}/preview/link` through `url`, with the device's token. The reply's `url` is a link to that preview for this device: it opens once, within `expires_in_secs`. Open it in the device's browser at once, and never keep or log it. From an app on the Mac it is refused `tailnet_only` (the preview's own address serves it), and for a preview that is not ready, `conflict`.
 3. The browser opens the link (`GET /client/preview-link/{code}`). darkmux checks the request comes from the tailnet user and device the link was made for, sets a session cookie in that browser and sends it on to the root of `url`, where the preview is. Every path outside /client/ there is the preview's, its WebSocket upgrades included, so live reload works when the preview's reload socket uses the app port.
 4. A link opened a second time, or too late, answers `not_found`; one whose preview stopped or restarted since it was made, or whose device was revoked, `conflict`. From another device or user it answers as a token would (`remote_device_mismatch`, `remote_identity_mismatch`), and is used up all the same. Ask for a new link.
-5. The session lasts while its preview runs. It ends when the preview stops or restarts, when the device is revoked, when previews are turned off on the Mac, and when `darkmux client serve` stops: the preview's pages then answer `no_preview_session`, and an open WebSocket closes within a second. Ask for a new link and open it.
+5. The session lasts while its preview runs. It ends when the preview stops or restarts, when the device is revoked, when previews are turned off on the Mac, and when `darkmux client serve` stops: the preview's pages then answer `no_preview_session`, and an open WebSocket closes, and an answer still streaming is cut, within a second. Ask for a new link and open it.
 
 What that means for a preview:
 

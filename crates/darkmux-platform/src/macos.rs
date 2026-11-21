@@ -203,6 +203,12 @@ impl Platform for MacPlatform {
         lsof_established(local.port()).map(|out| crate::peers_from_lsof_fpn(&out, local))
     }
 
+    /// (#3660) `pid`'s socket descriptors, each read with `proc_pidfdinfo`,
+    /// as #3559's listener read does: no `lsof`, no walk over processes.
+    fn tcp_ends_held_by(&self, pid: u32, local: std::net::SocketAddr) -> Option<Vec<std::net::SocketAddr>> {
+        connection_ends_held_by_pid(pid, local)
+    }
+
     /// (#3112) One `netstat -anv -p tcp` (the kernel's `pcblist`, no walk
     /// over processes), bounded to 5 s: about 5 ms measured on an M5 Max.
     fn tcp_port_listeners(&self, port: u16) -> Option<Vec<crate::PortListener>> {
@@ -725,14 +731,69 @@ pub(crate) mod libproc {
         Some((port, crate::PortListener { addr: Some(addr), text: addr.to_string(), scope, pid: Some(pid) }))
     }
 
+    /// (#3660) One socket's `struct socket_fdinfo` as an ESTABLISHED TCP
+    /// connection's two ends, `(own, other)`: `None` for any other socket (a
+    /// listener, one still connecting or closing, UDP, a local socket), as
+    /// Linux's `/proc/net/tcp` rows are read. The foreign port and address sit just before their
+    /// local forms (`insi_fport`, `insi_faddr`).
+    pub(crate) fn connection_in_fdinfo(info: &[u8]) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
+        let int = |at: usize| info.get(at..at + 4).map(|b| i32::from_ne_bytes([b[0], b[1], b[2], b[3]]));
+        if info.len() < SOCKET_FDINFO_SIZE || int(SOI_KIND)? != SOCKINFO_TCP || int(TCPSI_STATE)? != TSI_S_ESTABLISHED {
+            return None;
+        }
+        let port = |at: usize| u16::from_be_bytes([info[at], info[at + 1]]);
+        let addr = |v6: usize, v4: usize| -> Option<std::net::IpAddr> {
+            let vflag = info[INSI_VFLAG];
+            if vflag & INI_IPV6 != 0 {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&info[v6..v6 + 16]);
+                Some(std::net::Ipv6Addr::from(octets).into())
+            } else {
+                (vflag & INI_IPV4 != 0).then(|| std::net::IpAddr::from([info[v4], info[v4 + 1], info[v4 + 2], info[v4 + 3]]))
+            }
+        };
+        let own = std::net::SocketAddr::new(addr(INSI_LADDR6, INSI_LADDR4)?, port(INSI_LPORT));
+        let other = std::net::SocketAddr::new(addr(INSI_FADDR6, INSI_FADDR4)?, port(INSI_FPORT));
+        Some((own, other))
+    }
+
+    /// (#3660) The own ends of the connections to `local` among the socket
+    /// descriptors `fds`, each read by `read` (as [`listeners_in_records`]
+    /// reads them), however either address is spelled (an IPv4-mapped IPv6
+    /// address is its IPv4 one). A descriptor that is gone or cannot be read
+    /// is skipped (a process churning sockets has some torn down mid-read),
+    /// so every end named is one it holds.
+    pub(crate) fn connection_ends_in_records(
+        fds: &[i32],
+        mut read: impl FnMut(i32, &mut [u8]) -> (i32, i32),
+        local: std::net::SocketAddr,
+    ) -> Vec<std::net::SocketAddr> {
+        let canonical = |a: std::net::SocketAddr| std::net::SocketAddr::new(a.ip().to_canonical(), a.port());
+        let mut ends = Vec::new();
+        for &fd in fds {
+            let mut info = vec![0u8; SOCKET_FDINFO_SIZE];
+            let (got, errno) = read(fd, &mut info);
+            if libproc_read(got, Some(SOCKET_FDINFO_SIZE as i32), errno) != LibprocRead::Read {
+                continue;
+            }
+            if let Some((own, _)) = connection_in_fdinfo(&info).filter(|(_, other)| canonical(*other) == canonical(local)) {
+                ends.push(canonical(own));
+            }
+        }
+        ends
+    }
+
     /// Offsets in `struct socket_fdinfo`, measured with clang's `offsetof` on
     /// macOS 26.6: `psi.soi_kind`, then in `psi.soi_proto.pri_tcp`:
     /// `tcpsi_ini.insi_lport` (the port in network order, in an `int`),
     /// `.insi_vflag`, `.insi_laddr` (an `in6_addr`, its IPv4 form 12 bytes in),
     /// `.insi_v6.in6_ifindex`, and `tcpsi_state`.
     const SOI_KIND: usize = 256;
+    const INSI_FPORT: usize = 264;
     const INSI_LPORT: usize = 268;
     const INSI_VFLAG: usize = 288;
+    const INSI_FADDR6: usize = 296;
+    const INSI_FADDR4: usize = 308;
     const INSI_LADDR6: usize = 312;
     const INSI_LADDR4: usize = 324;
     const IN6_IFINDEX: usize = 340;
@@ -741,6 +802,7 @@ pub(crate) mod libproc {
     /// address family flags of `insi_vflag`.
     const SOCKINFO_TCP: i32 = 2;
     const TSI_S_LISTEN: i32 = 1;
+    const TSI_S_ESTABLISHED: i32 = 4;
     const INI_IPV4: u8 = 1;
     const INI_IPV6: u8 = 2;
 
@@ -833,7 +895,7 @@ pub(crate) mod libproc {
 }
 
 #[cfg(target_os = "macos")]
-use libproc::{listeners_in_records, socket_fds_in, PROC_PIDFDSOCKETINFO, PROC_PIDLISTFDS};
+use libproc::{connection_ends_in_records, listeners_in_records, socket_fds_in, PROC_PIDFDSOCKETINFO, PROC_PIDLISTFDS};
 
 /// `(pid, ppid, pgid, sid)` of every process this user's libproc reads
 /// answer for; `None` when the pid list cannot be read.
@@ -875,6 +937,26 @@ pub(crate) fn listeners_held_by_pid(pid: u32) -> Option<Vec<(u16, crate::PortLis
         (got, errno())
     };
     listeners_in_records(pid, &socket_fds(p)?, read, interface_name)
+}
+
+/// (#3660) The own ends of `pid`'s connections to `local`
+/// ([`connection_ends_in_records`]); `None` when its descriptors cannot be
+/// listed. A process that exited since it was named holds none.
+#[cfg(target_os = "macos")]
+pub(crate) fn connection_ends_held_by_pid(pid: u32, local: std::net::SocketAddr) -> Option<Vec<std::net::SocketAddr>> {
+    let p = libc::pid_t::try_from(pid).ok()?;
+    let read = |fd: i32, info: &mut [u8]| {
+        clear_errno();
+        // SAFETY: `info` holds as many bytes as the size given.
+        let got = unsafe { libc::proc_pidfdinfo(p, fd, PROC_PIDFDSOCKETINFO, info.as_mut_ptr().cast(), info.len() as libc::c_int) };
+        (got, errno())
+    };
+    Some(connection_ends_in_records(&socket_fds(p)?, read, local))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn connection_ends_held_by_pid(_pid: u32, _local: std::net::SocketAddr) -> Option<Vec<std::net::SocketAddr>> {
+    None
 }
 
 /// `pid`'s socket file descriptors (`PROC_PIDLISTFDS`); empty when it has

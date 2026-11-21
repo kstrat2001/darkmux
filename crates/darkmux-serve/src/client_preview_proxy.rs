@@ -54,8 +54,8 @@
 //! another identity), when previews are turned off
 //! (`clients.preview.enabled`, read at most once a second), and when
 //! `client serve` stops. A request on an ended session is refused, and an
-//! open WebSocket closes: at once when the session is ended or replaced,
-//! within [`RECHECK_EVERY`] otherwise. A request a session sends counts as
+//! open WebSocket closes and an answer still streaming is cut: at once when
+//! the session is ended or replaced, within [`RECHECK_EVERY`] otherwise. A request a session sends counts as
 //! viewing its preview, so the idle check never stops a preview being
 //! looked at. A browser keeps one darkmux cookie per address, so it shows
 //! one preview at a time; a new link replaces the client's earlier link and
@@ -137,10 +137,11 @@ pub const UPGRADES_PER_SESSION: usize = 2;
 /// The body, once begun, may take as long as it takes.
 pub const PREVIEW_HEAD_WITHIN: std::time::Duration = crate::client_preview::READY_WITHIN;
 
-/// How often an open WebSocket's session is checked again: a revoke, a
-/// stopped or restarted preview, previews turned off or `client serve`
-/// stopping ends the socket within this, at one look at `clients.json` and
-/// one at the setting per open socket each time.
+/// How often the session of an open WebSocket, or of an answer still
+/// streaming, is checked again: a revoke, a stopped or restarted preview,
+/// previews turned off or `client serve` stopping ends it within this, at
+/// one look at `clients.json` and one at the setting per open one each
+/// time.
 pub const RECHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What a preview link, and the session opened with it, is bound to: the
@@ -1039,8 +1040,9 @@ async fn send(
 }
 
 /// The preview's answer as the browser gets it, its turn held until its
-/// body is done; a 101 to an upgrade the browser asked for is joined end to
-/// end, holding the turn, while the session stands.
+/// body is done and its body ended with the session ([`Held`]); a 101 to an
+/// upgrade the browser asked for is joined end to end, holding the turn,
+/// while the session stands.
 fn answered(
     state: &ClientServerState,
     found: Found,
@@ -1055,25 +1057,43 @@ fn answered(
             tokio::spawn(joined(state.clone(), found, (browser, preview), turn));
             res.map(axum::body::Body::new)
         }
-        _ => res.map(|body| axum::body::Body::new(Held { body, _turn: turn })),
+        _ => {
+            let ended = Box::pin(session_ended(state.clone(), found));
+            res.map(|body| {
+                axum::body::Body::new(Held {
+                    body,
+                    ended,
+                    _turn: turn,
+                })
+            })
+        }
     }
 }
 
 /// A preview's answer's body, holding its session's turn until it is done.
+/// A body still streaming when its session ends ([`session_ended`]) fails
+/// then, so the browser's connection is cut as an open WebSocket's is,
+/// instead of streaming on from a preview the session no longer reaches.
 struct Held {
     body: hyper::body::Incoming,
+    ended: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     _turn: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl hyper::body::Body for Held {
     type Data = <hyper::body::Incoming as hyper::body::Body>::Data;
-    type Error = hyper::Error;
+    type Error = axum::BoxError;
 
     fn poll_frame(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-        std::pin::Pin::new(&mut self.body).poll_frame(cx)
+        if std::future::Future::poll(self.ended.as_mut(), cx).is_ready() {
+            return std::task::Poll::Ready(Some(Err("the preview session ended".into())));
+        }
+        std::pin::Pin::new(&mut self.body)
+            .poll_frame(cx)
+            .map_err(Into::into)
     }
 
     fn is_end_stream(&self) -> bool {
@@ -1103,19 +1123,22 @@ async fn joined(
     );
     tokio::select! {
         _ = tokio::io::copy_bidirectional(&mut b, &mut p) => {}
-        () = session_ended(&state, found) => {}
+        () = session_ended(state, found) => {}
     }
 }
 
 /// Returns once `found`'s session ends: at once when it is ended (or
 /// replaced, or every session is), and within [`RECHECK_EVERY`] when it no
-/// longer stands or `client serve` stops ([`still_open`]).
-async fn session_ended(state: &ClientServerState, mut found: Found) {
-    let mut every = tokio::time::interval(RECHECK_EVERY);
+/// longer stands or `client serve` stops ([`still_open`]). The first look
+/// is one [`RECHECK_EVERY`] in: the request was let through on a look just
+/// made ([`admitted`]), so an answer done sooner costs none.
+async fn session_ended(state: ClientServerState, mut found: Found) {
+    let mut every =
+        tokio::time::interval_at(tokio::time::Instant::now() + RECHECK_EVERY, RECHECK_EVERY);
     loop {
         tokio::select! {
             changed = found.alive.changed() => if changed.is_err() { return },
-            _ = every.tick() => if !still_open(state, &found) { return },
+            _ = every.tick() => if !still_open(&state, &found) { return },
         }
     }
 }

@@ -90,7 +90,7 @@
   --border: #232838;
   /* Semantic status colors, carried over from legacy's palette. These were USED before they were DEFINED — a
      `var(--warn)` with no fallback is invalid at computed-value time, so the
-     property silently unsets rather than erroring. `.fleetcov` (the
+     property silently unsets rather than erroring. `.fleetcov` (then the
      coverage-degraded banner, #1729) therefore rendered with inherited body
      color and a colorless border: the one surface whose whole job is to look
      alarming was the one rendering as ordinary text. Defining them here is
@@ -4224,6 +4224,34 @@ body {
     display: inline;
   }
 }
+/* (#2971) TOOL GEN of a named tool ("tool gen · write · 18s") in parts: on
+   a phone "tool gen · " goes (the `--full` rule above; the tube already says
+   TOOL GEN), and a name too long for the line ellipsizes inside its own box,
+   so the seconds after it are always on screen. The line stays one line, the
+   same height as every other reading. Centered on a desktop, like the
+   status line's plain text. */
+.mach .stat.mach-scope__rate--parts {
+  display: flex;
+  align-items: baseline;
+}
+@media (min-width: 561px) {
+  .mach .stat.mach-scope__rate--parts {
+    justify-content: center;
+  }
+}
+/* The dot sits mid-line, as `vertical-align: middle` puts it on a plain line. */
+.mach-scope__rate--parts > .lamp-dot {
+  align-self: center;
+}
+.mach-scope__rate--parts > .mach-scope__why,
+.mach-scope__secs {
+  white-space: pre;
+}
+.mach-scope__tool {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .mach .runs {
   margin-top: 5px;
   font: calc(12px * var(--fs-scale)) var(--font-mono);
@@ -4675,10 +4703,10 @@ body {
   }
 }
 
-/* (#1729) Fleet-coverage marker — shown ONLY when the presence substrate
-   could not be read (or is stale). An unconfigured fleet is not a
-   degradation, so a standalone machine never sees this. (#2683: it mounts
-   app-wide now, not just on the default view.)
+/* A source-unreadable notice (`FlowReadNotice`, the fleet lens's
+   `RunsUnreadableNotice` and `RosterUnreadableNotice`). (#3662: presence
+   coverage has none any more; the cards and the masthead count say what is
+   known.)
 
    `--warn`, not `--error`: "we could not look" is a caution, not a failure —
    we are missing an answer, not reporting a broken one. (#2725: this
@@ -4801,10 +4829,9 @@ body {
 .mco { white-space: nowrap; }
 .mco svg { width: 13px; height: 13px; vertical-align: -2px; margin-left: 2px; color: var(--accent-dim); }
 /* (#2683) The count is presence-derived; when presence is stale or
-   unreadable it is a claim the page can't back up, so it wears the same
-   `--warn` the full `.fleetcov` sentence below the masthead does. Same
-   treatment for both degraded states — the distinction is in the sentence,
-   not in two shades of warning. */
+   unreadable it is a claim the page can't back up, so it wears `--warn`.
+   Same treatment for both degraded states — the distinction is in the title
+   (`presenceCaveat`), not in two shades of warning. */
 .mco[data-coverage] { color: var(--warn); }
 .mco[data-coverage] svg { color: var(--warn); }
 

@@ -194,7 +194,11 @@ impl StepKind for ModsGateStepKind {
         let test_command = non_blank(cfg.test_command);
         let test_command = test_command.as_deref();
         let workdir = cfg.workdir.as_deref();
-        let placement = configured_gate_placement(non_blank(cfg.gate_image).as_deref(), cfg.gate_on_host.is_some_and(|f| f.0));
+        // The step's one read of `runtime.sandbox`: where the proposing
+        // sandbox saw the tree (the kit's paths) and where the gate runs.
+        let sandbox = darkmux_sandbox::selection().map(|s| s.kind);
+        let kind = sandbox.as_ref().ok().copied();
+        let placement = configured_gate_placement(non_blank(cfg.gate_image).as_deref(), cfg.gate_on_host.is_some_and(|f| f.0), sandbox);
 
         let root = mods::mods_dir();
         let all = mods::load_all_at(&root).context("loading the mod store")?;
@@ -215,7 +219,7 @@ impl StepKind for ModsGateStepKind {
             .and_then(|d| d.file_name().and_then(|n| n.to_str()).map(str::to_string));
         // (#3112 review) Where the proposing sandbox saw the workdir, recorded
         // beside the source so the deliverer maps a host-seen kit too.
-        let tree_seen = gate_tree_seen(workdir);
+        let tree_seen = gate_tree_seen(workdir, kind);
         let mut mods_gated = 0usize;
         for m in &targets {
             // A mutation self-check on this line is documented in this
@@ -229,7 +233,7 @@ impl StepKind for ModsGateStepKind {
             }
             let (outcome, skip_reason) = match test_command {
                 None => (None, no_command_reason.clone()),
-                Some(cmd) => gate_one_mod(m, cmd, workdir, &placement),
+                Some(cmd) => gate_one_mod(m, cmd, workdir, &placement, kind),
             };
             let res = mods::record_gate_with_source_root(&root, &m.key, outcome, skip_reason.as_deref(), resolved_source.as_deref(), tree_seen.as_deref())
                 .with_context(|| format!("step `{}`: recording the gate for mod `{}`", step.id, m.key))?;
@@ -259,12 +263,13 @@ fn gate_one_mod(
     command: &str,
     workdir: Option<&str>,
     placement: &Result<GatePlacement, String>,
+    kind: Option<darkmux_sandbox::BackendKind>,
 ) -> (Option<GateOutcome>, Option<String>) {
     let placement = match placement {
         Ok(p) => p,
         Err(refused) => return (None, Some(refused.clone())),
     };
-    match apply_kit_in_scratch(m, workdir) {
+    match apply_kit_in_scratch(m, workdir, kind) {
         Err(reason) => (None, Some(reason)),
         Ok((_scratch, _, KitApplied::No(reason))) => (
             Some(GateOutcome {
@@ -305,10 +310,15 @@ enum KitApplied {
 /// source checkout it applies to, a scratch copy of that checkout, the kit
 /// as a patch file beside it, and the apply. `Err` is an infra-level skip
 /// reason; the scratch dir is returned so it outlives the gate command.
-fn apply_kit_in_scratch(m: &ModRecord, workdir: Option<&str>) -> Result<(tempfile::TempDir, PathBuf, KitApplied), String> {
+/// `kind` is the step's read of the sandbox, where the kit's paths were seen.
+fn apply_kit_in_scratch(
+    m: &ModRecord,
+    workdir: Option<&str>,
+    kind: Option<darkmux_sandbox::BackendKind>,
+) -> Result<(tempfile::TempDir, PathBuf, KitApplied), String> {
     let (source_dir, kit) = gate_inputs(m, workdir)?;
     let (scratch, scratch_checkout) = scratch_copy(&source_dir)?;
-    let patch_path = write_kit_patch(scratch.path(), &source_dir, kit)?;
+    let patch_path = write_kit_patch(scratch.path(), &source_dir, kit, kind)?;
     let applied = apply_kit(scratch.path(), &scratch_checkout, &patch_path)?;
     Ok((scratch, scratch_checkout, applied))
 }
@@ -351,8 +361,8 @@ fn scratch_copy(source_dir: &Path) -> Result<(tempfile::TempDir, PathBuf), Strin
 
 /// (#3112 review) Where the configured sandbox saw the gate's workdir (the
 /// tree the proposing dispatch ran in), recorded on each gated mod.
-fn gate_tree_seen(workdir: Option<&str>) -> Option<String> {
-    workdir.map(|w| darkmux_sandbox::seen_at_configured(Path::new(w), "/workspace"))
+fn gate_tree_seen(workdir: Option<&str>, kind: Option<darkmux_sandbox::BackendKind>) -> Option<String> {
+    workdir.map(|w| darkmux_sandbox::seen_at(kind, Path::new(w), "/workspace"))
 }
 
 /// `kit` in the coordinates of the checkout `source_dir` (whose directory
@@ -367,7 +377,7 @@ fn gate_kit_mapped(kit: &str, source_dir: &Path, tree_seen: &str) -> String {
 
 /// `kit` written as `<scratch>/mod.patch`, in the coordinates of the
 /// checkout copied from `source_dir`, and terminated.
-fn write_kit_patch(scratch: &Path, source_dir: &Path, kit: &str) -> Result<PathBuf, String> {
+fn write_kit_patch(scratch: &Path, source_dir: &Path, kit: &str, kind: Option<darkmux_sandbox::BackendKind>) -> Result<PathBuf, String> {
     // (live proof 2026-09-05) A create-mod dispatch carries no `context.source`,
     // so its kit reaches the store in container coordinates — `a/<source
     // id>/src/x.ts` — with nothing having mapped it (`create_from_emission`
@@ -377,7 +387,7 @@ fn write_kit_patch(scratch: &Path, source_dir: &Path, kit: &str) -> Result<PathB
     // no-op for the `a/`/`b/`-marked headers (see `strip_kit_source_prefix`).
     // (#3112 review) Where the proposing sandbox saw the tree: the kit may
     // name its files under that root instead of `/workspace`.
-    let tree_seen = darkmux_sandbox::seen_at_configured(source_dir.parent().unwrap_or(source_dir), "/workspace");
+    let tree_seen = darkmux_sandbox::seen_at(kind, source_dir.parent().unwrap_or(source_dir), "/workspace");
     let mapped_kit = gate_kit_mapped(kit, source_dir, &tree_seen);
     let kit = mapped_kit.as_str();
     let patch_path = scratch.join("mod.patch");
@@ -481,12 +491,12 @@ fn run_gate_command(placement: &GatePlacement, command: &str, scratch_checkout: 
         &gate_run(command, scratch_checkout),
         crate::bounded_command::configured_timeout(),
     );
-    gate_result(command, scratch_checkout, ran)
+    gate_result(command, scratch_checkout, ran, placement.kind())
 }
 
 /// (#3112) Why the gate never ran test_command, naming the sandbox it was to
-/// run in (`kind`, the configured one; `None` when `runtime.sandbox` is
-/// refused, which `why` names); Docker's likely causes only under Docker.
+/// run in (`kind`, its placement's; `None` on the host); Docker's likely
+/// causes only under Docker.
 fn not_run_reason(why: &str, kind: Option<darkmux_sandbox::BackendKind>) -> String {
     match kind {
         Some(darkmux_sandbox::BackendKind::Docker) => format!(
@@ -508,11 +518,12 @@ fn gate_result(
     command: &str,
     scratch_checkout: &Path,
     ran: Result<crate::bounded_command::Bounded, crate::contained_command::NotRun>,
+    kind: Option<darkmux_sandbox::BackendKind>,
 ) -> (Option<GateOutcome>, Option<String>) {
     use crate::bounded_command::Bounded;
     let ran = match ran {
         Ok(ran) => ran,
-        Err(why) => return (None, Some(not_run_reason(&why.to_string(), darkmux_sandbox::selected().ok()))),
+        Err(why) => return (None, Some(not_run_reason(&why.to_string(), kind))),
     };
     match ran {
         Bounded::Finished { success, code, .. } => (
@@ -539,8 +550,9 @@ const GATE_PID_LABEL: &str = crate::contained_command::PID_LABEL;
 /// it runs in a container unless the operator chose the host explicitly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GatePlacement {
-    /// `docker run` on this image, the scratch copy its only mount, no network.
-    Container(String),
+    /// In a sandbox of this backend (the step's one read), on this image
+    /// (`host` on the host), the scratch copy its only mount, no network.
+    Container(String, darkmux_sandbox::BackendKind),
     /// `sh -c` on this machine, as the darkmux user (`gate_on_host: true`).
     Host,
 }
@@ -559,20 +571,24 @@ fn gate_placement(
         (None, true, _) => Ok(GatePlacement::Host),
         (_, false, Err(why)) => Err(format!("no sandbox can run the gate: {why}")),
         (image, false, Ok(darkmux_sandbox::BackendKind::Docker)) => docker_gate_placement(image),
-        (Some(image), false, Ok(_)) => crate::dispatch_internal::validate_image_ref(image)
-            .map(|()| GatePlacement::Container(image.to_string()))
+        (Some(image), false, Ok(kind)) => crate::dispatch_internal::validate_image_ref(image)
+            .map(|()| GatePlacement::Container(image.to_string(), kind))
             .map_err(|e| format!("`gate_image`: {e}")),
-        (None, false, Ok(_)) => Ok(GatePlacement::Container("host".to_string())),
+        (None, false, Ok(kind)) => Ok(GatePlacement::Container("host".to_string(), kind)),
     }
 }
 
-/// [`gate_placement`] under the configured sandbox, saying on stderr when
-/// it does not use the `gate_image` named ([`gate_image_note`]).
-fn configured_gate_placement(image: Option<&str>, on_host: bool) -> Result<GatePlacement, String> {
-    if let Some(note) = gate_image_note(image.filter(|_| !on_host), darkmux_sandbox::selected()) {
+/// [`gate_placement`] under the step's read of the sandbox, saying on
+/// stderr when it does not use the `gate_image` named ([`gate_image_note`]).
+fn configured_gate_placement(
+    image: Option<&str>,
+    on_host: bool,
+    sandbox: Result<darkmux_sandbox::BackendKind, String>,
+) -> Result<GatePlacement, String> {
+    if let Some(note) = gate_image_note(image.filter(|_| !on_host), sandbox.clone()) {
         eprintln!("{note}");
     }
-    gate_placement(image, on_host, darkmux_sandbox::selected())
+    gate_placement(image, on_host, sandbox)
 }
 
 /// (#3112 review) The note for a `gate_image` the configured sandbox does
@@ -595,7 +611,7 @@ fn docker_gate_placement(image: Option<&str>) -> Result<GatePlacement, String> {
         // (#3177 review) The dispatch path's own image-ref check: empty, a
         // leading `-`, whitespace or control characters are refused.
         Some(image) => crate::dispatch_internal::validate_image_ref(image)
-            .map(|()| GatePlacement::Container(image.to_string()))
+            .map(|()| GatePlacement::Container(image.to_string(), darkmux_sandbox::BackendKind::Docker))
             .map_err(|e| format!("`gate_image`: {e}")),
         None => Err("test_command runs model-written code, so the gate needs a place to run it, and \
             `runtime.sandbox` is `docker`, which needs an image: set `gate_image` to an image with the project's \
@@ -614,8 +630,16 @@ fn gate_run<'a>(command: &'a str, checkout: &'a Path) -> crate::contained_comman
 impl GatePlacement {
     fn contained(&self) -> crate::contained_command::Placement {
         match self {
-            GatePlacement::Container(image) => crate::contained_command::Placement::Container(image.clone()),
+            GatePlacement::Container(image, kind) => crate::contained_command::Placement::Container(image.clone(), *kind),
             GatePlacement::Host => crate::contained_command::Placement::Host,
+        }
+    }
+
+    /// The sandbox the gate runs in; `None` on the host.
+    fn kind(&self) -> Option<darkmux_sandbox::BackendKind> {
+        match self {
+            GatePlacement::Container(_, kind) => Some(*kind),
+            GatePlacement::Host => None,
         }
     }
 }
@@ -820,7 +844,7 @@ mod tests {
     #[test]
     fn the_gate_runs_in_a_container_unless_the_host_is_chosen_explicitly() {
         let gate_placement = |image, on_host| gate_placement(image, on_host, Ok(darkmux_sandbox::BackendKind::Docker));
-        assert_eq!(gate_placement(Some("rust:1-slim"), false), Ok(GatePlacement::Container("rust:1-slim".into())));
+        assert_eq!(gate_placement(Some("rust:1-slim"), false), Ok(GatePlacement::Container("rust:1-slim".into(), darkmux_sandbox::BackendKind::Docker)));
         assert_eq!(gate_placement(None, true), Ok(GatePlacement::Host));
         let neither = gate_placement(None, false).unwrap_err();
         assert!(neither.contains("gate_image") && neither.contains("gate_on_host"), "{neither}");
@@ -839,8 +863,8 @@ mod tests {
     #[test]
     fn under_seatbelt_the_gate_needs_no_image_and_names_one_it_cannot_use() {
         use darkmux_sandbox::BackendKind;
-        assert_eq!(gate_placement(None, false, Ok(BackendKind::Seatbelt)), Ok(GatePlacement::Container("host".into())));
-        assert_eq!(gate_placement(Some("rust:1-slim"), false, Ok(BackendKind::Seatbelt)), Ok(GatePlacement::Container("rust:1-slim".into())));
+        assert_eq!(gate_placement(None, false, Ok(BackendKind::Seatbelt)), Ok(GatePlacement::Container("host".into(), BackendKind::Seatbelt)));
+        assert_eq!(gate_placement(Some("rust:1-slim"), false, Ok(BackendKind::Seatbelt)), Ok(GatePlacement::Container("rust:1-slim".into(), BackendKind::Seatbelt)));
         let note = gate_image_note(Some("rust:1-slim"), Ok(BackendKind::Seatbelt)).expect("named");
         assert!(note.contains("`rust:1-slim`") && note.contains("darkmux config set runtime.sandbox docker"), "{note}");
         assert_eq!(gate_image_note(Some("rust:1-slim"), Ok(BackendKind::Docker)), None);
@@ -933,7 +957,7 @@ mod tests {
         let (_fixture, tree_root) = fixture_tree("wrong\n");
         let m = a_mod_kit("mod-slow", "sess-s/1", &one_line_kit("wrong", "right"), Some("unified-diff"));
         let (outcome, reason) = gate_one_mod(&m, "sleep 300", Some(&tree_root.to_string_lossy()),
-            &Ok(GatePlacement::Container("darkmux-runtime:latest".into())));
+            &Ok(GatePlacement::Container("darkmux-runtime:latest".into(), darkmux_sandbox::BackendKind::Docker)), Some(darkmux_sandbox::BackendKind::Docker));
         unsafe {
             match prev { Some(v) => std::env::set_var("DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS", v), None => std::env::remove_var("DARKMUX_STEP_COMMAND_TIMEOUT_SECONDS") }
         }
@@ -952,37 +976,22 @@ mod tests {
     #[test]
     fn a_container_that_never_ran_the_command_is_a_skip_not_a_failed_kit() {
         let never = crate::contained_command::NotRun("Unable to find image".into());
-        let (outcome, reason) = gate_result("true", Path::new("/w"), Err(never));
+        let (outcome, reason) = gate_result("true", Path::new("/w"), Err(never), Some(darkmux_sandbox::BackendKind::Docker));
         assert!(outcome.is_none(), "{outcome:?}");
         assert!(reason.unwrap().contains("Unable to find image"));
         let (own, _) = gate_result("true", Path::new("/w"),
-            Ok(crate::bounded_command::Bounded::Finished { success: false, code: Some(125), stdout: Vec::new(), stderr: Vec::new() }));
+            Ok(crate::bounded_command::Bounded::Finished { success: false, code: Some(125), stdout: Vec::new(), stderr: Vec::new() }), Some(darkmux_sandbox::BackendKind::Docker));
         assert!(own.is_some_and(|o| !o.passed && o.exit_code == Some(125)), "the command's own exit 125 fails the kit");
     }
 
-    /// (#3112 review) A refused `runtime.sandbox` is a named skip that says
-    /// why, never a gate run in Docker by default (an empty `PATH` makes any
-    /// Docker attempt a spawn failure instead).
+    /// (#3112 review) A refused `runtime.sandbox` (the step's one read) is
+    /// a named skip that says why, never a gate run in Docker by default.
     #[test]
-    #[serial_test::serial]
     fn a_refused_sandbox_skips_the_gate_naming_why() {
-        darkmux_types::run_in_own_process!();
-        let root = tempfile::TempDir::new().unwrap();
-        let checkout = root.path().join("tree");
-        std::fs::create_dir_all(&checkout).unwrap();
-        let empty = tempfile::TempDir::new().unwrap();
-        let (prev_path, prev_sb) = (std::env::var_os("PATH"), std::env::var_os("DARKMUX_SANDBOX"));
-        unsafe {
-            std::env::set_var("PATH", empty.path());
-            std::env::set_var("DARKMUX_SANDBOX", "podman");
-        }
-        let (outcome, reason) = run_gate_command(&GatePlacement::Container("rust:1-slim".into()), "true", &checkout);
-        unsafe {
-            match prev_path { Some(v) => std::env::set_var("PATH", v), None => std::env::remove_var("PATH") }
-            match prev_sb { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
-        }
-        assert!(outcome.is_none(), "{outcome:?}");
-        let reason = reason.unwrap_or_default();
+        // The step's one read refused: no placement, so every mod is skipped
+        // with that refusal, and nothing runs in Docker by default.
+        let refused = gate_placement(None, false, Err("`runtime.sandbox` is `podman`".into()));
+        let reason = document_skip_reason(Some("true"), &refused).unwrap_or_default();
         assert!(reason.contains("podman") && reason.contains("runtime.sandbox"), "{reason}");
         assert!(!reason.contains("Docker may be down"), "{reason}");
     }
@@ -1016,11 +1025,11 @@ mod tests {
     fn a_mod_with_no_kit_text_or_no_workdir_is_skipped_naming_why() {
         let mut kitless = a_mod_kit("mod-kitless", "kitless/1", "--- a/x\n+++ b/x\n", Some("unified-diff"));
         kitless.kit = None;
-        let (outcome, reason) = gate_one_mod(&kitless, "touch /tmp/should-not-run", Some("/nonexistent"), &Ok(GatePlacement::Host));
+        let (outcome, reason) = gate_one_mod(&kitless, "touch /tmp/should-not-run", Some("/nonexistent"), &Ok(GatePlacement::Host), Some(darkmux_sandbox::BackendKind::Docker));
         assert!(outcome.is_none());
         assert_eq!(reason.as_deref(), Some("no applicable kit"));
         let m = a_mod_kit("mod-nowhere", "nowhere/1", "--- a/x\n+++ b/x\n", Some("unified-diff"));
-        let (outcome, reason) = gate_one_mod(&m, "touch /tmp/should-not-run", None, &Ok(GatePlacement::Host));
+        let (outcome, reason) = gate_one_mod(&m, "touch /tmp/should-not-run", None, &Ok(GatePlacement::Host), Some(darkmux_sandbox::BackendKind::Docker));
         assert!(outcome.is_none());
         assert_eq!(reason.as_deref(), Some("no workdir configured"));
     }
@@ -1033,11 +1042,11 @@ mod tests {
         let scratch = TempDir::new().unwrap();
         let source = scratch.path().join("src1");
         let kit = "--- a/src1/x.txt\n+++ b/src1/x.txt\n@@ -1 +1 @@\n-old\n+new";
-        let path = write_kit_patch(scratch.path(), &source, kit).unwrap();
+        let path = write_kit_patch(scratch.path(), &source, kit, Some(darkmux_sandbox::BackendKind::Docker)).unwrap();
         assert_eq!(path, scratch.path().join("mod.patch"));
         let written = std::fs::read_to_string(&path).unwrap();
         assert_eq!(written, "--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-old\n+new\n");
-        let missing = write_kit_patch(&scratch.path().join("no-such-dir"), &source, kit).unwrap_err();
+        let missing = write_kit_patch(&scratch.path().join("no-such-dir"), &source, kit, Some(darkmux_sandbox::BackendKind::Docker)).unwrap_err();
         assert!(missing.contains("could not write the mod's kit"), "{missing}");
     }
 
@@ -1053,7 +1062,7 @@ mod tests {
         assert_eq!(host, docker);
     }
 
-    /// (#3112 review) The production wiring, through `selected()`: under
+    /// (#3112 review) The production wiring, through the step's one read: under
     /// `DARKMUX_SANDBOX=seatbelt` (on a Mac) the gate maps a kit written
     /// under the tree's own path and records that path; under Docker (a test
     /// build's default) it maps `/workspace` and records none.
@@ -1065,26 +1074,18 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
         let scratch = tempfile::TempDir::new().unwrap();
         let docker_kit = "--- /workspace/src1/x.txt\n+++ /workspace/src1/x.txt\n";
-        let path = write_kit_patch(scratch.path(), &source, docker_kit).unwrap();
+        let path = write_kit_patch(scratch.path(), &source, docker_kit, Some(darkmux_sandbox::BackendKind::Docker)).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "--- x.txt\n+++ x.txt\n");
         let w = tree.path().display().to_string();
-        assert_eq!(gate_tree_seen(Some(&w)).as_deref(), Some("/workspace"));
+        assert_eq!(gate_tree_seen(Some(&w), Some(darkmux_sandbox::BackendKind::Docker)).as_deref(), Some("/workspace"));
         let src = include_str!("mods_gate.rs");
-        assert!(src.contains("let tree_seen = gate_tree_seen(workdir);"));
-        if !darkmux_sandbox::SeatbeltBackend::available() {
-            return;
-        }
+        assert!(src.contains("let tree_seen = gate_tree_seen(workdir, kind);"));
         let real = tree.path().canonicalize().unwrap().display().to_string();
         let host_kit = format!("--- {real}/src1/x.txt\n+++ {real}/src1/x.txt\n");
-        let prev = std::env::var_os("DARKMUX_SANDBOX");
-        unsafe { std::env::set_var("DARKMUX_SANDBOX", "seatbelt") };
-        let mapped = write_kit_patch(scratch.path(), &source, &host_kit).map(|p| std::fs::read_to_string(p).unwrap());
-        let seen = gate_tree_seen(Some(&w));
-        unsafe {
-            match prev { Some(v) => std::env::set_var("DARKMUX_SANDBOX", v), None => std::env::remove_var("DARKMUX_SANDBOX") }
-        }
+        let seatbelt = Some(darkmux_sandbox::BackendKind::Seatbelt);
+        let mapped = write_kit_patch(scratch.path(), &source, &host_kit, seatbelt).map(|p| std::fs::read_to_string(p).unwrap());
         assert_eq!(mapped.unwrap(), "--- x.txt\n+++ x.txt\n");
-        assert_eq!(seen.as_deref(), Some(real.as_str()));
+        assert_eq!(gate_tree_seen(Some(&w), seatbelt).as_deref(), Some(real.as_str()));
     }
 
     /// With a `test_command` but no placement chosen, every mod records the
@@ -1092,7 +1093,7 @@ mod tests {
     #[test]
     fn a_test_command_with_no_placement_runs_nothing_and_says_why() {
         let m = a_mod_kit("mod-refused", "refused/1", "--- a/x\n+++ b/x\n", Some("unified-diff"));
-        let (outcome, reason) = gate_one_mod(&m, "touch /tmp/should-not-run", Some("/nonexistent"), &gate_placement(None, false, Ok(darkmux_sandbox::BackendKind::Docker)));
+        let (outcome, reason) = gate_one_mod(&m, "touch /tmp/should-not-run", Some("/nonexistent"), &gate_placement(None, false, Ok(darkmux_sandbox::BackendKind::Docker)), Some(darkmux_sandbox::BackendKind::Docker));
         assert!(outcome.is_none());
         assert!(reason.unwrap().contains("gate_image"), "the skip names the fix");
     }
@@ -2056,7 +2057,7 @@ mod tests {
         std::fs::write(deep.join("f.txt"), "x").unwrap();
         let m = a_mod_kit("mod-deep", "sess-a/1", &one_line_kit("wrong", "right"), Some("unified-diff"));
 
-        let (outcome, reason) = gate_one_mod(&m, "true", Some(&tree_root.to_string_lossy()), &Ok(GatePlacement::Host));
+        let (outcome, reason) = gate_one_mod(&m, "true", Some(&tree_root.to_string_lossy()), &Ok(GatePlacement::Host), Some(darkmux_sandbox::BackendKind::Docker));
 
         assert!(outcome.is_none(), "{outcome:?}");
         let reason = reason.expect("an infra skip reason");
