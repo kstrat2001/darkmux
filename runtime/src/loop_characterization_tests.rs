@@ -800,12 +800,14 @@ fn a_malformed_call_escalation_after_a_salvage_carries_the_banked_answer() {
 //
 // A structured-slot compaction renders a budget block into the SYSTEM
 // message it installs, so the model paces itself against it. The block's
-// per-call line comes from `BudgetSnapshot::max_tokens_per_call`, which the
-// two compaction sites fill differently: the main loop passes the cap the
-// call it just made carried on the wire, the resume catch-up (which has made
-// no call yet) passes the answer ceiling. The numbers below keep the three
-// candidate values apart (answer 10,000, generation check-in 4,000, and the
-// 32,000 built-in) so a site passing the wrong one reads as a different line.
+// per-call line comes from `BudgetSnapshot::max_tokens_per_call`, and both
+// compaction sites, the main loop and the resume catch-up, fill it with the
+// answer ceiling (#3142): the line names a per-turn emission ceiling, which a
+// check-in interval is not (the turn continues past it), and what a
+// non-streamed call carries on the wire is that interval. The numbers below
+// keep the three candidate values apart (answer 10,000, generation check-in
+// 4,000, and the 32,000 built-in) so a site passing the wrong one reads as a
+// different line.
 
 const STRUCTURED_SUMMARY: &str = r#"{"objective": "finish", "current_truth": {}, "compaction_metadata": {"schema_version": "0.1", "generation": 1, "source_message_count": 3}, "completed_decisions": "decision one"}"#;
 
@@ -839,7 +841,7 @@ fn per_call_line(request: &str) -> Option<String> {
 
 #[test]
 #[serial_test::serial]
-fn the_main_loop_tells_the_structured_compactor_the_cap_its_call_carried() {
+fn the_main_loop_tells_the_structured_compactor_the_answer_cap() {
     let mut s = Scenario::new(
         "structured_budget_main_loop",
         vec![
@@ -858,9 +860,10 @@ fn the_main_loop_tells_the_structured_compactor_the_cap_its_call_carried() {
     assert_eq!(ran.requests.len(), 3, "turn, compactor, turn");
     assert_eq!(
         per_call_line(&ran.requests[2]).as_deref(),
-        Some("- Per-call token cap: 4000 (per-turn emission ceiling)"),
-        "a non-streamed call carries the generation check-in on the wire, and that is the \
-         cap the compacted thread reports"
+        Some("- Per-call token cap: 10000 (per-turn emission ceiling)"),
+        "a non-streamed call carries the generation check-in on the wire, but the turn \
+         continues past it: the compacted thread reports the answer cap, as the resume \
+         catch-up does"
     );
 }
 
