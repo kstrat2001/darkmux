@@ -549,53 +549,119 @@ pub(crate) fn meta_from_json(v: &serde_json::Value) -> Option<ModelMeta> {
     })
 }
 
-/// (#3578) Start LM Studio's local server when it is off, so a dispatch to
-/// a model darkmux just made resident can reach it: `lms` loads models from
-/// the app while its server is off, and every request is then refused at
-/// connect. Only for a server on this machine (`lmstudio_url` on loopback);
-/// waits up to 15 s for it to accept. `Ok(true)` when it was off and now
-/// answers, `Ok(false)` when it was already on or isn't this machine's.
-pub fn ensure_server_running() -> Result<bool> {
-    let url = darkmux_types::config_access::lmstudio_url();
-    if crate::engine::availability::server_accepts(&url) || !is_loopback_url(&url) {
+/// (#3578) LM Studio's local server (the one `lmstudio_url` names), as LM
+/// Studio itself reports it. `lms` loads and lists models through the app
+/// whether or not that server runs, so a model can be resident and every
+/// request to it still refused at connect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LmStudioServer {
+    Running,
+    Off,
+    /// No report: `lmstudio_url` is not this machine's (this machine's `lms`
+    /// says nothing about it), or `lms` gave no answer it could read (an
+    /// `lms` without `server status --json`, or a stand-in for one).
+    Unknown,
+}
+
+/// `lms server status --json`'s answer, `{"running":false}` or
+/// `{"running":true,"port":1234}`. Anything else is [`LmStudioServer::Unknown`].
+pub(crate) fn parse_server_status(stdout: &str) -> LmStudioServer {
+    let running = serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .ok()
+        .and_then(|v| v.get("running").and_then(serde_json::Value::as_bool));
+    match running {
+        Some(true) => LmStudioServer::Running,
+        Some(false) => LmStudioServer::Off,
+        None => LmStudioServer::Unknown,
+    }
+}
+
+/// What this machine's `lms server status --json` reports. Never a
+/// connection to the server itself: a test's stand-in engine counts every
+/// connection it accepts, and the answer has to come from LM Studio anyway.
+fn server_status() -> LmStudioServer {
+    let mut cmd = Command::new(lms_bin());
+    cmd.args(["server", "status", "--json"]);
+    match run_bounded(cmd, "server status", Deadline(DEFAULT_LIST_BOUND), StdoutMode::Capture) {
+        Ok(out) if out.status.success() => parse_server_status(&out.stdout),
+        _ => LmStudioServer::Unknown,
+    }
+}
+
+/// The server at `url` as `status` reports it, asked only when `url` names
+/// this machine: this machine's `lms` knows nothing of a server elsewhere.
+pub(crate) fn server_state_at(url: &str, status: &dyn Fn() -> LmStudioServer) -> LmStudioServer {
+    if darkmux_types::endpoint::url_names_this_machine(url) {
+        status()
+    } else {
+        LmStudioServer::Unknown
+    }
+}
+
+/// LM Studio's local server at the configured `lmstudio_url`.
+pub fn server_state() -> LmStudioServer {
+    server_state_at(&darkmux_types::config_access::lmstudio_url(), &server_status)
+}
+
+/// `lms server start`, on the port `url` is dialed on.
+pub(crate) fn server_start_args(url: &str) -> Vec<String> {
+    let mut args = vec!["server".to_string(), "start".to_string()];
+    if let Some(port) = darkmux_types::endpoint::url_port(url) {
+        args.extend(["--port".to_string(), port.to_string()]);
+    }
+    args
+}
+
+/// How many times a start is checked for LM Studio reporting its server
+/// running, a pause apart, before it is said to have failed.
+pub(crate) const START_CHECKS: u32 = 20;
+
+/// [`ensure_server_running`] over its effects. Starts the server only when
+/// `url` is this machine's and LM Studio reports it off; an `Unknown` (no
+/// report) starts nothing, as before #3578.
+pub(crate) fn ensure_server_running_with(
+    url: &str,
+    status: &dyn Fn() -> LmStudioServer,
+    start: &dyn Fn(&[String]) -> Result<()>,
+    pause: &dyn Fn(),
+) -> Result<bool> {
+    if server_state_at(url, status) != LmStudioServer::Off {
         return Ok(false);
     }
-    let port = url
-        .split("://")
-        .last()
-        .and_then(|rest| rest.split('/').next())
-        .and_then(|authority| authority.rsplit_once(':'))
-        .and_then(|(_, p)| p.parse::<u16>().ok());
-    let mut cmd = Command::new(lms_bin());
-    cmd.args(["server", "start"]);
-    if let Some(port) = port {
-        cmd.args(["--port", &port.to_string()]);
+    start(&server_start_args(url))?;
+    for _ in 0..START_CHECKS {
+        if status() == LmStudioServer::Running {
+            return Ok(true);
+        }
+        pause();
     }
-    let out = run_bounded(cmd, "server start", Deadline::from_secs(30), StdoutMode::Null)
+    bail!("LM Studio did not report its local server running after `lms server start` (for {url})")
+}
+
+fn start_server(args: &[String]) -> Result<()> {
+    let mut cmd = Command::new(lms_bin());
+    cmd.args(args);
+    let out = run_bounded(cmd, "server start", Deadline(DEFAULT_LIST_BOUND), StdoutMode::Null)
         .map_err(|e| anyhow::anyhow!("running `lms server start`: {e}"))?;
     if !out.status.success() {
         bail!("`lms server start` failed: {}", out.stderr.trim());
     }
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while std::time::Instant::now() < until {
-        if crate::engine::availability::server_accepts(&url) {
-            return Ok(true);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-    bail!("LM Studio's local server did not answer at {url} after `lms server start`")
+    Ok(())
 }
 
-/// Whether a base URL names this machine (localhost, 127.0.0.0/8, ::1).
-pub fn is_loopback_url(url: &str) -> bool {
-    let rest = url.split("://").last().unwrap_or(url);
-    let authority = rest.split('/').next().unwrap_or("");
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or(""),
-        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
-    };
-    host == "localhost"
-        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+/// (#3578) Start LM Studio's local server when LM Studio reports it off, so
+/// a dispatch to a model darkmux made resident there can reach it. Only for
+/// a server on this machine (`lmstudio_url` names it), and only on LM
+/// Studio's own report: with no report (a stand-in `lms`) nothing starts.
+/// `Ok(true)` when it was off and LM Studio now reports it running,
+/// `Ok(false)` when nothing was started.
+pub fn ensure_server_running() -> Result<bool> {
+    ensure_server_running_with(
+        &darkmux_types::config_access::lmstudio_url(),
+        &server_status,
+        &start_server,
+        &|| std::thread::sleep(std::time::Duration::from_millis(500)),
+    )
 }
 
 pub fn unload(identifier: &str) -> Result<()> {
@@ -1175,5 +1241,100 @@ mod tests {
         let stuck = verify_unload_outcome(false, "device busy", "darkmux:m").unwrap_err();
         assert!(!is_not_resident(&stuck));
         assert!(format!("{stuck:#}").contains("device busy"), "the cause must survive: {stuck:#}");
+    }
+
+    /// (#3578) `lms server status --json`'s two answers, and anything else
+    /// (no output from a stand-in, the text an older `lms` prints, a JSON
+    /// with no `running`) as no report at all.
+    #[test]
+    fn server_status_reads_lms_json_and_nothing_else() {
+        use super::{parse_server_status, LmStudioServer::*};
+        assert_eq!(parse_server_status("{\"running\":true,\"port\":1234}\n"), Running);
+        assert_eq!(parse_server_status("{\"running\":false}"), Off);
+        for other in ["", "The server is not running.", "{\"port\":1234}", "{\"running\":\"no\"}", "[]"] {
+            assert_eq!(parse_server_status(other), Unknown, "{other:?}");
+        }
+    }
+
+    /// The effects [`super::ensure_server_running_with`] is driven by, with
+    /// what each was asked.
+    struct Starts {
+        reports: std::cell::RefCell<Vec<super::LmStudioServer>>,
+        asked: std::cell::Cell<usize>,
+        started: std::cell::RefCell<Vec<Vec<String>>>,
+        pauses: std::cell::Cell<u32>,
+    }
+
+    impl Starts {
+        /// LM Studio answers `reports` in turn, then its last one forever.
+        fn new(reports: &[super::LmStudioServer]) -> Self {
+            Starts {
+                reports: std::cell::RefCell::new(reports.iter().rev().copied().collect()),
+                asked: Default::default(),
+                started: Default::default(),
+                pauses: Default::default(),
+            }
+        }
+
+        fn run(&self, url: &str, start: anyhow::Result<()>) -> anyhow::Result<bool> {
+            let start = std::cell::RefCell::new(Some(start));
+            super::ensure_server_running_with(
+                url,
+                &|| {
+                    self.asked.set(self.asked.get() + 1);
+                    let mut r = self.reports.borrow_mut();
+                    if r.len() > 1 { r.pop().unwrap() } else { r[0] }
+                },
+                &|args| {
+                    self.started.borrow_mut().push(args.to_vec());
+                    start.borrow_mut().take().unwrap_or(Ok(()))
+                },
+                &|| self.pauses.set(self.pauses.get() + 1),
+            )
+        }
+    }
+
+    /// (#3578) The server is started only when `lmstudio_url` is this
+    /// machine's AND LM Studio reports it off. Another machine's URL is never
+    /// asked about (this `lms` knows only this machine), and no report, or a
+    /// running server, starts nothing.
+    #[test]
+    fn a_server_is_started_only_when_lm_studio_reports_it_off_here() {
+        use super::LmStudioServer::*;
+        let elsewhere = Starts::new(&[Off]);
+        assert!(!elsewhere.run("http://192.0.2.10:1234", Ok(())).unwrap());
+        assert_eq!((elsewhere.asked.get(), elsewhere.started.borrow().len()), (0, 0), "another machine's server");
+        for report in [Unknown, Running] {
+            let here = Starts::new(&[report]);
+            assert!(!here.run("http://localhost:1234", Ok(())).unwrap());
+            assert!(here.started.borrow().is_empty(), "{report:?} starts nothing");
+        }
+        let off = Starts::new(&[Off, Off, Running]);
+        assert!(off.run("http://127.0.0.1:1234", Ok(())).unwrap());
+        assert_eq!(*off.started.borrow(), vec![vec!["server", "start", "--port", "1234"]]);
+        assert_eq!(off.pauses.get(), 1, "checked until LM Studio reported it running");
+    }
+
+    /// (#3578) A start that fails, or after which LM Studio never reports
+    /// the server running, is an error (the preflight warns and goes on),
+    /// after a bounded number of checks.
+    #[test]
+    fn a_start_that_fails_or_never_comes_up_is_an_error() {
+        use super::LmStudioServer::*;
+        let refused = Starts::new(&[Off]);
+        let e = refused.run("http://localhost:1234", Err(anyhow::anyhow!("`lms server start` failed: no"))).unwrap_err();
+        assert!(format!("{e:#}").contains("failed: no"), "{e:#}");
+        let never = Starts::new(&[Off]);
+        let e = never.run("http://localhost:1234", Ok(())).unwrap_err();
+        assert!(format!("{e:#}").contains("did not report its local server running"), "{e:#}");
+        assert_eq!(never.pauses.get(), super::START_CHECKS);
+    }
+
+    /// `lms server start` is sent the port `lmstudio_url` is dialed on.
+    #[test]
+    fn the_server_starts_on_the_port_the_url_is_dialed_on() {
+        assert_eq!(super::server_start_args("http://localhost:4321/v1"), ["server", "start", "--port", "4321"]);
+        assert_eq!(super::server_start_args("http://localhost"), ["server", "start", "--port", "80"]);
+        assert_eq!(super::server_start_args("localhost:1234"), ["server", "start"]);
     }
 }

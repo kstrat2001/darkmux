@@ -3232,6 +3232,32 @@ printf '{\"result\":\"refused\",\"code\":\"busy\",\"error\":\"held\"}'\necho 'he
     assert!(e.error.contains("Connection refused"), "{e:?}");
 }
 
+/// (#3578) Each way an envelope says a dispatch did not finish is read as a
+/// failure on its own: an `error` result whatever the exit code, and a
+/// non-zero exit whatever the result. Only a clean exit with a result that
+/// is neither `refused` nor `error` is the run's envelope.
+#[test]
+fn an_envelope_is_a_finished_run_only_on_a_clean_exit_with_no_error() {
+    let error = r#"{"result":"error","error":"Connection refused (os error 61)"}"#;
+    let stop = r#"{"result":"stop","final_assistant":"done"}"#;
+    let refused = r#"{"result":"refused","code":"busy","error":"held"}"#;
+    assert_eq!(read_envelope(error, true).unwrap_err(), (None, Some("Connection refused (os error 61)".into())), "an error result at exit 0");
+    assert_eq!(read_envelope(stop, false).unwrap_err(), (None, None), "a non-zero exit");
+    assert_eq!(read_envelope(refused, true).unwrap_err(), (Some("busy".into()), Some("held".into())));
+    assert_eq!(read_envelope("not json", true).unwrap_err(), (None, None));
+    assert_eq!(read_envelope(stop, true).unwrap()["final_assistant"], "done");
+}
+
+/// The envelope's error leads a failed run's text, unless stderr already
+/// carries it.
+#[test]
+fn a_failed_runs_text_leads_with_the_envelope_error_once() {
+    assert_eq!(failure_tail(Some("refused".into()), "boom\n".into()), "refused\nboom");
+    assert_eq!(failure_tail(Some("boom".into()), "boom".into()), "boom");
+    assert_eq!(failure_tail(Some(String::new()), "boom".into()), "boom");
+    assert_eq!(failure_tail(None, "boom".into()), "boom");
+}
+
 // ─── Cancel ──────────────────────────────────────────────────────────────
 
 fn waiting_work() -> Value {

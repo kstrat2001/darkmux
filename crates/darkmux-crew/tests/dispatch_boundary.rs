@@ -161,6 +161,10 @@ case "$1" in
   unload)
     if [ -f "$state/lms-ps-after-unload.json" ]; then cp "$state/lms-ps-after-unload.json" "$state/lms-ps.json"; fi
     exit 0 ;;
+  server)
+    if [ "$2" = start ] && [ -f "$state/lms-server-after-start.json" ]; then cp "$state/lms-server-after-start.json" "$state/lms-server.json"; fi
+    if [ "$2" = status ] && [ -f "$state/lms-server.json" ]; then cat "$state/lms-server.json"; fi
+    exit 0 ;;
 esac
 if [ "$1" = ls ]; then echo '[]'; fi
 exit 0
@@ -1069,6 +1073,32 @@ fn a_reuse_reads_no_catalog_and_loads_nothing() {
     let lms = rig.lms_log();
     assert!(lms.iter().any(|l| l == "ps --json"), "residency was read: {lms:?}");
     assert!(lms.iter().all(|l| !l.starts_with("ls") && !l.starts_with("load")), "{lms:?}");
+}
+
+/// (#3578) LM Studio holds the model but reports its local server off (a
+/// request would be refused at connect): the preflight starts the server on
+/// the port `lmstudio_url` is dialed on, once, says so, and the dispatch
+/// runs. A server LM Studio reports running starts nothing, and neither
+/// does no report at all (every other test here: the fake says nothing).
+#[test]
+#[serial]
+fn a_server_lm_studio_reports_off_is_started_before_the_dispatch() {
+    own_process!();
+    for (report, starts) in [(r#"{"running":false}"#, 1), (r#"{"running":true,"port":1234}"#, 0)] {
+        let rig = Rig::new();
+        rig.fake("lms-server.json", report);
+        rig.fake("lms-server-after-start.json", r#"{"running":true,"port":1234}"#);
+        rig.container(ONE_TURN, ENVELOPE, "", 0);
+        let (res, stderr) = run(&rig, rig.opts());
+        assert_eq!(res.expect("the dispatch runs").exit_code, 0, "{report}");
+        let lms = rig.lms_log();
+        let started: Vec<&String> = lms.iter().filter(|l| l.starts_with("server start")).collect();
+        assert_eq!(started.len(), starts, "{report}: {lms:?}");
+        if starts == 1 {
+            assert_eq!(started[0], "server start --port 1234");
+            assert!(stderr.contains("started LM Studio's local server"), "{stderr}");
+        }
+    }
 }
 
 #[test]

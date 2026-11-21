@@ -6380,9 +6380,10 @@ pub(crate) fn dispatch_args(spec: &WorkSpec) -> Vec<std::ffi::OsString> {
 pub const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Run `exe dispatch ...` with the message on stdin and return its `--json`
-/// envelope. An envelope is returned whatever the exit code (its `result`
-/// says how the dispatch ended); no envelope is an error carrying the exit
-/// status and the tail of stderr.
+/// envelope. Only a dispatch that exited 0 with an envelope that is neither
+/// `refused` nor `error` is returned (#3578); any other end is an error
+/// carrying the exit status, the envelope's error when it printed one, and
+/// the tail of stderr.
 ///
 /// **Cancel.** When `cancel` is raised the child gets SIGTERM; one still
 /// alive `grace` later gets SIGKILL, and since a killed child runs none of
