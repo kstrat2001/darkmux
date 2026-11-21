@@ -8005,6 +8005,54 @@ mod tests {
 
     // ── (#2344) dispatch.map — session-presence heartbeat ────────────────
 
+    /// The value of every RESP `SET` the fake peer recorded whose key passes
+    /// `key`. An entry is one `read` off the socket, so it can hold several
+    /// commands: CI once saw the reconnect handshake (`CLIENT SETINFO`, which
+    /// contains "SET") and the final `DEL <presence key>` arrive in one read,
+    /// and a match on the substring "SET" plus the key counted that as a
+    /// second beat. Only a real `SET` command counts here.
+    fn recorded_sets(entries: &[String], key: impl Fn(&str) -> bool) -> Vec<&str> {
+        const SET: &str = "$3\r\nSET\r\n";
+        let mut values = Vec::new();
+        for entry in entries {
+            for (at, _) in entry.match_indices(SET) {
+                let rest = &entry[at + SET.len()..];
+                if let Some((k, rest)) = resp_bulk(rest) {
+                    if let Some((v, _)) = resp_bulk(rest).filter(|_| key(k)) {
+                        values.push(v);
+                    }
+                }
+            }
+        }
+        values
+    }
+
+    /// One RESP bulk string at the start of `s` (`$<len>\r\n<bytes>\r\n`),
+    /// and what follows it.
+    fn resp_bulk(s: &str) -> Option<(&str, &str)> {
+        let (len, rest) = s.strip_prefix('$')?.split_once("\r\n")?;
+        let len: usize = len.parse().ok()?;
+        let body = rest.get(..len)?;
+        Some((body, rest.get(len..)?.strip_prefix("\r\n")?))
+    }
+
+    #[test]
+    fn recorded_sets_counts_set_commands_not_a_handshake_read_beside_a_del() {
+        let k = "darkmux:session-presence:m-test.task.t1";
+        let hello = "*4\r\n$6\r\nCLIENT\r\n$7\r\nSETINFO\r\n$8\r\nLIB-NAME\r\n$8\r\nredis-rs\r\n";
+        let entries = vec![
+            hello.to_string(),
+            format!("*5\r\n$3\r\nSET\r\n${}\r\n{k}\r\n$4\r\nbeat\r\n$2\r\nEX\r\n$2\r\n15\r\n", k.len()),
+            "*6\r\n$3\r\nSET\r\n$45\r\ndarkmux:edge-claim:session-end:m-test.task.t1\r\n$1\r\n1\r\n$2\r\nNX\r\n$2\r\nEX\r\n$2\r\n60\r\n".to_string(),
+            format!("{hello}*2\r\n$3\r\nDEL\r\n${}\r\n{k}\r\n", k.len()),
+        ];
+        assert_eq!(recorded_sets(&entries, |key| key == k), vec!["beat"]);
+        assert_eq!(recorded_sets(&entries, |key| key.starts_with("darkmux:session-presence:")), vec!["beat"]);
+        // A longer key with the same prefix is a different key.
+        let t10 = format!("*3\r\n$3\r\nSET\r\n${}\r\n{k}0\r\n$1\r\nx\r\n", k.len() + 1);
+        assert!(recorded_sets(&[t10], |key| key == k).is_empty());
+    }
+
     /// A minimal fake Redis peer that ACKS everything: it completes the two
     /// `CLIENT SETINFO` handshake commands redis-rs pipelines on connect,
     /// then answers `+OK\r\n` to whatever real command follows, and records
@@ -8018,16 +8066,12 @@ mod tests {
     /// reply otherwise, which would make this a liveness test, not a
     /// presence-content test.
     ///
-    /// **Known limit (fresh-review finding), left as a comment rather than
-    /// engineered away:** each `read` is logged as ONE entry, and the
-    /// assertions below match a substring PAIR (`"SET"` and the key) within
-    /// a single entry. A command split across two reads would therefore
-    /// read as no match and fail the test spuriously. The commands in
-    /// question are ~161 bytes over loopback into a 4 KiB buffer, which the
-    /// kernel does not split in practice — 20 of 20 runs under heavy load
-    /// saw one read per command — so the fix (accumulate per connection and
-    /// parse RESP) would buy nothing but more test machinery. If this ever
-    /// flakes, that is the reason and that is the fix.
+    /// Each `read` is logged as ONE entry, and the assertions read the `SET`
+    /// commands in it with [`recorded_sets`], which parses RESP: one read can
+    /// carry several commands (a reconnect handshake beside a `DEL`). A
+    /// command split across two reads would still read as no match; the
+    /// commands are ~161 bytes over loopback into a 4 KiB buffer, which the
+    /// kernel has not been seen to split.
     fn spawn_acking_recording_redis_server(log: Arc<Mutex<Vec<String>>>) -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().unwrap().port();
@@ -8230,8 +8274,7 @@ mod tests {
             darkmux_types::session_id::SessionId::task(crate::test_run(), "t1").wire()
         );
         let entries = log.lock().unwrap().clone();
-        let set_count =
-            entries.iter().filter(|e| e.contains("SET") && e.contains(&expected_key)).count();
+        let set_count = recorded_sets(&entries, |k| k == expected_key).len();
         let saw_claim_edge = entries.iter().any(|e| e.contains(&format!("edge-claim:session-end:{}", darkmux_types::session_id::SessionId::task(crate::test_run(), "t1"))));
         assert_eq!(
             set_count, 1,
@@ -8314,9 +8357,8 @@ mod tests {
         mock.assert_hits(1);
 
         let entries = log.lock().unwrap().clone();
-        let beat_entry = entries
-            .iter()
-            .find(|e| e.contains("SET") && e.contains("darkmux:session-presence:"))
+        let beat_entry = *recorded_sets(&entries, |k| k.starts_with("darkmux:session-presence:"))
+            .first()
             .unwrap_or_else(|| panic!("expected a session-presence SET beat; saw {entries:?}"));
         assert!(
             beat_entry.contains("darkmux:qwen3-4b"),
@@ -8403,7 +8445,7 @@ mod tests {
         );
         let entries = log.lock().unwrap().clone();
         assert!(
-            entries.iter().any(|e| e.contains("SET") && e.contains(&expected_key)),
+            !recorded_sets(&entries, |k| k == expected_key).is_empty(),
             "a hosted `dispatch.single_shot` must beat while it is generating — expected a \
              session-presence SET for {expected_key}; saw {entries:?}"
         );
@@ -8520,9 +8562,8 @@ mod tests {
         mock.assert_hits(1);
 
         let entries = log.lock().unwrap().clone();
-        let beat_entry = entries
-            .iter()
-            .find(|e| e.contains("SET") && e.contains("darkmux:session-presence:"))
+        let beat_entry = *recorded_sets(&entries, |k| k.starts_with("darkmux:session-presence:"))
+            .first()
             .unwrap_or_else(|| panic!("expected a session-presence SET beat; saw {entries:?}"));
         assert!(
             beat_entry.contains("darkmux:qwen3-4b"),
