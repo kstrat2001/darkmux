@@ -85,11 +85,14 @@ pub enum ClientCapability {
     /// workspace (`status`, `fetch`, `push`, `merge_main`, `revert`,
     /// `diff`), and one lock per work copy (`work_copy_busy`).
     GitRoute,
+    /// (#3684) `POST /client/work` takes `fresh: true`: the run starts on a
+    /// new branch from the remote's main branch.
+    FreshBranch,
 }
 
 impl ClientCapability {
     /// Every capability, in declaration order: what `whoami` lists.
-    pub const ALL: [ClientCapability; 14] = [
+    pub const ALL: [ClientCapability; 15] = [
         ClientCapability::CleanPreview,
         ClientCapability::TemplateWorkspace,
         ClientCapability::Continues,
@@ -104,6 +107,7 @@ impl ClientCapability {
         ClientCapability::RemotePreview,
         ClientCapability::Engines,
         ClientCapability::GitRoute,
+        ClientCapability::FreshBranch,
     ];
 }
 
@@ -140,6 +144,7 @@ mod tests {
                 "remote_preview",
                 "engines",
                 "git_route",
+                "fresh_branch",
             ]
         );
         for c in ClientCapability::ALL {
