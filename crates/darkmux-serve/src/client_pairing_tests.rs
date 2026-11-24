@@ -823,7 +823,7 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
                            "capabilities": ["clean_preview", "template_workspace", "continues", "clone_preview",
                                             "recipe_set", "workspace_image", "workspace_edit", "workspace_remove",
                                              "remote_tailscale", "availability_codes",
-                                             "remote_requests", "remote_preview", "engines", "git_route", "fresh_branch"],
+                                             "remote_requests", "remote_preview", "engines", "git_route"],
                             "remote": {"state": "off", "url": null, "reason": null},
                             "via": "local"})
     );
@@ -12160,45 +12160,4 @@ async fn a_template_projects_first_push_goes_only_into_an_empty_repository() {
     let (_, s) = call(&h, git_call(&name, &token, "status", serde_json::json!({}))).await;
     assert_eq!(s["result"]["origin"], "github.com/o/empty", "{s}");
     assert_eq!(s["result"]["ahead"], 0, "{s}");
-}
-
-// ─── A fresh task (#3684) ────────────────────────────────────────────────
-
-/// After a merge, a `fresh` run's commit sits on a new branch whose parent
-/// is the remote's main, as last fetched.
-#[tokio::test]
-async fn a_fresh_run_starts_on_a_new_branch_from_the_remotes_main() {
-    let h = harness();
-    let token = paired(&h).await;
-    let (wt, bare) = git_remote_workspace(&h, "site");
-    run_in(&h, &token, "site", "edit-readme").await;
-    someone_else_pushes(&h, &bare, "main", "README.md", "merged\n");
-    let (code, v) = call(&h, git_call("site", &token, "fetch", serde_json::json!({}))).await;
-    assert_eq!(code, 200, "{v}");
-    let main = run_git(Some(&wt), &["rev-parse", "refs/remotes/origin/main"]);
-    let body = serde_json::json!({"role": "coder", "message": "edit-other", "workspace": "site", "fresh": true});
-    let (code, v) = call(&h, post("/client/work", Some(&token), body)).await;
-    assert_eq!(code, 202, "{v}");
-    let done = wait_done(&h, &token, v["work_id"].as_str().unwrap()).await;
-    let branch = done["branch"].as_str().unwrap_or_default().to_string();
-    assert!(branch.starts_with("mux/") && branch != "mux/test-abc123", "a new branch: {done}");
-    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD^"]), main, "its parent is the remote's main");
-    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), "merged\n", "the merged files");
-    assert!(run_git(Some(&wt), &["rev-parse", "--verify", "mux/test-abc123"]).len() >= 40, "the old branch stays");
-}
-
-/// Uncommitted changes to tracked files: nothing moves.
-#[tokio::test]
-async fn a_fresh_run_in_a_dirty_work_copy_is_refused_and_nothing_moves() {
-    let h = harness();
-    let token = paired(&h).await;
-    let (wt, _) = git_remote_workspace(&h, "site");
-    std::fs::write(wt.join("README.md"), "unsaved\n").unwrap();
-    let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
-    let body = serde_json::json!({"role": "coder", "message": "hello", "workspace": "site", "fresh": true});
-    let (code, v) = call(&h, post("/client/work", Some(&token), body)).await;
-    assert_eq!((code, v["code"].as_str()), (409, Some("dirty")), "{v}");
-    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), head);
-    assert_eq!(run_git(Some(&wt), &["branch", "--show-current"]), "mux/test-abc123");
-    assert!(h.ran.lock().unwrap().is_empty(), "nothing ran");
 }

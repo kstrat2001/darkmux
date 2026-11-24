@@ -3012,11 +3012,6 @@ pub(crate) struct WorkBody {
     /// first line).
     #[serde(default)]
     title: Option<String>,
-    /// (#3684) Start the next task: before the run, the work copy moves onto
-    /// a new branch of its bot's from the remote's main branch as last
-    /// fetched, so a task after a merge starts from the merged project.
-    #[serde(default)]
-    fresh: bool,
 }
 
 pub(crate) async fn work_handler(
@@ -3263,7 +3258,7 @@ fn admit(
     // Registered as running, so nothing else starts in the copy while it
     // is moved off its base branch.
     drop(works);
-    if let Err(r) = branch_for_run(state, git.as_ref(), req.fresh) {
+    if let Err(r) = onto_own_branch(state, git.as_ref()) {
         state.works.lock().unwrap().remove(&work_id);
         return Err(r);
     }
@@ -3290,36 +3285,6 @@ fn onto_own_branch(state: &ClientServerState, wc: Option<&WorkCopy>) -> Result<(
     let name = wc.work_tree.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let branch = new_bot_branch(&bot_slug(crate::client_workspace::bot_of(&base, &name).as_deref()))?;
     head_onto_new_branch(wc, &branch).map_err(|e| branch_failed(&format!("moving {name} off {on} onto {branch}: {e}")))
-}
-
-/// The branch a run works on: a fresh one from the remote's main (#3684),
-/// else the copy's own ([`onto_own_branch`]).
-fn branch_for_run(state: &ClientServerState, wc: Option<&WorkCopy>, fresh: bool) -> Result<(), Refused> {
-    match fresh {
-        true => onto_fresh_branch(state, wc),
-        false => onto_own_branch(state, wc),
-    }
-}
-
-/// (#3684) A run with `fresh`: the work copy moves onto a new branch of its
-/// bot's cut from `origin/<default>` as last fetched (`git switch -c`, the
-/// files checked out from there). Refused for a run with no work copy, a
-/// work copy with no remote (`no_origin`) and one with uncommitted changes
-/// to tracked files (`dirty`), so nothing of the person's is ever left
-/// behind on the old branch unsaid. The old branch stays as it was.
-fn onto_fresh_branch(state: &ClientServerState, wc: Option<&WorkCopy>) -> Result<(), Refused> {
-    let wc = wc.ok_or_else(|| refuse(StatusCode::CONFLICT, ClientCode::Conflict, "only a run in a work copy can start fresh"))?;
-    let main = crate::client_workspace::remote_default_of(wc)
-        .ok_or_else(|| refuse(StatusCode::CONFLICT, ClientCode::NoOrigin, "this work copy has no remote main branch to start from"))?;
-    let dirty = git(wc, None, &["status", "--porcelain", "--untracked-files=no"]).is_some_and(|o| !o.stdout.is_empty());
-    if dirty {
-        return Err(refuse(StatusCode::CONFLICT, ClientCode::Dirty, "the work copy has uncommitted changes, so it wasn't moved"));
-    }
-    let base = (state.worktrees_base)().map_err(|e| Box::new(internal(anyhow!(e))))?;
-    let name = wc.work_tree.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let branch = new_bot_branch(&bot_slug(crate::client_workspace::bot_of(&base, &name).as_deref()))?;
-    git_quiet(wc, &["switch", "--quiet", "--no-track", "-c", &branch, &main])
-        .map_err(|e| branch_failed(&format!("starting {name} fresh from {main} on {branch}: {e}")))
 }
 
 /// The branch `wc` is checked out on (empty when detached) when it has an
