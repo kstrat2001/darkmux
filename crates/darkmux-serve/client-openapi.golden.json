@@ -656,6 +656,45 @@
         }
       }
     },
+    "/client/workspaces/{name}/file": {
+      "post": {
+        "responses": {
+          "2XX": {
+            "description": "FileReply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileReply"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FileBody"
+              }
+            }
+          }
+        }
+      }
+    },
     "/client/workspaces/{name}/preview": {
       "post": {
         "responses": {
@@ -1439,6 +1478,11 @@
             "type": "string",
             "const": "git_route",
             "description": "(#3681) `POST /client/workspaces/{name}/git`: plain git on a\nworkspace (`status`, `fetch`, `push`, `merge_main`, `revert`,\n`diff`), and one lock per work copy (`work_copy_busy`)."
+          },
+          {
+            "type": "string",
+            "const": "workspace_file",
+            "description": "(#3688) `POST /client/workspaces/{name}/file`: a file a person\napproved, committed into the work copy like an image."
           }
         ],
         "description": "One thing the client API can do that an app may need to check for."
@@ -3147,6 +3191,54 @@
         },
         "required": [
           "name",
+          "data"
+        ]
+      },
+      "FileReply": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "work_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "commit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "description": "`POST /client/workspaces/{name}/file` (#3688): where the file went, and\nits work record and commit; no `work_id` when the same bytes were there\nalready and nothing was committed."
+      },
+      "FileBody": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Where the file goes in the work copy: relative, plain folder names,\nnever under `.git`."
+          },
+          "data": {
+            "type": "string",
+            "description": "The file's bytes, base64."
+          }
+        },
+        "required": [
+          "path",
           "data"
         ]
       },

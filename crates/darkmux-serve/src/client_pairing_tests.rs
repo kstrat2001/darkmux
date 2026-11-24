@@ -12176,7 +12176,7 @@ fn file_call(name: &str, token: &str, path: &str, data: &[u8]) -> Request<Body> 
 async fn an_approved_file_is_committed_and_a_revert_takes_it_out() {
     let h = harness();
     let token = paired(&h).await;
-    let wt = git_workspace(&h, "site");
+    let (wt, _) = git_remote_workspace(&h, "site");
     let recipe = b"{\"schema_version\": \"1.0\"}\n";
     let (code, v) = call(&h, file_call("site", &token, ".darkmux/preview.json", recipe)).await;
     assert_eq!(code, 200, "{v}");
