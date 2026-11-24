@@ -25,6 +25,9 @@ darkmux release.
   go one at a time, and a second is refused naming what holds it (`work_copy_busy`; the older routes
   keep `conflict` and now name the `holder` too). Capability `git_route`. Every refusal may now carry
   `holder`, `work_id` and `paths` (additive).
+- **A file a person approved goes into the work copy (#3688).** `POST /client/workspaces/{name}/file`
+  writes it (relative plain names only, nothing under `.git`, 256 KB at most, through no link) and
+  commits it like an image, so Undo and the git route's `revert` take it out. Capability `workspace_file`.
 
 ## [5.12.0] - 2026-11-21
 
