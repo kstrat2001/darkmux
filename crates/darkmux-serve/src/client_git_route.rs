@@ -790,9 +790,7 @@ fn back_to(wc: &WorkCopy, old: &str, new: &str) {
 /// changes (`dirty`) and a later commit that doesn't apply (`merge_conflict`,
 /// with its files) change nothing.
 fn new_task(st: &ClientServerState, name: &str, wc: &WorkCopy, a: &NewTaskArgs) -> Result<GitNewTask, Refused> {
-    if !full_id(&a.merged_head) || !full_id(&a.merge_sha) {
-        return Err(coded(ClientCode::BadRequest, "`merged_head` and `merge_sha` must be full commit ids"));
-    }
+    check_new_task_args(a)?;
     let Some(old) = is_merged_task(wc, &a.merged_head) else {
         return Ok(GitNewTask { moved: false, branch: line(wc, &["branch", "--show-current"]).unwrap_or_default(), head: line(wc, &["rev-parse", "HEAD"]), carried: 0 });
     };
@@ -800,14 +798,32 @@ fn new_task(st: &ClientServerState, name: &str, wc: &WorkCopy, a: &NewTaskArgs) 
     if is_dirty(wc) {
         return Err(coded(ClientCode::Dirty, "the work copy has uncommitted changes, so it wasn't moved"));
     }
-    let later: Vec<String> = line(wc, &["rev-list", "--reverse", &format!("{}..HEAD", a.merged_head)])
-        .map(|l| l.lines().map(str::to_string).collect())
-        .unwrap_or_default();
-    let base = (st.worktrees_base)().map_err(internal)?;
-    let new = cp::new_bot_branch(&cp::bot_slug(crate::client_workspace::bot_of(&base, name).as_deref()))?;
+    let later = made_after(wc, &a.merged_head);
+    let new = next_branch(st, name)?;
     client_git::quiet(wc, &["switch", "--quiet", "--no-track", "-c", &new, &main]).map_err(|e| conflict(format!("couldn't start the next task: {e}")))?;
     carry(wc, &later, &old, &new)?;
     Ok(GitNewTask { moved: true, branch: new, head: line(wc, &["rev-parse", "HEAD"]), carried: later.len() as u64 })
+}
+
+/// `new_task`'s commit ids are whole ones, never abbreviations.
+fn check_new_task_args(a: &NewTaskArgs) -> Result<(), Refused> {
+    if !full_id(&a.merged_head) || !full_id(&a.merge_sha) {
+        return Err(coded(ClientCode::BadRequest, "`merged_head` and `merge_sha` must be full commit ids"));
+    }
+    Ok(())
+}
+
+/// The commits on this branch after `merged_head`, oldest first.
+fn made_after(wc: &WorkCopy, merged_head: &str) -> Vec<String> {
+    line(wc, &["rev-list", "--reverse", &format!("{merged_head}..HEAD")])
+        .map(|l| l.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// A new bot branch name for the workspace's next task.
+fn next_branch(st: &ClientServerState, name: &str) -> Result<String, Refused> {
+    let base = (st.worktrees_base)().map_err(internal)?;
+    cp::new_bot_branch(&cp::bot_slug(crate::client_workspace::bot_of(&base, name).as_deref()))
 }
 
 /// The commits made after the merge, onto the new branch in order; on
