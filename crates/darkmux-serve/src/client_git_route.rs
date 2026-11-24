@@ -282,12 +282,16 @@ fn git_verb(st: &ClientServerState, client: &cp::ApprovedClient, name: &str, req
     match asked {
         Asked::Status => Ok(GitReply::Status(status(st, name, &wc, &dir))),
         Asked::Diff(against) => diff(st, name, &wc, against).map(GitReply::Diff),
-        changing => {
-            let _name = cp::held_in_use(st, name)?;
-            let _copy = cp::take_copy(st, &dir, &format!("git:{}", req.verb.word()))?;
-            changed(st, name, &wc, &dir, changing)
-        }
+        changing => held_and_changed(st, name, (&wc, &dir), req.verb, changing),
     }
+}
+
+/// [`changed`], with the workspace's name held shared and its work copy's
+/// lock taken (`git:<verb>`).
+fn held_and_changed(st: &ClientServerState, name: &str, (wc, dir): (&WorkCopy, &Path), verb: GitVerb, asked: Asked) -> Result<GitReply, Refused> {
+    let _name = cp::held_in_use(st, name)?;
+    let _copy = cp::take_copy(st, dir, &format!("git:{}", verb.word()))?;
+    changed(st, name, wc, dir, asked)
 }
 
 /// A verb that changes the copy or its refs, run while it is held.
@@ -446,11 +450,8 @@ fn auth_failed(out: &crate::client_workspace::NetOutput) -> bool {
 
 fn why(out: &crate::client_workspace::NetOutput, token: Option<&GitToken>) -> String {
     let lines: Vec<&str> = out.stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-    let text = match lines.is_empty() {
-        true => format!("git exited with {}", out.status),
-        false => lines.join("; "),
-    };
-    scrub(&text, token)
+    let said = format!("git exited with {}", out.status);
+    scrub(&std::iter::once(said.as_str()).chain(lines).collect::<Vec<_>>().join("; "), token)
 }
 
 /// [`net_git`] that must succeed; `code` when git fails.
@@ -774,14 +775,16 @@ pub fn askpass_answer(prompt: &str, token: &str) -> Option<String> {
 /// This binary as git's askpass ([`ASKPASS_ENV`] set): the answer on
 /// stdout, or nothing and exit 1.
 pub fn askpass_main() -> std::process::ExitCode {
-    let prompt = std::env::args().nth(1).unwrap_or_default();
-    let token = std::env::var(TOKEN_ENV).unwrap_or_default();
-    match askpass_answer(&prompt, &token) {
-        Some(answer) => {
-            println!("{answer}");
-            std::process::ExitCode::SUCCESS
-        }
-        None => std::process::ExitCode::FAILURE,
+    askpass_reply(std::env::args().nth(1), std::env::var(TOKEN_ENV).ok(), &mut std::io::stdout())
+}
+
+/// [`askpass_main`] for a given prompt and token, writing the answer to
+/// `out`.
+fn askpass_reply(prompt: Option<String>, token: Option<String>, out: &mut impl std::io::Write) -> std::process::ExitCode {
+    let answer = askpass_answer(&prompt.unwrap_or_default(), &token.unwrap_or_default());
+    match answer.map(|a| writeln!(out, "{a}")) {
+        Some(Ok(())) => std::process::ExitCode::SUCCESS,
+        _ => std::process::ExitCode::FAILURE,
     }
 }
 

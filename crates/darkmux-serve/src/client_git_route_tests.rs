@@ -51,3 +51,26 @@ fn an_authentication_failure_is_told_apart_from_other_failures() {
         assert!(!auth_failed(&net(err)), "{err}");
     }
 }
+
+#[test]
+fn git_with_nothing_on_stderr_still_says_how_it_exited() {
+    let said = why(&net(""), None);
+    assert!(said.starts_with("git exited with"), "{said}");
+    let t: GitToken = serde_json::from_value(serde_json::json!("ghs_t0k")).unwrap();
+    let said = why(&net("fatal: https://x:ghs_t0k@github.com refused\n\n"), Some(&t));
+    assert!(said.contains("refused") && !said.contains("ghs_t0k"), "{said}");
+}
+
+#[test]
+fn askpass_writes_the_answer_or_fails() {
+    let mut out = Vec::new();
+    let code = askpass_reply(Some("Password for 'https://x-access-token@github.com': ".into()), Some("t0k".into()), &mut out);
+    assert_eq!(code, std::process::ExitCode::SUCCESS);
+    assert_eq!(String::from_utf8(out).unwrap(), "t0k\n");
+    let mut out = Vec::new();
+    assert_eq!(askpass_reply(Some("Password for 'https://gitlab.com': ".into()), Some("t0k".into()), &mut out), std::process::ExitCode::FAILURE);
+    assert!(out.is_empty(), "nothing for another host");
+    assert_eq!(askpass_reply(None, None, &mut Vec::new()), std::process::ExitCode::FAILURE);
+    assert_eq!(askpass_answer("Token for 'https://github.com': ", "t0k"), None, "only the username and password prompts");
+    assert_eq!(askpass_answer("Password for https://github.com", "t0k"), None, "no quoted address");
+}

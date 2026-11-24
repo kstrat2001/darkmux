@@ -297,19 +297,7 @@ pub fn git_network(
     };
     let out = read(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
     let err = read(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("git took longer than {}s", timeout.as_secs()));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(e) => return Err(format!("waiting for git: {e}")),
-        }
-    };
+    let status = wait_for(&mut child, timeout)?;
     Ok(NetOutput { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
 }
 
@@ -482,14 +470,20 @@ const NETWORK_FIX: &str = "darkmux reads network settings from your global git c
 /// Waits for git, killing it past `timeout`; a failure names git's last
 /// stderr line.
 fn wait_bounded(mut child: std::process::Child, timeout: Duration) -> Result<(), String> {
+    let status = wait_for(&mut child, timeout)?;
+    match status.success() {
+        true => Ok(()),
+        false => Err(format!("git exited with {status}: {}", last_stderr_line(&mut child))),
+    }
+}
+
+/// Waits for `child` to exit, killing it past `timeout`. Shared by every
+/// git darkmux waits on here, so its deadline is one piece of code.
+fn wait_for(child: &mut std::process::Child, timeout: Duration) -> Result<std::process::ExitStatus, String> {
     let start = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => {
-                let last = last_stderr_line(&mut child);
-                return Err(format!("git exited with {status}: {last}"));
-            }
+            Ok(Some(status)) => return Ok(status),
             Ok(None) if start.elapsed() > timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
