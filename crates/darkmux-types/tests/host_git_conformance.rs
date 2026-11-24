@@ -105,7 +105,9 @@ fn literals(code: &str) -> (Vec<Lit>, usize) {
 
 /// A literal that names the git program.
 fn names_git(text: &str) -> bool {
-    text == "git" || text.ends_with("/git")
+    // (#3681) A client API route (`/client/workspaces/:name/git`) is a URL
+    // path, never a program.
+    (text == "git" || text.ends_with("/git")) && !text.starts_with("/client/")
 }
 
 /// Whether `lit` on `code` is a key or a comparison operand rather than a

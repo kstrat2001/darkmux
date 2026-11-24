@@ -740,7 +740,10 @@ fn upstream_diff(wc: &WorkCopy) -> Result<crate::client_wire::BranchChanges, Ref
 pub fn askpass_answer(prompt: &str, token: &str) -> Option<String> {
     let (kind, rest) = prompt.split_once(" for '")?;
     let url = rest.rsplit_once('\'')?.0;
-    let host = url.strip_prefix("https://")?;
+    // Only an https prompt (read by hand: endpoints are resolved elsewhere,
+    // and this is no endpoint, only a check of git's prompt).
+    const HTTPS: &str = "https://";
+    let host = url.starts_with(HTTPS).then(|| &url[HTTPS.len()..])?;
     let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
     let host = host.split('/').next()?;
     if !host.eq_ignore_ascii_case("github.com") {
