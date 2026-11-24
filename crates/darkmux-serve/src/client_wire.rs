@@ -28,6 +28,16 @@ use crate::client_profiles::ClientProfileInfo;
 pub struct ClientError {
     pub error: String,
     pub code: darkmux_types::client_code::ClientCode,
+    /// (#3681) What holds the work copy, on a refusal because something
+    /// does (`run`, `undo`, `edit`, `git:<verb>`, `preview_install`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+    /// (#3681) The run that holds the work copy, when one does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_id: Option<String>,
+    /// (#3681) The conflicting files, on a `merge_conflict`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
 }
 
 /// `POST /client/pair`, 202: the request to poll.
@@ -455,4 +465,101 @@ impl PreviewStage {
     pub fn getting(name: &str, display: &str, version: &str) -> Self {
         PreviewStage { code: format!("getting_{name}"), detail: format!("getting {display} {version}, first use only") }
     }
+}
+
+// ─── A workspace's git (#3681) ───────────────────────────────────────────
+
+/// `POST /client/workspaces/{name}/git`: what the verb did, tagged by it
+/// (`{"verb": "status", "result": {..}}`).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "verb", content = "result", rename_all = "snake_case")]
+pub enum GitReply {
+    Status(GitStatus),
+    /// The work copy's status after the fetch.
+    Fetch(GitStatus),
+    Push(GitPushed),
+    MergeMain(GitMerged),
+    Revert(GitReverted),
+    Diff(BranchChanges),
+}
+
+/// (#3681) A work copy as git has it now, read from its local refs only
+/// (never the network: `fetch` first for the remote's latest).
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
+pub struct GitStatus {
+    /// The branch it is on (empty when detached).
+    pub branch: String,
+    /// Its head commit, the full id (`None` before its first commit).
+    pub head: Option<String>,
+    /// Its remote, as `host/owner/repo` (`None` for a project made from a
+    /// template that was never pushed).
+    pub origin: Option<String>,
+    /// The project's main branch: the remote's default branch, or a
+    /// template project's own.
+    pub default_branch: Option<String>,
+    /// Where this branch left the main version: what `pending` counts from.
+    pub base: Option<String>,
+    /// Commits on this branch that the main version lacks.
+    pub pending: u64,
+    /// This branch on the remote, as of the last fetch or push (`None`
+    /// when it was never pushed or fetched).
+    pub upstream: Option<GitUpstream>,
+    /// Commits here that `upstream` lacks (`None` without one).
+    pub ahead: Option<u64>,
+    /// Commits in `upstream` that this branch lacks (`None` without one).
+    pub behind: Option<u64>,
+    /// Commits in the remote's main branch, as of the last fetch, that this
+    /// branch lacks (`None` without a remote).
+    pub behind_main: Option<u64>,
+    /// Tracked files have uncommitted changes.
+    pub dirty: bool,
+    /// What holds the work copy now, if anything.
+    pub busy: Option<GitBusy>,
+}
+
+/// (#3681) A branch on the remote, as this work copy last saw it.
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
+pub struct GitUpstream {
+    /// `origin/<branch>`.
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub head: String,
+}
+
+/// (#3681) What holds a work copy: `run`, `undo`, `edit`, `git:<verb>` or
+/// `preview_install`, and the run, when it is one.
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
+pub struct GitBusy {
+    pub holder: String,
+    pub work_id: Option<String>,
+}
+
+/// (#3681) `push`: the branch on the remote is now this head.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct GitPushed {
+    pub branch: String,
+    pub head: String,
+    /// `host/owner/repo`.
+    pub remote: String,
+    /// This push gave a template project its remote (`origin`).
+    pub added_origin: bool,
+}
+
+/// (#3681) `merge_main`: the main branch is in.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct GitMerged {
+    pub head: String,
+    /// It was in already: nothing changed.
+    pub up_to_date: bool,
+    /// The branch moved forward with no merge commit.
+    pub fast_forward: bool,
+}
+
+/// (#3681) `revert`: the new commit undoing `commit`, and the files it put
+/// back.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct GitReverted {
+    pub commit: String,
+    pub revert: String,
+    pub files: Vec<String>,
 }

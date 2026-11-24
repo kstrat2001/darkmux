@@ -456,6 +456,9 @@ fn harness() -> Harness {
             crate::client_preview::Previews::new(dir.path().join("previews"), emu.clone())
                 .with_clock(Arc::new(move || pc.load(Ordering::SeqCst))),
         ),
+        holds: Arc::new(CopyHolds::default()),
+        // (#3681) A local `file://` remote stands in for GitHub.
+        git_net: Arc::new(crate::client_git_route::GitNet::for_tests()),
         bound: Some(BOUND.parse().unwrap()),
         // On here, so the preview tests can run one; production's default is
         // off (`clients.preview.enabled`).
@@ -820,7 +823,7 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
                            "capabilities": ["clean_preview", "template_workspace", "continues", "clone_preview",
                                             "recipe_set", "workspace_image", "workspace_edit", "workspace_remove",
                                              "remote_tailscale", "availability_codes",
-                                             "remote_requests", "remote_preview", "engines"],
+                                             "remote_requests", "remote_preview", "engines", "git_route"],
                             "remote": {"state": "off", "url": null, "reason": null},
                             "via": "local"})
     );
@@ -6142,11 +6145,11 @@ async fn an_undo_that_lost_the_race_finds_the_run_already_undone() {
     let token = paired(&h).await;
     git_workspace(&h, "site");
     let first = run_in(&h, &token, "site", "edit-readme").await;
-    let held = UndoHold::take(&h.state.works, &first).unwrap_or_else(|_| panic!("the copy is free"));
-    assert!(UndoHold::take(&h.state.works, &first).is_err(), "held by the first Undo");
+    let held = UndoHold::take(&h.state.works, &h.state.holds, &first).unwrap_or_else(|_| panic!("the copy is free"));
+    assert!(UndoHold::take(&h.state.works, &h.state.holds, &first).is_err(), "held by the first Undo");
     h.state.works.lock().unwrap().get_mut(&first).unwrap().decided = Some("undone by abc".into());
     drop(held);
-    let refused = UndoHold::take(&h.state.works, &first).err().expect("already undone");
+    let refused = UndoHold::take(&h.state.works, &h.state.holds, &first).err().expect("already undone");
     assert_eq!(refused.status(), StatusCode::CONFLICT);
 }
 
@@ -11835,3 +11838,326 @@ fn futures_body(resp: axum::response::Response) -> Value {
 /// (#3560, part 4) The preview proxy's tests, on this harness.
 #[path = "client_preview_proxy_tests.rs"]
 mod preview_proxy;
+
+// ─── The git route (#3681) ───────────────────────────────────────────────
+
+/// `POST /client/workspaces/{name}/git` with `verb` and `args`.
+fn git_call(name: &str, token: &str, verb: &str, args: Value) -> Request<Body> {
+    post(&format!("/client/workspaces/{name}/git"), Some(token), serde_json::json!({"verb": verb, "args": args}))
+}
+
+/// A git workspace whose origin is `https://github.com/o/<name>`, which the
+/// route reaches as a local bare repository standing in for GitHub (a
+/// `url.insteadOf` only tests add). The remote holds `main`; the work copy
+/// has fetched it.
+fn git_remote_workspace(h: &Harness, name: &str) -> (PathBuf, PathBuf) {
+    let wt = git_workspace(h, name);
+    let bare = h.dir.path().join(format!("{name}-remote.git"));
+    run_git(None, &["init", "--quiet", "--bare", "-b", "main", bare.to_str().unwrap()]);
+    run_git(Some(&wt), &["push", "--quiet", bare.to_str().unwrap(), "main"]);
+    run_git(Some(&wt), &["remote", "add", "origin", &format!("https://github.com/o/{name}")]);
+    run_git(Some(&wt), &["update-ref", "refs/remotes/origin/main", "main"]);
+    let stand_in = bare.to_str().unwrap().trim_end_matches(".git").to_string();
+    h.state.git_net.add_setting(&format!("url.file://{stand_in}.insteadOf=https://github.com/o/{name}"));
+    (wt, bare)
+}
+
+/// A clone of the stand-in remote where another person commits `file` on
+/// `branch` and pushes it.
+fn someone_else_pushes(h: &Harness, bare: &Path, branch: &str, file: &str, text: &str) {
+    let other = h.dir.path().join(format!("other-{}", random_hex(4).unwrap()));
+    run_git(None, &["clone", "--quiet", bare.to_str().unwrap(), other.to_str().unwrap()]);
+    run_git(Some(&other), &["config", "user.name", "Other"]);
+    run_git(Some(&other), &["config", "user.email", "other@example.com"]);
+    run_git(Some(&other), &["checkout", "--quiet", "-B", branch, &format!("origin/{branch}")]);
+    std::fs::write(other.join(file), text).unwrap();
+    run_git(Some(&other), &["commit", "--quiet", "-am", "theirs"]);
+    run_git(Some(&other), &["push", "--quiet", "origin", branch]);
+}
+
+#[tokio::test]
+async fn git_status_reports_the_branch_from_local_refs() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (wt, _) = git_remote_workspace(&h, "site");
+    run_in(&h, &token, "site", "edit-readme").await;
+    let (code, v) = call(&h, git_call("site", &token, "status", serde_json::json!({}))).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["verb"], "status");
+    let s = &v["result"];
+    assert_eq!(s["branch"], "mux/test-abc123", "{v}");
+    assert_eq!(s["head"], run_git(Some(&wt), &["rev-parse", "HEAD"]));
+    assert_eq!(s["origin"], "github.com/o/site");
+    assert_eq!(s["default_branch"], "main");
+    assert_eq!(s["pending"], 1, "the run's commit: {v}");
+    assert_eq!(s["upstream"], Value::Null, "never pushed");
+    assert_eq!(s["ahead"], Value::Null);
+    assert_eq!(s["behind_main"], 0);
+    assert_eq!(s["dirty"], false, "the owner's untracked notes.txt isn't a change: {v}");
+    assert_eq!(s["busy"], Value::Null);
+}
+
+#[tokio::test]
+async fn git_push_sends_the_branch_and_status_then_shows_nothing_ahead() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (wt, bare) = git_remote_workspace(&h, "site");
+    run_in(&h, &token, "site", "edit-readme").await;
+    let (code, v) = call(&h, git_call("site", &token, "push", serde_json::json!({}))).await;
+    assert_eq!(code, 200, "{v}");
+    let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    assert_eq!(v["result"]["head"], head.as_str(), "{v}");
+    assert_eq!(v["result"]["remote"], "github.com/o/site");
+    assert_eq!(run_git(Some(&bare), &["rev-parse", "refs/heads/mux/test-abc123"]), head, "the remote has it");
+    let (_, s) = call(&h, git_call("site", &token, "status", serde_json::json!({}))).await;
+    assert_eq!((s["result"]["ahead"].clone(), s["result"]["behind"].clone()), (serde_json::json!(0), serde_json::json!(0)), "{s}");
+    assert_eq!(s["result"]["upstream"]["ref"], "origin/mux/test-abc123");
+}
+
+#[tokio::test]
+async fn git_push_never_forces_over_the_remotes_newer_commits() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (wt, bare) = git_remote_workspace(&h, "site");
+    run_in(&h, &token, "site", "edit-readme").await;
+    let (code, v) = call(&h, git_call("site", &token, "push", serde_json::json!({}))).await;
+    assert_eq!(code, 200, "{v}");
+    someone_else_pushes(&h, &bare, "mux/test-abc123", "README.md", "theirs\n");
+    let theirs = run_git(Some(&bare), &["rev-parse", "refs/heads/mux/test-abc123"]);
+    run_in(&h, &token, "site", "edit-readme-again").await;
+    let (code, v) = call(&h, git_call("site", &token, "push", serde_json::json!({}))).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("remote_moved")), "{v}");
+    assert_eq!(run_git(Some(&bare), &["rev-parse", "refs/heads/mux/test-abc123"]), theirs, "their commit stands");
+    assert_ne!(run_git(Some(&wt), &["rev-parse", "HEAD"]), theirs);
+}
+
+#[tokio::test]
+async fn git_fetch_then_merge_main_that_conflicts_leaves_the_tree_as_it_was() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (wt, bare) = git_remote_workspace(&h, "site");
+    run_in(&h, &token, "site", "edit-readme").await;
+    someone_else_pushes(&h, &bare, "main", "README.md", "main moved\n");
+    let (code, v) = call(&h, git_call("site", &token, "fetch", serde_json::json!({}))).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["result"]["behind_main"], 1, "the fetch saw main move: {v}");
+    let before = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    let (code, v) = call(&h, git_call("site", &token, "merge_main", serde_json::json!({}))).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("merge_conflict")), "{v}");
+    assert_eq!(v["paths"], serde_json::json!(["README.md"]), "{v}");
+    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), before, "nothing merged");
+    assert_eq!(run_git(Some(&wt), &["status", "--porcelain", "--untracked-files=no"]), "", "no half-merged file");
+    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), "changed by the run\n");
+}
+
+#[tokio::test]
+async fn git_merge_main_brings_in_a_main_that_moved_without_conflict() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (wt, bare) = git_remote_workspace(&h, "site");
+    run_in(&h, &token, "site", "edit-readme").await;
+    run_git(Some(&wt), &["config", "user.name", "Owner"]);
+    let other = h.dir.path().join("other-main");
+    run_git(None, &["clone", "--quiet", bare.to_str().unwrap(), other.to_str().unwrap()]);
+    run_git(Some(&other), &["config", "user.name", "Other"]);
+    run_git(Some(&other), &["config", "user.email", "other@example.com"]);
+    std::fs::write(other.join("NEW.md"), "new\n").unwrap();
+    run_git(Some(&other), &["add", "NEW.md"]);
+    run_git(Some(&other), &["commit", "--quiet", "-m", "new"]);
+    run_git(Some(&other), &["push", "--quiet", "origin", "main"]);
+    let (code, v) = call(&h, git_call("site", &token, "fetch", serde_json::json!({}))).await;
+    assert_eq!(code, 200, "{v}");
+    let (code, v) = call(&h, git_call("site", &token, "merge_main", serde_json::json!({}))).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["result"]["up_to_date"], false);
+    assert!(wt.join("NEW.md").exists(), "main's file is in");
+    let (_, s) = call(&h, git_call("site", &token, "status", serde_json::json!({}))).await;
+    assert_eq!(s["result"]["behind_main"], 0, "{s}");
+}
+
+#[tokio::test]
+async fn while_a_run_holds_the_work_copy_a_git_verb_is_busy_and_names_it() {
+    let h = harness();
+    let token = paired(&h).await;
+    git_remote_workspace(&h, "site");
+    let (code, v) = call(&h, post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": "wait", "workspace": "site"}))).await;
+    assert_eq!(code, 202, "{v}");
+    let id = v["work_id"].as_str().unwrap().to_string();
+    let (code, v) = call(&h, git_call("site", &token, "push", serde_json::json!({}))).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("work_copy_busy")), "{v}");
+    assert_eq!(v["holder"], "run");
+    assert_eq!(v["work_id"], id.as_str());
+    let (code, s) = call(&h, git_call("site", &token, "status", serde_json::json!({}))).await;
+    assert_eq!(code, 200, "status never waits: {s}");
+    assert_eq!(s["result"]["busy"], serde_json::json!({"holder": "run", "work_id": id}));
+    cancel(&h, Some(&token), &id).await;
+    wait_done(&h, &token, &id).await;
+    let (code, v) = call(&h, git_call("site", &token, "push", serde_json::json!({}))).await;
+    assert_eq!(code, 200, "free once the run ended: {v}");
+}
+
+/// While a git verb holds the work copy, a run is refused with the holder
+/// named, so a push and a run never overlap.
+#[tokio::test]
+async fn while_a_git_verb_holds_the_work_copy_a_run_is_refused() {
+    let h = harness();
+    let token = paired(&h).await;
+    git_remote_workspace(&h, "site");
+    let dir = h.base.join("site").canonicalize().unwrap();
+    let held = take_copy(&h.state, &dir, "git:push").unwrap();
+    let (code, v) = call(&h, post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": "hello", "workspace": "site"}))).await;
+    assert_eq!((code, v["holder"].as_str()), (409, Some("git:push")), "{v}");
+    drop(held);
+    let (code, v) = call(&h, post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": "hello", "workspace": "site"}))).await;
+    assert_eq!(code, 202, "{v}");
+}
+
+#[tokio::test]
+async fn git_revert_undoes_a_commit_once_and_waits_for_later_ones() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (wt, _) = git_remote_workspace(&h, "site");
+    run_in(&h, &token, "site", "edit-readme").await;
+    let first = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    run_in(&h, &token, "site", "edit-readme-again").await;
+    let second = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    let (code, v) = call(&h, git_call("site", &token, "revert", serde_json::json!({"commit": first}))).await;
+    assert_eq!(code, 409, "the later commit changed README.md: {v}");
+    let (code, v) = call(&h, git_call("site", &token, "revert", serde_json::json!({"commit": &second[..12]}))).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["result"]["commit"], second.as_str());
+    assert_eq!(v["result"]["files"], serde_json::json!(["README.md"]));
+    let (code, v) = call(&h, git_call("site", &token, "revert", serde_json::json!({"commit": second}))).await;
+    assert_eq!((code, v["error"].as_str()), (409, Some("already undone")), "{v}");
+    let (code, v) = call(&h, git_call("site", &token, "revert", serde_json::json!({"commit": first}))).await;
+    assert_eq!(code, 200, "the later one is undone now: {v}");
+    assert_eq!(std::fs::read_to_string(wt.join("README.md")).unwrap(), "hi\n");
+    let main = run_git(Some(&wt), &["rev-parse", "main"]);
+    let (code, v) = call(&h, git_call("site", &token, "revert", serde_json::json!({"commit": main}))).await;
+    assert_eq!(code, 409, "main's own commit isn't this branch's: {v}");
+}
+
+#[tokio::test]
+async fn git_diff_against_the_upstream_lists_only_what_the_remote_lacks() {
+    let h = harness();
+    let token = paired(&h).await;
+    git_remote_workspace(&h, "site");
+    run_in(&h, &token, "site", "edit-readme").await;
+    let (code, v) = call(&h, git_call("site", &token, "diff", serde_json::json!({"against": "upstream"}))).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("no_upstream")), "{v}");
+    let (code, v) = call(&h, git_call("site", &token, "diff", serde_json::json!({"against": "base"}))).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["result"]["files"][0]["path"], "README.md");
+    call(&h, git_call("site", &token, "push", serde_json::json!({}))).await;
+    run_in(&h, &token, "site", "edit-other").await;
+    let (code, v) = call(&h, git_call("site", &token, "diff", serde_json::json!({"against": "upstream"}))).await;
+    assert_eq!(code, 200, "{v}");
+    let paths: Vec<&str> = v["result"]["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert!(!paths.contains(&"README.md"), "pushed already: {paths:?}");
+    assert!(!paths.is_empty());
+}
+
+#[tokio::test]
+async fn git_refuses_any_other_verb_and_any_other_argument_by_name() {
+    let h = harness();
+    let token = paired(&h).await;
+    git_remote_workspace(&h, "site");
+    let (code, v) = call(&h, git_call("site", &token, "rebase", serde_json::json!({}))).await;
+    assert_eq!((code, v["code"].as_str()), (400, Some("bad_request")), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("rebase"), "named: {v}");
+    let (code, v) = call(&h, git_call("site", &token, "push", serde_json::json!({"force": true}))).await;
+    assert_eq!((code, v["code"].as_str()), (400, Some("bad_request")), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("force"), "named: {v}");
+    let (code, v) = call(&h, git_call("site", &token, "revert", serde_json::json!({"commit": "--hard"}))).await;
+    assert_eq!(code, 400, "{v}");
+}
+
+/// Every file under `root`, read as bytes, holding `needle`.
+fn files_holding(root: &Path, needle: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(p),
+                Ok(t) if t.is_file() => {
+                    if let Ok(bytes) = std::fs::read(&p) {
+                        if bytes.windows(needle.len()).any(|w| w == needle.as_bytes()) {
+                            found.push(p);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+/// (#3681) The token sent with a push is in no reply, record or log line
+/// darkmux wrote, after a push that worked, one the remote refused and one
+/// darkmux refused.
+#[tokio::test]
+async fn a_push_token_appears_in_no_reply_record_or_log() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (_, bare) = git_remote_workspace(&h, "site");
+    let secret = "ghs_s3cretTOKENvalue0123456789";
+    let mut replies = Vec::new();
+    run_in(&h, &token, "site", "edit-readme").await;
+    let (code, v) = call(&h, git_call("site", &token, "push", serde_json::json!({"token": secret}))).await;
+    assert_eq!(code, 200, "{v}");
+    replies.push(v);
+    someone_else_pushes(&h, &bare, "mux/test-abc123", "README.md", "theirs\n");
+    run_in(&h, &token, "site", "edit-readme-again").await;
+    let (code, v) = call(&h, git_call("site", &token, "push", serde_json::json!({"token": secret}))).await;
+    assert_eq!(code, 409, "{v}");
+    replies.push(v);
+    let (code, v) = call(&h, git_call("site", &token, "fetch", serde_json::json!({"token": secret}))).await;
+    assert_eq!(code, 200, "{v}");
+    replies.push(v);
+    // Refused by darkmux: the remote isn't on github.com.
+    let wt = h.base.join("site");
+    run_git(Some(&wt), &["remote", "set-url", "origin", "https://gitlab.com/o/site"]);
+    let (code, v) = call(&h, git_call("site", &token, "push", serde_json::json!({"token": secret}))).await;
+    assert_eq!((code, v["code"].as_str()), (400, Some("token_host_refused")), "{v}");
+    replies.push(v);
+    for r in &replies {
+        assert!(!r.to_string().contains(secret), "in a reply: {r}");
+    }
+    assert_eq!(files_holding(h.dir.path(), secret), Vec::<PathBuf>::new(), "written somewhere");
+}
+
+/// (#3681) A project made from a template gets its remote from its first
+/// push, only into an empty repository.
+#[tokio::test]
+async fn a_template_projects_first_push_goes_only_into_an_empty_repository() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (code, v) = call(&h, post("/client/workspaces", Some(&token), serde_json::json!({"repo_url": HCR, "template": true, "bot": "Bakery"}))).await;
+    assert_eq!(code, 201, "{v}");
+    let name = v["workspace"].as_str().unwrap().to_string();
+    let (code, v) = call(&h, git_call(&name, &token, "push", serde_json::json!({}))).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("no_origin")), "{v}");
+    let full = h.dir.path().join("full-remote.git");
+    run_git(None, &["init", "--quiet", "--bare", "-b", "main", full.to_str().unwrap()]);
+    run_git(None, &["--git-dir", full.to_str().unwrap(), "fetch", "--quiet", h.fixture.to_str().unwrap(), "main:main"]);
+    let empty = h.dir.path().join("empty-remote.git");
+    run_git(None, &["init", "--quiet", "--bare", "-b", "main", empty.to_str().unwrap()]);
+    for (repo, at) in [("full", &full), ("empty", &empty)] {
+        let stand_in = at.to_str().unwrap().trim_end_matches(".git").to_string();
+        h.state.git_net.add_setting(&format!("url.file://{stand_in}.insteadOf=https://github.com/o/{repo}"));
+    }
+    let (code, v) = call(&h, git_call(&name, &token, "push", serde_json::json!({"repo": "o/full"}))).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("remote_not_empty")), "{v}");
+    let (code, v) = call(&h, git_call(&name, &token, "push", serde_json::json!({"repo": "o/empty"}))).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["result"]["added_origin"], true);
+    assert_eq!(v["result"]["branch"], "main");
+    assert_eq!(run_git(Some(&empty), &["rev-parse", "main"]), v["result"]["head"].as_str().unwrap());
+    let (_, s) = call(&h, git_call(&name, &token, "status", serde_json::json!({}))).await;
+    assert_eq!(s["result"]["origin"], "github.com/o/empty", "{s}");
+    assert_eq!(s["result"]["ahead"], 0, "{s}");
+}

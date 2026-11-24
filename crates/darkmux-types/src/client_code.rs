@@ -132,6 +132,38 @@ pub enum ClientCode {
     /// remove it with `force`.
     UnsavedCommits,
 
+    // ── A workspace's git (#3681, `POST /client/workspaces/{name}/git`) ──
+    /// (#3681) Something else holds the work copy now (409): the refusal's
+    /// `holder` names it (`run`, `undo`, `edit`, `git:<verb>`,
+    /// `preview_install`) and `work_id` the run, when it is one. Retry once
+    /// it ends. Not `busy`, which is a dispatch's memory being held.
+    WorkCopyBusy,
+    /// (#3681) The push was refused because the branch on the remote has
+    /// commits this work copy lacks (409): fetch, bring them in, push again.
+    /// darkmux never forces a push.
+    RemoteMoved,
+    /// (#3681) The push failed for another reason (502); `error` says git's.
+    PushFailed,
+    /// (#3681) A token was sent for a remote that is not on `github.com`
+    /// (400): darkmux hands a token only to GitHub.
+    TokenHostRefused,
+    /// (#3681) A project's first push to a repository that already has
+    /// branches (409): darkmux pushes a template project only into an empty
+    /// repository.
+    RemoteNotEmpty,
+    /// (#3681) Bringing in the default branch conflicts (409): darkmux
+    /// aborted the merge, so nothing changed; `paths` names the files.
+    MergeConflict,
+    /// (#3681) The work copy has uncommitted changes to tracked files (409),
+    /// so darkmux changed nothing.
+    Dirty,
+    /// (#3681) The work copy has no remote yet (a project made from a
+    /// template that was never pushed; 409).
+    NoOrigin,
+    /// (#3681) The branch has never been pushed or fetched, so there is
+    /// nothing to compare with on the remote (409).
+    NoUpstream,
+
     // ── A failed run, from its `dispatch.error` `code` ──
     /// The memory is held by a running dispatch; retry later.
     Busy,
@@ -252,6 +284,15 @@ mod tests {
             (RemoteDeviceMismatch, "remote_device_mismatch"),
             (TailnetOnly, "tailnet_only"),
             (NoPreviewSession, "no_preview_session"),
+            (WorkCopyBusy, "work_copy_busy"),
+            (RemoteMoved, "remote_moved"),
+            (PushFailed, "push_failed"),
+            (TokenHostRefused, "token_host_refused"),
+            (RemoteNotEmpty, "remote_not_empty"),
+            (MergeConflict, "merge_conflict"),
+            (Dirty, "dirty"),
+            (NoOrigin, "no_origin"),
+            (NoUpstream, "no_upstream"),
         ] {
             assert_eq!(wire(c), s);
             assert_eq!(c.as_str(), s, "the method spells it as serde does");

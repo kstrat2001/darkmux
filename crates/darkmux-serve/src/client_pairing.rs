@@ -1144,6 +1144,12 @@ pub struct ClientServerState {
     pub workspace_asks: Arc<crate::client_workspace::Asks>,
     /// Workspaces' live previews (dev servers from `.darkmux/preview.json`).
     pub previews: Arc<crate::client_preview::Previews>,
+    /// (#3681) What holds each work copy besides runs, Undos and hand edits
+    /// (which the works map records): a git verb, a preview install.
+    pub holds: Arc<CopyHolds>,
+    /// (#3681) How the git route reaches a remote: the askpass program a
+    /// token goes through, and settings tests add.
+    pub git_net: Arc<crate::client_git_route::GitNet>,
     /// The address the listener bound, so a `Host` naming another port is
     /// not this listener's ([`crate::is_local_at`]); `None` until bound.
     pub bound: Option<SocketAddr>,
@@ -1251,6 +1257,7 @@ impl ClientServerState {
     /// worktrees base, and `darkmux dispatch` as a child of this binary.
     pub fn production() -> Result<Self> {
         let exe = std::env::current_exe().context("locating this darkmux binary")?;
+        let askpass = exe.clone();
         Ok(Self {
             store: Arc::new(ClientStore::production()),
             now: Arc::new(unix_now),
@@ -1279,6 +1286,8 @@ impl ClientServerState {
             fetch_repo: Arc::new(crate::client_workspace::fetch_with_git),
             workspace_asks: Arc::new(crate::client_workspace::Asks::default()),
             previews: Arc::new(crate::client_preview::Previews::production()),
+            holds: Arc::new(CopyHolds::default()),
+            git_net: Arc::new(crate::client_git_route::GitNet::production(askpass)),
             bound: None,
             preview_enabled: Arc::new(read_preview_enabled),
             preview_sandbox: Arc::new(read_preview_sandbox),
@@ -2126,7 +2135,7 @@ fn image_too_large() -> Response {
 
 /// The refusal of a request that could start something once `client serve`
 /// has begun to stop.
-fn stopping_refusal() -> Response {
+pub(crate) fn stopping_refusal() -> Response {
     err(
         StatusCode::SERVICE_UNAVAILABLE, ClientCode::Unavailable,
         "darkmux client serve is stopping; send the request again once it is back",
@@ -2291,7 +2300,12 @@ fn is_json(req: &axum::extract::Request) -> bool {
 }
 
 pub(crate) fn err(status: StatusCode, code: ClientCode, msg: impl Into<String>) -> Response {
-    (status, Json(ClientError { error: msg.into(), code })).into_response()
+    (status, Json(ClientError { error: msg.into(), code, holder: None, work_id: None, paths: None })).into_response()
+}
+
+/// (#3681) [`err`] with the `holder`, `work_id` or `paths` a refusal names.
+pub(crate) fn err_with(status: StatusCode, error: ClientError) -> Response {
+    (status, Json(error)).into_response()
 }
 
 /// (#3468) A path parameter, as every client route takes it: one the router
@@ -3217,7 +3231,7 @@ fn admit(
         return Err(Box::new(stopping_refusal()));
     }
     check_capacity(&mut works, client, now)?;
-    check_work_copy(&works, client, workdir.as_ref(), req.continues.as_deref())?;
+    check_work_copy(&works, &state.holds, client, workdir.as_ref(), req.continues.as_deref())?;
     let continues = req.continues.clone().filter(|c| works.contains_key(c));
     works.insert(
         work_id.clone(),
@@ -3288,7 +3302,7 @@ fn is_own_branch(branch: &str) -> bool {
 
 /// The work copy host git may touch for a canonical workdir: a workspace
 /// directly under the worktrees base whose repository darkmux recorded.
-fn work_copy_for(state: &ClientServerState, dir: &Path) -> Option<WorkCopy> {
+pub(crate) fn work_copy_for(state: &ClientServerState, dir: &Path) -> Option<WorkCopy> {
     let base = (state.worktrees_base)().ok()?;
     let name = dir.file_name()?.to_str()?;
     if dir.parent()? != base {
@@ -3419,6 +3433,7 @@ fn check_capacity(
 /// keep time, or before a restart) makes a plain new run.
 fn check_work_copy(
     works: &HashMap<String, WorkEntry>,
+    holds: &CopyHolds,
     client: &ApprovedClient,
     workdir: Option<&PathBuf>,
     continues: Option<&str>,
@@ -3432,7 +3447,7 @@ fn check_work_copy(
             None => Ok(()),
         };
     };
-    if let Some(r) = busy_copy(works, w) {
+    if let Some(r) = busy_copy(works, holds, w) {
         return Err(r);
     }
     let foreign = continues
@@ -3447,18 +3462,108 @@ fn check_work_copy(
     Ok(())
 }
 
-/// Why nothing may start in work copy `w` now, if something is using it:
-/// a run working in it, or an Undo reverting in it.
-fn busy_copy(works: &HashMap<String, WorkEntry>, w: &PathBuf) -> Option<Refused> {
-    let mut here = works.iter().filter(|(_, e)| e.workdir.as_ref() == Some(w));
-    let (id, e) = here.find(|(_, e)| e.undoing || matches!(e.status, WorkStatus::Running))?;
-    let why = if e.undoing {
-        format!("run {id} is being undone in this work copy")
-    } else {
-        format!("run {id} is already working in this work copy")
-    };
-    Some(refuse(StatusCode::CONFLICT, ClientCode::Conflict, why))
+/// (#3681) What holds work copy `w` now, and the run when it is one: a run
+/// working in it (`run`), an Undo reverting in it (`undo`), a hand edit
+/// (`edit`), or what [`CopyHolds`] records (`git:<verb>`,
+/// `preview_install`). One lock per work copy: whatever holds it, nothing
+/// else that changes it starts.
+pub(crate) fn holder_of(works: &HashMap<String, WorkEntry>, holds: &CopyHolds, w: &Path) -> Option<(String, Option<String>)> {
+    let mut here = works.iter().filter(|(_, e)| e.workdir.as_deref() == Some(w));
+    if let Some((id, e)) = here.find(|(_, e)| e.undoing || matches!(e.status, WorkStatus::Running)) {
+        let holder = match (e.undoing, e.role.as_str()) {
+            (true, _) => "undo",
+            (false, HAND_EDIT_ROLE) => "edit",
+            _ => "run",
+        };
+        return Some((holder.to_string(), Some(id.clone())));
+    }
+    holds.holder(w).map(|h| (h, None))
 }
+
+/// The sentence for a work copy `holder` holds.
+fn held_by_words(holder: &str, work_id: Option<&str>) -> String {
+    match (holder, work_id) {
+        ("undo", Some(id)) => format!("run {id} is being undone in this work copy"),
+        ("edit", Some(id)) => format!("hand edit {id} is changing this work copy"),
+        (_, Some(id)) => format!("run {id} is already working in this work copy"),
+        ("preview_install", None) => "the preview is reinstalling in this work copy".to_string(),
+        (h, None) => format!("`{}` is going in this work copy", h.replace(':', " ")),
+    }
+}
+
+/// Why nothing may start in work copy `w` now, if something is using it
+/// ([`holder_of`]): a 409 `conflict` naming the `holder`, as the older
+/// routes refuse.
+fn busy_copy(works: &HashMap<String, WorkEntry>, holds: &CopyHolds, w: &PathBuf) -> Option<Refused> {
+    let (holder, work_id) = holder_of(works, holds, w)?;
+    Some(Box::new(err_with(
+        StatusCode::CONFLICT,
+        ClientError {
+            error: held_by_words(&holder, work_id.as_deref()),
+            code: ClientCode::Conflict,
+            holder: Some(holder),
+            work_id,
+            paths: None,
+        },
+    )))
+}
+
+/// (#3681) The git route's refusal while `holder` holds the work copy:
+/// 409 `work_copy_busy`.
+pub(crate) fn work_copy_busy(holder: String, work_id: Option<String>) -> Response {
+    err_with(
+        StatusCode::CONFLICT,
+        ClientError {
+            error: held_by_words(&holder, work_id.as_deref()),
+            code: ClientCode::WorkCopyBusy,
+            holder: Some(holder),
+            work_id,
+            paths: None,
+        },
+    )
+}
+
+/// (#3681) The holds on work copies that are not work records: a git verb
+/// (`git:<verb>`) or a preview install (`preview_install`). Taken only
+/// under the works map's lock ([`take_copy`]), so a run and a git verb can
+/// never both start in one copy.
+#[derive(Debug, Default)]
+pub struct CopyHolds(Mutex<HashMap<PathBuf, String>>);
+
+impl CopyHolds {
+    fn holder(&self, w: &Path) -> Option<String> {
+        self.0.lock().unwrap().get(w).cloned()
+    }
+}
+
+/// (#3681) A hold on one work copy ([`take_copy`]); let go when dropped.
+pub(crate) struct CopyHold {
+    holds: Arc<CopyHolds>,
+    w: PathBuf,
+}
+
+impl Drop for CopyHold {
+    fn drop(&mut self) {
+        self.holds.0.lock().unwrap().remove(&self.w);
+    }
+}
+
+/// (#3681) Holds work copy `w` as `holder`, or says what holds it now (its
+/// holder and run). Refused while `client serve` stops, like a run.
+pub(crate) fn take_copy(state: &ClientServerState, w: &Path, holder: &str) -> Result<CopyHold, Response> {
+    let works = state.works.lock().unwrap();
+    if state.previews.stopping() {
+        return Err(stopping_refusal());
+    }
+    if let Some((h, id)) = holder_of(&works, &state.holds, w) {
+        return Err(work_copy_busy(h, id));
+    }
+    state.holds.0.lock().unwrap().insert(w.to_path_buf(), holder.to_string());
+    Ok(CopyHold { holds: state.holds.clone(), w: w.to_path_buf() })
+}
+
+/// The role a hand edit's work record carries.
+const HAND_EDIT_ROLE: &str = "hand-edit";
 
 /// Holds a work copy for one Undo: while held, no run starts there and no
 /// other Undo reverts there ([`busy_copy`]). Released when dropped.
@@ -3470,14 +3575,14 @@ struct UndoHold {
 impl UndoHold {
     /// Holds run `id`'s work copy, or says what is using it (or that an
     /// Undo that ran meanwhile already undid the run).
-    fn take(works: &Arc<Mutex<HashMap<String, WorkEntry>>>, id: &str) -> Result<UndoHold, Refused> {
+    fn take(works: &Arc<Mutex<HashMap<String, WorkEntry>>>, holds: &CopyHolds, id: &str) -> Result<UndoHold, Refused> {
         let mut all = works.lock().unwrap();
         let entry = all.get(id).ok_or_else(|| Box::new(not_found()))?;
         if entry.decided.is_some() {
             return Err(refuse(StatusCode::CONFLICT, ClientCode::Conflict, "already undone"));
         }
         let w = entry.workdir.clone().ok_or_else(|| Box::new(not_found()))?;
-        if let Some(r) = busy_copy(&all, &w) {
+        if let Some(r) = busy_copy(&all, holds, &w) {
             return Err(r);
         }
         if let Some(e) = all.get_mut(id) {
@@ -3852,7 +3957,7 @@ fn held_to_reuse(base: &Path, name: &str) -> Result<Option<crate::client_workspa
 
 /// Workspace `name` held for use ([`crate::client_workspace::Hold::Shared`]):
 /// a 409 while it is being removed.
-fn held_in_use(state: &ClientServerState, name: &str) -> Result<crate::client_workspace::NameHold, Refused> {
+pub(crate) fn held_in_use(state: &ClientServerState, name: &str) -> Result<crate::client_workspace::NameHold, Refused> {
     use crate::client_workspace as ws;
     let base = (state.worktrees_base)().map_err(|e| Box::new(internal(anyhow!(e))))?;
     match ws::try_hold(&base, name, ws::Hold::Shared) {
@@ -4048,7 +4153,7 @@ fn name_taken(base: &Path, n: &str) -> bool {
 }
 
 /// The branch a project made from a template starts on.
-const TEMPLATE_BRANCH: &str = "main";
+pub(crate) const TEMPLATE_BRANCH: &str = "main";
 
 /// Drops the clone's history and remote and makes it a new repo on
 /// [`TEMPLATE_BRANCH`] with everything in one commit, its repository again
@@ -4078,7 +4183,7 @@ fn start_fresh(base: &Path, name: &str, message: &str) -> Result<String, String>
 
 /// A Mac with no git identity yet can still commit in a fresh project: it
 /// gets its own, and the owner's takes over once there is one.
-fn ensure_identity(dir: &WorkCopy) -> Result<(), String> {
+pub(crate) fn ensure_identity(dir: &WorkCopy) -> Result<(), String> {
     if git_line(dir, &["config", "user.email"]).unwrap_or_default().is_empty() {
         git_quiet(dir, &["config", "user.name", "darkmux"])?;
         git_quiet(dir, &["config", "user.email", "darkmux@localhost"])?;
@@ -4657,6 +4762,16 @@ fn start_preview(state: &ClientServerState, client: &ApprovedClient, name: &str,
         Ok(held) => held,
         Err(r) => return *r,
     };
+    // (#3681) A clean start reinstalls in the work copy: it takes the
+    // copy's lock while it cleans and starts, so no run or git verb is
+    // there meanwhile. A plain start changes nothing in the copy.
+    let _installing = match clean {
+        true => match take_copy(state, &dir, "preview_install") {
+            Ok(hold) => Some(hold),
+            Err(r) => return r,
+        },
+        false => None,
+    };
     let started = if clean { state.previews.clean(name, &dir, &source) } else { Ok(()) }
         .and_then(|()| state.previews.start_holding(kind, name, &dir, &source, held));
     match started {
@@ -4852,33 +4967,33 @@ fn branch_changes(st: &ClientServerState, client: &ApprovedClient, name: &str) -
     let Some(dir) = work_copy_for(st, &dir) else {
         return err(StatusCode::CONFLICT, ClientCode::Conflict, "darkmux holds no repository for this workspace");
     };
-    let (default, base_branch) = match changes_base(st, &dir, name) {
-        Ok(b) => b,
-        Err(r) => return *r,
-    };
-    let branch = git_line(&dir, &["branch", "--show-current"]).unwrap_or_default();
-    if let Err(r) = own_branch(name, &branch, &default) {
-        return *r;
+    match branch_changes_of(st, name, &dir) {
+        Ok(changes) => Json(changes).into_response(),
+        Err(r) => r,
     }
-    let (Some(base), Some(head)) = (git_line(&dir, &["merge-base", "HEAD", &default]), git_line(&dir, &["rev-parse", "HEAD"])) else {
-        return err(StatusCode::CONFLICT, ClientCode::Conflict, "couldn't find where this branch left the default branch");
+}
+
+/// `/changes` (and the git route's `diff` against the base, #3681): the
+/// files work copy `dir` of workspace `name` holds that its base lacks.
+pub(crate) fn branch_changes_of(st: &ClientServerState, name: &str, dir: &WorkCopy) -> Result<BranchChanges, Response> {
+    let (default, base_branch) = changes_base(st, dir, name).map_err(|r| *r)?;
+    let branch = git_line(dir, &["branch", "--show-current"]).unwrap_or_default();
+    own_branch(name, &branch, &default).map_err(|r| *r)?;
+    let (Some(base), Some(head)) = (git_line(dir, &["merge-base", "HEAD", &default]), git_line(dir, &["rev-parse", "HEAD"])) else {
+        return Err(err(StatusCode::CONFLICT, ClientCode::Conflict, "couldn't find where this branch left the default branch"));
     };
-    let files = match crate::client_changes::branch_files(&dir, &base, &head, MAX_CHANGES_BYTES) {
-        Ok(f) => f,
-        Err(e) => return changes_refusal(e),
-    };
-    Json(BranchChanges {
+    let files = crate::client_changes::branch_files(dir, &base, &head, MAX_CHANGES_BYTES).map_err(changes_refusal)?;
+    Ok(BranchChanges {
         base,
         base_branch,
         head,
         branch,
         files,
     })
-    .into_response()
 }
 
 /// The reply for a branch whose files could not be read.
-fn changes_refusal(e: crate::client_changes::ChangesError) -> Response {
+pub(crate) fn changes_refusal(e: crate::client_changes::ChangesError) -> Response {
     use crate::client_changes::ChangesError;
     match e {
         ChangesError::Listing => internal(anyhow!("listing the branch's changes failed")),
@@ -4894,7 +5009,7 @@ fn changes_refusal(e: crate::client_changes::ChangesError) -> Response {
 /// ref an old clone was made at, would push its commits straight onto that
 /// branch of the user's. A template project's base is its own first commit
 /// (`default` is that commit, no `origin/` ref), so its `main` is its own.
-fn own_branch(name: &str, branch: &str, default: &str) -> Result<(), Refused> {
+pub(crate) fn own_branch(name: &str, branch: &str, default: &str) -> Result<(), Refused> {
     if branch.is_empty() {
         return Err(refuse(StatusCode::CONFLICT, ClientCode::Conflict, "the work copy isn't on a branch"));
     }
@@ -4915,7 +5030,7 @@ fn own_branch(name: &str, branch: &str, default: &str) -> Result<(), Refused> {
 /// from a template, which has no origin (#3480), darkmux's own recorded
 /// first commit on the branch it started. Any other work copy with no
 /// origin is a 409.
-fn changes_base(state: &ClientServerState, dir: &WorkCopy, name: &str) -> Result<(String, String), Refused> {
+pub(crate) fn changes_base(state: &ClientServerState, dir: &WorkCopy, name: &str) -> Result<(String, String), Refused> {
     if let Some(d) = crate::client_workspace::remote_default_of(dir) {
         let branch = d.trim_start_matches("origin/").to_string();
         return Ok((d, branch));
@@ -4995,7 +5110,7 @@ fn remove_owned(state: &ClientServerState, client: &ApprovedClient, name: &str, 
         Ok(dir) => dir,
         Err(r) => return *r,
     };
-    if let Some(r) = busy_copy(&state.works.lock().unwrap(), &dir) {
+    if let Some(r) = busy_copy(&state.works.lock().unwrap(), &state.holds, &dir) {
         return *r;
     }
     let base = match (state.worktrees_base)() {
@@ -5023,7 +5138,7 @@ fn remove_owned(state: &ClientServerState, client: &ApprovedClient, name: &str, 
 }
 
 /// The status a workspace refusal's code answers with.
-fn status_of_code(code: ClientCode) -> StatusCode {
+pub(crate) fn status_of_code(code: ClientCode) -> StatusCode {
     match code {
         ClientCode::BadRequest => StatusCode::BAD_REQUEST,
         ClientCode::NotFound => StatusCode::NOT_FOUND,
@@ -5415,7 +5530,7 @@ fn hold_for_edit(
     if st.previews.stopping() {
         return Err(Box::new(stopping_refusal()));
     }
-    if let Some(r) = busy_copy(&works, &dir.to_path_buf()) {
+    if let Some(r) = busy_copy(&works, &st.holds, &dir.to_path_buf()) {
         return Err(r);
     }
     works.insert(
@@ -5433,7 +5548,7 @@ fn hold_for_edit(
             undoing: false,
             continues: None,
             title,
-            role: "hand-edit".to_string(),
+            role: HAND_EDIT_ROLE.to_string(),
             commit: None,
             files: Vec::new(),
             branch: None,
@@ -6230,7 +6345,7 @@ fn undo_run(st: &ClientServerState, headers: &HeaderMap, work_id: &str) -> Respo
     let (Some(wd), Some(commit)) = (w.git.clone(), w.commit.clone()) else {
         return err(StatusCode::CONFLICT, ClientCode::Conflict, "the run has no git work copy");
     };
-    let _held = match UndoHold::take(&st.works, work_id).and_then(|undo| Ok((undo, held_work_copy(st, Some(&wd))?))) {
+    let _held = match UndoHold::take(&st.works, &st.holds, work_id).and_then(|undo| Ok((undo, held_work_copy(st, Some(&wd))?))) {
         Ok(h) => h,
         Err(r) => return *r,
     };
