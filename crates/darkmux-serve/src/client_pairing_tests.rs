@@ -12223,6 +12223,8 @@ async fn a_revoked_pairing_is_refused_every_work_copy() {
     assert_eq!(code, 401, "{v}");
     let (code, v) = call(&h, git_call("site", &a, "status", serde_json::json!({}))).await;
     assert_eq!(code, 200, "{v}");
+}
+
 /// (#3681) A push names this work copy's own remote, or for a template
 /// project with none, an empty repository; anything else is refused.
 #[tokio::test]
