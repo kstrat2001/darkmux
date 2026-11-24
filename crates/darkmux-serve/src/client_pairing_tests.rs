@@ -10266,7 +10266,7 @@ async fn every_declared_body_is_the_one_its_handler_reads() {
             }
         }
     }
-    assert_eq!(bodies, 10, "every route that declares a body was probed");
+    assert_eq!(bodies, 11, "every route that declares a body was probed");
     // (#3560) The two preview link routes answer this Mac's app
     // `tailnet_only`, past the token, before any lookup.
     assert_eq!(reached, 17, "every route that declares none was probed past its lookups");
