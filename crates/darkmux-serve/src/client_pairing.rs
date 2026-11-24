@@ -5867,17 +5867,11 @@ pub(crate) fn workspace_file_path(path: &str) -> Result<String, Refused> {
 
 /// [`workspace_file_handler`], blocking, with every refusal an `Err`.
 fn file_checked(st: &ClientServerState, client: &ApprovedClient, name: &str, req: &FileBody) -> Result<FileReply, Refused> {
-    let path = workspace_file_path(&req.path)?;
-    let bytes = crate::client_image::decode_base64(&req.data)
-        .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, ClientCode::BadRequest, "`data` must be base64"))?;
-    if bytes.len() > MAX_WORKSPACE_FILE_BYTES {
-        return Err(Box::new(file_too_large()));
-    }
+    let file = file_of(req)?;
     let dir = owned_workspace(st, client, name)?;
     let wc = work_copy_for(st, &dir)
         .ok_or_else(|| refuse(StatusCode::CONFLICT, ClientCode::Conflict, "darkmux holds no repository for this workspace"))?;
     let _in_use = held_work_copy(st, Some(&wc))?;
-    let file = Image { path, bytes };
     let work_id = format!("w-{}", random_hex(8).map_err(|e| Box::new(internal(e)))?);
     let held = hold_for_edit(st, client, &dir, &wc, &work_id, format!("file {}", file.path))?;
     let landed = held.finish(file_in(st, &wc, &file, &work_id))?;
@@ -5887,6 +5881,18 @@ fn file_checked(st: &ClientServerState, client: &ApprovedClient, name: &str, req
         commit: Some(landed.commit),
         branch: Some(landed.branch),
     })
+}
+
+/// The file `req` asks for: a path inside the project, base64 bytes, no
+/// larger than [`MAX_WORKSPACE_FILE_BYTES`].
+fn file_of(req: &FileBody) -> Result<Image, Refused> {
+    let path = workspace_file_path(&req.path)?;
+    let bytes = crate::client_image::decode_base64(&req.data)
+        .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, ClientCode::BadRequest, "`data` must be base64"))?;
+    if bytes.len() > MAX_WORKSPACE_FILE_BYTES {
+        return Err(Box::new(file_too_large()));
+    }
+    Ok(Image { path, bytes })
 }
 
 /// [`image_in`] for a file: on the copy's own branch, written and
