@@ -264,7 +264,7 @@ fn coded(code: ClientCode, msg: impl Into<String>) -> Refused {
     let status = match code {
         ClientCode::BadRequest | ClientCode::TokenHostRefused => StatusCode::BAD_REQUEST,
         ClientCode::NotFound => StatusCode::NOT_FOUND,
-        ClientCode::PushFailed | ClientCode::FetchFailed => StatusCode::BAD_GATEWAY,
+        ClientCode::PushFailed | ClientCode::FetchFailed | ClientCode::AuthFailed => StatusCode::BAD_GATEWAY,
         _ => StatusCode::CONFLICT,
     };
     Box::new(cp::err(status, code, msg))
@@ -419,10 +419,12 @@ fn net_git(
     let extra_owned = st.git_net.extra();
     let extra: Vec<&str> = extra_owned.iter().map(String::as_str).collect();
     let askpass = st.git_net.askpass.clone();
-    let env: Vec<(&str, &std::ffi::OsStr)> = match token {
-        Some(t) => vec![("GIT_ASKPASS", askpass.as_os_str()), (ASKPASS_ENV, "1".as_ref()), (TOKEN_ENV, t.0.as_ref())],
-        None => Vec::new(),
-    };
+    // git's messages in English, so an authentication failure is told
+    // apart ([`auth_failed`]).
+    let mut env: Vec<(&str, &std::ffi::OsStr)> = vec![("LC_ALL", "C".as_ref())];
+    if let Some(t) = token {
+        env.extend([("GIT_ASKPASS", askpass.as_os_str()), (ASKPASS_ENV, "1".as_ref()), (TOKEN_ENV, t.0.as_ref())]);
+    }
     let failed = if what == "pushed" { ClientCode::PushFailed } else { ClientCode::FetchFailed };
     ws::git_network(&net, &extra, &full, &env, NET_TIMEOUT).map_err(|e| coded(failed, format!("not {what}: {}", scrub(&e, token))))
 }
@@ -431,6 +433,17 @@ fn net_git(
 const TARGET: &str = "\u{0}target";
 
 /// git's error lines, scrubbed, for a person.
+/// (#3681) git's failure was the remote refusing the credential (an expired
+/// or revoked token, or none for a private repository): the app renews its
+/// sign-in and tries once more (`auth_failed`).
+fn auth_failed(out: &crate::client_workspace::NetOutput) -> bool {
+    let err = out.stderr.to_ascii_lowercase();
+    ["authentication failed", "could not read username", "could not read password", "invalid username or password",
+     "the requested url returned error: 401", "the requested url returned error: 403", "terminal prompts disabled"]
+        .iter()
+        .any(|m| err.contains(m))
+}
+
 fn why(out: &crate::client_workspace::NetOutput, token: Option<&GitToken>) -> String {
     let lines: Vec<&str> = out.stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     let text = match lines.is_empty() {
@@ -452,6 +465,7 @@ fn net_ok(
     let out = net_git(st, wc, what, token, remote, args)?;
     match out.status.success() {
         true => Ok(out),
+        false if auth_failed(&out) => Err(coded(ClientCode::AuthFailed, format!("not {what}: GitHub refused the sign-in ({})", why(&out, token)))),
         false => Err(coded(code, format!("not {what}: {}", why(&out, token)))),
     }
 }
@@ -516,6 +530,7 @@ fn push_refusal(out: &crate::client_workspace::NetOutput, token: Option<&GitToke
             ClientCode::RemoteMoved,
             format!("not pushed: {branch} on {remote} has commits this work copy doesn't; fetch and bring them in first"),
         ),
+        false if auth_failed(out) => coded(ClientCode::AuthFailed, format!("not pushed: GitHub refused the sign-in ({})", why(out, token))),
         false => coded(ClientCode::PushFailed, format!("not pushed: {}", why(out, token))),
     }
 }

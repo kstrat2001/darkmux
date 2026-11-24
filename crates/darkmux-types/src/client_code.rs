@@ -144,6 +144,10 @@ pub enum ClientCode {
     RemoteMoved,
     /// (#3681) The push failed for another reason (502); `error` says git's.
     PushFailed,
+    /// (#3681) The remote refused the credential for a `push` or `fetch`
+    /// (502): an expired or revoked token, or none for a private
+    /// repository. Renew the sign-in and send the call once more.
+    AuthFailed,
     /// (#3681) A token was sent for a remote that is not on `github.com`
     /// (400): darkmux hands a token only to GitHub.
     TokenHostRefused,
@@ -287,6 +291,7 @@ mod tests {
             (WorkCopyBusy, "work_copy_busy"),
             (RemoteMoved, "remote_moved"),
             (PushFailed, "push_failed"),
+            (AuthFailed, "auth_failed"),
             (TokenHostRefused, "token_host_refused"),
             (RemoteNotEmpty, "remote_not_empty"),
             (MergeConflict, "merge_conflict"),

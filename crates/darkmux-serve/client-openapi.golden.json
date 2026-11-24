@@ -1095,6 +1095,11 @@
           },
           {
             "type": "string",
+            "const": "auth_failed",
+            "description": "(#3681) The remote refused the credential for a `push` or `fetch`\n(502): an expired or revoked token, or none for a private\nrepository. Renew the sign-in and send the call once more."
+          },
+          {
+            "type": "string",
             "const": "token_host_refused",
             "description": "(#3681) A token was sent for a remote that is not on `github.com`\n(400): darkmux hands a token only to GitHub."
           },
