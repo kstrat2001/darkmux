@@ -12224,6 +12224,8 @@ async fn a_file_waits_while_the_work_copy_is_held() {
     drop(held);
     let (code, v) = call(&h, file_call("site", &token, "PLAYBOOK.md", b"# x\n")).await;
     assert_eq!(code, 200, "{v}");
+}
+
 /// (#3681) A push names this work copy's own remote, or for a template
 /// project with none, an empty repository; anything else is refused.
 #[tokio::test]
