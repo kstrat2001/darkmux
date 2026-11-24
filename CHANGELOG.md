@@ -25,6 +25,9 @@ darkmux release.
   go one at a time, and a second is refused naming what holds it (`work_copy_busy`; the older routes
   keep `conflict` and now name the `holder` too). Capability `git_route`. Every refusal may now carry
   `holder`, `work_id` and `paths` (additive).
+- **The next task after a merge starts from the merged project (#3684).** The git route's `new_task`
+  moves the work copy onto a new branch from the remote's main once it holds the merge, carrying any
+  change made after the merge; on any device, a second call changes nothing. Capability `new_task`.
 
 ## [5.12.0] - 2026-11-21
 

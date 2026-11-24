@@ -823,7 +823,7 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
                            "capabilities": ["clean_preview", "template_workspace", "continues", "clone_preview",
                                             "recipe_set", "workspace_image", "workspace_edit", "workspace_remove",
                                              "remote_tailscale", "availability_codes",
-                                             "remote_requests", "remote_preview", "engines", "git_route"],
+                                             "remote_requests", "remote_preview", "engines", "git_route", "new_task"],
                             "remote": {"state": "off", "url": null, "reason": null},
                             "via": "local"})
     );
@@ -12160,4 +12160,74 @@ async fn a_template_projects_first_push_goes_only_into_an_empty_repository() {
     let (_, s) = call(&h, git_call(&name, &token, "status", serde_json::json!({}))).await;
     assert_eq!(s["result"]["origin"], "github.com/o/empty", "{s}");
     assert_eq!(s["result"]["ahead"], 0, "{s}");
+}
+
+// ─── The next task after a merge (#3684) ─────────────────────────────────
+
+/// Someone squash-merges the task's branch into main on the stand-in
+/// remote; returns GitHub's merge commit.
+fn squash_merge_on_remote(h: &Harness, bare: &Path, branch: &str, file_text: Option<(&str, &str)>) -> String {
+    let other = h.dir.path().join(format!("merger-{}", random_hex(4).unwrap()));
+    run_git(None, &["clone", "--quiet", bare.to_str().unwrap(), other.to_str().unwrap()]);
+    run_git(Some(&other), &["config", "user.name", "Merger"]);
+    run_git(Some(&other), &["config", "user.email", "merger@example.com"]);
+    run_git(Some(&other), &["merge", "--quiet", "--squash", &format!("origin/{branch}")]);
+    if let Some((file, text)) = file_text {
+        std::fs::write(other.join(file), text).unwrap();
+        run_git(Some(&other), &["add", file]);
+    }
+    run_git(Some(&other), &["commit", "--quiet", "-m", "Squash merge"]);
+    run_git(Some(&other), &["push", "--quiet", "origin", "main"]);
+    run_git(Some(&other), &["rev-parse", "HEAD"])
+}
+
+#[tokio::test]
+async fn new_task_moves_onto_the_merged_main_and_carries_what_came_after() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (wt, bare) = git_remote_workspace(&h, "site");
+    run_in(&h, &token, "site", "edit-readme").await;
+    let (code, v) = call(&h, git_call("site", &token, "push", serde_json::json!({}))).await;
+    assert_eq!(code, 200, "{v}");
+    let merged_head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    let merge_sha = squash_merge_on_remote(&h, &bare, "mux/test-abc123", None);
+    // A change made here after the merge, before the next task.
+    run_in(&h, &token, "site", "edit-other").await;
+    let args = serde_json::json!({"merged_head": merged_head, "merge_sha": merge_sha});
+    let (code, v) = call(&h, git_call("site", &token, "new_task", args.clone())).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("stale_main")), "main not fetched yet: {v}");
+    call(&h, git_call("site", &token, "fetch", serde_json::json!({}))).await;
+    let (code, v) = call(&h, git_call("site", &token, "new_task", args.clone())).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["result"]["moved"], true);
+    assert_eq!(v["result"]["carried"], 1, "the change made after the merge came along");
+    let branch = run_git(Some(&wt), &["branch", "--show-current"]);
+    assert!(branch.starts_with("mux/") && branch != "mux/test-abc123", "{branch}");
+    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD^"]), merge_sha, "on top of the merge");
+    let (_, s) = call(&h, git_call("site", &token, "status", serde_json::json!({}))).await;
+    assert_eq!(s["result"]["pending"], 1, "only the carried change is pending: {s}");
+    let (code, v) = call(&h, git_call("site", &token, "new_task", args)).await;
+    assert_eq!((code, v["result"]["moved"].clone()), (200, serde_json::json!(false)), "a second call, from any device, changes nothing: {v}");
+}
+
+#[tokio::test]
+async fn new_task_that_cant_carry_a_later_change_moves_nothing() {
+    let h = harness();
+    let token = paired(&h).await;
+    let (wt, bare) = git_remote_workspace(&h, "site");
+    run_in(&h, &token, "site", "edit-readme").await;
+    call(&h, git_call("site", &token, "push", serde_json::json!({}))).await;
+    let merged_head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    // The merge on GitHub also changed README.md its own way.
+    let merge_sha = squash_merge_on_remote(&h, &bare, "mux/test-abc123", Some(("README.md", "merged with a fix\n")));
+    run_in(&h, &token, "site", "edit-readme-again").await;
+    call(&h, git_call("site", &token, "fetch", serde_json::json!({}))).await;
+    let before = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    let args = serde_json::json!({"merged_head": merged_head, "merge_sha": merge_sha});
+    let (code, v) = call(&h, git_call("site", &token, "new_task", args)).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("merge_conflict")), "{v}");
+    assert_eq!(v["paths"], serde_json::json!(["README.md"]));
+    assert_eq!(run_git(Some(&wt), &["branch", "--show-current"]), "mux/test-abc123", "back on its branch");
+    assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), before);
+    assert_eq!(run_git(Some(&wt), &["branch", "--list", "mux/*"]).lines().count(), 1, "the new branch is gone");
 }

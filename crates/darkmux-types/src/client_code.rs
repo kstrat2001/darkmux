@@ -164,6 +164,9 @@ pub enum ClientCode {
     /// (#3681) The work copy has no remote yet (a project made from a
     /// template that was never pushed; 409).
     NoOrigin,
+    /// (#3684) The remote's main version, as last fetched, doesn't have the
+    /// merge `new_task` names (409): fetch, then ask again.
+    StaleMain,
     /// (#3681) The branch has never been pushed or fetched, so there is
     /// nothing to compare with on the remote (409).
     NoUpstream,
@@ -298,6 +301,7 @@ mod tests {
             (Dirty, "dirty"),
             (NoOrigin, "no_origin"),
             (NoUpstream, "no_upstream"),
+            (StaleMain, "stale_main"),
         ] {
             assert_eq!(wire(c), s);
             assert_eq!(c.as_str(), s, "the method spells it as serde does");

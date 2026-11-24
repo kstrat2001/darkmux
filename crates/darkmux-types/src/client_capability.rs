@@ -85,11 +85,14 @@ pub enum ClientCapability {
     /// workspace (`status`, `fetch`, `push`, `merge_main`, `revert`,
     /// `diff`), and one lock per work copy (`work_copy_busy`).
     GitRoute,
+    /// (#3684) The git route's `new_task`: after a merge, the work copy
+    /// moves onto a new branch from the merged main.
+    NewTask,
 }
 
 impl ClientCapability {
     /// Every capability, in declaration order: what `whoami` lists.
-    pub const ALL: [ClientCapability; 14] = [
+    pub const ALL: [ClientCapability; 15] = [
         ClientCapability::CleanPreview,
         ClientCapability::TemplateWorkspace,
         ClientCapability::Continues,
@@ -104,6 +107,7 @@ impl ClientCapability {
         ClientCapability::RemotePreview,
         ClientCapability::Engines,
         ClientCapability::GitRoute,
+        ClientCapability::NewTask,
     ];
 }
 
@@ -140,6 +144,7 @@ mod tests {
                 "remote_preview",
                 "engines",
                 "git_route",
+                "new_task",
             ]
         );
         for c in ClientCapability::ALL {
