@@ -12161,3 +12161,22 @@ async fn a_template_projects_first_push_goes_only_into_an_empty_repository() {
     assert_eq!(s["result"]["origin"], "github.com/o/empty", "{s}");
     assert_eq!(s["result"]["ahead"], 0, "{s}");
 }
+
+/// (#3681) A push names this work copy's own remote, or for a template
+/// project with none, an empty repository; anything else is refused.
+#[tokio::test]
+async fn git_push_to_another_remote_or_with_no_remote_is_refused_plainly() {
+    let h = harness();
+    let token = paired(&h).await;
+    git_remote_workspace(&h, "site");
+    run_in(&h, &token, "site", "edit-readme").await;
+    let (code, v) = call(&h, git_call("site", &token, "push", serde_json::json!({"repo": "o/elsewhere"}))).await;
+    assert_eq!((code, v["code"].as_str()), (400, Some("bad_request")), "{v}");
+    let (code, v) = call(&h, git_call("site", &token, "push", serde_json::json!({"repo": "not a repo"}))).await;
+    assert_eq!((code, v["code"].as_str()), (400, Some("bad_request")), "{v}");
+    git_workspace(&h, "local");
+    let (code, v) = call(&h, git_call("local", &token, "push", serde_json::json!({"repo": "o/new"}))).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("no_origin")), "no remote, and no template project: {v}");
+    let (code, v) = call(&h, git_call("local", &token, "push", serde_json::json!({}))).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("no_origin")), "{v}");
+}
