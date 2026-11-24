@@ -5789,6 +5789,120 @@ pub(crate) struct ImageBody {
     replace: Option<String>,
 }
 
+/// (#3688) The most a file a paired app commits may hold.
+pub(crate) const MAX_WORKSPACE_FILE_BYTES: usize = 256 * 1024;
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileBody {
+    /// Where the file goes in the work copy: relative, plain folder names,
+    /// never under `.git`.
+    path: String,
+    /// The file's bytes, base64.
+    data: String,
+}
+
+/// `POST /client/workspaces/{name}/file` (#3688): a file a person approved
+/// in the app (a preview recipe, a playbook), sent as its path in the work
+/// copy and its bytes. darkmux writes it there, through no link at any
+/// name and never over a different file, and commits it as a work record
+/// with no model, like an image, so `/client/work/{id}/undo` and the git
+/// route's `revert` take it out again. The same bytes already there commit
+/// nothing (200, no `work_id`).
+pub(crate) async fn workspace_file_handler(
+    State(state): State<ClientServerState>,
+    ClientPath(name): ClientPath<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let client = match authenticate(&state, &headers) {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let limit = MAX_WORKSPACE_FILE_BYTES.div_ceil(3) * 8 + 64 * 1024;
+    let req: FileBody = match axum::body::to_bytes(body, limit).await {
+        Ok(b) => match serde_json::from_slice(&b) {
+            Ok(req) => req,
+            Err(e) => return err(StatusCode::BAD_REQUEST, ClientCode::BadRequest, format!("bad JSON body: {e}")),
+        },
+        Err(_) => return file_too_large(),
+    };
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || match file_checked(&st, &client, &name, &req) {
+        Ok(reply) => Json(reply).into_response(),
+        Err(r) => *r,
+    })
+    .await
+    .unwrap_or_else(|e| internal(anyhow!("adding a file panicked: {e}")))
+}
+
+fn file_too_large() -> Response {
+    err(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        ClientCode::PayloadTooLarge,
+        format!("a file may hold at most {} KB", MAX_WORKSPACE_FILE_BYTES / 1024),
+    )
+}
+
+/// (#3688) A path a paired app may name in a work copy: relative, at most
+/// 255 bytes, plain folder and file names (no `.` or `..`, no control
+/// characters or backslash), nothing under `.git` in any case.
+pub(crate) fn workspace_file_path(path: &str) -> Result<String, Refused> {
+    let bad = |why: &str| refuse(StatusCode::BAD_REQUEST, ClientCode::BadRequest, format!("`path` {why}"));
+    if path.is_empty() || path.len() > 255 {
+        return Err(bad("must be 1 to 255 bytes"));
+    }
+    if path.starts_with('/') || path.chars().any(|c| c.is_control() || c == '\\') {
+        return Err(bad("must be relative, with no control characters or backslash"));
+    }
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
+        return Err(bad("must be plain folder and file names"));
+    }
+    if segments.iter().any(|s| s.eq_ignore_ascii_case(".git")) {
+        return Err(bad("may not be in `.git`"));
+    }
+    Ok(path.to_string())
+}
+
+/// [`workspace_file_handler`], blocking, with every refusal an `Err`.
+fn file_checked(st: &ClientServerState, client: &ApprovedClient, name: &str, req: &FileBody) -> Result<FileReply, Refused> {
+    let path = workspace_file_path(&req.path)?;
+    let bytes = crate::client_image::decode_base64(&req.data)
+        .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, ClientCode::BadRequest, "`data` must be base64"))?;
+    if bytes.len() > MAX_WORKSPACE_FILE_BYTES {
+        return Err(Box::new(file_too_large()));
+    }
+    let dir = owned_workspace(st, client, name)?;
+    let wc = work_copy_for(st, &dir)
+        .ok_or_else(|| refuse(StatusCode::CONFLICT, ClientCode::Conflict, "darkmux holds no repository for this workspace"))?;
+    let _in_use = held_work_copy(st, Some(&wc))?;
+    let file = Image { path, bytes };
+    let work_id = format!("w-{}", random_hex(8).map_err(|e| Box::new(internal(e)))?);
+    let held = hold_for_edit(st, client, &dir, &wc, &work_id, format!("file {}", file.path))?;
+    let landed = held.finish(file_in(st, &wc, &file, &work_id))?;
+    Ok(FileReply {
+        path: landed.files.into_iter().next().unwrap_or(file.path),
+        work_id: Some(landed.work_id),
+        commit: Some(landed.commit),
+        branch: Some(landed.branch),
+    })
+}
+
+/// [`image_in`] for a file: on the copy's own branch, written and
+/// committed; the same bytes already there answer with nothing committed.
+fn file_in(st: &ClientServerState, wc: &WorkCopy, file: &Image, work_id: &str) -> Result<EditDone, Refused> {
+    onto_own_branch(st, Some(wc))?;
+    if image_already_there(wc, file)? {
+        let same = FileReply { path: file.path.clone(), work_id: None, commit: None, branch: None };
+        return Err(Box::new(Json(same).into_response()));
+    }
+    let before = snapshot_tree(wc).map_err(|e| Box::new(internal(anyhow!("reading the work copy failed: {e}"))))?;
+    let mut placed = Placed::default();
+    place_and_commit(wc, (file, "file"), false, None, &mut placed, before.tree, work_id)
+        .map_err(|why| not_added(why, &put_image_back(wc, file, &placed), &file.path))
+}
+
 /// `POST /client/workspaces/{name}/image` (#3545): an image a person picked
 /// on the device the app runs on, sent as bytes (never a path: darkmux
 /// never reads a file a client names). darkmux checks what it is (PNG,
@@ -5965,7 +6079,7 @@ fn image_in(
     let before = snapshot_tree(wc)
         .map_err(|e| Box::new(internal(anyhow!("reading the work copy failed: {e}"))))?;
     let mut placed = Placed::default();
-    place_and_commit(wc, image, already, hit.as_ref(), &mut placed, before.tree, work_id)
+    place_and_commit(wc, (image, "image"), already, hit.as_ref(), &mut placed, before.tree, work_id)
         .map_err(|why| not_added(why, &put_image_back(wc, image, &placed), &image.path))
 }
 
@@ -6016,7 +6130,7 @@ struct Placed {
 /// A failure is why, in words, for [`not_added`].
 fn place_and_commit(
     wc: &WorkCopy,
-    image: &Image,
+    (image, kind): (&Image, &str),
     already: bool,
     hit: Option<&EditHit>,
     placed: &mut Placed,
@@ -6043,13 +6157,13 @@ fn place_and_commit(
         Ok(c) => (Some(c), None),
         Err(e) => (None, Some(format!("reading the image's changes failed: {e}"))),
     };
-    let message = format!("image: {path} (work {work_id})");
+    let message = format!("{kind}: {path} (work {work_id})");
     #[cfg(test)]
     before_edit_commit(wc);
     let (commit, branch) =
-        commit_run(wc, &files, &message).map_err(|e| format!("couldn't commit the image: {e}"))?;
+        commit_run(wc, &files, &message).map_err(|e| format!("couldn't commit the {kind}: {e}"))?;
     Ok(EditDone {
-        result: serde_json::json!({"image": {"path": path, "url": url}}),
+        result: serde_json::json!({kind: {"path": path, "url": url}}),
         files,
         commit,
         branch,

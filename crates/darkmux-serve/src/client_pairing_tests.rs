@@ -823,7 +823,7 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
                            "capabilities": ["clean_preview", "template_workspace", "continues", "clone_preview",
                                             "recipe_set", "workspace_image", "workspace_edit", "workspace_remove",
                                              "remote_tailscale", "availability_codes",
-                                             "remote_requests", "remote_preview", "engines", "git_route"],
+                                             "remote_requests", "remote_preview", "engines", "git_route", "workspace_file"],
                             "remote": {"state": "off", "url": null, "reason": null},
                             "via": "local"})
     );
@@ -12160,4 +12160,68 @@ async fn a_template_projects_first_push_goes_only_into_an_empty_repository() {
     let (_, s) = call(&h, git_call(&name, &token, "status", serde_json::json!({}))).await;
     assert_eq!(s["result"]["origin"], "github.com/o/empty", "{s}");
     assert_eq!(s["result"]["ahead"], 0, "{s}");
+}
+
+// ─── A file a person approved (#3688) ────────────────────────────────────
+
+fn file_call(name: &str, token: &str, path: &str, data: &[u8]) -> Request<Body> {
+    post(
+        &format!("/client/workspaces/{name}/file"),
+        Some(token),
+        serde_json::json!({"path": path, "data": crate::client_workspace::base64_encode(data)}),
+    )
+}
+
+#[tokio::test]
+async fn an_approved_file_is_committed_and_a_revert_takes_it_out() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = git_workspace(&h, "site");
+    let recipe = b"{\"schema_version\": \"1.0\"}\n";
+    let (code, v) = call(&h, file_call("site", &token, ".darkmux/preview.json", recipe)).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["path"], ".darkmux/preview.json");
+    assert!(v["work_id"].as_str().is_some(), "{v}");
+    assert_eq!(std::fs::read(wt.join(".darkmux/preview.json")).unwrap(), recipe);
+    assert_eq!(run_git(Some(&wt), &["show", "--name-only", "--format=", "HEAD"]), ".darkmux/preview.json");
+    let (code, again) = call(&h, file_call("site", &token, ".darkmux/preview.json", recipe)).await;
+    assert_eq!((code, again["work_id"].clone()), (200, Value::Null), "the same bytes commit nothing: {again}");
+    let (code, v) = call(&h, file_call("site", &token, ".darkmux/preview.json", b"other\n")).await;
+    assert_eq!(code, 409, "never over a different file: {v}");
+    let head = run_git(Some(&wt), &["rev-parse", "HEAD"]);
+    let (code, v) = call(&h, git_call("site", &token, "revert", serde_json::json!({"commit": head}))).await;
+    assert_eq!(code, 200, "{v}");
+    assert!(!wt.join(".darkmux/preview.json").exists(), "taken out again");
+}
+
+#[tokio::test]
+async fn a_file_path_outside_plain_names_or_in_git_is_refused() {
+    let h = harness();
+    let token = paired(&h).await;
+    let wt = git_workspace(&h, "site");
+    for path in ["../x", "a/../b", "/etc/x", "a//b", ".git/config", "sub/.GIT/x", "./a", "a\\b", ""] {
+        let (code, v) = call(&h, file_call("site", &token, path, b"x")).await;
+        assert_eq!((code, v["code"].as_str()), (400, Some("bad_request")), "{path:?}: {v}");
+    }
+    // A link a run left at a folder name is never written through.
+    let outside = h.dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, wt.join("linked")).unwrap();
+    let (code, v) = call(&h, file_call("site", &token, "linked/preview.json", b"x")).await;
+    assert_eq!(code, 409, "{v}");
+    assert!(!outside.join("preview.json").exists(), "nothing written outside the work copy");
+}
+
+#[tokio::test]
+async fn a_file_waits_while_the_work_copy_is_held() {
+    let h = harness();
+    let token = paired(&h).await;
+    git_workspace(&h, "site");
+    let dir = h.base.join("site").canonicalize().unwrap();
+    let held = take_copy(&h.state, &dir, "git:push").unwrap();
+    let (code, v) = call(&h, file_call("site", &token, "PLAYBOOK.md", b"# x\n")).await;
+    assert_eq!((code, v["holder"].as_str()), (409, Some("git:push")), "{v}");
+    drop(held);
+    let (code, v) = call(&h, file_call("site", &token, "PLAYBOOK.md", b"# x\n")).await;
+    assert_eq!(code, 200, "{v}");
 }
