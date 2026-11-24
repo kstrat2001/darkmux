@@ -14,6 +14,14 @@ darkmux release.
 
 ## [Unreleased]
 
+### Added
+
+- **Runs that can't write can't write (#3682).** A role whose palette gives the model neither `write`
+  nor `edit` runs with its workspace mounted read-only in the sandbox (Seatbelt and Docker alike), so
+  a shell command can't change it either. This now covers `code-reviewer`, `reviewer`, `crawler` and the
+  new built-in `researcher` role (read, exec, update_plan), which paired apps use for read-only
+  questions. Capability `read_only_runs`.
+
 ## [5.12.0] - 2026-11-21
 
 **A phone can drive darkmux over the tailnet.** `darkmux client serve` publishes its port on this

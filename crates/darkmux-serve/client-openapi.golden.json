@@ -1321,6 +1321,11 @@
             "type": "string",
             "const": "engines",
             "description": "(#3569) `GET /client/engines`: the engines installed on this Mac,\nwhether any is `usable`, and `POST /client/engines`, which adds one\ndarkmux starts servers for once the app's user confirms."
+          },
+          {
+            "type": "string",
+            "const": "read_only_runs",
+            "description": "(#3682) A run whose role may neither write nor edit (`researcher`,\n`code-reviewer`) has its workspace mounted read-only, so it cannot\nchange it by any means; the built-in `researcher` role exists."
           }
         ],
         "description": "One thing the client API can do that an app may need to check for."
