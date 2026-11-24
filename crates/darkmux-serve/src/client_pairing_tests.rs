@@ -4922,9 +4922,8 @@ async fn reuse_runs_no_git_in_another_bots_or_apps_workspace() {
     assert_eq!(code, 201, "{other}");
     let (code, theirs) = call(&h, ask("Theirs")).await;
     assert_eq!(code, 201, "{theirs}");
-    // Another app's, for a bot of the very name asking.
+    // (#3683) Made for another pairing: still another bot's, so never read.
     crate::client_workspace::record_owner(&h.base, theirs["workspace"].as_str().unwrap(), "c-someone-else").unwrap();
-    crate::client_workspace::record_bot(&h.base, theirs["workspace"].as_str().unwrap(), "Mine").unwrap();
     let pipes: Vec<PathBuf> = [&other, &theirs]
         .iter()
         .map(|v| crate::client_git::clone_git_dir(&h.base, v["workspace"].as_str().unwrap()).join("config"))
@@ -5411,7 +5410,8 @@ async fn workspaces_from_before_owners_go_to_the_client_paired_when_the_store_mo
     git_workspace(&h, "site");
     std::fs::remove_file(h.base.join(".site.client")).unwrap();
     let (code, v) = call(&h, post("/client/work", Some(&second), serde_json::json!({"role": "coder", "message": "hi", "workspace": "site"}))).await;
-    assert_eq!(code, 403, "never the second app's: {v}");
+    assert_eq!(code, 202, "(#3683) given to the heir, it's the owner's, for any pairing: {v}");
+    wait_done(&h, &second, v["work_id"].as_str().unwrap()).await;
     let id = run_in(&h, first, "site", "hello").await;
     assert_eq!(status(&h, first, &id).await["status"], "done");
     assert_eq!(crate::client_workspace::owner_of(&h.base, "site"), Some(heir));
@@ -5482,31 +5482,30 @@ async fn with_two_apps_paired_only_the_operator_gives_out_an_unowned_workspace()
     assert!(unowned_workspaces(&h.store, &h.base).unwrap().is_empty());
     let (code, v) = call(&h, work(&a)).await;
     assert_eq!(code, 202, "{v}");
-    let (code, _) = call(&h, work(&b)).await;
-    assert_eq!(code, 403);
+    let (code, v) = call(&h, work(&b)).await;
+    assert_ne!(code, 403, "(#3683) once given out, it's the owner's, for any pairing: {v}");
 }
 
-/// A client's workspaces and runs belong to its id, not its name: after it
-/// is revoked, a new pairing given the same name inherits neither. Its
-/// workspaces stay unowned until the operator gives them to someone.
+/// (#3683) A revoked pairing loses every work copy at once; a new pairing
+/// of the owner (given the same name, even) has them, and the runs in them.
 #[tokio::test]
-async fn a_new_pairing_never_inherits_a_revoked_clients_workspaces_or_runs() {
+async fn a_revoked_pairing_loses_its_work_copies_and_a_new_one_of_the_owners_has_them() {
     let h = harness();
     let old = paired(&h).await;
     let (code, v) = call(&h, post("/client/workspaces", Some(&old), serde_json::json!({"repo_url": HCR}))).await;
     assert_eq!(code, 201, "{v}");
     let run = run_in(&h, &old, "hcr", "hello").await;
     assert!(revoke(&h.store, FIRST_CLIENT).unwrap());
+    let (code, _) = call(&h, get(&format!("/client/work/{run}"), &[("authorization", &bearer(&old))])).await;
+    assert_eq!(code, 401, "the revoked token");
     let new = paired(&h).await;
     assert_eq!(list_clients(&h.store).unwrap()[0].name, FIRST_CLIENT, "the name is reused");
-    let (code, v) = call(&h, post("/client/work", Some(&new), serde_json::json!({"role": "coder", "message": "hi", "workspace": "hcr"}))).await;
-    assert_eq!((code, v["code"].as_str()), (403, Some("forbidden")), "{v}");
-    let (code, _) = call(&h, get(&format!("/client/work/{run}"), &[("authorization", &bearer(&new))])).await;
-    assert_eq!(code, 404, "the revoked client's run is not the new one's");
+    let (code, v) = call(&h, get(&format!("/client/work/{run}"), &[("authorization", &bearer(&new))])).await;
+    assert_eq!(code, 200, "the run in the owner's work copy: {v}");
     let (code, v) = call(&h, post("/client/workspaces", Some(&new), serde_json::json!({"repo_url": HCR}))).await;
-    assert_eq!(code, 201, "a workspace of its own: {v}");
-    assert_ne!(v["workspace"], "hcr");
-    assert_eq!(unowned_workspaces(&h.store, &h.base).unwrap(), ["hcr"]);
+    assert_eq!((code, v["workspace"].as_str()), (200, Some("hcr")), "the owner's work copy, reused: {v}");
+    let (code, v) = call(&h, post("/client/work", Some(&new), serde_json::json!({"role": "coder", "message": "hi", "workspace": "hcr"}))).await;
+    assert_eq!(code, 202, "{v}");
 }
 
 /// The owner record is written only when it changes, and replaced in one
@@ -6258,13 +6257,13 @@ async fn undo_refuses_what_it_cant_do() {
     let (code, _) = call(
         &h,
         post(
-            &format!("/client/work/{id}/undo"),
+            "/client/work/w-0000000000000000/undo",
             Some(&other),
             serde_json::json!({}),
         ),
     )
     .await;
-    assert_eq!(code, 404);
+    assert_eq!(code, 404, "an unknown run");
     let (code, _) = call(
         &h,
         post(
@@ -6668,10 +6667,13 @@ async fn an_approved_recipe_is_the_owners_and_capped() {
     assert!(v["error"].as_str().unwrap().contains("larger than"), "{v}");
     let base = h.base.canonicalize().unwrap();
     assert!(!base.join(".hcr.recipe").exists());
-    own(&h, "hcr", "c-0000000000000000");
-    let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"command": "npm run dev"})).await;
+    // (#3683) A clone darkmux made for no app (no owner record, nobody to
+    // adopt it) keeps no recipe from an app.
+    std::fs::remove_file(base.join(".hcr.client")).unwrap();
+    let second = paired(&h).await;
+    let (code, v) = put_recipe(&h, &second, "hcr", serde_json::json!({"command": "npm run dev"})).await;
     assert_eq!((code, v["code"].as_str()), (403, Some("forbidden")), "{v}");
-    assert!(!base.join(".hcr.recipe").exists(), "another app's clone keeps no recipe of this one's");
+    assert!(!base.join(".hcr.recipe").exists(), "a clone made for no app keeps no recipe");
 }
 
 /// (#3571) A clone's records are read only as plain files: a linked or

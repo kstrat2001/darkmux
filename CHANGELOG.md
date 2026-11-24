@@ -25,6 +25,11 @@ darkmux release.
   go one at a time, and a second is refused naming what holds it (`work_copy_busy`; the older routes
   keep `conflict` and now name the `holder` too). Capability `git_route`. Every refusal may now carry
   `holder`, `work_id` and `paths` (additive).
+- **A work copy is the owner's (#3683).** Every pairing in `clients.json` is the operator's own, so any
+  live pairing (the Mac, the iPhone, the iPad) may use any workspace darkmux made for an app, and follow,
+  stop and undo the runs in it; asking for the same repo and bot from two devices gives the same work
+  copy. Mission worktrees and folders made for no app stay refused, and a revoked pairing is refused
+  everywhere at once. **Behavior change:** before, a workspace was its pairing's alone.
 
 ## [5.12.0] - 2026-11-21
 
