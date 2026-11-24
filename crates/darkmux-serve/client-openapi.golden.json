@@ -1125,6 +1125,11 @@
           },
           {
             "type": "string",
+            "const": "stale_main",
+            "description": "(#3684) The remote's main version, as last fetched, doesn't have the\nmerge `new_task` names (409): fetch, then ask again."
+          },
+          {
+            "type": "string",
             "const": "no_upstream",
             "description": "(#3681) The branch has never been pushed or fetched, so there is\nnothing to compare with on the remote (409)."
           },
@@ -1439,6 +1444,11 @@
             "type": "string",
             "const": "git_route",
             "description": "(#3681) `POST /client/workspaces/{name}/git`: plain git on a\nworkspace (`status`, `fetch`, `push`, `merge_main`, `revert`,\n`diff`), and one lock per work copy (`work_copy_busy`)."
+          },
+          {
+            "type": "string",
+            "const": "new_task",
+            "description": "(#3684) The git route's `new_task`: after a merge, the work copy\nmoves onto a new branch from the merged main."
           }
         ],
         "description": "One thing the client API can do that an app may need to check for."
@@ -2748,6 +2758,22 @@
               "verb",
               "result"
             ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "verb": {
+                "type": "string",
+                "const": "new_task"
+              },
+              "result": {
+                "$ref": "#/components/schemas/GitNewTask"
+              }
+            },
+            "required": [
+              "verb",
+              "result"
+            ]
           }
         ],
         "description": "`POST /client/workspaces/{name}/git`: what the verb did, tagged by it\n(`{\"verb\": \"status\", \"result\": {..}}`)."
@@ -2960,6 +2986,34 @@
         ],
         "description": "(#3681) `revert`: the new commit undoing `commit`, and the files it put\nback."
       },
+      "GitNewTask": {
+        "type": "object",
+        "properties": {
+          "moved": {
+            "type": "boolean"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "head": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "carried": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "moved",
+          "branch",
+          "carried"
+        ],
+        "description": "(#3684) `new_task`: whether the work copy moved, the branch it is on\nnow, its head, and how many commits made after the merge came along."
+      },
       "GitBody": {
         "type": "object",
         "additionalProperties": false,
@@ -2993,7 +3047,8 @@
           "push",
           "merge_main",
           "revert",
-          "diff"
+          "diff",
+          "new_task"
         ],
         "description": "The verbs, by their one wire spelling. Any other is refused."
       },
@@ -3010,6 +3065,9 @@
           },
           {
             "$ref": "#/components/schemas/DiffArgs"
+          },
+          {
+            "$ref": "#/components/schemas/NewTaskArgs"
           }
         ],
         "description": "Every verb's arguments, for the schema only."
@@ -3079,6 +3137,23 @@
           "base",
           "upstream"
         ]
+      },
+      "NewTaskArgs": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "merged_head": {
+            "type": "string"
+          },
+          "merge_sha": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "merged_head",
+          "merge_sha"
+        ],
+        "description": "`new_task` (#3684): the review GitHub merged, by the head it merged\n(`merged_head`) and GitHub's merge commit (`merge_sha`), both full ids."
       },
       "ImageReply": {
         "type": "object",
