@@ -754,14 +754,7 @@ fn upstream_diff(wc: &WorkCopy) -> Result<crate::client_wire::BranchChanges, Ref
 /// for GitHub's username prompt and `token` for its password prompt; for
 /// any other host, nothing.
 pub fn askpass_answer(prompt: &str, token: &str) -> Option<String> {
-    let (kind, rest) = prompt.split_once(" for '")?;
-    let url = rest.rsplit_once('\'')?.0;
-    // Only an https prompt (read by hand: endpoints are resolved elsewhere,
-    // and this is no endpoint, only a check of git's prompt).
-    const HTTPS: &str = "https://";
-    let host = url.starts_with(HTTPS).then(|| &url[HTTPS.len()..])?;
-    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
-    let host = host.split('/').next()?;
+    let (kind, host) = prompt_kind_and_host(prompt)?;
     if !host.eq_ignore_ascii_case("github.com") {
         return None;
     }
@@ -770,6 +763,19 @@ pub fn askpass_answer(prompt: &str, token: &str) -> Option<String> {
         "Password" if !token.is_empty() => Some(token.to_string()),
         _ => None,
     }
+}
+
+/// git's prompt `<Kind> for 'https://[user@]host/…': ` as its kind and
+/// host; nothing for any prompt not about an https address.
+fn prompt_kind_and_host(prompt: &str) -> Option<(&str, &str)> {
+    let (kind, rest) = prompt.split_once(" for '")?;
+    let url = rest.rsplit_once('\'')?.0;
+    // Only an https prompt (read by hand: endpoints are resolved elsewhere,
+    // and this is no endpoint, only a check of git's prompt).
+    const HTTPS: &str = "https://";
+    let host = url.starts_with(HTTPS).then(|| &url[HTTPS.len()..])?;
+    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+    Some((kind, host.split('/').next()?))
 }
 
 /// This binary as git's askpass ([`ASKPASS_ENV`] set): the answer on
