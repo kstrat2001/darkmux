@@ -3494,7 +3494,7 @@ fn held_by_words(holder: &str, work_id: Option<&str>) -> String {
 /// Why nothing may start in work copy `w` now, if something is using it
 /// ([`holder_of`]): a 409 `conflict` naming the `holder`, as the older
 /// routes refuse.
-fn busy_copy(works: &HashMap<String, WorkEntry>, holds: &CopyHolds, w: &PathBuf) -> Option<Refused> {
+fn busy_copy(works: &HashMap<String, WorkEntry>, holds: &CopyHolds, w: &Path) -> Option<Refused> {
     let (holder, work_id) = holder_of(works, holds, w)?;
     Some(Box::new(err_with(
         StatusCode::CONFLICT,
@@ -3550,13 +3550,13 @@ impl Drop for CopyHold {
 
 /// (#3681) Holds work copy `w` as `holder`, or says what holds it now (its
 /// holder and run). Refused while `client serve` stops, like a run.
-pub(crate) fn take_copy(state: &ClientServerState, w: &Path, holder: &str) -> Result<CopyHold, Response> {
+pub(crate) fn take_copy(state: &ClientServerState, w: &Path, holder: &str) -> Result<CopyHold, Refused> {
     let works = state.works.lock().unwrap();
     if state.previews.stopping() {
-        return Err(stopping_refusal());
+        return Err(Box::new(stopping_refusal()));
     }
     if let Some((h, id)) = holder_of(&works, &state.holds, w) {
-        return Err(work_copy_busy(h, id));
+        return Err(Box::new(work_copy_busy(h, id)));
     }
     state.holds.0.lock().unwrap().insert(w.to_path_buf(), holder.to_string());
     Ok(CopyHold { holds: state.holds.clone(), w: w.to_path_buf() })
@@ -4758,26 +4758,32 @@ fn start_preview(state: &ClientServerState, client: &ApprovedClient, name: &str,
         Ok(found) => found,
         Err(r) => return *r,
     };
-    let held = match held_in_use(state, name) {
-        Ok(held) => held,
-        Err(r) => return *r,
-    };
     // (#3681) A clean start reinstalls in the work copy: it takes the
     // copy's lock while it cleans and starts, so no run or git verb is
     // there meanwhile. A plain start changes nothing in the copy.
-    let _installing = match clean {
-        true => match take_copy(state, &dir, "preview_install") {
-            Ok(hold) => Some(hold),
-            Err(r) => return r,
-        },
-        false => None,
-    };
-    let started = if clean { state.previews.clean(name, &dir, &source) } else { Ok(()) }
-        .and_then(|()| state.previews.start_holding(kind, name, &dir, &source, held));
+    let holds = held_in_use(state, name)
+        .and_then(|held| Ok((held, clean.then(|| take_copy(state, &dir, "preview_install")).transpose()?)));
+    match holds {
+        Ok((held, _installing)) => start_preview_held(state, name, (kind, &dir, &source), clean, held),
+        Err(r) => *r,
+    }
+}
+
+/// [`start_preview`] once the workspace's name (and for a clean start, its
+/// work copy) is held.
+fn start_preview_held(
+    state: &ClientServerState,
+    name: &str,
+    (kind, dir, source): (darkmux_sandbox::BackendKind, &Path, &crate::client_preview::RecipeSource),
+    clean: bool,
+    held: crate::client_workspace::NameHold,
+) -> Response {
+    let started = if clean { state.previews.clean(name, dir, source) } else { Ok(()) }
+        .and_then(|()| state.previews.start_holding(kind, name, dir, source, held));
     match started {
         Ok((v, true)) => Json(v).into_response(),
         Ok((v, false)) => (StatusCode::ACCEPTED, Json(v)).into_response(),
-        Err(e) => recipe_refusal(&source, &no_recipe_in(&source, e)),
+        Err(e) => recipe_refusal(source, &no_recipe_in(source, e)),
     }
 }
 
@@ -4969,20 +4975,20 @@ fn branch_changes(st: &ClientServerState, client: &ApprovedClient, name: &str) -
     };
     match branch_changes_of(st, name, &dir) {
         Ok(changes) => Json(changes).into_response(),
-        Err(r) => r,
+        Err(r) => *r,
     }
 }
 
 /// `/changes` (and the git route's `diff` against the base, #3681): the
 /// files work copy `dir` of workspace `name` holds that its base lacks.
-pub(crate) fn branch_changes_of(st: &ClientServerState, name: &str, dir: &WorkCopy) -> Result<BranchChanges, Response> {
-    let (default, base_branch) = changes_base(st, dir, name).map_err(|r| *r)?;
+pub(crate) fn branch_changes_of(st: &ClientServerState, name: &str, dir: &WorkCopy) -> Result<BranchChanges, Refused> {
+    let (default, base_branch) = changes_base(st, dir, name)?;
     let branch = git_line(dir, &["branch", "--show-current"]).unwrap_or_default();
-    own_branch(name, &branch, &default).map_err(|r| *r)?;
+    own_branch(name, &branch, &default)?;
     let (Some(base), Some(head)) = (git_line(dir, &["merge-base", "HEAD", &default]), git_line(dir, &["rev-parse", "HEAD"])) else {
-        return Err(err(StatusCode::CONFLICT, ClientCode::Conflict, "couldn't find where this branch left the default branch"));
+        return Err(refuse(StatusCode::CONFLICT, ClientCode::Conflict, "couldn't find where this branch left the default branch"));
     };
-    let files = crate::client_changes::branch_files(dir, &base, &head, MAX_CHANGES_BYTES).map_err(changes_refusal)?;
+    let files = crate::client_changes::branch_files(dir, &base, &head, MAX_CHANGES_BYTES).map_err(|e| Box::new(changes_refusal(e)))?;
     Ok(BranchChanges {
         base,
         base_branch,
@@ -5530,7 +5536,7 @@ fn hold_for_edit(
     if st.previews.stopping() {
         return Err(Box::new(stopping_refusal()));
     }
-    if let Some(r) = busy_copy(&works, &st.holds, &dir.to_path_buf()) {
+    if let Some(r) = busy_copy(&works, &st.holds, dir) {
         return Err(r);
     }
     works.insert(
