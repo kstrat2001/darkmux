@@ -12230,6 +12230,8 @@ async fn new_task_that_cant_carry_a_later_change_moves_nothing() {
     assert_eq!(run_git(Some(&wt), &["branch", "--show-current"]), "mux/test-abc123", "back on its branch");
     assert_eq!(run_git(Some(&wt), &["rev-parse", "HEAD"]), before);
     assert_eq!(run_git(Some(&wt), &["branch", "--list", "mux/*"]).lines().count(), 1, "the new branch is gone");
+}
+
 /// (#3681) A push names this work copy's own remote, or for a template
 /// project with none, an empty repository; anything else is refused.
 #[tokio::test]
