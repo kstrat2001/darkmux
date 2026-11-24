@@ -32,3 +32,22 @@ fn a_commit_id_is_7_to_40_lowercase_hex() {
         assert!(!valid_commit(bad), "{bad}");
     }
 }
+
+fn net(stderr: &str) -> crate::client_workspace::NetOutput {
+    use std::os::unix::process::ExitStatusExt;
+    crate::client_workspace::NetOutput { status: std::process::ExitStatus::from_raw(128 << 8), stdout: String::new(), stderr: stderr.to_string() }
+}
+
+#[test]
+fn an_authentication_failure_is_told_apart_from_other_failures() {
+    for err in [
+        "remote: Invalid username or password.\nfatal: Authentication failed for 'https://github.com/o/r.git/'",
+        "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+        "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 403",
+    ] {
+        assert!(auth_failed(&net(err)), "{err}");
+    }
+    for err in ["fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com", "error: failed to push some refs"] {
+        assert!(!auth_failed(&net(err)), "{err}");
+    }
+}

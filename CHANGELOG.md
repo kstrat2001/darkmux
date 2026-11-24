@@ -21,7 +21,7 @@ darkmux release.
   no free-form git. `push` is fast-forward only and never forces (`remote_moved`); `merge_main` aborts
   on a conflict and names the files (`merge_conflict`). GitHub's token is handed over per `push` or
   `fetch` and reaches git only as this binary's askpass, with no credential helper, so it is never
-  stored or logged. One lock per work copy: runs, Undos, hand edits, git verbs and a clean preview start
+  stored or logged; a token GitHub refuses is `auth_failed`, so an app renews it and tries once more. One lock per work copy: runs, Undos, hand edits, git verbs and a clean preview start
   go one at a time, and a second is refused naming what holds it (`work_copy_busy`; the older routes
   keep `conflict` and now name the `holder` too). Capability `git_route`. Every refusal may now carry
   `holder`, `work_id` and `paths` (additive).
