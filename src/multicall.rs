@@ -60,6 +60,12 @@ fn helper(argv: &[OsString]) -> Option<&'static (&'static str, Entry)> {
 /// Run the helper this process was started as, and return its exit code;
 /// `None` for an ordinary darkmux command line.
 pub(crate) fn hand_over() -> Option<ExitCode> {
+    // (#3681) Started by git as its askpass for one push or fetch of the
+    // client git route: git passes the prompt as the only argument, so the
+    // mode is told by the variable darkmux set on that git child alone.
+    if std::env::var_os(darkmux_serve::client_git_route::ASKPASS_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        return Some(darkmux_serve::client_git_route::askpass_main());
+    }
     let argv: Vec<OsString> = std::env::args_os().collect();
     helper(&argv).map(|(_, entry)| entry())
 }

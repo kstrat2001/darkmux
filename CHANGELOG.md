@@ -14,6 +14,18 @@ darkmux release.
 
 ## [Unreleased]
 
+### Added
+
+- **A paired app runs plain git on its workspace (#3681).** `POST /client/workspaces/{name}/git` takes
+  one of six verbs (`status`, `fetch`, `push`, `merge_main`, `revert`, `diff`), each with a fixed shape:
+  no free-form git. `push` is fast-forward only and never forces (`remote_moved`); `merge_main` aborts
+  on a conflict and names the files (`merge_conflict`). GitHub's token is handed over per `push` or
+  `fetch` and reaches git only as this binary's askpass, with no credential helper, so it is never
+  stored or logged; a token GitHub refuses is `auth_failed`, so an app renews it and tries once more. One lock per work copy: runs, Undos, hand edits, git verbs and a clean preview start
+  go one at a time, and a second is refused naming what holds it (`work_copy_busy`; the older routes
+  keep `conflict` and now name the `holder` too). Capability `git_route`. Every refusal may now carry
+  `holder`, `work_id` and `paths` (additive).
+
 ## [5.12.0] - 2026-11-21
 
 **A phone can drive darkmux over the tailnet.** `darkmux client serve` publishes its port on this

@@ -234,25 +234,116 @@ fn git_bounded_with(
     args: &[&std::ffi::OsStr],
     timeout: Duration,
 ) -> Result<(), String> {
-    let child = std::process::Command::new("git")
-        .args([
-            "-c",
-            "protocol.allow=never",
-            "-c",
-            "protocol.https.allow=always",
-            "-c",
-            "protocol.ssh.allow=always",
-        ])
-        .args(global_network_config(config_dir))
-        .args(extra)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("running git: {e}"))?;
-    wait_bounded(child, timeout)
+    let net = global_network_config(config_dir);
+    let out = git_network(&net, extra, args, &[], timeout)?;
+    match out.status.success() {
+        true => Ok(()),
+        false => Err(format!("git exited with {}: {}", out.status, out.stderr.lines().last().unwrap_or("").trim())),
+    }
+}
+
+/// What a network git call left: its exit status and both streams.
+#[derive(Debug)]
+pub struct NetOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// The ONE git spawn a network operation goes through (`git_bounded_with`
+/// and the git route's fetch and push, #3681): only the https and ssh
+/// transports, the `net` settings that say which credential and ssh
+/// programs run (`global_network_config`, or the git route's token-only
+/// set), then `extra`, no terminal, and a deadline. `env` is set on this
+/// child only (the git route's askpass and token, never this process's).
+pub fn git_network(
+    net: &[String],
+    extra: &[&str],
+    args: &[&std::ffi::OsStr],
+    env: &[(&str, &std::ffi::OsStr)],
+    timeout: Duration,
+) -> Result<NetOutput, String> {
+    use std::io::Read;
+    let mut cmd = std::process::Command::new("git");
+    cmd.args([
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.https.allow=always",
+        "-c",
+        "protocol.ssh.allow=always",
+    ])
+    .args(net)
+    .args(extra)
+    .args(args)
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("running git: {e}"))?;
+    let read = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut p) = pipe {
+                let mut bytes = Vec::new();
+                let _ = p.read_to_end(&mut bytes);
+                text = String::from_utf8_lossy(&bytes).into_owned();
+            }
+            text
+        })
+    };
+    let out = read(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err = read(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let status = wait_for(&mut child, timeout)?;
+    Ok(NetOutput { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
+}
+
+/// (#3681) The network settings for a git call that carries a token: hooks
+/// and fsmonitor off, and NO credential helper at all (not even the
+/// operator's: git hands a credential that worked to every helper to
+/// store, which would keep the token), and no configured askpass, so the
+/// call's own `GIT_ASKPASS` is the only thing that answers.
+pub fn token_network_config() -> Vec<String> {
+    ["core.hooksPath=/dev/null", "core.fsmonitor=false", "credential.helper=", "core.askPass=", "core.sshCommand=ssh"]
+        .iter()
+        .flat_map(|s| ["-c".to_string(), s.to_string()])
+        .collect()
+}
+
+/// (#3681) [`global_network_config`] for the git route's calls without a
+/// token: the operator's own credential helpers and ssh, read in `dir`.
+pub fn operator_network_config(dir: &Path) -> Vec<String> {
+    global_network_config(dir)
+}
+
+/// (#3681) The network keys a work copy's own config sets that no override
+/// can switch off ([`refused_network_keys`]), read from the repository
+/// darkmux holds for it.
+pub fn refused_keys_of(wc: &crate::client_git::WorkCopy) -> Vec<String> {
+    let Some(out) = darkmux_types::host_git::HostGit::held_git_dir(&wc.git_dir)
+        .output(&["config", "-z", "--show-scope", "--list"])
+        .ok()
+        .filter(|o| o.status.success())
+    else {
+        return Vec::new();
+    };
+    let fields: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
+    let local: Vec<String> = fields
+        .chunks_exact(2)
+        .filter(|p| p[0] == b"local" || p[0] == b"worktree")
+        .map(|p| String::from_utf8_lossy(p[1].split(|b| *b == b'\n').next().unwrap_or_default()).to_lowercase())
+        .collect();
+    let mut refused = refused_network_keys(&local);
+    refused.dedup();
+    refused
+}
+
+/// (#3681) Why a work copy's network call was refused for `keys`.
+pub fn refused_keys_words(what: &str, keys: &[String]) -> String {
+    format!("not {what}: the repository's own git config sets {}. {NETWORK_FIX}.", keys.join(", "))
 }
 
 /// The keys whose checkout-local values a network operation overrides with
@@ -351,8 +442,11 @@ fn refused_network_keys(keys: &[String]) -> Vec<String> {
 
 /// (section prefix, key suffix) pairs [`refused_network_keys`] refuses; an
 /// empty suffix is the whole section.
-const REFUSED_NETWORK_KEYS: [(&str, &str); 9] = [
+const REFUSED_NETWORK_KEYS: [(&str, &str); 11] = [
     ("http.", ""),
+    // (#3681) Where a push goes, and the program the remote runs to take it.
+    ("remote.", ".pushurl"),
+    ("remote.", ".receivepack"),
     ("protocol.", ""),
     ("url.", ".insteadof"),
     ("url.", ".pushinsteadof"),
@@ -376,14 +470,20 @@ const NETWORK_FIX: &str = "darkmux reads network settings from your global git c
 /// Waits for git, killing it past `timeout`; a failure names git's last
 /// stderr line.
 fn wait_bounded(mut child: std::process::Child, timeout: Duration) -> Result<(), String> {
+    let status = wait_for(&mut child, timeout)?;
+    match status.success() {
+        true => Ok(()),
+        false => Err(format!("git exited with {status}: {}", last_stderr_line(&mut child))),
+    }
+}
+
+/// Waits for `child` to exit, killing it past `timeout`. Shared by every
+/// git darkmux waits on here, so its deadline is one piece of code.
+fn wait_for(child: &mut std::process::Child, timeout: Duration) -> Result<std::process::ExitStatus, String> {
     let start = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => {
-                let last = last_stderr_line(&mut child);
-                return Err(format!("git exited with {status}: {last}"));
-            }
+            Ok(Some(status)) => return Ok(status),
             Ok(None) if start.elapsed() > timeout => {
                 let _ = child.kill();
                 let _ = child.wait();

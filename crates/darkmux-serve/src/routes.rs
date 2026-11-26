@@ -213,6 +213,7 @@ macro_rules! client_json {
 /// a `ClientError`.
 pub(crate) fn client_table() -> Vec<ClientRoute> {
     use crate::client_engines::*;
+    use crate::client_git_route::{git_handler, GitBody};
     use crate::client_pairing::*;
     use crate::client_wire::*;
     vec![
@@ -235,6 +236,7 @@ pub(crate) fn client_table() -> Vec<ClientRoute> {
         client_json!(delete, WorkspaceRemoved, "/client/workspaces/:name", workspace_remove_handler, optional_body = RemoveBody),
         client_json!(get, BranchChanges, "/client/workspaces/:name/changes", workspace_changes_handler),
         client_json!(post, EditReply, "/client/workspaces/:name/edit", workspace_edit_handler, body = EditBody),
+        client_json!(post, GitReply, "/client/workspaces/:name/git", git_handler, body = GitBody),
         client_json!(post, ImageReply, IMAGE_ROUTE, workspace_image_handler, body = ImageBody),
         client_json!(post, PreviewState, "/client/workspaces/:name/preview", preview_start_handler, optional_body = PreviewStartBody),
         client_json!(get, PreviewState, "/client/workspaces/:name/preview", preview_status_handler),
