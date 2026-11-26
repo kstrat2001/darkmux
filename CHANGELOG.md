@@ -28,11 +28,11 @@ darkmux release.
 
 ### Fixed
 
-- **`lab run` no longer warns that a profile's second model will reload (#3678).** The envelope check
-  reported a reload for every model the profile declares, but the dispatch's residency preflight acts
-  on the default model only, so a second model resident at another context (the utility model, at its
-  own binding's) was named as a load that never happened. Notes now cover the default model only, and
-  read without the stray ` : `.
+- **`lab run` no longer warns that the utility model will reload when it won't (#3678).** The envelope
+  check judged the `internal.utility` model at the `n_ctx` the profile lists it with, but a dispatch
+  loads it at the binding's own window (or, with none declared, the default model's). So a utility
+  model resident at its binding's window was reported as reloading. It is now judged at that window.
+  The notes also read without a stray ` : `.
 
 ## [5.12.0] - 2026-11-21
 

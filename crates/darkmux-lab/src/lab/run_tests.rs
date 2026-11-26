@@ -683,7 +683,7 @@ fn a_failed_lms_ps_is_an_unverified_profile_warning() {
     // SAFETY: serial; `Lab`'s drop restores the variable.
     unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/lms") };
     let profile: darkmux_types::Profile = serde_json::from_str(r#"{"models":[{"id":"m","n_ctx":1}]}"#).unwrap();
-    let w = envelope_check(&profile, "fast");
+    let w = envelope_check(&profile, "fast", None);
     assert_eq!(w.len(), 1, "{w:?}");
     assert!(w[0].starts_with("could not verify profile-load match: `lms ps` failed ("), "{w:?}");
     assert!(w[0].ends_with("this run's `profile=fast` tag is unverified. (#365)"), "{w:?}");
@@ -779,8 +779,8 @@ fn a_profile_with_nothing_on_lm_studio_is_not_checked_against_it() {
     let profile = darkmux_types::Profile { models: vec![pm], ..Default::default() };
     let prev = std::env::var_os("DARKMUX_LMS_BIN");
     unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/lms") };
-    let unmanaged = envelope_check(&profile, "p");
-    let managed = envelope_check(&darkmux_types::Profile { models: vec![darkmux_types::ProfileModel { id: "m".into(), ..Default::default() }], ..Default::default() }, "p");
+    let unmanaged = envelope_check(&profile, "p", None);
+    let managed = envelope_check(&darkmux_types::Profile { models: vec![darkmux_types::ProfileModel { id: "m".into(), ..Default::default() }], ..Default::default() }, "p", None);
     unsafe {
         match prev {
             Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),

@@ -41,6 +41,29 @@ pub(crate) fn envelope_warnings(
     servers: &[EngineServer],
     recs_own: Option<&str>,
 ) -> Vec<String> {
+    envelope_warnings_with_utility(profile, profile_name, loaded, servers, recs_own, None)
+}
+
+/// (#3678) The machine's `internal.utility` binding: its model id and its
+/// declared window. The dispatch makes that model resident at the binding's
+/// window (or, with none declared, the default model's), never at the
+/// `n_ctx` a profile lists it with.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UtilityBinding<'a> {
+    pub id: &'a str,
+    pub n_ctx: Option<u32>,
+}
+
+/// [`envelope_warnings`], judging the utility model (when the profile lists
+/// it) at the window the dispatch loads it at.
+pub(crate) fn envelope_warnings_with_utility(
+    profile: &Profile,
+    profile_name: &str,
+    loaded: &[LoadedModel],
+    servers: &[EngineServer],
+    recs_own: Option<&str>,
+    utility: Option<UtilityBinding<'_>>,
+) -> Vec<String> {
     // (#590) Only the default model (default_model, or first model) is
     // load-bearing for the measurement envelope.
     let default_id = profile.default_model_id();
@@ -57,34 +80,42 @@ pub(crate) fn envelope_warnings(
             if pm.endpoint_kind().is_ok_and(|k| k.starts_servers()) {
                 return is_default.then(|| server_note(pm, servers, recs_own)).flatten();
             }
-            lms_note(pm, is_default, loaded)
+            lms_note(&as_loaded_by_dispatch(pm, utility, profile), is_default, loaded)
         })
         .map(|n| format!("requested profile `{profile_name}` {n}"))
         .collect()
 }
 
+/// `pm` with the window the dispatch loads it at: the utility binding's
+/// (else the default model's) when `pm` is the utility model, else its own.
+fn as_loaded_by_dispatch(pm: &ProfileModel, utility: Option<UtilityBinding<'_>>, profile: &Profile) -> ProfileModel {
+    let Some(u) = utility.filter(|u| u.id == pm.id) else { return pm.clone() };
+    let default_ctx = || profile.default_model_id().and_then(|d| profile.models.iter().find(|m| m.id == d)).and_then(|m| m.n_ctx);
+    ProfileModel { n_ctx: u.n_ctx.or_else(default_ctx), ..pm.clone() }
+}
+
 /// The note for an LM Studio model, from what the dispatch's residency
-/// preflight will do with `loaded`. (#3678) The preflight acts on the
-/// default model only, so any other model gets no note: its resident
-/// instance (the utility binding's, say, at its own context) is left alone.
+/// preflight will do with `loaded`.
 fn lms_note(pm: &ProfileModel, is_default: bool, loaded: &[LoadedModel]) -> Option<String> {
     // Empty means either nothing is loaded or `lms ps` couldn't be
     // queried — in both cases we can't validate, so stay quiet rather
     // than crying "primary not loaded" against a set we don't trust.
-    if !is_default || loaded.is_empty() {
+    if loaded.is_empty() {
         return None;
     }
     // (F1, 5.0 dogfood) The dispatch preflight's own decision function
     // owns the reuse/reload/load rule; this check reports it (#2985).
     let declared = pm.n_ctx.map(u64::from);
     match decide_preflight(&pm.id, pm.identifier.as_deref(), pm.n_ctx.unwrap_or(0), loaded) {
-        PreflightDecision::LoadFresh { foreign_identifier: None } => Some(format!(
+        PreflightDecision::LoadFresh { foreign_identifier: None } if is_default => Some(format!(
             "declares default model `{}` (ctx {}) but it is not among the currently loaded \
              models: the dispatch loads a new instance, so this run's wall-clock includes a \
              model load and is not comparable to a warm run.",
             pm.id,
             declared.map_or_else(|| "unset".to_string(), |v| v.to_string()),
         )),
+        // A missing non-default model is common and not worth the noise.
+        PreflightDecision::LoadFresh { foreign_identifier: None } => None,
         PreflightDecision::Reuse { resident_ctx, .. } => declared
             .filter(|d| ctx_diverges(*d, resident_ctx))
             .map(|d| {
@@ -262,22 +293,42 @@ mod tests {
         assert!(w[0].contains("not among the currently loaded"));
     }
 
-    /// (#3678) The dispatch's residency preflight acts on the default model
-    /// only, so a second model's resident instance (here the utility 4b,
-    /// loaded at its own binding's context) is never reloaded, reused or
-    /// loaded beside by this run, and gets no note.
+    /// (#3678) The utility model is loaded at its binding's window, so a
+    /// resident at that window is no reload, whatever `n_ctx` the profile
+    /// lists it with (the 5.12.0 dogfood false warning).
     #[test]
-    fn a_non_default_model_gets_no_note_whatever_is_resident() {
+    fn the_utility_model_is_judged_at_its_bindings_window() {
         let p = profile(vec![pm("qwen-35b", 262000), pm("qwen-4b", 120000)]);
-        let primary = lm("darkmux:qwen-35b", "qwen-35b", 262000);
-        for second in [
-            lm("darkmux:qwen-4b", "qwen-4b", 68000),
-            lm("darkmux:qwen-4b", "qwen-4b", 262144),
-            lm("qwen-4b", "qwen-4b", 120000),
-        ] {
-            let w = envelope_warnings(&p, "deep", &[primary.clone(), second.clone()], &[], None);
-            assert!(w.is_empty(), "resident {second:?}: {w:?}");
-        }
+        let loaded = [lm("darkmux:qwen-35b", "qwen-35b", 262000), lm("darkmux:qwen-4b", "qwen-4b", 68000)];
+        let bound = UtilityBinding { id: "qwen-4b", n_ctx: Some(68000) };
+        let w = envelope_warnings_with_utility(&p, "deep", &loaded, &[], None, Some(bound));
+        assert!(w.is_empty(), "{w:?}");
+        let tighter = UtilityBinding { id: "qwen-4b", n_ctx: Some(120000) };
+        let w = envelope_warnings_with_utility(&p, "deep", &loaded, &[], None, Some(tighter));
+        assert_eq!(w.len(), 1, "a binding above the resident's window still reloads it: {w:?}");
+        assert!(w[0].contains("at 120000 ctx but the resident instance is at 68000"), "{}", w[0]);
+    }
+
+    /// (#3678) A binding with no declared window takes the default model's.
+    #[test]
+    fn a_windowless_binding_takes_the_default_models_window() {
+        let p = profile(vec![pm("qwen-35b", 262000), pm("qwen-4b", 120000)]);
+        let loaded = [lm("darkmux:qwen-35b", "qwen-35b", 262000), lm("darkmux:qwen-4b", "qwen-4b", 68000)];
+        let windowless = UtilityBinding { id: "qwen-4b", n_ctx: None };
+        let w = envelope_warnings_with_utility(&p, "deep", &loaded, &[], None, Some(windowless));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("at 262000 ctx but the resident instance is at 68000"), "{}", w[0]);
+    }
+
+    /// A non-default model that is not the utility model keeps its note: a
+    /// lab dispatch can select it (capability scoring), so its reload is real.
+    #[test]
+    fn a_non_default_non_utility_model_still_gets_its_reload_note() {
+        let p = profile(vec![pm("qwen-35b", 262000), pm("coder-30b", 120000)]);
+        let loaded = [lm("darkmux:qwen-35b", "qwen-35b", 262000), lm("darkmux:coder-30b", "coder-30b", 32000)];
+        let w = envelope_warnings_with_utility(&p, "deep", &loaded, &[], None, Some(UtilityBinding { id: "qwen-4b", n_ctx: Some(68000) }));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("coder-30b") && w[0].contains("loads a new instance"), "{}", w[0]);
     }
 
     /// (#3678) No stray " : " in a note.

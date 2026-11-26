@@ -384,6 +384,10 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         profile_name: &profile_name,
         prune: &prune,
         model_hardware: &model_hardware,
+        utility: registry_loaded
+            .registry
+            .utility_model_id()
+            .map(|id| (id.to_string(), registry_loaded.registry.utility_model_n_ctx())),
     };
     let runs = opts.runs.max(1);
     let mut envelope = EnvelopeWarnings::default();
@@ -401,6 +405,9 @@ struct OneRun<'a> {
     prune: &'a Prune,
     /// (#3397) The profile's models' hardware as the registry said at start.
     model_hardware: &'a [crate::lab::manifest::ModelHardware],
+    /// (#3678) The registry's `internal.utility` model and declared window,
+    /// for the envelope check.
+    utility: Option<(String, Option<u32>)>,
 }
 
 impl OneRun<'_> {
@@ -532,7 +539,8 @@ impl OneRun<'_> {
         if let Some(note) = shadowed_note(self.workload, &paths::resolve(ResolveScope::ForceUser).root) {
             eprintln!("[lab] note: {note}");
         }
-        for w in envelope.fresh(envelope_check(self.profile, self.profile_name)) {
+        let utility = self.utility.as_ref().map(|(id, n_ctx)| crate::lab::profile_check::UtilityBinding { id, n_ctx: *n_ctx });
+        for w in envelope.fresh(envelope_check(self.profile, self.profile_name, utility)) {
             eprintln!("[lab] warn: {w}");
         }
     }
@@ -636,7 +644,11 @@ impl EnvelopeWarnings {
 
 /// The loaded models against the profile's declared ones. A failed `lms ps`
 /// is its own warning, so a run whose profile tag went unverified says so.
-fn envelope_check(profile: &darkmux_types::Profile, profile_name: &str) -> Vec<String> {
+fn envelope_check(
+    profile: &darkmux_types::Profile,
+    profile_name: &str,
+    utility: Option<crate::lab::profile_check::UtilityBinding<'_>>,
+) -> Vec<String> {
     // (#316) A profile with nothing on LM Studio (every model on the default
     // engine or another unmanaged endpoint) has nothing there to verify.
     if !profile.models.iter().any(|m| m.is_managed()) {
@@ -648,10 +660,10 @@ fn envelope_check(profile: &darkmux_types::Profile, profile_name: &str) -> Vec<S
     let recs_own = recs_own_address(profile);
     let recs_own = recs_own.as_deref();
     if !profile.models.iter().any(|m| m.is_managed() && !m.endpoint_kind().is_ok_and(|k| k.starts_servers())) {
-        return crate::lab::profile_check::envelope_warnings(profile, profile_name, &[], &servers, recs_own);
+        return crate::lab::profile_check::envelope_warnings_with_utility(profile, profile_name, &[], &servers, recs_own, utility);
     }
     match engine::lmstudio().loaded() {
-        Ok(loaded) => crate::lab::profile_check::envelope_warnings(profile, profile_name, &loaded, &servers, recs_own),
+        Ok(loaded) => crate::lab::profile_check::envelope_warnings_with_utility(profile, profile_name, &loaded, &servers, recs_own, utility),
         Err(e) => vec![format!(
             "could not verify profile-load match: `lms ps` failed ({e}); \
              this run's `profile={profile_name}` tag is unverified. (#365)"
