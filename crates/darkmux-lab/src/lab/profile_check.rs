@@ -61,12 +61,14 @@ pub(crate) fn dispatch_plan(
         Some((t.model, r.id.clone()))
     });
     // A binding whose endpoint does not resolve fails the dispatch, so
-    // nothing loads for it; one on an unmanaged endpoint, or on a server
-    // darkmux starts, is no LM Studio load.
+    // nothing loads for it; one on an unmanaged endpoint is no LM Studio
+    // load. A managed one is loaded on LM Studio whatever its endpoint (the
+    // crew's `prepare_compactor` takes the managed arm for a Flint or
+    // Tensorfold binding too), so it is planned like any other.
     let utility = darkmux_crew::target::utility_target_in(registry)
         .ok()
         .flatten()
-        .filter(|u| u.kind.is_managed() && !u.kind.starts_servers())
+        .filter(|u| u.kind.is_managed())
         .map(|u| UtilityPlan { id: u.id, n_ctx: u.n_ctx });
     DispatchPlan { work, utility }
 }
@@ -93,11 +95,6 @@ pub(crate) enum Part {
 }
 
 impl Part {
-    /// A work model's absence is a load worth a note; the utility model's
-    /// is common and quiet, as a missing non-default model always was.
-    fn is_work(&self) -> bool {
-        *self != Part::Utility
-    }
 
     /// The note's subject, ahead of its window.
     fn who(&self, id: &str) -> String {
@@ -219,14 +216,15 @@ fn lms_note(pm: &ProfileModel, part: &Part, loaded: &[LoadedModel]) -> Option<St
     let declared = pm.n_ctx.map(u64::from);
     let who = part.who(&pm.id);
     match decide_preflight(&pm.id, pm.identifier.as_deref(), pm.n_ctx.unwrap_or(0), loaded) {
-        PreflightDecision::LoadFresh { foreign_identifier: None } if part.is_work() => Some(format!(
+        // Every planned model is loaded before the run's timed section ends,
+        // the utility model included (`prepare_compactor`), so an absent one
+        // is a load inside the measurement.
+        PreflightDecision::LoadFresh { foreign_identifier: None } => Some(format!(
             "{who} (ctx {}) but it is not among the currently loaded models: the dispatch loads a \
              new instance, so this run's wall-clock includes a model load and is not comparable \
              to a warm run.",
             declared.map_or_else(|| "unset".to_string(), |v| v.to_string()),
         )),
-        // A missing utility model is common and not worth the noise.
-        PreflightDecision::LoadFresh { foreign_identifier: None } => None,
         PreflightDecision::Reuse { resident_ctx, .. } => declared.filter(|d| ctx_diverges(*d, resident_ctx)).map(|d| {
             format!(
                 "{who} at {d} ctx; the dispatch reuses the resident instance at {resident_ctx} \
@@ -525,6 +523,23 @@ mod tests {
         assert_eq!(local.utility.map(|u| (u.id, u.n_ctx)), Some(("qwen-4b".to_string(), Some(68000))));
     }
 
+    /// (#3678 review T2) A binding on a managed endpoint darkmux starts a
+    /// server for (Flint here) is still loaded on LM Studio by the crew's
+    /// compactor setup, so it is planned.
+    #[test]
+    fn a_utility_binding_on_a_server_endpoint_is_still_planned() {
+        let mut r: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+            "default_profile": "p",
+            "profiles": {"p": {"models": [{"id": "qwen-35b", "n_ctx": 262000}]}},
+            "endpoints": {"fl": {"managed": "flint", "port": 8092}},
+            "internal": {"utility": {"id": "qwen-4b", "n_ctx": 68000, "endpoint": "fl"}}
+        }))
+        .unwrap();
+        r.materialize_endpoints();
+        let plan = dispatch_plan(&r, None, "p");
+        assert_eq!(plan.utility.map(|u| (u.id, u.n_ctx)), Some(("qwen-4b".to_string(), Some(68000))));
+    }
+
     /// (#3678 R3) A binding with no declared window is loaded at the
     /// SELECTED model's window, not the default model's.
     #[test]
@@ -545,8 +560,8 @@ mod tests {
     }
 
     /// (#3678) The utility model is loaded whether or not the profile lists
-    /// it, so an undersized resident is a reload either way; a missing one
-    /// stays quiet, as a missing non-default model does.
+    /// it, so an undersized resident is a reload and a missing one is a load,
+    /// both inside the run's measurement (#3678 review T1).
     #[test]
     fn an_unlisted_utility_model_is_judged_too() {
         let p = profile(vec![pm("qwen-35b", 262000)]);
@@ -556,7 +571,9 @@ mod tests {
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("utility model `qwen-4b`") && w[0].contains("loads a new instance"), "{}", w[0]);
         loaded.pop();
-        assert!(planned_envelope_warnings(&p, "deep", &bound, &loaded, &[], None).is_empty());
+        let w = planned_envelope_warnings(&p, "deep", &bound, &loaded, &[], None);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("utility model `qwen-4b`") && w[0].contains("not among the currently loaded"), "{}", w[0]);
     }
 
     /// (#3678) Capability scoring can select a non-default model. The check
