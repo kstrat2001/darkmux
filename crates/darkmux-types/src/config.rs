@@ -1107,10 +1107,11 @@ pub struct RuntimeBehaviorConfig {
     /// (a non-thinking model's single 10000-token call outlasting the
     /// inactivity watchdog).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub generation_checkpoint_interval_tokens: Option<u32>,
-    /// (#2190) Per-dispatch budget for intra-turn stall recoveries — how
-    /// many times the runtime drops a useless turn (empty `tool_calls`, or
-    /// a runaway-reasoning cut) and nudges before escalating out of local-
-    /// tier. Absent = the runtime's built-in default (`MAX_STALL_RECOVERIES`
+    /// (#2190) Per-dispatch budget for intra-turn stall recoveries: each
+    /// useless turn (empty `tool_calls`, or a runaway-reasoning cut) the
+    /// runtime drops and nudges counts one, each productive turn pays one
+    /// back (#2229), and the dispatch escalates out of local-tier when the
+    /// count reaches it. Absent = the runtime's built-in default (`MAX_STALL_RECOVERIES`
     /// = 2). Surfaced live: a Devstral dispatch hit the SAME shape three
     /// turns running at ~19k context and died with a hard-coded budget of
     /// 2 with no operator override available.

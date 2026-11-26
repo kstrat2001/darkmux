@@ -1624,7 +1624,38 @@ fn removed_radio_router_staffing_status(role_binding: Option<&str>) -> Check {
 /// failed), so this check can never drift from what the page shows.
 fn check_unpriceable_residents() -> Check {
     let ledger = darkmux_profiles::engine::local().ledger();
-    unpriceable_residents_status(&ledger.models)
+    resident_pricing_status(&ledger.residents_read, &ledger.messages, &ledger.models)
+}
+
+/// (#3616) The pricing row by how the ledger came by its residents. Never
+/// "every resident model is priceable" when it has no list: a failed read
+/// warns naming why; an engine that does not report residents (asked
+/// nothing, so nothing is wrong) is not applicable, whatever else the
+/// machine probes said.
+fn resident_pricing_status(
+    read: &darkmux_profiles::model_ledger::ResidentsRead,
+    messages: &[darkmux_profiles::model_ledger::LedgerMessage],
+    models: &[darkmux_profiles::model_ledger::ModelRow],
+) -> Check {
+    use darkmux_profiles::model_ledger::ResidentsRead;
+    match read {
+        ResidentsRead::Listed => unpriceable_residents_status(models),
+        ResidentsRead::NotReported(why) => not_applicable("resident pricing", why),
+        ResidentsRead::Unknown => residents_unknown_status(messages),
+    }
+}
+
+/// The pricing row when reading the residents failed: a warning naming the
+/// ledger's warn and error messages.
+fn residents_unknown_status(messages: &[darkmux_profiles::model_ledger::LedgerMessage]) -> Check {
+    use darkmux_profiles::model_ledger::Severity;
+    let why: Vec<&str> = messages.iter().filter(|m| m.severity != Severity::Info).map(|m| m.text.as_str()).collect();
+    Check {
+        name: "resident pricing".into(),
+        status: Status::Warn,
+        message: format!("could not read the resident models, so their pricing is not checked: {}", why.join("; ")),
+        hint: Some("`darkmux machine resources` shows the same ledger and every message behind it.".into()),
+    }
 }
 
 /// Pure decision for [`check_unpriceable_residents`], split out so every arm
@@ -3202,9 +3233,9 @@ fn check_max_stall_recoveries() -> Check {
         name: name.into(),
         status: Status::Pass,
         message: format!(
-            "{shown} recoveries ({provenance}) — how many useless turns (empty tool_calls, \
-             or a runaway-reasoning cut) the runtime tolerates before escalating out of \
-             local-tier (#2190)"
+            "{shown} recoveries ({provenance}): each useless turn (empty tool_calls, or a \
+             runaway-reasoning cut) counts one and each productive turn pays one back; the \
+             dispatch escalates out of local-tier when the count reaches this (#2190, #2229)"
         ),
         hint: None,
     }
@@ -14735,6 +14766,38 @@ mod tests {
         let c = super::unpriceable_residents_status(&[]);
         assert_eq!(c.status, Status::Pass);
         assert!(c.message.contains("priceable"));
+    }
+
+    /// (#3616) When the resident list could not be read, the row says so
+    /// instead of claiming every resident is priceable.
+    #[test]
+    fn unknown_residents_warn_naming_why() {
+        use darkmux_profiles::model_ledger::{LedgerMessage, ResidentsRead};
+        let c = super::resident_pricing_status(&ResidentsRead::Unknown, &[LedgerMessage::warn("`lms ps` timed out after 5s")], &[]);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("`lms ps` timed out after 5s"), "{}", c.message);
+        assert!(!c.message.contains("every resident model is priceable"), "{}", c.message);
+    }
+
+    /// (#3616 review) An engine that does not report what it holds was never
+    /// asked: not applicable, naming its own reason, even when a machine
+    /// probe failed beside it.
+    #[test]
+    fn residents_an_engine_does_not_report_are_not_applicable() {
+        use darkmux_profiles::model_ledger::{LedgerMessage, ResidentsRead};
+        let why = "`local-8080` does not report which models it has loaded";
+        let messages = [LedgerMessage::info(why), LedgerMessage::error("`ps -axo pid=,rss=,command=` timed out after 2s")];
+        let c = super::resident_pricing_status(&ResidentsRead::NotReported(why.into()), &messages, &[]);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("not applicable") && c.message.contains(why), "{}", c.message);
+    }
+
+    #[test]
+    fn listed_residents_are_judged_by_their_pricing() {
+        use darkmux_profiles::model_ledger::ResidentsRead;
+        let c = super::resident_pricing_status(&ResidentsRead::Listed, &[], &[row("m", None)]);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("unpriceable"), "{}", c.message);
     }
 
     #[test]

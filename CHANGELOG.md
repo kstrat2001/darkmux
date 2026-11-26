@@ -33,6 +33,11 @@ darkmux release.
   every other verb that reads the index failed with it. The rebuild now skips that phase with one
   warning naming the missing or unreadable `mission.json`, and indexes everything else.
 
+- **`darkmux doctor`'s `resident pricing` row no longer passes when it could not read the residents
+  (#3616).** When the resident list could not be read (a timed-out `lms ps`, say), the row said "every
+  resident model is priceable". It now warns, naming why; on an engine that does not report what it
+  holds, it is not applicable.
+
 - **`lab run` warns about a model load when the run's dispatch will load one, and only then (#3678).**
   The envelope check judged every model the profile lists, each at the `n_ctx` the profile gives it,
   so it warned that the utility model would reload when it would not and missed loads it would make.
