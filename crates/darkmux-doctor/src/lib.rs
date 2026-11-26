@@ -7435,45 +7435,42 @@ fn unix_now_ms() -> u64 {
 }
 
 /// The latest release tag: the cached one while it is fresh at `now_ms` and
-/// not older than `installed` (an upgrade past it means a newer release
-/// exists), else `fetch`'s, which is then cached. A failed fetch is never
-/// cached, so the next run asks again.
+/// was fetched by this same `installed` version (an upgrade asks again, so it
+/// never reads an older "latest released"), else `fetch`'s, which is then
+/// cached. A failed fetch is never cached, so the next run asks again.
 fn latest_release_tag_cached(
     cache: &std::path::Path,
     now_ms: u64,
     installed: &str,
     fetch: impl FnOnce() -> Result<String, String>,
 ) -> Result<String, String> {
-    let cached = std::fs::read_to_string(cache).ok().and_then(|t| fresh_cached_tag(&t, now_ms));
-    if let Some(tag) = cached.filter(|tag| !older_than(tag, installed)) {
+    if let Some(tag) = std::fs::read_to_string(cache).ok().and_then(|t| fresh_cached_tag(&t, now_ms, installed)) {
         return Ok(tag);
     }
     let tag = fetch()?;
-    let _ = write_release_check_cache(cache, &tag, now_ms);
+    let _ = write_release_check_cache(cache, &tag, now_ms, installed);
     Ok(tag)
 }
 
-/// Whether release `tag` is older than `installed`; unparseable is not older.
-fn older_than(tag: &str, installed: &str) -> bool {
-    matches!((parse_semver(tag), parse_semver(installed)), (Some(t), Some(i)) if t < i)
-}
-
 /// The cached tag in `text` when it was fetched less than
-/// [`RELEASE_CHECK_CACHE_MS`] before `now_ms`. A stamp after `now_ms` (the
-/// clock went back) is not fresh.
-fn fresh_cached_tag(text: &str, now_ms: u64) -> Option<String> {
+/// [`RELEASE_CHECK_CACHE_MS`] before `now_ms` by this same `installed`
+/// version. A stamp after `now_ms` (the clock went back) is not fresh.
+fn fresh_cached_tag(text: &str, now_ms: u64, installed: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if v.get("installed")?.as_str()? != installed {
+        return None;
+    }
     let at = v.get("fetched_at_ms")?.as_u64()?;
     let tag = v.get("tag")?.as_str()?;
     let age = now_ms.checked_sub(at)?;
     (age < RELEASE_CHECK_CACHE_MS).then(|| tag.to_string())
 }
 
-fn write_release_check_cache(cache: &std::path::Path, tag: &str, now_ms: u64) -> std::io::Result<()> {
+fn write_release_check_cache(cache: &std::path::Path, tag: &str, now_ms: u64, installed: &str) -> std::io::Result<()> {
     if let Some(dir) = cache.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(cache, serde_json::json!({"tag": tag, "fetched_at_ms": now_ms}).to_string())
+    std::fs::write(cache, serde_json::json!({"tag": tag, "fetched_at_ms": now_ms, "installed": installed}).to_string())
 }
 
 /// Shell out to `curl` for the GitHub releases API. Avoids adding a
@@ -8584,6 +8581,24 @@ mod tests {
         assert_eq!(upgraded.as_deref(), Ok("5.13.0"));
         let same = super::latest_release_tag_cached(&cache, T0 + 2, "5.13.0", || panic!("current: no fetch"));
         assert_eq!(same.as_deref(), Ok("5.13.0"));
+    }
+
+    /// (#3701 review) A build ahead of the latest release (a release being
+    /// dogfooded before it is published) still asks GitHub once an hour, not
+    /// on every run.
+    #[test]
+    fn a_build_ahead_of_the_latest_release_fetches_once_an_hour() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("release-check.json");
+        let fetches = std::cell::Cell::new(0);
+        for i in 0..5 {
+            let tag = super::latest_release_tag_cached(&cache, T0 + i, "5.13.0", || {
+                fetches.set(fetches.get() + 1);
+                Ok("5.12.0".into())
+            });
+            assert_eq!(tag.as_deref(), Ok("5.12.0"));
+        }
+        assert_eq!(fetches.get(), 1);
     }
 
     #[test]
