@@ -413,8 +413,13 @@ impl<'a> AgentLoop<'a> {
         // `promote_terminal_reasoning` strips before this line but returns
         // to its caller for exactly this reason. See the detector's
         // firing site below for the actual condition.
-        self.enforce_pre_send_bound();
-        let sent = self.send(&bound)?;
+        // (#3679) A request the bound already judged unfittable is still
+        // sent (its estimate errs high on purpose, and the endpoint's real
+        // window may be larger than the profile declares), but if the
+        // endpoint then fails it, the error leads with darkmux's reason, worded
+        // as a condition: the failure may be something else (a dead endpoint).
+        let unfit = self.enforce_pre_send_bound();
+        let sent = self.send(&bound).map_err(|e| with_unfit_reason(e, unfit.as_deref()))?;
         let call = self.read_response(bound, sent)?;
         self.route(call)
     }
@@ -903,7 +908,7 @@ impl<'a> AgentLoop<'a> {
 
     // ─── the pre-send bound ──────────────────────────────────────────────
 
-    fn enforce_pre_send_bound(&mut self) {
+    fn enforce_pre_send_bound(&mut self) -> Option<String> {
         // (#2792) PRE-SEND BOUND. The last thing before the request is built:
         // is what is about to go out actually inside the window the profile
         // DECLARES?
@@ -923,9 +928,7 @@ impl<'a> AgentLoop<'a> {
         // every single request. Budgeting without it certified `fits: true`
         // on a body 36% over the window, which is the defect this bound
         // exists to prevent, wearing a record that says it was checked.
-        let Some(window) = self.cfg.context_window else {
-            return;
-        };
+        let window = self.cfg.context_window?;
         // Serialized inside the guard, not above it: it is used nowhere
         // else, and hoisting it cost a ~12KB serialization every turn on
         // dispatches that declare no window at all.
@@ -943,7 +946,7 @@ impl<'a> AgentLoop<'a> {
         // instead, so only this turn's new characters are guessed.
         let before_tokens = estimate_prompt_tokens(sys_c + prompt_c, tools_bytes, self.state.prompt_anchor);
         if before_tokens <= window {
-            return;
+            return None;
         }
         let prompt_anchor = self.state.prompt_anchor;
         // Derived by INVERTING the same estimator the line above
@@ -977,9 +980,7 @@ impl<'a> AgentLoop<'a> {
                 stats.bytes_reclaimed
             );
         }
-        if !fits {
-            self.report_unfittable_request(after_tokens, window, stats.results_trimmed);
-        }
+        let unfit = (!fits).then(|| self.report_unfittable_request(after_tokens, window, stats.results_trimmed));
         self.trajectory.append_pre_send_bound(
             // (#2792 round-2) `turns` has NOT been incremented yet at
             // this point — the sequence for this request is computed
@@ -992,9 +993,12 @@ impl<'a> AgentLoop<'a> {
             window,
             stats.results_trimmed,
         );
+        unfit
     }
 
-    fn report_unfittable_request(&self, after_tokens: u32, window: u32, results_trimmed: usize) {
+    /// Say the request does not fit, and return the reason a failed send
+    /// carries (#3679).
+    fn report_unfittable_request(&self, after_tokens: u32, window: u32, results_trimmed: usize) -> String {
         // Say WHICH fact is true. An earlier revision always
         // claimed "the weight is not in tool results", which was
         // a false factual claim on the shape where every result
@@ -1051,6 +1055,7 @@ impl<'a> AgentLoop<'a> {
              request may still fit; if the endpoint refuses it, raise the \
              profile's n_ctx or reduce what this role puts in context. (#2792)"
         );
+        unfit_reason(after_tokens, window)
     }
 
     // ─── the call ────────────────────────────────────────────────────────
