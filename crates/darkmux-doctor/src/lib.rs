@@ -7409,7 +7409,7 @@ fn check_darkmux_version_vs_latest_release() -> Check {
         return skip("update check disabled (DARKMUX_CHECK_UPDATES / config)");
     }
 
-    match latest_release_tag_cached(&release_check_cache_path(), unix_now_ms(), fetch_latest_release_tag) {
+    match latest_release_tag_cached(&release_check_cache_path(), unix_now_ms(), installed, fetch_latest_release_tag) {
         Ok(latest) => classify_version_vs_latest(installed, &latest, NAME),
         Err(reason) => skip(&reason),
     }
@@ -7417,10 +7417,10 @@ fn check_darkmux_version_vs_latest_release() -> Check {
 
 /// (#1603) How long a fetched release tag is reused before doctor asks GitHub
 /// again. Unauthenticated, the API allows 60 requests an hour per IP, and
-/// doctor in a loop or behind a panel would spend them. Six hours is the
-/// Homebrew tap's own sync cadence (its `sync-from-upstream` runs every six
-/// hours), so a release cannot reach `brew upgrade` sooner than this anyway.
-const RELEASE_CHECK_CACHE_MS: u64 = 6 * 60 * 60 * 1000;
+/// doctor in a loop or behind a panel would spend them: an hour holds any loop
+/// to one call an hour, and a release (whose tap sync is dispatched at once)
+/// still shows within the hour.
+const RELEASE_CHECK_CACHE_MS: u64 = 60 * 60 * 1000;
 
 /// Where the last fetched release tag is kept: darkmux's own run state, not
 /// a user file.
@@ -7434,20 +7434,28 @@ fn unix_now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// The latest release tag: the cached one while it is fresh at `now_ms`,
-/// else `fetch`'s, which is then cached. A failed fetch is never cached, so
-/// the next run asks again.
+/// The latest release tag: the cached one while it is fresh at `now_ms` and
+/// not older than `installed` (an upgrade past it means a newer release
+/// exists), else `fetch`'s, which is then cached. A failed fetch is never
+/// cached, so the next run asks again.
 fn latest_release_tag_cached(
     cache: &std::path::Path,
     now_ms: u64,
+    installed: &str,
     fetch: impl FnOnce() -> Result<String, String>,
 ) -> Result<String, String> {
-    if let Some(tag) = std::fs::read_to_string(cache).ok().and_then(|t| fresh_cached_tag(&t, now_ms)) {
+    let cached = std::fs::read_to_string(cache).ok().and_then(|t| fresh_cached_tag(&t, now_ms));
+    if let Some(tag) = cached.filter(|tag| !older_than(tag, installed)) {
         return Ok(tag);
     }
     let tag = fetch()?;
     let _ = write_release_check_cache(cache, &tag, now_ms);
     Ok(tag)
+}
+
+/// Whether release `tag` is older than `installed`; unparseable is not older.
+fn older_than(tag: &str, installed: &str) -> bool {
+    matches!((parse_semver(tag), parse_semver(installed)), (Some(t), Some(i)) if t < i)
 }
 
 /// The cached tag in `text` when it was fetched less than
@@ -8548,9 +8556,9 @@ mod tests {
     fn a_fresh_cached_tag_is_reused_without_a_fetch() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("run").join("release-check.json");
-        let first = super::latest_release_tag_cached(&cache, T0, || Ok("5.12.0".into()));
+        let first = super::latest_release_tag_cached(&cache, T0, "5.12.0", || Ok("5.12.0".into()));
         assert_eq!(first.as_deref(), Ok("5.12.0"));
-        let again = super::latest_release_tag_cached(&cache, T0 + super::RELEASE_CHECK_CACHE_MS - 1, || panic!("a fresh tag needs no fetch"));
+        let again = super::latest_release_tag_cached(&cache, T0 + super::RELEASE_CHECK_CACHE_MS - 1, "5.12.0", || panic!("a fresh tag needs no fetch"));
         assert_eq!(again.as_deref(), Ok("5.12.0"));
     }
 
@@ -8558,21 +8566,34 @@ mod tests {
     fn a_stale_or_future_stamped_tag_is_fetched_again() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("release-check.json");
-        super::latest_release_tag_cached(&cache, T0, || Ok("5.12.0".into())).unwrap();
-        let stale = super::latest_release_tag_cached(&cache, T0 + super::RELEASE_CHECK_CACHE_MS, || Ok("5.13.0".into()));
+        super::latest_release_tag_cached(&cache, T0, "5.12.0", || Ok("5.12.0".into())).unwrap();
+        let stale = super::latest_release_tag_cached(&cache, T0 + super::RELEASE_CHECK_CACHE_MS, "5.12.0", || Ok("5.13.0".into()));
         assert_eq!(stale.as_deref(), Ok("5.13.0"), "a stale tag is refetched and recached");
-        let back = super::latest_release_tag_cached(&cache, T0 - 1, || Ok("5.12.1".into()));
+        let back = super::latest_release_tag_cached(&cache, T0 - 1, "5.12.0", || Ok("5.12.1".into()));
         assert_eq!(back.as_deref(), Ok("5.12.1"), "a clock that went back refetches");
+    }
+
+    /// (#3701 review) After an upgrade past the cached tag, the cache cannot
+    /// say what the latest release is, so it asks again.
+    #[test]
+    fn a_cached_tag_older_than_the_installed_version_is_fetched_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("release-check.json");
+        super::latest_release_tag_cached(&cache, T0, "5.12.0", || Ok("5.12.0".into())).unwrap();
+        let upgraded = super::latest_release_tag_cached(&cache, T0 + 1, "5.13.0", || Ok("5.13.0".into()));
+        assert_eq!(upgraded.as_deref(), Ok("5.13.0"));
+        let same = super::latest_release_tag_cached(&cache, T0 + 2, "5.13.0", || panic!("current: no fetch"));
+        assert_eq!(same.as_deref(), Ok("5.13.0"));
     }
 
     #[test]
     fn a_failed_fetch_is_not_cached_and_garbage_is_ignored() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("release-check.json");
-        assert!(super::latest_release_tag_cached(&cache, T0, || Err("offline".into())).is_err());
+        assert!(super::latest_release_tag_cached(&cache, T0, "5.12.0", || Err("offline".into())).is_err());
         assert!(!cache.exists(), "nothing is cached on a failure");
         std::fs::write(&cache, "not json").unwrap();
-        let fetched = super::latest_release_tag_cached(&cache, T0, || Ok("5.12.0".into()));
+        let fetched = super::latest_release_tag_cached(&cache, T0, "5.12.0", || Ok("5.12.0".into()));
         assert_eq!(fetched.as_deref(), Ok("5.12.0"));
     }
 
