@@ -28,11 +28,15 @@ darkmux release.
 
 ### Fixed
 
-- **`lab run` no longer warns that the utility model will reload when it won't (#3678).** The envelope
-  check judged the `internal.utility` model at the `n_ctx` the profile lists it with, but a dispatch
-  loads it at the binding's own window (or, with none declared, the default model's). So a utility
-  model resident at its binding's window was reported as reloading. It is now judged at that window.
-  The notes also read without a stray ` : `.
+- **`lab run` warns about a model load exactly when the run's dispatch will load one (#3678).** The
+  envelope check judged every model the profile lists, each at the `n_ctx` the profile gives it, so it
+  warned that the utility model would reload when it would not and missed loads it would make. It now
+  asks the resolution the dispatch asks: the model the run's role selects (a non-default one when
+  capability scoring picks it), and the `internal.utility` model at the window the dispatch loads it
+  at, which is the binding's `n_ctx`, else the selected model's. The binding may be written
+  `darkmux:<key>`. When the utility model is also the work model, it is judged at the larger of the
+  two windows, since the dispatch ends with it resident at least that large. A model the dispatch
+  does not touch gets no note. The notes also read without a stray ` : `.
 
 ## [5.12.0] - 2026-11-21
 

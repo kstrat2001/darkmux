@@ -25,78 +25,189 @@ use darkmux_profiles::engine::server::EngineServer;
 use darkmux_profiles::envelope::ctx_diverges;
 use darkmux_types::{EndpointKind, LoadedModel, ManagedBackend, Profile, ProfileModel};
 
-/// Compare the requested profile's declared model envelope against what
-/// LMStudio actually has loaded, returning operator-facing warning lines
+/// (#3678) What one lab run's dispatch makes resident, resolved before the
+/// run by the resolution the dispatch itself runs ([`dispatch_plan`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DispatchPlan {
+    /// The model the dispatch runs on, and the role that selects it. `None`
+    /// when no role or no selection resolved (a provider that names no single
+    /// role, or a profile that selects nothing, which fails the dispatch
+    /// itself): the profile's default model stands in, as before #3678.
+    pub work: Option<(ProfileModel, String)>,
+    /// The `internal.utility` binding, when the dispatch loads it on LM Studio.
+    pub utility: Option<UtilityPlan>,
+}
+
+/// (#3678) The `internal.utility` binding: its id as written and its
+/// declared window.
+#[derive(Debug, Clone)]
+pub(crate) struct UtilityPlan {
+    pub id: String,
+    pub n_ctx: Option<u32>,
+}
+
+/// (#3678) The plan for a lab dispatch of `role` on `profile_name`, from
+/// crew's own resolvers: `resolve_in` with `--profile` given (so
+/// `role_profiles` is never consulted and `mapped` is `None`) and the lab's
+/// utility opt-in (`allow_utility_model: true`, as every lab provider sets
+/// it), and `utility_target_in` for the binding.
+pub(crate) fn dispatch_plan(
+    registry: &darkmux_types::ProfileRegistry,
+    role: Option<&darkmux_crew::types::Role>,
+    profile_name: &str,
+) -> DispatchPlan {
+    let work = role.and_then(|r| {
+        let t = darkmux_crew::target::resolve_in(registry, r, Some(profile_name), None, true).ok()?.target()?;
+        Some((t.model, r.id.clone()))
+    });
+    // A binding whose endpoint does not resolve fails the dispatch, so
+    // nothing loads for it; one on an unmanaged endpoint, or on a server
+    // darkmux starts, is no LM Studio load.
+    let utility = darkmux_crew::target::utility_target_in(registry)
+        .ok()
+        .flatten()
+        .filter(|u| u.kind.is_managed() && !u.kind.starts_servers())
+        .map(|u| UtilityPlan { id: u.id, n_ctx: u.n_ctx });
+    DispatchPlan { work, utility }
+}
+
+/// (#3678) One model the dispatch makes resident, at the window it ends
+/// resident at, and the part it plays.
+#[derive(Debug, Clone)]
+pub(crate) struct Planned {
+    pub model: ProfileModel,
+    pub part: Part,
+}
+
+/// The part a planned model plays in the dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Part {
+    /// The work model, the profile's default.
+    Default,
+    /// The work model, a non-default one the role (named) selects.
+    Selected(String),
+    /// The utility model, in an instance of its own.
+    Utility,
+    /// The work model is the utility model: one instance serves both.
+    Shared,
+}
+
+impl Part {
+    /// A work model's absence is a load worth a note; the utility model's
+    /// is common and quiet, as a missing non-default model always was.
+    fn is_work(&self) -> bool {
+        *self != Part::Utility
+    }
+
+    /// The note's subject, ahead of its window.
+    fn who(&self, id: &str) -> String {
+        match self {
+            Part::Default => format!("declares default model `{id}`"),
+            Part::Selected(role) => format!("declares model `{id}` for role `{role}`"),
+            Part::Utility => format!("runs utility model `{id}` (`internal.utility`)"),
+            Part::Shared => format!("runs model `{id}` as both work and utility model"),
+        }
+    }
+}
+
+/// (#3678) The models `plan`'s dispatch makes resident from `profile`: the
+/// work model, then the utility model at the window the dispatch loads it
+/// at, which is the binding's, else the work model's
+/// (`resolve_compactor_load_window`). With neither, compaction is refused
+/// and the utility model is not loaded.
+///
+/// When the two are one LM Studio instance, the dispatch's work preflight
+/// leaves it resident at no less than the work model's window, and its
+/// compactor preflight then reuses it when that is at least the binding's,
+/// else reloads it there (`decide_preflight`, sufficient means `>=`). So it
+/// ends resident at no less than the larger window, and a load happens
+/// exactly when the instance before the run is below that larger window:
+/// one judgment at the larger window is the two preflights' answer.
+pub(crate) fn planned_models(profile: &Profile, plan: &DispatchPlan) -> Vec<Planned> {
+    let work = work_model(profile, plan);
+    let Some(u) = &plan.utility else { return work.into_iter().collect() };
+    let window = u.n_ctx.or(work.as_ref().and_then(|w| w.model.n_ctx));
+    match work {
+        Some(w) if shares_instance(&w.model, &u.id) => {
+            let n_ctx = w.model.n_ctx.max(window);
+            vec![Planned { model: ProfileModel { n_ctx, ..w.model }, part: Part::Shared }]
+        }
+        work => work.into_iter().chain(window.map(|n| utility_model(&u.id, n))).collect(),
+    }
+}
+
+/// The work model: the plan's selection, else the profile's default.
+fn work_model(profile: &Profile, plan: &DispatchPlan) -> Option<Planned> {
+    let default_id = profile.default_model_id();
+    let Some((model, role)) = &plan.work else {
+        let model = profile.models.iter().find(|m| Some(m.id.as_str()) == default_id)?;
+        return Some(Planned { model: model.clone(), part: Part::Default });
+    };
+    let part = if Some(model.id.as_str()) == default_id { Part::Default } else { Part::Selected(role.clone()) };
+    Some(Planned { model: model.clone(), part })
+}
+
+/// The utility model as the dispatch loads it: its id at `n_ctx`, no
+/// identifier opt-out (crew's `utility_residency_pm`).
+fn utility_model(id: &str, n_ctx: u32) -> Planned {
+    let model = ProfileModel { id: id.to_string(), n_ctx: Some(n_ctx), ..Default::default() };
+    Planned { model, part: Part::Utility }
+}
+
+/// Whether the work model's LM Studio instance is the utility model's: the
+/// same bare key (`names_utility_model`) addressed by the same identifier
+/// (the compactor's is always `darkmux:<key>`, `compactor_wire_model_id`).
+fn shares_instance(work: &ProfileModel, utility_id: &str) -> bool {
+    let bare = darkmux_gestalt::bare_model_key;
+    let identifier = |key, explicit| darkmux_gestalt::namespaced_identifier(bare(key), explicit);
+    on_lm_studio(work)
+        && darkmux_crew::select::names_utility_model(&work.id, utility_id)
+        && identifier(&work.id, work.identifier.as_deref()) == identifier(utility_id, None)
+}
+
+/// Whether darkmux loads `pm` on LM Studio (managed, and not on an engine
+/// darkmux starts servers for).
+pub(crate) fn on_lm_studio(pm: &ProfileModel) -> bool {
+    pm.is_managed() && !pm.endpoint_kind().is_ok_and(|k| k.starts_servers())
+}
+
+/// Compare the models the run's dispatch makes resident ([`planned_models`])
+/// against what is resident now, returning operator-facing warning lines
 /// (empty when everything lines up — or when `loaded` is empty and we
 /// can't tell). Pure: the caller owns the best-effort `lms ps` query and
 /// the printing.
 ///
-/// One line per preflight outcome worth knowing: a load inside the run (default
+/// One line per preflight outcome worth knowing: a load inside the run (work
 /// model absent, resident undersized, or only a foreign copy resident), or a
 /// reuse of a materially larger darkmux-owned resident.
 pub(crate) fn envelope_warnings(
-    profile: &Profile,
+    planned: &[Planned],
     profile_name: &str,
     loaded: &[LoadedModel],
     servers: &[EngineServer],
     recs_own: Option<&str>,
 ) -> Vec<String> {
-    envelope_warnings_with_utility(profile, profile_name, loaded, servers, recs_own, None)
-}
-
-/// (#3678) The machine's `internal.utility` binding: its model id and its
-/// declared window. The dispatch makes that model resident at the binding's
-/// window (or, with none declared, the default model's), never at the
-/// `n_ctx` a profile lists it with.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct UtilityBinding<'a> {
-    pub id: &'a str,
-    pub n_ctx: Option<u32>,
-}
-
-/// [`envelope_warnings`], judging the utility model (when the profile lists
-/// it) at the window the dispatch loads it at.
-pub(crate) fn envelope_warnings_with_utility(
-    profile: &Profile,
-    profile_name: &str,
-    loaded: &[LoadedModel],
-    servers: &[EngineServer],
-    recs_own: Option<&str>,
-    utility: Option<UtilityBinding<'_>>,
-) -> Vec<String> {
-    // (#590) Only the default model (default_model, or first model) is
-    // load-bearing for the measurement envelope.
-    let default_id = profile.default_model_id();
-    profile
-        .models
+    planned
         .iter()
         // (#1282, #2902) Only a model darkmux manages has a loaded LM Studio
         // envelope to validate.
-        .filter(|pm| pm.is_managed())
-        .filter_map(|pm| {
-            let is_default = Some(pm.id.as_str()) == default_id;
+        .filter(|p| p.model.is_managed())
+        .filter_map(|p| {
             // (#3450) A model on an endpoint darkmux starts servers for is
             // resident as darkmux's server there, never as an LM Studio load.
-            if pm.endpoint_kind().is_ok_and(|k| k.starts_servers()) {
-                return is_default.then(|| server_note(pm, servers, recs_own)).flatten();
+            // Only the work model can be one ([`dispatch_plan`]).
+            if !on_lm_studio(&p.model) {
+                return server_note(&p.model, &p.part.who(&p.model.id), servers, recs_own);
             }
-            lms_note(&as_loaded_by_dispatch(pm, utility, profile), is_default, loaded)
+            lms_note(&p.model, &p.part, loaded)
         })
         .map(|n| format!("requested profile `{profile_name}` {n}"))
         .collect()
 }
 
-/// `pm` with the window the dispatch loads it at: the utility binding's
-/// (else the default model's) when `pm` is the utility model, else its own.
-fn as_loaded_by_dispatch(pm: &ProfileModel, utility: Option<UtilityBinding<'_>>, profile: &Profile) -> ProfileModel {
-    let Some(u) = utility.filter(|u| u.id == pm.id) else { return pm.clone() };
-    let default_ctx = || profile.default_model_id().and_then(|d| profile.models.iter().find(|m| m.id == d)).and_then(|m| m.n_ctx);
-    ProfileModel { n_ctx: u.n_ctx.or_else(default_ctx), ..pm.clone() }
-}
-
 /// The note for an LM Studio model, from what the dispatch's residency
 /// preflight will do with `loaded`.
-fn lms_note(pm: &ProfileModel, is_default: bool, loaded: &[LoadedModel]) -> Option<String> {
+fn lms_note(pm: &ProfileModel, part: &Part, loaded: &[LoadedModel]) -> Option<String> {
     // Empty means either nothing is loaded or `lms ps` couldn't be
     // queried — in both cases we can't validate, so stay quiet rather
     // than crying "primary not loaded" against a set we don't trust.
@@ -106,34 +217,30 @@ fn lms_note(pm: &ProfileModel, is_default: bool, loaded: &[LoadedModel]) -> Opti
     // (F1, 5.0 dogfood) The dispatch preflight's own decision function
     // owns the reuse/reload/load rule; this check reports it (#2985).
     let declared = pm.n_ctx.map(u64::from);
+    let who = part.who(&pm.id);
     match decide_preflight(&pm.id, pm.identifier.as_deref(), pm.n_ctx.unwrap_or(0), loaded) {
-        PreflightDecision::LoadFresh { foreign_identifier: None } if is_default => Some(format!(
-            "declares default model `{}` (ctx {}) but it is not among the currently loaded \
-             models: the dispatch loads a new instance, so this run's wall-clock includes a \
-             model load and is not comparable to a warm run.",
-            pm.id,
+        PreflightDecision::LoadFresh { foreign_identifier: None } if part.is_work() => Some(format!(
+            "{who} (ctx {}) but it is not among the currently loaded models: the dispatch loads a \
+             new instance, so this run's wall-clock includes a model load and is not comparable \
+             to a warm run.",
             declared.map_or_else(|| "unset".to_string(), |v| v.to_string()),
         )),
-        // A missing non-default model is common and not worth the noise.
+        // A missing utility model is common and not worth the noise.
         PreflightDecision::LoadFresh { foreign_identifier: None } => None,
-        PreflightDecision::Reuse { resident_ctx, .. } => declared
-            .filter(|d| ctx_diverges(*d, resident_ctx))
-            .map(|d| {
-                format!(
-                    "declares model `{}` at {d} ctx; the dispatch reuses the resident instance \
-                     at {resident_ctx} (larger than the declared {d}), so the run measures the \
-                     larger window and pays no model load.",
-                    pm.id,
-                )
-            }),
+        PreflightDecision::Reuse { resident_ctx, .. } => declared.filter(|d| ctx_diverges(*d, resident_ctx)).map(|d| {
+            format!(
+                "{who} at {d} ctx; the dispatch reuses the resident instance at {resident_ctx} \
+                 (larger than the declared {d}), so the run measures the larger window and pays \
+                 no model load.",
+            )
+        }),
         // Without a declared window there is nothing to compare; an
         // unreported resident ctx (0) is insufficient, so it reloads.
         PreflightDecision::Reload { stale_ctx, .. } => declared.map(|d| {
             format!(
-                "declares model `{}` at {d} ctx but the resident instance is at {stale_ctx}: \
-                 the dispatch unloads it and loads a new instance at the declared window, \
-                 so this run's wall-clock includes a model load.",
-                pm.id,
+                "{who} at {d} ctx but the resident instance is at {stale_ctx}: the dispatch \
+                 unloads it and loads a new instance at the declared window, so this run's \
+                 wall-clock includes a model load.",
             )
         }),
         PreflightDecision::LoadFresh { foreign_identifier: Some(foreign_identifier) } => Some(format!(
@@ -145,18 +252,18 @@ fn lms_note(pm: &ProfileModel, is_default: bool, loaded: &[LoadedModel]) -> Opti
     }
 }
 
-/// (#3450) The note for a default model on an engine server: none when
-/// darkmux's server on its endpoint runs it at its declared window.
+/// (#3450) The note for a work model on an engine server: none when
+/// darkmux's server on its endpoint runs it at its declared window. `who`
+/// is the note's subject ([`Part::who`]).
 /// (#3574) With rec's own server up (at `recs_own`, from `rec status`), a
 /// Flint model's dispatch in a lab run is refused, which is the note.
-fn server_note(pm: &ProfileModel, servers: &[EngineServer], recs_own: Option<&str>) -> Option<String> {
+fn server_note(pm: &ProfileModel, who: &str, servers: &[EngineServer], recs_own: Option<&str>) -> Option<String> {
     let endpoint = pm.endpoint.as_ref().and_then(|e| e.named_id()).unwrap_or_default();
     if let Some(address) = recs_own_up(pm, servers, recs_own) {
         return Some(format!(
-            "declares default model `{}` on Flint endpoint `{endpoint}`, where rec's own server is up (at \
+            "{who} on Flint endpoint `{endpoint}`, where rec's own server is up (at \
              {address}): {}, and darkmux starts no server beside rec's, so the dispatch is refused \
              (`engine_in_use`). Run `rec stop` first.",
-            pm.id,
             darkmux_profiles::engine::flint::LAB_NEVER_REUSES,
         ));
     }
@@ -164,16 +271,15 @@ fn server_note(pm: &ProfileModel, servers: &[EngineServer], recs_own: Option<&st
     match servers.iter().find(|s| s.endpoint == endpoint && s.model == pm.id) {
         Some(s) if pm.n_ctx == Some(s.n_ctx) => None,
         Some(s) => Some(format!(
-            "declares default model `{}` at {declared} ctx; darkmux's server on endpoint `{endpoint}` runs it at \
+            "{who} at {declared} ctx; darkmux's server on endpoint `{endpoint}` runs it at \
              ctx {}: the dispatch restarts it at the declared window, so this run's wall-clock includes a model \
              start and is not comparable to a warm run.",
-            pm.id, s.n_ctx,
+            s.n_ctx,
         )),
         None => Some(format!(
-            "declares default model `{}` (ctx {declared}) on endpoint `{endpoint}`, where no server of darkmux's \
+            "{who} (ctx {declared}) on endpoint `{endpoint}`, where no server of darkmux's \
              runs it: the dispatch starts its server, so this run's wall-clock includes a model start and is not \
              comparable to a warm run.",
-            pm.id,
         )),
     }
 }
@@ -192,6 +298,30 @@ fn recs_own_up<'a>(pm: &ProfileModel, servers: &[EngineServer], recs_own: Option
 mod tests {
     use super::*;
     use darkmux_types::ProfileModel;
+
+    /// The warnings for `plan`'s dispatch on `profile`.
+    fn planned_envelope_warnings(
+        profile: &Profile,
+        profile_name: &str,
+        plan: &DispatchPlan,
+        loaded: &[LoadedModel],
+        servers: &[EngineServer],
+        recs_own: Option<&str>,
+    ) -> Vec<String> {
+        super::envelope_warnings(&planned_models(profile, plan), profile_name, loaded, servers, recs_own)
+    }
+
+    /// The warnings with no role resolved and no utility binding: the
+    /// profile's default model alone.
+    fn envelope_warnings(
+        profile: &Profile,
+        profile_name: &str,
+        loaded: &[LoadedModel],
+        servers: &[EngineServer],
+        recs_own: Option<&str>,
+    ) -> Vec<String> {
+        planned_envelope_warnings(profile, profile_name, &DispatchPlan::default(), loaded, servers, recs_own)
+    }
 
     fn pm(id: &str, n_ctx: u32) -> ProfileModel {
         ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
@@ -293,42 +423,169 @@ mod tests {
         assert!(w[0].contains("not among the currently loaded"));
     }
 
-    /// (#3678) The utility model is loaded at its binding's window, so a
-    /// resident at that window is no reload, whatever `n_ctx` the profile
-    /// lists it with (the 5.12.0 dogfood false warning).
+    /// (#3678) A plan whose work model is `work` (selected for role `coder`)
+    /// and whose utility binding is `utility` at its declared window.
+    fn plan(work: &ProfileModel, utility: Option<(&str, Option<u32>)>) -> DispatchPlan {
+        DispatchPlan {
+            work: Some((work.clone(), "coder".to_string())),
+            utility: utility.map(|(id, n_ctx)| UtilityPlan { id: id.to_string(), n_ctx }),
+        }
+    }
+
+    /// (#3678) The 5.12.0 dogfood case: the utility model is listed in the
+    /// profile at 120000 but bound at 68000 and resident at 68000, and the
+    /// default model is resident at its window. Nothing loads, so no note.
+    /// A binding above the resident's window does reload it.
     #[test]
-    fn the_utility_model_is_judged_at_its_bindings_window() {
+    fn dogfood_utility_resident_at_its_bindings_window_is_quiet() {
         let p = profile(vec![pm("qwen-35b", 262000), pm("qwen-4b", 120000)]);
         let loaded = [lm("darkmux:qwen-35b", "qwen-35b", 262000), lm("darkmux:qwen-4b", "qwen-4b", 68000)];
-        let bound = UtilityBinding { id: "qwen-4b", n_ctx: Some(68000) };
-        let w = envelope_warnings_with_utility(&p, "deep", &loaded, &[], None, Some(bound));
+        let w = planned_envelope_warnings(&p, "deep", &plan(&p.models[0], Some(("qwen-4b", Some(68000)))), &loaded, &[], None);
         assert!(w.is_empty(), "{w:?}");
-        let tighter = UtilityBinding { id: "qwen-4b", n_ctx: Some(120000) };
-        let w = envelope_warnings_with_utility(&p, "deep", &loaded, &[], None, Some(tighter));
+        let tighter = plan(&p.models[0], Some(("qwen-4b", Some(120000))));
+        let w = planned_envelope_warnings(&p, "deep", &tighter, &loaded, &[], None);
         assert_eq!(w.len(), 1, "a binding above the resident's window still reloads it: {w:?}");
+        assert!(w[0].contains("utility model `qwen-4b`"), "{}", w[0]);
         assert!(w[0].contains("at 120000 ctx but the resident instance is at 68000"), "{}", w[0]);
     }
 
-    /// (#3678) A binding with no declared window takes the default model's.
+    /// (#3678 R1) When the utility model is also the work model (the lab's
+    /// `allow_utility_model`), the dispatch makes it resident at the work
+    /// model's window AND at the binding's, so it ends at least the larger:
+    /// a resident at the binding's smaller window is reloaded.
     #[test]
-    fn a_windowless_binding_takes_the_default_models_window() {
-        let p = profile(vec![pm("qwen-35b", 262000), pm("qwen-4b", 120000)]);
-        let loaded = [lm("darkmux:qwen-35b", "qwen-35b", 262000), lm("darkmux:qwen-4b", "qwen-4b", 68000)];
-        let windowless = UtilityBinding { id: "qwen-4b", n_ctx: None };
-        let w = envelope_warnings_with_utility(&p, "deep", &loaded, &[], None, Some(windowless));
+    fn a_utility_model_that_is_the_work_model_is_judged_at_the_larger_window() {
+        let p = profile(vec![pm("qwen-4b", 120000)]);
+        let small = [lm("darkmux:qwen-4b", "qwen-4b", 68000)];
+        let w = planned_envelope_warnings(&p, "util", &plan(&p.models[0], Some(("qwen-4b", Some(68000)))), &small, &[], None);
         assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].contains("at 262000 ctx but the resident instance is at 68000"), "{}", w[0]);
+        assert!(w[0].contains("as both work and utility model"), "{}", w[0]);
+        assert!(w[0].contains("at 120000 ctx but the resident instance is at 68000"), "{}", w[0]);
+        // Resident at the larger window: both preflights reuse it.
+        let large = [lm("darkmux:qwen-4b", "qwen-4b", 120000)];
+        let w = planned_envelope_warnings(&p, "util", &plan(&p.models[0], Some(("qwen-4b", Some(68000)))), &large, &[], None);
+        assert!(w.is_empty(), "{w:?}");
     }
 
-    /// A non-default model that is not the utility model keeps its note: a
-    /// lab dispatch can select it (capability scoring), so its reload is real.
+    /// (#3678 R2) `internal.utility` may be written `darkmux:<key>`; the
+    /// dispatch compares bare keys, and so does the check.
     #[test]
-    fn a_non_default_non_utility_model_still_gets_its_reload_note() {
-        let p = profile(vec![pm("qwen-35b", 262000), pm("coder-30b", 120000)]);
-        let loaded = [lm("darkmux:qwen-35b", "qwen-35b", 262000), lm("darkmux:coder-30b", "coder-30b", 32000)];
-        let w = envelope_warnings_with_utility(&p, "deep", &loaded, &[], None, Some(UtilityBinding { id: "qwen-4b", n_ctx: Some(68000) }));
+    fn a_namespaced_utility_binding_names_its_bare_model() {
+        let p = profile(vec![pm("qwen-35b", 262000), pm("qwen-4b", 120000)]);
+        let loaded = [lm("darkmux:qwen-35b", "qwen-35b", 262000), lm("darkmux:qwen-4b", "qwen-4b", 68000)];
+        let bound = plan(&p.models[0], Some(("darkmux:qwen-4b", Some(68000))));
+        let w = planned_envelope_warnings(&p, "deep", &bound, &loaded, &[], None);
+        assert!(w.is_empty(), "the binding's window, not the profile's listing: {w:?}");
+        // The same spelling naming the work model: one instance, larger window.
+        let p = profile(vec![pm("qwen-4b", 68000)]);
+        let loaded = [lm("darkmux:qwen-4b", "qwen-4b", 68000)];
+        let shared = plan(&p.models[0], Some(("darkmux:qwen-4b", Some(120000))));
+        let w = planned_envelope_warnings(&p, "util", &shared, &loaded, &[], None);
         assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].contains("coder-30b") && w[0].contains("loads a new instance"), "{}", w[0]);
+        assert!(w[0].contains("as both work and utility model"), "{}", w[0]);
+        assert!(w[0].contains("at 120000 ctx but the resident instance is at 68000"), "{}", w[0]);
+    }
+
+    /// (#3678) A work model with its own `identifier` opt-out is an instance
+    /// apart from the utility model's `darkmux:<key>`, even on the same key:
+    /// each is judged on its own, so the utility instance's reload is noted
+    /// although the work instance is large enough for both windows.
+    #[test]
+    fn an_identifier_opt_out_work_model_is_not_the_utility_instance() {
+        let mut work = pm("qwen-4b", 120000);
+        work.identifier = Some("my-qwen".into());
+        let p = profile(vec![work]);
+        let mut loaded = vec![lm("my-qwen", "qwen-4b", 120000), lm("darkmux:qwen-4b", "qwen-4b", 32000)];
+        let bound = plan(&p.models[0], Some(("qwen-4b", Some(68000))));
+        let w = planned_envelope_warnings(&p, "util", &bound, &loaded, &[], None);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("utility model `qwen-4b`") && w[0].contains("resident instance is at 32000"), "{}", w[0]);
+        loaded[1].context = 68000;
+        assert!(planned_envelope_warnings(&p, "util", &bound, &loaded, &[], None).is_empty());
+    }
+
+    /// (#3678) Only a binding the dispatch loads on LM Studio is planned: one
+    /// on an unmanaged endpoint loads nothing.
+    #[test]
+    fn a_utility_binding_on_an_unmanaged_endpoint_is_not_planned() {
+        let registry = |endpoint: serde_json::Value| -> darkmux_types::ProfileRegistry {
+            let mut r: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+                "default_profile": "p",
+                "profiles": {"p": {"models": [{"id": "qwen-35b", "n_ctx": 262000}]}},
+                "endpoints": {"hosted": {"url": "https://example.com/v1"}},
+                "internal": {"utility": {"id": "qwen-4b", "n_ctx": 68000, "endpoint": endpoint}}
+            }))
+            .unwrap();
+            r.materialize_endpoints();
+            r
+        };
+        let hosted = dispatch_plan(&registry(serde_json::json!("hosted")), None, "p");
+        assert!(hosted.utility.is_none(), "{hosted:?}");
+        let local = dispatch_plan(&registry(serde_json::Value::Null), None, "p");
+        assert_eq!(local.utility.map(|u| (u.id, u.n_ctx)), Some(("qwen-4b".to_string(), Some(68000))));
+    }
+
+    /// (#3678 R3) A binding with no declared window is loaded at the
+    /// SELECTED model's window, not the default model's.
+    #[test]
+    fn a_windowless_binding_takes_the_selected_models_window() {
+        let p = profile(vec![pm("qwen-35b", 262000), pm("coder-30b", 120000), pm("qwen-4b", 68000)]);
+        let mut loaded = vec![
+            lm("darkmux:qwen-35b", "qwen-35b", 262000),
+            lm("darkmux:coder-30b", "coder-30b", 120000),
+            lm("darkmux:qwen-4b", "qwen-4b", 120000),
+        ];
+        let windowless = plan(&p.models[1], Some(("qwen-4b", None)));
+        let w = planned_envelope_warnings(&p, "deep", &windowless, &loaded, &[], None);
+        assert!(w.is_empty(), "{w:?}");
+        loaded[2].context = 68000;
+        let w = planned_envelope_warnings(&p, "deep", &windowless, &loaded, &[], None);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("`qwen-4b`") && w[0].contains("at 120000 ctx but the resident instance is at 68000"), "{}", w[0]);
+    }
+
+    /// (#3678) The utility model is loaded whether or not the profile lists
+    /// it, so an undersized resident is a reload either way; a missing one
+    /// stays quiet, as a missing non-default model does.
+    #[test]
+    fn an_unlisted_utility_model_is_judged_too() {
+        let p = profile(vec![pm("qwen-35b", 262000)]);
+        let mut loaded = vec![lm("darkmux:qwen-35b", "qwen-35b", 262000), lm("darkmux:qwen-4b", "qwen-4b", 32000)];
+        let bound = plan(&p.models[0], Some(("qwen-4b", Some(68000))));
+        let w = planned_envelope_warnings(&p, "deep", &bound, &loaded, &[], None);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("utility model `qwen-4b`") && w[0].contains("loads a new instance"), "{}", w[0]);
+        loaded.pop();
+        assert!(planned_envelope_warnings(&p, "deep", &bound, &loaded, &[], None).is_empty());
+    }
+
+    /// (#3678) Capability scoring can select a non-default model. The check
+    /// asks the dispatch's own resolution (`resolve_in`, through
+    /// [`dispatch_plan`]), so the selected model's load is noted and the
+    /// unselected default's undersized resident, which the dispatch never
+    /// touches, is not.
+    #[test]
+    #[serial_test::serial]
+    fn a_capability_selected_model_is_the_one_judged() {
+        let _state = darkmux_types::test_isolation::IsolatedState::new();
+        let all = |v: f32| serde_json::json!({"code": v, "agentic_tool_use": v, "reasoning": v, "instruction_following": v});
+        let mut registry: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+            "default_profile": "p",
+            "profiles": {"p": {"models": [
+                {"id": "qwen-35b", "n_ctx": 262000, "capabilities": all(0.1)},
+                {"id": "coder-30b", "n_ctx": 120000, "capabilities": all(1.0)}
+            ]}}
+        }))
+        .unwrap();
+        registry.materialize_endpoints();
+        let role = darkmux_crew::dispatch::lab_role(&darkmux_crew::dispatch::LabInputs::Builtin, "coder").unwrap();
+        let plan = dispatch_plan(&registry, Some(&role), "p");
+        assert_eq!(plan.work.as_ref().map(|(m, _)| m.id.as_str()), Some("coder-30b"), "{plan:?}");
+        let p = &registry.profiles["p"];
+        let loaded = [lm("darkmux:qwen-35b", "qwen-35b", 101000)];
+        let w = planned_envelope_warnings(p, "p", &plan, &loaded, &[], None);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("`coder-30b` for role `coder`") && w[0].contains("not among the currently loaded"), "{}", w[0]);
     }
 
     /// (#3678) No stray " : " in a note.
