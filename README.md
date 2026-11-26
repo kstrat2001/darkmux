@@ -11,7 +11,7 @@ darkmux turns a Mac (or a few of them on a tailnet) into a working local-AI flee
 
 **[darkmux.com](https://darkmux.com) · [Live demo](https://darkmux.com/demo) — watch a real mission replay in your browser. Nothing to install.**
 
-> **Read before running.** darkmux orchestrates AI tools that execute on your machine. It drives your local LMStudio server and, in lab mode, runs AI-generated code in a working directory that is **not a security sandbox**. AI agents can behave unexpectedly; use darkmux on a machine where that is acceptable. Performance numbers here and in the articles were measured on the author's hardware and will differ on yours. See [DISCLAIMER.md](./DISCLAIMER.md). MIT licensed, no warranty.
+> **Read before running.** darkmux orchestrates AI tools that execute on your machine. It drives the model servers on your machine (LM Studio, Tensorfold, Recursive's Flint, or one you run) and, in lab mode, runs AI-generated code in a working directory that is **not a security sandbox**. AI agents can behave unexpectedly; use darkmux on a machine where that is acceptable. Performance numbers here and in the articles were measured on the author's hardware and will differ on yours. See [DISCLAIMER.md](./DISCLAIMER.md). MIT licensed, no warranty.
 
 ## Install
 
@@ -20,10 +20,24 @@ brew tap kstrat2001/tap
 brew install darkmux
 
 darkmux init      # config + profiles + agent skills (never overwrites)
-darkmux doctor    # pre-flight: LMStudio, models, sandbox, runtime, RAM
+darkmux doctor    # pre-flight: engines, models, sandbox, runtime, RAM
 ```
 
-Local seats run on [LMStudio](https://lmstudio.ai/) (one downloaded model minimum). Any seat can instead be staffed by a hosted OpenAI-compatible endpoint, or by Claude with prompt caching on every turn ([guide](https://darkmux.com/guide/claude.html)): a machine with zero local models still runs full reviews. On a Mac, dispatches run in macOS's own sandbox (Seatbelt): there is no Docker to install. [Docker](https://www.docker.com/products/docker-desktop) is optional there (`darkmux config set runtime.sandbox docker`) and the default on Linux; under it the runtime image pulls from GHCR on first use. Building from source, hub setup, updating, configuration: [docs/OPERATIONS.md](docs/OPERATIONS.md) · [full guide](https://darkmux.com/guide/).
+You need one engine with one model: a local server or a hosted seat (next section). `darkmux init` finds the engines already installed on the machine and lists them. Dispatches run in the operating system's own sandbox, with nothing to install: Seatbelt on a Mac, Landlock on Linux where the kernel supports it, else Docker. [Docker](https://www.docker.com/products/docker-desktop) is optional everywhere (`darkmux config set runtime.sandbox docker`); under it the runtime image pulls from GHCR on first use. Building from source, hub setup, updating, configuration: [docs/OPERATIONS.md](docs/OPERATIONS.md) · [full guide](https://darkmux.com/guide/).
+
+## Where the models run
+
+Every role in your profile registry names where its model runs, so one machine can mix engines, and one fleet can mix machines:
+
+| Engine | What darkmux does with it |
+|---|---|
+| [LM Studio](https://lmstudio.ai/) | Loads and unloads models at the context each profile declares, under the machine's memory budget, and starts LM Studio's local server when it is off. |
+| [Tensorfold](https://tensorfold.dev/), Flint (by [Recursive](https://recursive.com/)) | Starts and stops the server itself, on the port the profile names. `darkmux init --add-engine flint` (or `tensorfold`) adds one with a profile running its model. |
+| Any OpenAI-compatible server you run, such as `mlx_lm.server` | Sends it work. `darkmux init --engine-url <url>` records it as the machine's engine, so a machine without LM Studio runs `init` and dispatch with no hand-edited config. |
+| A hosted OpenAI-compatible endpoint | Staffs any seat with cloud weights. |
+| Claude (the Messages API) | Staffs any seat, with prompt caching on every turn ([guide](https://darkmux.com/guide/claude.html)). |
+
+A machine with no local models still runs full reviews on hosted seats. `darkmux doctor` checks that the machine's engine answers and names any installed engine not yet configured. Design and status: [docs/architecture/ENGINES.md](docs/architecture/ENGINES.md).
 
 ## Your first mission
 
@@ -42,7 +56,7 @@ Every mission runs as a live task graph you can watch from any device on your ta
 ## What you get
 
 - 🎯 **Missions, not chat.** Define work as config, launch it with one verb, watch it run as a task graph. Consequential steps stop and wait for your sign-off.
-- 🤝 **A crew, not a model.** Roles (coder, reviewer, judge, crawler), each staffed by the right local model, or by a hosted endpoint when a seat needs frontier weights. Your registry, your call.
+- 🤝 **A crew, not a model.** Roles (coder, reviewer, judge, crawler), each staffed by the model that fits it: on LM Studio, Tensorfold, Flint or a server you run, or a hosted endpoint when a seat needs frontier weights. Your registry, your call.
 - 🔍 **PR review by local models.** `mission launch review` bundles the change, fans probe seats across it, double-confirms every finding with an independent judge, and posts an anchored review. darkmux [reviews its own PRs in public](.github/workflows/darkmux-review.yml) this way.
 - 🧪 **The lab.** `darkmux lab run <workload>` captures wall clock, trajectory, and verify outcome on *your* hardware: baseline, change one knob, measure again. The [published findings](https://darklyenergized.substack.com) are re-runnable claims, not anecdotes.
 - 📊 **A fleet you can see.** One live view across every machine: what's loaded, what's running, and how many tokens each endpoint and model used. Phone-ready over your tailnet.
@@ -69,7 +83,7 @@ darkmux exists because the [Genesis series](https://darklyenergized.substack.com
 
 ## Honest limits
 
-- **Local model server: LMStudio, today.** A second local backend (Ollama, llama.cpp) is deliberately unbuilt until a real one has a real user ([#316](https://github.com/kstrat2001/darkmux/issues/316)). Hosted endpoints are not the gap: any seat can run on an OpenAI-compatible cloud endpoint today.
+- **Managed engines: LM Studio, Tensorfold and Recursive's Flint.** darkmux loads, starts, stops and budgets memory for those three. Any other OpenAI-compatible local server runs work as an endpoint (verified on `mlx_lm.server`), but darkmux does not load models on it or count what it holds against the machine's memory; Ollama and llama.cpp have no dedicated backend ([#316](https://github.com/kstrat2001/darkmux/issues/316)).
 - **Developed and dogfooded on Apple Silicon.** Linux compiles and passes CI's fleet tests, but nobody dogfoods it yet; Intel Mac is untested.
 - **Built to be driven by a frontier orchestrator** (Claude Code or equivalent). Standalone CLI use works for scripting; orchestrator-driven is the design.
 - **One operator, their own machines.** Not team tooling, not multi-tenant: a few Macs on a tailnet you trust. That's a focus, not a fence.
@@ -88,4 +102,4 @@ MIT · Kain Osterholt · [@DarklyEnergized](https://x.com/DarklyEnergized) · Da
 
 ---
 
-*Claude and Claude Code are trademarks of Anthropic PBC. LMStudio is a trademark of Element Labs Inc. darkmux is affiliated with neither.*
+*Claude and Claude Code are trademarks of Anthropic PBC. LM Studio is a trademark of Element Labs Inc. darkmux is affiliated with neither.*
