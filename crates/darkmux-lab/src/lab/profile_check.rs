@@ -64,27 +64,27 @@ pub(crate) fn envelope_warnings(
 }
 
 /// The note for an LM Studio model, from what the dispatch's residency
-/// preflight will do with `loaded`.
+/// preflight will do with `loaded`. (#3678) The preflight acts on the
+/// default model only, so any other model gets no note: its resident
+/// instance (the utility binding's, say, at its own context) is left alone.
 fn lms_note(pm: &ProfileModel, is_default: bool, loaded: &[LoadedModel]) -> Option<String> {
     // Empty means either nothing is loaded or `lms ps` couldn't be
     // queried — in both cases we can't validate, so stay quiet rather
     // than crying "primary not loaded" against a set we don't trust.
-    if loaded.is_empty() {
+    if !is_default || loaded.is_empty() {
         return None;
     }
     // (F1, 5.0 dogfood) The dispatch preflight's own decision function
     // owns the reuse/reload/load rule; this check reports it (#2985).
     let declared = pm.n_ctx.map(u64::from);
     match decide_preflight(&pm.id, pm.identifier.as_deref(), pm.n_ctx.unwrap_or(0), loaded) {
-        PreflightDecision::LoadFresh { foreign_identifier: None } if is_default => Some(format!(
+        PreflightDecision::LoadFresh { foreign_identifier: None } => Some(format!(
             "declares default model `{}` (ctx {}) but it is not among the currently loaded \
              models: the dispatch loads a new instance, so this run's wall-clock includes a \
              model load and is not comparable to a warm run.",
             pm.id,
             declared.map_or_else(|| "unset".to_string(), |v| v.to_string()),
         )),
-        // A missing non-default model is common and not worth the noise.
-        PreflightDecision::LoadFresh { foreign_identifier: None } => None,
         PreflightDecision::Reuse { resident_ctx, .. } => declared
             .filter(|d| ctx_diverges(*d, resident_ctx))
             .map(|d| {
@@ -99,15 +99,15 @@ fn lms_note(pm: &ProfileModel, is_default: bool, loaded: &[LoadedModel]) -> Opti
         // unreported resident ctx (0) is insufficient, so it reloads.
         PreflightDecision::Reload { stale_ctx, .. } => declared.map(|d| {
             format!(
-                "declares model `{}` at {d} ctx but the resident instance is at {stale_ctx} \
-                : the dispatch unloads it and loads a new instance at the declared window, \
+                "declares model `{}` at {d} ctx but the resident instance is at {stale_ctx}: \
+                 the dispatch unloads it and loads a new instance at the declared window, \
                  so this run's wall-clock includes a model load.",
                 pm.id,
             )
         }),
         PreflightDecision::LoadFresh { foreign_identifier: Some(foreign_identifier) } => Some(format!(
-            "model `{}` is resident only as `{foreign_identifier}`, which darkmux never reuses \
-            : the dispatch loads a new instance beside it, so this run's wall-clock includes \
+            "model `{}` is resident only as `{foreign_identifier}`, which darkmux never reuses: \
+             the dispatch loads a new instance beside it, so this run's wall-clock includes \
              a model load.",
             pm.id,
         )),
@@ -260,6 +260,35 @@ mod tests {
         let w = envelope_warnings(&p, "deep", &loaded, &[], None);
         assert_eq!(w.len(), 1, "expected not-loaded warning, got: {w:?}");
         assert!(w[0].contains("not among the currently loaded"));
+    }
+
+    /// (#3678) The dispatch's residency preflight acts on the default model
+    /// only, so a second model's resident instance (here the utility 4b,
+    /// loaded at its own binding's context) is never reloaded, reused or
+    /// loaded beside by this run, and gets no note.
+    #[test]
+    fn a_non_default_model_gets_no_note_whatever_is_resident() {
+        let p = profile(vec![pm("qwen-35b", 262000), pm("qwen-4b", 120000)]);
+        let primary = lm("darkmux:qwen-35b", "qwen-35b", 262000);
+        for second in [
+            lm("darkmux:qwen-4b", "qwen-4b", 68000),
+            lm("darkmux:qwen-4b", "qwen-4b", 262144),
+            lm("qwen-4b", "qwen-4b", 120000),
+        ] {
+            let w = envelope_warnings(&p, "deep", &[primary.clone(), second.clone()], &[], None);
+            assert!(w.is_empty(), "resident {second:?}: {w:?}");
+        }
+    }
+
+    /// (#3678) No stray " : " in a note.
+    #[test]
+    fn notes_join_their_clauses_with_a_plain_colon() {
+        let p = profile(vec![pm("qwen-35b", 262000)]);
+        for loaded in [vec![lm("darkmux:qwen-35b", "qwen-35b", 101000)], vec![lm("qwen-35b", "qwen-35b", 262000)]] {
+            let w = envelope_warnings(&p, "deep", &loaded, &[], None);
+            assert_eq!(w.len(), 1, "{w:?}");
+            assert!(!w[0].contains(" : "), "{}", w[0]);
+        }
     }
 
     #[test]

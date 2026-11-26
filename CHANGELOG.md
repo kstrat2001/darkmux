@@ -26,6 +26,14 @@ darkmux release.
   keep `conflict` and now name the `holder` too). Capability `git_route`. Every refusal may now carry
   `holder`, `work_id` and `paths` (additive).
 
+### Fixed
+
+- **`lab run` no longer warns that a profile's second model will reload (#3678).** The envelope check
+  reported a reload for every model the profile declares, but the dispatch's residency preflight acts
+  on the default model only, so a second model resident at another context (the utility model, at its
+  own binding's) was named as a load that never happened. Notes now cover the default model only, and
+  read without the stray ` : `.
+
 ## [5.12.0] - 2026-11-21
 
 **A phone can drive darkmux over the tailnet.** `darkmux client serve` publishes its port on this
