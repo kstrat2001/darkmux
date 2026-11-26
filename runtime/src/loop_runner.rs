@@ -2974,9 +2974,8 @@ pub(crate) fn estimate_prompt_tokens(
 pub(crate) fn unfit_reason(estimated: u32, window: u32) -> String {
     format!(
         "this request was estimated at ~{estimated} tokens against the {window}-token window this profile \
-         declares, with nothing left to trim, so the endpoint's error below most likely means it does not \
-         fit: shrink what this role puts in context (the brief, or the files it is given), or raise the \
-         profile's n_ctx (#3679)"
+         declares, with nothing left to trim; if the endpoint refused it as too long, shrink what this role \
+         puts in context (the brief, or the files it is given) or raise the profile's n_ctx (#3679)"
     )
 }
 
@@ -6822,6 +6821,8 @@ mod tests {
         let unfit = run(240_000);
         assert!(unfit.starts_with("this request was estimated at ~"), "darkmux's reason leads: {unfit}");
         assert!(unfit.contains("32000-token window") && unfit.contains("(#3679)"), "{unfit}");
+        assert!(unfit.contains("greater than the context length"), "the endpoint's own words survive: {unfit}");
+        assert!(unfit.contains("if the endpoint refused it as too long"), "the advice is conditional: {unfit}");
         let fitting = run(1_000);
         assert!(!fitting.contains("#3679"), "a fitting request's error is the endpoint's own: {fitting}");
     }

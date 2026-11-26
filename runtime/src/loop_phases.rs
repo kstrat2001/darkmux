@@ -416,10 +416,11 @@ impl<'a> AgentLoop<'a> {
         // (#3679) A request the bound already judged unfittable is still
         // sent (its estimate errs high on purpose, and the endpoint's real
         // window may be larger than the profile declares), but if the
-        // endpoint then refuses it, the error says darkmux's reason first.
+        // endpoint then fails it, the error leads with darkmux's reason, worded
+        // as a condition: the failure may be something else (a dead endpoint).
         let unfit = self.enforce_pre_send_bound();
         let sent = self.send(&bound).map_err(|e| with_unfit_reason(e, unfit.as_deref()))?;
-        let call = self.read_response(bound, sent).map_err(|e| with_unfit_reason(e, unfit.as_deref()))?;
+        let call = self.read_response(bound, sent)?;
         self.route(call)
     }
 
