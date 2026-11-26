@@ -108,7 +108,7 @@ fn load_registry_with(explicit: Option<&str>, announce: bool) -> Result<LoadedRe
 /// unrelated registry. `None` only when nothing names a file.
 fn registry_source(explicit: Option<&str>) -> Option<(PathBuf, &'static str)> {
     if let Some(p) = explicit {
-        return Some((PathBuf::from(p), "--profiles flag"));
+        return Some((PathBuf::from(p), "--profiles-file flag"));
     }
     // (#2632 CONSIDER 3) The one instrumented chokepoint for
     // `DARKMUX_PROFILES` — previously had no audited path at all, so crew's
@@ -626,7 +626,7 @@ mod tests {
             msg.contains("registry not found") || msg.contains("no profile registry"),
             "unexpected error: {msg}"
         );
-        assert!(msg.contains("--profiles flag"), "should attribute the source: {msg}");
+        assert!(msg.contains("--profiles-file flag"), "should attribute the source: {msg}");
     }
 
     /// `DARKMUX_PROFILES` must take precedence over the default search chain

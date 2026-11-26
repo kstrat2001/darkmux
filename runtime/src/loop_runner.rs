@@ -1720,9 +1720,10 @@ fn run_with_sleeper(
     // (#2171) The GENERATION check-in — bounds every call that does NOT
     // carry the reasoning bound. None = GENERATION_CHECKPOINT_INTERVAL.
     generation_checkpoint_interval: Option<u32>,
-    // (#2190) Per-dispatch budget for intra-turn stall recoveries — how
-    // many useless turns (empty `tool_calls`, or a runaway-reasoning cut)
-    // the loop tolerates before escalating. None = MAX_STALL_RECOVERIES (2).
+    // (#2190) Per-dispatch budget for intra-turn stall recoveries: a useless
+    // turn (empty `tool_calls`, or a runaway-reasoning cut) counts one, a
+    // productive turn pays one back (#2229), and the loop escalates when the
+    // count reaches it. None = MAX_STALL_RECOVERIES (2).
     max_stall_recoveries: Option<u32>,
     feedback_templates: std::collections::BTreeMap<String, String>,
     // (#1038) Optional `response_format` envelope (the role's output_schema,
