@@ -699,6 +699,13 @@ pub struct ModelLedger {
     /// changelog entry. A disclosure (`info`) no longer lights the same
     /// lamp as a real degradation (`warn`/`error`).
     pub messages: Vec<LedgerMessage>,
+    /// (#3616) The resident list could not be read (or the engine does not
+    /// report one), so `models` lists none of its residents: "none listed"
+    /// is not "none loaded". In process only: the wire already says it
+    /// through `attribution` and `machine.state`.
+    #[serde(skip)]
+    #[cfg_attr(feature = "ts-export", ts(skip))]
+    pub residents_unknown: bool,
 }
 
 // ── pure inputs (the test seam: canned/fixture data, never real probes) ──
@@ -1210,6 +1217,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         attribution,
         attribution_note,
         messages,
+        residents_unknown,
     }
 }
 
@@ -3407,6 +3415,20 @@ mod tests {
         assert_eq!(ledger.attribution, Attribution::Unavailable);
         assert!(ledger.machine.current_bytes.is_none());
         assert!(ledger.models.iter().all(|m| m.current_bytes.is_none()));
+    }
+
+    /// (#3616) A failed resident probe is said in process, so a reader
+    /// (doctor's pricing row) can tell "none listed" from "none loaded", and
+    /// stays off the wire, which already says it (`attribution`, the state).
+    #[test]
+    fn a_failed_resident_probe_is_marked_unknown_in_process_only() {
+        let mut inputs = base_inputs();
+        inputs.residents_unknown = true;
+        let ledger = compute_ledger(inputs, 1);
+        assert!(ledger.residents_unknown);
+        let wire = serde_json::to_value(&ledger).unwrap();
+        assert!(wire.get("residents_unknown").is_none(), "no wire change: {wire}");
+        assert!(!compute_ledger(base_inputs(), 1).residents_unknown);
     }
 
     #[test]

@@ -26,6 +26,13 @@ darkmux release.
   keep `conflict` and now name the `holder` too). Capability `git_route`. Every refusal may now carry
   `holder`, `work_id` and `paths` (additive).
 
+### Fixed
+
+- **`darkmux doctor`'s `resident pricing` row no longer passes when it could not read the residents
+  (#3616).** When the resident list could not be read (a timed-out `lms ps`, say), the row said "every
+  resident model is priceable". It now warns, naming why; on an engine that does not report what it
+  holds, it is not applicable.
+
 ## [5.12.0] - 2026-11-21
 
 **A phone can drive darkmux over the tailnet.** `darkmux client serve` publishes its port on this

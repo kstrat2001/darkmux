@@ -1624,7 +1624,30 @@ fn removed_radio_router_staffing_status(role_binding: Option<&str>) -> Check {
 /// failed), so this check can never drift from what the page shows.
 fn check_unpriceable_residents() -> Check {
     let ledger = darkmux_profiles::engine::local().ledger();
+    if ledger.residents_unknown {
+        return residents_unknown_status(&ledger.messages);
+    }
     unpriceable_residents_status(&ledger.models)
+}
+
+/// (#3616) The pricing row when the ledger could not list the residents: a
+/// warning naming why when the probe failed, and not applicable when the
+/// engine simply does not report what it holds (an info-only ledger). Never
+/// "every resident model is priceable", which it cannot know.
+fn residents_unknown_status(messages: &[darkmux_profiles::model_ledger::LedgerMessage]) -> Check {
+    use darkmux_profiles::model_ledger::Severity;
+    let name = "resident pricing";
+    let why: Vec<&str> = messages.iter().filter(|m| m.severity != Severity::Info).map(|m| m.text.as_str()).collect();
+    if why.is_empty() {
+        let info: Vec<&str> = messages.iter().map(|m| m.text.as_str()).collect();
+        return not_applicable(name, &info.join("; "));
+    }
+    Check {
+        name: name.into(),
+        status: Status::Warn,
+        message: format!("could not read the resident models, so their pricing is not checked: {}", why.join("; ")),
+        hint: Some("Run `darkmux doctor` again once the engine answers; `darkmux machine resources` shows the same ledger.".into()),
+    }
 }
 
 /// Pure decision for [`check_unpriceable_residents`], split out so every arm
@@ -14735,6 +14758,27 @@ mod tests {
         let c = super::unpriceable_residents_status(&[]);
         assert_eq!(c.status, Status::Pass);
         assert!(c.message.contains("priceable"));
+    }
+
+    /// (#3616) When the resident list could not be read, the row says so
+    /// instead of claiming every resident is priceable.
+    #[test]
+    fn unknown_residents_warn_naming_why() {
+        use darkmux_profiles::model_ledger::LedgerMessage;
+        let c = super::residents_unknown_status(&[LedgerMessage::warn("`lms ps` timed out after 5s")]);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("`lms ps` timed out after 5s"), "{}", c.message);
+        assert!(!c.message.contains("every resident model is priceable"), "{}", c.message);
+    }
+
+    /// (#3616) An engine that does not report what it holds was never asked:
+    /// nothing is wrong, so the row is not applicable rather than a warning.
+    #[test]
+    fn residents_an_engine_does_not_report_are_not_applicable() {
+        use darkmux_profiles::model_ledger::LedgerMessage;
+        let c = super::residents_unknown_status(&[LedgerMessage::info("engine `local-8080` does not report what it holds")]);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("not applicable") && c.message.contains("does not report"), "{}", c.message);
     }
 
     #[test]
