@@ -1720,9 +1720,10 @@ fn run_with_sleeper(
     // (#2171) The GENERATION check-in — bounds every call that does NOT
     // carry the reasoning bound. None = GENERATION_CHECKPOINT_INTERVAL.
     generation_checkpoint_interval: Option<u32>,
-    // (#2190) Per-dispatch budget for intra-turn stall recoveries — how
-    // many useless turns (empty `tool_calls`, or a runaway-reasoning cut)
-    // the loop tolerates before escalating. None = MAX_STALL_RECOVERIES (2).
+    // (#2190) Per-dispatch budget for intra-turn stall recoveries: a useless
+    // turn (empty `tool_calls`, or a runaway-reasoning cut) counts one, a
+    // productive turn pays one back (#2229), and the loop escalates when the
+    // count reaches it. None = MAX_STALL_RECOVERIES (2).
     max_stall_recoveries: Option<u32>,
     feedback_templates: std::collections::BTreeMap<String, String>,
     // (#1038) Optional `response_format` envelope (the role's output_schema,
@@ -2965,6 +2966,26 @@ pub(crate) fn estimate_prompt_tokens(
     // instead of defeating the bound.
     let flat_floor = (total / 4) as u32;
     anchored.max(flat_floor)
+}
+
+/// (#3679) darkmux's reason for a request the pre-send bound judged
+/// unfittable, put first on the error when the endpoint then refuses it, so
+/// the run does not end on the engine's words alone.
+pub(crate) fn unfit_reason(estimated: u32, window: u32) -> String {
+    format!(
+        "this request was estimated at ~{estimated} tokens against the {window}-token window this profile \
+         declares, with nothing left to trim; if the endpoint refused it as too long, shrink what this role \
+         puts in context (the brief, or the files it is given) or raise the profile's n_ctx (#3679)"
+    )
+}
+
+/// (#3679) `e`, with darkmux's reason first when the request was judged
+/// unfittable before it went out.
+pub(crate) fn with_unfit_reason(e: anyhow::Error, unfit: Option<&str>) -> anyhow::Error {
+    match unfit {
+        Some(reason) => e.context(reason.to_string()),
+        None => e,
+    }
 }
 
 /// (#2792 round-4) The inverse of [`estimate_prompt_tokens`]: how many MESSAGE
@@ -6769,6 +6790,41 @@ mod tests {
         assert!(turn_fills_window(Some(2500), 2500));
         assert!(turn_fills_window(Some(2500), 2501));
         assert!(!turn_fills_window(None, u32::MAX));
+    }
+
+    /// (#3679) A request the pre-send bound judged unfittable is still sent,
+    /// but when the endpoint refuses it the dispatch's error leads with
+    /// darkmux's reason (the estimate, the window, what to shrink); a fitting
+    /// request's endpoint error is passed through as before.
+    #[test]
+    #[serial_test::serial]
+    fn an_endpoint_refusing_an_unfittable_request_errs_with_darkmuxs_reason() {
+        let run = |brief_bytes: usize| -> String {
+            let server = crate::test_support::GuardedMockServer::start();
+            server.mock(|when, then| {
+                when.method(POST).path("/v1/chat/completions");
+                then.status(400).json_body(serde_json::json!({"error": "The number of tokens to keep from the initial prompt is greater than the context length."}));
+            });
+            let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+            let tmp = tempfile::Builder::new().prefix("unfit-reason").tempdir().unwrap();
+            let mut traj = Trajectory::open(tmp.path());
+            let initial = vec![Message::system("test"), Message::user("word ".repeat(brief_bytes / 5))];
+            let cfg = compaction::CompactionConfig { context_window: Some(32_000), ..compaction::CompactionConfig::never_compact() };
+            let err = run_with_sleeper(
+                &client, &client, "test-model", initial, &[Tool::Read], &mut traj, false, &cfg,
+                Some(5), None, Some(4_096), None, None,
+                None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+            )
+            .expect_err("the endpoint refuses");
+            format!("{err:#}")
+        };
+        let unfit = run(240_000);
+        assert!(unfit.starts_with("this request was estimated at ~"), "darkmux's reason leads: {unfit}");
+        assert!(unfit.contains("32000-token window") && unfit.contains("(#3679)"), "{unfit}");
+        assert!(unfit.contains("greater than the context length"), "the endpoint's own words survive: {unfit}");
+        assert!(unfit.contains("if the endpoint refused it as too long"), "the advice is conditional: {unfit}");
+        let fitting = run(1_000);
+        assert!(!fitting.contains("#3679"), "a fitting request's error is the endpoint's own: {fitting}");
     }
 
     /// (#3074) The same window bound for a turn that keeps REASONING: the

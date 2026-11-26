@@ -674,6 +674,43 @@ fn run_notes_name_an_unexplained_failure() {
     assert_eq!(run_notes("p", &r), ["provider=p", "wall=61s", "error: unknown", "verify=fail (2 failing)"]);
 }
 
+/// (#3678) The plan is the dispatch's own: the role `lab run` pinned
+/// (`lab_inputs`), selecting on the run's profile (not `default_profile`),
+/// with the lab's utility opt-in (the utility model may be the work model).
+/// With no inputs (a provider that names no role) nothing is selected, and
+/// the default model stands in.
+#[test]
+#[serial_test::serial]
+fn the_run_plan_selects_with_the_pinned_role() {
+    let _state = darkmux_types::test_isolation::IsolatedState::new();
+    let all = |v: f32| serde_json::json!({"code": v, "agentic_tool_use": v, "reasoning": v, "instruction_following": v});
+    let registry: darkmux_types::ProfileRegistry = serde_json::from_value(serde_json::json!({
+        "default_profile": "p",
+        "profiles": {
+            "p": {"models": [{"id": "qwen-35b", "n_ctx": 262000}]},
+            "q": {"models": [
+                {"id": "qwen-35b", "n_ctx": 262000, "capabilities": all(0.1)},
+                {"id": "coder-30b", "n_ctx": 120000, "capabilities": all(1.0)}
+            ]}
+        },
+        "internal": {"utility": {"id": "coder-30b", "n_ctx": 68000}}
+    }))
+    .unwrap();
+    let builtin = darkmux_crew::dispatch::LabInputs::Builtin;
+    let plan = run_plan(&registry, Some(&builtin), Some("coder"), "q");
+    assert_eq!(plan.work.map(|(m, role)| (m.id, role)), Some(("coder-30b".to_string(), "coder".to_string())));
+    assert_eq!(plan.utility.map(|u| u.id).as_deref(), Some("coder-30b"));
+    assert!(run_plan(&registry, None, Some("coder"), "q").work.is_none());
+    assert!(run_plan(&registry, Some(&builtin), None, "q").work.is_none());
+}
+
+/// [`envelope_check`] for a dispatch on `profile`'s default model alone
+/// (no role resolved, no utility binding).
+fn default_model_check(profile: &darkmux_types::Profile, profile_name: &str) -> Vec<String> {
+    use crate::lab::profile_check::{planned_models, DispatchPlan};
+    envelope_check(&planned_models(profile, &DispatchPlan::default()), profile_name)
+}
+
 /// (#365) An `lms ps` that cannot run is named as an unverified profile
 /// tag, not silently skipped.
 #[test]
@@ -683,7 +720,7 @@ fn a_failed_lms_ps_is_an_unverified_profile_warning() {
     // SAFETY: serial; `Lab`'s drop restores the variable.
     unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/lms") };
     let profile: darkmux_types::Profile = serde_json::from_str(r#"{"models":[{"id":"m","n_ctx":1}]}"#).unwrap();
-    let w = envelope_check(&profile, "fast");
+    let w = default_model_check(&profile, "fast");
     assert_eq!(w.len(), 1, "{w:?}");
     assert!(w[0].starts_with("could not verify profile-load match: `lms ps` failed ("), "{w:?}");
     assert!(w[0].ends_with("this run's `profile=fast` tag is unverified. (#365)"), "{w:?}");
@@ -779,8 +816,8 @@ fn a_profile_with_nothing_on_lm_studio_is_not_checked_against_it() {
     let profile = darkmux_types::Profile { models: vec![pm], ..Default::default() };
     let prev = std::env::var_os("DARKMUX_LMS_BIN");
     unsafe { std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/lms") };
-    let unmanaged = envelope_check(&profile, "p");
-    let managed = envelope_check(&darkmux_types::Profile { models: vec![darkmux_types::ProfileModel { id: "m".into(), ..Default::default() }], ..Default::default() }, "p");
+    let unmanaged = default_model_check(&profile, "p");
+    let managed = default_model_check(&darkmux_types::Profile { models: vec![darkmux_types::ProfileModel { id: "m".into(), ..Default::default() }], ..Default::default() }, "p");
     unsafe {
         match prev {
             Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),

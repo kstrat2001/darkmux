@@ -725,21 +725,15 @@ export function MachineHealthRegion({
   // Two clocks, not one. `nowMs` is the READING browser's; `generated_at_ms`
   // is the daemon HOST's, and this lens is read off-box over the tailnet by
   // design (#1286 constraint 2 — the display renders off-machine). A reader
-  // whose clock sits behind the host makes the delta negative, and
-  // `relAgoFrom` renders a negative delta as the empty string: the footer
-  // came out as a bare "snapshot" and the banner as "… — snapshot",
-  // answering nothing at the exact moment the reader asked "is this current?".
-  //
-  // Clamped HERE rather than inside `relAgoFrom`, which is shared with
-  // callers this fix has no measurement for. Skew is unknowable from inside
-  // the browser, so the honest floor is the freshest the reading could be.
-  const ageRef = Math.max(nowMs, b.generated_at_ms);
+  // whose clock sits behind the host makes the delta negative; `relAgoFrom`
+  // reads that as "just now" (#2382), so the footer and banner never come
+  // out as a bare "snapshot".
 
   return (
     <>
       {stale && (
         <div className="mm-stalebanner">
-          {STALE_BANNER_TEXT} — snapshot {relAgoFrom(ageRef, b.generated_at_ms)}
+          {STALE_BANNER_TEXT} — snapshot {relAgoFrom(nowMs, b.generated_at_ms)}
         </div>
       )}
 
@@ -972,7 +966,7 @@ export function MachineHealthRegion({
           here is paraphrased — every sentence that used to stand alone on
           the page is reproduced exactly, just behind one control instead of
           four. */}
-      <div className="memfoot">snapshot {relAgoFrom(ageRef, b.generated_at_ms)}</div>
+      <div className="memfoot">snapshot {relAgoFrom(nowMs, b.generated_at_ms)}</div>
       <details className="mm-about" ref={aboutRef}>
         <summary>how this was measured</summary>
         <div className="memfoot">{attributionLine(b)}</div>

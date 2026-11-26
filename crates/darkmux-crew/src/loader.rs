@@ -46,6 +46,10 @@ pub(crate) const BUILTIN_ROLES: &[(&str, &str)] = &[
     // in #2310 P4d. The shipped `review` config stages its work through
     // `reviewer`/`coder` instead.
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.json"))),
+    // (#3682) A read-only answerer for paired apps' "Researcher": reads and
+    // runs read-only commands, and (having no write or edit) runs with its
+    // workspace mounted read-only.
+    ("researcher", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/researcher.json"))),
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.json"))),
     ("test-designer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/test-designer.json"))),
     // (#1698 Packet A) The radio interpreter's ROUTING seat — bounded
@@ -92,6 +96,7 @@ pub(crate) const BUILTIN_ROLE_PROMPTS: &[(&str, &str)] = &[
     // locked by `radio_answer::tests::radio_host_role_prompt_matches_frozen_golden`.
     ("radio-host", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/radio-host.md"))),
     ("analyst", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/analyst.md"))),
+    ("researcher", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/researcher.md"))),
     ("design-reviewer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/design-reviewer.md"))),
     ("test-designer", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/roles/test-designer.md"))),
 ];

@@ -295,6 +295,42 @@ impl ServerEjectSummary {
 mod tests {
     use super::*;
 
+    /// (#3674) `DARKMUX_HOME` pointed at a temp dir for one test, restored on
+    /// drop. A residency lease is written under `<DARKMUX_HOME>/residency`, so a
+    /// test that writes one must own its home: otherwise a run that fails
+    /// mid-test can leave `<pid>.lease` in the real (or CI's pinned) state root.
+    /// Declare it before any `LeaseGuard` so the guards drop first.
+    struct TempHome {
+        dir: tempfile::TempDir,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl TempHome {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let prev = std::env::var_os("DARKMUX_HOME");
+            // SAFETY: every caller is #[serial]; restored in Drop.
+            unsafe { std::env::set_var("DARKMUX_HOME", dir.path()) };
+            Self { dir, prev }
+        }
+
+        fn own_lease(&self) -> std::path::PathBuf {
+            self.dir.path().join("residency").join(format!("{}.lease", std::process::id()))
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            // SAFETY: as in `new`.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                    None => std::env::remove_var("DARKMUX_HOME"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn namespaced_identifier_uses_prefix_when_no_override() {
         let m = ProfileModel { max_output_tokens: None, engine_args: Vec::new(),
@@ -614,7 +650,9 @@ mod tests {
     /// server darkmux started, a held one included, and still never a
     /// process its record no longer matches.
     #[test]
+    #[serial_test::serial]
     fn stopping_every_server_takes_held_ones_and_nothing_else() {
+        let home = TempHome::new();
         let tmp = tempfile::tempdir().unwrap();
         let dirs = dirs_in(&tmp);
         let (idle, busy, stranger) = (stand_in(), stand_in(), stand_in());
@@ -623,6 +661,7 @@ mod tests {
         record(&dirs, "reused", stranger.0.id(), Some(7));
         let dispatch = darkmux_types::residency_lease::LeaseGuard::acquire();
         dispatch.write(&["darkmux:m/busy".to_string()]).unwrap();
+        assert!(home.own_lease().exists(), "the lease is written under this test's own home (#3674)");
         let summary = stop_all_servers_in(&dirs, quick());
         let mut stopped: Vec<&str> = summary.stopped.iter().map(|s| s.endpoint.as_str()).collect();
         stopped.sort();
@@ -666,13 +705,16 @@ mod tests {
     /// residency leases, as a dispatch's eviction asks them: a server whose
     /// served name another dispatch leases is held.
     #[test]
+    #[serial_test::serial]
     fn a_server_another_dispatch_leases_is_held() {
+        let home = TempHome::new();
         let tmp = tempfile::tempdir().unwrap();
         let rec = record(&dirs_in(&tmp), "tf", std::process::id(), None);
         let probe = darkmux_types::residency_lease::LeaseGuard::acquire();
         assert!(!dispatch_holds(&probe)(&rec), "nothing leases it yet");
         let dispatch = darkmux_types::residency_lease::LeaseGuard::acquire();
         dispatch.write(&["darkmux:m/tf".to_string()]).unwrap();
+        assert!(home.own_lease().exists(), "the lease is written under this test's own home (#3674)");
         assert!(dispatch_holds(&probe)(&rec), "a running dispatch's lease holds it");
         drop(dispatch);
         assert!(!dispatch_holds(&probe)(&rec), "released with the dispatch");

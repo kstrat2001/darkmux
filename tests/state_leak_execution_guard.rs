@@ -573,6 +573,34 @@ fn parse_libtest_summary(stdout: &str, stderr: &str) -> Option<LibtestSummary> {
     total
 }
 
+/// (#3674) The tests libtest reported `FAILED` in `stdout`, in order (a
+/// `#[should_panic]` test's ` - should panic` tag dropped), so a leak from a
+/// unit that also went red names the tests to look at first.
+fn failed_test_names(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("test ")?.strip_suffix(" ... FAILED"))
+        .map(|name| name.strip_suffix(" - should panic").unwrap_or(name))
+        .collect()
+}
+
+/// `failed`, as the clause the offender line appends; empty when none failed.
+fn failed_tests_note(failed: &[&str]) -> String {
+    if failed.is_empty() {
+        return String::new();
+    }
+    format!("; failed tests: {}", failed.join(", "))
+}
+
+#[test]
+fn the_offender_line_names_the_tests_libtest_reported_failed() {
+    let stdout = "running 3 tests\ntest a::ok ... ok\ntest ownership::tests::held ... FAILED\n\
+                  test b::slow ... FAILED\ntest c::sp - should panic ... FAILED\n\nfailures:\n\ntest result: FAILED. 1 passed; 2 failed";
+    assert_eq!(failed_test_names(stdout), ["ownership::tests::held", "b::slow", "c::sp"]);
+    assert_eq!(failed_tests_note(&failed_test_names(stdout)), "; failed tests: ownership::tests::held, b::slow, c::sp");
+    assert_eq!(failed_tests_note(&failed_test_names("test a::ok ... ok\n")), "");
+}
+
 /// The red-prove for `parse_libtest_summary`'s `None` case, and (paired
 /// with the tests below) the thing #2736 item 3 says has never existed: a
 /// test that drives the anti-vacuity floor with a deliberately
@@ -849,10 +877,11 @@ fn no_test_unit_writes_into_a_sentinel_state_tree() {
             continue;
         }
         offenders.push(format!(
-            "  cargo {} — {} file(s) reached a darkmux state destination (child exit {:?})\n{}",
+            "  cargo {} — {} file(s) reached a darkmux state destination (child exit {:?}){}\n{}",
             unit.label(),
             census.leaked_files(),
             out.status.code(),
+            failed_tests_note(&failed_test_names(&stdout_text)),
             census.report(12),
         ));
     }

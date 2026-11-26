@@ -25229,3 +25229,41 @@ fn an_on_host_dispatch_ended_mid_run_names_its_sandbox_not_a_container() {
         "darkmux-runtime container dispatch was stopped (a phase stop) : the container `c` was killed mid-run"
     );
 }
+
+/// (#3682) A palette with neither `write` nor `edit` runs read-only; one
+/// with either, or an empty one (the whole catalog), does not.
+#[test]
+fn a_palette_without_write_or_edit_is_read_only() {
+    let palette = |allow: &[&str], deny: &[&str]| crate::types::ToolPalette {
+        allow: allow.iter().map(|s| s.to_string()).collect(),
+        deny: deny.iter().map(|s| s.to_string()).collect(),
+    };
+    assert!(palette_is_read_only(&palette(&["read", "exec"], &["edit", "write"])));
+    assert!(palette_is_read_only(&palette(&["read", "create_finding"], &[])));
+    assert!(palette_is_read_only(&palette(&[], &["exec"])), "no tools at all writes nothing");
+    assert!(!palette_is_read_only(&palette(&["read", "write"], &[])));
+    assert!(!palette_is_read_only(&palette(&["read", "edit"], &["write"])));
+    assert!(!palette_is_read_only(&palette(&[], &[])), "an empty palette is the whole catalog");
+    assert!(palette_is_read_only(&palette(&["read", "edit"], &["edit"])), "deny wins");
+}
+
+/// (#3682) The built-in roles that can't write run with the workspace
+/// mounted read-only; the coder and the analyst keep it writable, and an
+/// explicit ask still wins.
+#[test]
+fn a_dispatch_of_a_role_that_cant_write_mounts_the_workspace_read_only() {
+    let with_role = |id: &str, asked: bool| {
+        let mut opts = dispatch_preflight_probe_opts();
+        opts.role_id = id.to_string();
+        opts.workspace_read_only = asked;
+        workspace_read_only_for(&opts)
+    };
+    for id in ["researcher", "code-reviewer", "crawler"] {
+        assert!(with_role(id, false), "{id}");
+    }
+    for id in ["coder", "analyst"] {
+        assert!(!with_role(id, false), "{id}");
+        assert!(with_role(id, true), "{id}, asked");
+    }
+    assert!(!with_role("no-such-role", false));
+}

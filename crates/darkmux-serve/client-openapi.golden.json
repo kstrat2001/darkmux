@@ -1439,6 +1439,11 @@
             "type": "string",
             "const": "git_route",
             "description": "(#3681) `POST /client/workspaces/{name}/git`: plain git on a\nworkspace (`status`, `fetch`, `push`, `merge_main`, `revert`,\n`diff`), and one lock per work copy (`work_copy_busy`)."
+          },
+          {
+            "type": "string",
+            "const": "read_only_runs",
+            "description": "(#3682) A run whose role may neither write nor edit (`researcher`,\n`code-reviewer`) has its workspace mounted read-only, so it cannot\nchange it by any means; the built-in `researcher` role exists."
           }
         ],
         "description": "One thing the client API can do that an app may need to check for."
