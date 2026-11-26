@@ -11,7 +11,7 @@ darkmux turns a Mac (or a few of them on a tailnet) into a working local-AI flee
 
 **[darkmux.com](https://darkmux.com) · [Live demo](https://darkmux.com/demo) — watch a real mission replay in your browser. Nothing to install.**
 
-> **Read before running.** darkmux orchestrates AI tools that execute on your machine. It drives the model servers on your machine (LM Studio, Tensorfold, rec's Flint, or one you run) and, in lab mode, runs AI-generated code in a working directory that is **not a security sandbox**. AI agents can behave unexpectedly; use darkmux on a machine where that is acceptable. Performance numbers here and in the articles were measured on the author's hardware and will differ on yours. See [DISCLAIMER.md](./DISCLAIMER.md). MIT licensed, no warranty.
+> **Read before running.** darkmux orchestrates AI tools that execute on your machine. It drives the model servers on your machine (LM Studio, Tensorfold, Recursive's Flint, or one you run) and, in lab mode, runs AI-generated code in a working directory that is **not a security sandbox**. AI agents can behave unexpectedly; use darkmux on a machine where that is acceptable. Performance numbers here and in the articles were measured on the author's hardware and will differ on yours. See [DISCLAIMER.md](./DISCLAIMER.md). MIT licensed, no warranty.
 
 ## Install
 
@@ -83,7 +83,7 @@ darkmux exists because the [Genesis series](https://darklyenergized.substack.com
 
 ## Honest limits
 
-- **Managed engines: LM Studio, Tensorfold and rec's Flint.** darkmux loads, starts, stops and budgets memory for those three. Any other OpenAI-compatible local server runs work as an endpoint (verified on `mlx_lm.server`), but darkmux does not load models on it or count what it holds against the machine's memory; Ollama and llama.cpp have no dedicated backend ([#316](https://github.com/kstrat2001/darkmux/issues/316)).
+- **Managed engines: LM Studio, Tensorfold and Recursive's Flint.** darkmux loads, starts, stops and budgets memory for those three. Any other OpenAI-compatible local server runs work as an endpoint (verified on `mlx_lm.server`), but darkmux does not load models on it or count what it holds against the machine's memory; Ollama and llama.cpp have no dedicated backend ([#316](https://github.com/kstrat2001/darkmux/issues/316)).
 - **Developed and dogfooded on Apple Silicon.** Linux compiles and passes CI's fleet tests, but nobody dogfoods it yet; Intel Mac is untested.
 - **Built to be driven by a frontier orchestrator** (Claude Code or equivalent). Standalone CLI use works for scripting; orchestrator-driven is the design.
 - **One operator, their own machines.** Not team tooling, not multi-tenant: a few Macs on a tailnet you trust. That's a focus, not a fence.
