@@ -3202,9 +3202,9 @@ fn check_max_stall_recoveries() -> Check {
         name: name.into(),
         status: Status::Pass,
         message: format!(
-            "{shown} recoveries ({provenance}) — how many useless turns (empty tool_calls, \
-             or a runaway-reasoning cut) the runtime tolerates before escalating out of \
-             local-tier (#2190)"
+            "{shown} recoveries ({provenance}): each useless turn (empty tool_calls, or a \
+             runaway-reasoning cut) counts one and each productive turn pays one back; the \
+             dispatch escalates out of local-tier when the count reaches this (#2190, #2229)"
         ),
         hint: None,
     }
