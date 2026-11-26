@@ -95,7 +95,6 @@ pub(crate) enum Part {
 }
 
 impl Part {
-
     /// The note's subject, ahead of its window.
     fn who(&self, id: &str) -> String {
         match self {
@@ -618,11 +617,10 @@ mod tests {
 
     #[test]
     fn missing_non_default_model_does_not_warn() {
-        // (#590) Only the default model (first model) is load-bearing for the
-        // envelope. The first model is loaded; a missing SECOND (non-default)
-        // model is common and quiet. (Replaces the old primary+compactor case —
-        // the compactor moved to the registry's internal.utility binding and can
-        // no longer live in `models[]`.)
+        // (#3678) A missing second model the run's dispatch does not select
+        // is not in the plan, so it gets no note. (The compactor moved to the
+        // registry's internal.utility binding and can no longer live in
+        // `models[]`.)
         let p = profile(vec![pm("qwen-35b", 262000), pm("qwen-4b", 68000)]);
         let loaded = vec![lm("darkmux:qwen-35b", "qwen-35b", 262000)];
         assert!(envelope_warnings(&p, "deep", &loaded, &[], None).is_empty());
