@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { K_TO_M, MISSING, clk, clkOn, clkrange, compactDuration, compactThousands, fmtC, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote, shortModel } from "./format";
+import { K_TO_M, MISSING, clk, clkOn, clkrange, compactDuration, compactThousands, fmtC, fmtElapsed, memBytes, memPct, memStateCls, reclaimableNote, relAgoFrom, shortModel } from "./format";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -411,5 +411,17 @@ describe("clkOn — a time that may not be today", () => {
     const yesterday = noon - 13 * 3600000; // 23:00 the day before
     expect(clkOn(yesterday, noon)).toBe(`${new Date(yesterday).toLocaleDateString([], { month: "short", day: "numeric" })} ${clk(yesterday)}`);
     expect(clkOn(yesterday, noon)).toMatch(/^[A-Za-z]{3} \d{1,2} \d{2}:\d{2}:\d{2}$/);
+  });
+});
+
+// (#2382) A timestamp stamped by a machine whose clock is ahead of the
+// reader's reads "just now", never an empty label.
+describe("relAgoFrom on a clock behind the timestamp's", () => {
+  it("reads just now, never empty", () => {
+    expect(relAgoFrom(1_000_000, 1_030_000)).toBe("just now");
+    expect(relAgoFrom(1_000_000, 1_000_000 + 3_600_000)).toBe("just now");
+  });
+  it("still ages a past timestamp", () => {
+    expect(relAgoFrom(1_000_000 + 90_000, 1_000_000)).toBe("1m ago");
   });
 });

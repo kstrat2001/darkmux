@@ -3425,16 +3425,24 @@ fn check_capacity(
     Ok(())
 }
 
+/// (#3683) Whether `client` may follow, stop or undo run `w`: any pairing,
+/// for a run in a workspace darkmux made for an app (the work copy is the
+/// owner's, so a run started on the Mac can be stopped from the iPhone);
+/// only the pairing that started it, for a run with no work copy.
+fn may_see_run(w: &WorkEntry, client: &ApprovedClient) -> bool {
+    w.git.is_some() || w.client_id == client.id
+}
+
 /// One run at a time per work copy. Every ended run's changes are
 /// committed, so a new run needs no decision first. A Tweak's `continues`
-/// is a label: one naming a run darkmux still knows must be this client's,
+/// is a label: one naming a run darkmux still knows must have run
 /// in this work copy (however it ended: a failed or cancelled run's edits
 /// are committed like a finished one's); one it has forgotten (past its
 /// keep time, or before a restart) makes a plain new run.
 fn check_work_copy(
     works: &HashMap<String, WorkEntry>,
     holds: &CopyHolds,
-    client: &ApprovedClient,
+    _client: &ApprovedClient,
     workdir: Option<&PathBuf>,
     continues: Option<&str>,
 ) -> Result<(), Refused> {
@@ -3452,11 +3460,11 @@ fn check_work_copy(
     }
     let foreign = continues
         .and_then(|c| works.get(c).map(|e| (c, e)))
-        .filter(|(_, e)| e.client_id != client.id || e.workdir.as_ref() != Some(w));
+        .filter(|(_, e)| e.workdir.as_ref() != Some(w));
     if let Some((c, _)) = foreign {
         return Err(refuse(
             StatusCode::CONFLICT, ClientCode::Conflict,
-            format!("run {c} isn't a run of yours in this work copy"),
+            format!("run {c} isn't a run in this work copy"),
         ));
     }
     Ok(())
@@ -3708,11 +3716,16 @@ fn workspace_dir(state: &ClientServerState, name: &str) -> Result<PathBuf, Refus
     (state.check_workdir)(&dir).map_err(|e| refuse(StatusCode::FORBIDDEN, ClientCode::Forbidden, e))
 }
 
-/// [`workspace_dir`], and only when darkmux made that workspace for
-/// `client` (its owner record, by client id, written when the workspace was
-/// made, by [`adopt_unowned`] or by `client claim`): a 403 for another app's
-/// workspace, a revoked client's, a mission's worktrees or any folder no app
-/// asked darkmux for.
+/// [`workspace_dir`], and only when darkmux made that workspace for a
+/// paired app: its owner record, written when the workspace was made, by
+/// [`adopt_unowned`] or by `client claim`. (#3683) A work copy is the
+/// owner's, not one pairing's: every pairing in this store is the
+/// operator's own (approved on this Mac, or over the tailnet only as this
+/// Mac's own tailnet user), so any live pairing may act on any workspace
+/// darkmux made for an app. The record names the pairing that made it, as
+/// attribution only. A 403 for a mission's worktrees and any folder no app
+/// asked darkmux for. A revoked pairing is already a 401 at
+/// [`authenticate`].
 pub(crate) fn owned_workspace(state: &ClientServerState, client: &ApprovedClient, name: &str) -> Result<PathBuf, Refused> {
     let dir = workspace_dir(state, name)?;
     let base = (state.worktrees_base)().map_err(|e| internal(anyhow!(e)))?;
@@ -3723,10 +3736,11 @@ pub(crate) fn owned_workspace(state: &ClientServerState, client: &ApprovedClient
         }
         recorded => recorded,
     };
-    if owner.as_deref() != Some(client.id.as_str()) {
+    let _ = client;
+    if owner.is_none() {
         return Err(forbidden(format!(
-            "workspace {name} was not made for this app: an app works only in a workspace darkmux \
-             made for it (POST /client/workspaces)"
+            "workspace {name} was not made for an app: an app works only in a workspace darkmux \
+             made for one (POST /client/workspaces)"
         )));
     }
     Ok(dir)
@@ -5176,7 +5190,7 @@ pub(crate) async fn work_status_handler(
     };
     let entry = state.works.lock().unwrap().get(&work_id).cloned();
     match entry {
-        Some(w) if w.client_id == client.id => {
+        Some(w) if may_see_run(&w, &client) => {
             let st = state.clone();
             tokio::task::spawn_blocking(move || Json(work_status_json(&st, &work_id, w)).into_response())
                 .await
@@ -5327,7 +5341,7 @@ pub(crate) async fn cancel_handler(
     };
     let works = state.works.lock().unwrap();
     match works.get(&work_id) {
-        Some(w) if w.client_id == client.id => match w.status {
+        Some(w) if may_see_run(w, &client) => match w.status {
             WorkStatus::Running => {
                 w.cancel.request();
                 (
@@ -5789,6 +5803,126 @@ pub(crate) struct ImageBody {
     replace: Option<String>,
 }
 
+/// (#3688) The most a file a paired app commits may hold.
+pub(crate) const MAX_WORKSPACE_FILE_BYTES: usize = 256 * 1024;
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileBody {
+    /// Where the file goes in the work copy: relative, plain folder names,
+    /// never under `.git`.
+    path: String,
+    /// The file's bytes, base64.
+    data: String,
+}
+
+/// `POST /client/workspaces/{name}/file` (#3688): a file a person approved
+/// in the app (a preview recipe, a playbook), sent as its path in the work
+/// copy and its bytes. darkmux writes it there, through no link at any
+/// name and never over a different file, and commits it as a work record
+/// with no model, like an image, so `/client/work/{id}/undo` and the git
+/// route's `revert` take it out again. The same bytes already there commit
+/// nothing (200, no `work_id`).
+pub(crate) async fn workspace_file_handler(
+    State(state): State<ClientServerState>,
+    ClientPath(name): ClientPath<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let client = match authenticate(&state, &headers) {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let limit = MAX_WORKSPACE_FILE_BYTES.div_ceil(3) * 8 + 64 * 1024;
+    let req: FileBody = match axum::body::to_bytes(body, limit).await {
+        Ok(b) => match serde_json::from_slice(&b) {
+            Ok(req) => req,
+            Err(e) => return err(StatusCode::BAD_REQUEST, ClientCode::BadRequest, format!("bad JSON body: {e}")),
+        },
+        Err(_) => return file_too_large(),
+    };
+    let st = state.clone();
+    tokio::task::spawn_blocking(move || match file_checked(&st, &client, &name, &req) {
+        Ok(reply) => Json(reply).into_response(),
+        Err(r) => *r,
+    })
+    .await
+    .unwrap_or_else(|e| internal(anyhow!("adding a file panicked: {e}")))
+}
+
+fn file_too_large() -> Response {
+    err(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        ClientCode::PayloadTooLarge,
+        format!("a file may hold at most {} KB", MAX_WORKSPACE_FILE_BYTES / 1024),
+    )
+}
+
+/// (#3688) A path a paired app may name in a work copy: relative, at most
+/// 255 bytes, plain folder and file names (no `.` or `..`, no control
+/// characters or backslash), nothing under `.git` in any case.
+pub(crate) fn workspace_file_path(path: &str) -> Result<String, Refused> {
+    let bad = |why: &str| refuse(StatusCode::BAD_REQUEST, ClientCode::BadRequest, format!("`path` {why}"));
+    if path.is_empty() || path.len() > 255 {
+        return Err(bad("must be 1 to 255 bytes"));
+    }
+    if path.starts_with('/') || path.chars().any(|c| c.is_control() || c == '\\') {
+        return Err(bad("must be relative, with no control characters or backslash"));
+    }
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
+        return Err(bad("must be plain folder and file names"));
+    }
+    if segments.iter().any(|s| s.eq_ignore_ascii_case(".git")) {
+        return Err(bad("may not be in `.git`"));
+    }
+    Ok(path.to_string())
+}
+
+/// [`workspace_file_handler`], blocking, with every refusal an `Err`.
+fn file_checked(st: &ClientServerState, client: &ApprovedClient, name: &str, req: &FileBody) -> Result<FileReply, Refused> {
+    let file = file_of(req)?;
+    let dir = owned_workspace(st, client, name)?;
+    let wc = work_copy_for(st, &dir)
+        .ok_or_else(|| refuse(StatusCode::CONFLICT, ClientCode::Conflict, "darkmux holds no repository for this workspace"))?;
+    let _in_use = held_work_copy(st, Some(&wc))?;
+    let work_id = format!("w-{}", random_hex(8).map_err(|e| Box::new(internal(e)))?);
+    let held = hold_for_edit(st, client, &dir, &wc, &work_id, format!("file {}", file.path))?;
+    let landed = held.finish(file_in(st, &wc, &file, &work_id))?;
+    Ok(FileReply {
+        path: landed.files.into_iter().next().unwrap_or(file.path),
+        work_id: Some(landed.work_id),
+        commit: Some(landed.commit),
+        branch: Some(landed.branch),
+    })
+}
+
+/// The file `req` asks for: a path inside the project, base64 bytes, no
+/// larger than [`MAX_WORKSPACE_FILE_BYTES`].
+fn file_of(req: &FileBody) -> Result<Image, Refused> {
+    let path = workspace_file_path(&req.path)?;
+    let bytes = crate::client_image::decode_base64(&req.data)
+        .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, ClientCode::BadRequest, "`data` must be base64"))?;
+    if bytes.len() > MAX_WORKSPACE_FILE_BYTES {
+        return Err(Box::new(file_too_large()));
+    }
+    Ok(Image { path, bytes })
+}
+
+/// [`image_in`] for a file: on the copy's own branch, written and
+/// committed; the same bytes already there answer with nothing committed.
+fn file_in(st: &ClientServerState, wc: &WorkCopy, file: &Image, work_id: &str) -> Result<EditDone, Refused> {
+    onto_own_branch(st, Some(wc))?;
+    if image_already_there(wc, file)? {
+        let same = FileReply { path: file.path.clone(), work_id: None, commit: None, branch: None };
+        return Err(Box::new(Json(same).into_response()));
+    }
+    let before = snapshot_tree(wc).map_err(|e| Box::new(internal(anyhow!("reading the work copy failed: {e}"))))?;
+    let mut placed = Placed::default();
+    place_and_commit(wc, (file, "file"), false, None, &mut placed, before.tree, work_id)
+        .map_err(|why| not_added(why, &put_image_back(wc, file, &placed), &file.path))
+}
+
 /// `POST /client/workspaces/{name}/image` (#3545): an image a person picked
 /// on the device the app runs on, sent as bytes (never a path: darkmux
 /// never reads a file a client names). darkmux checks what it is (PNG,
@@ -5965,7 +6099,7 @@ fn image_in(
     let before = snapshot_tree(wc)
         .map_err(|e| Box::new(internal(anyhow!("reading the work copy failed: {e}"))))?;
     let mut placed = Placed::default();
-    place_and_commit(wc, image, already, hit.as_ref(), &mut placed, before.tree, work_id)
+    place_and_commit(wc, (image, "image"), already, hit.as_ref(), &mut placed, before.tree, work_id)
         .map_err(|why| not_added(why, &put_image_back(wc, image, &placed), &image.path))
 }
 
@@ -6016,7 +6150,7 @@ struct Placed {
 /// A failure is why, in words, for [`not_added`].
 fn place_and_commit(
     wc: &WorkCopy,
-    image: &Image,
+    (image, kind): (&Image, &str),
     already: bool,
     hit: Option<&EditHit>,
     placed: &mut Placed,
@@ -6043,13 +6177,13 @@ fn place_and_commit(
         Ok(c) => (Some(c), None),
         Err(e) => (None, Some(format!("reading the image's changes failed: {e}"))),
     };
-    let message = format!("image: {path} (work {work_id})");
+    let message = format!("{kind}: {path} (work {work_id})");
     #[cfg(test)]
     before_edit_commit(wc);
     let (commit, branch) =
-        commit_run(wc, &files, &message).map_err(|e| format!("couldn't commit the image: {e}"))?;
+        commit_run(wc, &files, &message).map_err(|e| format!("couldn't commit the {kind}: {e}"))?;
     Ok(EditDone {
-        result: serde_json::json!({"image": {"path": path, "url": url}}),
+        result: serde_json::json!({kind: {"path": path, "url": url}}),
         files,
         commit,
         branch,
@@ -6304,7 +6438,7 @@ fn committed_run(
 ) -> Result<WorkEntry, Refused> {
     let client = authenticate(state, headers)?;
     let entry = state.works.lock().unwrap().get(work_id).cloned();
-    let Some(w) = entry.filter(|w| w.client_id == client.id) else {
+    let Some(w) = entry.filter(|w| may_see_run(w, &client)) else {
         return Err(Box::new(not_found()));
     };
     if matches!(w.status, WorkStatus::Running) {

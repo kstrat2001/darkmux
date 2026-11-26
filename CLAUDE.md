@@ -16,7 +16,7 @@ cargo fmt                # format
 cargo install --path .   # install to ~/.cargo/bin/darkmux
 ```
 
-The release binary is self-contained (~11 MB as of 1.18.x — embedded workloads, roles, mission configs, and the viewer (now including the mission-graph lens, React Flow bundled in like every other `ui/` dependency, #1868) all ride inside it via `include_str!`/`include_bytes!`). `cargo install --path .` produces a binary that works from any directory without the source tree.
+The release binary is self-contained (~32 MB as of 5.12: embedded workloads, roles, mission configs, and the viewer (now including the mission-graph lens, React Flow bundled in like every other `ui/` dependency, #1868) all ride inside it via `include_str!`/`include_bytes!`). `cargo install --path .` produces a binary that works from any directory without the source tree.
 
 ## Verifying a change: scale it to the risk
 

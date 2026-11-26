@@ -766,8 +766,8 @@ async fn only_a_ready_preview_of_a_remotely_paired_devices_own_gets_a_link() {
         coded(&sent(&h, ask("wt1")).await),
         (409, "conflict".to_string())
     );
+    // (#3683) A folder darkmux made for no app is nobody's to preview.
     std::fs::create_dir_all(h.base.join("theirs")).unwrap();
-    own(&h, "theirs", "c-someone-else");
     h.state.previews.ready_for_test("theirs", 1);
     assert_eq!(
         coded(&sent(&h, ask("theirs")).await),

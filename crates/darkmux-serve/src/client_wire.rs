@@ -324,6 +324,17 @@ pub struct ImageReply {
     pub branch: Option<String>,
 }
 
+/// `POST /client/workspaces/{name}/file` (#3688): where the file went, and
+/// its work record and commit; no `work_id` when the same bytes were there
+/// already and nothing was committed.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct FileReply {
+    pub path: String,
+    pub work_id: Option<String>,
+    pub commit: Option<String>,
+    pub branch: Option<String>,
+}
+
 /// `POST /client/work/{id}/keep` (older apps): the run's commit.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct KeepReply {

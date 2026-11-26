@@ -444,7 +444,7 @@ darkmux mission finalize deploy-rewrite    <span class="comment"># close out dar
 
     <div class="callout">
       <strong>Under the hood: Task/Step.</strong>
-      <p style="margin: 8px 0 0;">As of darkmux #1230, the coder-phase loop executes through a generic Task/Step dependency-graph scheduler (worktree → dispatch → QA → gate, each a Step within a Task) rather than hardcoded control flow, the same engine the PR-review pipeline runs on. This is implementation detail today: Task/Step aren't yet a CLI surface you author directly, and the viewer doesn't render the graph yet (that's a tracked follow-up). Mentioned here so the vocabulary isn't a surprise if you see <code>task_id</code>/<code>step_id</code> fields in a flow record's payload.</p>
+      <p style="margin: 8px 0 0;">As of darkmux #1230, the coder-phase loop executes through a generic Task/Step dependency-graph scheduler (worktree → dispatch → QA → gate, each a Step within a Task) rather than hardcoded control flow, the same engine the PR-review pipeline runs on. This is implementation detail today: Task/Step aren't yet a CLI surface you author directly; the viewer's mission graph lens draws them. Mentioned here so the vocabulary isn't a surprise if you see <code>task_id</code>/<code>step_id</code> fields in a flow record's payload.</p>
     </div>
 
     <h3>Fleet fan-out: <code>dispatch --profile &lt;p&gt;@&lt;machine&gt;</code></h3>
