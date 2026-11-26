@@ -28,6 +28,11 @@ darkmux release.
 
 ### Fixed
 
+- **A phase file whose mission has no `mission.json` no longer breaks every role verb (#3675).** The
+  crew index rebuild failed with a bare `FOREIGN KEY constraint failed`, so `darkmux role list` and
+  every other verb that reads the index failed with it. The rebuild now skips that phase with one
+  warning naming the missing or unreadable `mission.json`, and indexes everything else.
+
 - **`darkmux doctor`'s `resident pricing` row no longer passes when it could not read the residents
   (#3616).** When the resident list could not be read (a timed-out `lms ps`, say), the row said "every
   resident model is priceable". It now warns, naming why; on an engine that does not report what it

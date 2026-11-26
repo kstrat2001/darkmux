@@ -693,14 +693,15 @@ fn populate(conn: &mut Connection) -> Result<()> {
         }
     }
 
-    // Phases. A phase belonging to a mission that was skipped above is also
-    // skipped — `phases.mission_id` has a deferred FK to `missions(id)`
-    // (checked at `tx.commit()`, see `defer_foreign_keys` above), so
-    // inserting it would only convert the earlier per-row mission warning
-    // into a hard commit-time FK failure that takes the whole rebuild down
-    // anyway (#2142).
+    // Phases. A phase whose mission is not indexed is skipped:
+    // `phases.mission_id` has a deferred FK to `missions(id)` (checked at
+    // `tx.commit()`, see `defer_foreign_keys` above), so inserting it would
+    // fail the whole rebuild at commit. Its mission was either skipped above
+    // (#2142) or never loaded: no `mission.json`, or one that would not read
+    // (#3675).
+    let indexed_mission_ids = indexed_missions(&missions, &skipped_mission_ids);
     for phase in &phases {
-        if skipped_mission_ids.contains(phase.mission_id.as_str()) {
+        if skip_unindexed_phase(phase, &indexed_mission_ids, &skipped_mission_ids) {
             continue;
         }
         // (#1341) `Phase` no longer carries `depends_on` — Phases are
@@ -755,6 +756,72 @@ fn populate(conn: &mut Connection) -> Result<()> {
 
     tx.commit()?;
     Ok(())
+}
+
+/// The missions the rebuild indexed: every loaded mission whose INSERT was
+/// not skipped (#2142).
+fn indexed_missions<'a>(
+    missions: &'a [Mission],
+    skipped: &std::collections::HashSet<&str>,
+) -> std::collections::HashSet<&'a str> {
+    missions.iter().map(|m| m.id.as_str()).filter(|id| !skipped.contains(id)).collect()
+}
+
+/// What the rebuild does with a phase, by whether its mission is indexed.
+#[derive(Debug, PartialEq, Eq)]
+enum PhaseFate {
+    Index,
+    /// Its mission's INSERT was skipped, and already warned about (#2142).
+    SkipQuietly,
+    /// Its mission never loaded (#3675): warn once.
+    SkipOrphan,
+}
+
+fn phase_fate(
+    mission: &str,
+    indexed: &std::collections::HashSet<&str>,
+    skipped: &std::collections::HashSet<&str>,
+) -> PhaseFate {
+    if indexed.contains(mission) {
+        PhaseFate::Index
+    } else if skipped.contains(mission) {
+        PhaseFate::SkipQuietly
+    } else {
+        PhaseFate::SkipOrphan
+    }
+}
+
+/// Whether `phase` must stay out of the index, saying why for an orphan.
+fn skip_unindexed_phase(
+    phase: &Phase,
+    indexed: &std::collections::HashSet<&str>,
+    skipped: &std::collections::HashSet<&str>,
+) -> bool {
+    let fate = phase_fate(&phase.mission_id, indexed, skipped);
+    if fate == PhaseFate::SkipOrphan {
+        let mission_file = crate::lifecycle::mission_path(&phase.mission_id);
+        eprintln!("{}", orphan_phase_warning(phase, &mission_file, mission_file.is_file()));
+    }
+    fate != PhaseFate::Index
+}
+
+/// The warning for a phase whose mission never loaded. The "remove it" advice
+/// is only for a missing `mission.json`: one that exists but was refused (a
+/// newer darkmux wrote it, say) holds a real mission, warned about above.
+fn orphan_phase_warning(phase: &Phase, mission_file: &Path, exists: bool) -> String {
+    let why = if exists {
+        format!("whose {} could not be read (see the warning above)", mission_file.display())
+    } else {
+        format!(
+            "which has no {}. If that directory is left over (for example from a test), remove it",
+            mission_file.display()
+        )
+    };
+    format!(
+        "warning: phase '{}' names mission '{}', {why}. The phase is skipped and the rebuild \
+         continues. (#3675)",
+        phase.id, phase.mission_id
+    )
 }
 
 fn upsert_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
@@ -1554,6 +1621,74 @@ mod tests {
             "darkmux role list reads this table — an aborted mission must not empty it (#2142)"
         );
     }
+
+    /// #3675 regression test. Pre-fix, one phase file whose mission has no
+    /// `mission.json` failed the whole rebuild at commit with a bare
+    /// `FOREIGN KEY constraint failed`, so every role verb failed with it.
+    /// The orphan is skipped; the rest of the store is still indexed.
+    #[serial_test::serial]
+    #[test]
+    fn rebuild_skips_a_phase_whose_mission_has_no_mission_json() {
+        let guard = CrewDirGuard::new();
+        write_mission_with_status(guard.path(), "m-real", "active");
+        write_phase(guard.path(), "p-kept", "m-real", "kept");
+        write_phase(guard.path(), "s5", "test-mission", "orphan");
+        let idx = guard.path().join("index.db");
+
+        rebuild_at(&idx).expect("an orphan phase file must not fail the rebuild (#3675)");
+
+        let conn = open_index(&idx).unwrap();
+        let phases: Vec<String> = conn
+            .prepare("SELECT id FROM phases ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(phases, ["p-kept"], "the orphan is skipped and the real mission's phase is indexed");
+        let role_count: i64 = conn.query_row("SELECT COUNT(*) FROM roles", [], |r| r.get(0)).unwrap();
+        assert!(role_count > 0, "darkmux role list reads this table");
+    }
+
+    #[test]
+    fn a_phase_is_indexed_only_when_its_mission_is() {
+        let indexed: std::collections::HashSet<&str> = ["m-real"].into_iter().collect();
+        let skipped: std::collections::HashSet<&str> = ["m-bad"].into_iter().collect();
+        assert_eq!(phase_fate("m-real", &indexed, &skipped), PhaseFate::Index);
+        assert_eq!(phase_fate("m-bad", &indexed, &skipped), PhaseFate::SkipQuietly, "warned once already (#2142)");
+        assert_eq!(phase_fate("test-mission", &indexed, &skipped), PhaseFate::SkipOrphan);
+    }
+
+    #[test]
+    fn a_mission_whose_insert_was_skipped_is_not_indexed() {
+        let mission = |id: &str| -> Mission {
+            serde_json::from_str(&format!(
+                r#"{{"id": "{id}", "description": "d", "status": "active", "phase_ids": [], "created_ts": 1}}"#
+            ))
+            .unwrap()
+        };
+        let missions = [mission("m-real"), mission("m-bad")];
+        let skipped: std::collections::HashSet<&str> = ["m-bad"].into_iter().collect();
+        let indexed = indexed_missions(&missions, &skipped);
+        assert_eq!(indexed, ["m-real"].into_iter().collect());
+    }
+
+    #[test]
+    fn the_orphan_warning_says_remove_only_when_the_mission_file_is_missing() {
+        let phase: Phase = serde_json::from_str(
+            r#"{"id": "s5", "mission_id": "test-mission", "description": "d", "created_ts": 1}"#,
+        )
+        .unwrap();
+        let file = Path::new("/state/missions/test-mission/mission.json");
+        let missing = orphan_phase_warning(&phase, file, false);
+        assert!(missing.contains("'s5'") && missing.contains("'test-mission'"), "{missing}");
+        assert!(missing.contains("has no /state/missions/test-mission/mission.json"), "{missing}");
+        assert!(missing.contains("remove it"), "{missing}");
+        let refused = orphan_phase_warning(&phase, file, true);
+        assert!(refused.contains("could not be read"), "{refused}");
+        assert!(!refused.contains("remove"), "a refused mission.json holds a real mission: {refused}");
+    }
+
 
     /// Drift guard for #2142: `mission_status_str`'s match is exhaustive
     /// over `MissionStatus`, so it cannot silently skip a variant — but
