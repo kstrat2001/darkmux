@@ -573,21 +573,14 @@ fn parse_libtest_summary(stdout: &str, stderr: &str) -> Option<LibtestSummary> {
     total
 }
 
-/// The red-prove for `parse_libtest_summary`'s `None` case, and (paired
-/// with the tests below) the thing #2736 item 3 says has never existed: a
-/// test that drives the anti-vacuity floor with a deliberately
-/// non-executing invocation, with no `cargo` spawn required. Delete the
-/// `summary.is_some()` assertion in `no_test_unit_writes_into_a_sentinel_
-/// state_tree` and this one still passes — it is scoped to the parser, not
-/// the caller — but deleting `parse_libtest_summary` itself (or hardcoding
-/// its result) turns this red immediately, along with the tests below.
-/// (#3674) The tests libtest reported `FAILED` in `stdout`, in order. A leak
-/// from a unit whose child exited 101 is usually a test that failed before
-/// its own cleanup ran, so the offender line names them.
+/// (#3674) The tests libtest reported `FAILED` in `stdout`, in order (a
+/// `#[should_panic]` test's ` - should panic` tag dropped), so a leak from a
+/// unit that also went red names the tests to look at first.
 fn failed_test_names(stdout: &str) -> Vec<&str> {
     stdout
         .lines()
         .filter_map(|l| l.strip_prefix("test ")?.strip_suffix(" ... FAILED"))
+        .map(|name| name.strip_suffix(" - should panic").unwrap_or(name))
         .collect()
 }
 
@@ -602,12 +595,20 @@ fn failed_tests_note(failed: &[&str]) -> String {
 #[test]
 fn the_offender_line_names_the_tests_libtest_reported_failed() {
     let stdout = "running 3 tests\ntest a::ok ... ok\ntest ownership::tests::held ... FAILED\n\
-                  test b::slow ... FAILED\n\nfailures:\n\ntest result: FAILED. 1 passed; 2 failed";
-    assert_eq!(failed_test_names(stdout), ["ownership::tests::held", "b::slow"]);
-    assert_eq!(failed_tests_note(&failed_test_names(stdout)), "; failed tests: ownership::tests::held, b::slow");
+                  test b::slow ... FAILED\ntest c::sp - should panic ... FAILED\n\nfailures:\n\ntest result: FAILED. 1 passed; 2 failed";
+    assert_eq!(failed_test_names(stdout), ["ownership::tests::held", "b::slow", "c::sp"]);
+    assert_eq!(failed_tests_note(&failed_test_names(stdout)), "; failed tests: ownership::tests::held, b::slow, c::sp");
     assert_eq!(failed_tests_note(&failed_test_names("test a::ok ... ok\n")), "");
 }
 
+/// The red-prove for `parse_libtest_summary`'s `None` case, and (paired
+/// with the tests below) the thing #2736 item 3 says has never existed: a
+/// test that drives the anti-vacuity floor with a deliberately
+/// non-executing invocation, with no `cargo` spawn required. Delete the
+/// `summary.is_some()` assertion in `no_test_unit_writes_into_a_sentinel_
+/// state_tree` and this one still passes — it is scoped to the parser, not
+/// the caller — but deleting `parse_libtest_summary` itself (or hardcoding
+/// its result) turns this red immediately, along with the tests below.
 #[test]
 fn parse_libtest_summary_reports_none_when_no_summary_line_ever_printed() {
     // A binary that never reached libtest's own harness at all — killed,
