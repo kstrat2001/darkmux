@@ -28,14 +28,6 @@ darkmux release.
 
 ### Fixed
 
-- **A dispatch whose first request cannot fit the window is refused before it is sent (#3679).** The
-  runtime estimated the request far over the declared window, with nothing left to trim, warned, and
-  sent it anyway, so the run ended on the engine's error instead of darkmux's. It now refuses the
-  dispatch's first request when it cannot fit even counted at 5 characters per token, more than any
-  content darkmux has measured, naming the size, the window and what to shrink. A request only over on
-  the deliberately high estimate is still sent, and a later request that outgrows the window is left to
-  the named escalations, which keep the run's work.
-
 - **A phase file whose mission has no `mission.json` no longer breaks every role verb (#3675).** The
   crew index rebuild failed with a bare `FOREIGN KEY constraint failed`, so `darkmux role list` and
   every other verb that reads the index failed with it. The rebuild now skips that phase with one

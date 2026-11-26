@@ -2968,42 +2968,25 @@ pub(crate) fn estimate_prompt_tokens(
     anchored.max(flat_floor)
 }
 
-/// (#3679) Characters per token above any rate measured for what a request
-/// carries: prose reads 3.94 on this project's own fixture and a thread of
-/// tool results 2.93 (see [`UNCOUNTED_CHARS_PER_TOKEN`]). A request that does
-/// not fit the window even counted at this rate cannot fit at the endpoint's
-/// real count, so it is refused instead of sent.
-const MOST_CHARS_PER_TOKEN: f64 = 5.0;
-
-/// (#3679) The fewest tokens the thread about to be sent can count at: what
-/// the endpoint already counted (the anchor) plus the new characters at
-/// [`MOST_CHARS_PER_TOKEN`], or everything at that rate with no anchor. The
-/// low bound to [`estimate_prompt_tokens`]'s deliberately high one.
-pub(crate) fn fewest_prompt_tokens(message_chars: usize, tools_chars: usize, anchor: Option<PromptAnchor>) -> u32 {
-    match anchor {
-        Some(a) if message_chars >= a.chars => {
-            a.tokens.saturating_add(((message_chars - a.chars) as f64 / MOST_CHARS_PER_TOKEN) as u32)
-        }
-        _ => ((message_chars + tools_chars) as f64 / MOST_CHARS_PER_TOKEN) as u32,
-    }
+/// (#3679) darkmux's reason for a request the pre-send bound judged
+/// unfittable, put first on the error when the endpoint then refuses it, so
+/// the run does not end on the engine's words alone.
+pub(crate) fn unfit_reason(estimated: u32, window: u32) -> String {
+    format!(
+        "this request was estimated at ~{estimated} tokens against the {window}-token window this profile \
+         declares, with nothing left to trim, so the endpoint's error below most likely means it does not \
+         fit: shrink what this role puts in context (the brief, or the files it is given), or raise the \
+         profile's n_ctx (#3679)"
+    )
 }
 
-/// (#3679) Refuse the dispatch's FIRST request when its fewest possible tokens
-/// exceed `window`: sent, the endpoint can only refuse it, its error would
-/// stand where darkmux's own reason belongs, and there is no work yet to
-/// keep. A later request that outgrows the window is left to the named
-/// escalations (#3074's `TurnContinuationsExhausted` and the rest), which
-/// carry the run's work out instead of failing it.
-pub(crate) fn refuse_unfittable(fewest: u32, window: u32, first_request: bool) -> Result<()> {
-    if !first_request || fewest <= window {
-        return Ok(());
+/// (#3679) `e`, with darkmux's reason first when the request was judged
+/// unfittable before it went out.
+pub(crate) fn with_unfit_reason(e: anyhow::Error, unfit: Option<&str>) -> anyhow::Error {
+    match unfit {
+        Some(reason) => e.context(reason.to_string()),
+        None => e,
     }
-    anyhow::bail!(
-        "refused to send the next request: even counted at {MOST_CHARS_PER_TOKEN} characters per token, \
-         more than any content darkmux has measured, it is ~{fewest} tokens against the {window}-token \
-         window this profile declares, and nothing further can reduce it. Shrink what this role puts in \
-         context (the brief, or the files it is given), or raise the profile's n_ctx. (#3679)"
-    )
 }
 
 /// (#2792 round-4) The inverse of [`estimate_prompt_tokens`]: how many MESSAGE
@@ -6808,6 +6791,39 @@ mod tests {
         assert!(turn_fills_window(Some(2500), 2500));
         assert!(turn_fills_window(Some(2500), 2501));
         assert!(!turn_fills_window(None, u32::MAX));
+    }
+
+    /// (#3679) A request the pre-send bound judged unfittable is still sent,
+    /// but when the endpoint refuses it the dispatch's error leads with
+    /// darkmux's reason (the estimate, the window, what to shrink); a fitting
+    /// request's endpoint error is passed through as before.
+    #[test]
+    #[serial_test::serial]
+    fn an_endpoint_refusing_an_unfittable_request_errs_with_darkmuxs_reason() {
+        let run = |brief_bytes: usize| -> String {
+            let server = crate::test_support::GuardedMockServer::start();
+            server.mock(|when, then| {
+                when.method(POST).path("/v1/chat/completions");
+                then.status(400).json_body(serde_json::json!({"error": "The number of tokens to keep from the initial prompt is greater than the context length."}));
+            });
+            let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+            let tmp = tempfile::Builder::new().prefix("unfit-reason").tempdir().unwrap();
+            let mut traj = Trajectory::open(tmp.path());
+            let initial = vec![Message::system("test"), Message::user(&"word ".repeat(brief_bytes / 5))];
+            let cfg = compaction::CompactionConfig { context_window: Some(32_000), ..compaction::CompactionConfig::never_compact() };
+            let err = run_with_sleeper(
+                &client, &client, "test-model", initial, &[Tool::Read], &mut traj, false, &cfg,
+                Some(5), None, Some(4_096), None, None,
+                None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+            )
+            .expect_err("the endpoint refuses");
+            format!("{err:#}")
+        };
+        let unfit = run(240_000);
+        assert!(unfit.starts_with("this request was estimated at ~"), "darkmux's reason leads: {unfit}");
+        assert!(unfit.contains("32000-token window") && unfit.contains("(#3679)"), "{unfit}");
+        let fitting = run(1_000);
+        assert!(!fitting.contains("#3679"), "a fitting request's error is the endpoint's own: {fitting}");
     }
 
     /// (#3074) The same window bound for a turn that keeps REASONING: the

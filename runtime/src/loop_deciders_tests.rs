@@ -243,15 +243,6 @@ fn call_bound_table() {
 }
 
 #[test]
-fn nothing_is_sent_yet_only_before_the_first_request() {
-    assert!(nothing_sent_yet(&state()));
-    assert!(!nothing_sent_yet(&LoopState { turns: 1, ..state() }));
-    assert!(!nothing_sent_yet(&LoopState { resuming_after_checkpoint: true, ..state() }));
-    assert!(!nothing_sent_yet(&LoopState { checkpoints_used: 1, ..state() }));
-    assert!(!nothing_sent_yet(&LoopState { generation_continuations_this_turn: 1, ..state() }));
-}
-
-#[test]
 fn request_seq_names_the_turn_the_request_belongs_to() {
     assert_eq!(request_seq(&LoopState { turns: 4, ..state() }), 5, "a fresh turn");
     assert_eq!(request_seq(&LoopState { turns: 4, resuming_after_checkpoint: true, ..state() }), 4, "a continuation");
