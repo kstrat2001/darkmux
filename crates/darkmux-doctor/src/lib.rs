@@ -7409,10 +7409,68 @@ fn check_darkmux_version_vs_latest_release() -> Check {
         return skip("update check disabled (DARKMUX_CHECK_UPDATES / config)");
     }
 
-    match fetch_latest_release_tag() {
+    match latest_release_tag_cached(&release_check_cache_path(), unix_now_ms(), installed, fetch_latest_release_tag) {
         Ok(latest) => classify_version_vs_latest(installed, &latest, NAME),
         Err(reason) => skip(&reason),
     }
+}
+
+/// (#1603) How long a fetched release tag is reused before doctor asks GitHub
+/// again. Unauthenticated, the API allows 60 requests an hour per IP, and
+/// doctor in a loop or behind a panel would spend them: an hour holds any loop
+/// to one call an hour, and a release (whose tap sync is dispatched at once)
+/// still shows within the hour.
+const RELEASE_CHECK_CACHE_MS: u64 = 60 * 60 * 1000;
+
+/// Where the last fetched release tag is kept: darkmux's own run state, not
+/// a user file.
+fn release_check_cache_path() -> PathBuf {
+    darkmux_types::paths::user_root_guarded().join("run").join("release-check.json")
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The latest release tag: the cached one while it is fresh at `now_ms` and
+/// was fetched by this same `installed` version (an upgrade asks again, so it
+/// never reads an older "latest released"), else `fetch`'s, which is then
+/// cached. A failed fetch is never cached, so the next run asks again.
+fn latest_release_tag_cached(
+    cache: &std::path::Path,
+    now_ms: u64,
+    installed: &str,
+    fetch: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    if let Some(tag) = std::fs::read_to_string(cache).ok().and_then(|t| fresh_cached_tag(&t, now_ms, installed)) {
+        return Ok(tag);
+    }
+    let tag = fetch()?;
+    let _ = write_release_check_cache(cache, &tag, now_ms, installed);
+    Ok(tag)
+}
+
+/// The cached tag in `text` when it was fetched less than
+/// [`RELEASE_CHECK_CACHE_MS`] before `now_ms` by this same `installed`
+/// version. A stamp after `now_ms` (the clock went back) is not fresh.
+fn fresh_cached_tag(text: &str, now_ms: u64, installed: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if v.get("installed")?.as_str()? != installed {
+        return None;
+    }
+    let at = v.get("fetched_at_ms")?.as_u64()?;
+    let tag = v.get("tag")?.as_str()?;
+    let age = now_ms.checked_sub(at)?;
+    (age < RELEASE_CHECK_CACHE_MS).then(|| tag.to_string())
+}
+
+fn write_release_check_cache(cache: &std::path::Path, tag: &str, now_ms: u64, installed: &str) -> std::io::Result<()> {
+    if let Some(dir) = cache.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(cache, serde_json::json!({"tag": tag, "fetched_at_ms": now_ms, "installed": installed}).to_string())
 }
 
 /// Shell out to `curl` for the GitHub releases API. Avoids adding a
@@ -8486,6 +8544,73 @@ pub fn print_report(r: &DoctorReport, verbose: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    // ── #1603: the release check reuses a fresh tag instead of asking GitHub ──
+
+    const T0: u64 = 1_800_000_000_000;
+
+    #[test]
+    fn a_fresh_cached_tag_is_reused_without_a_fetch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("run").join("release-check.json");
+        let first = super::latest_release_tag_cached(&cache, T0, "5.12.0", || Ok("5.12.0".into()));
+        assert_eq!(first.as_deref(), Ok("5.12.0"));
+        let again = super::latest_release_tag_cached(&cache, T0 + super::RELEASE_CHECK_CACHE_MS - 1, "5.12.0", || panic!("a fresh tag needs no fetch"));
+        assert_eq!(again.as_deref(), Ok("5.12.0"));
+    }
+
+    #[test]
+    fn a_stale_or_future_stamped_tag_is_fetched_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("release-check.json");
+        super::latest_release_tag_cached(&cache, T0, "5.12.0", || Ok("5.12.0".into())).unwrap();
+        let stale = super::latest_release_tag_cached(&cache, T0 + super::RELEASE_CHECK_CACHE_MS, "5.12.0", || Ok("5.13.0".into()));
+        assert_eq!(stale.as_deref(), Ok("5.13.0"), "a stale tag is refetched and recached");
+        let back = super::latest_release_tag_cached(&cache, T0 - 1, "5.12.0", || Ok("5.12.1".into()));
+        assert_eq!(back.as_deref(), Ok("5.12.1"), "a clock that went back refetches");
+    }
+
+    /// (#3701 review) After an upgrade past the cached tag, the cache cannot
+    /// say what the latest release is, so it asks again.
+    #[test]
+    fn a_cached_tag_older_than_the_installed_version_is_fetched_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("release-check.json");
+        super::latest_release_tag_cached(&cache, T0, "5.12.0", || Ok("5.12.0".into())).unwrap();
+        let upgraded = super::latest_release_tag_cached(&cache, T0 + 1, "5.13.0", || Ok("5.13.0".into()));
+        assert_eq!(upgraded.as_deref(), Ok("5.13.0"));
+        let same = super::latest_release_tag_cached(&cache, T0 + 2, "5.13.0", || panic!("current: no fetch"));
+        assert_eq!(same.as_deref(), Ok("5.13.0"));
+    }
+
+    /// (#3701 review) A build ahead of the latest release (a release being
+    /// dogfooded before it is published) still asks GitHub once an hour, not
+    /// on every run.
+    #[test]
+    fn a_build_ahead_of_the_latest_release_fetches_once_an_hour() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("release-check.json");
+        let fetches = std::cell::Cell::new(0);
+        for i in 0..5 {
+            let tag = super::latest_release_tag_cached(&cache, T0 + i, "5.13.0", || {
+                fetches.set(fetches.get() + 1);
+                Ok("5.12.0".into())
+            });
+            assert_eq!(tag.as_deref(), Ok("5.12.0"));
+        }
+        assert_eq!(fetches.get(), 1);
+    }
+
+    #[test]
+    fn a_failed_fetch_is_not_cached_and_garbage_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("release-check.json");
+        assert!(super::latest_release_tag_cached(&cache, T0, "5.12.0", || Err("offline".into())).is_err());
+        assert!(!cache.exists(), "nothing is cached on a failure");
+        std::fs::write(&cache, "not json").unwrap();
+        let fetched = super::latest_release_tag_cached(&cache, T0, "5.12.0", || Ok("5.12.0".into()));
+        assert_eq!(fetched.as_deref(), Ok("5.12.0"));
+    }
 
     // ── #3020: ai_headroom_bytes's arithmetic ─────────────────────────────
 
