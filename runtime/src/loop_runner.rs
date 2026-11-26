@@ -6808,7 +6808,7 @@ mod tests {
             let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
             let tmp = tempfile::Builder::new().prefix("unfit-reason").tempdir().unwrap();
             let mut traj = Trajectory::open(tmp.path());
-            let initial = vec![Message::system("test"), Message::user(&"word ".repeat(brief_bytes / 5))];
+            let initial = vec![Message::system("test"), Message::user("word ".repeat(brief_bytes / 5))];
             let cfg = compaction::CompactionConfig { context_window: Some(32_000), ..compaction::CompactionConfig::never_compact() };
             let err = run_with_sleeper(
                 &client, &client, "test-model", initial, &[Tool::Read], &mut traj, false, &cfg,

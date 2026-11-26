@@ -928,9 +928,7 @@ impl<'a> AgentLoop<'a> {
         // every single request. Budgeting without it certified `fits: true`
         // on a body 36% over the window, which is the defect this bound
         // exists to prevent, wearing a record that says it was checked.
-        let Some(window) = self.cfg.context_window else {
-            return None;
-        };
+        let window = self.cfg.context_window?;
         // Serialized inside the guard, not above it: it is used nowhere
         // else, and hoisting it cost a ~12KB serialization every turn on
         // dispatches that declare no window at all.
