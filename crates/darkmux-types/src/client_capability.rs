@@ -92,11 +92,14 @@ pub enum ClientCapability {
     /// (#3688) `POST /client/workspaces/{name}/file`: a file a person
     /// approved, committed into the work copy like an image.
     WorkspaceFile,
+    /// (#3684) The git route's `new_task`: after a merge, the work copy
+    /// moves onto a new branch from the merged main.
+    NewTask,
 }
 
 impl ClientCapability {
     /// Every capability, in declaration order: what `whoami` lists.
-    pub const ALL: [ClientCapability; 16] = [
+    pub const ALL: [ClientCapability; 17] = [
         ClientCapability::CleanPreview,
         ClientCapability::TemplateWorkspace,
         ClientCapability::Continues,
@@ -113,6 +116,7 @@ impl ClientCapability {
         ClientCapability::GitRoute,
         ClientCapability::ReadOnlyRuns,
         ClientCapability::WorkspaceFile,
+        ClientCapability::NewTask,
     ];
 }
 
@@ -151,6 +155,7 @@ mod tests {
                 "git_route",
                 "read_only_runs",
                 "workspace_file",
+                "new_task",
             ]
         );
         for c in ClientCapability::ALL {

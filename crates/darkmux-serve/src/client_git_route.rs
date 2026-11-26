@@ -10,6 +10,7 @@
 //! | `merge_main` | `origin/<default>` (as last fetched) into the branch | yes |
 //! | `revert` | a new commit undoing one of the branch's own commits | yes |
 //! | `diff` | the branch's files against its base or its upstream | no |
+//! | `new_task` | after a merge, a new branch from the merged main, carrying what came after (#3684) | yes |
 //!
 //! Anything else is refused by name, and each verb takes a fixed shape of
 //! arguments: no free-form git. Every local call goes through
@@ -47,7 +48,7 @@ use serde::Deserialize;
 
 use crate::client_git::{self, WorkCopy};
 use crate::client_pairing::{self as cp, ClientPath, ClientServerState};
-use crate::client_wire::{ClientError, GitBusy, GitMerged, GitPushed, GitReply, GitReverted, GitStatus, GitUpstream};
+use crate::client_wire::{ClientError, GitBusy, GitMerged, GitNewTask, GitPushed, GitReply, GitReverted, GitStatus, GitUpstream};
 use darkmux_types::client_code::ClientCode;
 
 /// Set to `1` on a git child: this binary, started as its `GIT_ASKPASS`,
@@ -121,6 +122,7 @@ pub(crate) enum GitVerb {
     MergeMain,
     Revert,
     Diff,
+    NewTask,
 }
 
 impl GitVerb {
@@ -131,6 +133,7 @@ impl GitVerb {
             GitVerb::Push => "push",
             GitVerb::MergeMain => "merge_main",
             GitVerb::Revert => "revert",
+            GitVerb::NewTask => "new_task",
             GitVerb::Diff => "diff",
         }
     }
@@ -145,6 +148,7 @@ enum GitArgsDoc {
     Push(PushArgs),
     Revert(RevertArgs),
     Diff(DiffArgs),
+    NewTask(NewTaskArgs),
 }
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
@@ -177,6 +181,15 @@ struct PushArgs {
 #[serde(deny_unknown_fields)]
 struct RevertArgs {
     commit: String,
+}
+
+/// `new_task` (#3684): the review GitHub merged, by the head it merged
+/// (`merged_head`) and GitHub's merge commit (`merge_sha`), both full ids.
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NewTaskArgs {
+    merged_head: String,
+    merge_sha: String,
 }
 
 /// `diff`: against the branch's base (what `/changes` answers) or its
@@ -213,6 +226,7 @@ enum Asked {
     Push(PushArgs),
     MergeMain,
     Revert(String),
+    NewTask(NewTaskArgs),
 }
 
 impl Asked {
@@ -227,6 +241,7 @@ impl Asked {
             GitVerb::Fetch => args_of(verb, args).map(Asked::Fetch),
             GitVerb::Push => args_of(verb, args).map(Asked::Push),
             GitVerb::Revert => args_of::<RevertArgs>(verb, args).map(|a| Asked::Revert(a.commit)),
+            GitVerb::NewTask => args_of(verb, args).map(Asked::NewTask),
         }
     }
 }
@@ -301,6 +316,7 @@ fn changed(st: &ClientServerState, name: &str, wc: &WorkCopy, dir: &Path, asked:
         Asked::Push(a) => push(st, name, wc, a).map(GitReply::Push),
         Asked::MergeMain => merge_main(wc).map(GitReply::MergeMain),
         Asked::Revert(commit) => revert(st, name, wc, &commit).map(GitReply::Revert),
+        Asked::NewTask(a) => new_task(st, name, wc, &a).map(GitReply::NewTask),
         Asked::Status | Asked::Diff(_) => unreachable!("read-only verbs are answered without the lock"),
     }
 }
@@ -728,6 +744,117 @@ fn revert(st: &ClientServerState, name: &str, wc: &WorkCopy, commit: &str) -> Re
         e.decided.get_or_insert_with(|| format!("undone by {revert}"));
     }
     Ok(GitReverted { commit: full, revert, files })
+}
+
+// ─── new_task (#3684) ────────────────────────────────────────────────────
+
+/// A full commit id: 40 lowercase hex digits.
+fn full_id(c: &str) -> bool {
+    c.len() == 40 && valid_commit(c)
+}
+
+/// Whether the task's branch is the one GitHub merged: its upstream, as
+/// last fetched or pushed, is `merged_head`. Not (already moved, by this
+/// device or another; or never sent): nothing to do.
+fn is_merged_task(wc: &WorkCopy, merged_head: &str) -> Option<String> {
+    let branch = line(wc, &["branch", "--show-current"])?;
+    let upstream = line(wc, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/origin/{branch}")])?;
+    (upstream == merged_head).then_some(branch)
+}
+
+/// The remote's main, as fetched, when it holds `merge_sha`; else the app
+/// fetches first (`stale_main`), so a task never starts from the main
+/// before the merge.
+fn merged_main(wc: &WorkCopy, merge_sha: &str) -> Result<String, Refused> {
+    let main = crate::client_workspace::remote_default_of(wc)
+        .ok_or_else(|| coded(ClientCode::NoOrigin, "this project has no remote main version to start from"))?;
+    match client_git::run(wc, None, &["merge-base", "--is-ancestor", merge_sha, &main]) {
+        Some(_) => Ok(main),
+        None => Err(coded(ClientCode::StaleMain, "the project's main version here doesn't have the merge yet: fetch first")),
+    }
+}
+
+/// Puts back a `new_task` that couldn't carry the later commits: the new
+/// branch gone, the work copy on its branch as it was.
+fn back_to(wc: &WorkCopy, old: &str, new: &str) {
+    let _ = client_git::quiet(wc, &["cherry-pick", "--abort"]);
+    let _ = client_git::quiet(wc, &["switch", "--quiet", "--discard-changes", old]);
+    let _ = client_git::quiet(wc, &["branch", "-D", new]);
+}
+
+/// (#3684) After GitHub merged the task: the work copy moves onto a new
+/// branch of its bot's cut from the remote's main (which must hold the
+/// merge), carrying the commits made here after the merge, in order. Only
+/// when this branch is the one that was merged, so a second device's call,
+/// or one after the move, changes nothing (`moved: false`). Uncommitted
+/// changes (`dirty`) and a later commit that doesn't apply (`merge_conflict`,
+/// with its files) change nothing.
+fn new_task(st: &ClientServerState, name: &str, wc: &WorkCopy, a: &NewTaskArgs) -> Result<GitNewTask, Refused> {
+    check_new_task_args(a)?;
+    let Some(old) = is_merged_task(wc, &a.merged_head) else {
+        return Ok(GitNewTask { moved: false, branch: line(wc, &["branch", "--show-current"]).unwrap_or_default(), head: line(wc, &["rev-parse", "HEAD"]), carried: 0 });
+    };
+    let main = merged_main(wc, &a.merge_sha)?;
+    if is_dirty(wc) {
+        return Err(coded(ClientCode::Dirty, "the work copy has uncommitted changes, so it wasn't moved"));
+    }
+    let later = made_after(wc, &a.merged_head);
+    let new = next_branch(st, name)?;
+    client_git::quiet(wc, &["switch", "--quiet", "--no-track", "-c", &new, &main]).map_err(|e| conflict(format!("couldn't start the next task: {e}")))?;
+    carry(wc, &later, &old, &new)?;
+    Ok(GitNewTask { moved: true, branch: new, head: line(wc, &["rev-parse", "HEAD"]), carried: later.len() as u64 })
+}
+
+/// `new_task`'s commit ids are whole ones, never abbreviations.
+fn check_new_task_args(a: &NewTaskArgs) -> Result<(), Refused> {
+    if !full_id(&a.merged_head) || !full_id(&a.merge_sha) {
+        return Err(coded(ClientCode::BadRequest, "`merged_head` and `merge_sha` must be full commit ids"));
+    }
+    Ok(())
+}
+
+/// The commits on this branch after `merged_head`, oldest first.
+fn made_after(wc: &WorkCopy, merged_head: &str) -> Vec<String> {
+    line(wc, &["rev-list", "--reverse", &format!("{merged_head}..HEAD")])
+        .map(|l| l.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// A new bot branch name for the workspace's next task.
+fn next_branch(st: &ClientServerState, name: &str) -> Result<String, Refused> {
+    let base = (st.worktrees_base)().map_err(internal)?;
+    cp::new_bot_branch(&cp::bot_slug(crate::client_workspace::bot_of(&base, name).as_deref()))
+}
+
+/// The commits made after the merge, onto the new branch in order; on
+/// the first that doesn't apply, everything is put back ([`back_to`]).
+fn carry(wc: &WorkCopy, later: &[String], old: &str, new: &str) -> Result<(), Refused> {
+    cp::ensure_identity(wc).map_err(internal)?;
+    for commit in later {
+        if let Err(e) = client_git::run_or_why(wc, None, &["cherry-pick", "--allow-empty", commit]) {
+            let paths: Vec<String> = line(wc, &["diff", "--name-only", "--diff-filter=U"]).map(|l| l.lines().map(str::to_string).collect()).unwrap_or_default();
+            back_to(wc, old, new);
+            return Err(carry_refusal(e, paths));
+        }
+    }
+    Ok(())
+}
+
+/// Why the commits made after the merge couldn't come along.
+fn carry_refusal(e: String, paths: Vec<String>) -> Refused {
+    if paths.is_empty() {
+        return conflict(format!("couldn't carry the changes made after the merge: {e}"));
+    }
+    Box::new(cp::err_with(
+        StatusCode::CONFLICT,
+        ClientError {
+            error: format!("changes made after the merge conflict with the merged project in {} file(s), so nothing moved", paths.len()),
+            code: ClientCode::MergeConflict,
+            holder: None,
+            work_id: None,
+            paths: Some(paths),
+        },
+    ))
 }
 
 // ─── diff ────────────────────────────────────────────────────────────────

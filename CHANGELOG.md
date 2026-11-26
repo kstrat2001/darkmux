@@ -38,6 +38,9 @@ darkmux release.
 - **A file a person approved goes into the work copy (#3688).** `POST /client/workspaces/{name}/file`
   writes it (relative plain names only, nothing under `.git`, 256 KB at most, through no link) and
   commits it like an image, so Undo and the git route's `revert` take it out. Capability `workspace_file`.
+- **The next task after a merge starts from the merged project (#3684).** The git route's `new_task`
+  moves the work copy onto a new branch from the remote's main once it holds the merge, carrying any
+  change made after the merge; on any device, a second call changes nothing. Capability `new_task`.
 
 ### Fixed
 

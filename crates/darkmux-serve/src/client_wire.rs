@@ -492,6 +492,7 @@ pub enum GitReply {
     MergeMain(GitMerged),
     Revert(GitReverted),
     Diff(BranchChanges),
+    NewTask(GitNewTask),
 }
 
 /// (#3681) A work copy as git has it now, read from its local refs only
@@ -564,6 +565,16 @@ pub struct GitMerged {
     pub up_to_date: bool,
     /// The branch moved forward with no merge commit.
     pub fast_forward: bool,
+}
+
+/// (#3684) `new_task`: whether the work copy moved, the branch it is on
+/// now, its head, and how many commits made after the merge came along.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct GitNewTask {
+    pub moved: bool,
+    pub branch: String,
+    pub head: Option<String>,
+    pub carried: u64,
 }
 
 /// (#3681) `revert`: the new commit undoing `commit`, and the files it put

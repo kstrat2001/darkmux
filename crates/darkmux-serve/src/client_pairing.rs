@@ -3862,7 +3862,7 @@ pub(crate) async fn workspace_create_handler(
 
 /// The bot's name as it goes into workspace and branch names ("app" when
 /// it has none).
-fn bot_slug(bot: Option<&str>) -> String {
+pub(crate) fn bot_slug(bot: Option<&str>) -> String {
     let slug = crate::client_workspace::slug(bot.unwrap_or("app"));
     if slug.is_empty() {
         "app".to_string()
@@ -4087,7 +4087,7 @@ fn head_onto_new_branch(wc: &WorkCopy, branch: &str) -> Result<(), String> {
 
 /// A new `mux/<bot>-<hex>` branch name: every workspace darkmux makes for a
 /// bot gets one of its own.
-fn new_bot_branch(bot: &str) -> Result<String, Refused> {
+pub(crate) fn new_bot_branch(bot: &str) -> Result<String, Refused> {
     use crate::client_workspace as ws;
     let short = random_hex(ws::BOT_BRANCH_SUFFIX_LEN / 2).map_err(|e| Box::new(internal(e)))?;
     Ok(ws::bot_branch(bot, &short))
