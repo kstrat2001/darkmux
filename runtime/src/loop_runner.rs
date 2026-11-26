@@ -2968,6 +2968,44 @@ pub(crate) fn estimate_prompt_tokens(
     anchored.max(flat_floor)
 }
 
+/// (#3679) Characters per token above any rate measured for what a request
+/// carries: prose reads 3.94 on this project's own fixture and a thread of
+/// tool results 2.93 (see [`UNCOUNTED_CHARS_PER_TOKEN`]). A request that does
+/// not fit the window even counted at this rate cannot fit at the endpoint's
+/// real count, so it is refused instead of sent.
+const MOST_CHARS_PER_TOKEN: f64 = 5.0;
+
+/// (#3679) The fewest tokens the thread about to be sent can count at: what
+/// the endpoint already counted (the anchor) plus the new characters at
+/// [`MOST_CHARS_PER_TOKEN`], or everything at that rate with no anchor. The
+/// low bound to [`estimate_prompt_tokens`]'s deliberately high one.
+pub(crate) fn fewest_prompt_tokens(message_chars: usize, tools_chars: usize, anchor: Option<PromptAnchor>) -> u32 {
+    match anchor {
+        Some(a) if message_chars >= a.chars => {
+            a.tokens.saturating_add(((message_chars - a.chars) as f64 / MOST_CHARS_PER_TOKEN) as u32)
+        }
+        _ => ((message_chars + tools_chars) as f64 / MOST_CHARS_PER_TOKEN) as u32,
+    }
+}
+
+/// (#3679) Refuse the dispatch's FIRST request when its fewest possible tokens
+/// exceed `window`: sent, the endpoint can only refuse it, its error would
+/// stand where darkmux's own reason belongs, and there is no work yet to
+/// keep. A later request that outgrows the window is left to the named
+/// escalations (#3074's `TurnContinuationsExhausted` and the rest), which
+/// carry the run's work out instead of failing it.
+pub(crate) fn refuse_unfittable(fewest: u32, window: u32, first_request: bool) -> Result<()> {
+    if !first_request || fewest <= window {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refused to send the next request: even counted at {MOST_CHARS_PER_TOKEN} characters per token, \
+         more than any content darkmux has measured, it is ~{fewest} tokens against the {window}-token \
+         window this profile declares, and nothing further can reduce it. Shrink what this role puts in \
+         context (the brief, or the files it is given), or raise the profile's n_ctx. (#3679)"
+    )
+}
+
 /// (#2792 round-4) The inverse of [`estimate_prompt_tokens`]: how many MESSAGE
 /// characters fit in `window` tokens, which is what `hard_trim_to_fit` takes.
 ///

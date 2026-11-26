@@ -376,6 +376,12 @@ pub(super) fn call_bound(in_answer_region: bool, dispatch_has_reasoned: bool, l:
 
 /// (#1221, #2792 round-2) The sequence the NEXT request's records carry: a
 /// fresh turn is `turns + 1`, a continuation is the turn it continues.
+/// (#3679) Whether the request about to go out is the dispatch's first: no
+/// turn banked, no checkpoint or continuation of one in flight.
+pub(super) fn nothing_sent_yet(s: &LoopState) -> bool {
+    s.turns == 0 && !s.resuming_after_checkpoint && s.checkpoints_used == 0 && s.generation_continuations_this_turn == 0
+}
+
 pub(super) fn request_seq(s: &LoopState) -> u32 {
     if s.resuming_after_checkpoint {
         s.turns

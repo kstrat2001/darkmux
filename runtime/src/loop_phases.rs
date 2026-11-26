@@ -413,7 +413,7 @@ impl<'a> AgentLoop<'a> {
         // `promote_terminal_reasoning` strips before this line but returns
         // to its caller for exactly this reason. See the detector's
         // firing site below for the actual condition.
-        self.enforce_pre_send_bound();
+        self.enforce_pre_send_bound()?;
         let sent = self.send(&bound)?;
         let call = self.read_response(bound, sent)?;
         self.route(call)
@@ -903,7 +903,7 @@ impl<'a> AgentLoop<'a> {
 
     // ─── the pre-send bound ──────────────────────────────────────────────
 
-    fn enforce_pre_send_bound(&mut self) {
+    fn enforce_pre_send_bound(&mut self) -> Result<()> {
         // (#2792) PRE-SEND BOUND. The last thing before the request is built:
         // is what is about to go out actually inside the window the profile
         // DECLARES?
@@ -924,7 +924,7 @@ impl<'a> AgentLoop<'a> {
         // on a body 36% over the window, which is the defect this bound
         // exists to prevent, wearing a record that says it was checked.
         let Some(window) = self.cfg.context_window else {
-            return;
+            return Ok(());
         };
         // Serialized inside the guard, not above it: it is used nowhere
         // else, and hoisting it cost a ~12KB serialization every turn on
@@ -943,7 +943,7 @@ impl<'a> AgentLoop<'a> {
         // instead, so only this turn's new characters are guessed.
         let before_tokens = estimate_prompt_tokens(sys_c + prompt_c, tools_bytes, self.state.prompt_anchor);
         if before_tokens <= window {
-            return;
+            return Ok(());
         }
         let prompt_anchor = self.state.prompt_anchor;
         // Derived by INVERTING the same estimator the line above
@@ -992,6 +992,11 @@ impl<'a> AgentLoop<'a> {
             window,
             stats.results_trimmed,
         );
+        crate::loop_runner::refuse_unfittable(
+            crate::loop_runner::fewest_prompt_tokens(sys_a + prompt_a, tools_bytes, prompt_anchor),
+            window,
+            nothing_sent_yet(&self.state),
+        )
     }
 
     fn report_unfittable_request(&self, after_tokens: u32, window: u32, results_trimmed: usize) {

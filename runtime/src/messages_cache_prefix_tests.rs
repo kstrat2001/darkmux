@@ -379,6 +379,55 @@ fn the_pre_send_bound_cuts_the_newest_result_and_keeps_the_prefix() {
     );
 }
 
+/// (#3679) A first request the runtime estimates far over the window, with
+/// nothing left to trim, is refused before it is sent, naming darkmux's own
+/// reason; one over only on the high-erring estimate is still sent, since it
+/// may fit at the endpoint's real count.
+#[test]
+#[serial_test::serial]
+fn a_request_that_cannot_fit_at_any_rate_is_refused_before_it_is_sent() {
+    const WINDOW: u32 = 32_000;
+    let dialect = Dialect::ChatCompletions;
+    let run = |brief_chars: usize| {
+        let (url, bodies) = recording_server(vec![reply(dialect, Some("All done."), &[])]);
+        let client = client_for(dialect, &url);
+        let cfg = compaction::CompactionConfig { context_window: Some(WINDOW), ..compaction::CompactionConfig::never_compact() };
+        let tmp = tempfile::Builder::new().prefix("refuse-over-window").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let brief = "word ".repeat(brief_chars / 5);
+        let outcome = run_with_sleeper(
+            &client, &client, "claude-test", vec![Message::system("system prompt"), Message::user(&brief)],
+            &[Tool::Echo], &mut traj, streams(dialect), &cfg, Some(5), None, Some(4_096), None,
+            Some(u32::MAX), None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        );
+        let sent = bodies.lock().unwrap().len();
+        (outcome.map(|_| ()).map_err(|e| format!("{e:#}")), sent)
+    };
+    // ~2.7x the window at 2.75 chars/token, and still ~1.5x at 5: refused.
+    let (far, sent) = run(240_000);
+    let err = far.expect_err("a request that cannot fit is refused");
+    assert_eq!(sent, 0, "nothing reaches the endpoint");
+    assert!(err.contains("#3679") && err.contains(&WINDOW.to_string()), "{err}");
+    // Over on the 2.75 ruler (~36k), under at 5 chars/token (~20k): sent.
+    let (near, sent) = run(100_000);
+    assert!(near.is_ok(), "{near:?}");
+    assert_eq!(sent, 1, "a near-fit request still goes out");
+}
+
+/// (#3679) The low bound carries what the endpoint counted and adds only new
+/// characters at the generous rate; with no anchor, everything at that rate.
+#[test]
+fn the_fewest_tokens_carry_the_anchor_and_count_new_characters_generously() {
+    use crate::loop_runner::{fewest_prompt_tokens, refuse_unfittable, PromptAnchor};
+    assert_eq!(fewest_prompt_tokens(10_000, 5_000, None), 3_000);
+    let anchor = PromptAnchor { chars: 8_000, tokens: 2_900 };
+    assert_eq!(fewest_prompt_tokens(10_000, 5_000, Some(anchor)), 2_900 + 400);
+    assert_eq!(fewest_prompt_tokens(6_000, 0, Some(anchor)), 1_200, "a thread that shrank drops the anchor");
+    assert!(refuse_unfittable(32_000, 32_000, true).is_ok(), "exactly the window still fits");
+    assert!(refuse_unfittable(32_001, 32_000, true).is_err());
+    assert!(refuse_unfittable(99_000, 32_000, false).is_ok(), "a later request is left to the escalations");
+}
+
 /// `a` around the first byte where it differs from `b`, so a failure shows
 /// the divergence rather than two whole messages.
 fn around_first_difference(a: &str, b: &str) -> String {
