@@ -375,6 +375,10 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
     // (#3397) Which machine serves each of the profile's models, read now,
     // before any run starts: an endpoint edited later never rewrites a run.
     let model_hardware = crate::lab::manifest::model_hardware_of(profile);
+    // (#3678) What the run's dispatch makes resident, resolved once, before
+    // any run, by the dispatch's own resolution.
+    let plan = run_plan(&registry_loaded.registry, loaded_workload.lab_inputs.as_ref(), run_role.as_deref(), &profile_name);
+    let planned = crate::lab::profile_check::planned_models(profile, &plan);
 
     let run = OneRun {
         opts: &opts,
@@ -384,6 +388,7 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         profile_name: &profile_name,
         prune: &prune,
         model_hardware: &model_hardware,
+        planned: &planned,
     };
     let runs = opts.runs.max(1);
     let mut envelope = EnvelopeWarnings::default();
@@ -401,6 +406,9 @@ struct OneRun<'a> {
     prune: &'a Prune,
     /// (#3397) The profile's models' hardware as the registry said at start.
     model_hardware: &'a [crate::lab::manifest::ModelHardware],
+    /// (#3678) The models the run's dispatch makes resident, at the windows
+    /// it loads them at, for the envelope check.
+    planned: &'a [crate::lab::profile_check::Planned],
 }
 
 impl OneRun<'_> {
@@ -532,7 +540,7 @@ impl OneRun<'_> {
         if let Some(note) = shadowed_note(self.workload, &paths::resolve(ResolveScope::ForceUser).root) {
             eprintln!("[lab] note: {note}");
         }
-        for w in envelope.fresh(envelope_check(self.profile, self.profile_name)) {
+        for w in envelope.fresh(envelope_check(self.planned, self.profile_name)) {
             eprintln!("[lab] warn: {w}");
         }
     }
@@ -634,24 +642,42 @@ impl EnvelopeWarnings {
     }
 }
 
-/// The loaded models against the profile's declared ones. A failed `lms ps`
-/// is its own warning, so a run whose profile tag went unverified says so.
-fn envelope_check(profile: &darkmux_types::Profile, profile_name: &str) -> Vec<String> {
-    // (#316) A profile with nothing on LM Studio (every model on the default
+/// (#3678) The plan for this run's dispatch: the role the provider
+/// dispatches as, read the way the dispatch reads it (`lab_role` over the
+/// inputs `lab run` pinned), on the run's profile. A provider that names no
+/// role, or a role that does not load (the dispatch then refuses on its
+/// own), leaves no selection, and the profile's default model stands in as
+/// the work model, as before #3678.
+fn run_plan(
+    registry: &darkmux_types::ProfileRegistry,
+    inputs: Option<&darkmux_crew::dispatch::LabInputs>,
+    role_id: Option<&str>,
+    profile_name: &str,
+) -> crate::lab::profile_check::DispatchPlan {
+    let role = role_id.zip(inputs).and_then(|(id, inputs)| darkmux_crew::dispatch::lab_role(inputs, id).ok());
+    crate::lab::profile_check::dispatch_plan(registry, role.as_ref(), profile_name)
+}
+
+/// The models the run's dispatch makes resident against what is resident
+/// now. A failed `lms ps` is its own warning, so a run whose profile tag
+/// went unverified says so.
+fn envelope_check(planned: &[crate::lab::profile_check::Planned], profile_name: &str) -> Vec<String> {
+    use crate::lab::profile_check::{envelope_warnings, on_lm_studio};
+    // (#316) A dispatch with nothing on LM Studio (every model on the default
     // engine or another unmanaged endpoint) has nothing there to verify.
-    if !profile.models.iter().any(|m| m.is_managed()) {
+    if !planned.iter().any(|p| p.model.is_managed()) {
         return Vec::new();
     }
     // (#3450) A model on a server darkmux starts is checked against its
     // record; `lms ps` is asked only when an LM Studio model needs it.
     let servers = engine::server::listed(&engine::server::Dirs::under_home());
-    let recs_own = recs_own_address(profile);
+    let recs_own = recs_own_address(planned);
     let recs_own = recs_own.as_deref();
-    if !profile.models.iter().any(|m| m.is_managed() && !m.endpoint_kind().is_ok_and(|k| k.starts_servers())) {
-        return crate::lab::profile_check::envelope_warnings(profile, profile_name, &[], &servers, recs_own);
+    if !planned.iter().any(|p| on_lm_studio(&p.model)) {
+        return envelope_warnings(planned, profile_name, &[], &servers, recs_own);
     }
     match engine::lmstudio().loaded() {
-        Ok(loaded) => crate::lab::profile_check::envelope_warnings(profile, profile_name, &loaded, &servers, recs_own),
+        Ok(loaded) => envelope_warnings(planned, profile_name, &loaded, &servers, recs_own),
         Err(e) => vec![format!(
             "could not verify profile-load match: `lms ps` failed ({e}); \
              this run's `profile={profile_name}` tag is unverified. (#365)"
@@ -659,13 +685,13 @@ fn envelope_check(profile: &darkmux_types::Profile, profile_name: &str) -> Vec<S
     }
 }
 
-/// (#3574) Where rec's own server is up, from `rec status`, asked only for
-/// a profile with a Flint model.
-fn recs_own_address(profile: &darkmux_types::Profile) -> Option<String> {
+/// (#3574) Where rec's own server is up, from `rec status`, asked only when
+/// the dispatch runs a Flint model.
+fn recs_own_address(planned: &[crate::lab::profile_check::Planned]) -> Option<String> {
     let flint = |m: &darkmux_types::ProfileModel| {
         m.endpoint_kind().is_ok_and(|k| k == darkmux_types::EndpointKind::Managed(darkmux_types::ManagedBackend::Flint))
     };
-    let own = profile.models.iter().any(flint).then(|| engine::flint::Rec::installed().own_server().ok().flatten());
+    let own = planned.iter().any(|p| flint(&p.model)).then(|| engine::flint::Rec::installed().own_server().ok().flatten());
     own.flatten().map(|o| o.address)
 }
 

@@ -38,6 +38,19 @@ darkmux release.
   resident model is priceable". It now warns, naming why; on an engine that does not report what it
   holds, it is not applicable.
 
+- **`lab run` warns about a model load when the run's dispatch will load one, and only then (#3678).**
+  The envelope check judged every model the profile lists, each at the `n_ctx` the profile gives it,
+  so it warned that the utility model would reload when it would not and missed loads it would make.
+  It now asks the resolution the dispatch asks: the model the run's role selects (a non-default one
+  when capability scoring picks it), and the `internal.utility` model at the window the dispatch
+  loads it at, which is the binding's `n_ctx`, else the selected model's. The binding may be written
+  `darkmux:<key>`. A utility model that is missing is now noted too, since its load falls inside the
+  run's measurement. When the utility model is also the work model, it is judged at the larger of
+  the two windows, since the dispatch ends with it resident at least that large. A model the dispatch
+  does not touch gets no note. One case is not covered: `lab loop`'s `context_window` override with
+  a utility binding that declares no window, which already warns on every dispatch. The notes also
+  read without a stray ` : `.
+
 ## [5.12.0] - 2026-11-21
 
 **A phone can drive darkmux over the tailnet.** `darkmux client serve` publishes its port on this
