@@ -50,6 +50,7 @@ GET /client/workspaces/:name  json WorkspaceInfo (client listener: 127.0.0.1, th
 DELETE /client/workspaces/:name  json WorkspaceRemoved (client listener: 127.0.0.1, this machine's apps and paired devices through its tailnet entry; not the viewer daemon)
 GET /client/workspaces/:name/changes  json BranchChanges (client listener: 127.0.0.1, this machine's apps and paired devices through its tailnet entry; not the viewer daemon)
 POST /client/workspaces/:name/edit  json EditReply (client listener: 127.0.0.1, this machine's apps and paired devices through its tailnet entry; not the viewer daemon)
+POST /client/workspaces/:name/git  json GitReply (client listener: 127.0.0.1, this machine's apps and paired devices through its tailnet entry; not the viewer daemon)
 POST /client/workspaces/:name/image  json ImageReply (client listener: 127.0.0.1, this machine's apps and paired devices through its tailnet entry; not the viewer daemon)
 POST /client/workspaces/:name/preview  json PreviewState (client listener: 127.0.0.1, this machine's apps and paired devices through its tailnet entry; not the viewer daemon)
 GET /client/workspaces/:name/preview  json PreviewState (client listener: 127.0.0.1, this machine's apps and paired devices through its tailnet entry; not the viewer daemon)
@@ -72,13 +73,16 @@ BranchFile.content?: string | null
 BranchFile.deleted?: boolean | null
 BranchFile.mode?: string | null
 BranchFile.path: string
-ClientCapability = "clean_preview" | "template_workspace" | "continues" | "clone_preview" | "recipe_set" | "workspace_image" | "workspace_edit" | "workspace_remove" | "remote_tailscale" | "availability_codes" | "remote_requests" | "remote_preview" | "engines" | "read_only_runs"
-ClientCode = "unsupported_media_type" | "payload_too_large" | "method_not_allowed" | "not_local" | "not_forwarded" | "not_paired_remotely" | "remote_identity_missing" | "remote_identity_mismatch" | "remote_pairing_unavailable" | "remote_identity_unconfirmed" | "remote_user_not_owner" | "remote_device_unknown" | "remote_device_mismatch" | "tailnet_only" | "no_preview_session" | "bad_request" | "not_found" | "unauthorized" | "forbidden" | "conflict" | "unprocessable" | "too_many_requests" | "unavailable" | "internal" | "preview_disabled" | "no_source_checkout" | "template_no_recipe" | "no_recipe" | "recipe_invalid" | "filter_in_repo_config" | "network_key_in_repo_config" | "fetch_failed" | "clone_failed" | "no_own_branch" | "branch_failed" | "unsaved_commits" | "busy" | "wont_fit" | "memory_in_use" | "model_start_failed" | "model_stop_failed" | "port_in_use" | "engine_unavailable" | "engine_in_use" | "dispatch_failed"
+ClientCapability = "clean_preview" | "template_workspace" | "continues" | "clone_preview" | "recipe_set" | "workspace_image" | "workspace_edit" | "workspace_remove" | "remote_tailscale" | "availability_codes" | "remote_requests" | "remote_preview" | "engines" | "git_route" | "read_only_runs"
+ClientCode = "unsupported_media_type" | "payload_too_large" | "method_not_allowed" | "not_local" | "not_forwarded" | "not_paired_remotely" | "remote_identity_missing" | "remote_identity_mismatch" | "remote_pairing_unavailable" | "remote_identity_unconfirmed" | "remote_user_not_owner" | "remote_device_unknown" | "remote_device_mismatch" | "tailnet_only" | "no_preview_session" | "bad_request" | "not_found" | "unauthorized" | "forbidden" | "conflict" | "unprocessable" | "too_many_requests" | "unavailable" | "internal" | "preview_disabled" | "no_source_checkout" | "template_no_recipe" | "no_recipe" | "recipe_invalid" | "filter_in_repo_config" | "network_key_in_repo_config" | "fetch_failed" | "clone_failed" | "no_own_branch" | "branch_failed" | "unsaved_commits" | "work_copy_busy" | "remote_moved" | "push_failed" | "auth_failed" | "token_host_refused" | "remote_not_empty" | "merge_conflict" | "dirty" | "no_origin" | "no_upstream" | "busy" | "wont_fit" | "memory_in_use" | "model_start_failed" | "model_stop_failed" | "port_in_use" | "engine_unavailable" | "engine_in_use" | "dispatch_failed"
 ClientEngines.detected: Array<DetectedEngine>
 ClientEngines.machine: ClientMachine
 ClientEngines.usable: boolean
 ClientError.code: ClientCode
 ClientError.error: string
+ClientError.holder?: string | null
+ClientError.paths?: Array<string> | null
+ClientError.work_id?: string | null
 ClientMachine.id: string
 ClientMachine.name: string
 ClientOpenApi = any
@@ -126,6 +130,33 @@ EngineAdded.profile: string
 FileChange.added?: integer | null
 FileChange.path: string
 FileChange.removed?: integer | null
+GitBusy.holder: string
+GitBusy.work_id?: string | null
+GitMerged.fast_forward: boolean
+GitMerged.head: string
+GitMerged.up_to_date: boolean
+GitPushed.added_origin: boolean
+GitPushed.branch: string
+GitPushed.head: string
+GitPushed.remote: string
+GitReply = { verb: "status", result: GitStatus } | { verb: "fetch", result: GitStatus } | { verb: "push", result: GitPushed } | { verb: "merge_main", result: GitMerged } | { verb: "revert", result: GitReverted } | { verb: "diff", result: BranchChanges }
+GitReverted.commit: string
+GitReverted.files: Array<string>
+GitReverted.revert: string
+GitStatus.ahead?: integer | null
+GitStatus.base?: string | null
+GitStatus.behind?: integer | null
+GitStatus.behind_main?: integer | null
+GitStatus.branch: string
+GitStatus.busy?: GitBusy | null
+GitStatus.default_branch?: string | null
+GitStatus.dirty: boolean
+GitStatus.head?: string | null
+GitStatus.origin?: string | null
+GitStatus.pending: integer
+GitStatus.upstream?: GitUpstream | null
+GitUpstream.head: string
+GitUpstream.ref: string
 ImageReply.branch?: string | null
 ImageReply.commit?: string | null
 ImageReply.matches?: integer | null

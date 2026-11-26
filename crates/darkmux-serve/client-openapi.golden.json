@@ -578,6 +578,45 @@
         }
       }
     },
+    "/client/workspaces/{name}/git": {
+      "post": {
+        "responses": {
+          "2XX": {
+            "description": "GitReply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GitReply"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/ClientError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GitBody"
+              }
+            }
+          }
+        }
+      }
+    },
     "/client/workspaces/{name}/image": {
       "post": {
         "responses": {
@@ -832,6 +871,30 @@
           },
           "code": {
             "$ref": "#/components/schemas/ClientCode"
+          },
+          "holder": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "(#3681) What holds the work copy, on a refusal because something\ndoes (`run`, `undo`, `edit`, `git:<verb>`, `preview_install`)."
+          },
+          "work_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "(#3681) The run that holds the work copy, when one does."
+          },
+          "paths": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "(#3681) The conflicting files, on a `merge_conflict`."
           }
         },
         "required": [
@@ -1014,6 +1077,56 @@
             "type": "string",
             "const": "unsaved_commits",
             "description": "Removing the workspace would lose commits nothing else holds (a\nclone's branch, a template project's history; 409): save them, then\nremove it with `force`."
+          },
+          {
+            "type": "string",
+            "const": "work_copy_busy",
+            "description": "(#3681) Something else holds the work copy now (409): the refusal's\n`holder` names it (`run`, `undo`, `edit`, `git:<verb>`,\n`preview_install`) and `work_id` the run, when it is one. Retry once\nit ends. Not `busy`, which is a dispatch's memory being held."
+          },
+          {
+            "type": "string",
+            "const": "remote_moved",
+            "description": "(#3681) The push was refused because the branch on the remote has\ncommits this work copy lacks (409): fetch, bring them in, push again.\ndarkmux never forces a push."
+          },
+          {
+            "type": "string",
+            "const": "push_failed",
+            "description": "(#3681) The push failed for another reason (502); `error` says git's."
+          },
+          {
+            "type": "string",
+            "const": "auth_failed",
+            "description": "(#3681) The remote refused the credential for a `push` or `fetch`\n(502): an expired or revoked token, or none for a private\nrepository. Renew the sign-in and send the call once more."
+          },
+          {
+            "type": "string",
+            "const": "token_host_refused",
+            "description": "(#3681) A token was sent for a remote that is not on `github.com`\n(400): darkmux hands a token only to GitHub."
+          },
+          {
+            "type": "string",
+            "const": "remote_not_empty",
+            "description": "(#3681) A project's first push to a repository that already has\nbranches (409): darkmux pushes a template project only into an empty\nrepository."
+          },
+          {
+            "type": "string",
+            "const": "merge_conflict",
+            "description": "(#3681) Bringing in the default branch conflicts (409): darkmux\naborted the merge, so nothing changed; `paths` names the files."
+          },
+          {
+            "type": "string",
+            "const": "dirty",
+            "description": "(#3681) The work copy has uncommitted changes to tracked files (409),\nso darkmux changed nothing."
+          },
+          {
+            "type": "string",
+            "const": "no_origin",
+            "description": "(#3681) The work copy has no remote yet (a project made from a\ntemplate that was never pushed; 409)."
+          },
+          {
+            "type": "string",
+            "const": "no_upstream",
+            "description": "(#3681) The branch has never been pushed or fetched, so there is\nnothing to compare with on the remote (409)."
           },
           {
             "type": "string",
@@ -1321,6 +1434,11 @@
             "type": "string",
             "const": "engines",
             "description": "(#3569) `GET /client/engines`: the engines installed on this Mac,\nwhether any is `usable`, and `POST /client/engines`, which adds one\ndarkmux starts servers for once the app's user confirms."
+          },
+          {
+            "type": "string",
+            "const": "git_route",
+            "description": "(#3681) `POST /client/workspaces/{name}/git`: plain git on a\nworkspace (`status`, `fetch`, `push`, `merge_main`, `revert`,\n`diff`), and one lock per work copy (`work_copy_busy`)."
           },
           {
             "type": "string",
@@ -2535,6 +2653,436 @@
         "required": [
           "old",
           "new"
+        ]
+      },
+      "GitReply": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "verb": {
+                "type": "string",
+                "const": "status"
+              },
+              "result": {
+                "$ref": "#/components/schemas/GitStatus"
+              }
+            },
+            "required": [
+              "verb",
+              "result"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "verb": {
+                "type": "string",
+                "const": "fetch"
+              },
+              "result": {
+                "$ref": "#/components/schemas/GitStatus"
+              }
+            },
+            "required": [
+              "verb",
+              "result"
+            ],
+            "description": "The work copy's status after the fetch."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "verb": {
+                "type": "string",
+                "const": "push"
+              },
+              "result": {
+                "$ref": "#/components/schemas/GitPushed"
+              }
+            },
+            "required": [
+              "verb",
+              "result"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "verb": {
+                "type": "string",
+                "const": "merge_main"
+              },
+              "result": {
+                "$ref": "#/components/schemas/GitMerged"
+              }
+            },
+            "required": [
+              "verb",
+              "result"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "verb": {
+                "type": "string",
+                "const": "revert"
+              },
+              "result": {
+                "$ref": "#/components/schemas/GitReverted"
+              }
+            },
+            "required": [
+              "verb",
+              "result"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "verb": {
+                "type": "string",
+                "const": "diff"
+              },
+              "result": {
+                "$ref": "#/components/schemas/BranchChanges"
+              }
+            },
+            "required": [
+              "verb",
+              "result"
+            ]
+          }
+        ],
+        "description": "`POST /client/workspaces/{name}/git`: what the verb did, tagged by it\n(`{\"verb\": \"status\", \"result\": {..}}`)."
+      },
+      "GitStatus": {
+        "type": "object",
+        "properties": {
+          "branch": {
+            "type": "string",
+            "description": "The branch it is on (empty when detached)."
+          },
+          "head": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its head commit, the full id (`None` before its first commit)."
+          },
+          "origin": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its remote, as `host/owner/repo` (`None` for a project made from a\ntemplate that was never pushed)."
+          },
+          "default_branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The project's main branch: the remote's default branch, or a\ntemplate project's own."
+          },
+          "base": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where this branch left the main version: what `pending` counts from."
+          },
+          "pending": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Commits on this branch that the main version lacks."
+          },
+          "upstream": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GitUpstream"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "This branch on the remote, as of the last fetch or push (`None`\nwhen it was never pushed or fetched)."
+          },
+          "ahead": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Commits here that `upstream` lacks (`None` without one)."
+          },
+          "behind": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Commits in `upstream` that this branch lacks (`None` without one)."
+          },
+          "behind_main": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Commits in the remote's main branch, as of the last fetch, that this\nbranch lacks (`None` without a remote)."
+          },
+          "dirty": {
+            "type": "boolean",
+            "description": "Tracked files have uncommitted changes."
+          },
+          "busy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GitBusy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What holds the work copy now, if anything."
+          }
+        },
+        "required": [
+          "branch",
+          "pending",
+          "dirty"
+        ],
+        "description": "(#3681) A work copy as git has it now, read from its local refs only\n(never the network: `fetch` first for the remote's latest)."
+      },
+      "GitUpstream": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "type": "string",
+            "description": "`origin/<branch>`."
+          },
+          "head": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ref",
+          "head"
+        ],
+        "description": "(#3681) A branch on the remote, as this work copy last saw it."
+      },
+      "GitBusy": {
+        "type": "object",
+        "properties": {
+          "holder": {
+            "type": "string"
+          },
+          "work_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "holder"
+        ],
+        "description": "(#3681) What holds a work copy: `run`, `undo`, `edit`, `git:<verb>` or\n`preview_install`, and the run, when it is one."
+      },
+      "GitPushed": {
+        "type": "object",
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "head": {
+            "type": "string"
+          },
+          "remote": {
+            "type": "string",
+            "description": "`host/owner/repo`."
+          },
+          "added_origin": {
+            "type": "boolean",
+            "description": "This push gave a template project its remote (`origin`)."
+          }
+        },
+        "required": [
+          "branch",
+          "head",
+          "remote",
+          "added_origin"
+        ],
+        "description": "(#3681) `push`: the branch on the remote is now this head."
+      },
+      "GitMerged": {
+        "type": "object",
+        "properties": {
+          "head": {
+            "type": "string"
+          },
+          "up_to_date": {
+            "type": "boolean",
+            "description": "It was in already: nothing changed."
+          },
+          "fast_forward": {
+            "type": "boolean",
+            "description": "The branch moved forward with no merge commit."
+          }
+        },
+        "required": [
+          "head",
+          "up_to_date",
+          "fast_forward"
+        ],
+        "description": "(#3681) `merge_main`: the main branch is in."
+      },
+      "GitReverted": {
+        "type": "object",
+        "properties": {
+          "commit": {
+            "type": "string"
+          },
+          "revert": {
+            "type": "string"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "commit",
+          "revert",
+          "files"
+        ],
+        "description": "(#3681) `revert`: the new commit undoing `commit`, and the files it put\nback."
+      },
+      "GitBody": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "verb": {
+            "$ref": "#/components/schemas/GitVerb"
+          },
+          "args": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GitArgsDoc"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The verb's arguments (`{}` or left out when it takes none).",
+            "default": null
+          }
+        },
+        "required": [
+          "verb"
+        ],
+        "description": "The route's body: a verb and its arguments."
+      },
+      "GitVerb": {
+        "type": "string",
+        "enum": [
+          "status",
+          "fetch",
+          "push",
+          "merge_main",
+          "revert",
+          "diff"
+        ],
+        "description": "The verbs, by their one wire spelling. Any other is refused."
+      },
+      "GitArgsDoc": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/FetchArgs"
+          },
+          {
+            "$ref": "#/components/schemas/PushArgs"
+          },
+          {
+            "$ref": "#/components/schemas/RevertArgs"
+          },
+          {
+            "$ref": "#/components/schemas/DiffArgs"
+          }
+        ],
+        "description": "Every verb's arguments, for the schema only."
+      },
+      "FetchArgs": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "description": "`fetch`: GitHub's token, for a private repository."
+      },
+      "PushArgs": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          }
+        },
+        "description": "`push`: GitHub's token, and for a project made from a template, the\nempty repository (`owner/name`) its first push goes to."
+      },
+      "RevertArgs": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "commit": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "commit"
+        ],
+        "description": "`revert`: one of the branch's own commits (7 to 40 hex digits)."
+      },
+      "DiffArgs": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "against": {
+            "$ref": "#/components/schemas/Against"
+          }
+        },
+        "required": [
+          "against"
+        ],
+        "description": "`diff`: against the branch's base (what `/changes` answers) or its\nupstream (what the remote's branch lacks)."
+      },
+      "Against": {
+        "type": "string",
+        "enum": [
+          "base",
+          "upstream"
         ]
       },
       "ImageReply": {

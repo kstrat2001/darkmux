@@ -81,6 +81,10 @@ pub enum ClientCapability {
     /// whether any is `usable`, and `POST /client/engines`, which adds one
     /// darkmux starts servers for once the app's user confirms.
     Engines,
+    /// (#3681) `POST /client/workspaces/{name}/git`: plain git on a
+    /// workspace (`status`, `fetch`, `push`, `merge_main`, `revert`,
+    /// `diff`), and one lock per work copy (`work_copy_busy`).
+    GitRoute,
     /// (#3682) A run whose role may neither write nor edit (`researcher`,
     /// `code-reviewer`) has its workspace mounted read-only, so it cannot
     /// change it by any means; the built-in `researcher` role exists.
@@ -89,7 +93,7 @@ pub enum ClientCapability {
 
 impl ClientCapability {
     /// Every capability, in declaration order: what `whoami` lists.
-    pub const ALL: [ClientCapability; 14] = [
+    pub const ALL: [ClientCapability; 15] = [
         ClientCapability::CleanPreview,
         ClientCapability::TemplateWorkspace,
         ClientCapability::Continues,
@@ -103,6 +107,7 @@ impl ClientCapability {
         ClientCapability::RemoteRequests,
         ClientCapability::RemotePreview,
         ClientCapability::Engines,
+        ClientCapability::GitRoute,
         ClientCapability::ReadOnlyRuns,
     ];
 }
@@ -139,6 +144,7 @@ mod tests {
                 "remote_requests",
                 "remote_preview",
                 "engines",
+                "git_route",
                 "read_only_runs",
             ]
         );

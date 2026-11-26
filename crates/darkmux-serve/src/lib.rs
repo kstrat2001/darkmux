@@ -53,6 +53,7 @@ pub mod client_engines;
 pub mod client_image;
 pub mod client_image_ref;
 pub mod client_git;
+pub mod client_git_route;
 mod client_changes;
 mod client_openapi;
 pub mod client_pairing;
