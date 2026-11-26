@@ -89,11 +89,14 @@ pub enum ClientCapability {
     /// `code-reviewer`) has its workspace mounted read-only, so it cannot
     /// change it by any means; the built-in `researcher` role exists.
     ReadOnlyRuns,
+    /// (#3688) `POST /client/workspaces/{name}/file`: a file a person
+    /// approved, committed into the work copy like an image.
+    WorkspaceFile,
 }
 
 impl ClientCapability {
     /// Every capability, in declaration order: what `whoami` lists.
-    pub const ALL: [ClientCapability; 15] = [
+    pub const ALL: [ClientCapability; 16] = [
         ClientCapability::CleanPreview,
         ClientCapability::TemplateWorkspace,
         ClientCapability::Continues,
@@ -109,6 +112,7 @@ impl ClientCapability {
         ClientCapability::Engines,
         ClientCapability::GitRoute,
         ClientCapability::ReadOnlyRuns,
+        ClientCapability::WorkspaceFile,
     ];
 }
 
@@ -146,6 +150,7 @@ mod tests {
                 "engines",
                 "git_route",
                 "read_only_runs",
+                "workspace_file",
             ]
         );
         for c in ClientCapability::ALL {

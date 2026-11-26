@@ -35,6 +35,9 @@ darkmux release.
   stop and undo the runs in it; asking for the same repo and bot from two devices gives the same work
   copy. Mission worktrees and folders made for no app stay refused, and a revoked pairing is refused
   everywhere at once. **Behavior change:** before, a workspace was its pairing's alone.
+- **A file a person approved goes into the work copy (#3688).** `POST /client/workspaces/{name}/file`
+  writes it (relative plain names only, nothing under `.git`, 256 KB at most, through no link) and
+  commits it like an image, so Undo and the git route's `revert` take it out. Capability `workspace_file`.
 
 ### Fixed
 
