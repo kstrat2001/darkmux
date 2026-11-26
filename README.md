@@ -32,7 +32,7 @@ Every role in your profile registry names where its model runs, so one machine c
 | Engine | What darkmux does with it |
 |---|---|
 | [LM Studio](https://lmstudio.ai/) | Loads and unloads models at the context each profile declares, under the machine's memory budget, and starts LM Studio's local server when it is off. |
-| [Tensorfold](https://tensorfold.dev/), rec's Flint | Starts and stops the server itself, on the port the profile names. `darkmux init --add-engine flint` (or `tensorfold`) adds one with a profile running its model. |
+| [Tensorfold](https://tensorfold.dev/), Flint (by [Recursive](https://recursive.com/)) | Starts and stops the server itself, on the port the profile names. `darkmux init --add-engine flint` (or `tensorfold`) adds one with a profile running its model. |
 | Any OpenAI-compatible server you run, such as `mlx_lm.server` | Sends it work. `darkmux init --engine-url <url>` records it as the machine's engine, so a machine without LM Studio runs `init` and dispatch with no hand-edited config. |
 | A hosted OpenAI-compatible endpoint | Staffs any seat with cloud weights. |
 | Claude (the Messages API) | Staffs any seat, with prompt caching on every turn ([guide](https://darkmux.com/guide/claude.html)). |
