@@ -3425,16 +3425,24 @@ fn check_capacity(
     Ok(())
 }
 
+/// (#3683) Whether `client` may follow, stop or undo run `w`: any pairing,
+/// for a run in a workspace darkmux made for an app (the work copy is the
+/// owner's, so a run started on the Mac can be stopped from the iPhone);
+/// only the pairing that started it, for a run with no work copy.
+fn may_see_run(w: &WorkEntry, client: &ApprovedClient) -> bool {
+    w.git.is_some() || w.client_id == client.id
+}
+
 /// One run at a time per work copy. Every ended run's changes are
 /// committed, so a new run needs no decision first. A Tweak's `continues`
-/// is a label: one naming a run darkmux still knows must be this client's,
+/// is a label: one naming a run darkmux still knows must have run
 /// in this work copy (however it ended: a failed or cancelled run's edits
 /// are committed like a finished one's); one it has forgotten (past its
 /// keep time, or before a restart) makes a plain new run.
 fn check_work_copy(
     works: &HashMap<String, WorkEntry>,
     holds: &CopyHolds,
-    client: &ApprovedClient,
+    _client: &ApprovedClient,
     workdir: Option<&PathBuf>,
     continues: Option<&str>,
 ) -> Result<(), Refused> {
@@ -3452,11 +3460,11 @@ fn check_work_copy(
     }
     let foreign = continues
         .and_then(|c| works.get(c).map(|e| (c, e)))
-        .filter(|(_, e)| e.client_id != client.id || e.workdir.as_ref() != Some(w));
+        .filter(|(_, e)| e.workdir.as_ref() != Some(w));
     if let Some((c, _)) = foreign {
         return Err(refuse(
             StatusCode::CONFLICT, ClientCode::Conflict,
-            format!("run {c} isn't a run of yours in this work copy"),
+            format!("run {c} isn't a run in this work copy"),
         ));
     }
     Ok(())
@@ -3708,11 +3716,16 @@ fn workspace_dir(state: &ClientServerState, name: &str) -> Result<PathBuf, Refus
     (state.check_workdir)(&dir).map_err(|e| refuse(StatusCode::FORBIDDEN, ClientCode::Forbidden, e))
 }
 
-/// [`workspace_dir`], and only when darkmux made that workspace for
-/// `client` (its owner record, by client id, written when the workspace was
-/// made, by [`adopt_unowned`] or by `client claim`): a 403 for another app's
-/// workspace, a revoked client's, a mission's worktrees or any folder no app
-/// asked darkmux for.
+/// [`workspace_dir`], and only when darkmux made that workspace for a
+/// paired app: its owner record, written when the workspace was made, by
+/// [`adopt_unowned`] or by `client claim`. (#3683) A work copy is the
+/// owner's, not one pairing's: every pairing in this store is the
+/// operator's own (approved on this Mac, or over the tailnet only as this
+/// Mac's own tailnet user), so any live pairing may act on any workspace
+/// darkmux made for an app. The record names the pairing that made it, as
+/// attribution only. A 403 for a mission's worktrees and any folder no app
+/// asked darkmux for. A revoked pairing is already a 401 at
+/// [`authenticate`].
 pub(crate) fn owned_workspace(state: &ClientServerState, client: &ApprovedClient, name: &str) -> Result<PathBuf, Refused> {
     let dir = workspace_dir(state, name)?;
     let base = (state.worktrees_base)().map_err(|e| internal(anyhow!(e)))?;
@@ -3723,10 +3736,11 @@ pub(crate) fn owned_workspace(state: &ClientServerState, client: &ApprovedClient
         }
         recorded => recorded,
     };
-    if owner.as_deref() != Some(client.id.as_str()) {
+    let _ = client;
+    if owner.is_none() {
         return Err(forbidden(format!(
-            "workspace {name} was not made for this app: an app works only in a workspace darkmux \
-             made for it (POST /client/workspaces)"
+            "workspace {name} was not made for an app: an app works only in a workspace darkmux \
+             made for one (POST /client/workspaces)"
         )));
     }
     Ok(dir)
@@ -5176,7 +5190,7 @@ pub(crate) async fn work_status_handler(
     };
     let entry = state.works.lock().unwrap().get(&work_id).cloned();
     match entry {
-        Some(w) if w.client_id == client.id => {
+        Some(w) if may_see_run(&w, &client) => {
             let st = state.clone();
             tokio::task::spawn_blocking(move || Json(work_status_json(&st, &work_id, w)).into_response())
                 .await
@@ -5327,7 +5341,7 @@ pub(crate) async fn cancel_handler(
     };
     let works = state.works.lock().unwrap();
     match works.get(&work_id) {
-        Some(w) if w.client_id == client.id => match w.status {
+        Some(w) if may_see_run(w, &client) => match w.status {
             WorkStatus::Running => {
                 w.cancel.request();
                 (
@@ -6304,7 +6318,7 @@ fn committed_run(
 ) -> Result<WorkEntry, Refused> {
     let client = authenticate(state, headers)?;
     let entry = state.works.lock().unwrap().get(work_id).cloned();
-    let Some(w) = entry.filter(|w| w.client_id == client.id) else {
+    let Some(w) = entry.filter(|w| may_see_run(w, &client)) else {
         return Err(Box::new(not_found()));
     };
     if matches!(w.status, WorkStatus::Running) {

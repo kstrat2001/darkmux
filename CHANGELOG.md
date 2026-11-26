@@ -30,6 +30,11 @@ darkmux release.
   a shell command can't change it either. This now covers `code-reviewer`, `reviewer`, `crawler` and the
   new built-in `researcher` role (read, exec, update_plan), which paired apps use for read-only
   questions. Capability `read_only_runs`.
+- **A work copy is the owner's (#3683).** Every pairing in `clients.json` is the operator's own, so any
+  live pairing (the Mac, the iPhone, the iPad) may use any workspace darkmux made for an app, and follow,
+  stop and undo the runs in it; asking for the same repo and bot from two devices gives the same work
+  copy. Mission worktrees and folders made for no app stay refused, and a revoked pairing is refused
+  everywhere at once. **Behavior change:** before, a workspace was its pairing's alone.
 
 ### Fixed
 
