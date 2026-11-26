@@ -799,16 +799,10 @@ fn skip_unindexed_phase(
 ) -> bool {
     let fate = phase_fate(&phase.mission_id, indexed, skipped);
     if fate == PhaseFate::SkipOrphan {
-        let mission_file = mission_file(&phase.mission_id);
+        let mission_file = crate::lifecycle::mission_path(&phase.mission_id);
         eprintln!("{}", orphan_phase_warning(phase, &mission_file, mission_file.is_file()));
     }
     fate != PhaseFate::Index
-}
-
-/// Where mission `id`'s `mission.json` lives.
-fn mission_file(id: &str) -> PathBuf {
-    let phases = crate::lifecycle::phases_dir(id);
-    phases.parent().unwrap_or(&phases).join("mission.json")
 }
 
 /// The warning for a phase whose mission never loaded. The "remove it" advice
@@ -1695,13 +1689,6 @@ mod tests {
         assert!(!refused.contains("remove"), "a refused mission.json holds a real mission: {refused}");
     }
 
-    #[serial_test::serial]
-    #[test]
-    fn a_mission_file_is_found_under_the_crew_root() {
-        let guard = CrewDirGuard::new();
-        let expected = guard.path().join("missions").join("test-mission").join("mission.json");
-        assert_eq!(mission_file("test-mission"), expected);
-    }
 
     /// Drift guard for #2142: `mission_status_str`'s match is exhaustive
     /// over `MissionStatus`, so it cannot silently skip a variant — but
