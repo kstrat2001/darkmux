@@ -28,6 +28,10 @@ darkmux release.
 
 ### Fixed
 
+- **The viewer's "N ago" labels no longer go blank when another machine's clock is ahead (#2382).**
+  A time stamped by the daemon host or a fleet peer that reads later than the browser's clock rendered
+  an empty label (a bare "last sample" on the machine page, for one). It now reads "just now".
+
 - **A phase file whose mission has no `mission.json` no longer breaks every role verb (#3675).** The
   crew index rebuild failed with a bare `FOREIGN KEY constraint failed`, so `darkmux role list` and
   every other verb that reads the index failed with it. The rebuild now skips that phase with one
