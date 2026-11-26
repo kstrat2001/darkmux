@@ -31,7 +31,7 @@ darkmux release.
 - **A phase file whose mission has no `mission.json` no longer breaks every role verb (#3675).** The
   crew index rebuild failed with a bare `FOREIGN KEY constraint failed`, so `darkmux role list` and
   every other verb that reads the index failed with it. The rebuild now skips that phase with one
-  warning naming the missing `mission.json`, and indexes everything else.
+  warning naming the missing or unreadable `mission.json`, and indexes everything else.
 
 ## [5.12.0] - 2026-11-21
 
