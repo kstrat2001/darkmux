@@ -823,11 +823,8 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
                            "capabilities": ["clean_preview", "template_workspace", "continues", "clone_preview",
                                             "recipe_set", "workspace_image", "workspace_edit", "workspace_remove",
                                              "remote_tailscale", "availability_codes",
-<<<<<<< HEAD
-                                             "remote_requests", "remote_preview", "engines", "read_only_runs"],
-=======
-                                             "remote_requests", "remote_preview", "engines", "git_route"],
->>>>>>> origin/main
+                                             "remote_requests", "remote_preview", "engines", "git_route",
+                                             "read_only_runs"],
                             "remote": {"state": "off", "url": null, "reason": null},
                             "via": "local"})
     );
