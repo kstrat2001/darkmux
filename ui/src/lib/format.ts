@@ -105,12 +105,15 @@ function shortDate(t: number): string {
 }
 
 /** `relAgoFrom()`. Coarse past-only relative time.
+ * (#2382) `t` after `ref` also reads "just now": the viewer is read off-box
+ * over the tailnet, so `t` is often stamped by another machine's clock, and
+ * a reader whose clock is behind it would otherwise get a bare label. Skew
+ * is unknowable from the browser, so the freshest reading is the honest one.
  * `<5s` reads as "just now"; note this is NOT the same threshold as
  * `<60s` — 5-59s renders as "Ns ago", a real bucket the machine lens's own
  * "just now" row (`ref===t`) never hits but a future corpus could. */
 export function relAgoFrom(ref: number, t: number): string {
-  const d = ref - t;
-  if (d < 0) return "";
+  const d = Math.max(0, ref - t);
   const s = Math.floor(d / 1000);
   if (s < 60) return s < 5 ? "just now" : `${s}s ago`;
   const m = Math.floor(s / 60);

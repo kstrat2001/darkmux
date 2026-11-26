@@ -7095,10 +7095,29 @@ fn admit_container_start(
     )
 }
 
+/// (#3682) Whether `opts`' workspace is mounted read-only: when asked
+/// (`--workspace-read-only`, a step's `workspace_read_only`), or when its
+/// role's palette grants neither `write` nor `edit` ([`palette_is_read_only`]).
+/// A role that doesn't resolve here keeps what was asked; its dispatch
+/// refuses it later, as before.
+pub(crate) fn workspace_read_only_for(opts: &DispatchOpts) -> bool {
+    opts.workspace_read_only
+        || crate::role_inputs::resolve_role(opts)
+            .ok()
+            .flatten()
+            .is_some_and(|r| palette_is_read_only(&r.role.tool_palette))
+}
+
+/// (#3682) A palette whose tools the model gets include neither `write` nor
+/// `edit`. An empty palette is the runtime's whole catalog, so it is not.
+pub(crate) fn palette_is_read_only(palette: &crate::types::ToolPalette) -> bool {
+    compute_runtime_allowed_tools(palette).is_some_and(|tools| !tools.iter().any(|t| t == "write" || t == "edit"))
+}
+
 /// A container dispatch end to end: the refusals and the route first, then
 /// everything the container needs before its `dispatch.start`, then the run
 /// itself ([`run_container`]), which owns the bookends.
-pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
+pub fn dispatch(mut opts: DispatchOpts) -> Result<DispatchResult> {
     // A stopped run starts nothing: no container, no model call, and no
     // record (an execution that never started opens no `dispatch.start`, as
     // a `dispatch.map` item the stop kept from starting opens none). Every
@@ -7116,6 +7135,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // `opts.skip_preflight`: that flag skips the Docker/daemon probe, and a
     // bad config value is not a probe result that could be stale.
     crate::user_files::preflight_with(darkmux_types::config_enum::Scope::Dispatch, opts.config_path.as_deref())?;
+    // (#3682) A role that may neither write nor edit runs with its workspace
+    // mounted read-only, so `exec` can't write there either. Decided here,
+    // before anything reads the flag (the resume gate, the mount, the
+    // execution record), for every host-side dispatch.
+    opts.workspace_read_only = workspace_read_only_for(&opts);
     // 0. Pre-flight: nudge the operator if the daemon isn't up. The
     //    dispatch will still write flow records to disk, but they
     //    won't be observable in the viewer until the daemon comes up.

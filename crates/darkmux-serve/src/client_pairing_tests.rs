@@ -823,7 +823,8 @@ async fn pairing_happy_path_delivers_a_token_that_whoami_accepts() {
                            "capabilities": ["clean_preview", "template_workspace", "continues", "clone_preview",
                                             "recipe_set", "workspace_image", "workspace_edit", "workspace_remove",
                                              "remote_tailscale", "availability_codes",
-                                             "remote_requests", "remote_preview", "engines", "git_route", "workspace_file"],
+                                             "remote_requests", "remote_preview", "engines", "git_route",
+                                             "read_only_runs", "workspace_file"],
                             "remote": {"state": "off", "url": null, "reason": null},
                             "via": "local"})
     );
@@ -4600,13 +4601,13 @@ async fn work_refuses_bad_unknown_or_doubled_workspaces() {
     assert!(h.ran.lock().unwrap().is_empty());
 }
 
-/// A paired app runs work only in a workspace darkmux made for it. A
-/// mission's worktree folder under the base (`<base>/<repo>/<phase>`),
-/// another app's workspace, and a folder darkmux holds a repository for but
-/// made for no app are refused by name and by path, with a code, before
-/// anything runs.
+/// A paired app runs work only in a workspace darkmux made for an app. A
+/// mission's worktree folder under the base (`<base>/<repo>/<phase>`) and a
+/// folder darkmux holds a repository for but made for no app are refused by
+/// name and by path, with a code, before anything runs. (#3683) A
+/// workspace made for another pairing is the owner's like any other.
 #[tokio::test]
-async fn work_runs_only_in_a_workspace_made_for_this_app() {
+async fn work_runs_only_in_a_workspace_made_for_an_app() {
     let h = harness();
     let token = paired(&h).await;
     std::fs::create_dir_all(h.base.join("darkmux-public/phase-1")).unwrap();
@@ -4616,7 +4617,7 @@ async fn work_runs_only_in_a_workspace_made_for_this_app() {
     // A workspace from before owners, in a store with no legacy owner.
     std::fs::remove_file(h.base.join(".nobodys.client")).unwrap();
     let base = h.base.canonicalize().unwrap();
-    for name in ["darkmux-public", "theirs", "nobodys"] {
+    for name in ["darkmux-public", "nobodys"] {
         for body in [
             serde_json::json!({"role": "coder", "message": "hi", "workspace": name}),
             serde_json::json!({"role": "coder", "message": "hi", "workdir": base.join(name).to_str()}),
@@ -4627,16 +4628,16 @@ async fn work_runs_only_in_a_workspace_made_for_this_app() {
         }
     }
     assert!(h.ran.lock().unwrap().is_empty(), "nothing ran");
-    // Nor can it look at or start anything in another app's workspace.
+    // Nor can it look at or start anything in one made for no app.
     for req in [
-        get("/client/workspaces/theirs", &[("authorization", &bearer(&token))]),
-        get("/client/workspaces/theirs/changes", &[("authorization", &bearer(&token))]),
-        get("/client/recipe?workspace=theirs", &[("authorization", &bearer(&token))]),
-        post("/client/workspaces/theirs/preview", Some(&token), serde_json::json!({})),
-        get("/client/workspaces/theirs/preview", &[("authorization", &bearer(&token))]),
+        get("/client/workspaces/nobodys", &[("authorization", &bearer(&token))]),
+        get("/client/workspaces/nobodys/changes", &[("authorization", &bearer(&token))]),
+        get("/client/recipe?workspace=nobodys", &[("authorization", &bearer(&token))]),
+        post("/client/workspaces/nobodys/preview", Some(&token), serde_json::json!({})),
+        get("/client/workspaces/nobodys/preview", &[("authorization", &bearer(&token))]),
         Request::builder()
             .method("DELETE")
-            .uri("/client/workspaces/theirs/preview")
+            .uri("/client/workspaces/nobodys/preview")
             .header("authorization", bearer(&token))
             .body(Body::empty())
             .unwrap(),
@@ -4644,12 +4645,14 @@ async fn work_runs_only_in_a_workspace_made_for_this_app() {
         let (code, v) = call(&h, req).await;
         assert_eq!((code, v["code"].as_str()), (403, Some("forbidden")), "{v}");
     }
+    let (code, v) = call(&h, get("/client/workspaces/theirs", &[("authorization", &bearer(&token))])).await;
+    assert_eq!(code, 200, "(#3683) another pairing's workspace is the owner's: {v}");
 }
 
-/// Two apps asking for the same repo each get a workspace of their own, and
-/// neither can run in the other's.
+/// (#3683) Two of the owner's devices asking for the same repo for the same
+/// bot get the same work copy, and either can run in it.
 #[tokio::test]
-async fn each_app_gets_its_own_workspace_of_a_repo() {
+async fn every_device_of_the_owner_gets_the_same_work_copy_of_a_repo() {
     let h = harness();
     let a = paired(&h).await;
     let b = paired(&h).await;
@@ -4657,17 +4660,13 @@ async fn each_app_gets_its_own_workspace_of_a_repo() {
     let (code, va) = call(&h, make(&a)).await;
     assert_eq!(code, 201, "{va}");
     let (code, vb) = call(&h, make(&b)).await;
-    assert_eq!(code, 201, "b gets its own, not a's: {vb}");
-    assert_ne!(va["workspace"], vb["workspace"]);
-    let (code, again) = call(&h, make(&a)).await;
-    assert_eq!((code, &again["workspace"]), (200, &va["workspace"]), "a reuses its own: {again}");
+    assert_eq!((code, &vb["workspace"]), (200, &va["workspace"]), "b gets a's, not one of its own: {vb}");
     let (code, v) = call(
         &h,
         post("/client/work", Some(&b), serde_json::json!({"role": "coder", "message": "hi", "workspace": va["workspace"]})),
     )
     .await;
-    assert_eq!((code, v["code"].as_str()), (403, Some("forbidden")), "{v}");
-    assert!(h.ran.lock().unwrap().is_empty());
+    assert_eq!(code, 202, "{v}");
 }
 
 /// `git <args>` against workspace `name`'s held repository (a clone's
@@ -4924,9 +4923,8 @@ async fn reuse_runs_no_git_in_another_bots_or_apps_workspace() {
     assert_eq!(code, 201, "{other}");
     let (code, theirs) = call(&h, ask("Theirs")).await;
     assert_eq!(code, 201, "{theirs}");
-    // Another app's, for a bot of the very name asking.
+    // (#3683) Made for another pairing: still another bot's, so never read.
     crate::client_workspace::record_owner(&h.base, theirs["workspace"].as_str().unwrap(), "c-someone-else").unwrap();
-    crate::client_workspace::record_bot(&h.base, theirs["workspace"].as_str().unwrap(), "Mine").unwrap();
     let pipes: Vec<PathBuf> = [&other, &theirs]
         .iter()
         .map(|v| crate::client_git::clone_git_dir(&h.base, v["workspace"].as_str().unwrap()).join("config"))
@@ -5145,8 +5143,8 @@ async fn a_workspace_in_use_is_not_removed_nor_used_while_removed() {
     assert_eq!((code, refused["code"].as_str()), (409, Some("conflict")), "no Undo either: {refused}");
     assert!(refused["error"].as_str().unwrap().contains("being made or removed"), "{refused}");
     drop(removing);
-    let (code, _) = remove_ws(&h, &other, "hcr", None).await;
-    assert_eq!(code, 403, "another app's");
+    let (code, v) = remove_ws(&h, &other, "hcr", None).await;
+    assert_ne!(code, 403, "(#3683) another pairing's is the owner's too: {v}");
     let (code, _) = remove_ws(&h, &token, "nope", None).await;
     assert_eq!(code, 404);
     let (code, _) = remove_ws(&h, &token, "..", None).await;
@@ -5413,7 +5411,8 @@ async fn workspaces_from_before_owners_go_to_the_client_paired_when_the_store_mo
     git_workspace(&h, "site");
     std::fs::remove_file(h.base.join(".site.client")).unwrap();
     let (code, v) = call(&h, post("/client/work", Some(&second), serde_json::json!({"role": "coder", "message": "hi", "workspace": "site"}))).await;
-    assert_eq!(code, 403, "never the second app's: {v}");
+    assert_eq!(code, 202, "(#3683) given to the heir, it's the owner's, for any pairing: {v}");
+    wait_done(&h, &second, v["work_id"].as_str().unwrap()).await;
     let id = run_in(&h, first, "site", "hello").await;
     assert_eq!(status(&h, first, &id).await["status"], "done");
     assert_eq!(crate::client_workspace::owner_of(&h.base, "site"), Some(heir));
@@ -5484,31 +5483,30 @@ async fn with_two_apps_paired_only_the_operator_gives_out_an_unowned_workspace()
     assert!(unowned_workspaces(&h.store, &h.base).unwrap().is_empty());
     let (code, v) = call(&h, work(&a)).await;
     assert_eq!(code, 202, "{v}");
-    let (code, _) = call(&h, work(&b)).await;
-    assert_eq!(code, 403);
+    let (code, v) = call(&h, work(&b)).await;
+    assert_ne!(code, 403, "(#3683) once given out, it's the owner's, for any pairing: {v}");
 }
 
-/// A client's workspaces and runs belong to its id, not its name: after it
-/// is revoked, a new pairing given the same name inherits neither. Its
-/// workspaces stay unowned until the operator gives them to someone.
+/// (#3683) A revoked pairing loses every work copy at once; a new pairing
+/// of the owner (given the same name, even) has them, and the runs in them.
 #[tokio::test]
-async fn a_new_pairing_never_inherits_a_revoked_clients_workspaces_or_runs() {
+async fn a_revoked_pairing_loses_its_work_copies_and_a_new_one_of_the_owners_has_them() {
     let h = harness();
     let old = paired(&h).await;
     let (code, v) = call(&h, post("/client/workspaces", Some(&old), serde_json::json!({"repo_url": HCR}))).await;
     assert_eq!(code, 201, "{v}");
     let run = run_in(&h, &old, "hcr", "hello").await;
     assert!(revoke(&h.store, FIRST_CLIENT).unwrap());
+    let (code, _) = call(&h, get(&format!("/client/work/{run}"), &[("authorization", &bearer(&old))])).await;
+    assert_eq!(code, 401, "the revoked token");
     let new = paired(&h).await;
     assert_eq!(list_clients(&h.store).unwrap()[0].name, FIRST_CLIENT, "the name is reused");
-    let (code, v) = call(&h, post("/client/work", Some(&new), serde_json::json!({"role": "coder", "message": "hi", "workspace": "hcr"}))).await;
-    assert_eq!((code, v["code"].as_str()), (403, Some("forbidden")), "{v}");
-    let (code, _) = call(&h, get(&format!("/client/work/{run}"), &[("authorization", &bearer(&new))])).await;
-    assert_eq!(code, 404, "the revoked client's run is not the new one's");
+    let (code, v) = call(&h, get(&format!("/client/work/{run}"), &[("authorization", &bearer(&new))])).await;
+    assert_eq!(code, 200, "the run in the owner's work copy: {v}");
     let (code, v) = call(&h, post("/client/workspaces", Some(&new), serde_json::json!({"repo_url": HCR}))).await;
-    assert_eq!(code, 201, "a workspace of its own: {v}");
-    assert_ne!(v["workspace"], "hcr");
-    assert_eq!(unowned_workspaces(&h.store, &h.base).unwrap(), ["hcr"]);
+    assert_eq!((code, v["workspace"].as_str()), (200, Some("hcr")), "the owner's work copy, reused: {v}");
+    let (code, v) = call(&h, post("/client/work", Some(&new), serde_json::json!({"role": "coder", "message": "hi", "workspace": "hcr"}))).await;
+    assert_eq!(code, 202, "{v}");
 }
 
 /// The owner record is written only when it changes, and replaced in one
@@ -6260,13 +6258,13 @@ async fn undo_refuses_what_it_cant_do() {
     let (code, _) = call(
         &h,
         post(
-            &format!("/client/work/{id}/undo"),
+            "/client/work/w-0000000000000000/undo",
             Some(&other),
             serde_json::json!({}),
         ),
     )
     .await;
-    assert_eq!(code, 404);
+    assert_eq!(code, 404, "an unknown run");
     let (code, _) = call(
         &h,
         post(
@@ -6670,10 +6668,13 @@ async fn an_approved_recipe_is_the_owners_and_capped() {
     assert!(v["error"].as_str().unwrap().contains("larger than"), "{v}");
     let base = h.base.canonicalize().unwrap();
     assert!(!base.join(".hcr.recipe").exists());
-    own(&h, "hcr", "c-0000000000000000");
-    let (code, v) = put_recipe(&h, &token, "hcr", serde_json::json!({"command": "npm run dev"})).await;
+    // (#3683) A clone darkmux made for no app (no owner record, nobody to
+    // adopt it) keeps no recipe from an app.
+    std::fs::remove_file(base.join(".hcr.client")).unwrap();
+    let second = paired(&h).await;
+    let (code, v) = put_recipe(&h, &second, "hcr", serde_json::json!({"command": "npm run dev"})).await;
     assert_eq!((code, v["code"].as_str()), (403, Some("forbidden")), "{v}");
-    assert!(!base.join(".hcr.recipe").exists(), "another app's clone keeps no recipe of this one's");
+    assert!(!base.join(".hcr.recipe").exists(), "a clone made for no app keeps no recipe");
 }
 
 /// (#3571) A clone's records are read only as plain files: a linked or
@@ -7653,14 +7654,16 @@ async fn continues_may_not_name_another_apps_run_or_one_in_another_work_copy() {
     own(&h, "site", &ids[0]);
     let first = run_in(&h, &token, "site", "edit-other").await;
     let tweak = |ws: &str, cont: &str| post("/client/work", Some(&token), serde_json::json!({"role": "coder", "message": "edit", "workspace": ws, "continues": cont}));
-    for (ws, cont) in [("elsewhere", first.as_str()), ("site", foreign.as_str())] {
-        let (code, v) = call(&h, tweak(ws, cont)).await;
-        assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "{ws} {cont}: {v}");
-    }
+    let (code, v) = call(&h, tweak("elsewhere", &first)).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("conflict")), "another work copy's run: {v}");
     let failed = run_in(&h, &token, "site", "edit-fail").await;
     assert_eq!(status(&h, &token, &failed).await["status"], "error");
     let (code, v) = call(&h, tweak("site", &failed)).await;
     assert_eq!(code, 202, "a failed run's committed edits can be tweaked: {v}");
+    let id = v["work_id"].as_str().unwrap().to_string();
+    wait_done(&h, &token, &id).await;
+    let (code, v) = call(&h, tweak("site", &foreign)).await;
+    assert_eq!(code, 202, "(#3683) another pairing's run in this work copy can be tweaked: {v}");
 }
 
 /// "Tweak it" the next morning, or after `client serve` restarts: a
@@ -12160,6 +12163,67 @@ async fn a_template_projects_first_push_goes_only_into_an_empty_repository() {
     let (_, s) = call(&h, git_call(&name, &token, "status", serde_json::json!({}))).await;
     assert_eq!(s["result"]["origin"], "github.com/o/empty", "{s}");
     assert_eq!(s["result"]["ahead"], 0, "{s}");
+}
+
+// ─── A work copy is the owner's (#3683) ──────────────────────────────────
+
+/// Pairing B reads the status of, pushes and stops a run in the work copy
+/// pairing A made, as the owner's iPhone would the Mac's.
+#[tokio::test]
+async fn another_pairing_of_the_owner_can_status_push_and_stop_runs_in_a_work_copy() {
+    let h = harness();
+    let a = paired(&h).await;
+    let b = paired(&h).await;
+    git_remote_workspace(&h, "site");
+    run_in(&h, &a, "site", "edit-readme").await;
+    let (code, v) = call(&h, git_call("site", &b, "status", serde_json::json!({}))).await;
+    assert_eq!((code, v["result"]["pending"].clone()), (200, serde_json::json!(1)), "{v}");
+    let (code, v) = call(&h, git_call("site", &b, "push", serde_json::json!({}))).await;
+    assert_eq!(code, 200, "{v}");
+    let (code, v) = call(&h, post("/client/work", Some(&a), serde_json::json!({"role": "coder", "message": "wait", "workspace": "site"}))).await;
+    assert_eq!(code, 202, "{v}");
+    let id = v["work_id"].as_str().unwrap().to_string();
+    let (code, v) = call(&h, get(&format!("/client/work/{id}"), &[("authorization", &bearer(&b))])).await;
+    assert_eq!((code, v["status"].as_str()), (200, Some("running")), "b follows a's run: {v}");
+    let (code, v) = cancel(&h, Some(&b), &id).await;
+    assert_eq!(code, 202, "b stops it: {v}");
+    assert_eq!(wait_done(&h, &a, &id).await["status"], "cancelled");
+}
+
+/// Two devices acting on one work copy at once: exactly one goes ahead,
+/// the other gets a 409 naming what holds it.
+#[tokio::test]
+async fn two_pairings_acting_on_one_work_copy_at_once_get_one_409() {
+    let h = harness();
+    let a = paired(&h).await;
+    let b = paired(&h).await;
+    git_remote_workspace(&h, "site");
+    let run = |t: &str| post("/client/work", Some(t), serde_json::json!({"role": "coder", "message": "wait", "workspace": "site"}));
+    let ((ca, va), (cb, vb)) = tokio::join!(call(&h, run(&a)), call(&h, run(&b)));
+    let mut codes = [ca, cb];
+    codes.sort();
+    assert_eq!(codes, [202, 409], "{va} {vb}");
+    let (started, by) = if ca == 202 { (&va, &a) } else { (&vb, &b) };
+    let (code, v) = call(&h, git_call("site", if by == &a { &b } else { &a }, "push", serde_json::json!({}))).await;
+    assert_eq!((code, v["code"].as_str()), (409, Some("work_copy_busy")), "{v}");
+    let id = started["work_id"].as_str().unwrap().to_string();
+    cancel(&h, Some(by), &id).await;
+    wait_done(&h, by, &id).await;
+}
+
+/// A revoked pairing loses every work copy at once.
+#[tokio::test]
+async fn a_revoked_pairing_is_refused_every_work_copy() {
+    let h = harness();
+    let a = paired(&h).await;
+    let b = paired(&h).await;
+    git_remote_workspace(&h, "site");
+    let b_name = h.store.read().unwrap().clients[1].name.clone();
+    assert!(revoke(&h.store, &b_name).unwrap());
+    let (code, v) = call(&h, git_call("site", &b, "status", serde_json::json!({}))).await;
+    assert_eq!(code, 401, "{v}");
+    let (code, v) = call(&h, git_call("site", &a, "status", serde_json::json!({}))).await;
+    assert_eq!(code, 200, "{v}");
 }
 
 // ─── A file a person approved (#3688) ────────────────────────────────────

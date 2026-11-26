@@ -1481,6 +1481,11 @@
           },
           {
             "type": "string",
+            "const": "read_only_runs",
+            "description": "(#3682) A run whose role may neither write nor edit (`researcher`,\n`code-reviewer`) has its workspace mounted read-only, so it cannot\nchange it by any means; the built-in `researcher` role exists."
+          },
+          {
+            "type": "string",
             "const": "workspace_file",
             "description": "(#3688) `POST /client/workspaces/{name}/file`: a file a person\napproved, committed into the work copy like an image."
           }

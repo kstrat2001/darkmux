@@ -11,7 +11,7 @@ Dispatches the **code-reviewer** role against the current branch's diff via `dar
 
 ## Step 1 — Determine review scope
 
-Same as the FH `qa-review` skill: branch-scoped diff from `origin/main`, excluding lockfiles.
+A branch-scoped diff from `origin/main`, excluding lockfiles.
 
 ```bash
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "(unknown)")

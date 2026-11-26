@@ -25,9 +25,48 @@ darkmux release.
   go one at a time, and a second is refused naming what holds it (`work_copy_busy`; the older routes
   keep `conflict` and now name the `holder` too). Capability `git_route`. Every refusal may now carry
   `holder`, `work_id` and `paths` (additive).
+- **Runs that can't write can't write (#3682).** A role whose palette gives the model neither `write`
+  nor `edit` runs with its workspace mounted read-only in the sandbox (Seatbelt and Docker alike), so
+  a shell command can't change it either. This now covers `code-reviewer`, `reviewer`, `crawler` and the
+  new built-in `researcher` role (read, exec, update_plan), which paired apps use for read-only
+  questions. Capability `read_only_runs`.
+- **A work copy is the owner's (#3683).** Every pairing in `clients.json` is the operator's own, so any
+  live pairing (the Mac, the iPhone, the iPad) may use any workspace darkmux made for an app, and follow,
+  stop and undo the runs in it; asking for the same repo and bot from two devices gives the same work
+  copy. Mission worktrees and folders made for no app stay refused, and a revoked pairing is refused
+  everywhere at once. **Behavior change:** before, a workspace was its pairing's alone.
 - **A file a person approved goes into the work copy (#3688).** `POST /client/workspaces/{name}/file`
   writes it (relative plain names only, nothing under `.git`, 256 KB at most, through no link) and
   commits it like an image, so Undo and the git route's `revert` take it out. Capability `workspace_file`.
+
+### Fixed
+
+- **The viewer's "N ago" labels no longer go blank when another machine's clock is ahead (#2382).**
+  A time stamped by the daemon host or a fleet peer that reads later than the browser's clock rendered
+  an empty label (a bare "last sample" on the machine page, for one). It now reads "just now".
+
+- **A phase file whose mission has no `mission.json` no longer breaks every role verb (#3675).** The
+  crew index rebuild failed with a bare `FOREIGN KEY constraint failed`, so `darkmux role list` and
+  every other verb that reads the index failed with it. The rebuild now skips that phase with one
+  warning naming the missing or unreadable `mission.json`, and indexes everything else.
+
+- **`darkmux doctor`'s `resident pricing` row no longer passes when it could not read the residents
+  (#3616).** When the resident list could not be read (a timed-out `lms ps`, say), the row said "every
+  resident model is priceable". It now warns, naming why; on an engine that does not report what it
+  holds, it is not applicable.
+
+- **`lab run` warns about a model load when the run's dispatch will load one, and only then (#3678).**
+  The envelope check judged every model the profile lists, each at the `n_ctx` the profile gives it,
+  so it warned that the utility model would reload when it would not and missed loads it would make.
+  It now asks the resolution the dispatch asks: the model the run's role selects (a non-default one
+  when capability scoring picks it), and the `internal.utility` model at the window the dispatch
+  loads it at, which is the binding's `n_ctx`, else the selected model's. The binding may be written
+  `darkmux:<key>`. A utility model that is missing is now noted too, since its load falls inside the
+  run's measurement. When the utility model is also the work model, it is judged at the larger of
+  the two windows, since the dispatch ends with it resident at least that large. A model the dispatch
+  does not touch gets no note. One case is not covered: `lab loop`'s `context_window` override with
+  a utility binding that declares no window, which already warns on every dispatch. The notes also
+  read without a stray ` : `.
 
 ## [5.12.0] - 2026-11-21
 

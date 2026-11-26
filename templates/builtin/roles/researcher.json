@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0",
+  "id": "researcher",
+  "role_family": "specialist",
+  "description": "Researcher who reads a project and answers questions about it with cited evidence. Reads and runs read-only commands; never changes files.",
+  "skills": [
+    "analyzing"
+  ],
+  "tool_palette": {
+    "allow": [
+      "read",
+      "exec",
+      "update_plan"
+    ],
+    "deny": [
+      "edit",
+      "write",
+      "process"
+    ]
+  },
+  "escalation_contract": "bail-with-explanation"
+}

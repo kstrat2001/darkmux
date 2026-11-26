@@ -172,15 +172,16 @@ pub struct BotName<'a> {
 }
 
 /// The workspaces darkmux holds a repository for that its records alone
-/// could give paired client `client`'s bot `bot`: recorded for that client,
-/// and for that bot's exact name (or for none, from before the name was
-/// recorded). Read from the records beside each workspace, so no git runs
-/// in another bot's or another app's workspace while looking for one to
-/// reuse.
-fn held_for(base: &Path, bot: BotName, client: &str) -> Vec<(String, crate::client_git::WorkCopy)> {
+/// could give bot `bot`: made for a paired app (an owner record, for any
+/// pairing: #3683, a work copy is the owner's, so the Mac and the iPhone
+/// get the same one), and for that bot's exact name (or for none, from
+/// before the name was recorded). Read from the records beside each
+/// workspace, so no git runs in another bot's workspace while looking for
+/// one to reuse. `_client` (the asking pairing) no longer narrows it.
+fn held_for(base: &Path, bot: BotName, _client: &str) -> Vec<(String, crate::client_git::WorkCopy)> {
     held_workspaces(base)
         .into_iter()
-        .filter(|(n, _)| owner_of(base, n).as_deref() == Some(client))
+        .filter(|(n, _)| owner_of(base, n).is_some())
         .filter(|(n, _)| bot_of(base, n).is_none_or(|b| b == bot.exact))
         .collect()
 }

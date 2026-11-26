@@ -85,6 +85,10 @@ pub enum ClientCapability {
     /// workspace (`status`, `fetch`, `push`, `merge_main`, `revert`,
     /// `diff`), and one lock per work copy (`work_copy_busy`).
     GitRoute,
+    /// (#3682) A run whose role may neither write nor edit (`researcher`,
+    /// `code-reviewer`) has its workspace mounted read-only, so it cannot
+    /// change it by any means; the built-in `researcher` role exists.
+    ReadOnlyRuns,
     /// (#3688) `POST /client/workspaces/{name}/file`: a file a person
     /// approved, committed into the work copy like an image.
     WorkspaceFile,
@@ -92,7 +96,7 @@ pub enum ClientCapability {
 
 impl ClientCapability {
     /// Every capability, in declaration order: what `whoami` lists.
-    pub const ALL: [ClientCapability; 15] = [
+    pub const ALL: [ClientCapability; 16] = [
         ClientCapability::CleanPreview,
         ClientCapability::TemplateWorkspace,
         ClientCapability::Continues,
@@ -107,6 +111,7 @@ impl ClientCapability {
         ClientCapability::RemotePreview,
         ClientCapability::Engines,
         ClientCapability::GitRoute,
+        ClientCapability::ReadOnlyRuns,
         ClientCapability::WorkspaceFile,
     ];
 }
@@ -144,6 +149,7 @@ mod tests {
                 "remote_preview",
                 "engines",
                 "git_route",
+                "read_only_runs",
                 "workspace_file",
             ]
         );
