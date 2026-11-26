@@ -699,13 +699,26 @@ pub struct ModelLedger {
     /// changelog entry. A disclosure (`info`) no longer lights the same
     /// lamp as a real degradation (`warn`/`error`).
     pub messages: Vec<LedgerMessage>,
-    /// (#3616) The resident list could not be read (or the engine does not
-    /// report one), so `models` lists none of its residents: "none listed"
-    /// is not "none loaded". In process only: the wire already says it
-    /// through `attribution` and `machine.state`.
+    /// (#3616) Whether `models` lists the residents at all: "none listed" is
+    /// not "none loaded". In process only: the wire already says it through
+    /// `attribution` and `machine.state`.
     #[serde(skip)]
     #[cfg_attr(feature = "ts-export", ts(skip))]
-    pub residents_unknown: bool,
+    pub residents_read: ResidentsRead,
+}
+
+/// (#3616) How the ledger came by its resident list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ResidentsRead {
+    /// The engine listed them (an empty list means none are loaded).
+    #[default]
+    Listed,
+    /// Asking failed (a timed-out `lms ps`, an unusable engine): the
+    /// ledger's warn and error messages say why.
+    Unknown,
+    /// The engine does not report what it holds, so it was never asked;
+    /// nothing is wrong. Carries the engine's own reason.
+    NotReported(String),
 }
 
 // ── pure inputs (the test seam: canned/fixture data, never real probes) ──
@@ -1217,7 +1230,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         attribution,
         attribution_note,
         messages,
-        residents_unknown,
+        residents_read: if residents_unknown { ResidentsRead::Unknown } else { ResidentsRead::Listed },
     }
 }
 
@@ -1736,7 +1749,9 @@ pub fn gather_residents_unknown(why: &str) -> ModelLedger {
 /// same unknown residents, said as information, not a warning. Nothing is
 /// wrong; the engine was never asked (it has no such question).
 pub fn gather_residents_not_reported(why: &str) -> ModelLedger {
-    gather_residents_unknown_as(LedgerMessage::info(why), why)
+    let mut ledger = gather_residents_unknown_as(LedgerMessage::info(why), why);
+    ledger.residents_read = ResidentsRead::NotReported(why.to_string());
+    ledger
 }
 
 fn gather_residents_unknown_as(message: LedgerMessage, why: &str) -> ModelLedger {
@@ -3425,10 +3440,22 @@ mod tests {
         let mut inputs = base_inputs();
         inputs.residents_unknown = true;
         let ledger = compute_ledger(inputs, 1);
-        assert!(ledger.residents_unknown);
+        assert_eq!(ledger.residents_read, ResidentsRead::Unknown);
         let wire = serde_json::to_value(&ledger).unwrap();
-        assert!(wire.get("residents_unknown").is_none(), "no wire change: {wire}");
-        assert!(!compute_ledger(base_inputs(), 1).residents_unknown);
+        assert!(wire.get("residents_read").is_none(), "no wire change: {wire}");
+        assert_eq!(compute_ledger(base_inputs(), 1).residents_read, ResidentsRead::Listed);
+    }
+
+    /// (#3616 review) The engine that does not report residents carries its
+    /// own reason, apart from whatever the machine probes said.
+    #[test]
+    fn a_not_reported_ledger_says_so_with_the_engines_reason() {
+        let ledger = gather_residents_not_reported("`local-8080` does not report which models it has loaded");
+        assert_eq!(
+            ledger.residents_read,
+            ResidentsRead::NotReported("`local-8080` does not report which models it has loaded".into())
+        );
+        assert_eq!(gather_residents_unknown("`lms ps` timed out").residents_read, ResidentsRead::Unknown);
     }
 
     #[test]
