@@ -844,7 +844,12 @@ function changesOf(close: NormRecord | null | undefined): string | null {
   return workspaceChangesLabel(endPayloadOf(close)?.workspace_changes);
 }
 
-const EXCLUDED_MARKERS: Record<string, string> = { "git-ignored": "git-ignored files", "nested-repositories": "nested repositories" };
+const EXCLUDED_MARKERS: Record<string, string> = {
+  "git-ignored": "git-ignored files",
+  "nested-repositories": "nested repositories",
+  submodules: "submodules",
+  "files-over-50mb": "files over 50 MB (compared by size and time)",
+};
 
 function outsideOf(excluded: readonly string[]): string {
   return excluded.length ? ` outside ${excluded.map((e) => EXCLUDED_MARKERS[e] ?? `${e}/`).join(", ")}` : "";

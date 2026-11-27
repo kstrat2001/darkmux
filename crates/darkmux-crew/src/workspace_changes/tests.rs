@@ -420,76 +420,393 @@ fn a_repository_the_run_made_inside_the_checkout_is_named_by_a_marker_never_a_pa
     );
 }
 
-/// A checkout whose files are older than its index, as a real one is: every
-/// object the measure needs is already the repository's own, read through
-/// the alternate, so the scratch store stays empty. Without the alternate,
-/// git writes every blob and tree again into scratch. (The seeded index only
-/// saves the hashing, which no object shows: the cost check measures it.)
+/// Every object the git path needs that the repository already holds is
+/// read in place through the alternate, so the scratch store stays empty:
+/// the operator's repository is read, never copied. Without the alternate,
+/// git writes every blob and tree again into scratch.
 #[test]
-fn the_git_path_reuses_the_checkouts_index_and_reads_its_objects_in_place() {
-    let dir = TempDir::new().unwrap();
-    git(dir.path(), &["init", "-q"]);
-    let aged = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
-    for (rel, body) in [("a.txt", "a\n"), ("b.txt", "b\n"), ("c/d.txt", "d\n")] {
-        write(dir.path(), rel, body.as_bytes());
-        fs::File::options()
-            .write(true)
-            .open(dir.path().join(rel))
-            .unwrap()
-            .set_modified(aged)
-            .unwrap();
-    }
-    git(dir.path(), &["add", "-A"]);
-    git(dir.path(), &["commit", "-q", "-m", "base"]);
+fn the_git_path_reads_the_repositorys_objects_in_place() {
+    let dir = repo();
     let git_dir = dir.path().join(".git");
     let baseline = WorkspaceBaseline::take(dir.path(), Some(&git_dir));
     let scratch = baseline.scratch_objects().expect("measured with git");
-    let written: Vec<PathBuf> = {
-        let mut v = Vec::new();
-        for e in fs::read_dir(scratch).unwrap().flatten() {
-            if e.path().is_dir() {
-                v.extend(fs::read_dir(e.path()).unwrap().flatten().map(|f| f.path()));
-            }
+    let mut written = Vec::new();
+    for e in fs::read_dir(scratch).unwrap().flatten() {
+        if e.path().is_dir() {
+            written.extend(fs::read_dir(e.path()).unwrap().flatten().map(|f| f.path()));
         }
-        v
-    };
+    }
+    // `build.log` is ignored and the rest is committed: nothing new to write.
     assert!(
         written.is_empty(),
         "the repository's objects are read in place: {written:?}"
     );
-    write(dir.path(), "a.txt", b"a\nmore\n");
+    write(dir.path(), "calc.py", b"x\n");
+    assert_eq!(baseline.measure().summary.files_changed, Some(1));
+}
+
+/// A checkout with a submodule `sub` whose `.git` the run replaced with a
+/// writable copy whose config defines a filter driver, assigned to every
+/// file there: `filter` is its `clean` command. The reviewer's setup.
+fn repo_with_a_planted_submodule(filter: &str) -> (TempDir, TempDir) {
+    let upstream = TempDir::new().unwrap();
+    git(upstream.path(), &["init", "-q"]);
+    write(upstream.path(), "a.txt", b"a\n");
+    git(upstream.path(), &["add", "-A"]);
+    git(upstream.path(), &["commit", "-q", "-m", "sub"]);
+    let dir = repo();
+    let url = upstream.path().to_string_lossy().to_string();
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &url,
+            "sub",
+        ],
+    );
+    git(dir.path(), &["commit", "-q", "-m", "add sub"]);
+    let planted = dir.path().join("sub/.git");
+    fs::remove_file(&planted).unwrap();
+    let copy = Command::new("cp")
+        .arg("-R")
+        .arg(dir.path().join(".git/modules/sub"))
+        .arg(&planted)
+        .status()
+        .unwrap();
+    assert!(copy.success());
+    git(
+        dir.path(),
+        &[
+            "config",
+            "-f",
+            "sub/.git/config",
+            "--unset",
+            "core.worktree",
+        ],
+    );
+    git(
+        dir.path(),
+        &[
+            "config",
+            "-f",
+            "sub/.git/config",
+            "filter.mark.clean",
+            filter,
+        ],
+    );
+    write(dir.path(), "sub/.git/info/attributes", b"* filter=mark\n");
+    // Same size, so git must hash it (through the filter) to tell.
+    write(dir.path(), "sub/a.txt", b"b\n");
+    (dir, upstream)
+}
+
+/// (#3236 review, PROVEN host code execution) The git path never runs git
+/// inside a submodule, whose `.git` a run can write: its index is fresh and
+/// empty, so it holds no gitlink to check (`host_git.rs`'s rule). A seeded
+/// index ran the planted filter on the host.
+#[test]
+fn a_planted_submodule_filter_never_runs_on_the_host() {
+    let marker_dir = TempDir::new().unwrap();
+    let marker = marker_dir.path().join("ran");
+    let (dir, _upstream) =
+        repo_with_a_planted_submodule(&format!("sh -c 'touch {}; cat'", marker.display()));
+    let git_dir = dir.path().join(".git");
+    let baseline = WorkspaceBaseline::take(dir.path(), Some(&git_dir));
+    write(dir.path(), "sub/a.txt", b"c\n");
     let m = baseline.measure();
+    assert!(!marker.exists(), "the planted filter ran on the host");
     assert_eq!(m.summary.method, WorkspaceMethod::Git);
     assert_eq!(
-        (
-            m.summary.files_changed,
-            m.summary.lines_added,
-            m.summary.lines_removed
-        ),
-        (Some(1), Some(1), Some(0))
+        m.summary.files_changed,
+        Some(0),
+        "uncommitted work inside a submodule is not in its gitlink"
+    );
+    assert!(
+        m.summary
+            .excluded
+            .contains(&WorkspaceChanges::SUBMODULES.to_string()),
+        "and the record says so: {:?}",
+        m.summary.excluded
     );
 }
 
+/// (#3236 review, PROVEN unbounded hang) A planted filter that never returns
+/// cannot hold the measure: it is never run.
+#[test]
+fn a_planted_submodule_filter_that_hangs_cannot_hang_the_measure() {
+    let (dir, _upstream) = repo_with_a_planted_submodule("sleep 60");
+    let git_dir = dir.path().join(".git");
+    let started = std::time::Instant::now();
+    let baseline =
+        WorkspaceBaseline::take_bounded(dir.path(), Some(&git_dir), Duration::from_secs(20));
+    let m = baseline.measure();
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(m.summary.method, WorkspaceMethod::Git);
+    assert_eq!(m.summary.files_changed, Some(0));
+}
+
+/// (#3236 review) Every git call is bounded: a command that does not return
+/// (here a filter from the operator's own global config, which darkmux runs
+/// by design, assigned by a `.gitattributes` the run wrote) ends at the
+/// bound, and the record says the changes were not measured, never `0`.
+#[test]
+#[serial_test::serial] // sets GIT_CONFIG_GLOBAL for the git it starts
+fn a_git_call_that_never_returns_ends_at_the_bound_as_not_measured() {
+    let dir = repo();
+    let global = TempDir::new().unwrap();
+    let config = global.path().join("gitconfig");
+    fs::write(&config, "[filter \"slow\"]\n\tclean = sleep 60\n").unwrap();
+    let prev = std::env::var_os("GIT_CONFIG_GLOBAL");
+    // SAFETY: serial, and restored before the test ends.
+    unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &config) };
+    let git_dir = dir.path().join(".git");
+    let baseline =
+        WorkspaceBaseline::take_bounded(dir.path(), Some(&git_dir), Duration::from_secs(3));
+    write(dir.path(), ".gitattributes", b"*.py filter=slow\n");
+    write(dir.path(), "calc.py", b"changed\n");
+    let started = std::time::Instant::now();
+    let m = baseline.measure();
+    let took = started.elapsed();
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", v) },
+        None => unsafe { std::env::remove_var("GIT_CONFIG_GLOBAL") },
+    }
+    assert!(took < Duration::from_secs(10), "took {took:?}");
+    assert_eq!(m.summary.files_changed, None);
+    let why = m.summary.not_measured.expect("why");
+    assert!(why.contains("git add did not finish within"), "{why}");
+}
+
+/// (#3236 review, PROVEN) `not_measured` rides the flow stream, so it is a
+/// fixed reason: git's own error names the file it failed on.
+#[cfg(unix)]
+#[test]
+fn a_failed_read_names_no_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = repo();
+    let git_dir = dir.path().join(".git");
+    let baseline = WorkspaceBaseline::take(dir.path(), Some(&git_dir));
+    let secret = dir.path().join("customer-acme-payroll-2026.csv");
+    fs::write(&secret, b"x\n").unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&secret).is_ok() {
+        return; // root reads it whatever the mode
+    }
+    let m = baseline.measure();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+    let why = m
+        .summary
+        .not_measured
+        .clone()
+        .expect("git add fails on the unreadable file");
+    assert_eq!(m.summary.files_changed, None);
+    assert!(why.contains("git add failed (exit"), "{why}");
+    let wire = serde_json::to_string(&m.summary).unwrap();
+    assert!(
+        !wire.contains("customer") && !wire.contains(&*dir.path().to_string_lossy()),
+        "{wire}"
+    );
+}
+
+/// (#3236 review) A file the checkout's index marks `--assume-unchanged` or
+/// `--skip-worktree` is still counted when the run edits it: the measure's
+/// index is its own.
+#[test]
+fn an_assume_unchanged_or_skip_worktree_file_is_still_counted() {
+    let dir = repo();
+    git(
+        dir.path(),
+        &["update-index", "--assume-unchanged", "calc.py"],
+    );
+    git(dir.path(), &["update-index", "--skip-worktree", "notes.md"]);
+    let git_dir = dir.path().join(".git");
+    let baseline = WorkspaceBaseline::take(dir.path(), Some(&git_dir));
+    write(dir.path(), "calc.py", b"edited\n");
+    write(dir.path(), "notes.md", b"edited\n");
+    let m = baseline.measure();
+    assert_eq!(m.summary.method, WorkspaceMethod::Git);
+    assert_eq!(m.summary.files_changed, Some(2), "{:?}", m.files);
+}
+
+/// (#3236 review) A symlink is counted by its target, added or retargeted,
+/// and never followed.
+#[cfg(unix)]
+#[test]
+fn a_symlink_added_or_retargeted_is_counted_by_its_target() {
+    use std::os::unix::fs::symlink;
+    let ws = TempDir::new().unwrap();
+    symlink("/etc/hosts", ws.path().join("old")).unwrap();
+    let baseline = WorkspaceBaseline::take(ws.path(), None);
+    fs::remove_file(ws.path().join("old")).unwrap();
+    symlink("/etc/passwd", ws.path().join("old")).unwrap();
+    symlink("/dev/zero", ws.path().join("new")).unwrap();
+    let m = baseline.measure();
+    assert_eq!(m.summary.files_changed, Some(2));
+    assert_eq!(
+        m.files,
+        vec![
+            WorkspaceFileChange {
+                path: "new".into(),
+                change: WorkspaceChangeKind::Added,
+                lines_added: Some(1),
+                lines_removed: Some(0)
+            },
+            WorkspaceFileChange {
+                path: "old".into(),
+                change: WorkspaceChangeKind::Modified,
+                lines_added: None,
+                lines_removed: None
+            },
+        ],
+        "a link to /dev/zero is its target's one line, never read"
+    );
+}
+
+/// (#3236 review) A permission change is a change.
+#[cfg(unix)]
+#[test]
+fn a_mode_change_is_counted() {
+    use std::os::unix::fs::PermissionsExt;
+    let ws = TempDir::new().unwrap();
+    write(ws.path(), "run.sh", b"echo hi\n");
+    let baseline = WorkspaceBaseline::take(ws.path(), None);
+    fs::set_permissions(ws.path().join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let m = baseline.measure();
+    assert_eq!(m.summary.files_changed, Some(1));
+    assert_eq!(m.files[0].change, WorkspaceChangeKind::Modified);
+}
+
+/// (#3236 review) A file over the hashing cap is compared by size and mtime:
+/// a same-size edit that moved its mtime is counted, one that kept both is
+/// not seen, and the record names that it compared such files that way.
+/// Lines of an added file over the cap are `null`, never read whole.
+#[test]
+fn a_file_over_the_hashing_cap_is_compared_by_size_and_mtime_and_named() {
+    let ws = TempDir::new().unwrap();
+    let big = ws.path().join("data.bin");
+    let size = snapshot::MAX_FILE_SIZE_BYTES + 1;
+    fs::File::create(&big).unwrap().set_len(size).unwrap();
+    let aged = std::time::SystemTime::now() - Duration::from_secs(120);
+    fs::File::options()
+        .write(true)
+        .open(&big)
+        .unwrap()
+        .set_modified(aged)
+        .unwrap();
+    let baseline = WorkspaceBaseline::take(ws.path(), None);
+    let edit = |keep_mtime: bool| {
+        use std::io::{Seek, Write};
+        let mut f = fs::File::options().write(true).open(&big).unwrap();
+        f.seek(std::io::SeekFrom::Start(10)).unwrap();
+        f.write_all(b"edited").unwrap();
+        if keep_mtime {
+            f.set_modified(aged).unwrap();
+        }
+    };
+    edit(true);
+    let kept = baseline.measure();
+    assert_eq!(kept.summary.files_changed, Some(0));
+    assert!(
+        kept.summary
+            .excluded
+            .contains(&WorkspaceChanges::LARGE_FILES.to_string()),
+        "{:?}",
+        kept.summary.excluded
+    );
+    edit(false);
+    let moved = baseline.measure();
+    assert_eq!(moved.summary.files_changed, Some(1), "a moved mtime counts");
+
+    let fresh = TempDir::new().unwrap();
+    let added = WorkspaceBaseline::take(fresh.path(), None);
+    {
+        use std::io::Write;
+        let mut f =
+            std::io::BufWriter::new(fs::File::create(fresh.path().join("big.txt")).unwrap());
+        let line = [b'a'; 1023]
+            .iter()
+            .copied()
+            .chain([b'\n'])
+            .collect::<Vec<u8>>();
+        for _ in 0..=(size / 1024) {
+            f.write_all(&line).unwrap();
+        }
+    }
+    let m = added.measure();
+    assert_eq!(
+        m.files[0].lines_added, None,
+        "a text file past the cap: its lines are not counted"
+    );
+}
+
+/// (#3236 review) A name that is not UTF-8 (possible on Linux, refused by
+/// APFS) is walked with its whole subtree, not skipped.
+#[cfg(unix)]
+#[test]
+fn a_name_that_is_not_utf8_is_counted() {
+    use std::os::unix::ffi::OsStrExt;
+    let ws = TempDir::new().unwrap();
+    let baseline = WorkspaceBaseline::take(ws.path(), None);
+    let odd = ws.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+    if fs::create_dir(&odd).is_err() {
+        return; // this filesystem refuses the name
+    }
+    fs::write(odd.join("inside.txt"), b"x\n").unwrap();
+    let m = baseline.measure();
+    assert_eq!(m.summary.files_changed, Some(1), "{:?}", m.files);
+}
+
+/// (#3236 review) A step's output forwarded to the next step's model keeps
+/// the workspace counts and loses the file list; anything else is unchanged.
+#[test]
+fn a_forwarded_envelope_keeps_the_counts_and_drops_the_file_list() {
+    let ws = TempDir::new().unwrap();
+    let baseline = WorkspaceBaseline::take(ws.path(), None);
+    write(ws.path(), "customer-acme.csv", b"x\n");
+    let envelope = serde_json::json!({"result": "stop", "final_assistant": "done", "workspace_changes": baseline.measure()}).to_string();
+    let forwarded = without_file_list(&envelope);
+    assert!(!forwarded.contains("customer-acme"), "{forwarded}");
+    let v: serde_json::Value = serde_json::from_str(&forwarded).unwrap();
+    assert_eq!(v["workspace_changes"]["files_changed"], 1);
+    assert!(
+        v["workspace_changes"].get("files").is_none()
+            && v["workspace_changes"].get("files_omitted").is_none()
+    );
+    assert_eq!(v["final_assistant"], "done");
+    for other in [
+        "plain text",
+        r#"{"result":"stop"}"#,
+        "[1,2]",
+        r#"{"workspace_changes": 3}"#,
+    ] {
+        assert_eq!(without_file_list(other), other, "returned byte for byte");
+    }
+}
+
 /// The cost of both walks on a generated 10,000-file tree (4 KiB each, in 100
-/// directories, aged so a seeded index matches), on the snapshot path and the
-/// git path (with and without the seeded index). A probe, not an assertion:
+/// directories), on the snapshot path and the git path. A probe, not an
+/// assertion:
 /// `cargo nextest run -p darkmux-crew --lib workspace_changes_cost_probe --run-ignored only --no-capture`.
 #[test]
 #[ignore = "cost probe: prints timings for a 10k-file workspace"]
 fn workspace_changes_cost_probe() {
     use std::time::Instant;
     let dir = TempDir::new().unwrap();
-    let aged = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
     let body = "x".repeat(4095) + "\n";
     for i in 0..10_000 {
-        let rel = format!("d{:02}/f{i:05}.txt", i % 100);
-        write(dir.path(), &rel, body.as_bytes());
-        fs::File::options()
-            .write(true)
-            .open(dir.path().join(rel))
-            .unwrap()
-            .set_modified(aged)
-            .unwrap();
+        write(
+            dir.path(),
+            &format!("d{:02}/f{i:05}.txt", i % 100),
+            body.as_bytes(),
+        );
     }
     let timed = |label: &str, git_dir: Option<&Path>| {
         let t = Instant::now();
@@ -509,20 +826,5 @@ fn workspace_changes_cost_probe() {
     git(dir.path(), &["init", "-q"]);
     git(dir.path(), &["add", "-A"]);
     git(dir.path(), &["commit", "-q", "-m", "base"]);
-    let git_dir = dir.path().join(".git");
-    timed("git, seeded index", Some(&git_dir));
-    let objects = TempDir::new().unwrap();
-    let run = git_runner(dir.path(), &git_dir, objects.path());
-    let t = Instant::now();
-    git_tree::snapshot_tree(dir.path(), &run, None).unwrap();
-    eprintln!(
-        "COST git, one tree with a fresh index (no seed): {:?}",
-        t.elapsed()
-    );
-    let t = Instant::now();
-    git_tree::snapshot_tree(dir.path(), &run, Some(&git_dir.join("index"))).unwrap();
-    eprintln!(
-        "COST git, one tree with the seeded index: {:?}",
-        t.elapsed()
-    );
+    timed("git", Some(&dir.path().join(".git")));
 }

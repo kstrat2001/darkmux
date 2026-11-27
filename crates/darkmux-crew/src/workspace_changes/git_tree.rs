@@ -7,11 +7,10 @@
 //! which repository git reads, or discovers one from a tree a run wrote.
 
 use std::path::Path;
-use std::process::Output;
 
 /// `git <args>` for one work tree, with `index` as its index when given;
-/// the output when git succeeded, else why it did not.
-pub type GitRun<'a> = &'a dyn Fn(Option<&Path>, &[&str]) -> Result<Output, String>;
+/// its stdout when git succeeded, else why it did not.
+pub type GitRun<'a> = &'a dyn Fn(Option<&Path>, &[&str]) -> Result<Vec<u8>, String>;
 
 /// A work tree as one tree, and the repositories inside it the tree leaves
 /// out.
@@ -24,21 +23,18 @@ pub struct TreeSnapshot {
 /// The whole work tree as a git tree id: tracked AND untracked files (not
 /// ignored ones), staged or not, written through a throwaway index so the
 /// work tree's own index, branch and files are never touched (only blob and
-/// tree objects are added to the object store `git` writes to). `seed_index`,
-/// when given and present, is copied in first with its mtime kept, so a file
-/// whose stat data still matches its entry is not hashed again (git's own
-/// racy-timestamp rule still re-reads one written in the index's second).
-pub fn snapshot_tree(
-    work_tree: &Path,
-    git: GitRun<'_>,
-    seed_index: Option<&Path>,
-) -> Result<TreeSnapshot, String> {
+/// tree objects are added to the object store `git` writes to).
+///
+/// The index is FRESH and EMPTY, never a copy of the checkout's own: an
+/// index entry for a populated submodule makes `git add` spawn git inside
+/// it, in a `.git` a run can have written, where its config's commands run
+/// (`darkmux_types::host_git`'s module doc: a caller "adds into a fresh,
+/// empty index, which holds no gitlink to check"). A copied index also
+/// carries `--assume-unchanged` and `--skip-worktree` bits that hide a
+/// file's change from the add. So every file is hashed, every time.
+pub fn snapshot_tree(work_tree: &Path, git: GitRun<'_>) -> Result<TreeSnapshot, String> {
     let scratch = tempfile::tempdir().map_err(|e| format!("a scratch index: {e}"))?;
     let index = scratch.path().join("index");
-    if let Some(seed) = seed_index.filter(|s| s.is_file()) {
-        copy_keeping_mtime(seed, &index)
-            .map_err(|e| format!("copying the index {}: {e}", seed.display()))?;
-    }
     let skipped = nested_repositories(work_tree, git)?;
     // A repository inside the work tree (an empty `git init sub` makes
     // `git add` fail outright; one with commits would be added as a link)
@@ -52,25 +48,27 @@ pub fn snapshot_tree(
     git(Some(&index), &add)?;
     let tree = git(Some(&index), &["write-tree"])?;
     Ok(TreeSnapshot {
-        tree: String::from_utf8_lossy(&tree.stdout).trim().to_string(),
+        tree: String::from_utf8_lossy(&tree).trim().to_string(),
         skipped,
     })
 }
 
-fn copy_keeping_mtime(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::copy(from, to)?;
-    let modified = std::fs::metadata(from)?.modified()?;
-    std::fs::File::options()
-        .write(true)
-        .open(to)?
-        .set_modified(modified)
+/// Whether `tree` holds a submodule (a gitlink, mode 160000) anywhere. A
+/// tree names a submodule by its commit only, so work inside one that is not
+/// committed there is not in the tree.
+pub fn has_gitlinks(git: GitRun<'_>, tree: &str) -> Result<bool, String> {
+    let out = git(
+        None,
+        &["ls-tree", "-r", "-z", "--format=%(objectmode)", tree],
+    )?;
+    Ok(out.split(|&b| b == 0).any(|mode| mode == b"160000"))
 }
 
 /// The untracked repositories inside the work tree: git lists each as one
 /// `path/` entry and does not descend into it.
 fn nested_repositories(work_tree: &Path, git: GitRun<'_>) -> Result<Vec<String>, String> {
     let out = git(None, &["ls-files", "-z", "--others", "--exclude-standard"])?;
-    Ok(String::from_utf8_lossy(&out.stdout)
+    Ok(String::from_utf8_lossy(&out)
         .split('\0')
         .filter_map(|e| e.strip_suffix('/'))
         .filter(|p| std::fs::symlink_metadata(work_tree.join(p).join(".git")).is_ok())
@@ -103,7 +101,7 @@ pub fn numstat(git: GitRun<'_>, before: &str, after: &str) -> Result<Vec<TreeFil
             after,
         ],
     )?;
-    Ok(String::from_utf8_lossy(&out.stdout)
+    Ok(String::from_utf8_lossy(&out)
         .split('\0')
         .filter(|l| !l.is_empty())
         .filter_map(|l| {
@@ -139,7 +137,7 @@ pub fn name_status(
             after,
         ],
     )?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = String::from_utf8_lossy(&out);
     let mut fields = text.split('\0').filter(|f| !f.is_empty());
     let mut entries = Vec::new();
     while let (Some(status), Some(path)) = (fields.next(), fields.next()) {

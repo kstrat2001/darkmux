@@ -732,8 +732,9 @@ impl Attribution for DispatchEndPayload {
 /// it could not be read, and `not_measured` says why. A line total is `null` unless every changed
 /// file's lines were measured (a binary file, or a modified file on the snapshot path, has none).
 /// `excluded` names what the measure did not look at: the directory names the snapshot skipped,
-/// or [`WorkspaceChanges::GIT_IGNORED`] (and [`WorkspaceChanges::NESTED_REPOSITORIES`]) for the
-/// git path, so "no changes" never overclaims.
+/// or a marker ([`WorkspaceChanges::GIT_IGNORED`], [`WorkspaceChanges::NESTED_REPOSITORIES`],
+/// [`WorkspaceChanges::SUBMODULES`], [`WorkspaceChanges::LARGE_FILES`]), so "no changes" never
+/// overclaims. `not_measured` is a fixed reason that names no path.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
@@ -757,6 +758,14 @@ impl WorkspaceChanges {
     /// inside the work tree (one the run made with `git init`). A marker, not
     /// the path: this record carries no path.
     pub const NESTED_REPOSITORIES: &'static str = "nested-repositories";
+    /// The `excluded` entry the git path writes when either tree holds a
+    /// submodule: a tree names one by its commit, so work inside it that is
+    /// not committed there is not counted.
+    pub const SUBMODULES: &'static str = "submodules";
+    /// The `excluded` entry the snapshot writes when it met a file over its
+    /// hashing cap (50 MB): such a file is compared by size and mtime only,
+    /// so an edit that keeps both is not counted.
+    pub const LARGE_FILES: &'static str = "files-over-50mb";
 }
 
 /// How a workspace's changes were measured.

@@ -147,6 +147,8 @@ fn outside(excluded: &[String]) -> String {
         .map(|e| match e.as_str() {
             darkmux_flow::payload::WorkspaceChanges::GIT_IGNORED => "git-ignored files".to_string(),
             darkmux_flow::payload::WorkspaceChanges::NESTED_REPOSITORIES => "nested repositories".to_string(),
+            darkmux_flow::payload::WorkspaceChanges::SUBMODULES => "submodules".to_string(),
+            darkmux_flow::payload::WorkspaceChanges::LARGE_FILES => "files over 50 MB (compared by size and time)".to_string(),
             dir => format!("{}/", sanitize_for_terminal(dir)),
         })
         .collect();

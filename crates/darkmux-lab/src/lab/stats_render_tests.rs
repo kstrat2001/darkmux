@@ -422,6 +422,13 @@ fn the_workspace_line_describes_each_state_and_what_it_left_out() {
         ..WorkspaceChanges::default()
     };
     assert_eq!(line(Some(git_clean)), "workspace    no changes outside git-ignored files");
+    let marked = WorkspaceChanges {
+        method: WorkspaceMethod::Git,
+        files_changed: Some(0),
+        excluded: vec![WorkspaceChanges::SUBMODULES.into(), WorkspaceChanges::LARGE_FILES.into()],
+        ..WorkspaceChanges::default()
+    };
+    assert_eq!(line(Some(marked)), "workspace    no changes outside submodules, files over 50 MB (compared by size and time)");
     let changed = WorkspaceChanges {
         method: WorkspaceMethod::Git,
         files_changed: Some(2),

@@ -35,11 +35,11 @@ use std::path::{Path, PathBuf};
 /// Hard cap on per-file size — files larger than this are skipped
 /// (their existence is still recorded but contents not hashed; the
 /// snapshot uses size-only equality for these). 50 MB.
-const MAX_FILE_SIZE_BYTES: u64 = 50 * 1024 * 1024;
+pub const MAX_FILE_SIZE_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Hard cap on file-count — beyond this, the snapshot bails with
 /// `WalkError::Overflow` to surface the misconfiguration.
-const MAX_FILE_COUNT: usize = 50_000;
+pub const MAX_FILE_COUNT: usize = 50_000;
 
 /// Directory names always skipped during the walk. Path-segment match
 /// (not glob; we don't want to lint each entry against globs for cost
@@ -78,10 +78,24 @@ static SKIPPED_DIR_NAMES: std::sync::LazyLock<Vec<&'static str>> = std::sync::La
 /// Per-file snapshot entry. `hash` is `None` when the file exceeded
 /// the per-file size cap (we still track its existence + size, but
 /// don't hash it for cost reasons).
+/// (#3236) A symlink is recorded by its target, never followed: its `size`
+/// and `hash` are the target's text. `mode` is the permission bits (0 where
+/// the platform has none), so a `chmod` is a change. A file over the size
+/// cap is compared by size and `mtime`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileSnapshot {
     pub size: u64,
     pub hash: Option<[u8; 32]>,
+    pub kind: EntryKind,
+    pub mode: u32,
+    pub mtime: Option<std::time::SystemTime>,
+}
+
+/// What a recorded entry is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Symlink,
 }
 
 /// Snapshot of a workspace at a moment in time. Keyed on relative
@@ -94,6 +108,9 @@ pub struct WorkspaceSnapshot {
     /// `SKIPPED_DIR_NAMES`), so a description of the delta can say what it
     /// did not look at.
     pub excluded: std::collections::BTreeSet<String>,
+    /// (#3236) The walk met a file over [`MAX_FILE_SIZE_BYTES`], compared
+    /// by size and mtime only.
+    pub unhashed: bool,
 }
 
 /// Differential between two snapshots taken at the same root.
@@ -163,48 +180,74 @@ fn walk_dir(
 }
 
 /// One directory entry: a directory is descended into (or, when its name
-/// is skipped, recorded as excluded), a regular file is recorded. Symlinks
-/// and other entries are silently skipped: they're not workspace content
-/// for delta-tracking purposes. (Edge case: a path that was a regular file
-/// in `before` and is a directory in `after` reads as `removed` in the
-/// delta, because the directory has no entry in `snapshot.files` — only
-/// `is_file()` paths are inserted. Same shape in reverse. The behavior is
+/// is skipped, recorded as excluded), a regular file or a symlink is
+/// recorded; anything else (a FIFO, a socket, a device) is not workspace
+/// content. (#3236) A name that is not UTF-8 is walked like any other: only
+/// the skip-list match needs its text. (Edge case: a path that was a
+/// regular file in `before` and is a directory in `after` reads as
+/// `removed` in the delta, because the directory has no entry in
+/// `snapshot.files`. Same shape in reverse. The behavior is
 /// invariant-bearing but easy to miss; named here so future readers don't
 /// re-derive it.)
 fn visit_entry(root: &Path, entry: &fs::DirEntry, snapshot: &mut WorkspaceSnapshot, count: &mut usize) -> Result<(), WalkError> {
     let path = entry.path();
-    let Some(name) = path.file_name().and_then(|s| s.to_str()) else { return Ok(()) };
     let file_type = entry.file_type()?;
     if file_type.is_dir() {
-        if SKIPPED_DIR_NAMES.contains(&name) {
-            snapshot.excluded.insert(name.to_string());
+        let name = entry.file_name();
+        if let Some(skipped) = name.to_str().filter(|n| SKIPPED_DIR_NAMES.contains(n)) {
+            snapshot.excluded.insert(skipped.to_string());
             return Ok(());
         }
         return walk_dir(root, &path, snapshot, count);
     }
-    if file_type.is_file() {
-        record_file(root, &path, entry, snapshot, count)?;
+    if file_type.is_file() || file_type.is_symlink() {
+        record_file(root, &path, snapshot, count)?;
     }
     Ok(())
 }
 
-/// A regular file's size and (under the size cap) content hash, keyed by its
-/// path under `root`; past [`MAX_FILE_COUNT`] files the walk bails.
-fn record_file(root: &Path, path: &Path, entry: &fs::DirEntry, snapshot: &mut WorkspaceSnapshot, count: &mut usize) -> Result<(), WalkError> {
+/// A regular file's size and (under the size cap) content hash, or a
+/// symlink's target, keyed by its path under `root`; past
+/// [`MAX_FILE_COUNT`] entries the walk bails.
+fn record_file(root: &Path, path: &Path, snapshot: &mut WorkspaceSnapshot, count: &mut usize) -> Result<(), WalkError> {
     *count += 1;
     if *count > MAX_FILE_COUNT {
         return Err(WalkError::Overflow { count_at_overflow: *count });
     }
-    let size = entry.metadata()?.len();
-    let hash = if size > MAX_FILE_SIZE_BYTES { None } else { Some(hash_file(path)?) };
+    let meta = fs::symlink_metadata(path)?;
     let rel = path.strip_prefix(root).expect("walk descended from root, so strip_prefix is total").to_path_buf();
-    snapshot.files.insert(rel, FileSnapshot { size, hash });
+    let (kind, size, hash) = if meta.file_type().is_symlink() {
+        let target = fs::read_link(path)?;
+        let text = target.as_os_str().as_encoded_bytes();
+        (EntryKind::Symlink, text.len() as u64, Some(*blake3::hash(text).as_bytes()))
+    } else if meta.len() > MAX_FILE_SIZE_BYTES {
+        snapshot.unhashed = true;
+        (EntryKind::File, meta.len(), None)
+    } else {
+        (EntryKind::File, meta.len(), Some(hash_file(root, &rel)?))
+    };
+    snapshot.files.insert(rel, FileSnapshot { size, hash, kind, mode: mode_of(&meta), mtime: meta.modified().ok() });
     Ok(())
 }
 
-fn hash_file(path: &Path) -> Result<[u8; 32], WalkError> {
+/// The permission bits; 0 where the platform has none to read.
+#[cfg(unix)]
+fn mode_of(meta: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn mode_of(meta: &fs::Metadata) -> u32 {
+    u32::from(meta.permissions().readonly())
+}
+
+/// A file's content hash, opened without following a link at any component
+/// and only as a regular file, so a FIFO swapped in never blocks the walk.
+fn hash_file(root: &Path, rel: &Path) -> Result<[u8; 32], WalkError> {
     let mut hasher = blake3::Hasher::new();
-    let mut file = fs::File::open(path)?;
+    let mut file = crate::contained_file::open_contained(root, rel)
+        .map_err(|e| WalkError::Io(std::io::Error::other(e.to_string())))?;
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = file.read(&mut buf)?;
@@ -251,15 +294,16 @@ pub fn diff_snapshots(before: &WorkspaceSnapshot, after: &WorkspaceSnapshot) -> 
 }
 
 fn file_changed(before: &FileSnapshot, after: &FileSnapshot) -> bool {
-    if before.size != after.size {
+    if before.size != after.size || before.kind != after.kind || before.mode != after.mode {
         return true;
     }
     // Same size — content may still differ. Compare hashes when both
-    // are present. When either is None (file too big to hash), size-
-    // equality is the best we can do; report as unchanged.
+    // are present. (#3236) When either is None (a file too big to hash),
+    // a moved mtime counts as a change; one that kept both size and mtime
+    // is not seen, which the measure names (`unhashed`).
     match (&before.hash, &after.hash) {
         (Some(b), Some(a)) => b != a,
-        _ => false,
+        _ => before.mtime != after.mtime,
     }
 }
 

@@ -20,6 +20,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const FLOW_SCHEMA_VERSION: &str = "2.10.0";
 // Version history:
+//   2.10.0 (#3236): `dispatch.complete` / `dispatch.error` gain
+//           `payload.workspace_changes` (`WorkspaceChanges`), what the
+//           execution's workspace changed: the measure's method, the changed
+//           file count, a fixed reason when it could not be read, the line
+//           totals and what it excluded. Counts only: no path rides it.
+//           ADDITIVE: absent on every record before 2.10.0, and on a terminal
+//           with no workspace read (a one-call dispatch, a step's bookend);
+//           absent never means "no changes". Read per field, leniently.
 //   2.9.0 (#3195): two step actions with no payload, `step.queue.wait` (an
 //           admitted step waits its turn: its endpoint's
 //           `limits.concurrent_calls`, the dispatch-free cap, or, for every

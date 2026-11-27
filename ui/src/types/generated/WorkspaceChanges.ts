@@ -11,7 +11,8 @@ import type { WorkspaceMethod } from "./WorkspaceMethod";
  * it could not be read, and `not_measured` says why. A line total is `null` unless every changed
  * file's lines were measured (a binary file, or a modified file on the snapshot path, has none).
  * `excluded` names what the measure did not look at: the directory names the snapshot skipped,
- * or [`WorkspaceChanges::GIT_IGNORED`] (and [`WorkspaceChanges::NESTED_REPOSITORIES`]) for the
- * git path, so "no changes" never overclaims.
+ * or a marker ([`WorkspaceChanges::GIT_IGNORED`], [`WorkspaceChanges::NESTED_REPOSITORIES`],
+ * [`WorkspaceChanges::SUBMODULES`], [`WorkspaceChanges::LARGE_FILES`]), so "no changes" never
+ * overclaims. `not_measured` is a fixed reason that names no path.
  */
 export type WorkspaceChanges = { method: WorkspaceMethod, files_changed: number | null, not_measured: string | null, lines_added: number | null, lines_removed: number | null, excluded: Array<string>, };

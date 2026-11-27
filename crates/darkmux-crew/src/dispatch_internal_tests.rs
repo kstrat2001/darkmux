@@ -25380,6 +25380,12 @@ mod workspace_changes_wiring {
         let wire = serde_json::to_value(&payload).unwrap();
         assert_eq!(wire["workspace_changes"]["files_changed"], 1, "{wire}");
         assert!(!wire.to_string().contains("calc.py"), "no path reaches the flow stream: {wire}");
+        // (#3236 review) Values, not only keys: nothing in the block names a
+        // path, the workspace's own included.
+        for value in wire["workspace_changes"].as_object().unwrap().values() {
+            let text = value.to_string();
+            assert!(!text.contains('/') && !text.contains(".py"), "a path-like value on the stream: {text}");
+        }
     }
 
     #[test]
@@ -25417,6 +25423,26 @@ mod workspace_changes_wiring {
         assert!(closure.contains("let workspace = run.workspace_baseline.as_ref().map(|b| b.measure().summary);"), "{closure}");
         assert!(closure.contains("                workspace,\n            );"), "the killed branch passes it: {closure}");
         assert!(src.contains("let workspace = run.workspace_baseline.as_ref().map(crate::workspace_changes::WorkspaceBaseline::measure);\n    close_container_run(opts, execution, run, bookend, outcome, workspace)"));
+        // (#3236 review) The exit between the launch and the watch closes
+        // with a block that says the workspace was not read, never none.
+        let unread = &src[src.find("let close_unread =").unwrap()..];
+        let unread = &unread[..unread.find("};").unwrap()];
+        assert!(unread.contains(".map(|b| b.not_read(\"the dispatch ended before its workspace was read\"))"), "{unread}");
+        let observers = &src[src.find("match spawn_observers(opts, execution, run, &launched, &local_stop) {").unwrap()..];
+        let observers = &observers[..observers.find("return Err(err);").unwrap()];
+        assert!(observers.contains("close_unread(bookend, &err);"), "{observers}");
+    }
+
+    /// (#3236 review) A dispatch that ended before its workspace was read
+    /// again says so: a fixed reason, the method it would have used, never
+    /// a count.
+    #[test]
+    fn a_dispatch_that_ended_before_the_read_records_it_as_not_measured() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let w = WorkspaceBaseline::take(ws.path(), None).not_read("the dispatch ended before its workspace was read");
+        assert_eq!(w.method, WorkspaceMethod::Snapshot);
+        assert_eq!(w.files_changed, None);
+        assert_eq!(w.not_measured.as_deref(), Some("the dispatch ended before its workspace was read"));
     }
 
     /// Which workspaces git may read: only a checkout's own `.git`

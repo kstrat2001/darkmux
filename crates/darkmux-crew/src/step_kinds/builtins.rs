@@ -72,9 +72,18 @@ pub(crate) fn expand_workspace_root(
 /// host artifact (a crawl's summary names the tree each finding was seen in
 /// and each unit's out-dir by host path, under the user's home) that the
 /// host reads and a model must never be sent.
+///
+/// (#3236) A dependency's dispatch envelope reaches the model without its
+/// workspace file list (`workspace_changes::without_file_list`): this message
+/// is recorded in the step's `dispatch.start` prompt, on the flow stream,
+/// which carries a workspace's counts and never its paths.
 fn model_inputs(step: &Step, input: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let source = step.config.get(crate::mission_config::grow::GROWN_FROM_KEY).and_then(|g| g.get("task")).and_then(|t| t.as_str());
-    input.iter().filter(|(dep, _)| Some(dep.as_str()) != source).map(|(k, v)| (k.clone(), v.clone())).collect()
+    input
+        .iter()
+        .filter(|(dep, _)| Some(dep.as_str()) != source)
+        .map(|(k, v)| (k.clone(), crate::workspace_changes::without_file_list(v).into_owned()))
+        .collect()
 }
 
 fn compose_message(base: &str, input: &BTreeMap<String, String>) -> String {
@@ -4711,6 +4720,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// (#3236 review) A dependency's dispatch envelope reaches the next
+    /// model, and so that step's `dispatch.start` prompt on the flow stream,
+    /// with its workspace counts and without its file list.
+    #[test]
+    fn a_dependency_envelope_reaches_the_model_without_its_file_list() {
+        let envelope = serde_json::json!({
+            "result": "stop",
+            "workspace_changes": {"method": "snapshot", "files_changed": 1, "not_measured": null, "lines_added": 1,
+                "lines_removed": 0, "excluded": [], "files": [{"path": "customer-acme.csv", "change": "added",
+                "lines_added": 1, "lines_removed": 0}], "files_omitted": 0}
+        })
+        .to_string();
+        let input: BTreeMap<String, String> =
+            [("code".to_string(), envelope), ("note".to_string(), "plain text".to_string())].into_iter().collect();
+        let composed = compose_message("base", &model_inputs(&step("s", "dispatch.internal", serde_json::json!({})), &input));
+        assert!(!composed.contains("customer-acme"), "{composed}");
+        assert!(composed.contains("\"files_changed\":1"), "the counts stay: {composed}");
+        assert!(composed.contains("plain text"));
     }
 
     #[test]

@@ -8631,9 +8631,44 @@ fn supervise_container(
             ));
         };
 
+    // (#3236) An exit before the sandbox's run is watched: the error that
+    // ended it, and a workspace block saying it was not read again.
+    let close_unread = |bookend: &mut DispatchBookendGuard<'_>, err: &anyhow::Error| {
+        let workspace = run
+            .workspace_baseline
+            .as_ref()
+            .map(|b| b.not_read("the dispatch ended before its workspace was read"));
+        let (mut payload, level) = ended_mid_run_terminal(
+            &format!("{err:#}"),
+            dispatch_start_instant.elapsed().as_millis() as u64,
+            &TrajectorySummary::default(),
+            run.unmanaged_endpoint_raw_label.as_deref(),
+            opts.resume_from.as_deref(),
+            workspace,
+        );
+        merge_record_context(&mut payload, &opts.record_context);
+        bookend.close(crate::dispatch::build_dispatch_record(
+            level,
+            &opts.role_id,
+            &opts.session,
+            execution,
+            Some(&run.model),
+            opts.phase_id.as_deref(),
+            payload,
+        ));
+    };
+
     // (#2925) This dispatch's own stop: see `DispatchStop`.
     let local_stop = DispatchStop::new(launched.sandbox.clone());
-    let (_observer_guards, threads) = spawn_observers(opts, execution, run, &launched, &local_stop)?;
+    let (_observer_guards, threads) = match spawn_observers(opts, execution, run, &launched, &local_stop) {
+        Ok(observers) => observers,
+        Err(err) => {
+            // (#3236) The sandbox is running and is stopped on the way out,
+            // so its workspace is not read now: the record says so.
+            close_unread(bookend, &err);
+            return Err(err);
+        }
+    };
     // (#3559) Watched while it runs, ended right after the wait.
     let listener_watch = watch_dispatch_listeners(&launched.sandbox, launched.child.id(), &local_stop, run.sandbox.way_back_to_docker());
     panic_after_guard_spawn_if_asked();

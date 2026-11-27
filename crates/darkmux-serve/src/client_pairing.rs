@@ -6851,8 +6851,8 @@ fn git(wd: &WorkCopy, index: Option<&Path>, args: &[&str]) -> Option<std::proces
 /// `darkmux_crew::workspace_changes::git_tree`, which a dispatch measures its
 /// workspace with too; this is the work copy's git commands handed to it.
 pub(crate) fn snapshot_tree(wd: &WorkCopy) -> Result<Snapshot, String> {
-    let git = |index: Option<&Path>, args: &[&str]| crate::client_git::run_or_why(wd, index, args);
-    darkmux_crew::workspace_changes::git_tree::snapshot_tree(&wd.work_tree, &git, None)
+    let git = |index: Option<&Path>, args: &[&str]| crate::client_git::run_or_why(wd, index, args).map(|o| o.stdout);
+    darkmux_crew::workspace_changes::git_tree::snapshot_tree(&wd.work_tree, &git)
 }
 
 /// A work copy as one tree, and the repositories inside it the tree leaves
@@ -6865,7 +6865,7 @@ pub(crate) use darkmux_crew::workspace_changes::git_tree::TreeSnapshot as Snapsh
 /// `Err` says why the work copy could not be read: never "no changes".
 pub(crate) fn changes_since(wd: &WorkCopy, before: &str) -> Result<RunChanges, String> {
     let after = snapshot_tree(wd)?;
-    let git = |index: Option<&Path>, args: &[&str]| crate::client_git::run_or_why(wd, index, args);
+    let git = |index: Option<&Path>, args: &[&str]| crate::client_git::run_or_why(wd, index, args).map(|o| o.stdout);
     let files: Vec<FileChange> = darkmux_crew::workspace_changes::git_tree::numstat(&git, before, &after.tree)?
         .into_iter()
         .map(|f| FileChange { path: f.path, added: f.added, removed: f.removed })

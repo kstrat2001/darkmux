@@ -2651,6 +2651,12 @@ describe("runRegions — the workspace changes row", () => {
       "no changes outside git-ignored files, nested repositories",
     );
     expect(rowOf(briefOf({ ...base, files_changed: 0 }))).toBe("no changes");
+    expect(rowOf(briefOf({ ...base, method: "git", files_changed: 0, excluded: ["git-ignored", "submodules"] }))).toBe(
+      "no changes outside git-ignored files, submodules",
+    );
+    expect(rowOf(briefOf({ ...base, files_changed: 0, excluded: ["files-over-50mb"] }))).toBe(
+      "no changes outside files over 50 MB (compared by size and time)",
+    );
   });
 
   it("counts the files and the lines, and says when lines were not measured", () => {
