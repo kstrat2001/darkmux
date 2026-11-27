@@ -998,6 +998,45 @@ fn measuring_never_runs_auto_maintenance_on_the_checkout() {
     assert_unchanged(&before, &git_dir_state(&git_dir));
 }
 
+/// (#3704 review 4) A checkout with a split index (`core.splitIndex`) keeps
+/// its shared index in `.git`. A scratch index written under that setting
+/// puts its own `sharedindex.*` there and expires old ones, which can delete
+/// the file the operator's index needs. Measuring adds, removes and
+/// rewrites nothing there, even with the shortest expiry, across two reads.
+/// The one exception is git's own: reading a split index freshens its
+/// shared index's mtime (so it never expires while in use), exactly as the
+/// operator's own `git status` does; its name, size and content stay.
+#[test]
+fn a_split_index_checkout_is_only_read() {
+    let dir = repo();
+    git(dir.path(), &["config", "core.splitIndex", "true"]);
+    git(dir.path(), &["config", "splitIndex.sharedIndexExpire", "now"]);
+    git(dir.path(), &["update-index", "--split-index"]);
+    let git_dir = dir.path().join(".git");
+    let state = |d: &Path| -> Vec<(PathBuf, Vec<u8>, Option<std::time::SystemTime>)> {
+        git_dir_state(d)
+            .into_iter()
+            .map(|(p, _, t)| {
+                let shared = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("sharedindex."));
+                let bytes = fs::read(&p).unwrap();
+                (p, bytes, (!shared).then_some(t))
+            })
+            .collect()
+    };
+    let before = state(&git_dir);
+    for round in 0..2 {
+        let baseline = WorkspaceBaseline::take(dir.path(), Some(&git_dir));
+        write(dir.path(), "calc.py", format!("x{round}\n").as_bytes());
+        let m = baseline.measure();
+        assert_eq!(m.summary.files_changed, Some(1));
+    }
+    let after = state(&git_dir);
+    let names = |s: &[(PathBuf, Vec<u8>, Option<std::time::SystemTime>)]| s.iter().map(|e| e.0.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&before), names(&after), "no file added to or removed from the operator's .git");
+    assert!(before == after, "every file's content (and, but for the shared index, its mtime) is unchanged");
+    git(dir.path(), &["status", "--porcelain"]);
+}
+
 /// Every measuring call carries the settings that turn auto maintenance
 /// and auto gc off, whatever the repository or the operator configured.
 #[test]

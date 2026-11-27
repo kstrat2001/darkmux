@@ -194,11 +194,15 @@ fn deadline_after(timeout: Duration) -> Option<Instant> {
 /// (#3236) Settings every measuring call adds: no auto gc and no auto
 /// maintenance, which would write the operator's repository (and can start
 /// a detached `git maintenance` child).
-pub(crate) const MEASURE_GIT_CONFIG: [&str; 4] = [
+pub(crate) const MEASURE_GIT_CONFIG: [&str; 5] = [
     "gc.auto=0",
     "maintenance.auto=false",
     "gc.autoDetach=false",
     "maintenance.autoDetach=false",
+    // (#3704 review 4) A scratch index written under the checkout's
+    // `core.splitIndex` keeps its shared index in `.git` and expires old
+    // ones there, which can delete the operator's own: keep it plain.
+    "core.splitIndex=false",
 ];
 
 /// The git calls of one read: `git` in `root` against the held `git_dir`,
