@@ -398,3 +398,58 @@ fn control_characters_in_a_baseline_comparisons_models_row_are_stripped() {
     assert!(!t.contains('\u{1b}'), "an ESC byte reached the comparison view:\n{t:?}");
     assert!(line_starting(&t, "models").contains("base[32m") && line_starting(&t, "models").contains("cand[31m"));
 }
+
+/// (#3236) The workspace line says what the measure saw, in each state, and
+/// never claims "no changes" for what it did not look at.
+#[test]
+fn the_workspace_line_describes_each_state_and_what_it_left_out() {
+    use darkmux_flow::payload::{WorkspaceChanges, WorkspaceMethod};
+    let line = |w: Option<WorkspaceChanges>| super::workspace_line(w.as_ref());
+    assert_eq!(line(None), "workspace    not recorded");
+    let none_changed = WorkspaceChanges {
+        method: WorkspaceMethod::Snapshot,
+        files_changed: Some(0),
+        lines_added: Some(0),
+        lines_removed: Some(0),
+        excluded: vec!["dist".into(), "target".into()],
+        ..WorkspaceChanges::default()
+    };
+    assert_eq!(line(Some(none_changed)), "workspace    no changes outside dist/, target/");
+    let git_clean = WorkspaceChanges {
+        method: WorkspaceMethod::Git,
+        files_changed: Some(0),
+        excluded: vec![WorkspaceChanges::GIT_IGNORED.into()],
+        ..WorkspaceChanges::default()
+    };
+    assert_eq!(line(Some(git_clean)), "workspace    no changes outside git-ignored files");
+    let marked = WorkspaceChanges {
+        method: WorkspaceMethod::Git,
+        files_changed: Some(0),
+        excluded: vec![WorkspaceChanges::SUBMODULES.into(), WorkspaceChanges::LARGE_FILES.into()],
+        ..WorkspaceChanges::default()
+    };
+    assert_eq!(line(Some(marked)), "workspace    no changes outside submodules, files over 50 MB (compared by size and time)");
+    let changed = WorkspaceChanges {
+        method: WorkspaceMethod::Git,
+        files_changed: Some(2),
+        lines_added: Some(12),
+        lines_removed: Some(3),
+        ..WorkspaceChanges::default()
+    };
+    assert_eq!(line(Some(changed)), "workspace    2 files changed   +12 -3");
+    let partial = WorkspaceChanges { method: WorkspaceMethod::Snapshot, files_changed: Some(1), ..WorkspaceChanges::default() };
+    assert_eq!(line(Some(partial)), "workspace    1 file changed   lines not measured");
+    let unread = WorkspaceChanges {
+        method: WorkspaceMethod::Snapshot,
+        not_measured: Some("walk \u{1b}[2Jfailed".into()),
+        ..WorkspaceChanges::default()
+    };
+    assert_eq!(line(Some(unread)), "workspace    not measured: walk [2Jfailed", "the reason is sanitized");
+}
+
+/// The line is printed, beside the work line.
+#[test]
+fn run_text_prints_the_workspace_line() {
+    let s = RunStats { checks: clean_checks(), ..RunStats::default() };
+    assert!(run_text(&s).contains("\nworkspace    not recorded\n"), "{}", run_text(&s));
+}

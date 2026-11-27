@@ -35,11 +35,11 @@ use std::path::{Path, PathBuf};
 /// Hard cap on per-file size — files larger than this are skipped
 /// (their existence is still recorded but contents not hashed; the
 /// snapshot uses size-only equality for these). 50 MB.
-const MAX_FILE_SIZE_BYTES: u64 = 50 * 1024 * 1024;
+pub const MAX_FILE_SIZE_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Hard cap on file-count — beyond this, the snapshot bails with
 /// `WalkError::Overflow` to surface the misconfiguration.
-const MAX_FILE_COUNT: usize = 50_000;
+pub const MAX_FILE_COUNT: usize = 50_000;
 
 /// Directory names always skipped during the walk. Path-segment match
 /// (not glob; we don't want to lint each entry against globs for cost
@@ -48,7 +48,7 @@ const MAX_FILE_COUNT: usize = 50_000;
 /// The run-artifact names (`.git`, `node_modules`, `target`,
 /// `__pycache__`, `coverage`, `.darkmux-runtime`, `.darkmux-agent`,
 /// `.coverage`) are drawn from the single canonical source in
-/// `crate::lab::artifact_dirs` so the workspace-delta view, the COW
+/// `super::artifact_dirs` so the workspace-delta view, the COW
 /// clone, and the content hash can never drift (the drift across the
 /// hand-rolled copies was the recurring root cause of lab-run
 /// contamination). On top of that canonical set, workspace_delta adds
@@ -61,7 +61,7 @@ const MAX_FILE_COUNT: usize = 50_000;
 /// Vitest/c8/nyc HTML output from the verify command); it now lives in
 /// the canonical `RUN_ARTIFACT_DIRS`.
 static SKIPPED_DIR_NAMES: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
-    use crate::lab::artifact_dirs::{HASH_ONLY_EXCLUDES, RUN_ARTIFACT_DIRS};
+    use super::artifact_dirs::{HASH_ONLY_EXCLUDES, RUN_ARTIFACT_DIRS};
     // Build-output dirs workspace_delta wants skipped that are NOT
     // run-artifacts (so they don't belong in the canonical clone/hash
     // slices).
@@ -78,23 +78,44 @@ static SKIPPED_DIR_NAMES: std::sync::LazyLock<Vec<&'static str>> = std::sync::La
 /// Per-file snapshot entry. `hash` is `None` when the file exceeded
 /// the per-file size cap (we still track its existence + size, but
 /// don't hash it for cost reasons).
+/// (#3236) A symlink is recorded by its target, never followed: its `size`
+/// and `hash` are the target's text. `mode` is the permission bits (0 where
+/// the platform has none), so a `chmod` is a change. A file over the size
+/// cap is compared by size and `mtime`.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct FileSnapshot {
+pub struct FileSnapshot {
     pub size: u64,
     pub hash: Option<[u8; 32]>,
+    pub kind: EntryKind,
+    pub mode: u32,
+    pub mtime: Option<std::time::SystemTime>,
+}
+
+/// What a recorded entry is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Symlink,
 }
 
 /// Snapshot of a workspace at a moment in time. Keyed on relative
 /// path (relative to the snapshot root) so two snapshots taken with
 /// the same root produce comparable keys.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct WorkspaceSnapshot {
+pub struct WorkspaceSnapshot {
     pub files: BTreeMap<PathBuf, FileSnapshot>,
+    /// (#3236) The skipped directory names this walk met (each in
+    /// `SKIPPED_DIR_NAMES`), so a description of the delta can say what it
+    /// did not look at.
+    pub excluded: std::collections::BTreeSet<String>,
+    /// (#3236) The walk met a file over [`MAX_FILE_SIZE_BYTES`], compared
+    /// by size and mtime only.
+    pub unhashed: bool,
 }
 
 /// Differential between two snapshots taken at the same root.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct WorkspaceDelta {
+pub struct WorkspaceDelta {
     pub added: Vec<PathBuf>,
     pub modified: Vec<PathBuf>,
     pub removed: Vec<PathBuf>,
@@ -105,7 +126,7 @@ pub(crate) struct WorkspaceDelta {
 }
 
 #[derive(Debug)]
-pub(crate) enum WalkError {
+pub enum WalkError {
     Overflow { count_at_overflow: usize },
     Io(std::io::Error),
 }
@@ -134,7 +155,7 @@ impl From<std::io::Error> for WalkError {
 /// Walk the workspace and produce a snapshot. Skipped dirs are not
 /// descended into. Files over the size cap have their size recorded
 /// but `hash` set to `None`.
-pub(crate) fn compute_snapshot(root: &Path) -> Result<WorkspaceSnapshot, WalkError> {
+pub fn compute_snapshot(root: &Path) -> Result<WorkspaceSnapshot, WalkError> {
     let mut snapshot = WorkspaceSnapshot::default();
     let mut count = 0usize;
     walk_dir(root, root, &mut snapshot, &mut count)?;
@@ -153,55 +174,80 @@ fn walk_dir(
         Err(e) => return Err(WalkError::Io(e)),
     };
     for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let name = match path.file_name().and_then(|s| s.to_str()) {
-            Some(n) => n,
-            None => continue,
-        };
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            if SKIPPED_DIR_NAMES.contains(&name) {
-                continue;
-            }
-            walk_dir(root, &path, snapshot, count)?;
-        } else if file_type.is_file() {
-            *count += 1;
-            if *count > MAX_FILE_COUNT {
-                return Err(WalkError::Overflow {
-                    count_at_overflow: *count,
-                });
-            }
-            let metadata = entry.metadata()?;
-            let size = metadata.len();
-            let hash = if size > MAX_FILE_SIZE_BYTES {
-                None
-            } else {
-                Some(hash_file(&path)?)
-            };
-            let rel = path
-                .strip_prefix(root)
-                .expect("walk descended from root, so strip_prefix is total")
-                .to_path_buf();
-            snapshot
-                .files
-                .insert(rel, FileSnapshot { size, hash });
-        }
-        // Symlinks and other entries silently skipped — they're not
-        // workspace content for delta-tracking purposes.
-        // (Edge case: a path that was a regular file in `before` and
-        // is a directory in `after` reads as `removed` in the delta,
-        // because the directory has no entry in `snapshot.files` —
-        // only `is_file()` paths are inserted. Same shape in reverse.
-        // The behavior is invariant-bearing but easy to miss; named
-        // here so future readers don't re-derive it.)
+        visit_entry(root, &entry?, snapshot, count)?;
     }
     Ok(())
 }
 
-fn hash_file(path: &Path) -> Result<[u8; 32], WalkError> {
+/// One directory entry: a directory is descended into (or, when its name
+/// is skipped, recorded as excluded), a regular file or a symlink is
+/// recorded; anything else (a FIFO, a socket, a device) is not workspace
+/// content. (#3236) A name that is not UTF-8 is walked like any other: only
+/// the skip-list match needs its text. (Edge case: a path that was a
+/// regular file in `before` and is a directory in `after` reads as
+/// `removed` in the delta, because the directory has no entry in
+/// `snapshot.files`. Same shape in reverse. The behavior is
+/// invariant-bearing but easy to miss; named here so future readers don't
+/// re-derive it.)
+fn visit_entry(root: &Path, entry: &fs::DirEntry, snapshot: &mut WorkspaceSnapshot, count: &mut usize) -> Result<(), WalkError> {
+    let path = entry.path();
+    let file_type = entry.file_type()?;
+    if file_type.is_dir() {
+        let name = entry.file_name();
+        if let Some(skipped) = name.to_str().filter(|n| SKIPPED_DIR_NAMES.contains(n)) {
+            snapshot.excluded.insert(skipped.to_string());
+            return Ok(());
+        }
+        return walk_dir(root, &path, snapshot, count);
+    }
+    if file_type.is_file() || file_type.is_symlink() {
+        record_file(root, &path, snapshot, count)?;
+    }
+    Ok(())
+}
+
+/// A regular file's size and (under the size cap) content hash, or a
+/// symlink's target, keyed by its path under `root`; past
+/// [`MAX_FILE_COUNT`] entries the walk bails.
+fn record_file(root: &Path, path: &Path, snapshot: &mut WorkspaceSnapshot, count: &mut usize) -> Result<(), WalkError> {
+    *count += 1;
+    if *count > MAX_FILE_COUNT {
+        return Err(WalkError::Overflow { count_at_overflow: *count });
+    }
+    let meta = fs::symlink_metadata(path)?;
+    let rel = path.strip_prefix(root).expect("walk descended from root, so strip_prefix is total").to_path_buf();
+    let (kind, size, hash) = if meta.file_type().is_symlink() {
+        let target = fs::read_link(path)?;
+        let text = target.as_os_str().as_encoded_bytes();
+        (EntryKind::Symlink, text.len() as u64, Some(*blake3::hash(text).as_bytes()))
+    } else if meta.len() > MAX_FILE_SIZE_BYTES {
+        snapshot.unhashed = true;
+        (EntryKind::File, meta.len(), None)
+    } else {
+        (EntryKind::File, meta.len(), Some(hash_file(root, &rel)?))
+    };
+    snapshot.files.insert(rel, FileSnapshot { size, hash, kind, mode: mode_of(&meta), mtime: meta.modified().ok() });
+    Ok(())
+}
+
+/// The permission bits; 0 where the platform has none to read.
+#[cfg(unix)]
+fn mode_of(meta: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn mode_of(meta: &fs::Metadata) -> u32 {
+    u32::from(meta.permissions().readonly())
+}
+
+/// A file's content hash, opened without following a link at any component
+/// and only as a regular file, so a FIFO swapped in never blocks the walk.
+fn hash_file(root: &Path, rel: &Path) -> Result<[u8; 32], WalkError> {
     let mut hasher = blake3::Hasher::new();
-    let mut file = fs::File::open(path)?;
+    let mut file = crate::contained_file::open_contained(root, rel)
+        .map_err(|e| WalkError::Io(std::io::Error::other(e.to_string())))?;
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = file.read(&mut buf)?;
@@ -216,7 +262,7 @@ fn hash_file(path: &Path) -> Result<[u8; 32], WalkError> {
 /// Diff two snapshots taken at the same root. Order-stable (sorted
 /// via the underlying BTreeMap) so two runs on the same inputs
 /// produce byte-identical output.
-pub(crate) fn diff_snapshots(before: &WorkspaceSnapshot, after: &WorkspaceSnapshot) -> WorkspaceDelta {
+pub fn diff_snapshots(before: &WorkspaceSnapshot, after: &WorkspaceSnapshot) -> WorkspaceDelta {
     let mut delta = WorkspaceDelta::default();
     // Iterate the union of paths.
     for (path, after_entry) in &after.files {
@@ -248,15 +294,16 @@ pub(crate) fn diff_snapshots(before: &WorkspaceSnapshot, after: &WorkspaceSnapsh
 }
 
 fn file_changed(before: &FileSnapshot, after: &FileSnapshot) -> bool {
-    if before.size != after.size {
+    if before.size != after.size || before.kind != after.kind || before.mode != after.mode {
         return true;
     }
     // Same size — content may still differ. Compare hashes when both
-    // are present. When either is None (file too big to hash), size-
-    // equality is the best we can do; report as unchanged.
+    // are present. (#3236) When either is None (a file too big to hash),
+    // a moved mtime counts as a change; one that kept both size and mtime
+    // is not seen, which the measure names (`unhashed`).
     match (&before.hash, &after.hash) {
         (Some(b), Some(a)) => b != a,
-        _ => false,
+        _ => before.mtime != after.mtime,
     }
 }
 
@@ -264,6 +311,14 @@ fn file_changed(before: &FileSnapshot, after: &FileSnapshot) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_walk_error_says_which_limit_or_io_failure_it_was() {
+        let overflow = WalkError::Overflow { count_at_overflow: 50_001 }.to_string();
+        assert!(overflow.contains(&MAX_FILE_COUNT.to_string()) && overflow.contains("saw 50001"), "{overflow}");
+        let io = WalkError::from(std::io::Error::other("disk gone")).to_string();
+        assert_eq!(io, "io error walking workspace: disk gone");
+    }
 
     fn write(root: &Path, rel: &str, content: &[u8]) {
         let p = root.join(rel);

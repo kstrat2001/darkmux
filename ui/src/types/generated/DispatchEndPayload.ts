@@ -3,6 +3,7 @@ import type { HostWindow } from "./HostWindow";
 import type { LiveSummary } from "./LiveSummary";
 import type { RecordContext } from "./RecordContext";
 import type { ResultClass } from "./ResultClass";
+import type { WorkspaceChanges } from "./WorkspaceChanges";
 
 /**
  * A role execution ended: the payload of `dispatch.complete` and `dispatch.error`. One type for
@@ -115,6 +116,12 @@ endpoint?: string,
  * The host-pressure summary over the execution.
  */
 host_window?: HostWindow, 
+/**
+ * (#3236, flow 2.10.0) What the execution's workspace changed, as counts. Absent where no
+ * workspace was read (a one-call dispatch, a step's per-call bookend, a terminal written
+ * before the sandbox started, a record from before 2.10.0): absent never means "no changes".
+ */
+workspace_changes?: WorkspaceChanges, 
 /**
  * The prior dispatch's output directory this one resumed.
  */

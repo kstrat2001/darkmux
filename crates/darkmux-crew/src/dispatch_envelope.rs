@@ -60,6 +60,15 @@ pub struct DispatchEnvelope {
     /// The reasoning checkpoints, reduced; absent when none ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoints: Option<CheckpointSummary>,
+    /// (#3236) What the execution's workspace changed, as the host read it
+    /// right before the sandbox started and again when the dispatch ended
+    /// (the tree as it was then; a process that outlives the dispatch can
+    /// still write afterward): the `dispatch.complete` record's counts plus
+    /// the files by name. `files_changed` is `0` only when it was read and
+    /// nothing changed, and `null` when it could not be (`not_measured` says
+    /// why). darkmux never compares it with what the model said it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_changes: Option<crate::workspace_changes::EnvelopeWorkspaceChanges>,
 }
 
 /// One container execution's counts, under the names `--json` callers, the lab

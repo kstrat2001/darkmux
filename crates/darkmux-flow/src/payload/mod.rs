@@ -50,7 +50,8 @@ pub use dispatch::{
     DispatchReasoningPayload, DispatchRestPayload, DispatchRoleInputs, DispatchRoutePayload, DispatchStartPayload,
     DispatchToolPayload, PromptAdditions, RoleInputSource,
     DispatchModelPayload, DispatchTurnPayload, DispatchWorkdirGitUnavailablePayload, GitCheckout, GitdirKind, WorkdirGitMount, HostWindow, Knob, KnobSource, KnobValue,
-    LiveSummary, ResultClass, RouteDecision, RuntimeBounds, StreamPhase, ToolOutcome, TurnUsage,
+    LiveSummary, ResultClass, RouteDecision, RuntimeBounds, StreamPhase, ToolOutcome, TurnUsage, WorkspaceChanges,
+    WorkspaceMethod,
 };
 pub use lifecycle::{
     BreachLevel, BudgetMetric, BudgetPayload, BudgetPolicyKind, BudgetScope, GhVerbExecutedPayload, GrowReason,

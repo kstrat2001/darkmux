@@ -712,6 +712,61 @@ fn a_knob_this_build_does_not_declare_survives_into_the_stats() {
     assert_eq!(s.gates.checkpoint.policy.as_deref(), Some("enforce"), "the policy still reads through the typed knob");
 }
 
+/// (#3236, run stats 2.6.0) What the run's dispatch changed in its workspace
+/// is read from its own terminal record: counts only, as the flow carries
+/// them. A run whose record predates flow 2.10.0 has none, which is not "no
+/// changes".
+#[test]
+fn the_runs_workspace_changes_come_from_its_terminal_record() {
+    let stats_of = |terminal: serde_json::Value| {
+        let run = tempfile::TempDir::new().unwrap();
+        let flows = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            run.path().join("trajectory.jsonl"),
+            format!(
+                "{}{}",
+                line(serde_json::json!({"type": "dispatch.start", "ts": 1_000, "model": "m"})),
+                line(serde_json::json!({"type": "dispatch.complete", "ts": 11_000, "result": "stop", "wall_ms": 10_000})),
+            ),
+        )
+        .unwrap();
+        std::fs::write(run.path().join("lifecycle.json"), serde_json::json!({"session_id": "sid-1"}).to_string()).unwrap();
+        std::fs::write(run.path().join("manifest.json"), serde_json::json!({"ok": true, "session_id": "sid-1"}).to_string()).unwrap();
+        std::fs::write(flows.path().join("2026-09-21.jsonl"), line(terminal)).unwrap();
+        compute_from_dir(run.path(), flows.path()).unwrap()
+    };
+    let s = stats_of(serde_json::json!({
+        "action": "dispatch.complete", "session_id": "sid-1",
+        "payload": {"total_turns": 2, "workspace_changes": {
+            "method": "snapshot", "files_changed": 0, "not_measured": null,
+            "lines_added": 0, "lines_removed": 0, "excluded": ["node_modules"]
+        }}
+    }));
+    let w = s.workspace_changes.expect("read from dispatch.complete");
+    assert_eq!(w.files_changed, Some(0), "measured, and nothing changed");
+    assert_eq!(w.excluded, vec!["node_modules".to_string()]);
+
+    let killed = stats_of(serde_json::json!({
+        "action": "dispatch.error", "session_id": "sid-1",
+        "payload": {"total_turns": 1, "workspace_changes": {"method": "git", "files_changed": 3, "lines_added": null}}
+    }));
+    assert_eq!(killed.workspace_changes.and_then(|w| w.files_changed), Some(3), "a stopped run's record counts too");
+
+    let older = stats_of(serde_json::json!({"action": "dispatch.complete", "session_id": "sid-1", "payload": {"total_turns": 2}}));
+    assert_eq!(older.workspace_changes, None);
+    let other = stats_of(serde_json::json!({
+        "action": "dispatch.complete", "session_id": "someone-else",
+        "payload": {"total_turns": 2, "workspace_changes": {"method": "git", "files_changed": 9}}
+    }));
+    assert_eq!(other.workspace_changes, None, "another session's record is not this run's");
+    let start = stats_of(serde_json::json!({
+        "action": "dispatch.start", "session_id": "sid-1",
+        "payload": {"workspace_changes": {"method": "git", "files_changed": 9}}
+    }));
+    assert_eq!(start.workspace_changes, None, "only a terminal record describes the run's changes");
+    assert_eq!(super::RUN_STATS_SCHEMA_VERSION, "2.6.0");
+}
+
 // ---------------------------------------------------------------------------
 // A run directory with no trajectory
 // ---------------------------------------------------------------------------

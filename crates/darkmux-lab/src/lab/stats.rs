@@ -62,7 +62,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Data-shape semver for [`RunStats`], per the repo's additive-minor rule.
-pub const RUN_STATS_SCHEMA_VERSION: &str = "2.5.0";
+pub const RUN_STATS_SCHEMA_VERSION: &str = "2.6.0";
 
 use darkmux_trajectory::DEGENERATE_TAIL_RATIO;
 
@@ -336,6 +336,12 @@ pub struct RunStats {
     /// `dispatch start.bounds` — the resolved caps with their provenance, so
     /// an arm's settings are read from the run rather than assumed.
     pub bounds: BTreeMap<String, darkmux_flow::payload::Knob>,
+    /// (2.6.0, #3236) What the run's dispatch changed in its workspace, from
+    /// its own `dispatch.complete` / `dispatch.error` record: counts and
+    /// totals, `null` counts where not measured. The files by name are in
+    /// the dispatch's envelope (the run's `qa-reply.json`). `None` for a run
+    /// recorded before flow 2.10.0, which is not "no changes".
+    pub workspace_changes: Option<darkmux_flow::payload::WorkspaceChanges>,
 
     // --- host -------------------------------------------------------------
     pub gpu_w_busy: Option<f64>,
@@ -735,6 +741,7 @@ pub(crate) struct FlowFacts {
     samples: Vec<Sample>,
     records_for_session: usize,
     bounds: BTreeMap<String, darkmux_flow::payload::Knob>,
+    workspace_changes: Option<darkmux_flow::payload::WorkspaceChanges>,
     scan: FlowScan,
 }
 
@@ -796,9 +803,7 @@ pub(crate) fn scan_flow_lines(
         if let Some(sid) = session_id {
             if r.get("session_id").and_then(|v| v.as_str()) == Some(sid) {
                 facts.records_for_session += 1;
-                if action == Some(darkmux_flow::FlowAction::DispatchStart) {
-                    merge_bounds(&mut facts.bounds, &r);
-                }
+                note_session_record(facts, action.as_ref(), &r);
             }
         }
 
@@ -817,6 +822,30 @@ fn payload_this_read_wants(action: Option<&darkmux_flow::FlowAction>, r: &serde_
         Some(darkmux_flow::FlowAction::MachineTelemetry) => darkmux_flow::reader::payload_of(r),
         _ => None,
     }
+}
+
+/// What one of the run's own session records adds: a `dispatch.start`'s
+/// bounds, a terminal's workspace changes.
+fn note_session_record(facts: &mut FlowFacts, action: Option<&darkmux_flow::FlowAction>, r: &serde_json::Value) {
+    if action == Some(&darkmux_flow::FlowAction::DispatchStart) {
+        merge_bounds(&mut facts.bounds, r);
+    }
+    if let Some(w) = terminal_workspace_changes(action, r) {
+        facts.workspace_changes = Some(w);
+    }
+}
+
+/// (#3236) The workspace block of a session's terminal record, read leniently:
+/// a block this build cannot read is skipped, never the run.
+fn terminal_workspace_changes(
+    action: Option<&darkmux_flow::FlowAction>,
+    record: &serde_json::Value,
+) -> Option<darkmux_flow::payload::WorkspaceChanges> {
+    use darkmux_flow::FlowAction::{DispatchComplete, DispatchError};
+    if !matches!(action, Some(DispatchComplete | DispatchError)) {
+        return None;
+    }
+    serde_json::from_value(record.pointer("/payload/workspace_changes")?.clone()).ok()
 }
 
 /// The first value each knob resolved to, across a session's `dispatch.start`
@@ -1175,6 +1204,7 @@ pub(crate) fn derive_stats(
             checkpoint,
         },
         bounds: flows.bounds.clone(),
+        workspace_changes: flows.workspace_changes.clone(),
         gpu_w_busy: host.gpu_w_busy,
         gpu_w_max: host.gpu_w_max,
         cpu_w_busy: host.cpu_w_busy,

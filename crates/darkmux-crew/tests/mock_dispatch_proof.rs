@@ -352,6 +352,12 @@ fn real_container_dispatch_round_trips_through_a_standalone_mock_model_process()
         "final_assistant must be the mock server's scripted content, not a fallback \
          string, got: {final_assistant:?}"
     );
+    // (#3236) The mock answers with no tool call, so its fresh workspace is
+    // untouched whatever the answer says: the envelope describes that as a
+    // measured zero, never a missing or null count.
+    let changes = envelope.get("workspace_changes").expect("a container dispatch describes its workspace");
+    assert_eq!(changes.get("files_changed").and_then(Value::as_u64), Some(0), "envelope: {envelope}");
+    assert_eq!(changes.get("method").and_then(Value::as_str), Some("snapshot"), "a fresh tempdir is not a repository");
 
     // Real flow records: dispatch.start + a terminal dispatch.complete for
     // THIS session_id, on disk under the isolated flows dir (contract #2,

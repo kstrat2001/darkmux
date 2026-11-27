@@ -5877,6 +5877,7 @@ fn ended_mid_run_terminal(
     summary: &TrajectorySummary,
     endpoint: Option<&str>,
     resume_from: Option<&std::path::Path>,
+    workspace_changes: Option<darkmux_flow::payload::WorkspaceChanges>,
 ) -> (darkmux_flow::Payload, darkmux_flow::Level) {
     let payload = DispatchEndPayload {
         error: Some(error.to_string()),
@@ -5898,6 +5899,7 @@ fn ended_mid_run_terminal(
             &HostExtras::default(),
             resume_from,
             None,
+            workspace_changes,
         )
     };
     (darkmux_flow::Payload::DispatchError(payload), darkmux_flow::Level::Error)
@@ -6998,7 +7000,7 @@ fn refusal_terminal(
     endpoint: Option<&str>,
     resume_from: Option<&std::path::Path>,
 ) -> darkmux_flow::Payload {
-    let (mut payload, _) = ended_mid_run_terminal(refusal.message(), wall_ms, &TrajectorySummary::default(), endpoint, resume_from);
+    let (mut payload, _) = ended_mid_run_terminal(refusal.message(), wall_ms, &TrajectorySummary::default(), endpoint, resume_from, None);
     if let darkmux_flow::Payload::DispatchError(p) = &mut payload {
         p.code = refusal.code().map(str::to_string);
     }
@@ -7011,7 +7013,7 @@ fn refusal_terminal(
 /// guard closes.
 fn refused_launch_terminal(err: &anyhow::Error, wall_ms: u64, endpoint: Option<&str>, resume_from: Option<&std::path::Path>) -> Option<darkmux_flow::Payload> {
     let code = crate::engine_dispatch::refusal_code(err)?;
-    let (mut payload, _) = ended_mid_run_terminal(&format!("{err:#}"), wall_ms, &TrajectorySummary::default(), endpoint, resume_from);
+    let (mut payload, _) = ended_mid_run_terminal(&format!("{err:#}"), wall_ms, &TrajectorySummary::default(), endpoint, resume_from, None);
     if let darkmux_flow::Payload::DispatchError(p) = &mut payload {
         p.code = Some(code.to_string());
     }
@@ -7286,6 +7288,10 @@ struct ContainerRun {
     /// The dispatch's one read of `runtime.sandbox` ([`dispatch_sandbox`]),
     /// for every message after the launch (the listener watch's way back).
     sandbox: darkmux_sandbox::Selection,
+    /// (#3236) The workspace as it was right before the sandbox started,
+    /// read in `run_container`; what the terminal record and the envelope
+    /// describe its changes against.
+    workspace_baseline: Option<crate::workspace_changes::WorkspaceBaseline>,
 }
 
 /// The one read of `runtime.sandbox` for a container dispatch: the read
@@ -7381,6 +7387,7 @@ fn prepare_container_run(
         leased_job,
         toolchain: Default::default(),
         sandbox,
+        workspace_baseline: None,
     })
 }
 
@@ -8482,6 +8489,7 @@ fn container_toolchain(
         &TrajectorySummary::default(),
         ask.endpoint,
         opts.resume_from.as_deref(),
+        None,
     );
     merge_record_context(&mut payload, &opts.record_context);
     bookend.close(crate::dispatch::build_dispatch_record(level, &opts.role_id, &opts.session, execution, Some(ask.model), opts.phase_id.as_deref(), payload));
@@ -8564,6 +8572,13 @@ fn run_container(opts: &DispatchOpts, execution: &ExecutionId, mut run: Containe
     )?;
 
     let remote_auth = run.remote_auth.take();
+    // (#3236) Read the workspace as close to the launch as possible: after
+    // the model load (an operator's edits during it are not the run's), and
+    // before anything in the sandbox can write.
+    run.workspace_baseline = Some(crate::workspace_changes::WorkspaceBaseline::take(
+        &run.workspace,
+        git_dir_to_measure(opts, &run.workspace).as_deref(),
+    ));
     let launched = launch_container(opts, execution, &run, remote_auth).inspect_err(|e| {
         let wall_ms = dispatch_start_instant.elapsed().as_millis() as u64;
         let refused = refused_launch_terminal(e, wall_ms, run.unmanaged_endpoint_raw_label.as_deref(), opts.resume_from.as_deref());
@@ -8594,12 +8609,15 @@ fn supervise_container(
     // and the turns it finished, never the guard's "early return or panic".
     let close_ended_mid_run =
         |bookend: &mut DispatchBookendGuard<'_>, err: &anyhow::Error, summary: &TrajectorySummary| {
+            // (#3236) A run stopped mid-way can still have written: describe it.
+            let workspace = run.workspace_baseline.as_ref().map(|b| b.measure().summary);
             let (mut payload, level) = ended_mid_run_terminal(
                 &format!("{err:#}"),
                 dispatch_start_instant.elapsed().as_millis() as u64,
                 summary,
                 run.unmanaged_endpoint_raw_label.as_deref(),
                 opts.resume_from.as_deref(),
+                workspace,
             );
             merge_record_context(&mut payload, &opts.record_context);
             bookend.close(crate::dispatch::build_dispatch_record(
@@ -8613,9 +8631,44 @@ fn supervise_container(
             ));
         };
 
+    // (#3236) An exit before the sandbox's run is watched: the error that
+    // ended it, and a workspace block saying it was not read again.
+    let close_unread = |bookend: &mut DispatchBookendGuard<'_>, err: &anyhow::Error| {
+        let workspace = run
+            .workspace_baseline
+            .as_ref()
+            .map(|b| b.not_read("the dispatch ended before its workspace was read"));
+        let (mut payload, level) = ended_mid_run_terminal(
+            &format!("{err:#}"),
+            dispatch_start_instant.elapsed().as_millis() as u64,
+            &TrajectorySummary::default(),
+            run.unmanaged_endpoint_raw_label.as_deref(),
+            opts.resume_from.as_deref(),
+            workspace,
+        );
+        merge_record_context(&mut payload, &opts.record_context);
+        bookend.close(crate::dispatch::build_dispatch_record(
+            level,
+            &opts.role_id,
+            &opts.session,
+            execution,
+            Some(&run.model),
+            opts.phase_id.as_deref(),
+            payload,
+        ));
+    };
+
     // (#2925) This dispatch's own stop: see `DispatchStop`.
     let local_stop = DispatchStop::new(launched.sandbox.clone());
-    let (_observer_guards, threads) = spawn_observers(opts, execution, run, &launched, &local_stop)?;
+    let (_observer_guards, threads) = match spawn_observers(opts, execution, run, &launched, &local_stop) {
+        Ok(observers) => observers,
+        Err(err) => {
+            // (#3236) The sandbox is running and is stopped on the way out,
+            // so its workspace is not read now: the record says so.
+            close_unread(bookend, &err);
+            return Err(err);
+        }
+    };
     // (#3559) Watched while it runs, ended right after the wait.
     let listener_watch = watch_dispatch_listeners(&launched.sandbox, launched.child.id(), &local_stop, run.sandbox.way_back_to_docker());
     panic_after_guard_spawn_if_asked();
@@ -8757,7 +8810,27 @@ fn supervise_container(
         &launched.sandbox,
         (launched.inactivity_timeout_seconds, launched.inactivity_timeout_seconds_source),
     );
-    close_container_run(opts, execution, run, bookend, outcome)
+    let workspace = run.workspace_baseline.as_ref().map(crate::workspace_changes::WorkspaceBaseline::measure);
+    close_container_run(opts, execution, run, bookend, outcome, workspace)
+}
+
+/// (#3236) The workspace's own git directory, when its changes may be read
+/// with git: a checkout whose `.git` is a real directory the run
+/// could not write (mounted read-only, the default since #3461, or inside a
+/// read-only workspace). A writable `.git`, a symlink, or a pointer file (a
+/// linked worktree, a submodule: its git dir is whatever the run left in the
+/// tree) is measured by snapshot instead, as is a workspace with no `.git`.
+pub(crate) fn git_dir_to_measure(opts: &DispatchOpts, workspace: &Path) -> Option<PathBuf> {
+    held_git_dir(workspace, opts.workspace_read_only, opts.workdir_git_writable)
+}
+
+/// [`git_dir_to_measure`] by value: `workspace`'s `.git`, when that is a
+/// real directory the run could not write. (A fresh tempdir has none.)
+pub(crate) fn held_git_dir(workspace: &Path, workspace_read_only: bool, git_writable: bool) -> Option<PathBuf> {
+    let git = workspace.join(".git");
+    let own_dir = std::fs::symlink_metadata(&git).is_ok_and(|m| m.is_dir());
+    let run_cannot_write = workspace_read_only || !git_writable;
+    (own_dir && run_cannot_write).then_some(git)
 }
 
 /// The `dispatch.start` payload of a container run: the runtime metadata
@@ -9842,6 +9915,7 @@ fn close_container_run(
     run: &mut ContainerRun,
     bookend: &mut DispatchBookendGuard<'_>,
     outcome: ContainerOutcome,
+    workspace: Option<crate::workspace_changes::EnvelopeWorkspaceChanges>,
 ) -> Result<DispatchResult> {
     let ContainerOutcome {
         wall_ms,
@@ -9872,6 +9946,7 @@ fn close_container_run(
             host_out,
             bounds,
             thermal_ladder_summary,
+            workspace.clone(),
         )
     });
 
@@ -9895,6 +9970,7 @@ fn close_container_run(
         &host_extras,
         opts.resume_from.as_deref(),
         thermal_ladder_summary,
+        workspace.map(|w| w.summary),
     );
     let (mut dispatch_complete_payload, level) = terminal_payload(exit_code, dispatch_complete_payload);
     // (#1959) Same provenance merge as `dispatch_start_payload`.
@@ -10358,6 +10434,9 @@ fn enrich_envelope_with_summary(
     bounds: RuntimeBounds,
     // (#2774) See `host_window`'s own doc.
     thermal_ladder: Option<crate::thermal_governor::ThermalLadderSummary>,
+    // (#3236) What the workspace changed, files listed; `None` when there
+    // was no workspace to read.
+    workspace_changes: Option<crate::workspace_changes::EnvelopeWorkspaceChanges>,
 ) -> String {
     // Anything that is not a runtime envelope (plain text, a list, a truncated
     // object) is handed back untouched: the enrichment never invents an
@@ -10381,6 +10460,7 @@ fn enrich_envelope_with_summary(
         findings: read_findings_summary(out_dir),
         degeneracy_warnings: (summary.degeneracy_warnings > 0).then_some(summary.degeneracy_warnings),
         checkpoints: crate::dispatch_envelope::CheckpointSummary::of(&summary.fold),
+        workspace_changes,
     };
     serde_json::to_string(&envelope).unwrap_or(stdout)
 }
@@ -11038,6 +11118,9 @@ fn build_dispatch_complete_payload(
     resume_from: Option<&std::path::Path>,
     // (#2774) See `host_window`'s own doc.
     thermal_ladder: Option<crate::thermal_governor::ThermalLadderSummary>,
+    // (#3236) The workspace's changes as counts (never the file list, which
+    // stays in the envelope); `None` when there was no workspace to read.
+    workspace_changes: Option<darkmux_flow::payload::WorkspaceChanges>,
 ) -> DispatchEndPayload {
     // Every count below is the fold of this execution's trajectory: the one
     // reading of the one log, the same one the live records and the envelope
@@ -11098,6 +11181,7 @@ fn build_dispatch_complete_payload(
         host_window: host_window(host_stats, host_extras, thermal_ladder),
         // (#2114 follow-up) Same field, same reason as `dispatch_start_payload`.
         resumed_from: resume_from.map(|rf| rf.display().to_string()),
+        workspace_changes,
         ..DispatchEndPayload::new(fold.turns() as u64)
     }
 }

@@ -2420,6 +2420,31 @@ mod tests {
         );
     }
 
+    /// (#3236 review) A `dispatch.internal` step whose dispatch exited
+    /// non-zero fails with what the dispatch printed. That text reaches a
+    /// `run_on: ["error"]` dependent's input (and so its `dispatch.start`
+    /// prompt on the flow stream) with the workspace counts and without the
+    /// file list.
+    #[test]
+    fn an_errored_dispatch_reaches_an_error_dependent_without_its_file_list() {
+        let envelope = serde_json::json!({
+            "result": "error", "final_assistant": "gave up",
+            "workspace_changes": {"method": "snapshot", "files_changed": 1, "not_measured": null, "lines_added": 1,
+                "lines_removed": 0, "excluded": [], "files": [{"path": "customer-acme-payroll.csv", "change": "added",
+                "lines_added": 1, "lines_removed": 0}], "files_omitted": 0}
+        })
+        .to_string();
+        let (dead, mut dead_steps) = errored_two_step_task("t-fail", &[]);
+        dead_steps[0].output = Some(crate::step_kinds::builtins::dispatch_exit_text(&dead_steps[0].id, 1, &envelope));
+        let (dep, dep_step) = task_and_step("t-dep2", &["t-fail"]);
+        let (tasks, steps) = graph_with(vec![(dead, dead_steps), (run_on_error(dep), vec![dep_step])]);
+
+        let inputs = gather_inputs(&steps["t-dep2-step"], &tasks["t-dep2"], &tasks, &steps);
+        let forwarded = inputs.get("t-fail").expect("the reason is forwarded");
+        assert!(!forwarded.contains("customer-acme"), "{forwarded}");
+        assert!(forwarded.contains("dispatch exited 1") && forwarded.contains("\"files_changed\":1"), "{forwarded}");
+    }
+
     /// The default-`run_on` case is byte-identical to pre-fix behavior: a
     /// dead dependency forwards nothing at all.
     #[test]

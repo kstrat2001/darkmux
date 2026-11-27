@@ -2616,3 +2616,67 @@ describe("runRegions: turns of a running relayed single-shot (5.0 R3)", () => {
     expect(v.metrics.find((x) => x.label === "TURNS")?.value).toBe("1");
   });
 });
+
+// (#3236) The brief's `changes` row: what the run's workspace actually
+// changed, as its terminal record says. It never claims "no changes" for what
+// the measure did not look at, and "not measured" is never shown as zero.
+describe("runRegions — the workspace changes row", () => {
+  const startRec: RawRecord = {
+    ts: "2026-01-01T00:00:00Z",
+    session_id: "s1",
+    action: "dispatch.start",
+    handle: "darkmux/coder",
+    payload: { workspace: "/tmp/wt" },
+  };
+  const briefOf = (workspace_changes: unknown): string[] => {
+    const end: RawRecord = {
+      ts: "2026-01-01T00:01:00Z",
+      session_id: "s1",
+      action: "dispatch.complete",
+      payload: workspace_changes === undefined ? { total_turns: 1 } : { total_turns: 1, workspace_changes },
+    };
+    return runRegions(flowToRenderModel([startRec, end]), "s1").briefLines.map((e) => e.text);
+  };
+  const rowOf = (lines: string[]): string | undefined => {
+    const i = lines.indexOf("changes");
+    return i >= 0 ? lines[i + 1] : undefined;
+  };
+  const base = { method: "snapshot", not_measured: null, lines_added: null, lines_removed: null, excluded: [] };
+
+  it("reads 'no changes' only when measured, naming what it left out", () => {
+    expect(rowOf(briefOf({ ...base, files_changed: 0, lines_added: 0, lines_removed: 0, excluded: ["dist", "target"] }))).toBe(
+      "no changes outside dist/, target/",
+    );
+    expect(rowOf(briefOf({ ...base, method: "git", files_changed: 0, excluded: ["git-ignored", "nested-repositories"] }))).toBe(
+      "no changes outside git-ignored files, nested repositories",
+    );
+    expect(rowOf(briefOf({ ...base, files_changed: 0 }))).toBe("no changes");
+    expect(rowOf(briefOf({ ...base, method: "git", files_changed: 0, excluded: ["git-ignored", "submodules"] }))).toBe(
+      "no changes outside git-ignored files, submodules",
+    );
+    expect(rowOf(briefOf({ ...base, files_changed: 0, excluded: ["files-over-50mb"] }))).toBe(
+      "no changes outside files over 50 MB (compared by size and time)",
+    );
+  });
+
+  it("counts the files and the lines, and says when lines were not measured", () => {
+    expect(rowOf(briefOf({ ...base, method: "git", files_changed: 2, lines_added: 12, lines_removed: 3 }))).toBe("2 files · +12 −3");
+    expect(rowOf(briefOf({ ...base, files_changed: 1 }))).toBe("1 file · lines not measured");
+  });
+
+  it("says 'not measured' with the reason when the workspace could not be read", () => {
+    expect(rowOf(briefOf({ ...base, files_changed: null, not_measured: "reading the workspace before the dispatch failed" }))).toBe(
+      "not measured: reading the workspace before the dispatch failed",
+    );
+  });
+
+  it("reads a count it cannot parse as not measured, never as a number", () => {
+    expect(rowOf(briefOf({ ...base, files_changed: "two" }))).toBe("not measured: no reason recorded");
+  });
+
+  it("shows no row where no workspace was recorded (an older record, a one-call dispatch)", () => {
+    const lines = briefOf(undefined);
+    expect(lines).toContain("workspace");
+    expect(lines).not.toContain("changes");
+  });
+});

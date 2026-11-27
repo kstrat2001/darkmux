@@ -6847,44 +6847,17 @@ fn git(wd: &WorkCopy, index: Option<&Path>, args: &[&str]) -> Option<std::proces
 /// ignored ones), staged or not, written through a throwaway index so the
 /// work copy's own index, branch and files are never touched (only blob and
 /// tree objects are added to its object store). `None` when `wd` is not in
-/// a git work copy.
+/// a git work copy. (#3236) The mechanism lives in
+/// `darkmux_crew::workspace_changes::git_tree`, which a dispatch measures its
+/// workspace with too; this is the work copy's git commands handed to it.
 pub(crate) fn snapshot_tree(wd: &WorkCopy) -> Result<Snapshot, String> {
-    let scratch = tempfile::tempdir().map_err(|e| format!("a scratch index: {e}"))?;
-    let index = scratch.path().join("index");
-    let skipped = nested_repositories(wd)?;
-    // A repository inside the work copy (an empty `git init sub` makes
-    // `git add` fail outright; one with commits would be added as a link)
-    // is left out, by name, literally.
-    let excludes: Vec<String> = skipped.iter().map(|p| format!(":(exclude,literal){p}")).collect();
-    let mut add = vec!["add", "-A", "--", "."];
-    add.extend(excludes.iter().map(String::as_str));
-    crate::client_git::run_or_why(wd, Some(&index), &add)?;
-    let tree = crate::client_git::run_or_why(wd, Some(&index), &["write-tree"])?;
-    Ok(Snapshot {
-        tree: String::from_utf8_lossy(&tree.stdout).trim().to_string(),
-        skipped,
-    })
+    let git = |index: Option<&Path>, args: &[&str]| crate::client_git::run_or_why(wd, index, args).map(|o| o.stdout);
+    darkmux_crew::workspace_changes::git_tree::snapshot_tree(&wd.work_tree, &git)
 }
 
 /// A work copy as one tree, and the repositories inside it the tree leaves
 /// out.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Snapshot {
-    pub tree: String,
-    pub skipped: Vec<String>,
-}
-
-/// The untracked repositories inside the work copy: git lists each as one
-/// `path/` entry and does not descend into it.
-fn nested_repositories(wd: &WorkCopy) -> Result<Vec<String>, String> {
-    let out = crate::client_git::run_or_why(wd, None, &["ls-files", "-z", "--others", "--exclude-standard"])?;
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .split('\0')
-        .filter_map(|e| e.strip_suffix('/'))
-        .filter(|p| std::fs::symlink_metadata(wd.work_tree.join(p).join(".git")).is_ok())
-        .map(str::to_string)
-        .collect())
-}
+pub(crate) use darkmux_crew::workspace_changes::git_tree::TreeSnapshot as Snapshot;
 
 /// What changed in `wd` since the tree `before` ([`snapshot_tree`]): the
 /// files (lines added and removed, `null` for a binary file), the unified
@@ -6892,24 +6865,10 @@ fn nested_repositories(wd: &WorkCopy) -> Result<Vec<String>, String> {
 /// `Err` says why the work copy could not be read: never "no changes".
 pub(crate) fn changes_since(wd: &WorkCopy, before: &str) -> Result<RunChanges, String> {
     let after = snapshot_tree(wd)?;
-    let numstat = crate::client_git::run_or_why(
-        wd,
-        None,
-        &["diff", "--no-renames", "--no-ext-diff", "--no-textconv", "--numstat", "-z", before, &after.tree],
-    )?;
-    let files: Vec<FileChange> = String::from_utf8_lossy(&numstat.stdout)
-        .split('\0')
-        .filter(|l| !l.is_empty())
-        .filter_map(|l| {
-            let mut parts = l.splitn(3, '\t');
-            let (added, removed, path) = (parts.next()?, parts.next()?, parts.next()?);
-            let n = |s: &str| s.parse::<u64>().ok();
-            Some(FileChange {
-                path: path.to_string(),
-                added: n(added),
-                removed: n(removed),
-            })
-        })
+    let git = |index: Option<&Path>, args: &[&str]| crate::client_git::run_or_why(wd, index, args).map(|o| o.stdout);
+    let files: Vec<FileChange> = darkmux_crew::workspace_changes::git_tree::numstat(&git, before, &after.tree)?
+        .into_iter()
+        .map(|f| FileChange { path: f.path, added: f.added, removed: f.removed })
         .collect();
     let patch = crate::client_git::run_or_why(
         wd,

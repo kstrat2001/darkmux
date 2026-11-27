@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn the_golden_does_not_offer_unknown_for_host_built_enums() {
         let golden = render_golden();
-        for name in ["DetectorKind", "DetectorSeverity", "KnobSource"] {
+        for name in ["DetectorKind", "DetectorSeverity", "KnobSource", "WorkspaceMethod"] {
             let line = golden.lines().find(|l| l.starts_with(&format!("{name} = "))).unwrap_or_else(|| panic!("{name} missing from the golden"));
             assert!(!line.contains("\"unknown\""), "{name} offers a value the verb never prints: {line}");
         }

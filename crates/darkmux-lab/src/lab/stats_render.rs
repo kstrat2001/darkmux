@@ -70,6 +70,7 @@ pub fn run_text(s: &crate::lab::stats::RunStats) -> String {
         "work         {} turns   {} compactions   {} tool calls ({} failed)",
         s.turns, s.compactions, s.tool_calls_total, s.tool_calls_failed
     );
+    p!(out, "{}", workspace_line(s.workspace_changes.as_ref()));
     p!(out, 
         "output       {} completion tokens   {} reasoning chars   {} content chars",
         s.completion_tokens, s.reasoning_chars, s.content_chars
@@ -121,6 +122,45 @@ pub fn run_text(s: &crate::lab::stats::RunStats) -> String {
     out
 }
 
+
+/// (#3236) The workspace line: what the run's dispatch changed, as its
+/// terminal record says.
+pub(crate) fn workspace_line(w: Option<&darkmux_flow::payload::WorkspaceChanges>) -> String {
+    let said = match w {
+        None => "not recorded".to_string(),
+        Some(w) => match w.files_changed {
+            None => format!("not measured: {}", sanitize_for_terminal(w.not_measured.as_deref().unwrap_or("no reason recorded"))),
+            Some(0) => format!("no changes{}", outside(&w.excluded)),
+            Some(n) => format!("{n} file{} changed   {}", if n == 1 { "" } else { "s" }, lines_said(w)),
+        },
+    };
+    format!("workspace    {said}")
+}
+
+/// " outside dist/, target/": what a "no changes" did not look at.
+fn outside(excluded: &[String]) -> String {
+    if excluded.is_empty() {
+        return String::new();
+    }
+    let named: Vec<String> = excluded
+        .iter()
+        .map(|e| match e.as_str() {
+            darkmux_flow::payload::WorkspaceChanges::GIT_IGNORED => "git-ignored files".to_string(),
+            darkmux_flow::payload::WorkspaceChanges::NESTED_REPOSITORIES => "nested repositories".to_string(),
+            darkmux_flow::payload::WorkspaceChanges::SUBMODULES => "submodules".to_string(),
+            darkmux_flow::payload::WorkspaceChanges::LARGE_FILES => "files over 50 MB (compared by size and time)".to_string(),
+            dir => format!("{}/", sanitize_for_terminal(dir)),
+        })
+        .collect();
+    format!(" outside {}", named.join(", "))
+}
+
+fn lines_said(w: &darkmux_flow::payload::WorkspaceChanges) -> String {
+    match (w.lines_added, w.lines_removed) {
+        (Some(a), Some(r)) => format!("+{a} -{r}"),
+        _ => "lines not measured".to_string(),
+    }
+}
 
 /// The host telemetry lines: power, energy and thermal state where package
 /// power was read, and the board sensors wherever they were; for a run

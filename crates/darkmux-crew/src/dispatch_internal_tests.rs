@@ -18604,6 +18604,7 @@ fn degeneracy_warnings_reach_the_envelope() {
         no_findings_dir(),
         test_bounds(),
         None,
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["degeneracy_warnings"], 2, "{out}");
@@ -18615,6 +18616,7 @@ fn degeneracy_warnings_reach_the_envelope() {
         &no_extras(),
         no_findings_dir(),
         test_bounds(),
+        None,
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -18632,6 +18634,7 @@ fn a_detection_reaches_the_envelope() {
         &no_extras(),
         no_findings_dir(),
         test_bounds(),
+        None,
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -18652,6 +18655,7 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
         &no_extras(),
         no_findings_dir(),
         test_bounds(),
+        None,
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -18674,6 +18678,7 @@ fn bounds_argument_survives_into_the_envelope() {
         &no_extras(),
         no_findings_dir(),
         distinctive_bounds.clone(),
+        None,
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -18701,6 +18706,7 @@ fn the_typed_envelope_fields_print_their_pinned_bytes() {
         no_findings_dir(),
         test_bounds(),
         None,
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     let field = |k: &str| serde_json::to_string(&v[k]).unwrap();
@@ -18723,6 +18729,7 @@ fn the_enriched_envelope_names_the_runtimes_keys_then_the_hosts() {
         no_findings_dir(),
         test_bounds(),
         None,
+        None,
     );
     let at = |key: &str| out.find(&format!("\"{key}\":")).unwrap_or_else(|| panic!("no {key} in {out}"));
     let order = ["result", "final_assistant", "trajectory_path", "failed_tool_invocations", "metrics", "detections", "bounds"];
@@ -18742,6 +18749,7 @@ fn a_stdout_that_is_not_an_envelope_is_returned_untouched() {
             &no_extras(),
             no_findings_dir(),
             test_bounds(),
+            None,
             None,
         );
         assert_eq!(out, text);
@@ -18787,6 +18795,7 @@ fn checkpoint_block(s: &super::TrajectorySummary) -> serde_json::Value {
         &no_extras(),
         no_findings_dir(),
         test_bounds(),
+        None,
         None,
     );
     serde_json::from_str::<serde_json::Value>(&out).unwrap()["checkpoints"].clone()
@@ -18872,6 +18881,7 @@ fn a_dispatch_that_never_checkpointed_omits_the_block() {
         no_findings_dir(),
         test_bounds(),
         None,
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v.get("checkpoints").is_none(), "no boundary hit, no block: {out}");
@@ -18905,6 +18915,7 @@ fn the_envelope_metrics_are_the_fold_of_the_trajectory() {
         no_findings_dir(),
         test_bounds(),
         None,
+        None,
     );
     let m = serde_json::from_str::<serde_json::Value>(&out).unwrap()["metrics"].clone();
     assert_eq!(m["model"], "darkmux:m");
@@ -18930,6 +18941,7 @@ fn non_envelope_stdout_is_untouched_by_enrichment() {
         &no_extras(),
         no_findings_dir(),
         test_bounds(),
+        None,
         None,
     ),
             raw,
@@ -19046,6 +19058,7 @@ fn host_stats_reach_the_envelope_nested_by_metric_only() {
         no_findings_dir(),
         test_bounds(),
         None,
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["host"]["cpu"]["peak_pct"], 95);
@@ -19093,6 +19106,7 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         no_findings_dir(),
         test_bounds(),
         None,
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["host"]["power"]["cpu"]["peak_mw"], 3000);
@@ -19117,6 +19131,7 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         no_findings_dir(),
         test_bounds(),
         None,
+        None,
     );
     let w: serde_json::Value = serde_json::from_str(&without).unwrap();
     for key in ["cpu", "mem", "gpu", "samples", "sample_interval_ms"] {
@@ -19137,6 +19152,7 @@ fn a_host_without_power_or_thermal_sources_omits_those_blocks() {
         &no_extras(),
         no_findings_dir(),
         test_bounds(),
+        None,
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -19161,6 +19177,7 @@ fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
         &no_extras(),
         no_findings_dir(),
         test_bounds(),
+        None,
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -19217,6 +19234,7 @@ fn the_envelope_reports_how_many_findings_the_crawl_recorded() {
         td.path(),
         test_bounds(),
         None,
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["findings"]["count"], 3, "the caller's next action turns on this: {out}");
@@ -19240,6 +19258,7 @@ fn a_trailing_newline_is_not_a_finding() {
         td.path(),
         test_bounds(),
         None,
+        None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["findings"]["count"], 1, "records, not lines: {out}");
@@ -19260,6 +19279,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         &no_extras(),
         no_findings_dir(),
         test_bounds(),
+        None,
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -21367,6 +21387,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         no_findings_dir(),
         test_bounds(),
         None,
+        None,
     );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["host_window"]["thermal_worst_state"], "serious");
@@ -21409,6 +21430,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 serious_episodes: 3,
                 current_duty_delay_ms: 120_000,
             }),
+            None,
     );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
@@ -21441,6 +21463,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
                 serious_episodes: 7,
                 current_duty_delay_ms: 240_000,
             }),
+            None,
         )).unwrap();
         assert_eq!(payload["host_window"]["thermal_serious_episodes"], 7, "{payload}");
         assert_eq!(payload["host_window"]["thermal_duty_delay_ms"], 240_000, "{payload}");
@@ -21462,6 +21485,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         no_findings_dir(),
         test_bounds(),
         None,
+        None,
     );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["host_window"]["thermal_serious_episodes"].is_null(), "{v}");
@@ -21478,6 +21502,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         &no_extras(),
         no_findings_dir(),
         test_bounds(),
+        None,
         None,
     );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -21515,6 +21540,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             &stats,
             &extras,
+            None,
             None,
             None,
         )).unwrap();
@@ -21561,6 +21587,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &no_extras(),
             None,
             None,
+            None,
         )).unwrap();
         assert_eq!(payload["prompt_tokens"], 100);
         assert_eq!(payload["completion_tokens"], 600);
@@ -21593,7 +21620,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         }
         let err = "darkmux-runtime container dispatch interrupted by an operator signal \
                    (SIGINT/SIGTERM/SIGHUP): the container `c` was killed mid-run";
-        let (payload, level) = super::ended_mid_run_terminal(err, 4200, &summary, None, None);
+        let (payload, level) = super::ended_mid_run_terminal(err, 4200, &summary, None, None, None);
         assert_eq!(payload.action(), darkmux_flow::FlowAction::DispatchError, "never a completion");
         assert!(matches!(level, darkmux_flow::Level::Error), "{level:?}");
         let payload = serde_json::to_value(payload).unwrap();
@@ -21654,6 +21681,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             &stats,
             &no_extras(),
+            None,
             None,
             None,
         ))
@@ -21738,6 +21766,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             &extras,
             None,
             None,
+            None,
         )).unwrap();
         assert_eq!(payload["result_class"], "error");
         assert_eq!(payload["endpoint"], "azure/gpt-x");
@@ -21762,6 +21791,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
             None,
             &super::HostStats::default(),
             &no_extras(),
+            None,
             None,
             None,
         );
@@ -24299,6 +24329,7 @@ fn an_envelope_that_does_not_parse_says_so_and_goes_out_as_written() {
         no_findings_dir(),
         test_bounds(),
         None,
+        None,
     );
     assert_eq!(out, stdout, "an envelope this darkmux cannot read goes out unchanged");
 }
@@ -24323,6 +24354,7 @@ fn a_partial_runtime_envelope_prints_no_empty_result_or_path() {
         &no_extras(),
         no_findings_dir(),
         test_bounds(),
+        None,
         None,
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -25097,7 +25129,7 @@ fn a_dispatch_the_listener_watch_stopped_closes_as_an_error_naming_the_listener(
     stop.request(why);
     assert!(run_was_killed(&stop, false), "a stopped dispatch that did not exit cleanly was killed");
     let err = killed_mid_run_error(&docker_sandbox("darkmux-dispatch-b3559-record"), &stop);
-    let (payload, _) = super::ended_mid_run_terminal(&format!("{err:#}"), 10, &super::TrajectorySummary::default(), None, None);
+    let (payload, _) = super::ended_mid_run_terminal(&format!("{err:#}"), 10, &super::TrajectorySummary::default(), None, None, None);
     assert_eq!(payload.action(), darkmux_flow::FlowAction::DispatchError);
     let payload = serde_json::to_value(payload).unwrap();
     let error = payload["error"].as_str().unwrap_or_default();
@@ -25266,4 +25298,167 @@ fn a_dispatch_of_a_role_that_cant_write_mounts_the_workspace_read_only() {
         assert!(with_role(id, true), "{id}, asked");
     }
     assert!(!with_role("no-such-role", false));
+}
+
+/// (#3236) What a dispatch's workspace changed reaches its envelope (files
+/// listed), its terminal record (counts only) and a killed run's
+/// `dispatch.error`.
+mod workspace_changes_wiring {
+    use crate::workspace_changes::{EnvelopeWorkspaceChanges, WorkspaceBaseline};
+    use darkmux_flow::payload::WorkspaceMethod;
+
+    /// A fresh tempdir (the no-`--workdir` workspace, empty when made) into
+    /// which the run wrote one file, measured as the dispatch measures it.
+    fn one_file_written() -> EnvelopeWorkspaceChanges {
+        let ws = tempfile::TempDir::new().unwrap();
+        let baseline = WorkspaceBaseline::take(ws.path(), None);
+        std::fs::write(ws.path().join("calc.py"), "def add(a, b):\n    return a + b\n").unwrap();
+        baseline.measure()
+    }
+
+    fn enriched(workspace: Option<EnvelopeWorkspaceChanges>) -> serde_json::Value {
+        let out = super::super::enrich_envelope_with_summary(
+            r#"{"result":"stop"}"#.to_string(),
+            "m",
+            &super::summary_with(vec![]),
+            &super::super::HostStats::default(),
+            &super::no_extras(),
+            super::no_findings_dir(),
+            super::test_bounds(),
+            None,
+            workspace,
+        );
+        serde_json::from_str(&out).unwrap()
+    }
+
+    #[test]
+    fn a_fresh_tempdir_dispatch_that_writes_one_file_says_so_in_its_envelope() {
+        let v = enriched(Some(one_file_written()));
+        let w = &v["workspace_changes"];
+        assert_eq!(w["method"], "snapshot", "{v}");
+        assert_eq!(w["files_changed"], 1);
+        assert_eq!(w["lines_added"], 2);
+        assert_eq!(w["lines_removed"], 0);
+        assert_eq!(w["files"][0]["path"], "calc.py");
+        assert_eq!(w["files"][0]["change"], "added");
+        assert_eq!(w["files_omitted"], 0);
+    }
+
+    #[test]
+    fn a_dispatch_that_changed_nothing_reads_zero_not_null() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("calc.py"), "x\n").unwrap();
+        let v = enriched(Some(WorkspaceBaseline::take(ws.path(), None).measure()));
+        assert_eq!(v["workspace_changes"]["files_changed"], 0, "{v}");
+        assert_eq!(v["workspace_changes"]["not_measured"], serde_json::Value::Null);
+        assert_eq!(v["workspace_changes"]["files"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn an_envelope_with_no_workspace_carries_no_block() {
+        let v = enriched(None);
+        assert!(v.get("workspace_changes").is_none(), "{v}");
+    }
+
+    #[test]
+    fn the_terminal_record_carries_the_counts_and_no_file_list() {
+        let changes = one_file_written();
+        let payload = super::super::build_dispatch_complete_payload(
+            10,
+            "",
+            "",
+            0,
+            &super::super::TrajectorySummary::default(),
+            None,
+            &super::super::HostStats::default(),
+            &super::no_extras(),
+            None,
+            None,
+            Some(changes.summary.clone()),
+        );
+        assert_eq!(payload.workspace_changes.as_ref(), Some(&changes.summary));
+        let wire = serde_json::to_value(&payload).unwrap();
+        assert_eq!(wire["workspace_changes"]["files_changed"], 1, "{wire}");
+        assert!(!wire.to_string().contains("calc.py"), "no path reaches the flow stream: {wire}");
+        // (#3236 review) Values, not only keys: nothing in the block names a
+        // path, the workspace's own included.
+        for value in wire["workspace_changes"].as_object().unwrap().values() {
+            let text = value.to_string();
+            assert!(!text.contains('/') && !text.contains(".py"), "a path-like value on the stream: {text}");
+        }
+    }
+
+    #[test]
+    fn a_killed_runs_error_record_describes_the_workspace() {
+        let changes = one_file_written();
+        let (payload, level) = super::super::ended_mid_run_terminal(
+            "the container was killed",
+            5,
+            &super::super::TrajectorySummary::default(),
+            None,
+            None,
+            Some(changes.summary.clone()),
+        );
+        assert!(matches!(level, darkmux_flow::Level::Error));
+        let darkmux_flow::Payload::DispatchError(p) = payload else { panic!("a dispatch.error") };
+        assert_eq!(p.workspace_changes.map(|w| (w.method, w.files_changed)), Some((WorkspaceMethod::Snapshot, Some(1))));
+    }
+
+    /// The container path's three wiring points need a live container, so
+    /// they are source-pinned, as `both_mid_run_exits_close_...` pins its
+    /// own: the baseline is read right before the launch (after the model
+    /// load), the mid-run closure measures it, and the clean close gets it.
+    #[test]
+    fn the_container_path_reads_the_workspace_before_the_launch_and_at_every_terminal() {
+        let full = include_str!("dispatch_internal.rs");
+        let src = &full[..full.rfind("mod tests;").unwrap()];
+        let run_container = &src[src.find("fn run_container(").unwrap()..];
+        let run_container = &run_container[..run_container.find("\nfn supervise_container(").unwrap()];
+        let take = run_container.find("run.workspace_baseline = Some(crate::workspace_changes::WorkspaceBaseline::take(").expect("the baseline is read");
+        let resident = run_container.find("container_model_resident(").unwrap();
+        let launch = run_container.find("launch_container(opts, execution, &run, remote_auth)").unwrap();
+        assert!(resident < take && take < launch, "read after the model load and before the launch");
+        let closure = &src[src.find("let close_ended_mid_run =").unwrap()..];
+        let closure = &closure[..closure.find("};").unwrap()];
+        assert!(closure.contains("let workspace = run.workspace_baseline.as_ref().map(|b| b.measure().summary);"), "{closure}");
+        assert!(closure.contains("                workspace,\n            );"), "the killed branch passes it: {closure}");
+        assert!(src.contains("let workspace = run.workspace_baseline.as_ref().map(crate::workspace_changes::WorkspaceBaseline::measure);\n    close_container_run(opts, execution, run, bookend, outcome, workspace)"));
+        // (#3236 review) The exit between the launch and the watch closes
+        // with a block that says the workspace was not read, never none.
+        let unread = &src[src.find("let close_unread =").unwrap()..];
+        let unread = &unread[..unread.find("};").unwrap()];
+        assert!(unread.contains(".map(|b| b.not_read(\"the dispatch ended before its workspace was read\"))"), "{unread}");
+        let observers = &src[src.find("match spawn_observers(opts, execution, run, &launched, &local_stop) {").unwrap()..];
+        let observers = &observers[..observers.find("return Err(err);").unwrap()];
+        assert!(observers.contains("close_unread(bookend, &err);"), "{observers}");
+    }
+
+    /// (#3236 review) A dispatch that ended before its workspace was read
+    /// again says so: a fixed reason, the method it would have used, never
+    /// a count.
+    #[test]
+    fn a_dispatch_that_ended_before_the_read_records_it_as_not_measured() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let w = WorkspaceBaseline::take(ws.path(), None).not_read("the dispatch ended before its workspace was read");
+        assert_eq!(w.method, WorkspaceMethod::Snapshot);
+        assert_eq!(w.files_changed, None);
+        assert_eq!(w.not_measured.as_deref(), Some("the dispatch ended before its workspace was read"));
+    }
+
+    /// Which workspaces git may read: only a checkout's own `.git`
+    /// directory the run could not write.
+    #[test]
+    fn only_a_read_only_git_directory_is_measured_with_git() {
+        let held = |ws: &std::path::Path, ro: bool, writable: bool| super::super::held_git_dir(ws, ro, writable);
+        let plain = tempfile::TempDir::new().unwrap();
+        assert_eq!(held(plain.path(), false, false), None, "no .git");
+        let repo = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        assert_eq!(held(repo.path(), false, false), Some(repo.path().join(".git")), "read-only .git, the default");
+        assert_eq!(held(repo.path(), false, true), None, "a writable .git is the run's to rewrite");
+        assert_eq!(held(repo.path(), true, true), Some(repo.path().join(".git")), "a read-only workspace's .git is read-only too");
+        let worktree = tempfile::TempDir::new().unwrap();
+        std::fs::write(worktree.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert_eq!(held(worktree.path(), false, false), None, "a pointer file names whatever the run left");
+    }
 }

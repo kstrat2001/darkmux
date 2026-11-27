@@ -1,7 +1,7 @@
 {
   "runs": [
     {
-      "schema_version": "2.5.0",
+      "schema_version": "2.6.0",
       "run": "run-a",
       "model": "m",
       "result": "stop",
@@ -61,6 +61,7 @@
         }
       },
       "bounds": {},
+      "workspace_changes": null,
       "gpu_w_busy": null,
       "gpu_w_max": null,
       "cpu_w_busy": null,
@@ -108,7 +109,7 @@
       }
     },
     {
-      "schema_version": "2.5.0",
+      "schema_version": "2.6.0",
       "run": "run-b",
       "model": "m",
       "result": "stop",
@@ -168,6 +169,7 @@
         }
       },
       "bounds": {},
+      "workspace_changes": null,
       "gpu_w_busy": null,
       "gpu_w_max": null,
       "cpu_w_busy": null,
@@ -303,7 +305,7 @@
   "baseline": {
     "runs": [
       {
-        "schema_version": "2.5.0",
+        "schema_version": "2.6.0",
         "run": "run-b",
         "model": "m",
         "result": "stop",
@@ -363,6 +365,7 @@
           }
         },
         "bounds": {},
+        "workspace_changes": null,
         "gpu_w_busy": null,
         "gpu_w_max": null,
         "cpu_w_busy": null,
