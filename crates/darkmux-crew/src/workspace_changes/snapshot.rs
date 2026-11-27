@@ -312,6 +312,14 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn a_walk_error_says_which_limit_or_io_failure_it_was() {
+        let overflow = WalkError::Overflow { count_at_overflow: 50_001 }.to_string();
+        assert!(overflow.contains(&MAX_FILE_COUNT.to_string()) && overflow.contains("saw 50001"), "{overflow}");
+        let io = WalkError::from(std::io::Error::other("disk gone")).to_string();
+        assert_eq!(io, "io error walking workspace: disk gone");
+    }
+
     fn write(root: &Path, rel: &str, content: &[u8]) {
         let p = root.join(rel);
         if let Some(parent) = p.parent() {

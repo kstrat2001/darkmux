@@ -272,3 +272,28 @@ pub fn name_status(
     }
     Ok(entries)
 }
+
+#[cfg(test)]
+mod await_scan_tests {
+    use super::await_scan;
+    use std::time::Duration;
+
+    #[test]
+    fn a_finished_scan_answers_and_a_dropped_one_reads_as_unknown() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(true)).unwrap();
+        assert_eq!(await_scan(&rx, Duration::from_secs(5)), Ok(Some(true)));
+        drop(tx);
+        assert_eq!(await_scan(&rx, Duration::from_secs(5)), Ok(None));
+    }
+
+    #[test]
+    fn a_scan_that_never_answers_ends_at_the_bound() {
+        let (_tx, rx) = std::sync::mpsc::channel::<Option<bool>>();
+        let started = std::time::Instant::now();
+        let err = await_scan(&rx, Duration::from_millis(250)).unwrap_err();
+        assert!(err.contains("did not finish within"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
