@@ -218,8 +218,22 @@ impl HostGit {
     /// add a `current_dir` or a `-C`, which would move git away from the
     /// directory this was built for.
     pub fn command<S: AsRef<OsStr>>(&self, args: &[S]) -> Command {
+        self.command_with_drivers(args, &self.repo_filter_drivers())
+    }
+
+    /// [`HostGit::command`] with the repository's filter drivers already
+    /// read by the caller, so building it runs nothing. (#3236) For a caller
+    /// that must bound that read too: a repository's config can
+    /// `include.path` a file inside a work tree a run wrote, and a FIFO
+    /// there blocks the read (the module doc's "Limits"). The caller runs
+    /// [`HostGit::filter_drivers_command`] under its own deadline, parses it
+    /// with [`filter_drivers_in`], and passes the names here, read for THIS
+    /// call: a driver the run defined since is still passed empty.
+    /// [`HostGit::command`] is this with the read done unbounded, as before,
+    /// for every other caller.
+    pub fn command_with_drivers<S: AsRef<OsStr>>(&self, args: &[S], drivers: &[String]) -> Command {
         let mut cmd = self.base();
-        neutralize_filters(&mut cmd, &self.repo_filter_drivers());
+        neutralize_filters(&mut cmd, drivers);
         let args: Vec<&OsStr> = args.iter().map(AsRef::as_ref).collect();
         let at = subcommand_end(&args);
         cmd.args(&args[..at]);
@@ -278,12 +292,25 @@ impl HostGit {
     /// defines for this repository. Reading config runs nothing. A failed
     /// read (no repository, no driver) is an empty list.
     pub fn repo_filter_drivers(&self) -> Vec<String> {
-        let out = self.base().args(["config", "-z", "--show-scope", "--get-regexp", "^filter\\."]).output();
-        match out {
+        match self.filter_drivers_command().output() {
             Ok(o) if o.status.success() => repo_defined_drivers(&o.stdout),
             _ => Vec::new(),
         }
     }
+
+    /// The one `git config` read [`HostGit::repo_filter_drivers`] runs, not
+    /// yet run: for a caller that bounds it ([`HostGit::command_with_drivers`]).
+    /// It exits 1 when no driver is defined, which is an empty list.
+    pub fn filter_drivers_command(&self) -> Command {
+        let mut cmd = self.base();
+        cmd.args(["config", "-z", "--show-scope", "--get-regexp", "^filter\\."]);
+        cmd
+    }
+}
+
+/// The driver names a successful [`HostGit::filter_drivers_command`] printed.
+pub fn filter_drivers_in(stdout: &[u8]) -> Vec<String> {
+    repo_defined_drivers(stdout)
 }
 
 /// Parse `git config -z --show-scope --get-regexp '^filter\.'`: entries of

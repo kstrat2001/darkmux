@@ -791,6 +791,170 @@ fn a_forwarded_envelope_keeps_the_counts_and_drops_the_file_list() {
     }
 }
 
+/// A checkout whose config `include.path`s a file in its work tree, which a
+/// run can rewrite: the reviewer's setup.
+fn repo_with_an_included_config() -> TempDir {
+    let dir = repo();
+    write(dir.path(), "shared.gitconfig", b"");
+    git(
+        dir.path(),
+        &["config", "include.path", "../shared.gitconfig"],
+    );
+    dir
+}
+
+#[cfg(unix)]
+fn mkfifo(path: &Path) {
+    let made = Command::new("mkfifo").arg(path).status().unwrap();
+    assert!(made.success());
+}
+
+/// (#3236 round 2, PROVEN hang) The filter-driver read every git call makes
+/// is bounded too: a run that replaced an included config with a FIFO ends
+/// the measure at the bound as not measured, never holding the close.
+#[cfg(unix)]
+#[test]
+fn an_included_config_replaced_by_a_fifo_cannot_hang_the_measure() {
+    let dir = repo_with_an_included_config();
+    let git_dir = dir.path().join(".git");
+    let baseline =
+        WorkspaceBaseline::take_bounded(dir.path(), Some(&git_dir), Duration::from_secs(3));
+    assert_eq!(baseline.not_read("x").method, WorkspaceMethod::Git);
+    fs::remove_file(dir.path().join("shared.gitconfig")).unwrap();
+    mkfifo(&dir.path().join("shared.gitconfig"));
+    let started = std::time::Instant::now();
+    let m = baseline.measure();
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(m.summary.files_changed, None);
+    assert!(
+        m.summary
+            .not_measured
+            .as_deref()
+            .unwrap_or("")
+            .contains("did not finish within"),
+        "{:?}",
+        m.summary.not_measured
+    );
+}
+
+/// The same FIFO already there when the dispatch starts: the git path cannot
+/// read its config in time, so the workspace is measured by snapshot, whose
+/// walk never opens a FIFO.
+#[cfg(unix)]
+#[test]
+fn a_fifo_include_before_the_run_falls_back_to_the_snapshot() {
+    let dir = repo_with_an_included_config();
+    fs::remove_file(dir.path().join("shared.gitconfig")).unwrap();
+    mkfifo(&dir.path().join("shared.gitconfig"));
+    let git_dir = dir.path().join(".git");
+    let started = std::time::Instant::now();
+    let baseline =
+        WorkspaceBaseline::take_bounded(dir.path(), Some(&git_dir), Duration::from_secs(2));
+    write(dir.path(), "calc.py", b"x\n");
+    let m = baseline.measure();
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(m.summary.method, WorkspaceMethod::Snapshot);
+    assert_eq!(m.summary.files_changed, Some(1));
+}
+
+/// A filter driver the run defined through the included config is passed
+/// empty on every measuring call: the drivers are read per call, never once
+/// before the run.
+#[test]
+fn a_filter_the_run_defines_through_an_include_never_runs() {
+    let marker_dir = TempDir::new().unwrap();
+    let marker = marker_dir.path().join("ran");
+    let dir = repo_with_an_included_config();
+    let git_dir = dir.path().join(".git");
+    let baseline = WorkspaceBaseline::take(dir.path(), Some(&git_dir));
+    write(
+        dir.path(),
+        "shared.gitconfig",
+        format!(
+            "[filter \"evil\"]\n\tclean = \"sh -c 'touch {}; cat'\"\n",
+            marker.display()
+        )
+        .as_bytes(),
+    );
+    write(dir.path(), ".gitattributes", b"* filter=evil\n");
+    write(dir.path(), "calc.py", b"x\n");
+    let m = baseline.measure();
+    assert!(!marker.exists(), "the run's filter ran on the host");
+    assert_eq!(m.summary.method, WorkspaceMethod::Git);
+    assert!(
+        m.summary.files_changed.is_some_and(|n| n >= 2),
+        "{:?}",
+        m.files
+    );
+}
+
+/// (#3236 round 2, PROVEN) A checkout too big for a captured listing (about
+/// 60 bytes an entry against the 1 MiB output cap) is still measured, and a
+/// submodule listed after every other entry is still found.
+#[test]
+fn a_repository_whose_listing_passes_the_output_cap_is_measured() {
+    let dir = repo();
+    for i in 0..20_000 {
+        write(dir.path(), &format!("d{:02}/f{i:05}.txt", i % 100), b"x\n");
+    }
+    let upstream = TempDir::new().unwrap();
+    git(upstream.path(), &["init", "-q"]);
+    write(upstream.path(), "a.txt", b"a\n");
+    git(upstream.path(), &["add", "-A"]);
+    git(upstream.path(), &["commit", "-q", "-m", "sub"]);
+    let url = upstream.path().to_string_lossy().to_string();
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &url,
+            "zzz/sub",
+        ],
+    );
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-q", "-m", "big"]);
+    let git_dir = dir.path().join(".git");
+    let baseline = WorkspaceBaseline::take(dir.path(), Some(&git_dir));
+    write(dir.path(), "calc.py", b"x\n");
+    let m = baseline.measure();
+    assert_eq!(m.summary.not_measured, None);
+    assert_eq!(m.summary.files_changed, Some(1));
+    assert!(
+        m.summary
+            .excluded
+            .contains(&WorkspaceChanges::SUBMODULES.to_string()),
+        "{:?}",
+        m.summary.excluded
+    );
+}
+
+/// The streamed scan finds a gitlink whatever the chunking, and only at a
+/// record's start.
+#[test]
+fn the_gitlink_scan_reads_record_modes_across_any_chunking() {
+    let listing =
+        b"100644 blob aaaa\t160000 tricky name\0040000 tree bbbb\tdir\0160000 commit cccc\tsub\0";
+    for split in 0..listing.len() {
+        let mut scan = git_tree::GitlinkScan::default();
+        let found = scan.feed(&listing[..split]) || scan.feed(&listing[split..]);
+        assert!(found, "split at {split}");
+    }
+    let mut none = git_tree::GitlinkScan::default();
+    assert!(!none.feed(b"100644 blob aaaa\t160000 in a path\0100755 blob bbbb\tx\0"));
+}
+
 /// The cost of both walks on a generated 10,000-file tree (4 KiB each, in 100
 /// directories), on the snapshot path and the git path. A probe, not an
 /// assertion:
@@ -801,7 +965,11 @@ fn workspace_changes_cost_probe() {
     use std::time::Instant;
     let dir = TempDir::new().unwrap();
     let body = "x".repeat(4095) + "\n";
-    for i in 0..10_000 {
+    let count: usize = std::env::var("COST_PROBE_FILES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+    for i in 0..count {
         write(
             dir.path(),
             &format!("d{:02}/f{i:05}.txt", i % 100),

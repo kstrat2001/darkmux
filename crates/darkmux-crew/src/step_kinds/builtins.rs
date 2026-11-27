@@ -66,6 +66,19 @@ pub(crate) fn expand_workspace_root(
     }
 }
 
+/// The error a `dispatch.internal` step fails with when its dispatch exits
+/// non-zero: the exit code and what the dispatch printed. (#3236 review)
+/// Printed without the envelope's workspace file list: this text becomes the
+/// step's output and its `step.error` record, and is forwarded to a
+/// `run_on: ["error"]` dependent's message, recorded on the flow stream,
+/// which carries a workspace's counts and never its paths.
+pub(crate) fn dispatch_exit_text(step_id: &str, exit_code: i32, stdout: &str) -> String {
+    format!(
+        "step `{step_id}` dispatch.internal: dispatch exited {exit_code} — {}",
+        crate::workspace_changes::without_file_list(stdout.trim())
+    )
+}
+
 /// (#3654) The dependency outputs a model-facing step composes into its
 /// message: every one but its grow source's. A grown step already carries
 /// its own item (its config's `{{item.*}}`); the source's whole output is a
@@ -795,12 +808,7 @@ impl StepKind for DispatchInternalStepKind {
         }
 
         if result.exit_code != 0 {
-            anyhow::bail!(
-                "step `{}` dispatch.internal: dispatch exited {} — {}",
-                step.id,
-                result.exit_code,
-                result.stdout.trim()
-            );
+            anyhow::bail!("{}", dispatch_exit_text(&step.id, result.exit_code, &result.stdout));
         }
 
         let flow_records = if parse_verifiers { failed_verifier_records(&result.stdout, step, ctx) } else { Vec::new() };

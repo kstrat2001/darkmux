@@ -53,15 +53,142 @@ pub fn snapshot_tree(work_tree: &Path, git: GitRun<'_>) -> Result<TreeSnapshot, 
     })
 }
 
-/// Whether `tree` holds a submodule (a gitlink, mode 160000) anywhere. A
-/// tree names a submodule by its commit only, so work inside one that is not
-/// committed there is not in the tree.
-pub fn has_gitlinks(git: GitRun<'_>, tree: &str) -> Result<bool, String> {
-    let out = git(
-        None,
-        &["ls-tree", "-r", "-z", "--format=%(objectmode)", tree],
-    )?;
-    Ok(out.split(|&b| b == 0).any(|mode| mode == b"160000"))
+/// Whether the `git ls-tree -r -z <tree>` that `cmd` runs lists a submodule
+/// (a gitlink, mode 160000) anywhere. A tree names a submodule by its commit
+/// only, so work inside one that is not committed there is not in the tree.
+///
+/// (#3236 review) Streamed, never collected: the listing is about 60 bytes
+/// an entry, so a capped capture made every repository past ~16k files (and,
+/// with `--format=%(objectmode)`, past ~150k) unmeasurable, and `--format`
+/// needs git 2.36. Plain `ls-tree -r -z` works on every git; this keeps only
+/// a "saw 160000" flag, stops git as soon as it is set, and kills it at
+/// `timeout`. `cmd`'s stdout is replaced with a pipe.
+pub fn has_gitlinks(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<bool, String> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd
+        .spawn()
+        .map_err(|_| "git ls-tree could not start".to_string())?;
+    let scan = scan_in_background(child.stdout.take().expect("piped above"));
+    let found = match await_scan(&scan, timeout) {
+        Ok(found) => found,
+        Err(e) => {
+            stop(&mut child);
+            return Err(e);
+        }
+    };
+    if found == Some(true) {
+        stop(&mut child);
+        return Ok(true);
+    }
+    let status = child
+        .wait()
+        .map_err(|_| "git ls-tree could not be waited on".to_string())?;
+    match (found, status.success()) {
+        (Some(false), true) => Ok(false),
+        _ => Err(format!(
+            "git ls-tree failed (exit {})",
+            status
+                .code()
+                .map_or("by signal".to_string(), |c| c.to_string())
+        )),
+    }
+}
+
+/// Read `out` to its end on a thread: `Some(true)` as soon as a gitlink is
+/// seen, `Some(false)` at the end without one, `None` on a read error.
+fn scan_in_background(
+    mut out: std::process::ChildStdout,
+) -> std::sync::mpsc::Receiver<Option<bool>> {
+    use std::io::Read;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut scan = GitlinkScan::default();
+        let mut buf = [0u8; 64 * 1024];
+        let found = loop {
+            match out.read(&mut buf) {
+                Ok(0) => break Some(false),
+                Ok(n) if scan.feed(&buf[..n]) => break Some(true),
+                Ok(_) => {}
+                Err(_) => break None,
+            }
+        };
+        let _ = tx.send(found);
+    });
+    rx
+}
+
+/// The scan's answer, or an error once `timeout` passed or darkmux was
+/// interrupted.
+fn await_scan(
+    rx: &std::sync::mpsc::Receiver<Option<bool>>,
+    timeout: std::time::Duration,
+) -> Result<Option<bool>, String> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let started = std::time::Instant::now();
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(found) => return Ok(found),
+            Err(RecvTimeoutError::Disconnected) => return Ok(None),
+            Err(RecvTimeoutError::Timeout)
+                if started.elapsed() >= timeout || darkmux_types::interrupt::is_set() =>
+            {
+                return Err(format!(
+                    "git ls-tree did not finish within {} s",
+                    timeout.as_secs()
+                ));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn stop(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The state of a scan over `git ls-tree -z` output, which may arrive in any
+/// chunks: each record is `<mode> SP <type> SP <oid> TAB <path> NUL`.
+#[derive(Debug)]
+pub(crate) struct GitlinkScan {
+    in_mode: bool,
+    mode: Vec<u8>,
+}
+
+impl Default for GitlinkScan {
+    fn default() -> Self {
+        GitlinkScan {
+            in_mode: true,
+            mode: Vec::with_capacity(8),
+        }
+    }
+}
+
+impl GitlinkScan {
+    /// Feed the next bytes; `true` once a record's mode is `160000`.
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> bool {
+        for &b in bytes {
+            if self.in_mode {
+                if b == b' ' {
+                    if self.mode == b"160000" {
+                        return true;
+                    }
+                    self.in_mode = false;
+                    self.mode.clear();
+                } else if self.mode.len() < 8 {
+                    self.mode.push(b);
+                }
+            } else if b == 0 {
+                self.in_mode = true;
+            }
+        }
+        false
+    }
 }
 
 /// The untracked repositories inside the work tree: git lists each as one

@@ -190,33 +190,81 @@ fn deadline_after(timeout: Duration) -> Option<Instant> {
     Instant::now().checked_add(timeout)
 }
 
-/// `git <args>` in `root` against the held `git_dir`, new objects into
-/// `objects` with the repository's own store as an alternate, each call
+/// The git calls of one read: `git` in `root` against the held `git_dir`,
+/// new objects into `objects` with the repository's own store as an
+/// alternate, every call (the filter-driver read each one needs included)
 /// bounded by what is left before `deadline`. A failure says which
 /// subcommand failed and how, never git's own words, which name paths.
-fn git_runner<'a>(
+struct GitCalls<'a> {
     root: &'a Path,
     git_dir: &'a Path,
     objects: &'a Path,
     deadline: Option<Instant>,
-) -> impl Fn(Option<&Path>, &[&str]) -> Result<Vec<u8>, String> + 'a {
-    use crate::bounded_command::{run_bounded_with_cuts, Bounded, UNBOUNDED};
-    move |index, args| {
-        let sub = args.first().copied().unwrap_or("git");
-        let left = deadline.map_or(UNBOUNDED, |d| d.saturating_duration_since(Instant::now()));
+}
+
+impl GitCalls<'_> {
+    fn host(&self) -> darkmux_types::host_git::HostGit {
+        darkmux_types::host_git::HostGit::run_written(self.git_dir, self.root)
+    }
+
+    /// The time left for `sub`; an error once the bound has passed.
+    fn left(&self, sub: &str) -> Result<Duration, String> {
+        let left = self
+            .deadline
+            .map_or(crate::bounded_command::UNBOUNDED, |d| {
+                d.saturating_duration_since(Instant::now())
+            });
         if left.is_zero() {
             return Err(format!(
                 "git {sub} was not started: the read's time bound had passed"
             ));
         }
-        let mut cmd = darkmux_types::host_git::HostGit::run_written(git_dir, root).command(args);
+        Ok(left)
+    }
+
+    /// The filter drivers the repository's config defines, read now and
+    /// bounded. (#3236 review) That config can `include.path` a file in the
+    /// work tree, which a run can replace with a FIFO; `HostGit::command`'s
+    /// own read of it is unbounded. Read per call, not once, so a driver the
+    /// run defined through such an include is still passed empty.
+    fn drivers(&self) -> Result<Vec<String>, String> {
+        use crate::bounded_command::{run_bounded, Bounded};
+        match run_bounded(self.host().filter_drivers_command(), self.left("config")?) {
+            Bounded::Finished {
+                success: true,
+                stdout,
+                ..
+            } => Ok(darkmux_types::host_git::filter_drivers_in(&stdout)),
+            Bounded::Finished { .. } => Ok(Vec::new()),
+            other => Err(bounded_failure("config", other)),
+        }
+    }
+
+    /// `git <args>`, hardened, with this call's drivers passed empty.
+    fn command(
+        &self,
+        index: Option<&Path>,
+        args: &[&str],
+    ) -> Result<std::process::Command, String> {
+        let mut cmd = self.host().command_with_drivers(args, &self.drivers()?);
         cmd.env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_OBJECT_DIRECTORY", objects)
-            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", git_dir.join("objects"));
+            .env("GIT_OBJECT_DIRECTORY", self.objects)
+            .env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                self.git_dir.join("objects"),
+            );
         if let Some(i) = index {
             cmd.env("GIT_INDEX_FILE", i);
         }
-        match run_bounded_with_cuts(cmd, left) {
+        Ok(cmd)
+    }
+
+    /// `git <args>` run to completion under the bound: its stdout.
+    fn run(&self, index: Option<&Path>, args: &[&str]) -> Result<Vec<u8>, String> {
+        use crate::bounded_command::{run_bounded_with_cuts, Bounded};
+        let sub = args.first().copied().unwrap_or("(no subcommand)");
+        let cmd = self.command(index, args)?;
+        match run_bounded_with_cuts(cmd, self.left(sub)?) {
             (
                 Bounded::Finished {
                     success: true,
@@ -228,29 +276,50 @@ fn git_runner<'a>(
             (Bounded::Finished { success: true, .. }, _) => {
                 Err(format!("git {sub} wrote more output than darkmux keeps"))
             }
-            (Bounded::Finished { code, .. }, _) => Err(format!(
+            (other, _) => Err(bounded_failure(sub, other)),
+        }
+    }
+
+    /// Whether `tree` holds a submodule, streamed under the bound.
+    fn has_gitlinks(&self, tree: &str) -> Result<bool, String> {
+        git_tree::has_gitlinks(
+            self.command(None, &["ls-tree", "-r", "-z", tree])?,
+            self.left("ls-tree")?,
+        )
+    }
+}
+
+/// A fixed reason for a bounded git call that did not succeed.
+fn bounded_failure(sub: &str, how: crate::bounded_command::Bounded) -> String {
+    use crate::bounded_command::Bounded;
+    match how {
+        Bounded::Finished { code, .. } => {
+            format!(
                 "git {sub} failed (exit {})",
                 code.map_or("by signal".to_string(), |c| c.to_string())
-            )),
-            (Bounded::TimedOut { seconds }, _) => {
-                Err(format!("git {sub} did not finish within {seconds} s"))
-            }
-            (Bounded::Interrupted, _) => Err(format!("git {sub} was stopped by a signal")),
-            (Bounded::SpawnFailed(_), _) => Err(format!("git {sub} could not start")),
+            )
         }
+        Bounded::TimedOut { seconds } => format!("git {sub} did not finish within {seconds} s"),
+        Bounded::Interrupted => format!("git {sub} was stopped by a signal"),
+        Bounded::SpawnFailed(_) => format!("git {sub} could not start"),
     }
 }
 
 fn git_before(root: &Path, git_dir: &Path, timeout: Duration) -> Option<GitBefore> {
-    if !darkmux_types::host_git::HostGit::run_written(git_dir, root)
-        .repo_filter_drivers()
-        .is_empty()
-    {
-        return None;
-    }
     let objects = tempfile::tempdir().ok()?;
     let tree = {
-        let git = git_runner(root, git_dir, objects.path(), deadline_after(timeout));
+        let calls = GitCalls {
+            root,
+            git_dir,
+            objects: objects.path(),
+            deadline: deadline_after(timeout),
+        };
+        // A repository whose own config defines a filter driver is measured
+        // by snapshot: darkmux runs none, so git would hash it unfiltered.
+        if !calls.drivers().ok()?.is_empty() {
+            return None;
+        }
+        let git = |index: Option<&Path>, args: &[&str]| calls.run(index, args);
         git_tree::snapshot_tree(root, &git).ok()?
     };
     Some(GitBefore {
@@ -261,17 +330,18 @@ fn git_before(root: &Path, git_dir: &Path, timeout: Duration) -> Option<GitBefor
 }
 
 fn measure_git(root: &Path, before: &GitBefore, timeout: Duration) -> EnvelopeWorkspaceChanges {
-    let git = git_runner(
+    let calls = GitCalls {
         root,
-        &before.git_dir,
-        before.objects.path(),
-        deadline_after(timeout),
-    );
+        git_dir: &before.git_dir,
+        objects: before.objects.path(),
+        deadline: deadline_after(timeout),
+    };
+    let git = |index: Option<&Path>, args: &[&str]| calls.run(index, args);
     let read = || -> Result<(Vec<WorkspaceFileChange>, Vec<String>), String> {
         let after = git_tree::snapshot_tree(root, &git)?;
         Ok((
             git_files(&git, &before.tree.tree, &after.tree)?,
-            git_excluded(&git, &before.tree, &after)?,
+            git_excluded(&calls, &before.tree, &after)?,
         ))
     };
     match read() {
@@ -311,7 +381,7 @@ fn git_files(
 /// What the git path did not look at: ignored files always, repositories
 /// the run made inside the checkout, and work inside submodules.
 fn git_excluded(
-    git: git_tree::GitRun<'_>,
+    calls: &GitCalls<'_>,
     before: &git_tree::TreeSnapshot,
     after: &git_tree::TreeSnapshot,
 ) -> Result<Vec<String>, String> {
@@ -319,7 +389,7 @@ fn git_excluded(
     if !before.skipped.is_empty() || !after.skipped.is_empty() {
         excluded.push(WorkspaceChanges::NESTED_REPOSITORIES.to_string());
     }
-    if git_tree::has_gitlinks(git, &before.tree)? || git_tree::has_gitlinks(git, &after.tree)? {
+    if calls.has_gitlinks(&before.tree)? || calls.has_gitlinks(&after.tree)? {
         excluded.push(WorkspaceChanges::SUBMODULES.to_string());
     }
     Ok(excluded)
