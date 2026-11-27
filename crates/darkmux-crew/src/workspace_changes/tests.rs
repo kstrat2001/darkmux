@@ -24,6 +24,12 @@ fn git(dir: &Path, args: &[&str]) -> String {
             "commit.gpgsign=false",
             "-c",
             "core.hooksPath=/dev/null",
+            // A fixture's own commits must not leave a detached auto
+            // maintenance running while the test reads `.git`.
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
         ])
         .args(args)
         .current_dir(dir)
@@ -55,23 +61,6 @@ fn repo() -> TempDir {
     git(dir.path(), &["commit", "-q", "-m", "base"]);
     write(dir.path(), "build.log", b"ignored\n");
     dir
-}
-
-fn object_files(git_dir: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        for e in fs::read_dir(dir).unwrap().flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(&p, out)
-            } else {
-                out.push(p)
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(&git_dir.join("objects"), &mut out);
-    out.sort();
-    out
 }
 
 #[test]
@@ -165,7 +154,7 @@ fn an_unreadable_workspace_after_the_run_is_null_with_the_reason() {
 fn the_git_path_counts_lines_with_numstat_and_never_writes_the_repository() {
     let dir = repo();
     let git_dir = dir.path().join(".git");
-    let objects_before = object_files(&git_dir);
+    let before = git_dir_state(&git_dir);
     let baseline = WorkspaceBaseline::take(dir.path(), Some(&git_dir));
     write(
         dir.path(),
@@ -214,11 +203,7 @@ fn the_git_path_counts_lines_with_numstat_and_never_writes_the_repository() {
             },
         ]
     );
-    assert_eq!(
-        object_files(&git_dir),
-        objects_before,
-        "the operator's object store is only read"
-    );
+    assert_unchanged(&before, &git_dir_state(&git_dir));
     assert_eq!(
         git(dir.path(), &["status", "--porcelain"]).lines().count(),
         3,
@@ -420,29 +405,24 @@ fn a_repository_the_run_made_inside_the_checkout_is_named_by_a_marker_never_a_pa
     );
 }
 
-/// Every object the git path needs that the repository already holds is
-/// read in place through the alternate, so the scratch store stays empty:
-/// the operator's repository is read, never copied. Without the alternate,
-/// git writes every blob and tree again into scratch.
+/// (#3236, CI) The git path keeps every object in its own scratch store and
+/// never touches the repository's: every file under `.git`, mtime included,
+/// is as it was. (Through an alternate, git "freshened" each object it found
+/// there, rewriting its file's mtime.)
 #[test]
-fn the_git_path_reads_the_repositorys_objects_in_place() {
+fn the_git_path_never_touches_the_repositorys_own_objects() {
     let dir = repo();
     let git_dir = dir.path().join(".git");
+    let before = git_dir_state(&git_dir);
     let baseline = WorkspaceBaseline::take(dir.path(), Some(&git_dir));
-    let scratch = baseline.scratch_objects().expect("measured with git");
-    let mut written = Vec::new();
-    for e in fs::read_dir(scratch).unwrap().flatten() {
-        if e.path().is_dir() {
-            written.extend(fs::read_dir(e.path()).unwrap().flatten().map(|f| f.path()));
-        }
-    }
-    // `build.log` is ignored and the rest is committed: nothing new to write.
-    assert!(
-        written.is_empty(),
-        "the repository's objects are read in place: {written:?}"
-    );
     write(dir.path(), "calc.py", b"x\n");
     assert_eq!(baseline.measure().summary.files_changed, Some(1));
+    let scratch = baseline.scratch_objects().expect("measured with git");
+    assert!(
+        fs::read_dir(scratch).unwrap().next().is_some(),
+        "the objects went to scratch"
+    );
+    assert_unchanged(&before, &git_dir_state(&git_dir));
 }
 
 /// A checkout with a submodule `sub` whose `.git` the run replaced with a
@@ -731,11 +711,7 @@ fn a_file_over_the_hashing_cap_is_compared_by_size_and_mtime_and_named() {
         use std::io::Write;
         let mut f =
             std::io::BufWriter::new(fs::File::create(fresh.path().join("big.txt")).unwrap());
-        let line = [b'a'; 1023]
-            .iter()
-            .copied()
-            .chain([b'\n'])
-            .collect::<Vec<u8>>();
+        let line = [&[b'a'; 1023][..], b"\n"].concat();
         for _ in 0..=(size / 1024) {
             f.write_all(&line).unwrap();
         }
@@ -945,14 +921,122 @@ fn a_repository_whose_listing_passes_the_output_cap_is_measured() {
 #[test]
 fn the_gitlink_scan_reads_record_modes_across_any_chunking() {
     let listing =
-        b"100644 blob aaaa\t160000 tricky name\0040000 tree bbbb\tdir\0160000 commit cccc\tsub\0";
+        b"100644 blob aaaa\t160000 tricky name\x00040000 tree bbbb\tdir\x00160000 commit cccc\tsub\x00";
     for split in 0..listing.len() {
         let mut scan = git_tree::GitlinkScan::default();
         let found = scan.feed(&listing[..split]) || scan.feed(&listing[split..]);
         assert!(found, "split at {split}");
     }
     let mut none = git_tree::GitlinkScan::default();
-    assert!(!none.feed(b"100644 blob aaaa\t160000 in a path\0100755 blob bbbb\tx\0"));
+    assert!(!none.feed(b"100644 blob aaaa\t160000 in a path\x00100755 blob bbbb\tx\x00"));
+}
+
+/// Every file under `.git`, with its size and mtime.
+fn git_dir_state(git_dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, u64, std::time::SystemTime)>) {
+        for e in fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            let m = fs::symlink_metadata(&p).unwrap();
+            if m.is_dir() {
+                walk(&p, out)
+            } else {
+                out.push((p, m.len(), m.modified().unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(git_dir, &mut out);
+    out.sort();
+    out
+}
+
+/// Every entry that appeared, vanished or changed between two states.
+fn assert_unchanged(
+    before: &[(PathBuf, u64, std::time::SystemTime)],
+    after: &[(PathBuf, u64, std::time::SystemTime)],
+) {
+    let changed: Vec<_> = after
+        .iter()
+        .filter(|e| !before.contains(e))
+        .chain(before.iter().filter(|e| !after.contains(e)))
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "the operator's repository was written: {changed:?}"
+    );
+}
+
+/// (#3236, CI on git 2.56) Measuring never runs git's auto maintenance or
+/// auto gc against the operator's repository, even one configured to want
+/// it at once and in the foreground: every file under `.git` is as it was.
+#[test]
+fn measuring_never_runs_auto_maintenance_on_the_checkout() {
+    let dir = repo();
+    for i in 0..300 {
+        write(
+            dir.path(),
+            &format!("many/f{i:03}.txt"),
+            format!("{i}\n").as_bytes(),
+        );
+    }
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-q", "-m", "loose objects"]);
+    for (key, value) in [
+        ("gc.auto", "1"),
+        ("maintenance.auto", "true"),
+        ("gc.autoDetach", "false"),
+        ("maintenance.autoDetach", "false"),
+    ] {
+        git(dir.path(), &["config", key, value]);
+    }
+    let git_dir = dir.path().join(".git");
+    let before = git_dir_state(&git_dir);
+    let baseline = WorkspaceBaseline::take(dir.path(), Some(&git_dir));
+    write(dir.path(), "calc.py", b"x\n");
+    let m = baseline.measure();
+    assert_eq!(m.summary.files_changed, Some(1));
+    assert_unchanged(&before, &git_dir_state(&git_dir));
+}
+
+/// Every measuring call carries the settings that turn auto maintenance
+/// and auto gc off, whatever the repository or the operator configured.
+#[test]
+fn every_measuring_call_turns_auto_maintenance_off() {
+    let dir = repo();
+    let git_dir = dir.path().join(".git");
+    let objects = TempDir::new().unwrap();
+    let calls = GitCalls {
+        root: dir.path(),
+        git_dir: &git_dir,
+        objects: objects.path(),
+        deadline: None,
+    };
+    for args in [
+        &["add", "-A"][..],
+        &["write-tree"],
+        &["ls-tree", "-r", "-z", "HEAD"],
+    ] {
+        let cmd = calls.command(None, args).unwrap();
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        for setting in MEASURE_GIT_CONFIG {
+            assert!(
+                argv.windows(2).any(|w| w[0] == "-c" && w[1] == setting),
+                "{args:?} lacks -c {setting}: {argv:?}"
+            );
+        }
+    }
+    let read = calls.host().filter_drivers_command();
+    let argv: Vec<String> = read
+        .get_args()
+        .map(|a| a.to_string_lossy().to_string())
+        .collect();
+    assert!(
+        argv.iter().any(|a| a == "gc.auto=0"),
+        "the driver read too: {argv:?}"
+    );
 }
 
 /// The cost of both walks on a generated 10,000-file tree (4 KiB each, in 100

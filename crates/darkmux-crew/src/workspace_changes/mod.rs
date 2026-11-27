@@ -12,7 +12,8 @@
 //! - **git** ([`git_tree`], from the client work copy): when the workspace is
 //!   a checkout whose own `.git` directory the run could not write, two
 //!   trees of the work tree through a throwaway index and a scratch object
-//!   store, so the operator's repository is only read. Tracked and untracked
+//!   store that never reaches the repository's own, with auto gc and auto
+//!   maintenance off, so the operator's repository is only read. Tracked and untracked
 //!   files count; ignored ones do not (`excluded` says so). Lines come from
 //!   `git diff --numstat`; a binary file has none.
 //! - **snapshot** ([`snapshot`], from the lab's workspace delta): every other
@@ -98,8 +99,8 @@ enum Before {
 }
 
 /// The git path's state between the two reads: the held git directory, the
-/// scratch object store new blobs go to (the repository's own is an
-/// alternate, only read), and the tree before.
+/// scratch object store every object of both trees goes to, and the tree
+/// before.
 struct GitBefore {
     git_dir: PathBuf,
     objects: tempfile::TempDir,
@@ -190,9 +191,21 @@ fn deadline_after(timeout: Duration) -> Option<Instant> {
     Instant::now().checked_add(timeout)
 }
 
+/// (#3236) Settings every measuring call adds: no auto gc and no auto
+/// maintenance, which would write the operator's repository (and can start
+/// a detached `git maintenance` child).
+pub(crate) const MEASURE_GIT_CONFIG: [&str; 4] = [
+    "gc.auto=0",
+    "maintenance.auto=false",
+    "gc.autoDetach=false",
+    "maintenance.autoDetach=false",
+];
+
 /// The git calls of one read: `git` in `root` against the held `git_dir`,
-/// new objects into `objects` with the repository's own store as an
-/// alternate, every call (the filter-driver read each one needs included)
+/// every object into `objects` and none read from or written to the
+/// repository's own store (#3236, CI: with that store as an alternate, git
+/// "freshens" an object it already holds by rewriting its file's mtime, a
+/// write to the operator's repository), every call (the filter-driver read each one needs included)
 /// bounded by what is left before `deadline`. A failure says which
 /// subcommand failed and how, never git's own words, which name paths.
 struct GitCalls<'a> {
@@ -205,6 +218,7 @@ struct GitCalls<'a> {
 impl GitCalls<'_> {
     fn host(&self) -> darkmux_types::host_git::HostGit {
         darkmux_types::host_git::HostGit::run_written(self.git_dir, self.root)
+            .with_config(&MEASURE_GIT_CONFIG)
     }
 
     /// The time left for `sub`; an error once the bound has passed.
@@ -248,11 +262,7 @@ impl GitCalls<'_> {
     ) -> Result<std::process::Command, String> {
         let mut cmd = self.host().command_with_drivers(args, &self.drivers()?);
         cmd.env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_OBJECT_DIRECTORY", self.objects)
-            .env(
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                self.git_dir.join("objects"),
-            );
+            .env("GIT_OBJECT_DIRECTORY", self.objects);
         if let Some(i) = index {
             cmd.env("GIT_INDEX_FILE", i);
         }
