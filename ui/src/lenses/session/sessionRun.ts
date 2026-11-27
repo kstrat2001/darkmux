@@ -68,6 +68,7 @@ import { isSingleShotWorkUsage, sumUsage, usageContribution } from "../../lib/us
 
 import { toolOutcome } from "../../lib/recordDetail";
 import type { DispatchStartPayload } from "../../types/generated/DispatchStartPayload";
+import type { WorkspaceChanges } from "../../types/generated/WorkspaceChanges";
 import { ACTION, CATEGORY, SOURCE, byTime, endPayloadOf, payloadOf, isBookendTerminal, isDispatchTerminal, latestByTime, recordsAsOf, type NormRecord, type NormSource } from "../../lib/ingest";
 import { maxOf } from "../../lib/numbers";
 import { sameMachine, sameUid } from "../../lib/machineIdentity";
@@ -823,12 +824,39 @@ function briefRoute(d: NormRecord | null, ep: string | undefined, first: NormRec
   return d?.action === ACTION.DispatchStart || ep ? routeLabel(ep, ranOn(d, first), viewerUid) : null;
 }
 
-function briefRowsOf(sp: DispatchStartPayload, model: string | null, d: NormRecord | null, route: string | null, timing: string): BriefEntry[] {
+/** (#3236) What the run's workspace changed, as its terminal record says:
+ *  `null` (no row) where no workspace was recorded. "no changes" names what
+ *  the measure left out, so it never claims more than it looked at, and a
+ *  count the record could not measure is never shown as zero. */
+function workspaceChangesLabel(w: WorkspaceChanges | undefined): string | null {
+  if (!w || typeof w !== "object") return null;
+  // A count this build cannot read (an archive another version wrote) is not
+  // a count: it reads as not measured, never as a number.
+  if (typeof w.files_changed !== "number") return `not measured: ${w.not_measured ?? "no reason recorded"}`;
+  if (w.files_changed === 0) return `no changes${outsideOf(w.excluded ?? [])}`;
+  const files = `${w.files_changed} file${w.files_changed === 1 ? "" : "s"}`;
+  const lines = w.lines_added != null && w.lines_removed != null ? `+${w.lines_added} −${w.lines_removed}` : "lines not measured";
+  return `${files} · ${lines}`;
+}
+
+/** The `changes` row of the run whose terminal record is `close`. */
+function changesOf(close: NormRecord | null | undefined): string | null {
+  return workspaceChangesLabel(endPayloadOf(close)?.workspace_changes);
+}
+
+const EXCLUDED_MARKERS: Record<string, string> = { "git-ignored": "git-ignored files", "nested-repositories": "nested repositories" };
+
+function outsideOf(excluded: readonly string[]): string {
+  return excluded.length ? ` outside ${excluded.map((e) => EXCLUDED_MARKERS[e] ?? `${e}/`).join(", ")}` : "";
+}
+
+function briefRowsOf(sp: DispatchStartPayload, model: string | null, d: NormRecord | null, route: string | null, timing: string, changes: string | null): BriefEntry[] {
   const rows: BriefEntry[] = [];
   pushKv(rows, "route", route);
   pushKv(rows, "image", sp.image);
   pushKv(rows, "model", model);
   pushKv(rows, "workspace", sp.workspace);
+  pushKv(rows, "changes", changes);
   if (d?.mission_id) {
     rows.push({ kind: "label", text: "mission" });
     rows.push({
@@ -1695,7 +1723,7 @@ export function runRegions(
   // CLOCK stamps stay record-derived: they are timestamps, not a duration.
   const briefTiming = `${clk(startTs)}${done ? ` → ${clkAt(endTs)} (${fmtElapsed(runWallMs)})` : ` · ${pill.open}`}`;
   const ep = remoteEp;
-  const briefRows = briefRowsOf(sp, model, d, briefRoute(d, ep, firstSessRec, viewerUid), briefTiming);
+  const briefRows = briefRowsOf(sp, model, d, briefRoute(d, ep, firstSessRec, viewerUid), briefTiming, changesOf(c));
   const { promptLines, disclosures } = promptOf(sp);
 
   // No "run" heading inside the block: the region's own `<h2>` directly above

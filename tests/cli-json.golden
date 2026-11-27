@@ -288,6 +288,7 @@ DispatchEnvelope
   findings?: FindingsSummary | null
   degeneracy_warnings?: uint32 | null
   checkpoints?: CheckpointSummary | null
+  workspace_changes?: EnvelopeWorkspaceChanges | null
 DispatchRefusedEnvelope
   result: string
   code: string
@@ -366,6 +367,15 @@ EnvelopeThermal
   worst_state: string
   above_nominal_ms: uint64
   min_cpu_speed_limit_pct: uint64
+EnvelopeWorkspaceChanges
+  method: WorkspaceMethod
+  files_changed: uint64 | null
+  not_measured: string | null
+  lines_added: uint64 | null
+  lines_removed: uint64 | null
+  excluded: string[]
+  files: WorkspaceFileChange[]
+  files_omitted: uint64
 EscalationKind = "bail-with-explanation" | "retry-with-hint" | "hand-off-to"
 FailedExec
   command: string
@@ -1094,6 +1104,7 @@ RunStats
   reasoning_chars_per_s: double | null
   gates: Gates
   bounds: { [key: string]: Knob }
+  workspace_changes: WorkspaceChanges | null
   gpu_w_busy: double | null
   gpu_w_max: double | null
   cpu_w_busy: double | null
@@ -1339,6 +1350,20 @@ UtilityModel
 Verdict = "productive" | "struggled" | "inert-false-pass" | "failed" | "escalated"
 VerdictShift = "improved" | "regressed" | "no-change"
 VersionSource = "peer" | "presence" | "unknown"
+WorkspaceChangeKind = "added" | "modified" | "removed"
+WorkspaceChanges
+  method: WorkspaceMethod
+  files_changed: uint64 | null
+  not_measured: string | null
+  lines_added: uint64 | null
+  lines_removed: uint64 | null
+  excluded: string[]
+WorkspaceFileChange
+  path: string
+  change: WorkspaceChangeKind
+  lines_added: uint64 | null
+  lines_removed: uint64 | null
+WorkspaceMethod = "git" | "snapshot"
 
 # untyped: fields (or types) that hold free-form JSON, each explained in DESIGN.md
 FindingRecord.emitted

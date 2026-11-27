@@ -233,6 +233,9 @@ pub mod user_files;
 // this packet states plainly (the crawl planner doesn't consume
 // `Materialized` yet).
 pub mod workspace_spec;
+// (#3236) What a dispatch's workspace changed: the git and snapshot measures, and the
+// directory names every workspace walk skips.
+pub mod workspace_changes;
 
 /// A test's record context, from its JSON.
 #[cfg(test)]

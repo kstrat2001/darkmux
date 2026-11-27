@@ -683,6 +683,12 @@ pub struct DispatchEndPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub host_window: Option<HostWindow>,
+    /// (#3236, flow 2.10.0) What the execution's workspace changed, as counts. Absent where no
+    /// workspace was read (a one-call dispatch, a step's per-call bookend, a terminal written
+    /// before the sandbox started, a record from before 2.10.0): absent never means "no changes".
+    #[serde(default, deserialize_with = "super::context::lenient", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub workspace_changes: Option<WorkspaceChanges>,
     /// The prior dispatch's output directory this one resumed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
@@ -715,6 +721,60 @@ impl Attribution for DispatchEndPayload {
     fn context_slot(&mut self) -> Option<&mut Option<RecordContext>> {
         Some(&mut self.context)
     }
+}
+
+/// (#3236, flow 2.10.0) What a dispatch's workspace changed, measured on the host from the
+/// tree as it was before the run started and as it was when the dispatch ended (a process that
+/// outlives the dispatch can still write afterward). Counts and totals only: the paths are in the
+/// dispatch's envelope, never on the flow stream, so this type has no field that could carry one.
+///
+/// `files_changed` is `0` only when the workspace was read and nothing changed; it is `null` when
+/// it could not be read, and `not_measured` says why. A line total is `null` unless every changed
+/// file's lines were measured (a binary file, or a modified file on the snapshot path, has none).
+/// `excluded` names what the measure did not look at: the directory names the snapshot skipped,
+/// or [`WorkspaceChanges::GIT_IGNORED`] (and [`WorkspaceChanges::NESTED_REPOSITORIES`]) for the
+/// git path, so "no changes" never overclaims.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub struct WorkspaceChanges {
+    pub method: WorkspaceMethod,
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
+    pub files_changed: Option<u64>,
+    pub not_measured: Option<String>,
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
+    pub lines_added: Option<u64>,
+    #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
+    pub lines_removed: Option<u64>,
+    pub excluded: Vec<String>,
+}
+
+impl WorkspaceChanges {
+    /// The `excluded` entry the git path writes: files git ignores were not looked at.
+    pub const GIT_IGNORED: &'static str = "git-ignored";
+    /// The `excluded` entry the git path writes when it left out a repository
+    /// inside the work tree (one the run made with `git init`). A marker, not
+    /// the path: this record carries no path.
+    pub const NESTED_REPOSITORIES: &'static str = "nested-repositories";
+}
+
+/// How a workspace's changes were measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../../../ui/src/types/generated/"))]
+pub enum WorkspaceMethod {
+    /// Two git trees of the work tree (tracked and untracked files, ignored ones left out).
+    Git,
+    /// A walk of every file before and after, compared by size and content hash.
+    Snapshot,
+    /// A value this build does not name, read from an archive written by another version.
+    /// Never written.
+    #[default]
+    #[schemars(skip)]
+    #[serde(other)]
+    Unknown,
 }
 
 /// The usage block a turn's model reply carried. A count the provider did not report is `null`,
@@ -1441,6 +1501,7 @@ impl DispatchEndPayload {
             cached_tokens: None,
             endpoint: None,
             host_window: None,
+            workspace_changes: None,
             resumed_from: None,
             kind: None,
             item_index: None,
@@ -1479,5 +1540,75 @@ mod role_source_tests {
             assert_eq!(serde_json::from_value::<RoleInputSource>(wire.into()).unwrap(), source);
         }
         assert_eq!(serde_json::from_value::<RoleInputSource>("from_the_future".into()).unwrap(), RoleInputSource::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod workspace_changes_tests {
+    use super::{DispatchEndPayload, WorkspaceChanges, WorkspaceMethod};
+    use serde_json::json;
+
+    fn measured() -> WorkspaceChanges {
+        WorkspaceChanges {
+            method: WorkspaceMethod::Git,
+            files_changed: Some(2),
+            not_measured: None,
+            lines_added: Some(12),
+            lines_removed: Some(3),
+            excluded: vec![WorkspaceChanges::GIT_IGNORED.to_string()],
+        }
+    }
+
+    /// (#3236) The flow stream (and so the fleet relay, which forwards these records as written)
+    /// carries counts and totals only. The wire keys are exactly these, so no file list can ride
+    /// on `dispatch.complete` / `dispatch.error`.
+    #[test]
+    fn the_terminal_payload_carries_counts_and_never_a_file_list() {
+        let payload = DispatchEndPayload { workspace_changes: Some(measured()), ..DispatchEndPayload::new(1) };
+        let wire = serde_json::to_value(&payload).unwrap();
+        let block = wire["workspace_changes"].as_object().expect("present when measured");
+        let keys: Vec<&str> = block.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["method", "files_changed", "not_measured", "lines_added", "lines_removed", "excluded"]);
+        assert!(!wire.to_string().contains("\"files\""), "{wire}");
+    }
+
+    /// (#3236) Not measured is `null`, never `0`, on the wire: every count is written, so a reader
+    /// tells "measured, nothing changed" from "could not be read".
+    #[test]
+    fn an_unmeasured_count_is_written_as_null() {
+        let unread = WorkspaceChanges {
+            method: WorkspaceMethod::Snapshot,
+            not_measured: Some("reading the workspace failed".into()),
+            ..WorkspaceChanges::default()
+        };
+        let wire = serde_json::to_value(&unread).unwrap();
+        assert_eq!(wire["files_changed"], json!(null));
+        assert_eq!(wire["lines_added"], json!(null));
+        assert_eq!(wire["method"], json!("snapshot"));
+    }
+
+    /// (#3236, contract 5) A record from before flow 2.10.0 reads with no workspace block; a block
+    /// a newer darkmux wrote with a value this build cannot read costs that block, never the
+    /// record; a method this build does not name reads as `Unknown`.
+    #[test]
+    fn an_older_or_newer_archive_reads_leniently() {
+        let old: DispatchEndPayload = serde_json::from_value(json!({"total_turns": 3, "exit_code": 0})).unwrap();
+        assert_eq!(old.workspace_changes, None);
+        assert_eq!(old.total_turns, Some(3));
+
+        let garbled: DispatchEndPayload =
+            serde_json::from_value(json!({"total_turns": 1, "workspace_changes": {"files_changed": "two"}})).unwrap();
+        assert_eq!(garbled.workspace_changes, None, "a wrong-typed block costs the block only");
+        assert_eq!(garbled.total_turns, Some(1));
+
+        let newer: DispatchEndPayload = serde_json::from_value(json!({
+            "total_turns": 1,
+            "workspace_changes": {"method": "from_the_future", "files_changed": 0, "a_newer_key": true}
+        }))
+        .unwrap();
+        let block = newer.workspace_changes.expect("a newer block still reads");
+        assert_eq!(block.method, WorkspaceMethod::Unknown);
+        assert_eq!(block.files_changed, Some(0));
+        assert!(block.excluded.is_empty());
     }
 }

@@ -11,7 +11,9 @@ macro_rules! p {
     }};
 }
 
-pub mod artifact_dirs;
+// (#3236) Moved to `darkmux-crew`, beside the workspace measure every dispatch now
+// takes with the same names; re-exported so lab paths read as before.
+pub use darkmux_crew::workspace_changes::artifact_dirs;
 // (#1222 Phase B packet 3) Built-in review bundler — diff -> per-changed-
 // function code bundles + mechanical facts + manifest.
 pub mod bundle;

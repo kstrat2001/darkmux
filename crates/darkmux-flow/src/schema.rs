@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "2.9.0";
+pub const FLOW_SCHEMA_VERSION: &str = "2.10.0";
 // Version history:
 //   2.9.0 (#3195): two step actions with no payload, `step.queue.wait` (an
 //           admitted step waits its turn: its endpoint's

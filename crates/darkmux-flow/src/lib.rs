@@ -4310,7 +4310,9 @@ mod tests {
         //            the container's `/workspace` (a sandbox on the host).
         //   2.9.0 — (#3195) additive: `step.queue.wait` / `.resume`, a
         //            step that waits its turn for a call slot.
-        assert_eq!(FLOW_SCHEMA_VERSION, "2.9.0");
+        //   2.10.0 — (#3236) additive: `dispatch.complete` / `.error`'s
+        //            `workspace_changes`, what the workspace changed (counts only).
+        assert_eq!(FLOW_SCHEMA_VERSION, "2.10.0");
     }
 
     #[test]

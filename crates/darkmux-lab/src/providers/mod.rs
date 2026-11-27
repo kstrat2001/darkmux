@@ -2,7 +2,9 @@ pub mod coding_task;
 pub(crate) mod expect;
 pub mod prompt;
 pub mod tool_bench;
-pub mod workspace_delta;
+// (#3236) Moved to `darkmux-crew` as `workspace_changes::snapshot`, the snapshot path of
+// the measure every container dispatch takes; re-exported under its lab name.
+pub use darkmux_crew::workspace_changes::snapshot as workspace_delta;
 
 use crate::workloads::registry;
 use crate::workloads::types::LoadedWorkload;
